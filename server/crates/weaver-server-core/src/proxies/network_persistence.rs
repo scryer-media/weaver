@@ -341,7 +341,7 @@ impl Database {
                         &[SqlArg::I64(i64::from(id))],
                     )
                     .await?;
-                    Ok(())
+                    Database::remove_egress_schedules(tx, id).await
                 })
             })
             .await

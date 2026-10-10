@@ -112,6 +112,7 @@ fn test_scheduler_handle(capture: RuntimeCapture) -> SchedulerHandle {
                 SchedulerCommand::SetSpeedLimit {
                     bytes_per_sec,
                     reply,
+                    ..
                 } => {
                     capture.speed_limits.lock().unwrap().push(bytes_per_sec);
                     let _ = reply.send(());

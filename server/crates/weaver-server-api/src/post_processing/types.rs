@@ -451,12 +451,70 @@ pub struct ScriptInstanceGql {
     pub blocking: bool,
     /// Null runs under the default timeout of its trigger.
     pub timeout_seconds: Option<u64>,
+    /// When a schedule instance runs. Empty for every other trigger.
+    pub schedule: ScriptInstanceScheduleGql,
     pub run_order: i64,
     /// Why the script cannot run as things stand, such as its file having gone
     /// from the scripts directory. Null when it can.
     pub script_problem: Option<String>,
     /// The script's header no longer declares the inputs this instance holds.
     pub header_drift: bool,
+}
+
+/// When a schedule instance runs.
+#[derive(Debug, Clone, Default, SimpleObject, InputObject)]
+#[graphql(
+    name = "ScriptInstanceSchedule",
+    input_name = "ScriptInstanceScheduleInput"
+)]
+pub struct ScriptInstanceScheduleGql {
+    /// `mon` to `sun`. Empty runs every day.
+    #[graphql(default)]
+    pub days: Vec<String>,
+    /// Each `HH:MM`, or `*:MM` for that minute of every hour.
+    #[graphql(default)]
+    pub times: Vec<String>,
+    /// Also run once each time Weaver starts.
+    #[graphql(default)]
+    pub run_at_startup: bool,
+}
+
+impl From<weaver_server_core::post_processing::instances::InstanceSchedule>
+    for ScriptInstanceScheduleGql
+{
+    fn from(schedule: weaver_server_core::post_processing::instances::InstanceSchedule) -> Self {
+        Self {
+            days: schedule
+                .days
+                .iter()
+                .map(|day| day.as_str().to_string())
+                .collect(),
+            times: schedule.times,
+            run_at_startup: schedule.run_at_startup,
+        }
+    }
+}
+
+impl TryFrom<ScriptInstanceScheduleGql>
+    for weaver_server_core::post_processing::instances::InstanceSchedule
+{
+    type Error = String;
+
+    fn try_from(schedule: ScriptInstanceScheduleGql) -> Result<Self, String> {
+        let days = schedule
+            .days
+            .iter()
+            .map(|day| {
+                weaver_server_core::bandwidth::Weekday::parse(&day.trim().to_lowercase())
+                    .ok_or_else(|| format!("'{day}' is not a day; use mon to sun"))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            days,
+            times: schedule.times,
+            run_at_startup: schedule.run_at_startup,
+        })
+    }
 }
 
 /// The scripts directory as it is now, for judging saved instances against.
@@ -521,6 +579,7 @@ impl ScriptDirectoryView {
             enabled: instance.enabled,
             blocking: instance.blocking,
             timeout_seconds: instance.timeout_seconds,
+            schedule: instance.schedule.into(),
             run_order: instance.run_order,
             script_problem,
             header_drift,
@@ -582,6 +641,9 @@ pub struct ScriptInstanceInput {
     #[graphql(default = true)]
     pub blocking: bool,
     pub timeout_seconds: Option<u64>,
+    /// When a schedule instance runs; ignored for every other trigger.
+    /// Omitted on an update, the saved one is kept.
+    pub schedule: Option<ScriptInstanceScheduleGql>,
 }
 
 impl ScriptInstanceInput {
@@ -615,6 +677,11 @@ impl ScriptInstanceInput {
             enabled: self.enabled,
             blocking: self.blocking,
             timeout_seconds: self.timeout_seconds,
+            schedule: self
+                .schedule
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
         })
     }
 }

@@ -88,6 +88,25 @@ enforced never-direct setting is planned for a later release.
   or a quota moved, and quota usage is written only when bytes moved.
   Feeds, schedules and script instances are no longer reloaded in full
   just to decide whether anything is due.
+- Executables are refused by default. The unwanted extension list, which
+  shipped empty, now starts as exe, bat, cmd, com, scr, msi, vbs, ps1, lnk
+  and js. A job that holds one fails with the reason "unwanted extension
+  '.exe' in '<file>'", at RAR open and before publication, so Scryer sees
+  a failed grab and moves on instead of parking an import. The delivery
+  rename never names a job after a file the list refuses, nor after an
+  executable even when the list is empty. Clearing the list turns the
+  check off.
+- A "Set speed limit" schedule names the limit for every target at once:
+  Global, each egress and each provider, each with its own value. A blank
+  leaves that target as it is and 0 removes its limit. The lowest limit
+  that applies to a download is the one in force; the two waits are no
+  longer added together. A speed rule takes one time of day.
+- Schedules can pause and resume RSS. While paused, no feed is polled.
+- A script job that runs on a schedule carries its own run times, days and
+  "also run at startup" on the job itself. The Schedules table no longer
+  lists scripts.
+- "Quota metering" schedules target every egress or one egress; one egress's
+  rule wins over the rule for every egress.
 - The settings search box searches every settings panel, not only the open
   one. Matches show under a heading per panel; the open panel stays
   editable and another panel's result opens that panel with the query
@@ -106,6 +125,13 @@ enforced never-direct setting is planned for a later release.
 - Implicit schedules derived from a script's `### TASK TIME:` header are
   gone. "Set up from header" creates real schedule rows instead.
 - The NZBGet `<Script>:=no` per-download opt-out is not supported.
+- The schedule actions "scan watch folder", "fetch RSS", "run script" and
+  "use configured speed limit" are gone. GraphQL: `Schedule.instanceId`,
+  `Schedule.runAtStartup` and `Schedule.feedId` are removed;
+  `Schedule.speedLimits` and `Schedule.quotaEgressId` are new, with
+  `ScheduleSpeedLimitInput` on the input; `Schedule.speedLimitBytes` stays,
+  deprecated, mirroring the Global value. `ScriptInstance.schedule` and
+  `ScriptInstanceScheduleInput` carry a job's run times.
 - The ISP bandwidth cap is gone, replaced by the System egress's download
   quota. GraphQL: `GeneralSettings.ispBandwidthCap`,
   `GeneralSettingsInput.ispBandwidthCap`, the `IspBandwidthCapSettings`,
@@ -123,9 +149,17 @@ enforced never-direct setting is planned for a later release.
 
 ## Upgrade notes
 
-- The database moves from schema 50 to 55 in one step. Scripts, their
+- An install whose unwanted extension list was empty gets the default list
+  once, on this upgrade, because an empty list could not be told apart from
+  the old default. A list cleared after the upgrade stays cleared, and a
+  list that already named extensions is kept.
+- The database moves from schema 50 to 57 in one step. Scripts, their
   options, category lists, feed scripts and script schedules are carried
-  over as script jobs automatically. Each secret option a script had saved
+  over as script jobs automatically. A schedule that ran a script becomes
+  that job's run times; its days are joined with the job's. Schedules for
+  the removed actions are dropped, each named in the log. A pause or resume
+  rule that used to fall back to the configured speed limit becomes a
+  Global entry pinned to the limit saved at upgrade time. Each secret option a script had saved
   becomes one named secret, "<script> <option>", linked by every job of that
   script. The upgrade stops with a message if the
   saved scripts directory exists but cannot be read; make it readable and

@@ -1,9 +1,7 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import {
-  CREATE_SCHEDULE_MUTATION,
   CREATE_SCRIPT_INSTANCE_MUTATION,
-  SCHEDULES_QUERY,
   SECRETS_QUERY,
   UPDATE_SCRIPT_INSTANCE_MUTATION,
 } from "@/graphql/queries";
@@ -23,9 +21,8 @@ import {
   formFromInstance,
   inputFromForm,
   inputNameProblem,
-  jobScheduleRule,
+  jobSchedule,
   newInstanceForm,
-  scheduleFromHeader,
   triggerTitle,
   unwiredTriggers,
   withScript,
@@ -39,7 +36,7 @@ import {
   type ScriptInstance,
   type ScriptKind,
 } from "../../../data/script-instances";
-import { SCHEDULE_DAYS, scheduleDaysLabel } from "../../../data/schedule-options";
+import { SCHEDULE_DAYS } from "../../../data/schedule-options";
 import { sortedSecrets, type Secret, type SecretRef } from "../../../data/secrets";
 import { FieldControlView, type FieldSpec } from "../framework";
 import { SecretEditor } from "./SecretEditor";
@@ -55,23 +52,13 @@ import { SecretEditor } from "./SecretEditor";
  * is never shown. An input added here may instead be a secret of the job's
  * own: typed once, stored encrypted, and never shown again.
  *
- * A new instance on the schedule is given when it runs here, starting from the
- * times the header asks for, and is saved with the schedule rule that runs it.
- * A saved one shows its rules; they are changed among the schedules.
+ * An instance on the schedule keeps when it runs: its times, its days and
+ * whether it also runs at startup. A new one starts from the times the header
+ * asks for. Scripts never appear among the schedules.
  */
 
 /** What the editor was opened on: a saved instance, or a new one. */
 export type InstanceEditorTarget = { mode: "new" } | { mode: "edit"; instance: ScriptInstance };
-
-/** A schedule rule, as far as the instance it runs shows it. */
-interface InstanceRule {
-  id: string;
-  actionType: string;
-  instanceId: string | null;
-  time: string;
-  days: string[];
-  runAtStartup: boolean;
-}
 
 /** The secret picker's entry that opens the editor of a new secret. */
 const CREATE_SECRET = "\u0000create";
@@ -113,7 +100,6 @@ export function ScriptInstanceEditor({
   const t = useTranslate();
   const [, createInstance] = useMutation(CREATE_SCRIPT_INSTANCE_MUTATION);
   const [, updateInstance] = useMutation(UPDATE_SCRIPT_INSTANCE_MUTATION);
-  const [, createSchedule] = useMutation(CREATE_SCHEDULE_MUTATION);
 
   const editing = target.mode === "edit" ? target.instance : null;
   const byName = useMemo(() => new Map(scripts.map((entry) => [entry.name, entry])), [scripts]);
@@ -122,12 +108,6 @@ export function ScriptInstanceEditor({
       ? formFromInstance(target.instance, byName.get(target.instance.script))
       : newInstanceForm(undefined),
   );
-  // When a new instance on the schedule runs.
-  const [schedule, setSchedule] = useState<JobScheduleForm>(() => scheduleFromHeader(undefined));
-  const [{ data: rulesData }] = useQuery<{ schedules: InstanceRule[] }>({
-    query: SCHEDULES_QUERY,
-    pause: target.mode !== "edit",
-  });
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // The input being added: a name and its value, kept as the job's own secret when the box is ticked.
@@ -157,18 +137,20 @@ export function ScriptInstanceEditor({
   };
 
   const scheduled = form.trigger === "SCHEDULER";
+  const schedule = form.schedule;
   const patchSchedule = (next: Partial<JobScheduleForm>) => {
     setError(null);
-    setSchedule((current) => ({ ...current, ...next }));
+    setForm((current) => ({ ...current, schedule: { ...current.schedule, ...next } }));
   };
 
   const save = async () => {
-    // What is wrong with the times is said before anything is created.
-    const rule = editing === null && scheduled ? jobScheduleRule(schedule) : null;
-    if (rule && "problem" in rule) {
+    // What is wrong with the times is said before anything is saved. A job
+    // that is turned off may wait without any.
+    const times = scheduled ? jobSchedule(schedule) : null;
+    if (times && "problem" in times && (times.problem === "invalid" || form.enabled)) {
       setError(
-        rule.problem === "invalid"
-          ? t("next.postProcessing.runTimeInvalid", { time: rule.time })
+        times.problem === "invalid"
+          ? t("next.postProcessing.runTimeInvalid", { time: times.time })
           : t("next.postProcessing.runTimeNeeded"),
       );
       return;
@@ -185,29 +167,6 @@ export function ScriptInstanceEditor({
     }
     const name = input.name || input.script;
     const status = t(editing ? "next.postProcessing.instanceSaved" : "next.postProcessing.instanceCreated", { name });
-    if (rule) {
-      const made = await createSchedule({
-        input: {
-          ...rule,
-          actionType: "run_script",
-          label: name,
-          enabled: true,
-          instanceId: result.data.createScriptInstance.id,
-        },
-      });
-      if (made.error) {
-        // The instance is there; saving again would make a second one.
-        setBusy(false);
-        onSaved(
-          status,
-          t("next.postProcessing.scheduleNotCreated", {
-            name,
-            error: made.error.graphQLErrors[0]?.message ?? made.error.message,
-          }),
-        );
-        return;
-      }
-    }
     setBusy(false);
     onSaved(status);
   };
@@ -252,9 +211,6 @@ export function ScriptInstanceEditor({
         onChange: (next) => {
           setError(null);
           setForm((current) => withScript(current, byName.get(next), editing === null));
-          if (editing === null) {
-            setSchedule(scheduleFromHeader(byName.get(next)));
-          }
         },
       },
     },
@@ -303,42 +259,7 @@ export function ScriptInstanceEditor({
 
   /* ----------------------------------------------------------- when it runs */
 
-  const rules = (rulesData?.schedules ?? []).filter(
-    (rule) => rule.actionType === "run_script" && rule.instanceId === editing?.id,
-  );
-  const ruleLine = (rule: InstanceRule) =>
-    [
-      rule.time === "*" ? t("next.postProcessing.atStartup") : rule.time,
-      rule.time !== "*" && rule.runAtStartup ? t("next.postProcessing.atStartup") : "",
-      scheduleDaysLabel(t, rule.days),
-    ]
-      .filter(Boolean)
-      .join(" · ");
-
-  const scheduleFields: FieldSpec[] = editing
-    ? [
-        {
-          id: "runTimes",
-          label: t("next.postProcessing.runTimes"),
-          help: t("next.postProcessing.runTimesElsewhere"),
-          control: {
-            kind: "static",
-            value:
-              rulesData === undefined ? (
-                ""
-              ) : rules.length === 0 ? (
-                t("next.postProcessing.noRunTimes")
-              ) : (
-                <span className="flex flex-col items-end gap-1 font-wv-mono">
-                  {rules.map((rule) => (
-                    <span key={rule.id}>{ruleLine(rule)}</span>
-                  ))}
-                </span>
-              ),
-          },
-        },
-      ]
-    : [
+  const scheduleFields: FieldSpec[] = [
         {
           id: "runTimes",
           label: t("next.postProcessing.runTimes"),
@@ -392,7 +313,7 @@ export function ScriptInstanceEditor({
             onChange: (next) => patchSchedule({ startup: next }),
           },
         },
-      ];
+  ];
 
   /* ------------------------------------------------------------- its inputs */
 

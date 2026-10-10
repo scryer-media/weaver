@@ -11,9 +11,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::model::{
     GlobalScriptsRun, OptionName, OptionValue, PostProcessingSettings, QueueEvent, ResolvedOption,
-    ScriptEventLabel, ScriptKind, ScriptName, SecretOptionValue,
+    ScriptEventLabel, ScriptKind, ScriptName, ScriptTaskTime, SecretOptionValue,
 };
 use super::secrets::{SecretRef, secrets_exist_tx};
+use crate::bandwidth::Weekday;
 use crate::persistence::encryption::{decrypt_value, encrypt_value};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, is_foreign_key_violation};
 use crate::persistence::{Database, StateError};
@@ -143,6 +144,100 @@ impl InstanceInput {
     }
 }
 
+/// When a schedule job runs. Every other trigger leaves it empty.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceSchedule {
+    /// Empty runs on every day.
+    pub days: Vec<Weekday>,
+    /// Each one `HH:MM`, or `*:MM` for that minute of every hour, in order.
+    pub times: Vec<String>,
+    /// Also run once when Weaver starts.
+    pub run_at_startup: bool,
+}
+
+const MAX_SCHEDULE_TIMES: usize = 96;
+
+impl InstanceSchedule {
+    pub fn is_empty(&self) -> bool {
+        self.days.is_empty() && self.times.is_empty() && !self.run_at_startup
+    }
+
+    /// The run times a script header declares: `*` is run at startup, and
+    /// every other declaration is a time.
+    pub fn from_task_times(declared: &[ScriptTaskTime]) -> Self {
+        let mut schedule = Self::default();
+        for time in declared {
+            match time {
+                ScriptTaskTime::Startup => schedule.run_at_startup = true,
+                time => schedule.times.push(time.to_string()),
+            }
+        }
+        schedule.times.sort();
+        schedule.times.dedup();
+        schedule
+    }
+
+    /// Its times, as parsed declarations.
+    pub fn task_times(&self) -> impl Iterator<Item = ScriptTaskTime> + '_ {
+        self.times
+            .iter()
+            .filter_map(|time| time.parse::<ScriptTaskTime>().ok())
+            .filter(|time| *time != ScriptTaskTime::Startup)
+    }
+
+    fn validated(self) -> Result<Self, ScriptInstanceError> {
+        let mut days = self.days;
+        days.sort();
+        days.dedup();
+        if days.len() == Weekday::ALL.len() {
+            days.clear();
+        }
+        if self.times.len() > MAX_SCHEDULE_TIMES {
+            return Err(ScriptInstanceError::Invalid("too many run times"));
+        }
+        let mut times = Vec::with_capacity(self.times.len());
+        for time in &self.times {
+            match time.trim().parse::<ScriptTaskTime>() {
+                Ok(ScriptTaskTime::Startup) | Err(_) => {
+                    return Err(ScriptInstanceError::Invalid(
+                        "a run time is HH:MM, or *:MM for every hour",
+                    ));
+                }
+                Ok(time) => times.push(time.to_string()),
+            }
+        }
+        times.sort();
+        times.dedup();
+        Ok(Self {
+            days,
+            times,
+            run_at_startup: self.run_at_startup,
+        })
+    }
+
+    fn stored_days(&self) -> String {
+        self.days
+            .iter()
+            .map(|day| day.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn from_stored(days: &str, times: &str, run_at_startup: bool) -> Self {
+        Self {
+            days: days.split(',').filter_map(Weekday::parse).collect(),
+            times: times
+                .split(',')
+                .map(str::trim)
+                .filter(|time| !time.is_empty())
+                .map(str::to_string)
+                .collect(),
+            run_at_startup,
+        }
+    }
+}
+
 /// A script wired to one trigger.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,6 +257,9 @@ pub struct ScriptInstance {
     /// `None` runs under the default timeout of its trigger.
     pub timeout_seconds: Option<u64>,
     pub run_order: i64,
+    /// When a schedule job runs.
+    #[serde(default)]
+    pub schedule: InstanceSchedule,
 }
 
 impl ScriptInstance {
@@ -338,6 +436,8 @@ pub struct ScriptInstanceDraft {
     pub enabled: bool,
     pub blocking: bool,
     pub timeout_seconds: Option<u64>,
+    /// Kept only for a schedule job; any other trigger saves it empty.
+    pub schedule: InstanceSchedule,
 }
 
 impl ScriptInstanceDraft {
@@ -351,7 +451,20 @@ impl ScriptInstanceDraft {
             enabled: true,
             blocking: true,
             timeout_seconds: None,
+            schedule: InstanceSchedule::default(),
         }
+    }
+
+    /// Run on `days` (empty for every day) at each of `times`.
+    pub fn runs_at(mut self, days: &[Weekday], times: &[&str]) -> Self {
+        self.schedule.days = days.to_vec();
+        self.schedule.times = times.iter().map(|time| time.to_string()).collect();
+        self
+    }
+
+    pub fn at_startup(mut self) -> Self {
+        self.schedule.run_at_startup = true;
+        self
     }
 
     pub fn named(mut self, name: impl Into<String>) -> Self {
@@ -417,6 +530,7 @@ impl ScriptInstanceDraft {
             enabled: instance.enabled,
             blocking: instance.blocking,
             timeout_seconds: instance.timeout_seconds,
+            schedule: instance.schedule.clone(),
         }
     }
 }
@@ -482,6 +596,7 @@ struct ValidatedInstance {
     enabled: bool,
     blocking: bool,
     timeout_seconds: Option<i64>,
+    schedule: InstanceSchedule,
 }
 
 impl ValidatedInstance {
@@ -621,9 +736,17 @@ impl Database {
             };
             inputs.push((name.as_str().to_string(), stored));
         }
+        // Only a schedule job has run times; switching a job to another
+        // trigger lets go of them.
+        let schedule = if draft.trigger == InstanceTrigger::Schedule {
+            draft.schedule.validated()?
+        } else {
+            InstanceSchedule::default()
+        };
         // Linked secrets, and secrets of its own that are to be kept, are
         // checked inside the write's transaction.
         Ok(ValidatedInstance {
+            schedule,
             name,
             script: draft.script.as_str().to_string(),
             trigger: draft.trigger,
@@ -666,7 +789,8 @@ impl Database {
                 datastore.read_exec(),
                 &format!(
                     "SELECT id, name, script, trigger_kind, trigger_detail, enabled, blocking,
-                            timeout_seconds, run_order
+                            timeout_seconds, run_order, schedule_days, schedule_times,
+                            run_at_startup
                        FROM script_instances {instance_filter}
                       ORDER BY run_order, created_at_ms, id"
                 ),
@@ -756,6 +880,11 @@ impl Database {
                         .opt_i64("timeout_seconds")?
                         .and_then(|seconds| u64::try_from(seconds).ok()),
                     run_order: row.i64("run_order")?,
+                    schedule: InstanceSchedule::from_stored(
+                        &row.text("schedule_days")?,
+                        &row.text("schedule_times")?,
+                        row.bool("run_at_startup")?,
+                    ),
                     id,
                 });
             }
@@ -863,6 +992,7 @@ impl Database {
                             "UPDATE script_instances
                                 SET name = {}, script = {}, trigger_kind = {}, trigger_detail = {},
                                     enabled = {}, blocking = {}, timeout_seconds = {},
+                                    schedule_days = {}, schedule_times = {}, run_at_startup = {},
                                     updated_at_ms = {}
                               WHERE id = {}",
                             &[
@@ -873,6 +1003,9 @@ impl Database {
                                 SqlArg::Bool(instance.enabled),
                                 SqlArg::Bool(instance.blocking),
                                 SqlArg::OptI64(instance.timeout_seconds),
+                                SqlArg::Text(instance.schedule.stored_days()),
+                                SqlArg::Text(instance.schedule.times.join(",")),
+                                SqlArg::Bool(instance.schedule.run_at_startup),
                                 SqlArg::I64(now),
                                 SqlArg::Text(id.clone()),
                             ],
@@ -1245,8 +1378,9 @@ async fn insert_instance_tx(
     tx.execute(
         "INSERT INTO script_instances
             (id, name, script, trigger_kind, trigger_detail, enabled, blocking,
-             timeout_seconds, run_order, created_at_ms, updated_at_ms)
-         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+             timeout_seconds, schedule_days, schedule_times, run_at_startup, run_order,
+             created_at_ms, updated_at_ms)
+         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
         &[
             SqlArg::Text(id.into()),
             SqlArg::Text(instance.name.clone()),
@@ -1256,6 +1390,9 @@ async fn insert_instance_tx(
             SqlArg::Bool(instance.enabled),
             SqlArg::Bool(instance.blocking),
             SqlArg::OptI64(instance.timeout_seconds),
+            SqlArg::Text(instance.schedule.stored_days()),
+            SqlArg::Text(instance.schedule.times.join(",")),
+            SqlArg::Bool(instance.schedule.run_at_startup),
             SqlArg::I64(next),
             SqlArg::I64(now),
             SqlArg::I64(now),
@@ -1322,6 +1459,7 @@ mod tests {
             blocking: true,
             timeout_seconds: None,
             run_order: order,
+            schedule: InstanceSchedule::default(),
         }
     }
 
@@ -1419,5 +1557,54 @@ mod tests {
         }
         assert!("queue:NOPE".parse::<InstanceTrigger>().is_err());
         assert!("cron".parse::<InstanceTrigger>().is_err());
+    }
+
+    #[test]
+    fn a_schedule_instance_keeps_its_run_times_and_another_trigger_drops_them() {
+        let db = Database::open_in_memory().unwrap();
+        let script = ScriptName::new("tidy.sh").unwrap();
+        let saved = db
+            .create_script_instance(
+                ScriptInstanceDraft::new(script.clone(), InstanceTrigger::Schedule)
+                    .runs_at(
+                        &[Weekday::Fri, Weekday::Mon, Weekday::Fri],
+                        &["19:30", "*:05", "7:00"],
+                    )
+                    .at_startup(),
+            )
+            .unwrap();
+        assert_eq!(
+            saved.schedule,
+            InstanceSchedule {
+                days: vec![Weekday::Mon, Weekday::Fri],
+                times: vec!["*:05".into(), "07:00".into(), "19:30".into()],
+                run_at_startup: true,
+            }
+        );
+        assert_eq!(db.script_instance(&saved.id).unwrap().unwrap(), saved);
+
+        let every_day = db
+            .update_script_instance(
+                &saved.id,
+                ScriptInstanceDraft::from_instance(&saved).runs_at(&Weekday::ALL, &["07:00"]),
+            )
+            .unwrap();
+        assert!(every_day.schedule.days.is_empty());
+
+        for wrong in ["*", "25:00", "noon"] {
+            assert!(
+                db.create_script_instance(
+                    ScriptInstanceDraft::new(script.clone(), InstanceTrigger::Schedule)
+                        .runs_at(&[], &[wrong])
+                )
+                .is_err(),
+                "accepted {wrong}"
+            );
+        }
+
+        let mut moved = ScriptInstanceDraft::from_instance(&saved);
+        moved.trigger = InstanceTrigger::Scan;
+        let moved = db.update_script_instance(&saved.id, moved).unwrap();
+        assert!(moved.schedule.is_empty());
     }
 }

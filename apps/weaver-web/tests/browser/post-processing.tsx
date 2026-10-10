@@ -69,7 +69,9 @@ interface Stored {
   id: string; name: string; script: string; trigger: string; queueEvent: string | null;
   inputs: { name: string; value: string; secretId: string | null; sealed?: boolean }[]; categories: string[];
   enabled: boolean; blocking: boolean; timeoutSeconds: number | null; runOrder: number;
+  schedule: { days: string[]; times: string[]; runAtStartup: boolean };
 }
+const NO_SCHEDULE = { days: [] as string[], times: [] as string[], runAtStartup: false };
 const held = (name: string, value: string) => ({ name, value, secretId: null as string | null });
 const linked = (name: string, secretId: string) => ({ name, value: "", secretId: secretId as string | null });
 // A job's own secret: what was typed is not kept anywhere a screen could read it.
@@ -79,12 +81,14 @@ const storedSecret = (id: string, name: string, value: string): StoredSecret => 
 });
 const instance = (id: string, name: string, script: string, trigger: string, extra: Partial<Stored> = {}): Stored => ({
   id, name, script, trigger, queueEvent: null, inputs: [], categories: [], enabled: true, blocking: true,
-  timeoutSeconds: null, runOrder: 0, ...extra,
+  timeoutSeconds: null, runOrder: 0, schedule: NO_SCHEDULE, ...extra,
 });
 
-const rule = (id: string, instanceId: string, time: string, extra: Record<string, unknown> = {}) => ({
-  id, enabled: true, label: null as string | null, days: [] as string[], time, actionType: "run_script",
-  instanceId, runAtStartup: false, ...extra,
+/** When the daemon runs a schedule job its header asks for: `*` alone is at startup. */
+const headerSchedule = (taskTimes: string[]) => ({
+  days: [] as string[],
+  times: taskTimes.filter((time) => time !== "*").sort(),
+  runAtStartup: taskTimes.includes("*"),
 });
 
 const state = {
@@ -128,19 +132,15 @@ const state = {
         ...(has("shared") ? [linked("Token", "s1")] : []),
       ],
     }),
-    instance("6", "Nightly report", "nightly.py", "SCHEDULER", { timeoutSeconds: 3600 }),
+    instance("6", "Nightly report", "nightly.py", "SCHEDULER", {
+      timeoutSeconds: 3600, schedule: { days: ["sat", "sun"], times: ["*:20", "04:00"], runAtStartup: true },
+    }),
     instance("7", "Feed intake", "intake.py", "FEED", { blocking: false }),
   ],
   categories: has("nocategories") ? [] : [{ id: 1, name: "movies" }, { id: 2, name: "tv" }],
-  // The schedule rules that run an instance.
-  schedules: empty ? [] : [
-    rule("r1", "6", "04:00"),
-    rule("r2", "6", "*:20", { days: ["sat", "sun"], runAtStartup: true }),
-  ],
 };
 let lastInstance = 7;
 let lastSecret = 2;
-let lastRule = 2;
 // Every instance mutation the screens sent, oldest first.
 const requests: { name: string; variables: Record<string, any> }[] = [];
 
@@ -272,6 +272,8 @@ function saveInstance(variables: Record<string, any>): Stored | string {
     name: input.name || input.script, script: input.script, trigger: input.trigger, queueEvent: input.queueEvent,
     inputs, categories: input.categories, enabled: input.enabled,
     blocking: input.blocking, timeoutSeconds: input.timeoutSeconds,
+    // Only a schedule job keeps run times.
+    schedule: input.trigger === "SCHEDULER" ? structuredClone(input.schedule ?? NO_SCHEDULE) : NO_SCHEDULE,
   };
   if (previous) {
     return Object.assign(previous, fields);
@@ -472,6 +474,7 @@ function graphql(name: string, variables: Record<string, any>) {
       const created = instance(String(++lastInstance), from.name, from.name, trigger.trigger, {
         queueEvent: trigger.queueEvent, runOrder: inTrigger(trigger.trigger),
         inputs: from.preset.inputs.filter((input) => !input.secret).map((input) => held(input.name, input.value)),
+        schedule: trigger.trigger === "SCHEDULER" ? headerSchedule(from.preset.taskTimes) : NO_SCHEDULE,
       });
       state.instances.push(created);
       added.push(created);
@@ -489,14 +492,6 @@ function graphql(name: string, variables: Record<string, any>) {
       return declared.secret ? [] : [held(declared.name, declared.value)];
     });
     mutation = { reapplyScriptHeader: view(target) };
-  } else if (name === "CreateSchedule") {
-    requests.push({ name, variables });
-    // With `norule`, the daemon takes the instance and refuses its rule.
-    if (has("norule")) return refused("the schedule could not be written");
-    const { instanceId, time, ...rest } = variables.input;
-    const created = rule(`r${++lastRule}`, instanceId, time, { ...rest, days: rest.days ?? [] });
-    state.schedules.push(created);
-    mutation = { createSchedule: created };
   } else if (name === "CreateSecret") {
     requests.push({ name, variables });
     return createSecret(variables);
@@ -518,7 +513,7 @@ function graphql(name: string, variables: Record<string, any>) {
     outputRequests.push(variables.outputId);
   }
   return { data: structuredClone({ postProcessingSettings: state.settings, categories: state.categories,
-    scriptInstances: state.instances.map(view), discoveredScripts: state.scripts, schedules: state.schedules, secrets: state.secrets.map(secretView),
+    scriptInstances: state.instances.map(view), discoveredScripts: state.scripts, secrets: state.secrets.map(secretView),
     postProcessingResults: results, scriptRuns: scriptRunPage(variables), scriptRunRequests,
     scriptOutput: retainedOutput[variables.outputId] ?? null,
     browseDirectories: { currentPath: variables.path ?? state.settings.scriptDirectory, parentPath: "/fixture", entries: [] },
@@ -526,7 +521,7 @@ function graphql(name: string, variables: Record<string, any>) {
 }
 // What the daemon holds, secrets included, and what it was asked to do, for the
 // test to read and for it to move a test run along.
-Object.assign(window, { scriptsFixture: { instances: state.instances, secrets: state.secrets, schedules: state.schedules, requests, tests, outputRequests } });
+Object.assign(window, { scriptsFixture: { instances: state.instances, secrets: state.secrets, requests, tests, outputRequests } });
 const client = new Client({ url: "/graphql", exchanges: [fetchExchange], preferGetMethod: false });
 const originalFetch = window.fetch.bind(window);
 window.fetch = async (request, init) => {

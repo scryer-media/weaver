@@ -11,7 +11,7 @@ import {
   waitingGates, writeBareScript, writeFixturePackage, writeFixtureScript,
 } from "./support/script-fixtures";
 import {
-  type ListEntry, type ScriptResult, WEAVER_SCRIPTS_DIR, createScriptInstance, deleteScriptInstance, instanceIds, loadStageState,
+  type ListEntry, type ScriptResult, WEAVER_SCRIPTS_DIR, createScriptInstance, deleteScriptInstance, loadStageState,
   nzbDocument, nzbgetRpc, queueRows, saveStageState, scriptInstances, scriptOutput,
   scriptResults, scriptSettings, setScriptLists, submitNzb, useScripts, waitJobLessResults, waitQueueRows, waitResults,
   withControlKey,
@@ -658,20 +658,13 @@ function subjectOccurrences(from: Date, to: Date): number {
   return count;
 }
 
-type Schedule = { id: string; enabled: boolean; label: string; time: string; instanceId: string | null; runAtStartup: boolean; actionType: string };
-async function schedules(request: APIRequestContext): Promise<Schedule[]> {
-  return (await graphql<{ schedules: Schedule[] }>(request,
-    "query { schedules { id enabled label time instanceId runAtStartup actionType } }")).schedules;
+/** The schedule jobs of `script`, with the run times saved on each. */
+async function scheduleJobs(request: APIRequestContext, script: string) {
+  return (await scriptInstances(request)).filter(entry => entry.script === script && entry.trigger === "SCHEDULER");
 }
 
-/** The rules that run an instance of `script`. */
-async function scriptSchedules(request: APIRequestContext, script: string): Promise<Schedule[]> {
-  const ids = new Set(await instanceIds(request, script));
-  return (await schedules(request)).filter(entry => entry.instanceId !== null && ids.has(entry.instanceId));
-}
-
-test("SS01 SCHEDULER task times become schedule rules on the e2e clock; Startup runs only by explicit rule", async ({ request }) => {
-  note("discrepancy", "The header's Startup (`*`) time gets no rule; a startup run needs a run_script rule with runAtStartup, which this test creates for an instance of its own and checks after the restart.");
+test("SS01 SCHEDULER task times run from the job on the e2e clock; Startup runs only when the job asks for it", async ({ request }) => {
+  note("discrepancy", "The lists leave the header's Startup (`*`) time off the job; a startup run needs a job saved with runAtStartup, which this test creates for an instance of its own and checks after the restart.");
   if (stage() !== "initial") {
     const saved = loadStageState<{ header: number; rule: number }>("ss01");
     await expect.poll(() => subjectRuns(false).length, { message: "the startup rule ran at boot", timeout: 0 }).toBeGreaterThanOrEqual(saved.rule + 1);
@@ -705,9 +698,10 @@ test("SS01 SCHEDULER task times become schedule rules on the e2e clock; Startup 
   }, { message: "the schedule evaluator fires the witness on the e2e clock", timeout: 0 }).toBe(true);
 
   await setScriptLists(request, await withCurrentLists(request, [{ script: SS01_SUBJECT }, { script: SS01_WITNESS }]));
-  const entries = await scriptSchedules(request, SS01_SUBJECT);
-  expect(entries.map(entry => entry.time).sort()).toEqual(["*:15", "03:30"].sort());
-  for (const entry of entries) expect(entry).toMatchObject({ actionType: "run_script", enabled: true, runAtStartup: false });
+  const [job, ...extra] = await scheduleJobs(request, SS01_SUBJECT);
+  expect(extra, "one schedule job for the subject").toEqual([]);
+  expect([...job.schedule.times].sort()).toEqual(["*:15", "03:30"].sort());
+  expect(job).toMatchObject({ enabled: true, schedule: { days: [], runAtStartup: false } });
 
   let at = readClock();
   const end = new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate(), 3, 34));
@@ -727,32 +721,32 @@ test("SS01 SCHEDULER task times become schedule rules on the e2e clock; Startup 
     await deleteScriptInstance(request, instance.id);
   }
   // Deliberately not restored: the restarted stage checks this rule ran at boot.
-  const startup = await createScriptInstance(request, {
+  await createScriptInstance(request, {
     name: SS01_RULE, script: SS01_SUBJECT, trigger: "SCHEDULER", inputs: [{ name: "Origin", value: "rule" }],
+    schedule: { days: [], times: [], runAtStartup: true },
   });
-  expect(await graphqlErrors(request, "mutation($input: ScheduleInput!) { createSchedule(input: $input) { id } }",
-    { input: { actionType: "run_script", instanceId: startup.id, time: "*", label: `${SS01_RULE}-refused` } }))
-    .toEqual([expect.stringContaining("startup scripts require runAtStartup")]);
-  await graphql(request, "mutation($input: ScheduleInput!) { createSchedule(input: $input) { id } }",
-    { input: { actionType: "run_script", instanceId: startup.id, time: "*", runAtStartup: true, label: SS01_RULE } });
   saveStageState("ss01", { header: subjectRuns(true).length, rule: subjectRuns(false).length });
 });
 
-test("SS02 a header's task times become ordinary rules the operator can change", async ({ request }) => {
+test("SS02 a header's task times are saved on the job, where the operator can change them", async ({ request }) => {
   const script = writeFixtureScript(`ss02-${token()}`, { kinds: ["SCHEDULER"], taskTimes: ["05:00"] });
   const restore = await useScripts(request, await withCurrentLists(request, [{ script }]));
   try {
-    const [entry, ...others] = await scriptSchedules(request, script);
-    expect(others, "one rule for the one task time").toEqual([]);
-    expect(entry).toMatchObject({ actionType: "run_script", time: "05:00", enabled: true });
-    const variables = { id: entry.id };
-    await graphql(request, "mutation($id: String!) { toggleSchedule(id: $id, enabled: false) { id } }", variables);
-    await graphql(request, "mutation($id: String!, $input: ScheduleInput!) { updateSchedule(id: $id, input: $input) { id } }",
-      { ...variables, input: { actionType: "run_script", instanceId: entry.instanceId, time: "06:00", enabled: false, label: entry.label } });
-    expect((await schedules(request)).find(candidate => candidate.id === entry.id)).toMatchObject({ enabled: false, time: "06:00" });
-    await graphql(request, "mutation($id: String!) { deleteSchedule(id: $id) { id } }", variables);
-    expect((await schedules(request)).some(candidate => candidate.id === entry.id)).toBe(false);
-    note("observed", "the rule made for a header time toggles, updates and deletes like any other rule.");
+    const [job, ...others] = await scheduleJobs(request, script);
+    expect(others, "one schedule job for the script").toEqual([]);
+    expect(job.schedule).toEqual({ days: [], times: ["05:00"], runAtStartup: false });
+    const input = {
+      name: job.name, script: job.script, trigger: job.trigger, queueEvent: job.queueEvent, categories: job.categories,
+      inputs: job.inputs.map(({ name, value }) => ({ name, value })), enabled: false, blocking: job.blocking,
+      timeoutSeconds: job.timeoutSeconds, schedule: { days: ["mon"], times: ["06:00"], runAtStartup: false },
+    };
+    await graphql(request, "mutation($id: String!, $input: ScriptInstanceInput!) { updateScriptInstance(id: $id, input: $input) { id } }",
+      { id: job.id, input });
+    expect((await scheduleJobs(request, script)).find(candidate => candidate.id === job.id))
+      .toMatchObject({ enabled: false, schedule: { days: ["mon"], times: ["06:00"], runAtStartup: false } });
+    expect((await graphql<{ schedules: Array<{ actionType: string }> }>(request, "query { schedules { actionType } }")).schedules
+      .some(rule => rule.actionType === "run_script"), "the Schedules screen holds no script rule").toBe(false);
+    note("observed", "a header time lands on the job itself and changes with the job.");
   } finally {
     await restore();
     removeFixtureScripts([script]);

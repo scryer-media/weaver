@@ -107,6 +107,8 @@ export interface ScriptInstance {
   blocking: boolean;
   /** Null runs under the default timeout of its trigger. */
   timeoutSeconds: number | null;
+  /** When a schedule job runs; empty for every other trigger. */
+  schedule: JobSchedule;
   runOrder: number;
   /** Why the script cannot run as things stand; null when it can. */
   scriptProblem: string | null;
@@ -267,6 +269,8 @@ export interface InstanceForm {
   blocking: boolean;
   /** Zero runs under the trigger's default timeout. */
   timeoutSeconds: number;
+  /** When it runs; only read while the trigger is the schedule. */
+  schedule: JobScheduleForm;
 }
 
 function sameName(left: string, right: string): boolean {
@@ -301,6 +305,7 @@ export function newInstanceForm(script: DiscoveredScript | undefined): InstanceF
     enabled: true,
     blocking: true,
     timeoutSeconds: 0,
+    schedule: scheduleFromHeader(script),
   };
 }
 
@@ -340,6 +345,11 @@ export function formFromInstance(instance: ScriptInstance, script: DiscoveredScr
     enabled: instance.enabled,
     blocking: instance.blocking,
     timeoutSeconds: instance.timeoutSeconds ?? 0,
+    schedule: {
+      times: instance.schedule.times.join(", "),
+      days: instance.schedule.days,
+      startup: instance.schedule.runAtStartup,
+    },
   };
 }
 
@@ -375,6 +385,7 @@ export interface ScriptInstanceInput {
   enabled: boolean;
   blocking: boolean;
   timeoutSeconds: number | null;
+  schedule: JobSchedule;
 }
 
 /**
@@ -396,8 +407,12 @@ function sentInput(input: InstanceInputForm): ScriptInstanceValueInput[] {
   return input.secretId === null ? [] : [{ name, secretId: input.secretId }];
 }
 
-/** What the daemon is sent for a form. */
+/**
+ * What the daemon is sent for a form. Run times that cannot be read are left
+ * out; {@link jobSchedule} says what is wrong with them before saving.
+ */
 export function inputFromForm(form: InstanceForm): ScriptInstanceInput {
+  const schedule = form.trigger === "SCHEDULER" ? jobSchedule(form.schedule) : NO_SCHEDULE;
   return {
     name: form.name.trim(),
     script: form.script,
@@ -408,6 +423,7 @@ export function inputFromForm(form: InstanceForm): ScriptInstanceInput {
     enabled: form.enabled,
     blocking: form.blocking,
     timeoutSeconds: form.timeoutSeconds > 0 ? Math.min(MAX_TIMEOUT_SECONDS, Math.round(form.timeoutSeconds)) : null,
+    schedule: "problem" in schedule ? NO_SCHEDULE : schedule,
   };
 }
 
@@ -432,6 +448,7 @@ export function inputFromInstance(
     enabled: instance.enabled,
     blocking: instance.blocking,
     timeoutSeconds: instance.timeoutSeconds,
+    schedule: instance.schedule,
     ...patch,
   };
 }
@@ -497,7 +514,19 @@ const SCRIPT_TIME = /^(?:\*|(?:\*|[01]?\d|2[0-3]):[0-5]?\d)$/;
 /** A run at startup, as a script's list of times spells it. */
 const AT_STARTUP = "*";
 
-/** When a new Schedule job runs, as its editor holds it. */
+/** When a Schedule job runs, as it is saved. */
+export interface JobSchedule {
+  /** `mon` to `sun`; empty runs on every day. */
+  days: string[];
+  /** Each `HH:MM`, or `*:MM` for that minute of every hour. */
+  times: string[];
+  runAtStartup: boolean;
+}
+
+/** What a job of any other trigger is saved with. */
+export const NO_SCHEDULE: JobSchedule = { days: [], times: [], runAtStartup: false };
+
+/** When a Schedule job runs, as its editor holds it. */
 export interface JobScheduleForm {
   /** The times as typed, separated by commas. */
   times: string;
@@ -516,17 +545,13 @@ export function scheduleFromHeader(script: DiscoveredScript | undefined): JobSch
   };
 }
 
-/** The schedule rule a new Schedule job is given, or why what was entered makes none. */
-export type JobScheduleRule =
-  | { time: string; days: string[] | null; runAtStartup: boolean }
-  | { problem: "none" }
-  | { problem: "invalid"; time: string };
-
 /**
- * The rule for what was entered. A job with no time and no run at startup would
- * never run, so that is a problem rather than a job without a rule.
+ * The schedule for what was entered, or why it makes none. A job with no time
+ * and no run at startup would never run, so that is a problem.
  */
-export function jobScheduleRule(form: JobScheduleForm): JobScheduleRule {
+export function jobSchedule(
+  form: JobScheduleForm,
+): JobSchedule | { problem: "none" } | { problem: "invalid"; time: string } {
   const typed = form.times
     .split(/[,;]/)
     .map((time) => time.trim())
@@ -540,9 +565,5 @@ export function jobScheduleRule(form: JobScheduleForm): JobScheduleRule {
   if (clock.length === 0 && !runAtStartup) {
     return { problem: "none" };
   }
-  return {
-    time: clock.length > 0 ? clock.join(", ") : AT_STARTUP,
-    days: form.days.length > 0 ? form.days : null,
-    runAtStartup,
-  };
+  return { days: form.days, times: clock, runAtStartup };
 }

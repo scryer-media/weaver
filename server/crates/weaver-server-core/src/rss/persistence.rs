@@ -102,7 +102,6 @@ impl Database {
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_routed_consumer", |tx| {
                 Box::pin(async move {
-                    Self::remove_feed_schedules(tx, id).await?;
                     let changed = tx
                         .execute(
                             "DELETE FROM rss_feeds WHERE id = {}",

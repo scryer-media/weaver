@@ -600,3 +600,13 @@ kind = "sql"
 file = "migrations/0056_script_run_status/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 57
+description = "default unwanted extension list for installs that never set one"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "default_unwanted_extensions_v57"
+scope = "upgrade_only"

@@ -3082,7 +3082,7 @@ async fn unacceptable_rar_member_is_rejected_before_extraction() {
     let JobStatus::Failed { error } = status else {
         panic!("a confirmed RAR member extension must fail the job");
     };
-    assert!(error.contains("RAR member 'E01.exe' before extraction"));
+    assert_eq!(error, "unwanted extension '.exe' in 'E01.exe'");
     assert!(
         !complete_dir
             .join(crate::jobs::working_dir::sanitize_dirname(

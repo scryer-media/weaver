@@ -729,9 +729,6 @@ fn spawn_test_scheduler(
                 SchedulerCommand::ApplyScheduleAction { reply, .. } => {
                     let _ = reply.send(());
                 }
-                SchedulerCommand::ClearScheduleAction { reply } => {
-                    let _ = reply.send(());
-                }
                 // Stands in for the pipeline: the chosen profile is in force
                 // at once, since this mock has no schedule behind it.
                 SchedulerCommand::SetHardwareProfile { profile, reply } => {

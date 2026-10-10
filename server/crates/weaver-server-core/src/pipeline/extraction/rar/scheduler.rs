@@ -825,12 +825,14 @@ impl Pipeline {
                                         budget: Some(Arc::clone(&budget)),
                                     },
                                 )?;
-                            if let Some((member, pattern)) =
+                            if let Some(member) =
                                 Self::blocked_rar_member(&selection.archive, &policy_for_task)
                             {
-                                return Err(budget.reject_content_policy(format!(
-                                    "unacceptable extension '{pattern}' matched RAR member '{member}' before extraction"
-                                )));
+                                return Err(budget.reject_content_policy(
+                                    crate::post_processing::model::unwanted_extension_reason(
+                                        &member,
+                                    ),
+                                ));
                             }
                             let _memory_permit =
                                 budget.reserve_memory_wait(selection.decoder_memory_bytes)?;

@@ -226,6 +226,11 @@ pub struct ServerTransferRegistry {
     capacity: Arc<RegistryCapacitySignal>,
     /// Whether quotas count bytes; new controls start with it.
     quota_metering: AtomicBool,
+    /// Holders whose metering was set on its own, which the registry-wide
+    /// setting leaves alone. Removing a holder drops its setting, so a later
+    /// holder given the same id follows the registry-wide setting; dropping
+    /// every control at once with [`Self::clear`] keeps them.
+    quota_metering_overrides: RwLock<HashMap<StableServerId, bool>>,
 }
 
 impl Default for ServerTransferRegistry {
@@ -246,6 +251,7 @@ impl ServerTransferRegistry {
             controls: RwLock::new(HashMap::new()),
             capacity: Arc::new(RegistryCapacitySignal::default()),
             quota_metering: AtomicBool::new(true),
+            quota_metering_overrides: RwLock::new(HashMap::new()),
         }
     }
 
@@ -258,6 +264,7 @@ impl ServerTransferRegistry {
             controls: RwLock::new(HashMap::new()),
             capacity: Arc::clone(&self.capacity),
             quota_metering: AtomicBool::new(true),
+            quota_metering_overrides: RwLock::new(HashMap::new()),
         }
     }
 
@@ -296,34 +303,76 @@ impl ServerTransferRegistry {
         let mut controls = self.controls.write().expect("transfer registry poisoned");
         Arc::clone(controls.entry(id).or_insert_with(|| {
             let control = ServerTransferControl::new(id, scope, capacity);
-            control.quota_metering.store(
-                self.quota_metering.load(Ordering::Acquire),
-                Ordering::Release,
-            );
+            control
+                .quota_metering
+                .store(self.quota_metering_of(id), Ordering::Release);
             Arc::new(control)
         }))
     }
 
     /// Start or stop quotas counting bytes on every control, present and
-    /// future. While stopped, bytes still count toward lifetime totals but
-    /// not toward any quota, and no quota turns work away. Usage already
-    /// counted in a window is kept.
+    /// future, except those set on their own with
+    /// [`Self::set_quota_metering_for`]. While stopped, bytes still count
+    /// toward lifetime totals but not toward any quota, and no quota turns
+    /// work away. Usage already counted in a window is kept.
     pub fn set_quota_metering(&self, enabled: bool) {
         self.quota_metering.store(enabled, Ordering::Release);
+        let overrides = self
+            .quota_metering_overrides
+            .read()
+            .expect("transfer registry poisoned")
+            .clone();
         let controls = self
             .controls
             .read()
             .expect("transfer registry poisoned")
-            .values()
-            .map(Arc::clone)
+            .iter()
+            .filter(|(id, _)| !overrides.contains_key(id))
+            .map(|(_, control)| Arc::clone(control))
             .collect::<Vec<_>>();
         for control in controls {
             control.set_quota_metering(enabled);
         }
     }
 
+    /// Start or stop one holder's quota counting bytes, whatever the
+    /// registry-wide setting is now or is set to later.
+    pub fn set_quota_metering_for(&self, id: StableServerId, enabled: bool) {
+        self.quota_metering_overrides
+            .write()
+            .expect("transfer registry poisoned")
+            .insert(id, enabled);
+        if let Some(control) = self.get(id) {
+            control.set_quota_metering(enabled);
+        }
+    }
+
+    /// Hand one holder's quota counting back to the registry-wide setting.
+    pub fn clear_quota_metering_for(&self, id: StableServerId) {
+        let removed = self
+            .quota_metering_overrides
+            .write()
+            .expect("transfer registry poisoned")
+            .remove(&id)
+            .is_some();
+        if removed && let Some(control) = self.get(id) {
+            control.set_quota_metering(self.quota_metering.load(Ordering::Acquire));
+        }
+    }
+
+    /// The registry-wide setting, which holders without their own follow.
     pub fn quota_metering(&self) -> bool {
         self.quota_metering.load(Ordering::Acquire)
+    }
+
+    /// Whether `id`'s quota counts bytes.
+    pub fn quota_metering_of(&self, id: StableServerId) -> bool {
+        self.quota_metering_overrides
+            .read()
+            .expect("transfer registry poisoned")
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| self.quota_metering.load(Ordering::Acquire))
     }
 
     /// Apply a live policy update while preserving counters and reservations.
@@ -370,9 +419,13 @@ impl ServerTransferRegistry {
         snapshots
     }
 
-    /// Remove an inactive server control. Existing lanes keep their `Arc` and
-    /// remain safe until they drain.
+    /// Remove an inactive server control, and the quota metering set on its
+    /// own. Existing lanes keep their `Arc` and remain safe until they drain.
     pub fn remove(&self, id: StableServerId) -> Option<Arc<ServerTransferControl>> {
+        self.quota_metering_overrides
+            .write()
+            .expect("transfer registry poisoned")
+            .remove(&id);
         let removed = self
             .controls
             .write()
@@ -683,6 +736,16 @@ impl ServerTransferControl {
     pub fn pace_read_without_wait(&self, bytes: usize) {
         self.record_lifetime_bytes(bytes as u64);
         let _ = self.reserve_rate(bytes as u64);
+    }
+
+    /// Read-path pacing without quota admission, reserved but not yet waited
+    /// for. See [`RateCharge`].
+    pub(crate) fn charge_read(self: &Arc<Self>, bytes: usize) -> Option<RateCharge> {
+        self.record_lifetime_bytes(bytes as u64);
+        self.reserve_rate(bytes as u64).map(|ticket| RateCharge {
+            control: Arc::clone(self),
+            ticket,
+        })
     }
 
     /// Reserve the estimated raw BODY payload before issuing `BODY`.
@@ -1123,6 +1186,35 @@ impl ServerTransferControl {
     }
 }
 
+/// A read's rate cost on one control, reserved but not yet waited for.
+///
+/// A read through an egress to a provider is paced by both. Reserving every
+/// level's charge before waiting on any makes the read wait until the latest
+/// of their deadlines, so it runs at the lowest of the rates. Waiting on one
+/// level before reserving on the next would add the waits instead, and hold
+/// the read below every limit that applies to it.
+pub(crate) struct RateCharge {
+    control: Arc<ServerTransferControl>,
+    ticket: RateTicket,
+}
+
+impl RateCharge {
+    /// When this level lets the read go on.
+    #[cfg(test)]
+    fn deadline(&self) -> Instant {
+        self.control.rate_origin
+            + Duration::from_micros(self.ticket.target_micros.saturating_sub(RATE_BURST_MICROS))
+    }
+
+    pub(crate) async fn wait_async(self) -> Duration {
+        self.control.wait_async(self.ticket).await
+    }
+
+    pub(crate) fn wait_blocking(self) -> Duration {
+        self.control.wait_blocking(self.ticket)
+    }
+}
+
 /// RAII admission permit for exactly one BODY response.
 ///
 /// Dropping it refunds any unused estimate. Bytes already reported remain
@@ -1181,6 +1273,22 @@ impl BodyTransferPermit {
         };
         self.throttle_wait = self.throttle_wait.saturating_add(waited);
         waited
+    }
+
+    /// Charge bytes and reserve their rate cost without waiting. The caller
+    /// waits on the charge and credits the wait with
+    /// [`Self::add_throttle_wait`].
+    pub(crate) fn charge(&mut self, bytes: usize) -> Option<RateCharge> {
+        let bytes = bytes as u64;
+        self.record_bytes(bytes);
+        self.control.reserve_rate(bytes).map(|ticket| RateCharge {
+            control: Arc::clone(&self.control),
+            ticket,
+        })
+    }
+
+    pub(crate) fn add_throttle_wait(&mut self, waited: Duration) {
+        self.throttle_wait = self.throttle_wait.saturating_add(waited);
     }
 
     fn record_bytes(&mut self, bytes: u64) {
@@ -2204,5 +2312,148 @@ mod tests {
         registry.set_quota_metering(true);
         assert!(control.try_reserve(500).is_err());
         assert!(control.try_reserve(400).is_ok());
+    }
+
+    #[test]
+    fn one_egress_quota_metering_wins_over_the_setting_for_every_egress() {
+        let registry = ServerTransferRegistry::with_scope(TransferScope::Egress);
+        let own = registry.configure(StableServerId(1), quota(1, 1));
+        let other = registry.configure(StableServerId(2), quota(1, 1));
+
+        registry.set_quota_metering_for(StableServerId(1), false);
+        assert!(own.try_reserve(10).is_ok());
+        assert!(other.try_reserve(10).is_err());
+
+        // Every egress's setting leaves the one set on its own alone, either way.
+        registry.set_quota_metering(true);
+        assert!(own.try_reserve(10).is_ok());
+        registry.set_quota_metering(false);
+        assert!(other.try_reserve(10).is_ok());
+        registry.set_quota_metering_for(StableServerId(1), true);
+        assert!(own.try_reserve(10).is_err());
+        assert!(other.try_reserve(10).is_ok());
+
+        // A holder made again under a removed one's id follows every
+        // egress's setting, not the removed one's own.
+        registry.remove(StableServerId(1));
+        let reused = registry.configure(StableServerId(1), quota(1, 1));
+        assert!(reused.try_reserve(10).is_ok());
+        assert!(!registry.quota_metering_of(StableServerId(1)));
+        registry.set_quota_metering(true);
+        assert!(reused.try_reserve(10).is_err());
+    }
+
+    #[test]
+    fn clearing_one_egress_quota_metering_hands_it_back_to_every_egress() {
+        let registry = ServerTransferRegistry::with_scope(TransferScope::Egress);
+        let own = registry.configure(StableServerId(1), quota(1, 1));
+        registry.set_quota_metering(false);
+        registry.set_quota_metering_for(StableServerId(1), true);
+        assert!(own.try_reserve(10).is_err());
+
+        registry.clear_quota_metering_for(StableServerId(1));
+        assert!(own.try_reserve(10).is_ok());
+        assert!(!registry.quota_metering_of(StableServerId(1)));
+        registry.set_quota_metering(true);
+        assert!(own.try_reserve(10).is_err());
+    }
+
+    #[test]
+    fn dropping_every_control_keeps_one_egress_quota_metering() {
+        let registry = ServerTransferRegistry::with_scope(TransferScope::Egress);
+        registry.configure(StableServerId(1), quota(1, 1));
+        registry.set_quota_metering_for(StableServerId(1), false);
+        registry.clear();
+        let restored = registry.configure(StableServerId(1), quota(1, 1));
+        assert!(restored.try_reserve(10).is_ok());
+    }
+
+    /// An egress and a provider pacing the same reads. The rates are a few
+    /// bytes a second against reads of thousands of bytes, so each charge is
+    /// minutes of schedule and every later charge chains onto the one before
+    /// it however slowly the test runs.
+    fn paced_pair(
+        egress_rate: u64,
+        server_rate: u64,
+    ) -> (Arc<ServerTransferControl>, Arc<ServerTransferControl>) {
+        let servers = ServerTransferRegistry::new();
+        let egresses = servers.sibling(TransferScope::Egress);
+        let rate = |rate_bytes_per_sec| ServerTransferConfig {
+            rate_bytes_per_sec,
+            quota: None,
+        };
+        (
+            egresses.configure(StableServerId(1), rate(egress_rate)),
+            servers.configure(StableServerId(2), rate(server_rate)),
+        )
+    }
+
+    /// When each read of `reads` bytes may go on: the latest deadline of the
+    /// levels it was charged on, both charged before either is waited for.
+    fn read_deadlines(
+        egress: &Arc<ServerTransferControl>,
+        server: &Arc<ServerTransferControl>,
+        reads: &[usize],
+    ) -> Vec<(Instant, Option<Instant>, Option<Instant>)> {
+        let mut permit = server.try_reserve(0).unwrap();
+        reads
+            .iter()
+            .map(|&bytes| {
+                let egress = egress.charge_read(bytes).map(|charge| charge.deadline());
+                let server = permit.charge(bytes).map(|charge| charge.deadline());
+                let read = egress.into_iter().chain(server).max().unwrap();
+                (read, egress, server)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_provider_faster_than_its_egress_is_held_to_the_egress_rate() {
+        let (egress, server) = paced_pair(2, 8);
+        let reads = read_deadlines(&egress, &server, &[1_000; 4]);
+        for (read, egress, server) in &reads {
+            assert_eq!(Some(*read), *egress);
+            assert!(server.unwrap() < *read);
+        }
+        // 1000 bytes at 2 bytes a second is 500 seconds a read.
+        for pair in reads.windows(2) {
+            assert_eq!(pair[1].0 - pair[0].0, Duration::from_secs(500));
+        }
+    }
+
+    #[test]
+    fn an_egress_faster_than_its_provider_is_held_to_the_provider_rate() {
+        let (egress, server) = paced_pair(8, 2);
+        let reads = read_deadlines(&egress, &server, &[1_000; 4]);
+        for (read, _, server) in &reads {
+            assert_eq!(Some(*read), *server);
+        }
+        for pair in reads.windows(2) {
+            assert_eq!(pair[1].0 - pair[0].0, Duration::from_secs(500));
+        }
+    }
+
+    #[test]
+    fn raising_the_provider_above_its_egress_changes_nothing() {
+        let spacing = |server_rate| {
+            let (egress, server) = paced_pair(2, server_rate);
+            let reads = read_deadlines(&egress, &server, &[1_000; 3]);
+            reads
+                .windows(2)
+                .map(|pair| pair[1].0 - pair[0].0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spacing(4), spacing(4_000));
+        assert_eq!(spacing(4), vec![Duration::from_secs(500); 2]);
+    }
+
+    #[test]
+    fn no_limit_at_one_level_leaves_the_other_in_charge() {
+        let (egress, server) = paced_pair(0, 2);
+        let reads = read_deadlines(&egress, &server, &[1_000; 3]);
+        for (read, egress, server) in &reads {
+            assert_eq!(*egress, None);
+            assert_eq!(Some(*read), *server);
+        }
     }
 }

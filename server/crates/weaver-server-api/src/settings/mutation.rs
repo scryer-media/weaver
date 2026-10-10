@@ -26,28 +26,7 @@ async fn validate_schedule_input(
         .map_err(|_| async_graphql::Error::new("system profile unavailable"))?
         .clone();
     input.validate(&probe).map_err(async_graphql::Error::new)?;
-    let Some(instance_id) = input.script_instance_id() else {
-        return Ok(());
-    };
-    // A rule is saved against the instance it runs, so one that names nothing,
-    // or something a schedule cannot start, is refused here instead of being
-    // skipped every time it comes due.
-    let db = ctx.data::<Database>()?.clone();
-    let instance = tokio::task::spawn_blocking(move || db.script_instance(&instance_id)).await??;
-    match instance {
-        Some(instance)
-            if instance.trigger
-                == weaver_server_core::post_processing::instances::InstanceTrigger::Schedule =>
-        {
-            Ok(())
-        }
-        Some(_) => Err(async_graphql::Error::new(
-            "that script instance does not run on a schedule",
-        )),
-        None => Err(async_graphql::Error::new(
-            "that script instance does not exist",
-        )),
-    }
+    Ok(())
 }
 
 async fn schedule_response(

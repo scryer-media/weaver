@@ -272,6 +272,23 @@ impl ServerTransferPolicyRegistry {
         self.notify_changed();
     }
 
+    /// Start or stop one egress's quota counting bytes. It keeps that setting
+    /// whatever later happens to every egress's.
+    pub fn set_one_egress_quota_metering(&self, egress_id: u32, enabled: bool) {
+        self.egresses
+            .transfers
+            .set_quota_metering_for(StableServerId(egress_id), enabled);
+        self.notify_changed();
+    }
+
+    /// Hand one egress's quota counting back to every egress's setting.
+    pub fn clear_one_egress_quota_metering(&self, egress_id: u32) {
+        self.egresses
+            .transfers
+            .clear_quota_metering_for(StableServerId(egress_id));
+        self.notify_changed();
+    }
+
     fn reconfigure_book(
         &self,
         scope: TransferScope,
@@ -868,6 +885,39 @@ mod tests {
             .unwrap();
         assert!(!registry.quota_rejection_is_current(&rejection));
         assert!(!registry.egress_snapshot(7).unwrap().blocked);
+    }
+
+    #[test]
+    fn an_egress_given_a_deleted_egress_id_follows_the_metering_for_every_egress() {
+        let db = Database::open_in_memory().unwrap();
+        let registry = ServerTransferPolicyRegistry::new(db, &[]).unwrap();
+        let egress = crate::proxies::EgressInterface {
+            id: 7,
+            name: "Metered link".into(),
+            binding: crate::proxies::EgressBinding::System,
+            enabled: true,
+            max_download_speed: 0,
+            download_quota: quota(ServerDownloadQuotaPeriod::OneTime),
+        };
+        registry
+            .reconfigure_egresses(std::slice::from_ref(&egress))
+            .unwrap();
+        registry.set_egress_quota_metering(true);
+        registry.set_one_egress_quota_metering(7, false);
+        let transfers = registry.egress_transfer_registry();
+        assert!(!transfers.quota_metering_of(StableServerId(7)));
+
+        // Deleted, then made again under the same id.
+        registry.reconfigure_egresses(&[]).unwrap();
+        registry
+            .reconfigure_egresses(std::slice::from_ref(&egress))
+            .unwrap();
+        assert!(transfers.quota_metering_of(StableServerId(7)));
+        let control = transfers.control(StableServerId(7));
+        let _reservation = control
+            .try_reserve(egress.download_quota.limit_bytes)
+            .unwrap();
+        assert!(control.try_reserve(1).is_err());
     }
 
     #[test]

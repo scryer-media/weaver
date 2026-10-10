@@ -824,9 +824,13 @@ pub enum SchedulerCommand {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Set global speed limit (bytes/sec). 0 means unlimited.
+    /// Set global speed limit (bytes/sec). 0 means unlimited. With
+    /// `replaces_schedule`, an operator's edit: it is in force at once, over
+    /// a scheduled limit, until the next scheduled speed rule fires. Without,
+    /// it is recorded and waits while a scheduled limit is in force.
     SetSpeedLimit {
         bytes_per_sec: u64,
+        replaces_schedule: bool,
         reply: oneshot::Sender<()>,
     },
     /// Change the minimum post age and recalculate pending propagation holds.
@@ -840,9 +844,6 @@ pub enum SchedulerCommand {
         action: crate::bandwidth::ScheduleAction,
         reply: oneshot::Sender<()>,
     },
-    /// Clear any schedule-imposed pause or speed limit. A scheduled hardware
-    /// profile is a separate track and is left alone.
-    ClearScheduleAction { reply: oneshot::Sender<()> },
     /// Make this the operator's hardware profile: the one in force whenever
     /// no schedule rule puts another in force.
     SetHardwareProfile {
@@ -1433,12 +1434,29 @@ impl SchedulerHandle {
         self.state.is_post_processing_paused()
     }
 
-    /// Set the global download speed limit. 0 means unlimited.
+    /// Set the global download speed limit as the operator's edit. 0 means
+    /// unlimited. It is in force at once, over a scheduled limit, until the
+    /// next scheduled speed rule fires.
     pub async fn set_speed_limit(&self, bytes_per_sec: u64) -> Result<(), SchedulerError> {
+        self.send_speed_limit(bytes_per_sec, true).await
+    }
+
+    /// Load the saved global speed limit, as a configuration reload does. It
+    /// waits while a scheduled limit is in force.
+    pub async fn restore_speed_limit(&self, bytes_per_sec: u64) -> Result<(), SchedulerError> {
+        self.send_speed_limit(bytes_per_sec, false).await
+    }
+
+    async fn send_speed_limit(
+        &self,
+        bytes_per_sec: u64,
+        replaces_schedule: bool,
+    ) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::SetSpeedLimit {
                 bytes_per_sec,
+                replaces_schedule,
                 reply: tx,
             })
             .await
@@ -1465,17 +1483,6 @@ impl SchedulerHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::ApplyScheduleAction { action, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
-        Ok(())
-    }
-
-    /// Clear any schedule-imposed pause or speed limit.
-    pub async fn clear_schedule_action(&self) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::ClearScheduleAction { reply: tx })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?;

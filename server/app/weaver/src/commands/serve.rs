@@ -231,7 +231,7 @@ pub(crate) async fn run(
     // Load schedules from DB and spawn the schedule evaluator.
     let shared_schedules: weaver_server_core::bandwidth::schedule::SharedSchedules = {
         let initial = db.list_schedules().unwrap_or_else(|error| {
-            error!(%error, "failed to load or migrate schedules; scheduled holds are unavailable until the settings are repaired");
+            error!(%error, "failed to load schedules; scheduled holds are unavailable until the settings are repaired");
             Vec::new()
         });
         std::sync::Arc::new(tokio::sync::RwLock::new(initial))
@@ -254,7 +254,6 @@ pub(crate) async fn run(
     weaver_server_core::post_processing::scheduler::spawn_script_evaluator(
         db.clone(),
         shared_config.clone(),
-        shared_schedules.clone(),
     );
 
     let pipeline_config = shared_config.clone();

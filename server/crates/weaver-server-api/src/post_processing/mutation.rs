@@ -2,12 +2,10 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::auth::{AdminGuard, FreshAdminGuard, graphql_error};
-use weaver_server_core::bandwidth::ScheduleAction;
-use weaver_server_core::bandwidth::schedule::SharedSchedules;
 use weaver_server_core::post_processing::executor::{
     PostProcessingExecutor, strict_security_enabled,
 };
-use weaver_server_core::post_processing::instances::{InstanceTrigger, ScriptInstance};
+use weaver_server_core::post_processing::instances::ScriptInstance;
 use weaver_server_core::post_processing::listing::resolve_script;
 use weaver_server_core::post_processing::model::{
     PipelineOutcome, PostProcessingSettings, ScriptName,
@@ -63,28 +61,6 @@ fn secret_error(error: SecretError) -> async_graphql::Error {
 
 fn view(db: &Database, instance: ScriptInstance) -> ScriptInstanceGql {
     crate::post_processing::query::directory_view(db).instance(instance)
-}
-
-/// Take out every schedule rule that runs the instance `id`, and return the
-/// rules as they are saved afterwards.
-fn prune_schedule_rules(
-    db: &Database,
-    id: &str,
-) -> std::result::Result<
-    Vec<weaver_server_core::bandwidth::ScheduleEntry>,
-    weaver_server_core::StateError,
-> {
-    let mut rules = db.list_schedules()?;
-    let before = rules.len();
-    rules.retain(|rule| {
-        !matches!(&rule.action,
-            ScheduleAction::RunScript { instance_id, .. } if *instance_id == id)
-    });
-    if rules.len() != before {
-        db.save_schedules(&rules)?;
-        rules = db.list_schedules()?;
-    }
-    Ok(rules)
 }
 
 #[derive(Default)]
@@ -300,8 +276,8 @@ impl PostProcessingMutation {
     /// Replace everything saved in an instance. Each input is sent as a value,
     /// as the secret it links, or as a secret of the instance's own; one of
     /// those sent without a value keeps the secret already saved under that
-    /// name. An instance that no longer runs on a schedule loses the schedule
-    /// rules that ran it.
+    /// name. A schedule left out keeps the saved one; an instance that no
+    /// longer runs on a schedule loses its run times.
     #[graphql(guard = "FreshAdminGuard")]
     async fn update_script_instance(
         &self,
@@ -309,54 +285,36 @@ impl PostProcessingMutation {
         id: String,
         input: ScriptInstanceInput,
     ) -> Result<ScriptInstanceGql> {
-        let draft = input.into_draft().map_err(async_graphql::Error::new)?;
+        let keep_schedule = input.schedule.is_none();
+        let mut draft = input.into_draft().map_err(async_graphql::Error::new)?;
         let db = ctx.data::<Database>()?.clone();
-        let schedules_state = ctx.data::<SharedSchedules>()?.clone();
-        // Held across the whole change so the rules a running evaluator reads
-        // never name an instance that no longer runs on a schedule.
-        let mut schedules = schedules_state.write().await;
-        let (instance, rules) = blocking(move || {
+        blocking(move || {
             let existing = db
                 .script_instance(&id)
                 .map_err(|error| error.to_string())?
                 .ok_or("script instance does not exist")?;
+            if keep_schedule {
+                draft.schedule = existing.schedule.clone();
+            }
             if existing.script != draft.script {
                 require_script(&db, &draft.script)?;
             }
             let instance = db
                 .update_script_instance(&id, draft)
                 .map_err(|error| error.to_string())?;
-            let rules = if instance.trigger != InstanceTrigger::Schedule {
-                Some(prune_schedule_rules(&db, &id).map_err(|error| error.to_string())?)
-            } else {
-                None
-            };
-            Ok::<_, String>((view(&db, instance), rules))
+            Ok::<_, String>(view(&db, instance))
         })
-        .await?;
-        if let Some(rules) = rules {
-            *schedules = rules;
-        }
-        Ok(instance)
+        .await
     }
 
-    /// Remove an instance, along with any schedule rule that ran it. False
-    /// when there was no such instance.
+    /// Remove an instance. False when there was no such instance.
     #[graphql(guard = "FreshAdminGuard")]
     async fn delete_script_instance(&self, ctx: &Context<'_>, id: String) -> Result<bool> {
         let db = ctx.data::<Database>()?.clone();
-        let schedules_state = ctx.data::<SharedSchedules>()?.clone();
-        // Held across the whole change so the rules a running evaluator reads
-        // never name an instance that has just gone.
-        let mut schedules = schedules_state.write().await;
-        // The rules go first: an instance left without them is a lesser
-        // mistake than a rule left naming an instance that is gone.
-        let (rules, deleted) = blocking(move || {
-            let rules = prune_schedule_rules(&db, &id)?;
-            Ok::<_, weaver_server_core::StateError>((rules, db.delete_script_instance(&id)))
+        let deleted = blocking(move || {
+            Ok::<_, weaver_server_core::StateError>(db.delete_script_instance(&id))
         })
         .await?;
-        *schedules = rules;
         deleted.map_err(refused)
     }
 
@@ -416,9 +374,9 @@ impl PostProcessingMutation {
     }
 
     /// Create every instance a script's header asks for and does not have
-    /// yet: one per declared trigger, filled from the header, and for a new
-    /// schedule instance one schedule rule per declared run time. Returns the
-    /// instances it added. After this the header is not read again.
+    /// yet: one per declared trigger, filled from the header, a new schedule
+    /// instance carrying every declared run time. Returns the instances it
+    /// added. After this the header is not read again.
     #[graphql(guard = "FreshAdminGuard")]
     async fn set_up_script_from_header(
         &self,
@@ -427,26 +385,20 @@ impl PostProcessingMutation {
     ) -> Result<Vec<ScriptInstanceGql>> {
         let script = parse_script_name(script)?;
         let db = ctx.data::<Database>()?.clone();
-        let schedules_state = ctx.data::<SharedSchedules>()?.clone();
-        let mut schedules = schedules_state.write().await;
-        let (added, rules) = blocking(move || {
+        blocking(move || {
             let setup = db
                 .set_up_script_from_header(&script)
                 .map_err(|error| error.to_string())?;
-            let rules = db.list_schedules().map_err(|error| error.to_string())?;
             let directory = crate::post_processing::query::directory_view(&db);
-            Ok::<_, String>((
+            Ok::<_, String>(
                 setup
                     .instances
                     .into_iter()
                     .map(|instance| directory.instance(instance))
                     .collect::<Vec<_>>(),
-                rules,
-            ))
+            )
         })
-        .await?;
-        *schedules = rules;
-        Ok(added)
+        .await
     }
 
     /// Bring one instance's inputs back in line with its script's header:

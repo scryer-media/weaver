@@ -341,11 +341,61 @@ impl From<SchedulePruneFiles> for weaver_server_core::bandwidth::PruneFiles {
     }
 }
 
+/// What one speed-limit change in a rule applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum ScheduleTargetKind {
+    Global,
+    Egress,
+    Server,
+}
+
+/// One target of a `speed_limit` rule and the rate it sets. 0 removes the
+/// limit at that level.
+#[derive(Debug, Clone, Copy, SimpleObject, InputObject)]
+#[graphql(input_name = "ScheduleSpeedLimitInput")]
+pub struct ScheduleSpeedLimit {
+    pub kind: ScheduleTargetKind,
+    /// The egress or provider id; null for the global limit.
+    pub id: Option<u32>,
+    pub bytes_per_sec: u64,
+}
+
+impl From<weaver_server_core::bandwidth::SpeedLimitChange> for ScheduleSpeedLimit {
+    fn from(change: weaver_server_core::bandwidth::SpeedLimitChange) -> Self {
+        use weaver_server_core::bandwidth::SpeedTarget;
+        let (kind, id) = match change.target {
+            SpeedTarget::Global => (ScheduleTargetKind::Global, None),
+            SpeedTarget::Egress(id) => (ScheduleTargetKind::Egress, Some(id)),
+            SpeedTarget::Server(id) => (ScheduleTargetKind::Server, Some(id)),
+        };
+        Self {
+            kind,
+            id,
+            bytes_per_sec: change.bytes_per_sec,
+        }
+    }
+}
+
+impl TryFrom<ScheduleSpeedLimit> for weaver_server_core::bandwidth::SpeedLimitChange {
+    type Error = String;
+
+    fn try_from(limit: ScheduleSpeedLimit) -> Result<Self, String> {
+        use weaver_server_core::bandwidth::SpeedTarget;
+        let target = match (limit.kind, limit.id) {
+            (ScheduleTargetKind::Global, _) => SpeedTarget::Global,
+            (ScheduleTargetKind::Egress, Some(id)) => SpeedTarget::Egress(id),
+            (ScheduleTargetKind::Server, Some(id)) => SpeedTarget::Server(id),
+            (_, None) => return Err("an egress or provider speed limit needs its id".into()),
+        };
+        Ok(Self {
+            target,
+            bytes_per_sec: limit.bytes_per_sec,
+        })
+    }
+}
+
 #[derive(SimpleObject)]
 pub struct Schedule {
-    /// The script instance a `run_script` rule runs.
-    pub instance_id: Option<String>,
-    pub run_at_startup: bool,
     pub id: String,
     pub enabled: bool,
     pub label: String,
@@ -355,15 +405,23 @@ pub struct Schedule {
     pub every_hour_at_minute: Option<u8>,
     pub server_id: Option<u32>,
     pub server_active: Option<bool>,
-    pub feed_id: Option<u32>,
     pub quota_metering_enabled: Option<bool>,
+    /// The egress a `set_quota_metering` rule applies to; null for every
+    /// egress.
+    pub quota_egress_id: Option<u32>,
     pub prune_failed: Option<SchedulePruneFiles>,
     pub prune_completed: Option<SchedulePruneFiles>,
     pub prune_cancelled: Option<SchedulePruneFiles>,
     pub action_type: String,
-    /// Rules on this track hold independently of every other track.
+    /// Rules on this track hold independently of every other track. A rule
+    /// touching several tracks reports the first.
     pub track: ScheduleTrackGql,
+    /// The global rate a `speed_limit` rule sets, if it sets one.
+    #[graphql(deprecation = "Use speedLimits.")]
     pub speed_limit_bytes: Option<u64>,
+    /// Every target a `speed_limit` rule sets, global first, then each
+    /// egress, then each provider. Empty for every other action.
+    pub speed_limits: Vec<ScheduleSpeedLimit>,
     /// The profile a `hardware_profile` rule puts in force; null for every
     /// other action.
     pub hardware_profile: Option<HardwareProfileGql>,
@@ -371,32 +429,35 @@ pub struct Schedule {
 
 impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
     fn from(e: weaver_server_core::bandwidth::ScheduleEntry) -> Self {
-        use weaver_server_core::bandwidth::ScheduleTrack;
-        let track = match e.action.track() {
+        use weaver_server_core::bandwidth::{
+            QuotaTarget, ScheduleAction, ScheduleTrack, SpeedTarget,
+        };
+        let track = match e.action.tracks().first() {
             Some(ScheduleTrack::Downloads) => ScheduleTrackGql::Downloads,
             Some(ScheduleTrack::PostProcessing) => ScheduleTrackGql::PostProcessing,
             Some(ScheduleTrack::WatchFolder) => ScheduleTrackGql::WatchFolder,
             Some(ScheduleTrack::Rss) => ScheduleTrackGql::Rss,
-            Some(ScheduleTrack::Speed) => ScheduleTrackGql::Speed,
+            Some(ScheduleTrack::Speed(_)) => ScheduleTrackGql::Speed,
             Some(ScheduleTrack::Profile) => ScheduleTrackGql::Profile,
-            Some(ScheduleTrack::Quota) => ScheduleTrackGql::Quota,
+            Some(ScheduleTrack::Quota(_)) => ScheduleTrackGql::Quota,
             Some(ScheduleTrack::Server(_)) => ScheduleTrackGql::Server,
             None => ScheduleTrackGql::OneShot,
         };
-        use weaver_server_core::bandwidth::ScheduleAction;
         let (server_id, server_active) = match e.action {
             ScheduleAction::SetServerActive { server_id, active } => {
                 (Some(server_id), Some(active))
             }
             _ => (None, None),
         };
-        let feed_id = match e.action {
-            ScheduleAction::FetchRss { feed_id } => feed_id,
-            _ => None,
-        };
-        let quota_metering_enabled = match e.action {
-            ScheduleAction::SetQuotaMetering { enabled } => Some(enabled),
-            _ => None,
+        let (quota_metering_enabled, quota_egress_id) = match e.action {
+            ScheduleAction::SetQuotaMetering { enabled, target } => (
+                Some(enabled),
+                match target {
+                    QuotaTarget::AllEgresses => None,
+                    QuotaTarget::Egress(id) => Some(id),
+                },
+            ),
+            _ => (None, None),
         };
         let (prune_failed, prune_completed, prune_cancelled) = match e.action {
             ScheduleAction::PruneHistory {
@@ -411,68 +472,53 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
             _ => (None, None, None),
         };
         let mut hardware_profile = None;
-        let mut instance_id = None;
-        let mut run_at_startup = false;
-        let (action_type, speed_limit_bytes) = match &e.action {
-            weaver_server_core::bandwidth::ScheduleAction::RunScript {
-                instance_id: id,
-                run_at_startup: startup,
-            } => {
-                instance_id = Some(id.clone());
-                run_at_startup = *startup;
-                ("run_script".into(), None)
+        let mut speed_limits = Vec::new();
+        let mut speed_limit_bytes = None;
+        let action_type = match &e.action {
+            ScheduleAction::Pause => "pause",
+            ScheduleAction::Resume => "resume",
+            ScheduleAction::PauseAll => "pause_all",
+            ScheduleAction::PausePostProcessing => "pause_post_processing",
+            ScheduleAction::ResumePostProcessing => "resume_post_processing",
+            ScheduleAction::PauseWatchFolderScanning => "pause_watch_folder_scanning",
+            ScheduleAction::ResumeWatchFolderScanning => "resume_watch_folder_scanning",
+            ScheduleAction::PauseRss => "pause_rss",
+            ScheduleAction::ResumeRss => "resume_rss",
+            ScheduleAction::SetServerActive { .. } => "set_server_active",
+            ScheduleAction::SetQuotaMetering { .. } => "set_quota_metering",
+            ScheduleAction::PruneHistory { .. } => "prune_history",
+            ScheduleAction::SpeedLimit { limits } => {
+                speed_limit_bytes = limits
+                    .iter()
+                    .find(|change| change.target == SpeedTarget::Global)
+                    .map(|change| change.bytes_per_sec);
+                speed_limits = limits.iter().copied().map(Into::into).collect();
+                "speed_limit"
             }
-            weaver_server_core::bandwidth::ScheduleAction::Pause => ("pause".into(), None),
-            weaver_server_core::bandwidth::ScheduleAction::Resume => ("resume".into(), None),
-            ScheduleAction::PauseAll => ("pause_all".into(), None),
-            ScheduleAction::PausePostProcessing => ("pause_post_processing".into(), None),
-            ScheduleAction::ResumePostProcessing => ("resume_post_processing".into(), None),
-            ScheduleAction::SetServerActive { .. } => ("set_server_active".into(), None),
-            ScheduleAction::SetQuotaMetering { .. } => ("set_quota_metering".into(), None),
-            ScheduleAction::ScanWatchFolder => ("scan_watch_folder".into(), None),
-            ScheduleAction::FetchRss { .. } => ("fetch_rss".into(), None),
-            ScheduleAction::PruneHistory { .. } => ("prune_history".into(), None),
-            weaver_server_core::bandwidth::ScheduleAction::PauseWatchFolderScanning => {
-                ("pause_watch_folder_scanning".into(), None)
-            }
-            weaver_server_core::bandwidth::ScheduleAction::ResumeWatchFolderScanning => {
-                ("resume_watch_folder_scanning".into(), None)
-            }
-            weaver_server_core::bandwidth::ScheduleAction::SpeedLimit { bytes_per_sec } => {
-                ("speed_limit".into(), Some(*bytes_per_sec))
-            }
-            weaver_server_core::bandwidth::ScheduleAction::ConfiguredSpeedLimit => {
-                ("configured_speed_limit".into(), None)
-            }
-            weaver_server_core::bandwidth::ScheduleAction::HardwareProfile { profile } => {
+            ScheduleAction::HardwareProfile { profile } => {
                 hardware_profile = Some((*profile).into());
-                ("hardware_profile".into(), None)
+                "hardware_profile"
             }
         };
         Self {
-            instance_id,
-            run_at_startup,
             id: e.id,
             track,
             enabled: e.enabled,
             label: e.label,
-            days: e
-                .days
-                .iter()
-                .map(|d| format!("{d:?}").to_lowercase())
-                .collect(),
+            days: e.days.iter().map(|d| d.as_str().to_string()).collect(),
             time: e.time,
             times: e.times,
             every_hour_at_minute: e.every_hour_at_minute,
             server_id,
             server_active,
-            feed_id,
             quota_metering_enabled,
+            quota_egress_id,
             prune_failed,
             prune_completed,
             prune_cancelled,
-            action_type,
+            action_type: action_type.to_string(),
             speed_limit_bytes,
+            speed_limits,
             hardware_profile,
         }
     }
@@ -480,10 +526,6 @@ impl From<weaver_server_core::bandwidth::ScheduleEntry> for Schedule {
 
 #[derive(InputObject)]
 pub struct ScheduleInput {
-    /// The script instance a `run_script` rule runs. It must be one whose
-    /// trigger is a schedule.
-    pub instance_id: Option<String>,
-    pub run_at_startup: Option<bool>,
     pub enabled: Option<bool>,
     pub label: Option<String>,
     pub days: Option<Vec<String>>,
@@ -492,24 +534,63 @@ pub struct ScheduleInput {
     pub every_hour_at_minute: Option<u8>,
     pub server_id: Option<u32>,
     pub server_active: Option<bool>,
-    pub feed_id: Option<u32>,
     pub quota_metering_enabled: Option<bool>,
+    /// The egress a `set_quota_metering` rule applies to; omit for every
+    /// egress.
+    pub quota_egress_id: Option<u32>,
     pub prune_failed: Option<SchedulePruneFiles>,
     pub prune_completed: Option<SchedulePruneFiles>,
     pub prune_cancelled: Option<SchedulePruneFiles>,
     pub action_type: String,
+    /// A global rate for a `speed_limit` rule, read only when `speedLimits`
+    /// is omitted.
+    #[graphql(deprecation = "Use speedLimits.")]
     pub speed_limit_bytes: Option<u64>,
+    /// Every target a `speed_limit` rule sets. A target left out is left as
+    /// it is; 0 removes the limit at that level.
+    pub speed_limits: Option<Vec<ScheduleSpeedLimit>>,
     /// Required when the action is `hardware_profile`, ignored otherwise.
     pub hardware_profile: Option<HardwareProfileGql>,
 }
 
 impl ScheduleInput {
-    /// The instance a `run_script` rule names, for checking against what is
-    /// saved.
-    pub fn script_instance_id(&self) -> Option<String> {
-        (self.action_type == "run_script")
-            .then(|| self.instance_id.clone())
-            .flatten()
+    /// The changes a `speed_limit` rule makes, global first, then each egress,
+    /// then each provider. A target named twice keeps its last value.
+    fn speed_limit_changes(
+        &self,
+    ) -> Result<Vec<weaver_server_core::bandwidth::SpeedLimitChange>, String> {
+        use weaver_server_core::bandwidth::{SpeedLimitChange, SpeedTarget};
+        let mut changes: Vec<SpeedLimitChange> = match &self.speed_limits {
+            Some(limits) => limits
+                .iter()
+                .copied()
+                .map(SpeedLimitChange::try_from)
+                .collect::<Result<_, _>>()?,
+            None => self
+                .speed_limit_bytes
+                .map(|bytes_per_sec| SpeedLimitChange {
+                    target: SpeedTarget::Global,
+                    bytes_per_sec,
+                })
+                .into_iter()
+                .collect(),
+        };
+        // Egress and provider limits are stored as signed 64-bit values.
+        if changes
+            .iter()
+            .any(|change| i64::try_from(change.bytes_per_sec).is_err())
+        {
+            return Err("speed limit is too large".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        changes.reverse();
+        changes.retain(|change| seen.insert(change.target));
+        changes.sort_by_key(|change| match change.target {
+            SpeedTarget::Global => (0, 0),
+            SpeedTarget::Egress(id) => (1, id),
+            SpeedTarget::Server(id) => (2, id),
+        });
+        Ok(changes)
     }
 
     /// Refuse a rule [`Self::into_entry`] would not build as asked. A
@@ -517,61 +598,29 @@ impl ScheduleInput {
     /// honour: a rule that could never apply is refused by name here rather
     /// than saved and skipped every time it fires.
     pub fn validate(&self, probe: &SystemProfile) -> Result<(), String> {
-        if self.action_type == "run_script" {
-            // Script rules keep their own time list (`HH:MM`, `*:MM` or
-            // `startup`) in `time`, read by the script evaluator.
-            if self.every_hour_at_minute.is_some()
-                || self.times.as_ref().is_some_and(|times| !times.is_empty())
-            {
-                return Err("a run_script schedule lists its times in time".into());
-            }
-            if self
-                .instance_id
-                .as_deref()
-                .is_none_or(|id| id.trim().is_empty())
-            {
-                return Err("a run_script schedule needs a script instance".into());
-            }
-            for time in self.time.split([',', ';']) {
-                let time = time
-                    .trim()
-                    .parse::<weaver_server_core::post_processing::model::ScriptTaskTime>()
-                    .map_err(str::to_string)?;
-                if time == weaver_server_core::post_processing::model::ScriptTaskTime::Startup
-                    && !self.run_at_startup.unwrap_or(false)
-                {
-                    return Err("startup scripts require runAtStartup".into());
-                }
-            }
-            return Ok(());
-        }
         if !matches!(
             self.action_type.as_str(),
             "pause"
                 | "resume"
-                | "speed_limit"
-                | "configured_speed_limit"
-                | "pause_watch_folder_scanning"
-                | "resume_watch_folder_scanning"
-                | "hardware_profile"
                 | "pause_all"
                 | "pause_post_processing"
                 | "resume_post_processing"
+                | "pause_watch_folder_scanning"
+                | "resume_watch_folder_scanning"
+                | "pause_rss"
+                | "resume_rss"
+                | "speed_limit"
+                | "hardware_profile"
                 | "set_server_active"
                 | "set_quota_metering"
-                | "scan_watch_folder"
-                | "fetch_rss"
                 | "prune_history"
         ) {
             return Err(format!("unknown schedule actionType: {}", self.action_type));
         }
-        let one_shot = matches!(
-            self.action_type.as_str(),
-            "scan_watch_folder" | "fetch_rss" | "prune_history"
-        );
+        let one_shot = self.action_type == "prune_history";
         if let Some(minute) = self.every_hour_at_minute {
             if !one_shot {
-                return Err("hourly schedules are only supported for one-shot actions".into());
+                return Err("hourly schedules are only supported for pruning history".into());
             }
             if minute > 59 {
                 return Err("hourly minute must be between 0 and 59".into());
@@ -579,6 +628,11 @@ impl ScheduleInput {
             if self.times.as_ref().is_some_and(|times| !times.is_empty()) {
                 return Err("choose multiple times or hourly, not both".into());
             }
+        }
+        if self.action_type == "speed_limit"
+            && self.times.as_ref().is_some_and(|times| times.len() > 1)
+        {
+            return Err("a speed_limit schedule takes one time of day".into());
         }
         if weaver_server_core::bandwidth::schedule::parse_time(&self.time).is_none()
             || self.times.as_ref().is_some_and(|times| {
@@ -589,6 +643,9 @@ impl ScheduleInput {
             })
         {
             return Err("schedule times must be HH:MM, with at most 24 times per rule".into());
+        }
+        if self.action_type == "speed_limit" && self.speed_limit_changes()?.is_empty() {
+            return Err("a speed_limit schedule needs at least one limit".into());
         }
         if self.action_type == "set_server_active"
             && (self.server_id.is_none() || self.server_active.is_none())
@@ -618,18 +675,18 @@ impl ScheduleInput {
     }
 
     pub fn into_entry(self) -> Result<weaver_server_core::bandwidth::ScheduleEntry, String> {
-        use weaver_server_core::bandwidth::{ScheduleAction, Weekday};
+        use weaver_server_core::bandwidth::{QuotaTarget, ScheduleAction, Weekday};
 
         let action = match self.action_type.as_str() {
-            "run_script" => ScheduleAction::RunScript {
-                instance_id: self.instance_id.unwrap_or_default(),
-                run_at_startup: self.run_at_startup.unwrap_or(false),
-            },
             "pause" => ScheduleAction::Pause,
             "resume" => ScheduleAction::Resume,
             "pause_all" => ScheduleAction::PauseAll,
             "pause_post_processing" => ScheduleAction::PausePostProcessing,
             "resume_post_processing" => ScheduleAction::ResumePostProcessing,
+            "pause_watch_folder_scanning" => ScheduleAction::PauseWatchFolderScanning,
+            "resume_watch_folder_scanning" => ScheduleAction::ResumeWatchFolderScanning,
+            "pause_rss" => ScheduleAction::PauseRss,
+            "resume_rss" => ScheduleAction::ResumeRss,
             "set_server_active" => ScheduleAction::SetServerActive {
                 server_id: self
                     .server_id
@@ -642,22 +699,22 @@ impl ScheduleInput {
                 enabled: self
                     .quota_metering_enabled
                     .ok_or("set_quota_metering requires quotaMeteringEnabled")?,
-            },
-            "scan_watch_folder" => ScheduleAction::ScanWatchFolder,
-            "fetch_rss" => ScheduleAction::FetchRss {
-                feed_id: self.feed_id,
+                target: self
+                    .quota_egress_id
+                    .map_or(QuotaTarget::AllEgresses, QuotaTarget::Egress),
             },
             "prune_history" => ScheduleAction::PruneHistory {
                 failed: self.prune_failed.map(Into::into),
                 completed: self.prune_completed.map(Into::into),
                 cancelled: self.prune_cancelled.map(Into::into),
             },
-            "pause_watch_folder_scanning" => ScheduleAction::PauseWatchFolderScanning,
-            "resume_watch_folder_scanning" => ScheduleAction::ResumeWatchFolderScanning,
-            "speed_limit" => ScheduleAction::SpeedLimit {
-                bytes_per_sec: self.speed_limit_bytes.unwrap_or(0),
-            },
-            "configured_speed_limit" => ScheduleAction::ConfiguredSpeedLimit,
+            "speed_limit" => {
+                let limits = self.speed_limit_changes()?;
+                if limits.is_empty() {
+                    return Err("a speed_limit schedule needs at least one limit".into());
+                }
+                ScheduleAction::SpeedLimit { limits }
+            }
             "hardware_profile" => match self.hardware_profile {
                 Some(profile) => ScheduleAction::HardwareProfile {
                     profile: profile.into(),
@@ -670,16 +727,7 @@ impl ScheduleInput {
             .days
             .unwrap_or_default()
             .iter()
-            .filter_map(|d| match d.to_lowercase().as_str() {
-                "mon" => Some(Weekday::Mon),
-                "tue" => Some(Weekday::Tue),
-                "wed" => Some(Weekday::Wed),
-                "thu" => Some(Weekday::Thu),
-                "fri" => Some(Weekday::Fri),
-                "sat" => Some(Weekday::Sat),
-                "sun" => Some(Weekday::Sun),
-                _ => None,
-            })
+            .filter_map(|d| Weekday::parse(&d.to_lowercase()))
             .collect();
         Ok(weaver_server_core::bandwidth::ScheduleEntry {
             id: format!(
@@ -706,38 +754,17 @@ impl ScheduleInput {
 }
 
 #[cfg(test)]
-mod schedule_script_tests {
+mod schedule_input_tests {
     use super::*;
+    use weaver_server_core::bandwidth::{
+        QuotaTarget, ScheduleAction, SpeedLimitChange, SpeedTarget,
+    };
 
-    fn script_input(time: &str, startup: bool) -> ScheduleInput {
-        ScheduleInput {
-            instance_id: Some("nightly".into()),
-            run_at_startup: Some(startup),
-            enabled: Some(true),
-            label: None,
-            days: None,
-            time: time.into(),
-            times: None,
-            every_hour_at_minute: None,
-            server_id: None,
-            server_active: None,
-            feed_id: None,
-            quota_metering_enabled: None,
-            prune_failed: None,
-            prune_completed: None,
-            prune_cancelled: None,
-            action_type: "run_script".into(),
-            speed_limit_bytes: None,
-            hardware_profile: None,
-        }
-    }
-
-    #[test]
-    fn script_schedule_accepts_hourly_lists_and_requires_startup_opt_in() {
+    fn probe() -> SystemProfile {
         use weaver_server_core::runtime::system_profile::{
             CpuProfile, DiskProfile, FilesystemType, MemoryProfile, StorageClass,
         };
-        let probe = SystemProfile {
+        SystemProfile {
             cpu: CpuProfile {
                 physical_cores: 2,
                 logical_cores: 2,
@@ -756,12 +783,175 @@ mod schedule_script_tests {
                 random_read_iops: 0.0,
                 same_filesystem: true,
             },
-        };
-        for time in ["*:15", "*:15, 03:00;04:30", "*"] {
-            assert!(script_input(time, true).validate(&probe).is_ok(), "{time}");
         }
-        assert!(script_input("*", false).validate(&probe).is_err());
-        assert!(script_input("*:60", true).validate(&probe).is_err());
-        assert!(script_input("01:00,", true).validate(&probe).is_err());
+    }
+
+    fn input(action_type: &str) -> ScheduleInput {
+        ScheduleInput {
+            enabled: Some(true),
+            label: None,
+            days: None,
+            time: "01:00".into(),
+            times: None,
+            every_hour_at_minute: None,
+            server_id: None,
+            server_active: None,
+            quota_metering_enabled: None,
+            quota_egress_id: None,
+            prune_failed: None,
+            prune_completed: None,
+            prune_cancelled: None,
+            action_type: action_type.into(),
+            speed_limit_bytes: None,
+            speed_limits: None,
+            hardware_profile: None,
+        }
+    }
+
+    fn limit(kind: ScheduleTargetKind, id: Option<u32>, bytes_per_sec: u64) -> ScheduleSpeedLimit {
+        ScheduleSpeedLimit {
+            kind,
+            id,
+            bytes_per_sec,
+        }
+    }
+
+    #[test]
+    fn a_speed_rule_sets_each_target_it_names_in_global_egress_provider_order() {
+        let mut rule = input("speed_limit");
+        rule.speed_limits = Some(vec![
+            limit(ScheduleTargetKind::Server, Some(4), 0),
+            limit(ScheduleTargetKind::Egress, Some(2), 2_000_000),
+            limit(ScheduleTargetKind::Global, None, 5_000_000),
+        ]);
+        rule.validate(&probe()).unwrap();
+        let entry = rule.into_entry().unwrap();
+        assert_eq!(
+            entry.action,
+            ScheduleAction::SpeedLimit {
+                limits: vec![
+                    SpeedLimitChange {
+                        target: SpeedTarget::Global,
+                        bytes_per_sec: 5_000_000,
+                    },
+                    SpeedLimitChange {
+                        target: SpeedTarget::Egress(2),
+                        bytes_per_sec: 2_000_000,
+                    },
+                    SpeedLimitChange {
+                        target: SpeedTarget::Server(4),
+                        bytes_per_sec: 0,
+                    },
+                ],
+            }
+        );
+        let shown = Schedule::from(entry);
+        assert_eq!(shown.speed_limit_bytes, Some(5_000_000));
+        assert_eq!(shown.speed_limits.len(), 3);
+        assert_eq!(shown.track, ScheduleTrackGql::Speed);
+    }
+
+    #[test]
+    fn the_old_single_rate_field_still_saves_a_global_limit() {
+        let mut rule = input("speed_limit");
+        rule.speed_limit_bytes = Some(1024);
+        let entry = rule.into_entry().unwrap();
+        assert_eq!(
+            entry.action,
+            ScheduleAction::SpeedLimit {
+                limits: vec![SpeedLimitChange {
+                    target: SpeedTarget::Global,
+                    bytes_per_sec: 1024,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn a_speed_rule_with_no_target_or_an_unnamed_egress_is_refused() {
+        assert!(input("speed_limit").validate(&probe()).is_err());
+        let mut rule = input("speed_limit");
+        rule.speed_limits = Some(vec![limit(ScheduleTargetKind::Egress, None, 1)]);
+        assert!(rule.validate(&probe()).is_err());
+        let mut rule = input("speed_limit");
+        rule.speed_limits = Some(vec![limit(ScheduleTargetKind::Global, None, 1)]);
+        rule.times = Some(vec!["01:00".into(), "02:00".into()]);
+        assert!(rule.validate(&probe()).is_err(), "one time of day per rule");
+    }
+
+    #[test]
+    fn a_speed_rate_above_the_stored_range_is_refused() {
+        let largest = i64::MAX as u64;
+        for kind in [
+            ScheduleTargetKind::Global,
+            ScheduleTargetKind::Egress,
+            ScheduleTargetKind::Server,
+        ] {
+            let id = (kind != ScheduleTargetKind::Global).then_some(1);
+            let mut rule = input("speed_limit");
+            rule.speed_limits = Some(vec![limit(kind, id, largest + 1)]);
+            assert_eq!(
+                rule.validate(&probe()).unwrap_err(),
+                "speed limit is too large"
+            );
+            rule.speed_limits = Some(vec![limit(kind, id, largest)]);
+            assert!(rule.validate(&probe()).is_ok());
+        }
+        let mut rule = input("speed_limit");
+        rule.speed_limit_bytes = Some(u64::MAX);
+        assert!(rule.validate(&probe()).is_err());
+        assert!(rule.into_entry().is_err());
+    }
+
+    #[test]
+    fn quota_metering_applies_to_every_egress_unless_one_is_named() {
+        let mut rule = input("set_quota_metering");
+        rule.quota_metering_enabled = Some(false);
+        let entry = rule.into_entry().unwrap();
+        assert_eq!(
+            entry.action,
+            ScheduleAction::SetQuotaMetering {
+                enabled: false,
+                target: QuotaTarget::AllEgresses,
+            }
+        );
+        let mut rule = input("set_quota_metering");
+        rule.quota_metering_enabled = Some(true);
+        rule.quota_egress_id = Some(3);
+        let shown = Schedule::from(rule.into_entry().unwrap());
+        assert_eq!(shown.quota_egress_id, Some(3));
+        assert_eq!(shown.quota_metering_enabled, Some(true));
+    }
+
+    #[test]
+    fn rss_pair_is_offered_and_removed_actions_are_refused() {
+        for action in ["pause_rss", "resume_rss"] {
+            input(action).validate(&probe()).unwrap();
+        }
+        assert_eq!(
+            input("pause_rss").into_entry().unwrap().action,
+            ScheduleAction::PauseRss
+        );
+        for action in [
+            "run_script",
+            "scan_watch_folder",
+            "fetch_rss",
+            "configured_speed_limit",
+        ] {
+            assert!(input(action).validate(&probe()).is_err(), "{action}");
+        }
+    }
+
+    #[test]
+    fn only_pruning_runs_hourly() {
+        let mut rule = input("pause");
+        rule.every_hour_at_minute = Some(5);
+        assert!(rule.validate(&probe()).is_err());
+        let mut rule = input("prune_history");
+        rule.every_hour_at_minute = Some(5);
+        rule.prune_failed = Some(SchedulePruneFiles {
+            delete_files: false,
+        });
+        rule.validate(&probe()).unwrap();
     }
 }

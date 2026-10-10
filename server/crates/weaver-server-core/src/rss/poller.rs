@@ -161,39 +161,6 @@ impl RssService {
         }
     }
 
-    /// Additional scheduled fetch; the regular poller keeps its own cadence.
-    pub async fn run_scheduled_sync(
-        &self,
-        feed_id: Option<u32>,
-    ) -> Result<RssSyncReport, RssServiceError> {
-        self.run_scheduled_sync_cancellable(
-            feed_id,
-            crate::bandwidth::schedule::ScheduleCancellation::new(),
-        )
-        .await
-    }
-
-    pub(crate) async fn run_scheduled_sync_cancellable(
-        &self,
-        feed_id: Option<u32>,
-        cancellation: crate::bandwidth::schedule::ScheduleCancellation,
-    ) -> Result<RssSyncReport, RssServiceError> {
-        let _guard = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Ok(RssSyncReport::default()),
-            guard = self.inner.sync_lock.lock() => guard,
-        };
-        if self.is_scheduled_paused() {
-            return Ok(RssSyncReport::default());
-        }
-        self.run_sync_inner_cancellable(
-            feed_id.map_or(RssSyncTarget::AllEnabledFeeds, RssSyncTarget::Feed),
-            false,
-            cancellation,
-        )
-        .await
-    }
-
     /// Fire-and-forget trigger used by the NZBGet `fetchfeeds` facade.
     ///
     /// Spawns a background sync and returns immediately. Concurrent callers

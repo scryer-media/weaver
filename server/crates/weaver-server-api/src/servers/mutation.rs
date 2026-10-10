@@ -260,9 +260,15 @@ impl ServersMutation {
             }
         }
 
+        // The delete took this server's rules and speed limits out of what is
+        // saved; publish that.
         if let Some(schedules) = schedules_guard.as_mut() {
-            schedules.retain(|entry| !matches!(entry.action,
-                weaver_server_core::bandwidth::ScheduleAction::SetServerActive { server_id, .. } if server_id == id));
+            let db = db.clone();
+            **schedules =
+                spawn_blocking_db("servers.mutation.remove_server.schedules", move || {
+                    db.list_schedules()
+                })
+                .await?;
         }
         drop(schedules_guard);
 

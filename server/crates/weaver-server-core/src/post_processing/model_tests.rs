@@ -1,5 +1,5 @@
 use super::model::{
-    OptionName, OptionValue, PostProcessingSettings, PostProcessingSummary, ResolvedOption,
+    DEFAULT_UNACCEPTABLE_EXTENSIONS, OptionName, OptionValue, PostProcessingSettings, PostProcessingSummary, ResolvedOption,
     ScriptAdapter, ScriptManifest, ScriptName, ScriptOption, ScriptOptionType, ScriptStatus,
     SecretOptionValue, merge_post_processing_summary,
 };
@@ -256,6 +256,15 @@ fn unacceptable_extension_patterns_reject_paths_dots_and_regex_syntax() {
         };
         assert!(settings.normalized().is_err(), "accepted {pattern:?}");
     }
+}
+
+#[test]
+fn the_rename_executable_floor_matches_the_default_unacceptable_extensions() {
+    let mut floor: Vec<&str> = weaver_nzb::delivery_rename::EXECUTABLE_EXTENSIONS.to_vec();
+    floor.sort_unstable();
+    let mut defaults: Vec<&str> = DEFAULT_UNACCEPTABLE_EXTENSIONS.to_vec();
+    defaults.sort_unstable();
+    assert_eq!(floor, defaults);
 }
 
 #[test]

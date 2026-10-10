@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
+import { join } from "node:path";
 import { createServer } from "vite";
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_PATH ?? "playwright");
 let server, browser, baseUrl;
@@ -10,6 +11,14 @@ before(async () => {
   browser = await chromium.launch({ headless: true });
 });
 after(async () => { await browser?.close(); await server?.close(); });
+/** With `SCHEDULES_SCREENSHOT_DIR` set to a directory, the page as it stands is saved there as `name`.png. */
+async function shot(page, name) {
+  if (!process.env.SCHEDULES_SCREENSHOT_DIR) return;
+  // A dialog's body scrolls inside the window; a taller one holds the whole of it.
+  await page.setViewportSize({ width: 1600, height: 1500 });
+  await page.screenshot({ path: join(process.env.SCHEDULES_SCREENSHOT_DIR, `${name}.png`) });
+  await page.setViewportSize({ width: 1600, height: 1000 });
+}
 // The shared controls: a select is a button that opens a menu, and a toggle is a switch.
 async function choose(page, scope, name, option) {
   await scope.getByRole("button", { name, exact: true }).click();
@@ -66,7 +75,7 @@ test("backup settings, retained create, token download and delete use the render
 test("all new schedule actions support disabled create, edit, draft and list toggles, and delete", async () => {
   const page = await open("?schedules");
   try {
-    for (const [action, group] of [["Pause all intake", "Downloads"], ["Pause post-processing", "Post-processing"], ["Resume post-processing", "Post-processing"], ["Set server availability", "Servers"], ["Set quota metering", "Quota metering"], ["Scan watch folder", "One-shot actions"], ["Fetch RSS", "One-shot actions"], ["Prune history", "One-shot actions"]]) {
+    for (const [action, group] of [["Pause all intake", "Downloads"], ["Pause post-processing", "Post-processing"], ["Resume post-processing", "Post-processing"], ["Set server availability", "Servers"], ["Set quota metering", "Quota metering"], ["Pause RSS", "RSS"], ["Resume RSS", "RSS"], ["Prune history", "One-shot actions"]]) {
       await addSchedule(page).click();
       const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
       await form.getByLabel("Label", { exact: true }).fill(`fixture ${action}`);
@@ -74,8 +83,8 @@ test("all new schedule actions support disabled create, edit, draft and list tog
       await form.getByRole("button", { name: "Action", exact: true }).click();
       await page.getByRole("menuitemradio", { name: action, exact: true }).click();
       if (action === "Set server availability") await choose(page, form, "Server", "fixture-provider");
-      if (action === "Prune history") await toggle(form, "Completed").check();
-      if (action === "Fetch RSS") {
+      if (action === "Prune history") {
+        await toggle(form, "Completed").check();
         await toggle(form, "Every hour").click();
         // A number field commits what was typed when focus leaves it.
         const minute = form.getByRole("spinbutton", { name: "Minute of the hour", exact: true });
@@ -87,7 +96,7 @@ test("all new schedule actions support disabled create, edit, draft and list tog
       const row = page.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(`fixture ${action}`, { exact: true }) });
       await row.waitFor();
       assert.equal(await row.getByRole("switch").isChecked(), false);
-      if (action === "Scan watch folder") {
+      if (action === "Pause RSS") {
         // The fixture stores mutations without dispatching real schedule actions.
         await row.getByRole("switch").click();
         await row.locator('[role="switch"][aria-checked="true"]').waitFor();
@@ -96,16 +105,17 @@ test("all new schedule actions support disabled create, edit, draft and list tog
       }
       const description = {
         "Set server availability": "Set server availability: fixture-provider (On)",
-        "Set quota metering": "Set quota metering: On",
-        "Fetch RSS": "Fetch RSS: All enabled feeds",
+        "Set quota metering": "Count downloads against the quota",
         "Prune history": "Prune history: Completed (Delete files too: Off)",
       }[action];
       if (description) await row.getByText(description, { exact: true }).waitFor();
       await row.click();
       const edit = page.getByRole("dialog", { name: `fixture ${action}`, exact: true });
       if (action === "Set server availability") await edit.getByRole("button", { name: "Server", exact: true }).getByText("fixture-provider", { exact: true }).waitFor();
-      if (action === "Fetch RSS") assert.equal(await edit.getByRole("spinbutton", { name: "Minute of the hour", exact: true }).inputValue(), "15");
-      if (action === "Prune history") assert.equal(await toggle(edit, "Completed").isChecked(), true);
+      if (action === "Prune history") {
+        assert.equal(await edit.getByRole("spinbutton", { name: "Minute of the hour", exact: true }).inputValue(), "15");
+        assert.equal(await toggle(edit, "Completed").isChecked(), true);
+      }
       await edit.getByLabel("Label", { exact: true }).fill(`edited ${action}`);
       await edit.getByRole("switch", { name: "Enabled", exact: true }).click();
       await edit.getByRole("switch", { name: "Enabled", exact: true }).click();
@@ -122,13 +132,10 @@ test("all new schedule actions support disabled create, edit, draft and list tog
   } finally { await page.close(); }
 });
 
-test("editing another action into server and quota rules saves the displayed boolean defaults", async () => {
+test("editing another action into server and quota rules saves the displayed defaults", async () => {
   const page = await open("?schedules");
   try {
-    for (const [action, group, option] of [
-      ["Set server availability", "Servers", "Server active"],
-      ["Set quota metering", "Quota metering", "Count traffic toward the quota"],
-    ]) {
+    for (const [action, group] of [["Set server availability", "Servers"], ["Set quota metering", "Quota metering"]]) {
       const label = `converted ${group}`;
       await addSchedule(page).click();
       const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
@@ -140,18 +147,29 @@ test("editing another action into server and quota rules saves the displayed boo
       const edit = page.getByRole("dialog", { name: label, exact: true });
       await edit.getByRole("button", { name: "Action", exact: true }).click();
       await page.getByRole("menuitemradio", { name: action, exact: true }).click();
-      if (group === "Servers") await choose(page, edit, "Server", "fixture-provider");
-      assert.equal(await toggle(edit, option).isChecked(), true);
+      const reopen = () => page.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(label, { exact: true }) }).click();
+      if (group === "Servers") {
+        await choose(page, edit, "Server", "fixture-provider");
+        assert.equal(await toggle(edit, "Server active").isChecked(), true);
+      } else {
+        await edit.getByRole("button", { name: "Downloads", exact: true }).getByText("Count downloads against the quota", { exact: true }).waitFor();
+        await edit.getByRole("button", { name: "Egress", exact: true }).getByText("Every egress", { exact: true }).waitFor();
+      }
       await edit.getByRole("button", { name: "Save", exact: true }).click();
       await edit.waitFor({ state: "hidden" });
-      await page.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(label, { exact: true }) }).click();
-      assert.equal(await toggle(edit, option).isChecked(), true);
-      await toggle(edit, option).uncheck();
+      await reopen();
+      if (group === "Servers") {
+        assert.equal(await toggle(edit, "Server active").isChecked(), true);
+        await toggle(edit, "Server active").uncheck();
+      } else {
+        await choose(page, edit, "Downloads", "Stop counting downloads against the quota");
+      }
       await edit.getByRole("button", { name: "Save", exact: true }).click();
       await edit.waitFor({ state: "hidden" });
-      await page.getByRole("region", { name: group, exact: true }).getByText(group === "Servers" ? "Set server availability: fixture-provider (Off)" : "Set quota metering: Off", { exact: true }).waitFor();
-      await page.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(label, { exact: true }) }).click();
-      assert.equal(await toggle(edit, option).isChecked(), false);
+      await page.getByRole("region", { name: group, exact: true }).getByText(group === "Servers" ? "Set server availability: fixture-provider (Off)" : "Stop counting downloads against the quota", { exact: true }).waitFor();
+      await reopen();
+      if (group === "Servers") assert.equal(await toggle(edit, "Server active").isChecked(), false);
+      else await edit.getByRole("button", { name: "Downloads", exact: true }).getByText("Stop counting downloads against the quota", { exact: true }).waitFor();
       await edit.getByRole("button", { name: "Cancel", exact: true }).click();
     }
   } finally { await page.close(); }
@@ -184,82 +202,91 @@ test("the schedules are one list with one Add, headed only by the groups that ho
 const storedSchedules = (page) => page.evaluate(() => fetch("/graphql", {
   method: "POST", body: JSON.stringify({ operationName: "Schedules", variables: {} }),
 }).then((response) => response.json()).then((payload) => payload.data.schedules));
-const oneShotRow = (page, label) => page.getByRole("region", { name: "One-shot actions", exact: true })
+const groupRow = (page, group, label) => page.getByRole("region", { name: group, exact: true })
   .getByRole("button").filter({ has: page.getByText(label, { exact: true }) });
 
-test("a rule that runs a script names a schedule instance, and is listed by that instance's name", async () => {
+test("the action picker offers the holds, then the settings a rule switches, and never a script", async () => {
   const page = await open("?schedules");
   try {
     await addSchedule(page).click();
     const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
-    await form.getByLabel("Label", { exact: true }).fill("fixture script");
+    await form.getByRole("button", { name: "Action", exact: true }).click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), [
+      "Pause downloads", "Resume downloads", "Pause all intake", "Pause post-processing", "Resume post-processing",
+      "Pause watch folder scanning", "Resume watch folder scanning", "Pause RSS", "Resume RSS", "Set a speed limit",
+      "Switch the hardware profile", "Set server availability", "Prune history", "Set quota metering",
+    ]);
+    await page.keyboard.press("Escape");
     assert.equal(await form.getByRole("button", { name: "Script job", exact: true }).count(), 0);
-    await choose(page, form, "Action", "Run script");
-    const instance = form.getByRole("button", { name: "Script job", exact: true });
-    await instance.getByText("Choose a job", { exact: true }).waitFor();
-    await form.getByText("A rule can only run a job whose trigger is Schedule.", { exact: true }).waitFor();
-    // A rule with no instance to run is refused, and the editor stays open to say so.
-    await form.getByRole("button", { name: "Save", exact: true }).click();
-    await form.getByText("a run_script schedule needs a script instance", { exact: true }).waitFor();
-    assert.deepEqual(await storedSchedules(page), []);
-    // Only the instances a schedule starts are offered, each by its name with its script beside it.
-    await instance.click();
-    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Choose a job", "Nightly report · nightly.py", "sweep.sh"]);
-    await page.getByRole("menuitemradio", { name: "Nightly report · nightly.py", exact: true }).click();
-    await instance.getByText("Nightly report · nightly.py", { exact: true }).waitFor();
-    // A script rule's time takes the script evaluator's own notation.
-    await form.getByText("Local time. HH:MM, or *:MM for every hour; separate several with commas.", { exact: true }).waitFor();
-    await form.getByLabel("Time", { exact: true }).fill("*:20");
-    await form.getByRole("button", { name: "Save", exact: true }).click();
-    await form.waitFor({ state: "hidden" });
-
-    const list = page.getByRole("region", { name: "Schedules", exact: true });
-    await list.getByRole("region", { name: "One-shot actions", exact: true }).getByText("local time · runs once each time", { exact: true }).waitFor();
-    const row = oneShotRow(page, "fixture script");
-    for (const text of ["*:20", "Run Nightly report"]) await row.getByText(text, { exact: true }).waitFor();
-    // Every rule is the operator's own: none is read-only.
-    assert.equal(await row.getByRole("switch").isDisabled(), false);
-    const [rule] = await storedSchedules(page);
-    assert.deepEqual(
-      [rule.actionType, rule.instanceId, rule.runAtStartup, rule.time, rule.times, rule.everyHourAtMinute],
-      ["run_script", "1", false, "*:20", [], null],
-    );
-    assert.equal("script" in rule, false);
-
-    // Reopened, the rule shows the instance it runs, and a chosen instance cannot be unchosen.
-    await row.getByText("fixture script", { exact: true }).click();
-    const edit = page.getByRole("dialog", { name: "fixture script", exact: true });
-    await edit.getByRole("button", { name: "Script job", exact: true }).getByText("Nightly report · nightly.py", { exact: true }).waitFor();
-    await edit.getByRole("button", { name: "Script job", exact: true }).click();
-    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Nightly report · nightly.py", "sweep.sh"]);
-    await page.getByRole("menuitemradio", { name: "sweep.sh", exact: true }).click();
-    await toggle(edit, "Also run at startup").click();
-    await edit.getByRole("button", { name: "Save", exact: true }).click();
-    await edit.waitFor({ state: "hidden" });
-    await row.getByText("Run sweep.sh", { exact: true }).waitFor();
-    const [updated] = await storedSchedules(page);
-    assert.deepEqual([updated.instanceId, updated.runAtStartup], ["2", true]);
   } finally { await page.close(); }
 });
 
-test("a rule whose instance no longer runs on a schedule says so, and can be pointed at one that does", async () => {
-  const page = await open("?schedules&stranded");
+test("a speed rule sets the global limit, each egress and each provider on its own, and blank leaves one as it is", async () => {
+  const page = await open("?schedules");
   try {
-    const row = oneShotRow(page, "fixture stranded");
-    // The instance is still there, but nothing about it is a schedule's any more.
-    await row.getByText("Run script", { exact: true }).waitFor();
-    assert.equal(await row.getByRole("switch").isDisabled(), false);
-    await row.getByText("fixture stranded", { exact: true }).click();
-    const edit = page.getByRole("dialog", { name: "fixture stranded", exact: true });
-    const instance = edit.getByRole("button", { name: "Script job", exact: true });
-    await instance.getByText("No longer a schedule job", { exact: true }).waitFor();
-    await instance.click();
-    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Nightly report · nightly.py", "sweep.sh", "No longer a schedule job"]);
-    await page.getByRole("menuitemradio", { name: "Nightly report · nightly.py", exact: true }).click();
+    await addSchedule(page).click();
+    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+    await form.getByLabel("Label", { exact: true }).fill("fixture evening");
+    await choose(page, form, "Action", "Set a speed limit");
+    // One time of day: there is no list of further times for a speed rule.
+    assert.equal(await form.getByLabel("Several times", { exact: true }).count(), 0);
+    for (const heading of ["Global", "Egresses", "Providers"]) await form.getByText(heading, { exact: true }).first().waitFor();
+    await form.getByText("MB/s", { exact: true }).first().waitFor();
+    // A rule that sets nothing is refused.
+    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await form.getByText("Set at least one limit.", { exact: true }).waitFor();
+    await form.getByLabel("fixture-egress", { exact: true }).fill("fast");
+    await form.getByText("A speed limit is a number of MB/s, 0 or more.", { exact: true }).waitFor();
+    await form.getByLabel("Global limit", { exact: true }).fill("5");
+    // Typing a rate takes back what a refused save said.
+    assert.equal(await form.getByText("Set at least one limit.", { exact: true }).count(), 0);
+    await form.getByLabel("fixture-egress", { exact: true }).fill("0");
+    await form.getByLabel("fixture-provider", { exact: true }).fill("2.5");
+    await shot(page, "speed-limit-editor");
+    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await form.waitFor({ state: "hidden" });
+
+    const [rule] = await storedSchedules(page);
+    assert.deepEqual(rule.speedLimits, [
+      { kind: "GLOBAL", id: null, bytesPerSec: 5 * 1024 * 1024 },
+      { kind: "EGRESS", id: 7, bytesPerSec: 0 },
+      { kind: "SERVER", id: 1, bytesPerSec: Math.round(2.5 * 1024 * 1024) },
+    ]);
+    assert.deepEqual(rule.times, []);
+    const row = groupRow(page, "Speed limit", "fixture evening");
+    const line = await row.getByText(/^Global /).textContent();
+    assert.match(line, /^Global 5(\.0+)? MB\/s, fixture-egress unlimited, fixture-provider 2\.5 MB\/s$/);
+
+    // Reopened, the stored rates are shown, and the target left blank stays out of the rule.
+    await row.click();
+    const edit = page.getByRole("dialog", { name: "fixture evening", exact: true });
+    assert.equal(await edit.getByLabel("Global limit", { exact: true }).inputValue(), "5");
+    assert.equal(await edit.getByLabel("fixture-egress", { exact: true }).inputValue(), "0");
+    assert.equal(await edit.getByLabel("fixture-vpn", { exact: true }).inputValue(), "");
+    await edit.getByLabel("fixture-provider", { exact: true }).fill("");
     await edit.getByRole("button", { name: "Save", exact: true }).click();
     await edit.waitFor({ state: "hidden" });
-    await row.getByText("Run Nightly report", { exact: true }).waitFor();
-    assert.equal((await storedSchedules(page))[0].instanceId, "1");
+    assert.deepEqual((await storedSchedules(page))[0].speedLimits.map((limit) => limit.kind), ["GLOBAL", "EGRESS"]);
+  } finally { await page.close(); }
+});
+
+test("a quota rule counts downloads against the quota on every egress or on one", async () => {
+  const page = await open("?schedules");
+  try {
+    await addSchedule(page).click();
+    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+    await form.getByLabel("Label", { exact: true }).fill("fixture unmetered");
+    await choose(page, form, "Action", "Set quota metering");
+    await choose(page, form, "Downloads", "Stop counting downloads against the quota");
+    await form.getByRole("button", { name: "Egress", exact: true }).click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Every egress", "fixture-egress", "fixture-vpn"]);
+    await page.getByRole("menuitemradio", { name: "fixture-vpn", exact: true }).click();
+    await shot(page, "quota-metering-editor");
+    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await form.waitFor({ state: "hidden" });
+    const [rule] = await storedSchedules(page);
+    assert.deepEqual([rule.quotaMeteringEnabled, rule.quotaEgressId], [false, 8]);
+    await groupRow(page, "Quota metering", "fixture unmetered").getByText("Stop counting downloads against the quota: fixture-vpn", { exact: true }).waitFor();
   } finally { await page.close(); }
 });
 

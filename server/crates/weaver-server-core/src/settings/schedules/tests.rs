@@ -1,4 +1,6 @@
 use super::*;
+use crate::bandwidth::{SpeedLimitChange, Weekday};
+use crate::proxies::{EgressBinding, EgressInterface};
 
 fn rule(id: &str, time: &str, days: Vec<Weekday>, action: ScheduleAction) -> ScheduleEntry {
     ScheduleEntry {
@@ -13,85 +15,31 @@ fn rule(id: &str, time: &str, days: Vec<Weekday>, action: ScheduleAction) -> Sch
     }
 }
 
-fn limit(id: &str, time: &str, days: Vec<Weekday>) -> ScheduleEntry {
-    rule(
-        id,
-        time,
-        days,
-        ScheduleAction::SpeedLimit {
-            bytes_per_sec: 1024,
+fn speeds(limits: &[(SpeedTarget, u64)]) -> ScheduleAction {
+    ScheduleAction::SpeedLimit {
+        limits: limits
+            .iter()
+            .map(|&(target, bytes_per_sec)| SpeedLimitChange {
+                target,
+                bytes_per_sec,
+            })
+            .collect(),
+    }
+}
+
+fn second_egress(db: &Database) -> u32 {
+    db.create_egress_interface(&EgressInterface {
+        id: 0,
+        name: "second line".into(),
+        binding: EgressBinding::SourceAddress {
+            address: "192.0.2.1".parse().unwrap(),
         },
-    )
-}
-
-#[test]
-fn migration_preserves_resets_across_watch_rules_and_week_boundaries() {
-    let entries = vec![
-        limit("limit", "23:00", vec![Weekday::Sun]),
-        rule(
-            "watch",
-            "23:30",
-            vec![Weekday::Sun],
-            ScheduleAction::PauseWatchFolderScanning,
-        ),
-        rule("resume", "07:00", vec![], ScheduleAction::Resume),
-        rule("pause", "22:00", vec![], ScheduleAction::Pause),
-    ];
-    let migrated = migrate_legacy_tracks(entries.clone());
-    assert_eq!(migrated.len(), entries.len() + 1);
-    let reset = &migrated[3];
-    assert_eq!(reset.time, "07:00");
-    assert_eq!(reset.days, vec![Weekday::Mon]);
-    assert_eq!(reset.action, ScheduleAction::ConfiguredSpeedLimit);
-    assert_eq!(migrate_legacy_tracks(migrated.clone()), migrated);
-}
-
-#[test]
-fn migration_keeps_same_minute_order_and_avoids_id_collisions() {
-    let migrated = migrate_legacy_tracks(vec![
-        limit("limit", "07:00", vec![]),
-        rule("pause", "23:00", vec![], ScheduleAction::Pause),
-        limit("pause-speed-reset", "23:00", vec![]),
-        rule("resume", "23:00", vec![], ScheduleAction::Resume),
-    ]);
-    assert_eq!(migrated.len(), 6);
-    assert_eq!(migrated[2].id, "pause-speed-reset-reset");
-    assert_eq!(migrated[3].id, "pause-speed-reset");
-    assert_eq!(migrated[5].action, ScheduleAction::ConfiguredSpeedLimit);
-    assert!(migrated[2].days.is_empty());
-}
-
-#[test]
-fn migration_preserves_reset_when_a_legacy_disabled_limit_is_enabled_later() {
-    let mut disabled = limit("disabled", "07:00", vec![]);
-    disabled.enabled = false;
-    let entries = vec![
-        disabled,
-        limit("invalid", "25:00", vec![]),
-        rule("pause", "08:00", vec![], ScheduleAction::Pause),
-        rule("resume", "09:00", vec![], ScheduleAction::Resume),
-    ];
-    let migrated = migrate_legacy_tracks(entries);
-    assert_eq!(migrated.len(), 5);
-    assert_eq!(migrated[3].action, ScheduleAction::ConfiguredSpeedLimit);
-    assert_eq!(migrated[3].time, "08:00");
-    assert!(!migrated[0].enabled);
-    assert!(migrate_legacy_tracks(vec![]).is_empty());
-}
-
-#[test]
-fn a_same_minute_watch_rule_shadowing_pause_does_not_add_a_speed_reset() {
-    let entries = vec![
-        limit("limit", "07:00", vec![]),
-        rule("pause", "23:00", vec![], ScheduleAction::Pause),
-        rule(
-            "watch",
-            "23:00",
-            vec![],
-            ScheduleAction::PauseWatchFolderScanning,
-        ),
-    ];
-    assert_eq!(migrate_legacy_tracks(entries.clone()), entries);
+        enabled: true,
+        max_download_speed: 0,
+        download_quota: Default::default(),
+    })
+    .unwrap()
+    .id
 }
 
 #[test]
@@ -109,125 +57,194 @@ fn pause_all_history_survives_rule_removal() {
 }
 
 #[test]
-fn migration_restores_configured_limit_after_an_unlimited_override_too() {
+fn speed_and_quota_rules_round_trip_with_their_targets() {
+    let db = Database::open_in_memory().unwrap();
+    let egress = second_egress(&db);
     let entries = vec![
         rule(
-            "unlimited",
-            "06:00",
-            vec![],
-            ScheduleAction::SpeedLimit { bytes_per_sec: 0 },
+            "speeds",
+            "07:00",
+            vec![Weekday::Mon],
+            speeds(&[
+                (SpeedTarget::Global, 5_000_000),
+                (SpeedTarget::Egress(egress), 0),
+            ]),
         ),
-        rule("resume", "08:00", vec![], ScheduleAction::Resume),
+        rule(
+            "count",
+            "08:00",
+            vec![],
+            ScheduleAction::SetQuotaMetering {
+                enabled: false,
+                target: QuotaTarget::Egress(egress),
+            },
+        ),
+        rule("rss", "09:00", vec![], ScheduleAction::PauseRss),
     ];
-    let migrated = migrate_legacy_tracks(entries);
-    assert_eq!(migrated.len(), 3);
-    assert_eq!(
-        migrated[0].action,
-        ScheduleAction::SpeedLimit { bytes_per_sec: 0 }
-    );
-    assert_eq!(migrated[2].action, ScheduleAction::ConfiguredSpeedLimit);
-    assert_eq!(migrate_legacy_tracks(migrated.clone()), migrated);
+    db.save_schedules(&entries).unwrap();
+    assert_eq!(db.list_schedules().unwrap(), entries);
 }
 
 #[test]
-fn legacy_settings_are_migrated_once_and_persisted_atomically() {
+fn a_quota_rule_saved_without_a_target_counts_for_every_egress() {
     let db = Database::open_in_memory().unwrap();
-    let entries = vec![
-        limit("limit", "07:00", vec![]),
-        rule("resume", "23:00", vec![], ScheduleAction::Resume),
-    ];
-    db.set_setting("schedules", &serde_json::to_string(&entries).unwrap())
-        .unwrap();
-    let migrated = db.list_schedules().unwrap();
-    assert_eq!(migrated.len(), 3);
+    db.set_setting(
+        "schedules",
+        r#"[{"id":"q","time":"08:00","action":{"type":"set_quota_metering","enabled":false}}]"#,
+    )
+    .unwrap();
     assert_eq!(
-        db.get_setting(TRACKS_VERSION_KEY).unwrap().as_deref(),
-        Some(TRACKS_VERSION)
+        db.list_schedules().unwrap()[0].action,
+        ScheduleAction::SetQuotaMetering {
+            enabled: false,
+            target: QuotaTarget::AllEgresses,
+        }
     );
+}
+
+#[test]
+fn a_rule_naming_a_missing_egress_is_refused() {
+    let db = Database::open_in_memory().unwrap();
+    for action in [
+        speeds(&[(SpeedTarget::Egress(99), 1)]),
+        ScheduleAction::SetQuotaMetering {
+            enabled: true,
+            target: QuotaTarget::Egress(99),
+        },
+        speeds(&[(SpeedTarget::Server(99), 1)]),
+    ] {
+        assert!(
+            db.save_schedules(&[rule("r", "07:00", vec![], action)])
+                .is_err()
+        );
+    }
+    assert!(db.list_schedules().unwrap().is_empty());
+}
+
+#[test]
+fn a_deleted_egress_drops_out_of_speed_and_quota_rules_on_load() {
+    let db = Database::open_in_memory().unwrap();
+    let egress = second_egress(&db);
+    let entries = vec![
+        rule(
+            "speeds",
+            "07:00",
+            vec![],
+            speeds(&[
+                (SpeedTarget::Global, 1_000),
+                (SpeedTarget::Egress(egress), 2_000),
+                (SpeedTarget::Egress(0), 3_000),
+            ]),
+        ),
+        rule(
+            "only",
+            "08:00",
+            vec![],
+            speeds(&[(SpeedTarget::Egress(egress), 2_000)]),
+        ),
+        rule(
+            "count",
+            "09:00",
+            vec![],
+            ScheduleAction::SetQuotaMetering {
+                enabled: false,
+                target: QuotaTarget::Egress(egress),
+            },
+        ),
+    ];
+    db.save_schedules(&entries).unwrap();
+    db.delete_egress_interface(egress).unwrap();
+
+    let loaded = db.list_schedules().unwrap();
+    assert_eq!(
+        loaded,
+        vec![
+            rule(
+                "speeds",
+                "07:00",
+                vec![],
+                speeds(&[
+                    (SpeedTarget::Global, 1_000),
+                    (SpeedTarget::Egress(0), 3_000)
+                ]),
+            ),
+            // Kept, doing nothing, so the operator sees what became of it.
+            rule("only", "08:00", vec![], speeds(&[])),
+        ]
+    );
+    // What was taken out is saved, so it is reported once.
     assert_eq!(
         decode(&db.get_setting("schedules").unwrap().unwrap()).unwrap(),
-        migrated
+        loaded
     );
-    assert_eq!(db.list_schedules().unwrap(), migrated);
-    // An operator can remove the compatibility rule without it coming back.
-    db.save_schedules(&entries).unwrap();
-    assert_eq!(db.list_schedules().unwrap(), entries);
 }
 
 #[test]
-fn new_schedule_sets_are_never_migrated() {
+fn an_egress_given_a_deleted_egress_id_inherits_none_of_its_rules() {
     let db = Database::open_in_memory().unwrap();
-    let entries = vec![
-        limit("limit", "07:00", vec![]),
-        rule("resume", "23:00", vec![], ScheduleAction::Resume),
-    ];
-    db.save_schedules(&entries).unwrap();
-    assert_eq!(db.list_schedules().unwrap(), entries);
+    let egress = second_egress(&db);
+    db.save_schedules(&[
+        rule(
+            "speeds",
+            "07:00",
+            vec![],
+            speeds(&[
+                (SpeedTarget::Global, 1_000),
+                (SpeedTarget::Egress(egress), 2_000),
+            ]),
+        ),
+        rule(
+            "count",
+            "08:00",
+            vec![],
+            ScheduleAction::SetQuotaMetering {
+                enabled: false,
+                target: QuotaTarget::Egress(egress),
+            },
+        ),
+    ])
+    .unwrap();
+    db.delete_egress_interface(egress).unwrap();
+
+    // The delete itself took the rules out, before any load tidied them.
+    let stripped = vec![rule(
+        "speeds",
+        "07:00",
+        vec![],
+        speeds(&[(SpeedTarget::Global, 1_000)]),
+    )];
+    assert_eq!(
+        decode(&db.get_setting("schedules").unwrap().unwrap()).unwrap(),
+        stripped
+    );
+
+    let reused = second_egress(&db);
+    assert_eq!(reused, egress);
+    assert_eq!(db.list_schedules().unwrap(), stripped);
 }
 
 #[test]
-fn invalid_legacy_json_leaves_settings_and_version_untouched() {
+fn an_unreadable_rule_is_left_out_and_the_rest_load() {
+    let db = Database::open_in_memory().unwrap();
+    db.set_setting(
+        "schedules",
+        r#"[{"id":"gone","label":"Fetch feeds","time":"08:00","action":{"type":"fetch_rss","feed_id":null}},
+            {"id":"kept","time":"09:00","action":{"type":"pause"}}]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        db.list_schedules().unwrap(),
+        vec![rule("kept", "09:00", vec![], ScheduleAction::Pause)]
+    );
+}
+
+#[test]
+fn unreadable_schedules_are_an_error_and_left_as_they_are() {
     let db = Database::open_in_memory().unwrap();
     db.set_setting("schedules", "invalid").unwrap();
     assert!(db.list_schedules().is_err());
     assert_eq!(
         db.get_setting("schedules").unwrap().as_deref(),
         Some("invalid")
-    );
-    assert_eq!(db.get_setting(TRACKS_VERSION_KEY).unwrap(), None);
-}
-
-#[test]
-fn disabled_legacy_download_rules_enable_their_reset_companions() {
-    for action in [ScheduleAction::Pause, ScheduleAction::Resume] {
-        let db = Database::open_in_memory().unwrap();
-        let mut disabled = rule("download", "08:00", vec![], action);
-        disabled.enabled = false;
-        let entries = vec![
-            limit("limit", "07:00", vec![]),
-            disabled,
-            rule("later", "09:00", vec![], ScheduleAction::Resume),
-        ];
-        db.set_setting("schedules", &serde_json::to_string(&entries).unwrap())
-            .unwrap();
-        let mut migrated = db.list_schedules().unwrap();
-        assert_eq!(migrated.len(), 5);
-        assert!(!migrated[2].enabled);
-        assert!(migrated[4].enabled);
-        assert_eq!(migrate_legacy_tracks(migrated.clone()), migrated);
-        migrated[1].enabled = true;
-        db.save_schedules(&migrated).unwrap();
-        let mut saved = db.list_schedules().unwrap();
-        assert!(saved[2].enabled);
-        saved[2].enabled = false;
-        db.save_schedules(&saved).unwrap();
-        saved[1].enabled = false;
-        db.save_schedules(&saved).unwrap();
-        saved[1].enabled = true;
-        db.save_schedules(&saved).unwrap();
-        assert!(!db.list_schedules().unwrap()[2].enabled);
-        saved.remove(2);
-        saved[1].enabled = false;
-        db.save_schedules(&saved).unwrap();
-        saved[1].enabled = true;
-        db.save_schedules(&saved).unwrap();
-        assert_eq!(db.list_schedules().unwrap(), saved);
-    }
-}
-
-#[test]
-fn unreadable_reset_links_do_not_block_schedule_saves() {
-    let db = Database::open_in_memory().unwrap();
-    let entries = vec![limit("limit", "07:00", vec![])];
-    db.save_schedules(&entries).unwrap();
-    db.set_setting("schedule_legacy_speed_reset_links", "invalid")
-        .unwrap();
-    db.save_schedules(&entries).unwrap();
-    assert_eq!(db.list_schedules().unwrap(), entries);
-    assert_eq!(
-        db.get_setting("schedule_legacy_speed_reset_links")
-            .unwrap()
-            .as_deref(),
-        Some("{}")
     );
 }

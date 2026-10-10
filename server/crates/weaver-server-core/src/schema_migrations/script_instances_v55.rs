@@ -21,6 +21,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::StateError;
+use crate::bandwidth::Weekday;
 use crate::persistence::sql_runtime::{SqlArg, SqlConn};
 use crate::post_processing::listing::resolve_script;
 use crate::post_processing::model::{
@@ -40,6 +41,7 @@ const OPTIONS_KEY: &str = "post_processing.script_options.v1";
 const DIRECTORY_KEY: &str = "post_processing.script_directory.v1";
 const SETTINGS_KEY: &str = "post_processing.settings.v2";
 const SCHEDULES_KEY: &str = "schedules";
+const SPEED_KEY: &str = "max_download_speed";
 
 const MAX_NAME_BYTES: usize = 128;
 const MAX_TIMEOUT_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -134,6 +136,9 @@ struct Saved {
     options: Option<String>,
     schedules: Option<String>,
     settings: Option<String>,
+    /// The download speed limit set in the settings, which a pause or resume
+    /// rule used to put back in force.
+    configured_speed: u64,
     /// Each feed with the script names it was given.
     feeds: Vec<(i64, String)>,
     /// Secret names already taken, in their compared form.
@@ -191,6 +196,65 @@ struct Instance {
     enabled: bool,
     blocking: bool,
     timeout_seconds: Option<i64>,
+    timing: Timing,
+}
+
+/// When a schedule instance runs: the `schedule_days`, `schedule_times` and
+/// `run_at_startup` columns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Timing {
+    /// `None` until a time is carried in. Empty is every day.
+    days: Option<BTreeSet<Weekday>>,
+    /// `HH:MM`, or `*:MM` for every hour.
+    times: BTreeSet<String>,
+    run_at_startup: bool,
+}
+
+impl Timing {
+    /// Add the times one saved rule or header ran the script at. The days
+    /// are joined, so a rule for other days than the rest runs its times on
+    /// those days as well; that is reported.
+    fn add(&mut self, days: &[Weekday], times: &[ScriptTaskTime]) -> bool {
+        let days = if days.len() >= 7 {
+            BTreeSet::new()
+        } else {
+            days.iter().copied().collect()
+        };
+        for time in times {
+            match time {
+                ScriptTaskTime::Startup => self.run_at_startup = true,
+                time => {
+                    self.times.insert(time.to_string());
+                }
+            }
+        }
+        let differs = self.days.as_ref().is_some_and(|saved| *saved != days);
+        self.days = Some(match self.days.take() {
+            Some(saved) if saved.is_empty() || days.is_empty() => BTreeSet::new(),
+            Some(mut saved) => {
+                saved.extend(days);
+                if saved.len() == 7 {
+                    saved.clear();
+                }
+                saved
+            }
+            None => days,
+        });
+        differs
+    }
+
+    fn stored_days(&self) -> String {
+        self.days
+            .iter()
+            .flatten()
+            .map(|day| day.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn stored_times(&self) -> String {
+        self.times.iter().cloned().collect::<Vec<_>>().join(",")
+    }
 }
 
 /// What to write, worked out before anything is written.
@@ -212,13 +276,14 @@ async fn read(conn: &mut SqlConn<'_>) -> Result<Saved, StateError> {
     let mut saved = Saved::default();
     for row in conn
         .fetch_all(
-            "SELECT key, value FROM settings WHERE key IN ({}, {}, {}, {}, {})",
+            "SELECT key, value FROM settings WHERE key IN ({}, {}, {}, {}, {}, {})",
             &[
                 SqlArg::Text(LISTS_KEY.into()),
                 SqlArg::Text(OPTIONS_KEY.into()),
                 SqlArg::Text(DIRECTORY_KEY.into()),
                 SqlArg::Text(SETTINGS_KEY.into()),
                 SqlArg::Text(SCHEDULES_KEY.into()),
+                SqlArg::Text(SPEED_KEY.into()),
             ],
         )
         .await?
@@ -232,6 +297,7 @@ async fn read(conn: &mut SqlConn<'_>) -> Result<Saved, StateError> {
             DIRECTORY_KEY => saved.directory = Some(PathBuf::from(value)),
             SETTINGS_KEY => saved.settings = Some(value),
             SCHEDULES_KEY => saved.schedules = Some(value),
+            SPEED_KEY => saved.configured_speed = value.trim().parse().unwrap_or(0),
             _ => {}
         }
     }
@@ -272,8 +338,9 @@ async fn write(conn: &mut SqlConn<'_>, plan: &Plan) -> Result<(), StateError> {
         conn.execute(
             "INSERT INTO script_instances
                 (id, name, script, trigger_kind, trigger_detail, enabled, blocking,
-                 timeout_seconds, run_order, created_at_ms, updated_at_ms)
-             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                 timeout_seconds, schedule_days, schedule_times, run_at_startup, run_order,
+                 created_at_ms, updated_at_ms)
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             &[
                 SqlArg::Text(instance.id.clone()),
                 SqlArg::Text(instance.name.clone()),
@@ -283,6 +350,9 @@ async fn write(conn: &mut SqlConn<'_>, plan: &Plan) -> Result<(), StateError> {
                 SqlArg::Bool(instance.enabled),
                 SqlArg::Bool(instance.blocking),
                 SqlArg::OptI64(instance.timeout_seconds),
+                SqlArg::Text(instance.timing.stored_days()),
+                SqlArg::Text(instance.timing.stored_times()),
+                SqlArg::Bool(instance.timing.run_at_startup),
                 SqlArg::I64(run_order as i64),
                 SqlArg::I64(now),
                 SqlArg::I64(now),
@@ -614,6 +684,7 @@ impl Planner<'_> {
                 .timeout_seconds
                 .filter(|seconds| (1..=MAX_TIMEOUT_SECONDS).contains(seconds))
                 .map(|seconds| seconds as i64),
+            timing: Timing::default(),
         };
         self.plan.instances.push(instance);
         Ok(self.plan.instances.len() - 1)
@@ -621,6 +692,82 @@ impl Planner<'_> {
 
     fn id(&self, index: usize) -> String {
         self.plan.instances[index].id.clone()
+    }
+
+    /// Move a saved rule that ran a script onto that script's schedule
+    /// instance, making the instance when the list had none.
+    fn carry_scheduled_run(
+        &mut self,
+        row: &Value,
+        label: &str,
+        lists: &SavedLists,
+        schedule_instances: &mut BTreeMap<String, usize>,
+    ) -> Result<(), StateError> {
+        let Some(name) = row
+            .pointer("/action/script")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            self.plan.warnings.push(format!(
+                "schedule rule {label} ran a script it did not name, and was removed"
+            ));
+            return Ok(());
+        };
+        let enabled = rule_enabled(row);
+        let index = match schedule_instances.get(&name) {
+            Some(index) => *index,
+            None => {
+                let Some(script) = self.known(&name) else {
+                    return Ok(());
+                };
+                let listed = lists.global.iter().find(|entry| entry.script == name);
+                let ran = script.declares(ScriptKind::Scheduler);
+                let policy = Policy {
+                    enabled: false,
+                    blocking: listed.is_none_or(|entry| entry.blocking),
+                    timeout_seconds: listed.and_then(|entry| entry.timeout_seconds),
+                };
+                if !ran {
+                    self.plan.warnings.push(format!(
+                        "a schedule named script {name}, which did not run on a schedule; it was kept as a turned-off instance"
+                    ));
+                }
+                let index = self.add(&script, Trigger::Schedule, None, policy)?;
+                schedule_instances.insert(name.clone(), index);
+                if !ran {
+                    // Kept off, but with the times it would have run at.
+                    self.plan.instances[index]
+                        .timing
+                        .add(&rule_days(row), &rule_times(row));
+                    self.plan.warnings.push(format!(
+                        "schedule rule {label} ran script {name}; its times are now on that script's schedule job, and the rule was removed"
+                    ));
+                    return Ok(());
+                }
+                index
+            }
+        };
+        if !enabled {
+            // A rule turned off ran nothing, so its times are not carried.
+            self.plan.warnings.push(format!(
+                "schedule rule {label} for script {name} was turned off, so its times were not carried to the script's schedule job; the rule was removed"
+            ));
+            return Ok(());
+        }
+        // A saved rule ran its script whether or not the list had it turned on.
+        let instance = &mut self.plan.instances[index];
+        instance.enabled = true;
+        let differs = instance.timing.add(&rule_days(row), &rule_times(row));
+        self.plan.warnings.push(if differs {
+            format!(
+                "schedule rule {label} ran script {name} on other days than its other times; its times are now on that script's schedule job on all of those days, and the rule was removed"
+            )
+        } else {
+            format!(
+                "schedule rule {label} ran script {name}; its times are now on that script's schedule job, and the rule was removed"
+            )
+        });
+        Ok(())
     }
 }
 
@@ -651,27 +798,147 @@ fn decode<T: for<'de> Deserialize<'de> + Default>(
     })
 }
 
-/// A schedule row as it is saved, running `instance_id` at `time`.
-fn schedule_row(
-    id: String,
-    enabled: bool,
-    label: String,
-    time: String,
-    instance_id: String,
-) -> Value {
+/// What a saved schedule rule is called in a log line.
+fn rule_label(row: &Value) -> String {
+    [row.get("label"), row.get("id")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find(|text| !text.is_empty())
+        .unwrap_or("unnamed")
+        .to_string()
+}
+
+fn rule_kind(row: &Value) -> &str {
+    row.pointer("/action/type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn rule_enabled(row: &Value) -> bool {
+    row.get("enabled").and_then(Value::as_bool).unwrap_or(true)
+}
+
+/// A rule's days. Empty is every day.
+fn rule_days(row: &Value) -> Vec<Weekday> {
+    row.get("days")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(Weekday::parse)
+        .collect()
+}
+
+/// Every time a rule that ran a script fired at: its time, which may be a
+/// list, its extra times, its minute past every hour and run at startup.
+fn rule_times(row: &Value) -> Vec<ScriptTaskTime> {
+    let mut declared = Vec::<String>::new();
+    if let Some(time) = row.get("time").and_then(Value::as_str) {
+        declared.extend(time.split([',', ';']).map(str::to_string));
+    }
+    declared.extend(
+        row.get("times")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string),
+    );
+    if let Some(minute) = row.get("every_hour_at_minute").and_then(Value::as_u64) {
+        declared.push(format!("*:{minute:02}"));
+    }
+    if row
+        .pointer("/action/run_at_startup")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        declared.push("*".into());
+    }
+    declared
+        .iter()
+        .filter_map(|time| time.trim().parse::<ScriptTaskTime>().ok())
+        .collect()
+}
+
+/// `HH:MM` as minutes past midnight.
+fn minute_of_day(time: &str) -> Option<u32> {
+    let (hour, minute) = time.trim().split_once(':')?;
+    let (hour, minute) = (hour.parse::<u32>().ok()?, minute.parse::<u32>().ok()?);
+    (hour < 24 && minute < 60).then_some(hour * 60 + minute)
+}
+
+/// Earlier builds held pause, resume and speed rules on one track, so a pause
+/// or resume ended a scheduled speed limit and put the configured one back.
+/// Each now holds its own track, so for every day a pause or resume followed
+/// a speed rule, a speed rule setting the configured limit is added beside
+/// it. Returns those days by the rule's position.
+fn legacy_speed_resets(rows: &[Value]) -> BTreeMap<usize, Vec<Weekday>> {
+    const SHARED: [&str; 4] = ["pause", "resume", "speed_limit", "configured_speed_limit"];
+    let on = |row: &Value, day: Weekday| {
+        let days = rule_days(row);
+        days.is_empty() || days.contains(&day)
+    };
+    let time = |row: &Value| {
+        row.get("time")
+            .and_then(Value::as_str)
+            .and_then(minute_of_day)
+    };
+    let mut week = Vec::new();
+    for (day_index, day) in Weekday::ALL.into_iter().enumerate() {
+        for (index, row) in rows.iter().enumerate() {
+            // A rule turned off can be turned on later, so it gets its
+            // companion too, turned off the same way.
+            if !on(row, day) || !SHARED.contains(&rule_kind(row)) {
+                continue;
+            }
+            if let Some(time) = time(row) {
+                week.push((day_index, time, index));
+            }
+        }
+    }
+    // A later watch-folder rule in the same minute took the one track.
+    week.retain(|&(day, minute, index)| {
+        !rows.iter().skip(index + 1).any(|row| {
+            rule_enabled(row)
+                && on(row, Weekday::ALL[day])
+                && time(row) == Some(minute)
+                && matches!(
+                    rule_kind(row),
+                    "pause_watch_folder_scanning" | "resume_watch_folder_scanning"
+                )
+        })
+    });
+    week.sort_unstable();
+    let mut resets = BTreeMap::<usize, Vec<Weekday>>::new();
+    for (position, &(day, minute, index)) in week.iter().enumerate() {
+        let previous = (1..=week.len())
+            .map(|offset| week[(position + week.len() - offset) % week.len()].2)
+            .find(|&candidate| {
+                rule_enabled(&rows[candidate]) || rule_kind(&rows[candidate]) == "speed_limit"
+            })
+            .unwrap_or(index);
+        let (next_day, next_minute, next) = week[(position + 1) % week.len()];
+        if next_day == day
+            && next_minute == minute
+            && rule_kind(&rows[next]) == "configured_speed_limit"
+        {
+            continue;
+        }
+        if matches!(rule_kind(&rows[index]), "pause" | "resume")
+            && rule_kind(&rows[previous]) == "speed_limit"
+        {
+            resets.entry(index).or_default().push(Weekday::ALL[day]);
+        }
+    }
+    resets
+}
+
+/// A speed rule for the global limit alone.
+fn global_speed(bytes_per_sec: u64) -> Value {
     json!({
-        "id": id,
-        "enabled": enabled,
-        "label": label,
-        "days": [],
-        "time": time,
-        "times": [],
-        "every_hour_at_minute": null,
-        "action": {
-            "type": "run_script",
-            "instance_id": instance_id,
-            "run_at_startup": false,
-        },
+        "type": "speed_limit",
+        "limits": [{"target": {"kind": "global"}, "bytes_per_sec": bytes_per_sec}],
     })
 }
 
@@ -705,7 +972,6 @@ fn plan(saved: &Saved) -> Result<Plan, StateError> {
     let mut schedule_instances = BTreeMap::<String, usize>::new();
     let mut scan_scripts = BTreeSet::<String>::new();
     let mut feed_instances = Vec::<(String, usize)>::new();
-    let mut rows = Vec::<Value>::new();
     for entry in &lists.global {
         let Some(script) = planner.known(&entry.script) else {
             continue;
@@ -741,19 +1007,15 @@ fn plan(saved: &Saved) -> Result<Plan, StateError> {
                 ScriptKind::Scheduler => {
                     let index = planner.add(&script, Trigger::Schedule, None, policy)?;
                     schedule_instances.insert(entry.script.clone(), index);
-                    // The times in the header were a schedule nobody saved.
-                    // A start-up time never ran, so it has no row.
-                    for time in times
+                    // The times in the header ran while the script was turned
+                    // on in the list. A start-up time never ran.
+                    let header = times
                         .iter()
-                        .filter(|time| **time != ScriptTaskTime::Startup)
-                    {
-                        rows.push(schedule_row(
-                            new_id()?,
-                            entry.enabled,
-                            format!("{} ({time})", entry.script),
-                            time.to_string(),
-                            planner.id(index),
-                        ));
+                        .copied()
+                        .filter(|time| *time != ScriptTaskTime::Startup)
+                        .collect::<Vec<_>>();
+                    if entry.enabled && !header.is_empty() {
+                        planner.plan.instances[index].timing.add(&[], &header);
                     }
                 }
             }
@@ -845,13 +1107,15 @@ fn plan(saved: &Saved) -> Result<Plan, StateError> {
         }
     }
 
-    // Saved schedule rows named a script; they name an instance now.
-    let mut schedules = match saved
+    // Saved schedule rules. One that ran a script becomes that script's own
+    // run times; one this build no longer offers is removed; a speed rule
+    // sets the global limit.
+    let schedules = match saved
         .schedules
         .as_deref()
         .map(serde_json::from_str::<Value>)
     {
-        None => Some(Vec::new()),
+        None => None,
         Some(Ok(Value::Array(saved))) => Some(saved),
         Some(_) => {
             planner.plan.warnings.push(
@@ -861,60 +1125,75 @@ fn plan(saved: &Saved) -> Result<Plan, StateError> {
             None
         }
     };
-    if let Some(schedules) = &mut schedules {
+    if let Some(schedules) = schedules {
+        let resets = legacy_speed_resets(&schedules);
+        let mut ids = schedules
+            .iter()
+            .filter_map(|row| row.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let mut kept = Vec::with_capacity(schedules.len());
         let mut changed = false;
-        for row in schedules.iter_mut() {
-            let Some(action) = row.get_mut("action").and_then(Value::as_object_mut) else {
-                continue;
-            };
-            if action.get("type").and_then(Value::as_str) != Some("run_script") {
-                continue;
-            }
-            let Some(name) = action
-                .get("script")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            let index = match schedule_instances.get(&name) {
-                // A saved row ran its script whether or not the list had it
-                // turned on.
-                Some(index) => {
-                    planner.plan.instances[*index].enabled = true;
-                    *index
+        for (position, mut row) in schedules.into_iter().enumerate() {
+            let label = rule_label(&row);
+            match rule_kind(&row) {
+                "run_script" => {
+                    changed = true;
+                    planner.carry_scheduled_run(&row, &label, &lists, &mut schedule_instances)?;
+                    continue;
                 }
-                None => {
-                    let Some(script) = planner.known(&name) else {
-                        continue;
-                    };
-                    let listed = lists.global.iter().find(|entry| entry.script == name);
-                    let ran = script.declares(ScriptKind::Scheduler);
-                    let policy = Policy {
-                        enabled: ran,
-                        blocking: listed.is_none_or(|entry| entry.blocking),
-                        timeout_seconds: listed.and_then(|entry| entry.timeout_seconds),
-                    };
-                    if !ran {
-                        planner.plan.warnings.push(format!(
-                            "a schedule named script {name}, which did not run on a schedule; it was kept as a turned-off instance"
-                        ));
+                kind @ ("scan_watch_folder" | "fetch_rss" | "configured_speed_limit") => {
+                    changed = true;
+                    planner.plan.warnings.push(format!(
+                        "schedule rule {label} ({kind}) is not offered any more and was removed"
+                    ));
+                    continue;
+                }
+                "speed_limit" => {
+                    if let Some(bytes_per_sec) =
+                        row.pointer("/action/bytes_per_sec").and_then(Value::as_u64)
+                    {
+                        row["action"] = global_speed(bytes_per_sec);
+                        changed = true;
                     }
-                    let index = planner.add(&script, Trigger::Schedule, None, policy)?;
-                    schedule_instances.insert(name, index);
-                    index
                 }
-            };
-            action.remove("script");
-            action.insert("instance_id".into(), Value::String(planner.id(index)));
-            changed = true;
-        }
-        if !rows.is_empty() {
-            schedules.append(&mut rows);
-            changed = true;
+                _ => {}
+            }
+            let reset = resets.get(&position).map(|days| {
+                let id = row
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("rule")
+                    .to_string();
+                let mut id = format!("{id}-speed-reset");
+                while !ids.insert(id.clone()) {
+                    id.push_str("-reset");
+                }
+                json!({
+                    "id": id,
+                    "enabled": rule_enabled(&row),
+                    "label": "Preserve legacy speed reset",
+                    "days": if days.len() == 7 {
+                        Vec::new()
+                    } else {
+                        days.iter().map(|day| day.as_str()).collect::<Vec<_>>()
+                    },
+                    "time": row.get("time").cloned().unwrap_or(Value::Null),
+                    "times": [],
+                    "every_hour_at_minute": null,
+                    "action": global_speed(saved.configured_speed),
+                })
+            });
+            kept.push(row);
+            // After its rule, so a later speed rule in the same minute still
+            // wins.
+            if let Some(reset) = reset {
+                kept.push(reset);
+                changed = true;
+            }
         }
         if changed {
-            planner.plan.schedules = Some(Value::Array(std::mem::take(schedules)).to_string());
+            planner.plan.schedules = Some(Value::Array(kept).to_string());
         }
     }
 
@@ -1001,7 +1280,10 @@ mod tests {
     use super::*;
     use crate::Database;
     use crate::bandwidth::ScheduleAction;
-    use crate::post_processing::instances::{InstanceTrigger, ScriptInstance, resolve_instances};
+    use crate::bandwidth::{SpeedLimitChange, SpeedTarget};
+    use crate::post_processing::instances::{
+        InstanceSchedule, InstanceTrigger, ScriptInstance, resolve_instances,
+    };
     use crate::post_processing::model::ScriptEventLabel;
 
     /// A script whose header is a line of its own source.
@@ -1307,7 +1589,20 @@ mod tests {
             ])
         );
 
-        let nightly = id("nightly.sh", Schedule);
+        // The saved rule's time is on the job now. The header's time never
+        // ran, because the list had the script turned off.
+        let nightly = instances
+            .iter()
+            .find(|instance| instance.id == id("nightly.sh", Schedule))
+            .unwrap();
+        assert_eq!(
+            nightly.schedule,
+            InstanceSchedule {
+                days: Vec::new(),
+                times: vec!["02:00".into()],
+                run_at_startup: false,
+            }
+        );
         let schedules = db.list_schedules().unwrap();
         assert_eq!(
             schedules
@@ -1319,28 +1614,7 @@ mod tests {
                     &row.action
                 ))
                 .collect::<Vec<_>>(),
-            [
-                (
-                    "night",
-                    "02:00",
-                    true,
-                    &ScheduleAction::RunScript {
-                        instance_id: nightly.clone(),
-                        run_at_startup: false,
-                    }
-                ),
-                ("quiet", "01:00", true, &ScheduleAction::Pause),
-                // The time in the header, which nobody had saved.
-                (
-                    "nightly.sh (03:30)",
-                    "03:30",
-                    false,
-                    &ScheduleAction::RunScript {
-                        instance_id: nightly,
-                        run_at_startup: false,
-                    }
-                ),
-            ]
+            [("quiet", "01:00", true, &ScheduleAction::Pause)]
         );
 
         let settings = db.post_processing_settings().unwrap();
@@ -1437,12 +1711,164 @@ mod tests {
             plan.instances.iter().map(shape).collect::<Vec<_>>(),
             [("post.sh", Trigger::Schedule, None, false, true)]
         );
-        assert_eq!(plan.warnings.len(), 1);
-        let rows: Value = serde_json::from_str(plan.schedules.as_deref().unwrap()).unwrap();
+        // The script, and the rule that was removed.
+        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
         assert_eq!(
-            rows[0]["action"],
-            json!({"type": "run_script", "instance_id": plan.instances[0].id, "run_at_startup": true})
+            plan.instances[0].timing,
+            Timing {
+                days: Some(BTreeSet::new()),
+                times: BTreeSet::from(["02:00".to_string()]),
+                run_at_startup: true,
+            }
         );
+        assert_eq!(plan.schedules.as_deref(), Some("[]"));
+    }
+
+    fn scheduler_script(root: &Path) {
+        bare(
+            root,
+            "tidy.sh",
+            "### NZBGET SCHEDULER SCRIPT ###\n### TASK TIME: *;03:30 ###",
+        );
+    }
+
+    #[test]
+    fn script_rules_become_the_jobs_run_times_and_one_turned_off_runs_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        scheduler_script(root.path());
+        let plan = plan(&Saved {
+            lists: Some(json!({"global": [{"script": "tidy.sh"}]}).to_string()),
+            schedules: Some(
+                json!([
+                    {"id": "a", "label": "Weekday mornings", "days": ["mon", "fri"], "time": "07:00;*:15",
+                     "action": {"type": "run_script", "script": "tidy.sh", "run_at_startup": true}},
+                    {"id": "b", "label": "Weekends", "days": ["sat"], "time": "10:00",
+                     "action": {"type": "run_script", "script": "tidy.sh", "run_at_startup": false}},
+                    {"id": "c", "label": "Off", "enabled": false, "time": "11:00",
+                     "action": {"type": "run_script", "script": "tidy.sh", "run_at_startup": false}},
+                    {"id": "d", "label": "Keep", "time": "12:00", "action": {"type": "pause"}},
+                ])
+                .to_string(),
+            ),
+            ..saved(root.path())
+        })
+        .unwrap();
+        assert_eq!(plan.instances.len(), 1);
+        // The header's 03:30 ran every day, so every rule's days join it.
+        assert_eq!(
+            plan.instances[0].timing,
+            Timing {
+                days: Some(BTreeSet::new()),
+                times: ["*:15", "03:30", "07:00", "10:00"].map(String::from).into(),
+                run_at_startup: true,
+            }
+        );
+        // One line per removed rule, naming it.
+        for label in ["Weekday mornings", "Weekends", "Off"] {
+            assert!(
+                plan.warnings.iter().any(|warning| warning.contains(label)),
+                "{label}: {:?}",
+                plan.warnings
+            );
+        }
+        let rows: Value = serde_json::from_str(plan.schedules.as_deref().unwrap()).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["id"], "d");
+    }
+
+    #[test]
+    fn rules_for_removed_actions_are_dropped_by_name_and_a_speed_rule_sets_the_global_limit() {
+        let plan = plan(&Saved {
+            schedules: Some(
+                json!([
+                    {"id": "a", "label": "Scan now", "time": "01:00", "action": {"type": "scan_watch_folder"}},
+                    {"id": "b", "label": "Feeds", "time": "02:00", "action": {"type": "fetch_rss", "feed_id": null}},
+                    {"id": "c", "label": "Back to normal", "time": "03:00", "action": {"type": "configured_speed_limit"}},
+                    {"id": "d", "label": "Slow", "time": "04:00", "action": {"type": "speed_limit", "bytes_per_sec": 5000}},
+                ])
+                .to_string(),
+            ),
+            ..Saved::default()
+        })
+        .unwrap();
+        for label in ["Scan now", "Feeds", "Back to normal"] {
+            assert!(
+                plan.warnings.iter().any(|warning| warning.contains(label)),
+                "{label}: {:?}",
+                plan.warnings
+            );
+        }
+        let rows: Vec<crate::bandwidth::ScheduleEntry> =
+            serde_json::from_str(plan.schedules.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.id.as_str(), row.action.clone()))
+                .collect::<Vec<_>>(),
+            [(
+                "d",
+                ScheduleAction::SpeedLimit {
+                    limits: vec![SpeedLimitChange {
+                        target: SpeedTarget::Global,
+                        bytes_per_sec: 5000,
+                    }],
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn a_pause_after_a_speed_rule_keeps_putting_the_configured_limit_back() {
+        let plan = plan(&Saved {
+            configured_speed: 9000,
+            schedules: Some(
+                json!([
+                    {"id": "slow", "time": "08:00", "action": {"type": "speed_limit", "bytes_per_sec": 1000}},
+                    {"id": "stop", "days": ["mon", "tue"], "time": "12:00", "action": {"type": "pause"}},
+                    {"id": "go", "time": "13:00", "action": {"type": "resume"}},
+                ])
+                .to_string(),
+            ),
+            ..Saved::default()
+        })
+        .unwrap();
+        let rows: Vec<crate::bandwidth::ScheduleEntry> =
+            serde_json::from_str(plan.schedules.as_deref().unwrap()).unwrap();
+        let configured = ScheduleAction::SpeedLimit {
+            limits: vec![SpeedLimitChange {
+                target: SpeedTarget::Global,
+                bytes_per_sec: 9000,
+            }],
+        };
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.id.as_str(), row.days.clone(), row.time.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("slow", vec![], "08:00"),
+                ("stop", vec![Weekday::Mon, Weekday::Tue], "12:00"),
+                (
+                    "stop-speed-reset",
+                    vec![Weekday::Mon, Weekday::Tue],
+                    "12:00"
+                ),
+                ("go", vec![], "13:00"),
+                // Only on the days no pause came between.
+                (
+                    "go-speed-reset",
+                    vec![
+                        Weekday::Wed,
+                        Weekday::Thu,
+                        Weekday::Fri,
+                        Weekday::Sat,
+                        Weekday::Sun
+                    ],
+                    "13:00"
+                ),
+            ]
+        );
+        assert_eq!(rows[2].action, configured);
+        assert_eq!(rows[4].action, configured);
+        assert_eq!(rows[2].label, "Preserve legacy speed reset");
     }
 
     #[test]

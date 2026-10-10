@@ -7,8 +7,10 @@
 //! A rule stays in force until the next rule on its track fires, across midnight and across
 //! days the rules skip, so "pause at 23:00, resume at 06:00" pauses all night.
 //!
-//! Downloads, watch-folder scanning, speed and hardware profile hold independently.
-//! Deleting the last rule on a track does not undo its last applied state.
+//! Downloads, watch-folder scanning, RSS, each speed limit, hardware profile,
+//! quota metering and each server hold independently. Deleting the last rule
+//! on a track does not undo its last applied state, except one egress's quota
+//! metering, which goes back to the setting for every egress.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -17,7 +19,7 @@ use chrono::{Datelike, Duration, NaiveDateTime, NaiveTime};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::bandwidth::{ScheduleAction, ScheduleEntry, ScheduleTrack, Weekday};
+use crate::bandwidth::{QuotaTarget, ScheduleAction, ScheduleEntry, ScheduleTrack, Weekday};
 
 use crate::jobs::handle::SchedulerHandle;
 use crate::watch_folder::WatchFolderService;
@@ -224,6 +226,14 @@ pub fn spawn_evaluator_with_services(
                         )
                     })
                     .await;
+                let released = tick.take_released_egress_quotas();
+                if !released.is_empty()
+                    && let Some(policy) = tick_handle.server_transfer_policy()
+                {
+                    for egress_id in released {
+                        policy.clear_one_egress_quota_metering(egress_id);
+                    }
+                }
                 (tick, failures)
             })
             .await;
@@ -321,25 +331,9 @@ async fn apply_one_shot(
     if cancellation.is_cancelled() {
         return Ok(());
     }
-    match action {
-        ScheduleAction::FetchRss { feed_id } => services
-            .rss
-            .ok_or("RSS service is not available")?
-            .run_scheduled_sync_cancellable(feed_id, cancellation)
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string().into()),
-        ScheduleAction::ScanWatchFolder => services
-            .watch_folder
-            .ok_or("watch folder service is not available")?
-            .scan_scheduled_cancellable(cancellation)
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string().into()),
-        // History acceptance is a short durable transaction. Drain its owned
-        // blocking task instead of abandoning a writer during service teardown.
-        other => apply_schedule_action(handle, services, other, None).await,
-    }
+    // History acceptance is a short durable transaction. Drain its owned
+    // blocking task instead of abandoning a writer during service teardown.
+    apply_schedule_action(handle, services, action, None).await
 }
 
 const MAX_RUNNING_ONE_SHOTS: usize = 32;
@@ -386,6 +380,12 @@ struct HoldEvaluator {
     /// Set when a pause or server disable failed this tick. New downloads
     /// stay held until it applies, so the rule's intent is not overrun.
     admission_hold: Option<String>,
+    /// Egresses whose quota metering a rule set on its own. Kept across
+    /// clock jumps, which forget `applied`.
+    egress_quotas_set: BTreeSet<u32>,
+    /// Egresses no enabled rule sets metering for any more, to hand back to
+    /// the setting for every egress.
+    egress_quotas_released: Vec<u32>,
 }
 
 impl HoldEvaluator {
@@ -453,6 +453,18 @@ impl HoldEvaluator {
             .flat_map(|entry| entry.action.tracks())
             .collect();
         self.applied.retain(|track, _| tracks.contains(track));
+        // Unlike other tracks, one egress's metering does not outlive its
+        // last rule: that egress follows the rule for every egress again.
+        let released: Vec<u32> = self
+            .egress_quotas_set
+            .iter()
+            .copied()
+            .filter(|id| !tracks.contains(&ScheduleTrack::Quota(QuotaTarget::Egress(*id))))
+            .collect();
+        for id in released {
+            self.egress_quotas_set.remove(&id);
+            self.egress_quotas_released.push(id);
+        }
         for track in tracks {
             let Some((entry, days_back, time)) = most_recently_fired(
                 entries,
@@ -470,10 +482,11 @@ impl HoldEvaluator {
                 self.applied.remove(&track);
                 continue;
             };
+            let action = entry.action.for_track(track);
             let desired = AppliedRule {
                 id: entry.id.clone(),
                 occurrence: (now.date() - Duration::days(days_back)).and_time(time),
-                action: entry.action.clone(),
+                action: action.clone(),
             };
             if self.applied.get(&track) == Some(&desired) {
                 continue;
@@ -484,21 +497,24 @@ impl HoldEvaluator {
                         && entries.iter().any(|entry| {
                             entry.enabled
                                 && entry.id == applied.id
-                                && entry.action == applied.action
+                                && entry.action.for_track(track) == applied.action
                         })
                 })
             {
                 continue;
             }
-            info!(id = %entry.id, ?track, action = ?entry.action, "schedule transition");
-            match apply(entry.action.clone(), track).await {
+            info!(id = %entry.id, ?track, ?action, "schedule transition");
+            match apply(action.clone(), track).await {
                 Ok(()) => {
+                    if let ScheduleTrack::Quota(QuotaTarget::Egress(id)) = track {
+                        self.egress_quotas_set.insert(id);
+                    }
                     self.applied.insert(track, desired);
                 }
                 Err(ScheduleApplyError::Pending) => {}
                 Err(ScheduleApplyError::Failed(error)) => {
                     if matches!(track, ScheduleTrack::Downloads | ScheduleTrack::Server(_))
-                        && entry.action.holds_admission()
+                        && action.holds_admission()
                         && self.admission_hold.is_none()
                     {
                         let rule = if entry.label.is_empty() {
@@ -516,6 +532,12 @@ impl HoldEvaluator {
             }
         }
         failures
+    }
+
+    /// The egresses to hand back to the quota metering for every egress,
+    /// each once.
+    fn take_released_egress_quotas(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.egress_quotas_released)
     }
 }
 
@@ -565,7 +587,10 @@ async fn apply_schedule_action(
         services
             .rss
             .ok_or("RSS service is not available")?
-            .set_scheduled_paused(matches!(action, ScheduleAction::PauseAll));
+            .set_scheduled_paused(matches!(
+                action,
+                ScheduleAction::PauseAll | ScheduleAction::PauseRss
+            ));
         return Ok(());
     }
     if track == Some(ScheduleTrack::WatchFolder) {
@@ -593,20 +618,9 @@ async fn apply_schedule_action(
                 .set_active(server_id, active)
                 .await
         }
-        ScheduleAction::ScanWatchFolder => services
-            .watch_folder
-            .ok_or("watch folder service is not available")?
-            .scan_scheduled()
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
-        ScheduleAction::FetchRss { feed_id } => services
-            .rss
-            .ok_or("RSS service is not available")?
-            .run_scheduled_sync(feed_id)
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
+        ScheduleAction::SpeedLimit { limits } => {
+            apply_speed_limits(&handle, services.servers.as_ref(), limits).await
+        }
         ScheduleAction::PruneHistory {
             failed,
             completed,
@@ -628,6 +642,40 @@ async fn apply_schedule_action(
             .map_err(|error| error.to_string()),
     };
     result.map_err(ScheduleApplyError::Failed)
+}
+
+/// Set each limit a speed rule names. The global limit is the scheduler's;
+/// an egress's or a provider's is that holder's own speed limit, saved and
+/// put in force as an edit on the Networking or Servers screen would be.
+async fn apply_speed_limits(
+    handle: &SchedulerHandle,
+    servers: Option<&crate::servers::service::ServersService>,
+    limits: Vec<crate::bandwidth::SpeedLimitChange>,
+) -> Result<(), String> {
+    use crate::bandwidth::SpeedTarget;
+    for limit in limits {
+        match limit.target {
+            SpeedTarget::Global => handle
+                .apply_schedule_action(ScheduleAction::SpeedLimit {
+                    limits: vec![limit],
+                })
+                .await
+                .map_err(|error| error.to_string())?,
+            SpeedTarget::Egress(egress_id) => {
+                servers
+                    .ok_or("servers service is not available")?
+                    .set_egress_speed_limit(egress_id, limit.bytes_per_sec)
+                    .await?
+            }
+            SpeedTarget::Server(server_id) => {
+                servers
+                    .ok_or("servers service is not available")?
+                    .set_server_speed_limit(server_id, limit.bytes_per_sec)
+                    .await?
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The enabled rule among `candidate`s that fired most recently.
@@ -740,8 +788,7 @@ impl OneShotEvaluator {
             let day = Weekday::from_chrono(date.weekday());
             for entry in entries.iter().filter(|entry| {
                 entry.enabled
-                    && entry.action.track().is_none()
-                    && !entry.action.is_script()
+                    && entry.action.is_one_shot()
                     && (entry.days.is_empty() || entry.days.contains(&day))
             }) {
                 for time in entry_times(entry) {

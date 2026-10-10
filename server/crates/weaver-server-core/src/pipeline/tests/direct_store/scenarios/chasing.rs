@@ -94,13 +94,15 @@ async fn rar_chase_rejects_unacceptable_extension_before_writing_payload() {
         }
         .await;
         let outcome = pipeline.direct_unpack.outcome(job_id, "mixed").unwrap();
-        assert!(
-            outcome
-                .result
-                .as_ref()
-                .err()
-                .expect("chase must reject the blocked member")
-                .contains("unacceptable extension 'bin'")
+        let error = outcome
+            .result
+            .as_ref()
+            .err()
+            .expect("chase must reject the blocked member");
+        assert!(crate::pipeline::JobExtractionBudget::is_rejection(error));
+        assert_eq!(
+            crate::pipeline::JobExtractionBudget::job_failure_reason(error.clone()),
+            "unwanted extension '.bin' in 'zeros_64k.bin'"
         );
         assert!(!outcome.staging_dir.join("zeros_64k.bin").exists());
     }

@@ -126,6 +126,12 @@ pub(crate) struct ScriptRuntime {
     failed_runs: std::sync::Mutex<BTreeMap<String, String>>,
     effects: std::sync::Mutex<(BTreeSet<u64>, Option<watch::Sender<()>>)>,
     admission_hint: std::sync::Mutex<(u64, Option<AdmissionHint>)>,
+    /// The schedule jobs the script evaluator works from, read once after
+    /// each change to the jobs rather than on every tick.
+    pub(super) schedule_jobs: std::sync::Mutex<(
+        u64,
+        Option<std::sync::Arc<Vec<super::instances::ScriptInstance>>>,
+    )>,
     admissions: std::sync::Mutex<QueueAdmissions>,
     durable_events_seen: std::sync::atomic::AtomicBool,
     background: BackgroundLane,
@@ -975,6 +981,14 @@ impl Database {
             .unwrap_or_else(|error| error.into_inner());
         cache.0 = cache.0.wrapping_add(1);
         cache.1 = None;
+        drop(cache);
+        let mut jobs = self
+            .script_runtime
+            .schedule_jobs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        jobs.0 = jobs.0.wrapping_add(1);
+        jobs.1 = None;
     }
 
     pub(crate) fn queue_scripts_possible(&self) -> bool {

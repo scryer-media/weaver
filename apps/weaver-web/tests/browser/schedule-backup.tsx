@@ -11,16 +11,8 @@ import { SettingsShellProvider } from "@/next/pages/settings/framework";
 import "@/next/fonts.css";
 import "@/next/theme.css";
 
-// The script instances the daemon holds. A rule can run only one whose trigger is the schedule.
-const scriptInstances = [
-  { id: "1", name: "Nightly report", script: "nightly.py", trigger: "SCHEDULER" },
-  { id: "2", name: "sweep.sh", script: "sweep.sh", trigger: "SCHEDULER" },
-  { id: "3", name: "Notify", script: "notify.py", trigger: "POST_PROCESSING" },
-];
-// A rule whose instance has since been given another trigger.
-const strandedRule = { id: "stranded", time: "04:00", days: [], times: [], everyHourAtMinute: null, actionType: "run_script", instanceId: "3", runAtStartup: false, enabled: true, label: "fixture stranded", track: "ONE_SHOT" };
 const state = {
-  schedules: (location.search.includes("stranded") ? [strandedRule] : []) as Record<string, unknown>[],
+  schedules: [] as Record<string, unknown>[],
   backups: [] as Record<string, unknown>[],
   backupSettings: { customBackupPath: null as string | null, backupPath: "/fixture/backups" },
   autoBackupSettings: { enabled: location.search.includes("automatic"), dailyTimeLocal: "03:00", autoBackupKeyPresent: location.search.includes("automatic"), nextRunAt: (location.search.includes("automatic") ? "2026-01-03T03:00:00Z" : null) as string | null },
@@ -30,7 +22,7 @@ let passwordVerified = !location.search.includes("expired");
 let verificationRequests = 0;
 let acceptedBackupMutations = 0;
 let acceptedBackupCreates = 0;
-const track = (action: string) => ({ pause_all: "DOWNLOADS", pause_post_processing: "POST_PROCESSING", resume_post_processing: "POST_PROCESSING", set_server_active: "SERVER", set_quota_metering: "QUOTA", scan_watch_folder: "ONE_SHOT", fetch_rss: "ONE_SHOT", prune_history: "ONE_SHOT", run_script: "ONE_SHOT", speed_limit: "SPEED", configured_speed_limit: "SPEED", hardware_profile: "PROFILE", pause_watch_folder_scanning: "WATCH_FOLDER", resume_watch_folder_scanning: "WATCH_FOLDER" })[action] ?? "DOWNLOADS";
+const track = (action: string) => ({ pause_all: "DOWNLOADS", pause_post_processing: "POST_PROCESSING", resume_post_processing: "POST_PROCESSING", set_server_active: "SERVER", set_quota_metering: "QUOTA", prune_history: "ONE_SHOT", speed_limit: "SPEED", hardware_profile: "PROFILE", pause_watch_folder_scanning: "WATCH_FOLDER", resume_watch_folder_scanning: "WATCH_FOLDER", pause_rss: "RSS", resume_rss: "RSS" })[action] ?? "DOWNLOADS";
 function graphql(name: string, variables: Record<string, any>) {
   let mutation = {};
   if (["UpdateBackupSettings", "UpdateAutoBackupSettings", "DeleteBackup", "BackupDownloadToken"].includes(name)) {
@@ -45,8 +37,8 @@ function graphql(name: string, variables: Record<string, any>) {
     if (input.actionType === "set_quota_metering" && input.quotaMeteringEnabled == null) {
       return { errors: [{ message: "set_quota_metering requires quotaMeteringEnabled" }] };
     }
-    if (input.actionType === "run_script" && !input.instanceId) {
-      return { errors: [{ message: "a run_script schedule needs a script instance" }] };
+    if (input.actionType === "speed_limit" && (input.speedLimits ?? []).length === 0) {
+      return { errors: [{ message: "a speed_limit schedule needs at least one limit" }] };
     }
   }
   if (name === "CreateSchedule") {
@@ -71,7 +63,7 @@ function graphql(name: string, variables: Record<string, any>) {
   } else if (name === "DeleteBackup") {
     state.backups = state.backups.filter((row) => row.filename !== variables.filename); mutation = { deleteBackup: true };
   } else if (name === "BackupDownloadToken") mutation = { createBackupDownloadToken: "fixture-token" };
-  return { data: structuredClone({ ...state, settings: { dataDir: "/fixture" }, servers: [{ id: 1, host: "fixture-provider" }], rssFeeds: [{ id: 1, name: "Fixture feed" }], scriptInstances, hardwareProfile: { available: ["balanced"], current: "balanced" }, ...mutation }) };
+  return { data: structuredClone({ ...state, settings: { dataDir: "/fixture" }, servers: [{ id: 1, host: "fixture-provider" }], egressInterfaces: [{ id: 7, name: "fixture-egress" }, { id: 8, name: "fixture-vpn" }], hardwareProfile: { available: ["balanced"], current: "balanced" }, ...mutation }) };
 }
 const client = new Client({ url: "/graphql", exchanges: [fetchExchange], preferGetMethod: false });
 const originalFetch = window.fetch.bind(window);

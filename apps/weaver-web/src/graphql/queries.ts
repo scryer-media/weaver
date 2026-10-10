@@ -1798,15 +1798,13 @@ export const SCHEDULES_QUERY = gql`
       everyHourAtMinute
       serverId
       serverActive
-      feedId
       quotaMeteringEnabled
+      quotaEgressId
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimitBytes
+      speedLimits { kind id bytesPerSec }
       hardwareProfile
-      instanceId
-      runAtStartup
     }
   }
 `;
@@ -1825,15 +1823,13 @@ export const CREATE_SCHEDULE_MUTATION = gql`
       everyHourAtMinute
       serverId
       serverActive
-      feedId
       quotaMeteringEnabled
+      quotaEgressId
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimitBytes
+      speedLimits { kind id bytesPerSec }
       hardwareProfile
-      instanceId
-      runAtStartup
     }
   }
 `;
@@ -1852,15 +1848,13 @@ export const UPDATE_SCHEDULE_MUTATION = gql`
       everyHourAtMinute
       serverId
       serverActive
-      feedId
       quotaMeteringEnabled
+      quotaEgressId
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimitBytes
+      speedLimits { kind id bytesPerSec }
       hardwareProfile
-      instanceId
-      runAtStartup
     }
   }
 `;
@@ -1879,15 +1873,13 @@ export const DELETE_SCHEDULE_MUTATION = gql`
       everyHourAtMinute
       serverId
       serverActive
-      feedId
       quotaMeteringEnabled
+      quotaEgressId
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimitBytes
+      speedLimits { kind id bytesPerSec }
       hardwareProfile
-      instanceId
-      runAtStartup
     }
   }
 `;
@@ -1906,15 +1898,13 @@ export const TOGGLE_SCHEDULE_MUTATION = gql`
       everyHourAtMinute
       serverId
       serverActive
-      feedId
       quotaMeteringEnabled
+      quotaEgressId
       pruneFailed { deleteFiles }
       pruneCompleted { deleteFiles }
       pruneCancelled { deleteFiles }
-      speedLimitBytes
+      speedLimits { kind id bytesPerSec }
       hardwareProfile
-      instanceId
-      runAtStartup
     }
   }
 `;
@@ -1960,6 +1950,11 @@ const SCRIPT_INSTANCE_FIELDS = gql`
     enabled
     blocking
     timeoutSeconds
+    schedule {
+      days
+      times
+      runAtStartup
+    }
     runOrder
     scriptProblem
     headerDrift

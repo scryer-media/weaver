@@ -112,11 +112,11 @@ pub(crate) fn extract(
                     ));
                 }
                 if !info.is_directory
-                    && let Some(pattern) = policy.unacceptable_extension_match(&name)
+                    && policy.unacceptable_extension_match(&name).is_some()
                 {
-                    return Err(budget.reject_content_policy(format!(
-                        "unacceptable extension '{pattern}' matched RAR member '{name}' before extraction"
-                    )));
+                    return Err(budget.reject_content_policy(
+                        crate::post_processing::model::unwanted_extension_reason(&name),
+                    ));
                 }
                 if !should_extract(&name)? {
                     if archive.is_solid() {

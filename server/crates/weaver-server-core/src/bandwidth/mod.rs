@@ -9,4 +9,7 @@ pub mod schedule;
 pub mod service;
 
 pub use caps::QuotaWeekday;
-pub use model::{PruneFiles, ScheduleAction, ScheduleEntry, ScheduleTrack, Weekday};
+pub use model::{
+    PruneFiles, QuotaTarget, ScheduleAction, ScheduleEntry, ScheduleTrack, SpeedLimitChange,
+    SpeedTarget, Weekday,
+};

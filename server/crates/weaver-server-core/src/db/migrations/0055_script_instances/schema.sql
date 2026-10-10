@@ -7,6 +7,9 @@ CREATE TABLE script_instances (
     enabled BOOLEAN NOT NULL,
     blocking BOOLEAN NOT NULL,
     timeout_seconds BIGINT,
+    schedule_days TEXT NOT NULL DEFAULT '',
+    schedule_times TEXT NOT NULL DEFAULT '',
+    run_at_startup BOOLEAN NOT NULL DEFAULT FALSE,
     run_order BIGINT NOT NULL,
     created_at_ms BIGINT NOT NULL,
     updated_at_ms BIGINT NOT NULL

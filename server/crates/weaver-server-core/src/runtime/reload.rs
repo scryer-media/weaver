@@ -161,7 +161,7 @@ pub async fn reload_runtime_from_db(
         .await
         .map_err(|error| error.to_string())?;
     handle
-        .set_speed_limit(loaded.max_download_speed.unwrap_or(0))
+        .restore_speed_limit(loaded.max_download_speed.unwrap_or(0))
         .await
         .map_err(|error| error.to_string())?;
     if load_global_pause_from_db(db).await? {
@@ -466,9 +466,137 @@ mod tests {
         pipeline.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn a_scheduled_provider_speed_limit_is_saved_and_put_in_force() {
+        let db = Database::open_in_memory().unwrap();
+        let provider = server(42);
+        db.insert_server(&provider).unwrap();
+        let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+        let (commands, mut received) = mpsc::channel(2);
+        let (events, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            commands,
+            events,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        handle.set_server_transfer_policy(Arc::new(
+            crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+                db.clone(),
+                &config.read().await.servers,
+            )
+            .unwrap(),
+        ));
+        let (rebuilt, mut rebuilds) = mpsc::channel(2);
+        let pipeline = tokio::spawn(async move {
+            let mut generation = 0;
+            while let Some(command) = received.recv().await {
+                let crate::SchedulerCommand::RebuildNntp {
+                    total_connections,
+                    reply,
+                    ..
+                } = command
+                else {
+                    panic!("a provider speed limit only rebuilds the provider generation");
+                };
+                generation += 1;
+                rebuilt.send(generation).await.unwrap();
+                reply
+                    .send(Ok(NntpRuntimeActivation {
+                        generation,
+                        configured_connections: total_connections,
+                    }))
+                    .unwrap();
+            }
+        });
+        let service =
+            crate::servers::service::ServersService::new(db.clone(), config.clone(), handle);
+        service.set_server_speed_limit(42, 2_000_000).await.unwrap();
+        assert_eq!(rebuilds.recv().await.unwrap(), 1);
+        assert_eq!(
+            db.load_config().unwrap().servers[0].max_download_speed,
+            2_000_000
+        );
+        assert_eq!(config.read().await.servers[0].max_download_speed, 2_000_000);
+        // The same value again changes nothing.
+        service.set_server_speed_limit(42, 2_000_000).await.unwrap();
+        assert!(rebuilds.try_recv().is_err());
+        // 0 removes the limit.
+        service.set_server_speed_limit(42, 0).await.unwrap();
+        assert_eq!(rebuilds.recv().await.unwrap(), 2);
+        assert_eq!(db.load_config().unwrap().servers[0].max_download_speed, 0);
+        assert!(service.set_server_speed_limit(999, 1).await.is_err());
+        drop(service);
+        pipeline.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_egress_speed_limit_whose_reload_fails_is_put_back_and_retried() {
+        fn raw(db: &Database, sql: &'static str) {
+            let store = db.datastore();
+            db.run_sql_blocking(async move {
+                SqlRuntime::run_in_transaction(&store, "egress_speed_fixture", |tx| {
+                    Box::pin(async move {
+                        tx.execute(sql, &[]).await?;
+                        Ok(())
+                    })
+                })
+                .await
+            })
+            .unwrap();
+        }
+        let speed = |db: &Database, id: u32| {
+            db.list_egress_interfaces()
+                .unwrap()
+                .into_iter()
+                .find(|egress| egress.id == id)
+                .unwrap()
+                .max_download_speed
+        };
+
+        let db = Database::open_in_memory().unwrap();
+        let egress = db
+            .create_egress_interface(&crate::proxies::EgressInterface {
+                id: 0,
+                name: "second line".into(),
+                binding: crate::proxies::EgressBinding::SourceAddress {
+                    address: "192.0.2.1".parse().unwrap(),
+                },
+                enabled: true,
+                max_download_speed: 0,
+                download_quota: Default::default(),
+            })
+            .unwrap()
+            .id;
+        let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+        let (commands, _received) = mpsc::channel(2);
+        let (events, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            commands,
+            events,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        handle.set_proxy_runtime(
+            crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
+                .unwrap(),
+        );
+        let service = crate::servers::service::ServersService::new(db.clone(), config, handle);
+
+        // A stored route that cannot be read makes the reload fail.
+        raw(
+            &db,
+            "INSERT INTO proxy_routes (consumer, policy) VALUES ('server:9', 'not a route')",
+        );
+        assert!(service.set_egress_speed_limit(egress, 5_000).await.is_err());
+        assert_eq!(speed(&db, egress), 0);
+
+        raw(&db, "DELETE FROM proxy_routes WHERE consumer = 'server:9'");
+        service.set_egress_speed_limit(egress, 5_000).await.unwrap();
+        assert_eq!(speed(&db, egress), 5_000);
+    }
+
     #[test]
     fn deleting_server_removes_only_its_schedules() {
-        use crate::bandwidth::{ScheduleAction, ScheduleEntry};
+        use crate::bandwidth::{ScheduleAction, ScheduleEntry, SpeedLimitChange, SpeedTarget};
         let db = Database::open_in_memory().unwrap();
         for id in [42, 43] {
             db.insert_server(&server(id)).unwrap();
@@ -489,9 +617,39 @@ mod tests {
                 },
             })
             .collect();
-        db.save_schedules(&rules).unwrap();
+        let speeds = |limits: &[(SpeedTarget, u64)]| ScheduleEntry {
+            id: "speeds".into(),
+            enabled: true,
+            label: String::new(),
+            days: vec![],
+            time: "09:00".into(),
+            times: vec![],
+            every_hour_at_minute: None,
+            action: ScheduleAction::SpeedLimit {
+                limits: limits
+                    .iter()
+                    .map(|&(target, bytes_per_sec)| SpeedLimitChange {
+                        target,
+                        bytes_per_sec,
+                    })
+                    .collect(),
+            },
+        };
+        let mut saved = rules.clone();
+        saved.push(speeds(&[
+            (SpeedTarget::Global, 1_000),
+            (SpeedTarget::Server(42), 2_000),
+            (SpeedTarget::Server(43), 3_000),
+        ]));
+        db.save_schedules(&saved).unwrap();
         assert!(db.delete_server(42).unwrap());
-        assert_eq!(db.list_schedules().unwrap(), rules[1..]);
+        let mut kept = rules[1..].to_vec();
+        kept.push(speeds(&[
+            (SpeedTarget::Global, 1_000),
+            (SpeedTarget::Server(43), 3_000),
+        ]));
+        assert_eq!(db.list_schedules().unwrap(), kept);
+        db.save_schedules(&rules[1..]).unwrap();
         assert_eq!(db.load_config().unwrap().servers[0].id, 43);
         assert!(db.save_schedules(&rules).is_err());
         assert_eq!(db.list_schedules().unwrap(), rules[1..]);

@@ -896,10 +896,29 @@ impl NetworkingMutation {
         let runtime = runtime(ctx)?;
         let _guard = runtime.mutations.lock().await;
         let db = ctx.data::<Database>()?.clone();
-        spawn_blocking_db("network.delete_egress", move || {
-            db.delete_egress_interface(id)
-        })
-        .await?;
+        // Serialize with schedule edits, so an earlier save cannot republish
+        // rules for this deleted egress.
+        let mut schedules_guard =
+            match ctx.data_opt::<weaver_server_core::bandwidth::schedule::SharedSchedules>() {
+                Some(schedules) => Some(schedules.write().await),
+                None => None,
+            };
+        {
+            let db = db.clone();
+            spawn_blocking_db("network.delete_egress", move || {
+                db.delete_egress_interface(id)
+            })
+            .await?;
+        }
+        // The delete took this egress's rules and speed limits out of what is
+        // saved; publish that.
+        if let Some(schedules) = schedules_guard.as_mut() {
+            **schedules = spawn_blocking_db("network.delete_egress.schedules", move || {
+                db.list_schedules()
+            })
+            .await?;
+        }
+        drop(schedules_guard);
         runtime.reload().await.map_err(async_graphql::Error::new)?;
         Ok(true)
     }

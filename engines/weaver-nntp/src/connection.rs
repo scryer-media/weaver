@@ -890,25 +890,41 @@ impl NntpConnection {
         if let Some(outcome) = &self.route_outcome {
             outcome.read(bytes);
         }
-        let egress_wait = match (self.egress_accounting.front_mut(), &self.egress_control) {
-            (Some(BodyTransferAccounting::Tracked(permit)), _) => permit.record_async(bytes).await,
+        // Both levels are charged before either is waited on, so the read
+        // waits for the later deadline: the lower of the two rates.
+        let egress_charge = match (self.egress_accounting.front_mut(), &self.egress_control) {
+            (Some(BodyTransferAccounting::Tracked(permit)), _) => permit.charge(bytes),
             (Some(BodyTransferAccounting::Unlimited), Some(control)) => {
                 control.record_unlimited_body_bytes(bytes);
-                Duration::ZERO
+                None
             }
-            (None, Some(control)) => control.pace_read_async(bytes).await,
-            (_, None) => Duration::ZERO,
+            (None, Some(control)) => control.charge_read(bytes),
+            (_, None) => None,
         };
-        let server_wait = match self.body_accounting.front_mut() {
+        let server_charge = match self.body_accounting.front_mut() {
             Some(BodyTransferAccounting::Unlimited) => {
                 if let Some(control) = &self.transfer_control {
                     control.record_unlimited_body_bytes(bytes);
                 }
-                Duration::ZERO
+                None
             }
-            Some(BodyTransferAccounting::Tracked(permit)) => permit.record_async(bytes).await,
+            Some(BodyTransferAccounting::Tracked(permit)) => permit.charge(bytes),
+            None => None,
+        };
+        let egress_wait = match egress_charge {
+            Some(charge) => charge.wait_async().await,
             None => Duration::ZERO,
         };
+        let server_wait = match server_charge {
+            Some(charge) => charge.wait_async().await,
+            None => Duration::ZERO,
+        };
+        if let Some(BodyTransferAccounting::Tracked(permit)) = self.egress_accounting.front_mut() {
+            permit.add_throttle_wait(egress_wait);
+        }
+        if let Some(BodyTransferAccounting::Tracked(permit)) = self.body_accounting.front_mut() {
+            permit.add_throttle_wait(server_wait);
+        }
         egress_wait.saturating_add(server_wait)
     }
 

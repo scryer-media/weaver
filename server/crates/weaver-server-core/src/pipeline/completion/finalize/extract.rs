@@ -2393,12 +2393,10 @@ impl Pipeline {
     pub(in crate::pipeline) fn blocked_rar_member(
         archive: &unrar_rs::RarArchive,
         policy: &crate::post_processing::model::PostProcessingSettings,
-    ) -> Option<(String, String)> {
+    ) -> Option<String> {
         archive.metadata().members.iter().find_map(|member| {
-            (!member.is_directory)
-                .then(|| policy.unacceptable_extension_match(&member.name))
-                .flatten()
-                .map(|pattern| (member.name.clone(), pattern.to_string()))
+            (!member.is_directory && policy.unacceptable_extension_match(&member.name).is_some())
+                .then(|| member.name.clone())
         })
     }
 
@@ -2618,10 +2616,10 @@ impl Pipeline {
                         budget: Some(Arc::clone(&budget)),
                     },
                 )?;
-                if let Some((member, pattern)) = Self::blocked_rar_member(&selection.archive, &policy) {
-                    return Err(budget.reject_content_policy(format!(
-                        "unacceptable extension '{pattern}' matched RAR member '{member}' before extraction"
-                    )));
+                if let Some(member) = Self::blocked_rar_member(&selection.archive, &policy) {
+                    return Err(budget.reject_content_policy(
+                        crate::post_processing::model::unwanted_extension_reason(&member),
+                    ));
                 }
                 let _memory_permit =
                     budget.reserve_memory_wait(selection.decoder_memory_bytes)?;
