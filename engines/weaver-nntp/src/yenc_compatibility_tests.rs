@@ -496,3 +496,250 @@ fn unusable_multipart_starts_decode_without_a_position() {
         }
     }
 }
+
+/// What one decode path made of an article: the bytes and the verdict.
+#[derive(Debug, PartialEq)]
+struct Verdict {
+    data: Vec<u8>,
+    crc: CrcVerification,
+    has_trailer: bool,
+    defects: YencHeaderDefects,
+}
+
+impl Verdict {
+    fn of(data: Vec<u8>, result: &DecodeResult) -> Self {
+        assert_eq!(data.len(), result.bytes_written);
+        Self {
+            data,
+            crc: result.crc_status,
+            has_trailer: result.has_trailer,
+            defects: result.defects,
+        }
+    }
+}
+
+fn whole_buffer_verdict(article: &[u8]) -> Verdict {
+    let mut output = vec![0; article.len() + 64];
+    let result = weaver_yenc::decode_nntp(article, &mut output).unwrap();
+    Verdict::of(output[..result.bytes_written].to_vec(), &result)
+}
+
+/// The whole-buffer, streaming and fused decoders give one verdict for the
+/// article at every wire split, and it is `expected`.
+fn assert_three_way(article: &[u8], expected: &Verdict, name: &str) {
+    assert_eq!(
+        &whole_buffer_verdict(article),
+        expected,
+        "{name}: whole buffer"
+    );
+    let response = wire(article);
+    let mut splits: Vec<Vec<&[u8]>> = (0..=response.len())
+        .map(|split| vec![&response[..split], &response[split..]])
+        .collect();
+    splits.push(response.chunks(1).collect());
+    for chunks in &splits {
+        let (streamed, left) = streaming(chunks);
+        assert!(left.is_empty());
+        assert_eq!(
+            &Verdict::of(streamed.data, &streamed.result),
+            expected,
+            "{name}: streaming {:?}",
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>()
+        );
+        let (decoded, left) = fused(chunks);
+        assert!(left.is_empty());
+        assert_eq!(
+            &Verdict::of(decoded.to_data(), decoded.yenc_result()),
+            expected,
+            "{name}: fused {:?}",
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>()
+        );
+    }
+}
+
+const TABLE_HEADER: &[u8] = b"=ybegin part=1 line=128 size=2 name=a\r\n=ypart begin=1 end=2\r\n";
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = weaver_yenc::crc::Crc32::new();
+    crc.update(bytes);
+    crc.finalize()
+}
+
+fn table_article(body: &[u8], pcrc32: u32) -> Vec<u8> {
+    [
+        TABLE_HEADER,
+        body,
+        format!("=yend size=2 part=1 pcrc32={pcrc32:08x}\r\n").as_bytes(),
+    ]
+    .concat()
+}
+
+/// A lone `=` ending the last body line before the trailer, and every related
+/// shape: whole-buffer, streaming and fused decode each the way rapidyenc and
+/// sabctools do, byte for byte and verdict for verdict, at every wire split.
+/// The `=` escapes the line's `\r` (0xA3), the `\r` still breaks the line, the
+/// trailer is found, and a damaged article reports its CRC mismatch with its
+/// data kept.
+#[test]
+fn escape_before_trailer_agrees_on_every_path() {
+    let ab = crc32(b"AB");
+    let mismatch = |data: &[u8], size_mismatch: bool| Verdict {
+        data: data.to_vec(),
+        crc: CrcVerification::Mismatch,
+        has_trailer: true,
+        defects: YencHeaderDefects {
+            yend_size_mismatch: size_mismatch,
+            ypart_size_mismatch: size_mismatch,
+            ..YencHeaderDefects::default()
+        },
+    };
+    let rows: Vec<(&str, Vec<u8>, Verdict)> = vec![
+        // T1, T2: a lone `=` ends the last line, plain and dot-stuffed trailer.
+        (
+            "T1",
+            table_article(b"kl=\r\n", ab),
+            mismatch(b"AB\xa3", true),
+        ),
+        (
+            "T2",
+            [
+                TABLE_HEADER,
+                b"kl=\r\n.",
+                &table_article(b"", ab)[TABLE_HEADER.len()..],
+            ]
+            .concat(),
+            mismatch(b"AB\xa3", true),
+        ),
+        // T3: an odd run; the last `=` escapes the `\r`.
+        (
+            "T3",
+            table_article(b"k===\r\n", ab),
+            mismatch(b"A\xd3\xa3", true),
+        ),
+        // T4: an even run is a complete escape.
+        (
+            "T4",
+            table_article(b"k==\r\n", ab),
+            mismatch(b"A\xd3", false),
+        ),
+        // T5: a lone `=` ends a middle line.
+        (
+            "T5",
+            table_article(b"k=\r\nl\r\n", ab),
+            mismatch(b"A\xa3B", true),
+        ),
+        // T6: `=y` inside an escape is data, and the real trailer is found.
+        (
+            "T6a",
+            table_article(b"k==yl\r\n", ab),
+            mismatch(b"A\xd3OB", true),
+        ),
+        (
+            "T6b",
+            table_article(b"kl\r\n==yl\r\n", ab),
+            mismatch(b"AB\xd3OB", true),
+        ),
+        // T7: the valid n+1 escaped CR.
+        (
+            "T7",
+            table_article(b"kl=M\r\n", ab),
+            mismatch(b"AB\xe3", true),
+        ),
+        // T12: the right CRC for the decoded bytes verifies.
+        (
+            "T12",
+            table_article(b"kl=\r\n", crc32(b"AB\xa3")),
+            Verdict {
+                crc: CrcVerification::Verified,
+                ..mismatch(b"AB\xa3", true)
+            },
+        ),
+        // The correct article.
+        (
+            "J",
+            table_article(b"kl\r\n", ab),
+            Verdict {
+                crc: CrcVerification::Verified,
+                ..mismatch(b"AB", false)
+            },
+        ),
+    ];
+    for (name, article, expected) in &rows {
+        assert_three_way(article, expected, name);
+    }
+
+    // T8: no trailer, the NNTP terminator ends the body.
+    let no_trailer = [TABLE_HEADER, b"kl=\r\n"].concat();
+    let verdict = whole_buffer_verdict(&no_trailer);
+    assert_eq!(verdict.data, b"AB\xa3");
+    assert_eq!(verdict.crc, CrcVerification::Unverified);
+    assert!(!verdict.has_trailer);
+    assert_three_way(&no_trailer, &verdict, "T8");
+
+    // T9: an LF-only break is no line break before a trailer on any path.
+    let lf_only = table_article(b"kl=\n", ab);
+    let verdict = whole_buffer_verdict(&lf_only);
+    assert!(!verdict.has_trailer);
+    assert_three_way(&lf_only, &verdict, "T9");
+}
+
+/// T11: the escape before the trailer at every offset of a 64-byte window, and
+/// across a 64 KiB read, deep in a body long enough for the SIMD kernels, gives
+/// one verdict on every path.
+#[test]
+fn escape_before_trailer_agrees_at_every_window_offset() {
+    let line = [b'k'; 128];
+    for pad in 0..64 {
+        let mut body = Vec::new();
+        for _ in 0..560 {
+            body.extend_from_slice(&line);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(&vec![b'k'; pad]);
+        body.extend_from_slice(b"=\r\n");
+        let mut decoded = vec![b'A'; 560 * 128 + pad];
+        decoded.push(0xa3);
+        let article = table_article(&body, crc32(b"AB"));
+        let expected = Verdict {
+            crc: CrcVerification::Mismatch,
+            has_trailer: true,
+            defects: YencHeaderDefects {
+                yend_size_mismatch: true,
+                ypart_size_mismatch: true,
+                ..YencHeaderDefects::default()
+            },
+            data: decoded,
+        };
+        assert_eq!(whole_buffer_verdict(&article), expected, "pad {pad}");
+        let response = wire(&article);
+        let escape = memchr::memmem::rfind(&response, b"=\r\n=yend").unwrap();
+        for split in [
+            64 * 1024,
+            escape,
+            escape + 1,
+            escape + 2,
+            escape + 3,
+            escape + 4,
+        ] {
+            let chunks = [&response[..split], &response[split..]];
+            let (streamed, _) = streaming(&chunks);
+            assert_eq!(
+                Verdict::of(streamed.data, &streamed.result),
+                expected,
+                "pad {pad} split {split}"
+            );
+            let (fused_article, _) = fused(&chunks);
+            assert_eq!(
+                Verdict::of(fused_article.to_data(), fused_article.yenc_result()),
+                expected,
+                "pad {pad} split {split}"
+            );
+        }
+        let chunks: Vec<_> = response.chunks(64 * 1024).collect();
+        let (fused_article, _) = fused(&chunks);
+        assert_eq!(
+            Verdict::of(fused_article.to_data(), fused_article.yenc_result()),
+            expected
+        );
+    }
+}

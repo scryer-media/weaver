@@ -14,7 +14,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.14.5"
+version = "0.14.7"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -115,7 +115,7 @@ windows-sys = { version = "0.61", default-features = false }
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 # Authenticated recovery scanning and source-change handling.
-par2-rs = { version = "=0.10.7", default-features = false, features = ["crypto-aws-lc"] }
+par2-rs = { version = "=0.10.8", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
@@ -127,7 +127,7 @@ par2-rs = { version = "=0.10.7", default-features = false, features = ["crypto-a
 # not use: it verifies and repairs sets other producers wrote.
 # 0.4.3 adds an opt-in `wasm-simd` feature for wasm builds. Weaver is native
 # and does not forward it.
-par3-rs = { version = "=0.4.4", default-features = false }
+par3-rs = { version = "=0.5.0", default-features = false }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x
@@ -150,7 +150,7 @@ par3-rs = { version = "=0.4.4", default-features = false }
 # header names one, which is every store member weaver opens from volume one.
 # 0.10.8 makes the NEON BLAKE2sp message load alignment-agnostic (no UB) and
 # adds an x86-64-v3 clone of the RAR5 fast symbol loop, picked at runtime.
-unrar-rs = { version = "0.10.8", default-features = false, features = ["crypto-aws-lc"] }
+unrar-rs = { version = "0.10.9", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]
