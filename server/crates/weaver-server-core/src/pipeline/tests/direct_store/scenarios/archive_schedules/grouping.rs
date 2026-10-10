@@ -956,6 +956,26 @@ async fn solid_bare_first_part_keeps_repair_and_restart_fallbacks() {
     }
 }
 
+#[tokio::test]
+async fn reposted_rar4_restores_both_volume_identities() {
+    run_cell(
+        Cell {
+            container: Container::Rar4,
+            naming: Naming::HexReposted,
+            binding: Binding::Nothing,
+        },
+        ExtractionProfile::Conventional,
+        vec![(
+            104,
+            (
+                vec![(0, 0), (0, 1), (1, 1), (1, 0)],
+                Interruption::Restart(2),
+            ),
+        )],
+    )
+    .await;
+}
+
 const PROFILES: [ExtractionProfile; 3] = [
     ExtractionProfile::DirectStore,
     ExtractionProfile::Chase,
