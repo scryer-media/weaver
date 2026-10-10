@@ -1555,6 +1555,165 @@ impl Pipeline {
         self.identity_viability_sweep(job_id).await;
     }
 
+    fn orphan_named_rar_volume(&self, file_id: NzbFileId) -> bool {
+        let Some(state) = self.jobs.get(&file_id.job_id) else {
+            return false;
+        };
+        let Some(file) = state.assembly.file(file_id) else {
+            return false;
+        };
+        if !matches!(
+            file.declared_role(),
+            weaver_model::files::FileRole::RarVolume { .. }
+        ) {
+            return false;
+        }
+        let set = weaver_model::files::archive_base_name(file.filename(), file.declared_role());
+        !state.assembly.files().any(|candidate| {
+            matches!(
+                candidate.declared_role(),
+                weaver_model::files::FileRole::RarVolume { volume_number: 0 }
+            ) && weaver_model::files::archive_base_name(
+                candidate.filename(),
+                candidate.declared_role(),
+            ) == set
+        })
+    }
+
+    pub(in crate::pipeline) fn identity_prefix_pending(
+        &mut self,
+        file_id: NzbFileId,
+        declared_len: u64,
+    ) -> bool {
+        if !self.direct_store.gate().is_enabled() {
+            return false;
+        }
+        let admission = self.direct_store.identity.get(&file_id.job_id);
+        if admission.is_some_and(|admission| {
+            admission.leaked.contains(&file_id.file_index)
+                || admission.no_match.contains(&file_id.file_index)
+        }) || self
+            .identity_par2_carrier_files(file_id.job_id)
+            .contains(&file_id.file_index)
+        {
+            return false;
+        }
+        let captured = self.file_prefix_16k.get(&file_id).map_or(0, Vec::len);
+        if captured == 0 && self.orphan_named_rar_volume(file_id) {
+            return true;
+        }
+        let Some(admission) = admission else {
+            return false;
+        };
+        admission.rosters.values().any(|roster| {
+            roster.volumes.iter().any(|(index, volume)| {
+                volume.length == declared_len
+                    && !roster.bound.values().any(|bound| bound == index)
+                    && captured
+                        < volume
+                            .length
+                            .min(crate::pipeline::PAR2_HASH_16K_BYTES as u64)
+                            as usize
+            })
+        })
+    }
+
+    /// A complete repost can be kept conventionally without condemning the
+    /// original direct set, but only after comparing all its decoded bytes
+    /// with the completed virtual source. A shared header is not enough.
+    pub(in crate::pipeline) async fn complete_header_repost(
+        &mut self,
+        file_id: NzbFileId,
+        offset: u64,
+        segment: &crate::pipeline::BufferedDecodedSegment,
+    ) -> bool {
+        if offset != 0
+            || segment.data.len_bytes() as u64 != segment.declared_file_len
+            || segment.damaged_source.is_some()
+        {
+            return false;
+        }
+        let Some(prefix) = self.file_prefix_16k.get(&file_id) else {
+            return false;
+        };
+        let super::sniff::PrefixSniff::Rar5 {
+            volume_number,
+            is_volume: true,
+        } = super::sniff::sniff_rar_prefix(prefix)
+        else {
+            return false;
+        };
+        let Some(header_set) =
+            self.direct_store
+                .identity
+                .get(&file_id.job_id)
+                .and_then(|admission| {
+                    admission.header_sets.iter().find(|set| {
+                        set.volume_set
+                            && set.bound.iter().any(|(file, volume)| {
+                                *file != file_id.file_index && *volume == volume_number
+                            })
+                    })
+                })
+        else {
+            return false;
+        };
+        let Some(set) = self.direct_store.set(file_id.job_id, header_set.set_index) else {
+            return false;
+        };
+        if set.is_demoted() || !set.volume_is_complete(volume_number) {
+            return false;
+        }
+        let Some(original) = set.plan().volumes.get(&volume_number) else {
+            return false;
+        };
+        let original_id = NzbFileId {
+            job_id: file_id.job_id,
+            file_index: *original,
+        };
+        if self.file_declared_size.get(&original_id) != Some(&segment.declared_file_len) {
+            return false;
+        }
+        let volumes = set
+            .retained_volumes()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                set.virtual_volumes(&BTreeMap::from([(
+                    volume_number,
+                    segment.declared_file_len,
+                )]))
+            });
+        let provider = super::provider::HybridVolumeProvider::new(volumes);
+        let mut expected = blake3::Hasher::new();
+        segment.data.for_each_slice(|bytes| {
+            expected.update(bytes);
+        });
+        let expected = expected.finalize();
+        let length = segment.declared_file_len;
+        let equal = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut reader = provider.open(volume_number)?;
+            let mut remaining = length;
+            let mut buffer = vec![0u8; 64 * 1024];
+            let mut actual = blake3::Hasher::new();
+            while remaining != 0 {
+                let take = remaining.min(buffer.len() as u64) as usize;
+                reader.read_exact(&mut buffer[..take]).ok()?;
+                actual.update(&buffer[..take]);
+                remaining -= take as u64;
+            }
+            Some(actual.finalize() == expected)
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        if equal && let Some(admission) = self.direct_store.identity.get_mut(&file_id.job_id) {
+            admission.no_match.insert(file_id.file_index);
+        }
+        equal
+    }
+
     /// The identity half of the routing seam: matches one file's offset-zero
     /// bytes against the job's armed rosters, and turns the unique match into
     /// a routed binding — admitting the set on its first one.
@@ -1573,12 +1732,10 @@ impl Pipeline {
         &mut self,
         file_id: NzbFileId,
         file_offset: u64,
+        declared_file_len: u64,
     ) -> Option<DirectFileTarget> {
         let job_id = file_id.job_id;
         let file_index = file_id.file_index;
-        if file_offset != 0 {
-            return None;
-        }
         // Two rungs, mutually exclusive per job. Described rosters — PAR2
         // metadata named the volumes — are the stronger evidence and go
         // first; a job without them falls to the header rung, where the
@@ -1600,6 +1757,9 @@ impl Pipeline {
             return None;
         }
         if !has_rosters {
+            if file_offset != 0 {
+                return None;
+            }
             return self.direct_header_route_target(file_id).await;
         }
         // Evaluate against every roster's unclaimed volumes.
@@ -1650,7 +1810,7 @@ impl Pipeline {
             for (set_name, roster) in &admission.rosters {
                 let claimed: HashSet<u32> = roster.bound.values().copied().collect();
                 for (volume_index, volume) in &roster.volumes {
-                    if claimed.contains(volume_index) {
+                    if claimed.contains(volume_index) || declared_file_len != volume.length {
                         continue;
                     }
                     let window = volume
@@ -1966,11 +2126,11 @@ impl Pipeline {
         set.router.set_password(password);
         set.router.note_par2_available(par2_available);
         set.router.note_par3_available(par3_available);
-        // A set bound after the job's harvest ran would otherwise never see
-        // it: the live seam offers the harvest when it runs, and it has run.
-        if let Some(harvest) = self.direct_store.header_harvest.get(&job_id) {
-            offer_direct_header_candidates(&mut set, password, harvest);
-        }
+        // Identity admission can happen after the article's password refresh,
+        // when no set existed to receive it. The first routed bytes already
+        // need the header key, so offer the candidates before publishing it.
+        let harvest = self.harvest_direct_header_passwords(job_id);
+        offer_direct_header_candidates(&mut set, password, &harvest);
         let sets = self.direct_store.sets.entry(job_id).or_default();
         sets.push(set);
         sets.len() - 1
@@ -2047,10 +2207,18 @@ impl Pipeline {
         // so the name proves nothing either way — the byte sniff below is the
         // gate, exactly as it is for the hex names. A real split payload
         // sniffs as not-RAR and settles as an ordinary conventional file.
+        // Unclaimed named RAR continuations also need this rung when the
+        // first volume alone is obfuscated. Plan ownership was excluded above.
+        if matches!(role, weaver_model::files::FileRole::RarVolume { .. })
+            && !self.orphan_named_rar_volume(file_id)
+        {
+            return None;
+        }
         if !matches!(
             role,
             weaver_model::files::FileRole::Unknown
                 | weaver_model::files::FileRole::SplitFile { .. }
+                | weaver_model::files::FileRole::RarVolume { .. }
         ) {
             return None;
         }

@@ -1347,7 +1347,19 @@ impl Pipeline {
                             | weaver_model::files::FileRole::SevenZipSplit { .. }
                     )
                 })
-                .map(|f| self.current_filename_for_file(job_id, f))
+                .flat_map(|f| {
+                    let mut names = vec![self.current_filename_for_file(job_id, f)];
+                    if let Some(identity) = self.effective_file_identity(job_id, f.file_id())
+                        && identity.classification_source
+                            == crate::jobs::record::FileIdentitySource::Par2
+                        && let Some(canonical) = identity.canonical_filename
+                    {
+                        // Repair may materialize the canonical path while a
+                        // chase retains its original, verified input alias.
+                        names.push(canonical);
+                    }
+                    names
+                })
                 .collect();
             for topology in state.assembly.archive_topologies().values() {
                 cleanup_files.extend(topology.volume_map.keys().cloned());
@@ -1417,6 +1429,10 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> Result<(), String> {
+        // A copy may have completed while its equivalent set was extracting;
+        // that live layout could not be rebound then. Reconsider it once the
+        // verification frontier is settled, before rebuilding missing sets.
+        self.group_nameless_rar_volumes(job_id).await;
         for set_name in self.rar_set_names_for_job(job_id) {
             if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
                 if crate::pipeline::archive::topology::is_incoherent_rar_waiting_state_error(&error)

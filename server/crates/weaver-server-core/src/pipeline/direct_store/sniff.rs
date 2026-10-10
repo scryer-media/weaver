@@ -178,6 +178,11 @@ pub(crate) fn sniff_sevenz_prefix(prefix: &[u8], declared_len: Option<u64>) -> S
     {
         return SevenZipSniff::NotSevenZip;
     }
+    let mut crc = weaver_yenc::crc::Crc32::new();
+    crc.update(&prefix[12..32]);
+    if crc.finalize() != u32::from_le_bytes(prefix[8..12].try_into().unwrap()) {
+        return SevenZipSniff::NotSevenZip;
+    }
     let Some(declared_len) = declared_len.filter(|len| *len > 0) else {
         return SevenZipSniff::NotSevenZip;
     };
@@ -212,11 +217,24 @@ mod tests {
     fn sevenz_head(offset: u64, size: u64) -> Vec<u8> {
         let mut bytes = SEVEN_Z_SIGNATURE.to_vec();
         bytes.extend_from_slice(&[0, 4]);
-        bytes.extend_from_slice(&[0xAA; 4]); // start-header crc: unchecked
+        bytes.extend_from_slice(&[0; 4]);
         bytes.extend_from_slice(&offset.to_le_bytes());
         bytes.extend_from_slice(&size.to_le_bytes());
         bytes.extend_from_slice(&[0xBB; 4]);
+        let mut crc = weaver_yenc::crc::Crc32::new();
+        crc.update(&bytes[12..32]);
+        bytes[8..12].copy_from_slice(&crc.finalize().to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn corrupted_start_header_is_refused() {
+        let mut head = sevenz_head(1_000, 40);
+        head[12] ^= 1;
+        assert_eq!(
+            sniff_sevenz_prefix(&head, Some(500)),
+            SevenZipSniff::NotSevenZip
+        );
     }
 
     #[test]

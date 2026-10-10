@@ -754,13 +754,13 @@ fn multi_set_base_name_grouping() {
     // Different episodes produce different base names.
     let e01 = archive_base_name("Show.S01E01.7z.001", &FileRole::SevenZipSplit { number: 0 });
     let e02 = archive_base_name("Show.S01E02.7z.001", &FileRole::SevenZipSplit { number: 0 });
-    assert_eq!(e01, Some("Show.S01E01.7z".into()));
-    assert_eq!(e02, Some("Show.S01E02.7z".into()));
+    assert_eq!(e01, Some("show.s01e01.7z".into()));
+    assert_eq!(e02, Some("show.s01e02.7z".into()));
     assert_ne!(e01, e02);
 
     // Same episode, different parts, produce the same base name.
     let e01_p1 = archive_base_name("Show.S01E01.7z.001", &FileRole::SevenZipSplit { number: 0 });
-    let e01_p2 = archive_base_name("Show.S01E01.7z.002", &FileRole::SevenZipSplit { number: 1 });
+    let e01_p2 = archive_base_name("show.s01e01.7Z.002", &FileRole::SevenZipSplit { number: 1 });
     assert_eq!(e01_p1, e01_p2);
 }
 

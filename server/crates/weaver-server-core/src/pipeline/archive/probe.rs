@@ -196,6 +196,7 @@ impl Pipeline {
         }
         self.classify_completed_file(job_id, file_id, allow_probe)
             .await;
+        self.group_header_first_sevenz(job_id);
 
         let Some(state) = self.jobs.get(&job_id) else {
             return;
@@ -216,7 +217,7 @@ impl Pipeline {
                 self.try_update_archive_topology(job_id, file_id).await;
                 // After it: grouping reads the facts the topology update just
                 // registered for this volume.
-                self.group_nameless_rar_volumes(job_id, file_id).await;
+                self.group_nameless_rar_volumes(job_id).await;
             }
             FileRole::SevenZipArchive
             | FileRole::SevenZipSplit { .. }
@@ -462,6 +463,102 @@ impl Pipeline {
         }
     }
 
+    fn group_header_first_sevenz(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let mut heads = Vec::new();
+        let mut numbered = BTreeMap::<String, BTreeMap<u32, u64>>::new();
+        let mut occupied = HashSet::new();
+        for file in state.assembly.files() {
+            let Some(set) = self.classified_archive_set_name_for_file(job_id, file) else {
+                continue;
+            };
+            match self.classified_role_for_file(job_id, file) {
+                FileRole::SevenZipSplit { number } => {
+                    let Some(length) = self.file_declared_size.get(&file.file_id()).copied() else {
+                        continue;
+                    };
+                    if number == 0 {
+                        occupied.insert(set.clone());
+                    }
+                    if numbered
+                        .entry(set.clone())
+                        .or_default()
+                        .insert(number, length)
+                        .is_some()
+                    {
+                        occupied.insert(set);
+                    }
+                }
+                FileRole::SevenZipArchive => {
+                    occupied.insert(set.clone());
+                    let Some(prefix) = self.file_prefix_16k.get(&file.file_id()) else {
+                        continue;
+                    };
+                    let length = self.file_declared_size.get(&file.file_id()).copied();
+                    if crate::pipeline::direct_store::sniff::sniff_sevenz_prefix(prefix, length)
+                        == crate::pipeline::direct_store::sniff::SevenZipSniff::FirstPart
+                        && matches!(file.declared_role(), FileRole::Unknown)
+                    {
+                        let total = 32u64
+                            .checked_add(u64::from_le_bytes(prefix[12..20].try_into().unwrap()))
+                            .and_then(|n| {
+                                n.checked_add(u64::from_le_bytes(
+                                    prefix[20..28].try_into().unwrap(),
+                                ))
+                            });
+                        if let Some(total) = total {
+                            heads.push((file.file_id(), set, length.unwrap(), total));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Header evidence identifies part zero; the remaining order must be
+        // explicit. More than one compatible first part or numbered set is
+        // ambiguous and stays unbound.
+        if heads.len() != 1 {
+            return;
+        }
+        let (first, old_set, chunk, total) = heads.pop().unwrap();
+        let count = total.div_ceil(chunk);
+        let matches: Vec<_> = numbered
+            .into_iter()
+            .filter(|(set, parts)| {
+                !occupied.contains(set)
+                    && parts.len() as u64 + 1 == count
+                    && parts.keys().copied().map(u64::from).eq(1..count)
+                    && parts.iter().all(|(index, length)| {
+                        *length == chunk.min(total - u64::from(*index) * chunk)
+                    })
+            })
+            .collect();
+        let [(set_name, _)] = matches.as_slice() else {
+            return;
+        };
+        let set_name = set_name.clone();
+        if let Err(error) = self.set_detected_archive_identity(
+            job_id,
+            first,
+            DetectedArchiveIdentity {
+                kind: PersistedDetectedArchiveKind::SevenZipSplit,
+                set_name: set_name.clone(),
+                volume_index: Some(0),
+            },
+        ) {
+            tracing::warn!(job_id = job_id.0, %error, "failed to bind 7z first part by its header");
+            return;
+        }
+        self.invalidate_reclassified_chase(job_id, &old_set);
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.assembly.remove_archive_topology(&old_set);
+            state.assembly.remove_archive_topology(&set_name);
+        }
+        self.try_update_7z_topology(job_id, first);
+    }
+
     async fn classify_completed_file(
         &mut self,
         job_id: JobId,
@@ -650,9 +747,15 @@ impl Pipeline {
         tokio::task::spawn_blocking(move || {
             let mut file = std::fs::File::open(&path)
                 .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
-            let mut signature = [0u8; 6];
-            match file.read_exact(&mut signature) {
-                Ok(()) => Ok(signature == SEVEN_Z_SIGNATURE),
+            let mut header = [0u8; 32];
+            match file.read_exact(&mut header) {
+                Ok(()) => {
+                    let mut crc = weaver_yenc::crc::Crc32::new();
+                    crc.update(&header[12..]);
+                    Ok(header[..6] == SEVEN_Z_SIGNATURE
+                        && header[6] == 0
+                        && crc.finalize() == u32::from_le_bytes(header[8..12].try_into().unwrap()))
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
                 Err(error) => Err(format!("failed to read {}: {error}", path.display())),
             }
@@ -690,12 +793,19 @@ impl Pipeline {
         }
 
         numbered_files.sort_by_key(|(suffix, filename, _)| (*suffix, filename.clone()));
-        let expected_volume_count = numbered_files.len() as u32;
+        let origin = numbered_files.first()?.0;
+        let expected_volume_count = numbered_files
+            .last()?
+            .0
+            .checked_sub(origin)?
+            .checked_add(1)?;
         let mut volume_map = HashMap::new();
         let mut complete_volumes = HashSet::new();
 
-        for (index, (_, filename, is_complete)) in numbered_files.into_iter().enumerate() {
-            let normalized_number = index as u32;
+        for (suffix, filename, is_complete) in numbered_files {
+            // Preserve holes and duplicate claims. Ranking the observed files
+            // erased missing parts and concatenated reposts as extra volumes.
+            let normalized_number = suffix.checked_sub(origin)?;
             volume_map.insert(filename, normalized_number);
             if is_complete {
                 complete_volumes.insert(normalized_number);
@@ -864,6 +974,17 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return Vec::new();
         };
+        let named_firsts: HashSet<String> = state
+            .assembly
+            .files()
+            .filter_map(|file| {
+                let filename = self.current_filename_for_file(job_id, file);
+                let identity = Self::canonical_archive_identity_from_filename(&filename)?;
+                (identity.kind == PersistedDetectedArchiveKind::Rar
+                    && identity.volume_index == Some(0))
+                .then_some(identity.set_name)
+            })
+            .collect();
         let mut found = Vec::new();
         for file in state.assembly.files().filter(|file| file.is_complete()) {
             let Some(identity) = self.effective_file_identity(job_id, file.file_id()) else {
@@ -924,11 +1045,10 @@ impl Pipeline {
             })
             .map(|volume| volume.classification.set_name.clone())
             .collect();
-        nameless.extend(
-            named
-                .into_iter()
-                .filter(|volume| contradicted.contains(&volume.classification.set_name)),
-        );
+        nameless.extend(named.into_iter().filter(|volume| {
+            contradicted.contains(&volume.classification.set_name)
+                || !named_firsts.contains(&volume.classification.set_name)
+        }));
         nameless
     }
 
@@ -953,10 +1073,13 @@ impl Pipeline {
     /// following the volume whose headers continue it. A link is taken only
     /// when exactly one volume can be next; an ambiguous or missing link ends
     /// the chain there, and the volumes past it stay where they were.
-    fn chain_nameless_rar_volumes(volumes: &[NamelessRarVolume]) -> Vec<Vec<(usize, u32)>> {
+    fn chain_nameless_rar_volumes(
+        volumes: &[NamelessRarVolume],
+        representatives: &[usize],
+    ) -> Vec<Vec<(usize, u32)>> {
         let mut assigned = vec![false; volumes.len()];
         let mut openers: Vec<usize> = (0..volumes.len())
-            .filter(|index| volumes[*index].opens_set())
+            .filter(|index| representatives[*index] == *index && volumes[*index].opens_set())
             .collect();
         openers.sort_by(|left, right| volumes[*left].filename.cmp(&volumes[*right].filename));
         for opener in &openers {
@@ -972,7 +1095,8 @@ impl Pipeline {
                 let next_index = current_index + 1;
                 let candidates: Vec<usize> = (0..volumes.len())
                     .filter(|candidate| {
-                        !assigned[*candidate]
+                        representatives[*candidate] == *candidate
+                            && !assigned[*candidate]
                             && volumes[*candidate].follows(&volumes[current], next_index)
                     })
                     .collect();
@@ -991,6 +1115,19 @@ impl Pipeline {
                 current = next;
                 current_index = next_index;
             }
+            let copies: Vec<_> = chain
+                .iter()
+                .flat_map(|(representative, index)| {
+                    representatives
+                        .iter()
+                        .enumerate()
+                        .filter(move |(candidate, rep)| {
+                            candidate != *rep && **rep == *representative
+                        })
+                        .map(move |(candidate, _)| (candidate, *index))
+                })
+                .collect();
+            chain.extend(copies);
             chains.push(chain);
         }
         chains
@@ -1014,14 +1151,83 @@ impl Pipeline {
     /// path, never a verdict the headers cannot overrule. Volumes no chain
     /// reaches are left as they are, and a set that still has no first volume
     /// waits for one through the ordinary missing-volume path.
-    pub(crate) async fn group_nameless_rar_volumes(&mut self, job_id: JobId, file_id: NzbFileId) {
+    pub(crate) async fn group_nameless_rar_volumes(&mut self, job_id: JobId) {
         let volumes = self.header_placed_rar_volumes(job_id).await;
-        if !volumes.iter().any(|volume| volume.file_id == file_id) {
+        if volumes.is_empty() {
             return;
         }
 
+        // A matching checksum is only a cheap candidate filter. Compare the
+        // files byte-for-byte before treating two posted copies as one link.
+        let mut paths = Vec::new();
+        for (index, volume) in volumes.iter().enumerate() {
+            let checksum = self
+                .par2_runtime
+                .get(&job_id)
+                .and_then(|runtime| runtime.completed_checksums.get(&volume.file_id))
+                .map(|checksum| checksum.crc32);
+            if let Some(path) = self.resolve_job_input_path(job_id, &volume.filename) {
+                paths.push((index, path, checksum));
+            }
+        }
+        // Preserve a live representative when a byte-identical repost arrives
+        // later. A lexically earlier copy must not rename an established set.
+        paths.sort_by_key(|(index, _, _)| !volumes[*index].registered);
+        let volume_count = volumes.len();
+        let representatives = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut candidates = BTreeMap::<u64, Vec<_>>::new();
+            for (index, path, checksum) in paths {
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    candidates
+                        .entry(metadata.len())
+                        .or_default()
+                        .push((index, path, checksum));
+                }
+            }
+            let equal =
+                |left: &std::path::Path, right: &std::path::Path| -> std::io::Result<bool> {
+                    let mut left = std::fs::File::open(left)?;
+                    let mut right = std::fs::File::open(right)?;
+                    let length = left.metadata()?.len();
+                    if right.metadata()?.len() != length {
+                        return Ok(false);
+                    }
+                    let mut a = vec![0u8; 64 * 1024];
+                    let mut b = vec![0u8; a.len()];
+                    let mut remaining = length;
+                    while remaining != 0 {
+                        let n = remaining.min(a.len() as u64) as usize;
+                        left.read_exact(&mut a[..n])?;
+                        right.read_exact(&mut b[..n])?;
+                        if a[..n] != b[..n] {
+                            return Ok(false);
+                        }
+                        remaining -= n as u64;
+                    }
+                    Ok(true)
+                };
+            let mut representatives: Vec<_> = (0..volume_count).collect();
+            for group in candidates.values().filter(|group| group.len() > 1) {
+                for (position, (index, path, checksum)) in group.iter().enumerate().skip(1) {
+                    for (prior, previous, previous_checksum) in &group[..position] {
+                        if matches!((checksum, previous_checksum), (Some(a), Some(b)) if a != b) {
+                            continue;
+                        }
+                        if equal(path, previous).unwrap_or(false) {
+                            representatives[*index] = representatives[*prior];
+                            break;
+                        }
+                    }
+                }
+            }
+            representatives
+        })
+        .await
+        .unwrap_or_else(|_| (0..volume_count).collect());
+
         let mut rebinds: Vec<(usize, DetectedArchiveIdentity)> = Vec::new();
-        for chain in Self::chain_nameless_rar_volumes(&volumes) {
+        for chain in Self::chain_nameless_rar_volumes(&volumes, &representatives) {
             let set_name = volumes[chain[0].0].classification.set_name.clone();
             for (volume, index) in chain {
                 let wanted = DetectedArchiveIdentity {
@@ -1030,9 +1236,15 @@ impl Pipeline {
                     volume_index: Some(index),
                 };
                 let current = &volumes[volume].classification;
+                let registered_equivalent = volumes.iter().enumerate().any(|(other, candidate)| {
+                    representatives[other] == representatives[volume]
+                        && candidate.registered
+                        && candidate.classification.set_name == wanted.set_name
+                        && candidate.classification.volume_index.unwrap_or(0) == index
+                });
                 if current.set_name != wanted.set_name
                     || current.volume_index.unwrap_or(0) != index
-                    || !volumes[volume].registered
+                    || !registered_equivalent
                 {
                     rebinds.push((volume, wanted));
                 }
@@ -1096,6 +1308,74 @@ impl Pipeline {
                 .inflight_extractions
                 .get(&job_id)
                 .is_some_and(|sets| sets.contains(set_name))
+    }
+
+    /// Report an interior numbered hole only after recovery has placed its
+    /// outputs. A repaired part on disk can fill a hole the NZB never listed.
+    pub(crate) fn missing_numbered_archive_part(&self, job_id: JobId) -> Option<String> {
+        let state = self.jobs.get(&job_id)?;
+        let mut groups: BTreeMap<String, BTreeMap<u32, (String, usize, usize)>> = BTreeMap::new();
+        for file in state.assembly.files() {
+            if self.direct_set_already_installed(job_id, file)
+                || self.recovery_superseded_source(job_id, file.file_id())
+                || !matches!(
+                    self.classified_role_for_file(job_id, file),
+                    FileRole::RarVolume { .. } | FileRole::SevenZipSplit { .. }
+                )
+            {
+                continue;
+            }
+            let name = self
+                .effective_file_identity(job_id, file.file_id())
+                .and_then(|identity| identity.canonical_filename)
+                .unwrap_or_else(|| self.current_filename_for_file(job_id, file));
+            let lower = name.to_ascii_lowercase();
+            let end = if lower.ends_with(".rar") && lower.contains(".part") {
+                name.len() - 4
+            } else {
+                name.len()
+            };
+            let start = name[..end]
+                .rfind(|c: char| !c.is_ascii_digit())
+                .map_or(0, |at| at + 1);
+            if start == end || start == 0 {
+                continue;
+            }
+            // Digits at the end of an obfuscated stem are not a volume tail.
+            // Only explicit .NNN or .partNN.rar spelling establishes a gap.
+            if (end == name.len() && name.as_bytes()[start - 1] != b'.')
+                || (end != name.len() && !lower[..start].ends_with(".part"))
+            {
+                continue;
+            }
+            let Ok(number) = name[start..end].parse::<u32>() else {
+                continue;
+            };
+            let key = format!("{}{}", &lower[..start], &lower[end..]);
+            groups
+                .entry(key)
+                .or_default()
+                .insert(number, (name, start, end));
+        }
+        for parts in groups.values() {
+            let mut previous: Option<u32> = None;
+            for (&number, (name, start, end)) in parts {
+                if let Some(missing) = previous.and_then(|value| value.checked_add(1))
+                    && missing < number
+                {
+                    for missing in missing..number {
+                        let width = end - start;
+                        let missing_name =
+                            format!("{}{:0width$}{}", &name[..*start], missing, &name[*end..]);
+                        if !state.working_dir.join(&missing_name).is_file() {
+                            return Some(format!("missing archive part '{missing_name}'"));
+                        }
+                    }
+                }
+                previous = Some(number);
+            }
+        }
+        None
     }
 
     /// For every RAR set of the job that has never had a first volume, which

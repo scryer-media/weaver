@@ -2107,9 +2107,18 @@ impl Pipeline {
             // descriptions, and an offset-zero article is the one moment a
             // file can prove which described volume it is — with the decoded
             // bytes in hand, before any of them are written anywhere.
-            if direct_target.is_none() && !encoding.is_uu() {
+            if direct_target.is_none()
+                && !encoding.is_uu()
+                && !self
+                    .complete_header_repost(file_id, file_offset, &buffered_segment)
+                    .await
+            {
                 direct_target = self
-                    .direct_identity_route_target(file_id, file_offset)
+                    .direct_identity_route_target(
+                        file_id,
+                        file_offset,
+                        buffered_segment.declared_file_len,
+                    )
                     .await;
                 if let Some(DirectFileTarget::Route {
                     set_index,
@@ -2232,6 +2241,8 @@ impl Pipeline {
         let job_id = file_id.job_id;
         let ready = {
             let buffered_len = buffered_segment.len_bytes();
+            let identity_pending = !direct_handoff
+                && self.identity_prefix_pending(file_id, buffered_segment.declared_file_len);
 
             // While a demoted set's reconstruction sweep is outstanding, this
             // file's conventional bytes are parked, not written. The assembly
@@ -2266,7 +2277,7 @@ impl Pipeline {
                 } else {
                     write_buf.insert(file_offset, buffered_segment);
                 }
-                if sweep_outstanding {
+                if sweep_outstanding || identity_pending {
                     (Vec::new(), 0)
                 } else {
                     write_buf.drain_ready_with_contiguous_end()
@@ -2355,6 +2366,31 @@ impl Pipeline {
                 }
                 prefix.extend_from_slice(&slice[..slice.len().min(room)]);
             });
+            // Out-of-order articles already held by the reorder buffer can
+            // finish this window for every route, including conventional
+            // extraction. Only an unbroken prefix is evidence of identity.
+            if let Some(buffer) = self.write_buffers.get(&file_id) {
+                let mut parked: Vec<_> = buffer
+                    .buffered_chunks()
+                    .filter(|(offset, _)| *offset < crate::pipeline::PAR2_HASH_16K_BYTES as u64)
+                    .collect();
+                parked.sort_by_key(|(offset, _)| *offset);
+                for (offset, segment) in parked {
+                    if offset > prefix.len() as u64 {
+                        break;
+                    }
+                    let mut at = offset;
+                    segment.data.for_each_slice(|slice| {
+                        let skip = (prefix.len() as u64)
+                            .saturating_sub(at)
+                            .min(slice.len() as u64) as usize;
+                        let room =
+                            crate::pipeline::PAR2_HASH_16K_BYTES.saturating_sub(prefix.len());
+                        prefix.extend_from_slice(&slice[skip..skip + room.min(slice.len() - skip)]);
+                        at += slice.len() as u64;
+                    });
+                }
+            }
             (
                 prefix.len() == crate::pipeline::PAR2_HASH_16K_BYTES,
                 (header_was_incomplete || replaced_prefix)
@@ -3261,7 +3297,14 @@ impl Pipeline {
         if self.demotion_sweep_owns_file(file_id) {
             return Ok(());
         }
-        let direct_unpack = self.direct_unpack_wants_committed_ranges(file_id);
+        // A prospective chase must not force an identity candidate to leak
+        // before its prefix arrives. Normal memory-pressure eviction still
+        // applies and explicitly retires the identity admission if necessary.
+        let direct_unpack = self.direct_unpack_wants_committed_ranges(file_id)
+            && !self.identity_prefix_pending(
+                file_id,
+                self.file_declared_size.get(&file_id).copied().unwrap_or(0),
+            );
         loop {
             let batch = {
                 let Some(write_buf) = self.write_buffers.get_mut(&file_id) else {
@@ -4253,27 +4296,9 @@ impl Pipeline {
                         stage_ms = stage_start.elapsed().as_millis() as u64,
                         "file-complete stage: try_merge_par2_recovery"
                     );
-                    stage_start = Instant::now();
-                    self.refresh_archive_state_for_completed_file(job_id, file_id, true)
-                        .await;
-                    crate::runtime::perf_probe::record(
-                        "file_complete.refresh_archive_state_for_completed_file",
-                        stage_start.elapsed(),
-                    );
-                    debug!(
-                        job_id = job_id.0,
-                        stage_ms = stage_start.elapsed().as_millis() as u64,
-                        "file-complete stage: refresh_archive_state_for_completed_file"
-                    );
-                    // Released only now, after the archive probe above has
-                    // read the file: the last close of a freshly written file
-                    // is where the kernel flushes it, and a probe opened
-                    // during that flush waits on the vnode for the whole of
-                    // it. Every write landed before this seam ran, so the
-                    // probe reads complete bytes through the open handle.
-                    // Still queued behind the file's final write on its owner
-                    // thread, so the fd is gone before verification, repair,
-                    // or the final move touch this path.
+                    // Settle content identity before topology admission can
+                    // arm a chase over names that PAR2 is about to replace.
+                    // Closing is queued behind the final write on its owner.
                     crate::pipeline::release_cached_write_handle(file_path);
                     stage_start = Instant::now();
                     self.retry_par2_authoritative_identity(job_id).await;
@@ -4285,6 +4310,18 @@ impl Pipeline {
                         job_id = job_id.0,
                         stage_ms = stage_start.elapsed().as_millis() as u64,
                         "file-complete stage: retry_par2_authoritative_identity"
+                    );
+                    stage_start = Instant::now();
+                    self.refresh_archive_state_for_completed_file(job_id, file_id, true)
+                        .await;
+                    crate::runtime::perf_probe::record(
+                        "file_complete.refresh_archive_state_for_completed_file",
+                        stage_start.elapsed(),
+                    );
+                    debug!(
+                        job_id = job_id.0,
+                        stage_ms = stage_start.elapsed().as_millis() as u64,
+                        "file-complete stage: refresh_archive_state_for_completed_file"
                     );
                     stage_start = Instant::now();
                     self.try_rar_extraction(job_id).await;

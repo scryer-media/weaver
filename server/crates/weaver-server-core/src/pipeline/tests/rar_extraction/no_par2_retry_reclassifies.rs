@@ -9,7 +9,10 @@ async fn no_par2_retry_reclassifies_obfuscated_rar_redownload_as_7z() {
     let job_id = JobId(30079);
     let filename = "51273aad56a8b904e96928935278a627";
     let rar_bytes = rar5_fixture_bytes("rar5_store.rar");
-    let seven_zip_bytes = vec![0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x04];
+    let seven_zip_bytes: Vec<u8> = sevenz_fixture_bytes("generated_split_store_plain.7z")
+        .into_iter()
+        .flat_map(|(_, bytes)| bytes)
+        .collect();
     let spec = rar_job_spec(
         "Obfuscated RAR Retry Reclassifies As 7z",
         &[(filename.to_string(), rar_bytes.clone())],

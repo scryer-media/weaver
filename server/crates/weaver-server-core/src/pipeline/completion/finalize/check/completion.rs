@@ -1048,6 +1048,17 @@ impl Pipeline {
             return;
         }
 
+        // Recovery volumes have had their opportunity above. With no PAR2
+        // verdict still owed, report the actual missing part before a generic
+        // exhausted-work failure obscures the topology defect.
+        if download_pipeline_exhausted
+            && (par2_bypassed || !self.job_spec_has_par2_file(job_id))
+            && let Some(error) = self.missing_numbered_archive_part(job_id)
+        {
+            self.fail_job(job_id, error);
+            return;
+        }
+
         if let Some(error) = self.ownerless_live_rar_plan_error_for_job(job_id) {
             self.fail_job(job_id, error);
             return;
@@ -1852,6 +1863,12 @@ impl Pipeline {
                             )
                             .await;
 
+                        if download_pipeline_exhausted
+                            && let Some(error) = self.missing_numbered_archive_part(job_id)
+                        {
+                            self.fail_job(job_id, error);
+                            return;
+                        }
                         if !self.par2_verified.contains(&job_id) {
                             self.schedule_job_completion_check(job_id);
                             return;
@@ -2455,6 +2472,12 @@ impl Pipeline {
                         )
                         .await;
 
+                    if download_pipeline_exhausted
+                        && let Some(error) = self.missing_numbered_archive_part(job_id)
+                    {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
                     if !self.par2_verified.contains(&job_id) {
                         self.schedule_job_completion_check(job_id);
                         return;
@@ -2858,6 +2881,10 @@ impl Pipeline {
         //  - before the terminal transition records history, so a verdict
         //    reaches history and the UI through the same family PAR2 verdicts
         //    use rather than arriving after the job is already filed.
+        if let Some(error) = self.missing_numbered_archive_part(job_id) {
+            self.fail_job(job_id, error);
+            return;
+        }
         if let Some(error) = self.verify_par2_less_job_with_sfv(job_id).await {
             self.fail_job(job_id, error);
             return;
@@ -3051,7 +3078,10 @@ impl Pipeline {
                 }
             }
             ExtractionReadiness::Blocked { reason } => {
-                if reason.starts_with("archive topology not yet available") {
+                if reason.starts_with("archive topology not yet available")
+                    && (self.job_has_pending_download_pipeline_work(job_id)
+                        || self.job_has_active_extraction_tasks(job_id))
+                {
                     info!(
                         job_id = job_id.0,
                         reason = %reason,
@@ -3060,6 +3090,9 @@ impl Pipeline {
                     self.schedule_job_completion_check(job_id);
                     return;
                 }
+                // Downloads, placement and recovery have settled above. With
+                // no producer left, another completion check cannot supply a
+                // missing topology: refusal must terminate the job.
                 self.fail_job(job_id, reason);
             }
             ExtractionReadiness::Partial {

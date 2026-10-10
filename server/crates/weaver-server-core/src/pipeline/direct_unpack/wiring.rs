@@ -923,6 +923,24 @@ impl Pipeline {
                 continue;
             }
             let filename = self.current_filename_for_file(job_id, file);
+            // Header grouping assigns unnamed copies one position only after
+            // proving their bytes equivalent. Keep its registered representative
+            // instead of adding each physical copy to the reader's stream.
+            if matches!(file.declared_role(), weaver_model::files::FileRole::Unknown)
+                && self
+                    .effective_file_identity(job_id, file.file_id())
+                    .is_some_and(|identity| {
+                        identity.classification_source
+                            == crate::jobs::record::FileIdentitySource::Probe
+                    })
+                && self
+                    .rar_sets
+                    .get(&(job_id, set_name.to_string()))
+                    .and_then(|set| set.volume_files.get(&volume_number))
+                    .is_some_and(|registered| registered != &filename)
+            {
+                continue;
+            }
             filenames.entry(filename).or_insert(volume_number);
         }
         let mut parts = std::collections::BTreeMap::new();
@@ -936,6 +954,24 @@ impl Pipeline {
         }
         if parts.is_empty() || parts.keys().copied().ne(0..parts.len() as u32) {
             return Err("RAR volume roster is empty or noncontiguous".into());
+        }
+        if self
+            .rar_sets
+            .get(&(job_id, set_name.to_string()))
+            .is_some_and(|set| {
+                set.facts.get(&0).is_some_and(|facts| {
+                    facts.volume_number.is_some_and(|number| number != 0)
+                        || facts
+                            .members
+                            .iter()
+                            .min_by_key(|member| member.order)
+                            .is_some_and(|member| member.split_before)
+                }) || set.facts.iter().any(|(index, facts)| {
+                    facts.more_volumes && !parts.contains_key(&index.saturating_add(1))
+                })
+            })
+        {
+            return Err("RAR header requires a continuation not yet placed".into());
         }
         Ok(parts.into_values().collect())
     }
@@ -1526,6 +1562,21 @@ impl Pipeline {
         let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file_asm) else {
             return;
         };
+        if matches!(role, weaver_model::files::FileRole::SevenZipArchive)
+            && state.assembly.files().any(|part| {
+                matches!(
+                    self.classified_role_for_file(job_id, part),
+                    weaver_model::files::FileRole::SevenZipSplit { .. }
+                ) && self
+                    .classified_archive_set_name_for_file(job_id, part)
+                    .as_deref()
+                    == Some(set_name.as_str())
+            })
+        {
+            self.direct_unpack.pending_single_arm.remove(&file_id);
+            self.try_arm_direct_unpack(job_id, &set_name);
+            return;
+        }
         let filename = self.current_filename_for_file(job_id, file_asm);
         let Some(path) = self.resolve_job_input_path(job_id, &filename) else {
             self.direct_unpack.pending_single_arm.remove(&file_id);
@@ -2923,6 +2974,28 @@ impl Pipeline {
         );
     }
 
+    /// A changed container classification invalidates even a successful join.
+    pub(in crate::pipeline) fn invalidate_reclassified_chase(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+    ) {
+        if let Some(outcome) = self
+            .direct_unpack
+            .outcomes
+            .get_mut(&(job_id, set_name.to_string()))
+        {
+            outcome.tainted = true;
+        }
+        self.direct_unpack_abort_set(
+            job_id,
+            set_name,
+            "archive classification changed after chase admission",
+            AbortLatch::Permanent,
+            DemotionReason::PartUnreadable,
+        );
+    }
+
     /// Mark a set's chase unusable because repair replaced bytes it read.
     ///
     /// A running chase is aborted outright; a finished one is flagged so
@@ -3652,6 +3725,63 @@ impl Pipeline {
             );
             record_event("released_after_clean_verification");
         }
+    }
+
+    /// Keep a reader's input alias when content identity confirms the same
+    /// container and position. Renaming these bytes adds no verification and
+    /// would invalidate an otherwise usable chase.
+    pub(in crate::pipeline) fn chase_keeps_archive_alias(
+        &self,
+        job_id: JobId,
+        filename: &str,
+        canonical: &str,
+    ) -> bool {
+        let Some(identity) = Self::canonical_archive_identity_from_filename(canonical) else {
+            return false;
+        };
+        let Some((set_name, index)) = self
+            .direct_unpack
+            .watermark_targets
+            .get(&job_id)
+            .and_then(|targets| targets.get(filename))
+        else {
+            return false;
+        };
+        if identity.set_name != *set_name || identity.volume_index.unwrap_or(0) as usize != *index {
+            return false;
+        }
+        let key = (job_id, set_name.clone());
+        let physical_rar = self
+            .direct_unpack
+            .armed
+            .get(&key)
+            .is_some_and(|armed| armed.physical_rar);
+        let format_matches = (physical_rar
+            && identity.kind == crate::jobs::assembly::DetectedArchiveKind::Rar)
+            || self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.archive_topology_for(set_name))
+                .is_some_and(|topology| {
+                    matches!(
+                        (identity.kind, topology.archive_type),
+                        (
+                            crate::jobs::assembly::DetectedArchiveKind::Rar,
+                            crate::jobs::assembly::ArchiveType::Rar
+                        ) | (
+                            crate::jobs::assembly::DetectedArchiveKind::SevenZipSingle
+                                | crate::jobs::assembly::DetectedArchiveKind::SevenZipSplit,
+                            crate::jobs::assembly::ArchiveType::SevenZip
+                        )
+                    )
+                });
+        format_matches
+            && (self.direct_unpack.armed.contains_key(&key)
+                || self
+                    .direct_unpack
+                    .outcomes
+                    .get(&key)
+                    .is_some_and(|outcome| !outcome.tainted && outcome.result.is_ok()))
     }
 
     /// Taint every chase whose set contains `filename`.

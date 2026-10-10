@@ -744,51 +744,76 @@ impl Pipeline {
             .collect();
         let _ = state;
 
-        let mut by_current = HashMap::<String, NzbFileId>::new();
-        let mut by_source = HashMap::<String, NzbFileId>::new();
-        let mut by_canonical = HashMap::<String, NzbFileId>::new();
-        let mut by_rar_volume = HashMap::<u32, NzbFileId>::new();
-
-        for (file_id, identity, role, _) in &files {
-            by_current.insert(identity.current_filename.clone(), *file_id);
-            by_source.insert(identity.source_filename.clone(), *file_id);
-            if let Some(canonical) = identity.canonical_filename.as_ref() {
-                by_canonical.insert(canonical.clone(), *file_id);
-            }
-            // A probed volume whose headers state no number reads as volume 0
-            // in its role. That is right for a first volume and wrong for one
-            // that opens mid-member, and matching on it hands the first
-            // volume's described name to whichever volume happened to be
-            // probed.
-            let position_unknown = identity
-                .classification
-                .as_ref()
-                .is_some_and(|classification| {
-                    self.numberless_rar_volume_position_unknown(job_id, classification)
-                });
-            if !position_unknown
-                && let weaver_model::files::FileRole::RarVolume { volume_number } = role
-            {
-                by_rar_volume.insert(*volume_number, *file_id);
-            }
-        }
-        // A file some description names is that description's. The volume
-        // number speaks only for a file whose name says nothing, and numbers
-        // repeat across sets: two single-volume sets are both volume 0, so a
-        // set that never reached disk had its description handed to the other
-        // set's volume once that one was renamed to its own description.
-        let named: HashSet<NzbFileId> = par2_set
-            .files
-            .values()
-            .filter_map(|desc| {
-                let name = sanitize_download_filename(&desc.filename);
-                by_current
-                    .get(&name)
-                    .or_else(|| by_source.get(&name))
-                    .or_else(|| by_canonical.get(&name))
-                    .copied()
+        // Names and volume numbers can lie. An authoritative classification
+        // requires a unique content fingerprint and the description's length.
+        // A restart loses the decode prefix. Recover the fingerprint from a
+        // completed physical file before considering it unidentified. Its disk
+        // length also supersedes the encoded article counts restored by NZB.
+        let candidates: Vec<_> = files
+            .iter()
+            .filter(|(file_id, _, _, complete)| {
+                *complete
+                    && self
+                        .content_bound_par2_file_id(*file_id, par2_set)
+                        .is_none()
+            })
+            .map(|(file_id, identity, _, _)| {
+                (*file_id, working_dir.join(&identity.current_filename))
             })
             .collect();
+        if !candidates.is_empty() {
+            let fingerprints = tokio::task::spawn_blocking(move || {
+                use std::io::Read;
+                candidates
+                    .into_iter()
+                    .filter_map(|(file_id, path)| {
+                        let mut file = std::fs::File::open(path).ok()?;
+                        let length = file.metadata().ok()?.len();
+                        let mut prefix = vec![
+                            0;
+                            length.min(crate::pipeline::PAR2_HASH_16K_BYTES as u64)
+                                as usize
+                        ];
+                        file.read_exact(&mut prefix).ok()?;
+                        Some((file_id, prefix, length))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|error| format!("failed to read restored file identity: {error}"))?;
+            for (file_id, prefix, length) in fingerprints {
+                self.file_proven_par2_fingerprint
+                    .insert(file_id, (par2_rs::checksum::md5(&prefix), length));
+                self.file_prefix_16k.insert(file_id, prefix);
+            }
+        }
+        let mut by_content = HashMap::<par2_rs::FileId, Vec<NzbFileId>>::new();
+        for (file_id, identity, _, _) in &files {
+            let description = self
+                .content_bound_par2_file_id(*file_id, par2_set)
+                .or_else(|| {
+                    // A persisted authoritative identity remains authoritative
+                    // even after its archive volume has been eagerly deleted.
+                    if identity.classification_source
+                        != crate::jobs::record::FileIdentitySource::Par2
+                    {
+                        return None;
+                    }
+                    let canonical = identity.canonical_filename.as_ref()?;
+                    let matches: Vec<_> = par2_set
+                        .files
+                        .iter()
+                        .filter(|(_, desc)| {
+                            sanitize_download_filename(&desc.filename) == *canonical
+                        })
+                        .map(|(id, _)| *id)
+                        .collect();
+                    unique_par2_binding_candidate(&matches)
+                });
+            if let Some(description) = description {
+                by_content.entry(description).or_default().push(*file_id);
+            }
+        }
         let mut occupied_filenames = HashSet::<String>::new();
         for (_, identity, _, _) in &files {
             reserve_identity_filenames(identity, &mut occupied_filenames);
@@ -799,27 +824,15 @@ impl Pipeline {
         let mut touched_rar_files = HashMap::<String, HashSet<String>>::new();
         let mut touched_complete_rar_sets = HashSet::<String>::new();
         let mut stale_rar_sets = HashSet::<String>::new();
+        let mut renamed_away = HashSet::<String>::new();
         let mut rebound = 0usize;
 
-        for desc in par2_set.files.values() {
+        for (description_id, desc) in &par2_set.files {
             let canonical_filename = sanitize_download_filename(&desc.filename);
-            let matched_file_id = by_current
-                .get(&canonical_filename)
-                .copied()
-                .or_else(|| by_source.get(&canonical_filename).copied())
-                .or_else(|| by_canonical.get(&canonical_filename).copied())
-                .or_else(|| {
-                    match weaver_model::files::FileRole::from_filename(&canonical_filename) {
-                        weaver_model::files::FileRole::RarVolume { volume_number } => by_rar_volume
-                            .get(&volume_number)
-                            .copied()
-                            .filter(|file_id| !named.contains(file_id)),
-                        _ => None,
-                    }
-                });
-            let Some(file_id) = matched_file_id else {
+            let Some([file_id]) = by_content.get(description_id).map(Vec::as_slice) else {
                 continue;
             };
+            let file_id = *file_id;
 
             let Some((_, identity, old_role, is_complete)) = files
                 .iter()
@@ -830,6 +843,14 @@ impl Pipeline {
             };
 
             let old_current = identity.current_filename.clone();
+            if old_current == desc.filename
+                && Self::canonical_archive_identity_from_filename(&canonical_filename).is_none()
+            {
+                // An ordinary source already has the described path. Preserve
+                // it (and any PAR3 identity) instead of flattening a valid
+                // relative source path as a side effect of archive grouping.
+                continue;
+            }
             let mut target_occupied = occupied_filenames.clone();
             forget_identity_filenames(&identity, &mut target_occupied);
             let canonical_filename =
@@ -870,6 +891,7 @@ impl Pipeline {
                 runtime_fs::paths_equivalent_for_placement(&old_path, &new_path);
             let renamed_to_canonical = if filename_changed
                 && is_complete
+                && !self.chase_keeps_archive_alias(job_id, &old_current, &canonical_filename)
                 && old_path.exists()
                 && (!canonical_path_exists || canonical_path_is_same)
             {
@@ -894,6 +916,9 @@ impl Pipeline {
             let canonical_is_current = !filename_changed
                 || renamed_to_canonical
                 || (canonical_path_exists && !old_path.exists());
+            if filename_changed && canonical_is_current {
+                renamed_away.insert(old_current.clone());
+            }
 
             let classification =
                 Self::canonical_archive_identity_from_filename(&canonical_filename)
@@ -953,6 +978,33 @@ impl Pipeline {
 
         for (set_name, touched_filenames) in &touched_rar_files {
             self.invalidate_archive_set_for_identity_rebind(job_id, set_name, touched_filenames);
+        }
+
+        // Retire the old non-RAR roster before rebuilding under the verified
+        // identity. Otherwise it can queue an extraction from renamed inputs.
+        let retired_sets: Vec<String> = self
+            .jobs
+            .get(&job_id)
+            .into_iter()
+            .flat_map(|state| state.assembly.archive_topologies().iter())
+            .filter(|(_, topology)| {
+                !matches!(
+                    topology.archive_type,
+                    crate::jobs::assembly::ArchiveType::Rar
+                ) && topology
+                    .volume_map
+                    .keys()
+                    .any(|name| renamed_away.contains(name))
+            })
+            .map(|(set_name, _)| set_name.clone())
+            .collect();
+        for set_name in retired_sets {
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.assembly.remove_archive_topology(&set_name);
+            }
+            self.db
+                .clear_extraction_chunks_for_set(job_id, &set_name)
+                .map_err(|error| format!("failed to retire renamed archive state: {error}"))?;
         }
 
         for file_id in touched_files {
@@ -2323,12 +2375,16 @@ impl Pipeline {
             // skip, so a file that moved under us is read in full instead.
             options.trust_seeded_evidence_for_scan = true;
             par2_rs::Par2RepairSession::open(options)
+                // Tokio stores the blocking result inside its task cell.
+                // Keep the large session off the async caller's stack while
+                // that cell is constructed and moved through the scheduler.
+                .map(Box::new)
                 .map_err(|error| format!("failed to open retained PAR2 session: {error}"))
         })
         .await
         .map_err(|error| format!("retained PAR2 session task panicked: {error}"))??;
 
-        Ok(Some((session_result, true)))
+        Ok(Some((*session_result, true)))
     }
 
     pub(crate) fn par2_cancellation_token(&mut self, job_id: JobId) -> par2_rs::CancellationToken {

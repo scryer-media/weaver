@@ -51,6 +51,165 @@ fn buffered_extraction_output<W: Write>(writer: W) -> std::io::BufWriter<W> {
     std::io::BufWriter::with_capacity(EXTRACT_WRITE_BUFFER_BYTES, writer)
 }
 
+/// Resolve completed split candidates on the extraction worker. Inputs remain
+/// untouched until the selected archive has passed entry length and CRC checks.
+fn verified_sevenz_part_paths(parts: &[(u32, PathBuf)]) -> Result<Vec<PathBuf>, String> {
+    use std::io::Read;
+    let mut groups = std::collections::BTreeMap::<u32, Vec<&PathBuf>>::new();
+    for (index, path) in parts {
+        groups.entry(*index).or_default().push(path);
+    }
+    let first = groups.get(&0).ok_or("missing 7z part 1")?;
+    let mut valid_heads = Vec::new();
+    for path in first {
+        let mut head = [0u8; 32];
+        let Ok(mut file) = std::fs::File::open(path) else {
+            continue;
+        };
+        if file.read_exact(&mut head).is_err()
+            || head[..6] != [b'7', b'z', 0xbc, 0xaf, 0x27, 0x1c]
+            || head[6] != 0
+        {
+            continue;
+        }
+        let mut crc = weaver_yenc::crc::Crc32::new();
+        crc.update(&head[12..]);
+        if crc.finalize() == u32::from_le_bytes(head[8..12].try_into().unwrap()) {
+            valid_heads.push((*path, head));
+        }
+    }
+    let (_, header) = valid_heads
+        .first()
+        .ok_or("7z part 1 has no CRC-valid start header")?;
+    if valid_heads.iter().any(|(_, other)| other != header) {
+        return Err("ambiguous duplicate 7z start headers".into());
+    }
+    let offset = u64::from_le_bytes(header[12..20].try_into().unwrap());
+    let size = u64::from_le_bytes(header[20..28].try_into().unwrap());
+    let total = 32u64
+        .checked_add(offset)
+        .and_then(|n| n.checked_add(size))
+        .ok_or("7z container length overflow")?;
+    let chunk = valid_heads
+        .iter()
+        .filter_map(|(path, _)| std::fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .filter(|length| *length >= 32 && (*length <= total || groups.len() == 1))
+        .map(|length| length.min(total))
+        .max()
+        .ok_or("7z part 1 has an invalid length")?;
+    let count = total.div_ceil(chunk);
+    if groups.len() as u64 != count || !groups.keys().copied().map(u64::from).eq(0..count) {
+        return Err("missing 7z part or part index past the container end".into());
+    }
+    let mut selected = Vec::new();
+    for (index, paths) in groups {
+        let expected = chunk.min(total - u64::from(index) * chunk);
+        let candidates: Vec<_> = paths
+            .into_iter()
+            .filter(|path| {
+                std::fs::metadata(path).is_ok_and(|meta| {
+                    if meta.len() == expected {
+                        return true;
+                    }
+                    // The single-volume PAR3 envelope follows the container.
+                    // Match the direct router's signature rule; arbitrary
+                    // excess bytes and split-volume size mismatches fail.
+                    if count != 1 || meta.len() <= expected {
+                        return false;
+                    }
+                    use std::io::{Seek, SeekFrom};
+                    let Ok(mut file) = std::fs::File::open(path) else {
+                        return false;
+                    };
+                    let mut magic = [0u8; 8];
+                    file.seek(SeekFrom::Start(total)).is_ok()
+                        && file.read_exact(&mut magic).is_ok()
+                        && magic == *par3_rs::MAGIC
+                }) && (index != 0 || valid_heads.iter().any(|(valid, _)| valid == path))
+            })
+            .collect();
+        let chosen = candidates.first().ok_or_else(|| {
+            format!(
+                "7z part {} has no candidate of the required size {expected}",
+                index + 1
+            )
+        })?;
+        for other in candidates.iter().skip(1) {
+            let mut left = std::fs::File::open(chosen).map_err(|e| e.to_string())?;
+            let mut right = std::fs::File::open(other).map_err(|e| e.to_string())?;
+            let mut a = vec![0u8; 64 * 1024];
+            let mut b = vec![0u8; a.len()];
+            let mut remaining = expected;
+            while remaining != 0 {
+                let n = remaining.min(a.len() as u64) as usize;
+                left.read_exact(&mut a[..n]).map_err(|e| e.to_string())?;
+                right.read_exact(&mut b[..n]).map_err(|e| e.to_string())?;
+                if a[..n] != b[..n] {
+                    return Err(format!("ambiguous duplicate 7z part {}", index + 1));
+                }
+                remaining -= n as u64;
+            }
+        }
+        selected.push((*chosen).clone());
+    }
+    Ok(selected)
+}
+
+/// A decoder can reach EOF before its checksum reader reaches the declared
+/// length. Verify both facts before committing the member or its counters.
+fn copy_verified_7z_member(
+    entry: &sevenz_turbo::ArchiveEntry,
+    reader: &mut dyn std::io::Read,
+    writer: &mut impl Write,
+) -> std::io::Result<u64> {
+    let mut crc = weaver_yenc::crc::Crc32::new();
+    let mut buffer = vec![0u8; EXTRACT_WRITE_BUFFER_BYTES];
+    let mut copied = 0u64;
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            break;
+        }
+        copied = copied.checked_add(count as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "7z member length overflow")
+        })?;
+        if copied > entry.size() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "7z member {} exceeds declared size {}",
+                    entry.name(),
+                    entry.size()
+                ),
+            ));
+        }
+        crc.update(&buffer[..count]);
+        writer.write_all(&buffer[..count])?;
+    }
+    if copied != entry.size() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "7z member {} size mismatch: expected {}, produced {copied}",
+                entry.name(),
+                entry.size()
+            ),
+        ));
+    }
+    if entry.has_crc && u64::from(crc.finalize()) != entry.crc {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("7z member {} CRC mismatch", entry.name()),
+        ));
+    }
+    writer.flush()?;
+    Ok(copied)
+}
+
 struct CountingWriter<W> {
     inner: W,
     attempt: Arc<PhaseAttemptCounters>,
@@ -1112,8 +1271,7 @@ where
             .map_err(std::io::Error::other)?;
         let attempt = Arc::new(PhaseAttemptCounters::new(Arc::clone(phase_counters)));
         let mut file = buffered_extraction_output(CountingWriter::new(file, Arc::clone(&attempt)));
-        let copied = std::io::copy(reader, &mut file);
-        let copied = copied.and_then(|bytes| file.flush().map(|()| bytes));
+        let copied = copy_verified_7z_member(entry, reader, &mut file);
         let bytes_written = match copied {
             Ok(bytes) => {
                 attempt.commit();
@@ -2821,6 +2979,23 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
     ) -> Result<Vec<PathBuf>, String> {
+        let parts = self.archive_set_indexed_part_paths(job_id, set_name)?;
+        if parts.first().is_some_and(|(index, _)| *index != 0) {
+            return Err(format!("missing first archive part in '{set_name}'"));
+        }
+        if parts.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(format!(
+                "duplicate archive part in '{set_name}' requires verification"
+            ));
+        }
+        Ok(parts.into_iter().map(|(_, path)| path).collect())
+    }
+
+    fn archive_set_indexed_part_paths(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<Vec<(u32, PathBuf)>, String> {
         let state = self
             .jobs
             .get(&job_id)
@@ -2860,8 +3035,8 @@ impl Pipeline {
                 parts.push((*vol, path));
             }
         }
-        parts.sort_by_key(|(n, _)| *n);
-        Ok(parts.into_iter().map(|(_, p)| p).collect())
+        parts.sort();
+        Ok(parts)
     }
 
     /// Extract a single 7z archive set. Only collects files belonging to the named set.
@@ -2870,7 +3045,7 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
     ) -> Result<u32, String> {
-        let file_paths = self.archive_set_part_paths(job_id, set_name)?;
+        let part_candidates = self.archive_set_indexed_part_paths(job_id, set_name)?;
         let password = self.primary_archive_password_for_job(job_id);
 
         let output_dir = self.extraction_staging_dir(job_id);
@@ -2923,9 +3098,8 @@ impl Pipeline {
                 pp_pool.install(move || {
                     let _task_permit = task_permit;
                     let root = _task_permit.root();
-                    if file_paths.is_empty() {
-                        return Err(format!("no 7z files found for set '{set_name_owned}'"));
-                    }
+                    let file_paths = verified_sevenz_part_paths(&part_candidates)
+                        .map_err(|error| format!("failed to read 7z archive: {error}"))?;
                     let end_header_bytes = sevenz_declared_end_header_bytes(&file_paths[0]);
 
                     let pw = if let Some(ref p) = password {

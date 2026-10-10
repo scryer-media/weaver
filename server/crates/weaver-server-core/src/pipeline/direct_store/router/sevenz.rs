@@ -208,6 +208,11 @@ impl StartHeader {
         if prefix[6] != 0 {
             return None;
         }
+        let mut crc = weaver_yenc::crc::Crc32::new();
+        crc.update(&prefix[12..]);
+        if crc.finalize() != u32::from_le_bytes(prefix[8..12].try_into().unwrap()) {
+            return None;
+        }
         let word = |at: usize| {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&prefix[at..at + 8]);

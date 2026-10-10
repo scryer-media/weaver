@@ -2795,6 +2795,27 @@ impl Pipeline {
             None => return,
         };
 
+        // Content identification can arrive after a numbered continuation built
+        // a plain split topology. Rebuild it before the joiner can bypass archive
+        // decoding and publish the concatenated container as a successful member.
+        if matches!(
+            role,
+            weaver_model::files::FileRole::SevenZipArchive
+                | weaver_model::files::FileRole::SevenZipSplit { .. }
+        ) && state
+            .assembly
+            .archive_topology_for(&set_name)
+            .is_some_and(|topology| topology.archive_type == ArchiveType::Split)
+        {
+            self.invalidate_reclassified_chase(job_id, &set_name);
+            self.jobs
+                .get_mut(&job_id)
+                .unwrap()
+                .assembly
+                .remove_archive_topology(&set_name);
+        }
+        let state = self.jobs.get(&job_id).unwrap();
+
         // A split set whose joined output the recovery data already produced is
         // retired for the rest of the job. Several paths re-offer its completed
         // parts here — job restore, and the archive finalization that re-refreshes
@@ -2815,49 +2836,16 @@ impl Pipeline {
         }
 
         match role {
-            weaver_model::files::FileRole::SevenZipArchive => {
-                if state.assembly.archive_topology_for(&set_name).is_some() {
-                    let state = self.jobs.get_mut(&job_id).unwrap();
-                    state.assembly.mark_volume_complete(&set_name, 0);
-                    debug!(
-                        job_id = job_id.0,
-                        set_name = %set_name,
-                        "7z single-file volume complete"
-                    );
-                    return;
-                }
-
-                let mut volume_map = std::collections::HashMap::new();
-                volume_map.insert(filename.clone(), 0);
-
-                let topology = ArchiveTopology {
-                    archive_type: ArchiveType::SevenZip,
-                    volume_map,
-                    complete_volumes: std::collections::HashSet::new(),
-                    expected_volume_count: Some(1),
-                    members: vec![ArchiveMember {
-                        name: set_name.clone(),
-                        first_volume: 0,
-                        last_volume: 0,
-                        unpacked_size: 0,
-                    }],
-                    unresolved_spans: vec![],
+            weaver_model::files::FileRole::SevenZipArchive
+            | weaver_model::files::FileRole::SevenZipSplit { .. } => {
+                // A bare .7z can be part zero of a numbered set. Include it in
+                // the same roster before any completion can arm a chase.
+                let part_number = |role| match role {
+                    weaver_model::files::FileRole::SevenZipArchive => Some(0),
+                    weaver_model::files::FileRole::SevenZipSplit { number } => Some(number),
+                    _ => None,
                 };
-
-                let state = self.jobs.get_mut(&job_id).unwrap();
-                state
-                    .assembly
-                    .set_archive_topology(set_name.clone(), topology);
-                state.assembly.mark_volume_complete(&set_name, 0);
-
-                info!(
-                    job_id = job_id.0,
-                    set_name = %set_name,
-                    "7z topology set (single archive)"
-                );
-            }
-            weaver_model::files::FileRole::SevenZipSplit { number } => {
-                let completing_number = number;
+                let completing_number = part_number(role).unwrap();
 
                 if state.assembly.archive_topology_for(&set_name).is_some() {
                     let state = self.jobs.get_mut(&job_id).unwrap();
@@ -2900,8 +2888,7 @@ impl Pipeline {
                 let mut volume_map = std::collections::HashMap::new();
                 let mut max_number = 0u32;
                 for f in state.assembly.files() {
-                    if let weaver_model::files::FileRole::SevenZipSplit { number: n } =
-                        self.classified_role_for_file(job_id, f)
+                    if let Some(n) = part_number(self.classified_role_for_file(job_id, f))
                         && self
                             .classified_archive_set_name_for_file(job_id, f)
                             .as_deref()
@@ -2957,8 +2944,7 @@ impl Pipeline {
                     .files()
                     .filter(|f| f.is_complete())
                     .filter_map(|f| {
-                        if let weaver_model::files::FileRole::SevenZipSplit { number: n } =
-                            self.classified_role_for_file(job_id, f)
+                        if let Some(n) = part_number(self.classified_role_for_file(job_id, f))
                             && self
                                 .classified_archive_set_name_for_file(job_id, f)
                                 .as_deref()

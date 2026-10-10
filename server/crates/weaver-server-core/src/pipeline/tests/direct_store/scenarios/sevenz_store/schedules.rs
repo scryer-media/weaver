@@ -11,7 +11,7 @@ mod extended;
 /// Bytes in which no slice recurs. A recovery set mends a lost slice from any
 /// copy of it elsewhere in the set, so a payload that repeats survives a loss
 /// the set carries no recovery data for.
-fn unrepeated_payload(seed: u64, len: usize) -> Vec<u8> {
+pub(in super::super) fn unrepeated_payload(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed;
     (0..len)
         .map(|_| {
@@ -72,7 +72,7 @@ fn map_extents(archive: &[u8]) -> Vec<(usize, usize)> {
 }
 
 /// The schedule slots holding any byte of [`map_extents`], as a loss mask.
-fn map_slots(archive: &[u8], count: usize, articles: usize) -> u8 {
+pub(in super::super) fn map_slots(archive: &[u8], count: usize, articles: usize) -> u8 {
     let chunk = archive.len().div_ceil(count);
     let extents = map_extents(archive);
     let mut slots = 0u8;
@@ -96,7 +96,7 @@ fn loses<const MAP: u8>(mask: u8) -> bool {
 }
 
 /// [`loses`] for every four-slot map, indexed by the map's own mask.
-const LOSES: [fn(u8) -> bool; 16] = [
+pub(in super::super) const LOSES: [fn(u8) -> bool; 16] = [
     loses::<0>,
     loses::<1>,
     loses::<2>,

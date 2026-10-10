@@ -531,7 +531,7 @@ async fn par2_metadata_sanitizes_unsafe_canonical_target_before_rename() {
     let topology = pipeline
         .jobs
         .get(&job_id)
-        .and_then(|state| state.assembly.archive_topology_for("Fixture.Payload"))
+        .and_then(|state| state.assembly.archive_topology_for("fixture.payload"))
         .cloned()
         .expect("sanitized PAR2 rebinding should rebuild RAR topology");
     assert!(
@@ -544,78 +544,115 @@ async fn par2_metadata_sanitizes_unsafe_canonical_target_before_rename() {
 
 #[tokio::test]
 async fn par2_metadata_records_canonical_name_without_phantom_current_path() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(30113);
-    let canonical_filename = "show.part001.rar";
-    let source_filename = "incoming.part001.rar";
-    let rar_bytes = build_multifile_multivolume_rar_set()[0].1.clone();
-    let spec = JobSpec {
-        name: "PAR2 Canonical Before File Completion".to_string(),
-        password: None,
-        total_bytes: rar_bytes.len() as u64,
-        category: None,
-        metadata: vec![],
-        files: vec![FileSpec {
-            filename: source_filename.to_string(),
-            role: FileRole::from_filename(source_filename),
-            groups: vec!["alt.binaries.test".to_string()],
-            posted_at_epoch: None,
-            segments: vec![segment_spec! {
-                number: 0,
-                bytes: rar_bytes.len() as u32,
-                message_id: "rar-before-complete@example.com".to_string(),
+    use crate::pipeline::direct_unpack::settings::{DirectUnpackGate, DirectUnpackSettings};
+    use crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime;
+    for chase in [false, true] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
+            gate: if chase {
+                DirectUnpackGate::Enabled
+            } else {
+                DirectUnpackGate::Disabled
+            },
+        });
+        let job_id = JobId(30113);
+        let canonical_filename = "show.part001.rar";
+        let source_filename = "incoming.part001.rar";
+        let rar_bytes = build_multifile_multivolume_rar_set()[0].1.clone();
+        let spec = JobSpec {
+            name: "PAR2 Canonical Before File Completion".to_string(),
+            password: None,
+            total_bytes: rar_bytes.len() as u64,
+            category: None,
+            metadata: vec![],
+            files: vec![FileSpec {
+                filename: source_filename.to_string(),
+                role: FileRole::from_filename(source_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: rar_bytes.len() as u32,
+                    message_id: "rar-before-complete@example.com".to_string(),
+                }],
             }],
-        }],
-    };
-    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-    install_test_par2_runtime(
-        &mut pipeline,
-        job_id,
-        placement_par2_file_set(&[(canonical_filename.to_string(), rar_bytes.clone())]),
-        &[],
-    );
-
-    pipeline.retry_par2_authoritative_identity(job_id).await;
-
-    let identity = pipeline
-        .file_identity(
+        };
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+        install_test_par2_runtime(
+            &mut pipeline,
             job_id,
-            NzbFileId {
-                job_id,
-                file_index: 0,
-            },
-        )
-        .cloned()
-        .expect("PAR2 should still bind identity by RAR volume number");
-    assert_eq!(identity.current_filename, source_filename);
-    assert_eq!(
-        identity.canonical_filename.as_deref(),
-        Some(canonical_filename)
-    );
-    assert_eq!(identity.classification_source, FileIdentitySource::Par2);
-    assert!(!working_dir.join(canonical_filename).exists());
+            placement_par2_file_set(&[(canonical_filename.to_string(), rar_bytes.clone())]),
+            &[],
+        );
 
-    write_and_complete_file(&mut pipeline, job_id, 0, source_filename, &rar_bytes).await;
-    pipeline.retry_par2_authoritative_identity(job_id).await;
+        pipeline.retry_par2_authoritative_identity(job_id).await;
 
-    let identity = pipeline
-        .file_identity(
+        let file_id = NzbFileId {
             job_id,
-            NzbFileId {
+            file_index: 0,
+        };
+        assert!(
+            pipeline
+                .file_identity(job_id, file_id)
+                .is_none_or(|identity| identity.canonical_filename.is_none()),
+            "the same volume number alone must not establish canonical identity"
+        );
+        // Model decoded bytes captured before their file-completion commit.
+        // Content can establish a canonical name without inventing its disk path.
+        pipeline.file_prefix_16k.insert(
+            file_id,
+            rar_bytes[..rar_bytes.len().min(crate::pipeline::PAR2_HASH_16K_BYTES)].to_vec(),
+        );
+        pipeline.retry_par2_authoritative_identity(job_id).await;
+
+        let identity = pipeline
+            .file_identity(
                 job_id,
-                file_index: 0,
-            },
-        )
-        .cloned()
-        .expect("data file identity should remain persisted");
-    assert_eq!(identity.current_filename, canonical_filename);
-    assert_eq!(
-        identity.canonical_filename.as_deref(),
-        Some(canonical_filename)
-    );
-    assert!(!working_dir.join(source_filename).exists());
-    assert!(working_dir.join(canonical_filename).exists());
+                NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+            )
+            .cloned()
+            .expect("PAR2 should bind identity from the decoded content prefix");
+        assert_eq!(identity.current_filename, source_filename);
+        assert_eq!(
+            identity.canonical_filename.as_deref(),
+            Some(canonical_filename)
+        );
+        assert_eq!(identity.classification_source, FileIdentitySource::Par2);
+        assert!(!working_dir.join(canonical_filename).exists());
+
+        write_and_complete_file(&mut pipeline, job_id, 0, source_filename, &rar_bytes).await;
+        pipeline.retry_par2_authoritative_identity(job_id).await;
+
+        let identity = pipeline
+            .file_identity(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+            )
+            .cloned()
+            .expect("data file identity should remain persisted");
+        assert_eq!(
+            identity.current_filename,
+            if chase {
+                source_filename
+            } else {
+                canonical_filename
+            }
+        );
+        assert_eq!(
+            identity.canonical_filename.as_deref(),
+            Some(canonical_filename)
+        );
+        assert_eq!(working_dir.join(source_filename).exists(), chase);
+        assert_eq!(working_dir.join(canonical_filename).exists(), !chase);
+        assert!(working_dir.join(&identity.current_filename).is_file());
+    }
 }
 
 #[tokio::test]

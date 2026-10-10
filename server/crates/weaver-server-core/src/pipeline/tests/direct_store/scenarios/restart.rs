@@ -1544,6 +1544,13 @@ async fn a_short_held_prefix_is_replaced_by_the_window_read_back_from_the_placed
         .file_prefix_16k
         .insert(file_id, real[..window / 4].to_vec());
     pipeline.file_proven_par2_fingerprint.remove(&file_id);
+    // The earlier complete prefix now establishes a canonical identity as
+    // soon as the index arrives. Remove that proof too to model the restored
+    // header-only state this read-back regression is intended to exercise.
+    let mut identity = pipeline.effective_file_identity(job_id, file_id).unwrap();
+    identity.canonical_filename = None;
+    identity.classification_source = crate::jobs::record::FileIdentitySource::Probe;
+    pipeline.set_file_identity(job_id, identity).unwrap();
     assert!(
         pipeline.resolve_par2_file_binding(file_id).is_none(),
         "non-vacuity: the short capture must leave the volume unbound"
