@@ -2,6 +2,15 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** Japanese strings for the Next interface; the keys and their order follow `en.ts`. */
 export const nextJa: LocaleDictionary = {
+  "next.archivePasswords.title": "アーカイブのパスワード",
+  "next.archivePasswords.list": "パスワード（1行に1つ）",
+  "next.archivePasswords.file": "パスワードファイル",
+  "next.archivePasswords.saved": "パスワード保存済み",
+  "next.archivePasswords.clear": "パスワードを削除",
+  "next.archivePasswords.password": "アーカイブのパスワード",
+  "next.archivePasswords.show": "表示",
+  "next.archivePasswords.hide": "非表示",
+  "next.archivePasswords.loadFailed": "パスワードを読み込めませんでした",
   // Shell
   "next.nav.downloads": "ダウンロード",
   "next.nav.history": "履歴",

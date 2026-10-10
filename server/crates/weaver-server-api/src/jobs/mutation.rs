@@ -372,16 +372,30 @@ impl JobsMutation {
     }
     /// Reprocess a completed or failed job (re-run post-download stages without re-downloading).
     #[graphql(guard = "ControlGuard")]
-    async fn reprocess_job(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
+    async fn reprocess_job(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        password: Option<String>,
+    ) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        handle.reprocess_job(JobId(id)).await?;
+        handle
+            .reprocess_job_with_password(JobId(id), password)
+            .await?;
         Ok(true)
     }
     /// Re-download a completed or failed job from its persisted NZB under the same job ID.
     #[graphql(guard = "ControlGuard")]
-    async fn redownload_job(&self, ctx: &Context<'_>, id: u64) -> Result<bool> {
+    async fn redownload_job(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        password: Option<String>,
+    ) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        handle.redownload_job(JobId(id)).await?;
+        handle
+            .redownload_job_with_password(JobId(id), password)
+            .await?;
         Ok(true)
     }
     /// Delete completed/failed/cancelled jobs from history.
@@ -726,9 +740,18 @@ impl JobsMutation {
     }
     /// Reprocess a failed queue item.
     #[graphql(guard = "ControlGuard")]
-    async fn reprocess_queue_item(&self, ctx: &Context<'_>, id: u64) -> Result<QueueCommandResult> {
+    async fn reprocess_queue_item(
+        &self,
+        ctx: &Context<'_>,
+        id: u64,
+        password: Option<String>,
+    ) -> Result<QueueCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        map_scheduler_result(handle.reprocess_job(JobId(id)).await)?;
+        map_scheduler_result(
+            handle
+                .reprocess_job_with_password(JobId(id), password)
+                .await,
+        )?;
         let item = handle
             .get_job(JobId(id))
             .ok()
@@ -746,9 +769,14 @@ impl JobsMutation {
         &self,
         ctx: &Context<'_>,
         id: u64,
+        password: Option<String>,
     ) -> Result<QueueCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        map_scheduler_result(handle.redownload_job(JobId(id)).await)?;
+        map_scheduler_result(
+            handle
+                .redownload_job_with_password(JobId(id), password)
+                .await,
+        )?;
         let item = handle
             .get_job(JobId(id))
             .ok()

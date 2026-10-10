@@ -1089,10 +1089,23 @@ impl Pipeline {
         (assembly, download_queue, recovery_queue)
     }
 
+    #[cfg(test)]
     pub(crate) async fn reprocess_job(
         &mut self,
         job_id: JobId,
     ) -> Result<(), crate::SchedulerError> {
+        self.reprocess_job_with_password(job_id, None).await
+    }
+
+    pub(crate) async fn reprocess_job_with_password(
+        &mut self,
+        job_id: JobId,
+        password: Option<String>,
+    ) -> Result<(), crate::SchedulerError> {
+        if password.is_some() {
+            self.archive_password_winners
+                .retain(|(id, _), _| *id != job_id);
+        }
         let in_jobs = self.jobs.contains_key(&job_id);
 
         if in_jobs {
@@ -1105,82 +1118,94 @@ impl Pipeline {
             }
         } else {
             let history_row = self.load_history_row(job_id).await?;
-            let (nzb, nzb_path, nzb_hash, category, metadata, output_dir, downloaded_bytes) =
-                if let Some(row) = history_row.as_ref() {
-                    let status = crate::job_status_from_persisted_str(
-                        &row.status,
-                        row.error_message.as_deref(),
-                    );
-                    if !Self::is_restartable_terminal_status(&status) {
-                        return Err(crate::SchedulerError::Conflict(format!(
-                            "job {} is not complete or failed",
-                            job_id.0
-                        )));
-                    }
+            let (
+                nzb,
+                nzb_path,
+                nzb_zstd,
+                nzb_hash,
+                category,
+                metadata,
+                output_dir,
+                downloaded_bytes,
+            ) = if let Some(row) = history_row.as_ref() {
+                let status =
+                    crate::job_status_from_persisted_str(&row.status, row.error_message.as_deref());
+                if !Self::is_restartable_terminal_status(&status) {
+                    return Err(crate::SchedulerError::Conflict(format!(
+                        "job {} is not complete or failed",
+                        job_id.0
+                    )));
+                }
 
-                    let metadata = row
-                        .metadata
-                        .as_deref()
-                        .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
-                        .unwrap_or_default();
+                let metadata = row
+                    .metadata
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
+                    .unwrap_or_default();
 
-                    let (preferred_nzb_path, nzb_zstd) = self
-                        .db
-                        .load_history_job_persisted_nzb(job_id.0)
-                        .map_err(crate::SchedulerError::State)?
-                        .unwrap_or_else(|| {
-                            (self.persisted_nzb_path_for_job(job_id, Some(row)), None)
-                        });
-                    let (nzb, nzb_path, nzb_zstd) =
-                        self.load_restart_nzb(job_id, &preferred_nzb_path, nzb_zstd)?;
-                    let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
-                    (
-                        nzb,
-                        nzb_path,
-                        nzb_hash,
-                        row.category.clone(),
-                        metadata,
-                        row.output_dir.clone(),
-                        row.downloaded_bytes,
-                    )
-                } else {
-                    let history_entry = self.finished_jobs.iter().find(|job| job.job_id == job_id);
-                    let Some(info) = history_entry else {
-                        return Err(crate::SchedulerError::JobNotFound(job_id));
-                    };
-                    if !Self::is_restartable_terminal_status(&info.status) {
-                        return Err(crate::SchedulerError::Conflict(format!(
-                            "job {} is not complete or failed",
-                            job_id.0
-                        )));
-                    }
-
-                    let (nzb_path, nzb_zstd) = self
-                        .db
-                        .load_history_job_persisted_nzb(job_id.0)
-                        .map_err(crate::SchedulerError::State)?
-                        .unwrap_or_else(|| {
-                            (
-                                self.persisted_nzb_path_for_job(job_id, history_row.as_ref()),
-                                None,
-                            )
-                        });
-                    let (nzb, nzb_path, nzb_zstd) =
-                        self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-                    let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
-
-                    (
-                        nzb,
-                        nzb_path,
-                        nzb_hash,
-                        info.category.clone(),
-                        info.metadata.clone(),
-                        info.output_dir.clone(),
-                        info.downloaded_bytes,
-                    )
+                let (preferred_nzb_path, nzb_zstd) = self
+                    .db
+                    .load_history_job_persisted_nzb(job_id.0)
+                    .map_err(crate::SchedulerError::State)?
+                    .unwrap_or_else(|| (self.persisted_nzb_path_for_job(job_id, Some(row)), None));
+                let (nzb, nzb_path, nzb_zstd) =
+                    self.load_restart_nzb(job_id, &preferred_nzb_path, nzb_zstd)?;
+                let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
+                (
+                    nzb,
+                    nzb_path,
+                    nzb_zstd,
+                    nzb_hash,
+                    row.category.clone(),
+                    metadata,
+                    row.output_dir.clone(),
+                    row.downloaded_bytes,
+                )
+            } else {
+                let history_entry = self.finished_jobs.iter().find(|job| job.job_id == job_id);
+                let Some(info) = history_entry else {
+                    return Err(crate::SchedulerError::JobNotFound(job_id));
                 };
+                if !Self::is_restartable_terminal_status(&info.status) {
+                    return Err(crate::SchedulerError::Conflict(format!(
+                        "job {} is not complete or failed",
+                        job_id.0
+                    )));
+                }
 
-            let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+                let (nzb_path, nzb_zstd) = self
+                    .db
+                    .load_history_job_persisted_nzb(job_id.0)
+                    .map_err(crate::SchedulerError::State)?
+                    .unwrap_or_else(|| {
+                        (
+                            self.persisted_nzb_path_for_job(job_id, history_row.as_ref()),
+                            None,
+                        )
+                    });
+                let (nzb, nzb_path, nzb_zstd) =
+                    self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
+                let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
+
+                (
+                    nzb,
+                    nzb_path,
+                    nzb_zstd,
+                    nzb_hash,
+                    info.category.clone(),
+                    info.metadata.clone(),
+                    info.output_dir.clone(),
+                    info.downloaded_bytes,
+                )
+            };
+
+            let mut spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+            if let Some(password) = password.as_ref() {
+                spec.password = Some(password.clone());
+            }
+            spec.metadata.retain(|(key, _)| {
+                key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+            });
             let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
 
             let working_dir = output_dir
@@ -1199,6 +1224,27 @@ impl Pipeline {
                     "failed to stamp reprocessed working directory as Weaver-owned"
                 );
             }
+
+            self.db
+                .create_active_job(&crate::ActiveJob {
+                    job_id,
+                    nzb_hash,
+                    nzb_path,
+                    nzb_zstd,
+                    output_dir: working_dir.clone(),
+                    created_at: (crate::jobs::model::epoch_ms_now() / 1000.0) as u64,
+                    category: spec.category.clone(),
+                    metadata: spec.metadata.clone(),
+                    status: "downloading",
+                    download_state: "downloading",
+                    post_state: "idle",
+                    run_state: "active",
+                    paused_resume_status: None,
+                    paused_resume_download_state: None,
+                    paused_resume_post_state: None,
+                    password_override: Some(spec.password.clone().unwrap_or_default()),
+                })
+                .map_err(crate::SchedulerError::State)?;
 
             let all_segments = Self::all_segment_ids(job_id, &spec);
             let (assembly, download_queue, recovery_queue) =
@@ -1300,6 +1346,23 @@ impl Pipeline {
             self.persist_file_identities(job_id, &file_identities).await;
         }
 
+        if let Some(state) = self.jobs.get(&job_id) {
+            let mut metadata = state.spec.metadata.clone();
+            metadata.retain(|(key, _)| {
+                key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+            });
+            let update = crate::jobs::JobUpdate {
+                password: password
+                    .map(crate::jobs::FieldUpdate::Set)
+                    .unwrap_or_default(),
+                metadata: crate::jobs::FieldUpdate::Set(metadata),
+                ..Default::default()
+            };
+            self.db
+                .update_active_job(job_id, &update)
+                .map_err(crate::SchedulerError::State)?;
+            update.apply_to_spec(&mut self.jobs.get_mut(&job_id).unwrap().spec);
+        }
         self.queue_scripts_completed.remove(&job_id);
         self.delete_failed_history_entry(job_id).await;
         // Reprocess replaces the assembly and file identities wholesale, so a
@@ -1321,10 +1384,23 @@ impl Pipeline {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn redownload_job(
         &mut self,
         job_id: JobId,
     ) -> Result<(), crate::SchedulerError> {
+        self.redownload_job_with_password(job_id, None).await
+    }
+
+    pub(crate) async fn redownload_job_with_password(
+        &mut self,
+        job_id: JobId,
+        password: Option<String>,
+    ) -> Result<(), crate::SchedulerError> {
+        if password.is_some() {
+            self.archive_password_winners
+                .retain(|(id, _), _| *id != job_id);
+        }
         if let Some(state) = self.jobs.get(&job_id) {
             if !Self::is_restartable_terminal_status(&state.status) {
                 return Err(crate::SchedulerError::Conflict(format!(
@@ -1343,8 +1419,14 @@ impl Pipeline {
                 .map_err(crate::SchedulerError::State)?
                 .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
             let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-            let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+            let mut spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
 
+            if let Some(password) = password.clone() {
+                spec.password = Some(password);
+            }
+            spec.metadata.retain(|(key, _)| {
+                key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+            });
             self.remove_redownload_artifacts(job_id, &working_dir, staging_dir.as_deref())
                 .await;
             self.purge_terminal_job_runtime(job_id);
@@ -1387,7 +1469,14 @@ impl Pipeline {
                 .as_deref()
                 .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
                 .unwrap_or_default();
-            let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, row.category.clone(), metadata);
+            let mut spec =
+                crate::ingest::nzb_to_spec(&nzb, &nzb_path, row.category.clone(), metadata);
+            if let Some(password) = password.clone() {
+                spec.password = Some(password);
+            }
+            spec.metadata.retain(|(key, _)| {
+                key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+            });
             let working_dir = row
                 .output_dir
                 .as_deref()
@@ -1435,12 +1524,18 @@ impl Pipeline {
                 )
             });
         let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-        let spec = crate::ingest::nzb_to_spec(
+        let mut spec = crate::ingest::nzb_to_spec(
             &nzb,
             &nzb_path,
             info.category.clone(),
             info.metadata.clone(),
         );
+        if let Some(password) = password.clone() {
+            spec.password = Some(password);
+        }
+        spec.metadata.retain(|(key, _)| {
+            key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+        });
         let working_dir = history_row
             .as_ref()
             .and_then(|row| row.output_dir.as_ref())

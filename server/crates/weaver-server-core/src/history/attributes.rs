@@ -1,4 +1,5 @@
 pub const CLIENT_REQUEST_ID_ATTRIBUTE_KEY: &str = "__weaver_client_request_id";
+pub const VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY: &str = "__weaver_validated_archive_password";
 
 pub fn parse_history_metadata(metadata: Option<&str>) -> Vec<(String, String)> {
     metadata

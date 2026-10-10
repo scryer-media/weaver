@@ -6,6 +6,20 @@ pub(crate) struct SettingsQuery;
 
 #[Object]
 impl SettingsQuery {
+    #[graphql(guard = "AdminGuard")]
+    async fn archive_password_settings(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<crate::settings::types::ArchivePasswordSettings> {
+        let db = ctx.data::<Database>()?.clone();
+        let (has_passwords, password_file) =
+            tokio::task::spawn_blocking(move || db.archive_password_settings()).await??;
+        Ok(crate::settings::types::ArchivePasswordSettings {
+            has_passwords,
+            password_file,
+        })
+    }
+
     /// Get general settings.
     #[graphql(guard = "AdminGuard")]
     async fn settings(&self, ctx: &Context<'_>) -> Result<GeneralSettings> {

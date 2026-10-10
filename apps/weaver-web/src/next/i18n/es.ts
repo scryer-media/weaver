@@ -2,6 +2,15 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** Spanish strings for the Next interface; the keys and their order follow `en.ts`. */
 export const nextEs: LocaleDictionary = {
+  "next.archivePasswords.title": "Contraseñas de archivos",
+  "next.archivePasswords.list": "Contraseñas (una por línea)",
+  "next.archivePasswords.file": "Archivo de contraseñas",
+  "next.archivePasswords.saved": "Contraseñas guardadas",
+  "next.archivePasswords.clear": "Borrar contraseñas",
+  "next.archivePasswords.password": "Contraseña del archivo",
+  "next.archivePasswords.show": "Mostrar",
+  "next.archivePasswords.hide": "Ocultar",
+  "next.archivePasswords.loadFailed": "No se pudo cargar la contraseña",
   // Shell
   "next.nav.downloads": "Descargas",
   "next.nav.history": "Historial",

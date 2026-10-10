@@ -207,6 +207,11 @@ type ApplicationUpgradeStatus {
 	latestRun: ApplicationUpgradeRunPayload
 }
 
+type ArchivePasswordSettings {
+	hasPasswords: Boolean!
+	passwordFile: String
+}
+
 type Attribute {
 	key: String!
 	value: String!
@@ -1520,11 +1525,11 @@ type MutationRoot {
 	"""
 	Reprocess a completed or failed job (re-run post-download stages without re-downloading).
 	"""
-	reprocessJob(id: Int!): Boolean!
+	reprocessJob(id: Int!, password: String): Boolean!
 	"""
 	Re-download a completed or failed job from its persisted NZB under the same job ID.
 	"""
-	redownloadJob(id: Int!): Boolean!
+	redownloadJob(id: Int!, password: String): Boolean!
 	"""
 	Delete completed/failed/cancelled jobs from history.
 	Integration (control) scope may also delete completed output with `deleteFiles: true`.
@@ -1600,11 +1605,11 @@ type MutationRoot {
 	"""
 	Reprocess a failed queue item.
 	"""
-	reprocessQueueItem(id: Int!): QueueCommandResult!
+	reprocessQueueItem(id: Int!, password: String): QueueCommandResult!
 	"""
 	Re-download a failed queue item under the same job ID.
 	"""
-	redownloadQueueItem(id: Int!): QueueCommandResult!
+	redownloadQueueItem(id: Int!, password: String): QueueCommandResult!
 	"""
 	Remove history items by ID. Integration (control) scope may also delete completed output with `deleteFiles: true`.
 	"""
@@ -1707,6 +1712,7 @@ type MutationRoot {
 	"""
 	rerunPostProcessing(jobId: Int!): Boolean!
 	cancelJobPostProcessing(jobId: Int!): Boolean!
+	updateArchivePasswordSettings(passwords: [String!], passwordFile: String): ArchivePasswordSettings!
 	"""
 	Choose how hard Weaver leans on this machine.
 
@@ -2247,6 +2253,7 @@ type QueryRoot {
 	Get the event log for a specific job.
 	"""
 	jobEvents(jobId: Int!): [JobEvent!]!
+	validatedArchivePassword(id: Int!): String
 	"""
 	A report on a queued or finished job's NZB and how the job went, with
 	every name, path, host and password left out so it can be shared.
@@ -2369,6 +2376,7 @@ type QueryRoot {
 	Load one configured NNTP server for editing.
 	"""
 	server(id: Int!): ServerDetails
+	archivePasswordSettings: ArchivePasswordSettings!
 	"""
 	Get general settings.
 	"""

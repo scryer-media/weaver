@@ -2894,6 +2894,80 @@ fn nzb_half_candidates() -> Vec<ArchivePasswordCandidate> {
 }
 
 #[tokio::test]
+async fn archive_password_sources_are_ordered_and_validated_password_is_private() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30901);
+    let file = temp_dir.path().join("passwords.txt");
+    std::fs::write(&file, "global-key\nfile-key\n").unwrap();
+    pipeline
+        .db
+        .save_archive_password_settings(
+            Some(vec!["global-key".into()]),
+            Some(Some(file.to_str().unwrap().into())),
+        )
+        .unwrap();
+    let mut spec = standalone_job_spec("Archive Fixture", &[("episode.mkv".to_string(), 123)]);
+    spec.password = Some("filename-key".into());
+    pipeline
+        .add_job(
+            job_id,
+            spec,
+            PathBuf::from("Archive Fixture {{filename-key}}.nzb"),
+            sample_nzb_zstd_with_password("meta-key"),
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+    let candidates = pipeline.archive_password_candidates_for_job(job_id);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.value())
+            .collect::<Vec<_>>(),
+        ["filename-key", "meta-key", "global-key", "file-key"]
+    );
+    assert_eq!(candidates[0].source(), ArchivePasswordSource::Explicit);
+    pipeline.remember_archive_password_winner(job_id, "fixture", Some("file-key"), &candidates);
+    assert_eq!(
+        pipeline
+            .db
+            .validated_archive_password(job_id.0)
+            .unwrap()
+            .as_deref(),
+        Some("file-key")
+    );
+    let metadata = &pipeline.jobs.get(&job_id).unwrap().spec.metadata;
+    assert!(!format!("{metadata:?}").contains("file-key"));
+    assert!(
+        !crate::public_history_attributes(metadata)
+            .iter()
+            .any(|(key, _)| key.contains("validated_archive_password"))
+    );
+    let mut history = history_row_with_output_dir(
+        job_id,
+        "Archive Fixture",
+        "complete",
+        temp_dir.path().join("output"),
+    );
+    history.metadata = Some(serde_json::to_string(metadata).unwrap());
+    insert_history_row_with_nzb_zstd(&pipeline.db, &history, &sample_nzb_zstd());
+    pipeline.db.delete_active_job(job_id).unwrap();
+    assert_eq!(
+        pipeline
+            .db
+            .validated_archive_password(job_id.0)
+            .unwrap()
+            .as_deref(),
+        Some("file-key")
+    );
+    pipeline
+        .db
+        .validate_encrypted_credentials(pipeline.db.encryption_key().unwrap())
+        .unwrap();
+}
+
+#[tokio::test]
 async fn add_job_keeps_nzb_password_candidates_so_the_harvest_never_rereads_the_nzb() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -3117,6 +3191,56 @@ async fn finalize_completed_file_hash_falls_back_to_disk_after_out_of_order_stre
         .unwrap();
     assert_eq!(checksum.md5, Some(par2_rs::checksum::md5(payload)));
     assert_eq!(checksum.crc32, par2_rs::checksum::crc32(payload));
+}
+
+#[tokio::test]
+async fn archive_password_override_is_durable_for_history_reprocess_and_redownload() {
+    for reprocess in [false, true] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30902);
+        let mut row = history_row_with_output_dir(
+            job_id,
+            "Archive Fixture",
+            "failed",
+            temp_dir.path().join("unused-output"),
+        );
+        row.output_dir = None;
+        row.error_message = Some("password required".into());
+        insert_history_row_with_nzb_zstd(
+            &pipeline.db,
+            &row,
+            &sample_nzb_zstd_with_password("metadata-key"),
+        );
+        pipeline.archive_password_winners.insert(
+            (job_id, "fixture".into()),
+            ArchivePasswordCandidate::new(ArchivePasswordSource::NzbMeta, "metadata-key".into()),
+        );
+        if reprocess {
+            pipeline
+                .reprocess_job_with_password(job_id, Some("replacement-key".into()))
+                .await
+                .unwrap();
+        } else {
+            pipeline
+                .redownload_job_with_password(job_id, Some("replacement-key".into()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            pipeline.jobs.get(&job_id).unwrap().spec.password.as_deref(),
+            Some("replacement-key")
+        );
+        assert_eq!(
+            pipeline.archive_password_candidates_for_set(job_id, "fixture")[0].value(),
+            "replacement-key"
+        );
+        let restored = pipeline.db.load_active_jobs().unwrap();
+        assert_eq!(
+            restored.get(&job_id).unwrap().password_override.as_deref(),
+            Some("replacement-key")
+        );
+    }
 }
 
 #[tokio::test]

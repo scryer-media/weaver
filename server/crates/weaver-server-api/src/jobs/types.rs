@@ -1007,7 +1007,7 @@ impl From<&weaver_server_core::JobInfo> for Job {
             optional_recovery_downloaded_bytes: info.optional_recovery_downloaded_bytes,
             failed_bytes: info.failed_bytes,
             health: info.health,
-            has_password: info.password.is_some(),
+            has_password: info.password.is_some() || info.metadata.iter().any(|(key, _)| key == weaver_server_core::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY),
             category: info.category.clone(),
             metadata: info
                 .metadata
@@ -1243,7 +1243,9 @@ fn queue_item_from_display(
         file_count: info.total_files,
         remaining_file_count: info.total_files.saturating_sub(info.completed_files),
         remaining_par_count: info.remaining_par_files,
-        has_password: info.password.is_some(),
+        has_password: info.password.is_some() || info.metadata.iter().any(|(key, _)| {
+            key == weaver_server_core::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+        }),
         category: info.category.clone(),
         attributes,
         client_request_id,

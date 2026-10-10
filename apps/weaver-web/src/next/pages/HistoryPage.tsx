@@ -3,6 +3,7 @@ import { useNavigate } from "react-router";
 import { useMutation, useQuery } from "urql";
 import {
   REDOWNLOAD_JOB_MUTATION,
+  REPROCESS_JOB_MUTATION,
   RERUN_POST_PROCESSING_MUTATION,
   SYSTEM_INFO_QUERY,
 } from "@/graphql/queries";
@@ -14,6 +15,7 @@ import { statusToken } from "@/lib/status-tokens";
 import { EmptyState, MetricCell, MetricStrip, SectionHeader, Square } from "../components/chrome";
 import { BulkBar, BulkButton, BulkCluster } from "../components/BulkBar";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { ArchivePassword, ArchivePasswordDialog } from "../components/ArchivePassword";
 import { Pagination } from "../components/Pagination";
 import { CheckBox, SecondaryButton, TextField } from "../components/controls";
 import { Icon } from "../components/icons";
@@ -108,6 +110,7 @@ interface HistoryRow {
   totalBytes: number;
   downloadedBytes: number;
   health: number;
+  hasPassword: boolean;
   category: string | null;
   createdAt: string | number | null;
   completedAt: string | number | null;
@@ -185,6 +188,7 @@ export function HistoryPage() {
   const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
   const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [retryAction, setRetryAction] = useState<"redownload" | "reprocess" | null>(null);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -230,6 +234,7 @@ export function HistoryPage() {
   }>({ query: SYSTEM_INFO_QUERY });
 
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
+  const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [, rerunPostProcessing] = useMutation(RERUN_POST_PROCESSING_MUTATION);
 
   const page = data?.historyPage;
@@ -393,10 +398,13 @@ export function HistoryPage() {
         icon="redownload"
         disabled={actionsBusy}
         onClick={() => {
-          void runOnPicked("requeued", (id) => redownloadJob({ id }));
+          setRetryAction("redownload");
         }}
       >
         {t("next.completed.redownload")}
+      </BulkButton>
+      <BulkButton icon="reprocess" disabled={actionsBusy} onClick={() => setRetryAction("reprocess")}>
+        {t("next.job.reprocess")}
       </BulkButton>
       <BulkButton
         icon="postProcessing"
@@ -683,6 +691,7 @@ export function HistoryPage() {
                     />
                     <div className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg">
                       {formatJobReleaseName(row)}
+                      {row.hasPassword ? <ArchivePassword id={row.id} /> : null}
                     </div>
                     <div className="flex min-w-0 items-center gap-[7px]">
                       <Square
@@ -720,6 +729,13 @@ export function HistoryPage() {
         )}
       </div>
 
+      {retryAction ? <ArchivePasswordDialog
+        title={t(retryAction === "redownload" ? "next.completed.redownload" : "next.job.reprocess")}
+        busy={actionsBusy} onDismiss={() => setRetryAction(null)}
+        onConfirm={(password) => {
+          setRetryAction(null);
+          void runOnPicked("requeued", (id) => retryAction === "redownload" ? redownloadJob({ id, password }) : reprocessJob({ id, password }));
+        }} /> : null}
       <ConfirmDialog
         open={confirmDelete}
         title={t("action.delete")}

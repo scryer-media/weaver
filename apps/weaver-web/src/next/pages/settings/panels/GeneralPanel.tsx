@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { ArchivePasswordSettings } from "./ArchivePasswordSettings";
 import { useMutation, useQuery } from "urql";
 import {
   HARDWARE_PROFILE_QUERY,
@@ -173,6 +174,7 @@ export function GeneralPanel() {
   ];
 
   const blocks: (SettingsBlock | null)[] = [
+    { kind: "custom", id: "archivePasswords", title: t("next.archivePasswords.title"), searchText: "archive password file", body: <ArchivePasswordSettings /> },
     { kind: "section", id: "interface", title: t("next.general.interface"), fields: interfaceFields },
     {
       kind: "section",

@@ -132,7 +132,21 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> Vec<ArchivePasswordCandidate> {
-        self.harvest_archive_password_candidates(job_id).0
+        let mut candidates = self.harvest_archive_password_candidates(job_id).0;
+        match self.db.global_archive_password_candidates() {
+            Ok(global) => {
+                for candidate in global {
+                    if !candidates
+                        .iter()
+                        .any(|existing| existing.value() == candidate.value())
+                    {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+            Err(_) => warn!(job_id = job_id.0, "could not load global archive passwords"),
+        }
+        candidates
     }
 
     // [`Self::archive_password_candidates_for_job`] plus whether the job's
@@ -168,11 +182,8 @@ impl Pipeline {
                 }
             };
 
-        if let Some(value) = crate::ingest::normalize_archive_password_candidate(spec_password)
-            && !candidates
-                .iter()
-                .any(|candidate| candidate.value() == value.as_str())
-        {
+        if let Some(value) = crate::ingest::normalize_archive_password_candidate(spec_password) {
+            candidates.retain(|candidate| candidate.value() != value);
             candidates.insert(
                 0,
                 ArchivePasswordCandidate::new(ArchivePasswordSource::Explicit, value),
@@ -259,16 +270,44 @@ impl Pipeline {
         let Some(selected_password) = selected_password else {
             return;
         };
-        let Some(candidate) = candidates
+        let candidate = candidates
             .iter()
             .find(|candidate| candidate.value() == selected_password)
             .cloned()
-        else {
-            return;
-        };
+            .unwrap_or_else(|| {
+                ArchivePasswordCandidate::new(
+                    ArchivePasswordSource::Explicit,
+                    selected_password.to_string(),
+                )
+            });
 
         self.archive_password_winners
             .insert((job_id, set_name.to_string()), candidate);
+        let sealed = match self.db.seal_validated_archive_password(selected_password) {
+            Ok(sealed) => sealed,
+            Err(_) => {
+                warn!(
+                    job_id = job_id.0,
+                    "could not store validated archive password"
+                );
+                return;
+            }
+        };
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            let key = crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY;
+            state.spec.metadata.retain(|(name, _)| name != key);
+            state.spec.metadata.push((key.to_string(), sealed));
+            let update = crate::jobs::JobUpdate {
+                metadata: crate::jobs::FieldUpdate::Set(state.spec.metadata.clone()),
+                ..Default::default()
+            };
+            if self.db.update_active_job(job_id, &update).is_err() {
+                warn!(
+                    job_id = job_id.0,
+                    "could not persist validated archive password"
+                );
+            }
+        }
     }
 }
 

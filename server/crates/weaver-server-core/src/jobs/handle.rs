@@ -898,11 +898,13 @@ pub enum SchedulerCommand {
     // Reprocess a completed or failed job (re-run post-download stages without re-downloading).
     ReprocessJob {
         job_id: JobId,
+        password: Option<String>,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     // Re-download a completed or failed job from its persisted NZB under the same job ID.
     RedownloadJob {
         job_id: JobId,
+        password: Option<String>,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
     // Delete a completed/failed/cancelled job from history.
@@ -1195,9 +1197,21 @@ impl SchedulerHandle {
 
     // Reprocess a completed or failed job (re-run post-download stages without re-downloading).
     pub async fn reprocess_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.reprocess_job_with_password(job_id, None).await
+    }
+
+    pub async fn reprocess_job_with_password(
+        &self,
+        job_id: JobId,
+        password: Option<String>,
+    ) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::ReprocessJob { job_id, reply: tx })
+            .send(SchedulerCommand::ReprocessJob {
+                job_id,
+                password,
+                reply: tx,
+            })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
@@ -1205,9 +1219,21 @@ impl SchedulerHandle {
 
     // Re-download a completed or failed job from its persisted NZB under the same job ID.
     pub async fn redownload_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.redownload_job_with_password(job_id, None).await
+    }
+
+    pub async fn redownload_job_with_password(
+        &self,
+        job_id: JobId,
+        password: Option<String>,
+    ) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SchedulerCommand::RedownloadJob { job_id, reply: tx })
+            .send(SchedulerCommand::RedownloadJob {
+                job_id,
+                password,
+                reply: tx,
+            })
             .await
             .map_err(|_| SchedulerError::ChannelClosed)?;
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?

@@ -9,6 +9,15 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
  * carries exactly these keys; `tests/next-i18n.test.ts` holds them to it.
  */
 export const nextEn: LocaleDictionary = {
+  "next.archivePasswords.title": "Archive passwords",
+  "next.archivePasswords.list": "Passwords (one per line)",
+  "next.archivePasswords.file": "Password file",
+  "next.archivePasswords.saved": "Passwords saved",
+  "next.archivePasswords.clear": "Clear passwords",
+  "next.archivePasswords.password": "Archive password",
+  "next.archivePasswords.show": "Show",
+  "next.archivePasswords.hide": "Hide",
+  "next.archivePasswords.loadFailed": "Could not load password",
   // Shell
   "next.nav.downloads": "Downloads",
   "next.nav.history": "History",
