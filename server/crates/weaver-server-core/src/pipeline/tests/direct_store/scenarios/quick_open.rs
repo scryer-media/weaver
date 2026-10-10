@@ -1694,6 +1694,32 @@ async fn missing_part_report_requires_an_explicit_tail_and_checks_every_hole() {
     assert_eq!(pipeline.missing_numbered_archive_part(job_id), None);
 }
 
+// A part recovery rebuilt is consumed by extraction like any other part.
+// Once eager deletion has taken it off disk, the numbering still has no hole.
+#[tokio::test]
+async fn missing_part_report_counts_a_part_extraction_consumed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41106);
+    let volumes = vec![
+        ("example.part1.rar".to_string(), vec![0u8; 32]),
+        ("example.part3.rar".to_string(), vec![0u8; 32]),
+    ];
+    let spec = direct_store_job_spec_with_articles("Restored archive", &volumes, 1);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    assert_eq!(
+        pipeline.missing_numbered_archive_part(job_id).as_deref(),
+        Some("missing archive part 'example.part2.rar'")
+    );
+
+    pipeline
+        .eagerly_deleted
+        .entry(job_id)
+        .or_default()
+        .insert("example.part2.rar".to_string());
+    assert_eq!(pipeline.missing_numbered_archive_part(job_id), None);
+}
+
 #[tokio::test]
 async fn complete_reposts_require_matching_content_beyond_the_identity_prefix() {
     for corrupt in [false, true] {

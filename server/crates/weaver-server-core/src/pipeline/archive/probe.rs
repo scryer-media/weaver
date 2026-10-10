@@ -1367,7 +1367,14 @@ impl Pipeline {
                         let width = end - start;
                         let missing_name =
                             format!("{}{:0width$}{}", &name[..*start], missing, &name[*end..]);
-                        if !state.working_dir.join(&missing_name).is_file() {
+                        // A part recovery rebuilt and extraction then
+                        // consumed is no longer on disk, but it was never
+                        // missing: eager deletion records the name it took.
+                        let consumed = self
+                            .eagerly_deleted
+                            .get(&job_id)
+                            .is_some_and(|deleted| deleted.contains(&missing_name));
+                        if !consumed && !state.working_dir.join(&missing_name).is_file() {
                             return Some(format!("missing archive part '{missing_name}'"));
                         }
                     }

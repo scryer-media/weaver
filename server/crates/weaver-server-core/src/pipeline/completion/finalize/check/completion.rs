@@ -2881,7 +2881,14 @@ impl Pipeline {
         //  - before the terminal transition records history, so a verdict
         //    reaches history and the UI through the same family PAR2 verdicts
         //    use rather than arriving after the job is already filed.
-        if let Some(error) = self.missing_numbered_archive_part(job_id) {
+        // A hole in the numbering is only a verdict once nothing else can
+        // fill it. While downloads are still draining, the part may yet
+        // arrive, and once they drain the recovery-volume restore above gets
+        // its turn first; failing here before then condemned sets whose
+        // `.rev` files would have rebuilt the missing part.
+        if download_pipeline_exhausted
+            && let Some(error) = self.missing_numbered_archive_part(job_id)
+        {
             self.fail_job(job_id, error);
             return;
         }
