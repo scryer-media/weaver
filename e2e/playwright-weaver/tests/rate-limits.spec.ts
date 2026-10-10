@@ -51,7 +51,14 @@ test(`global, scheduled, and per-server limits: ${stage}`, async ({ request }) =
   ).toBe(serverLimit);
 
   const scheduledRate = await runRateProbe(request, "scheduled");
+  // Deleting a rule leaves its limit in force; the operator's own edit of the
+  // global limit is what takes a scheduled limit away.
   await deleteSchedule(request, scheduleId);
+  await graphql(
+    request,
+    "mutation WeaverE2EGlobalRateAgain($input: GeneralSettingsInput!) { updateSettings(input: $input) { maxDownloadSpeed } }",
+    { input: { maxDownloadSpeed: globalLimit } },
+  );
   await expectScheduledLimit(request, 0);
 
   const perServerRate = await runRateProbe(request, "per-server");
