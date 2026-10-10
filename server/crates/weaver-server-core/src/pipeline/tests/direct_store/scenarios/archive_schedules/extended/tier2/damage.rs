@@ -411,6 +411,22 @@ impl Cell for DamageCell {
     }
 }
 
+#[tokio::test]
+async fn swapped_encrypted_headers_repaired_after_restart() {
+    run_cell(
+        DamageCell {
+            kind: Damage::Swapped,
+            location: Location::FirstVolumeHead,
+            pattern: Pattern::TwelveAcrossThree,
+            recovery: Recovery::Par2(Margin::With),
+            container: Container::Rar5Encrypted,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(0, (vec![(0, 0), (1, 1), (0, 1), (1, 0)], Interruption::Restart(2)))],
+    )
+    .await;
+}
+
 macro_rules! damage_smokes {
     ($($name:ident $kind:ident $location:ident $pattern:ident $recovery:expr, $container:ident;)+) => {
         mod damage_smoke {

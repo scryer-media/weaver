@@ -772,6 +772,15 @@ impl Pipeline {
         let authoritative_par2_verification_owed = rar_par2_repair_ready
             || self.par3_requires_authoritative_par2(job_id)
             || known_archive_damage
+            // Completed transport is not proof that a restored direct image
+            // decoded successfully. Its member gates must pass before the
+            // strong-decode shortcut can replace an authoritative read.
+            || self.direct_store.sets_for(job_id).iter().any(|set| {
+                !set.is_demoted()
+                    && !set.is_finalized()
+                    && set.all_volumes_complete()
+                    && !set.ready_to_finalize()
+            })
             || has_crc_failures
             || (has_incomplete_data_files && download_pipeline_exhausted)
             || rar_waiting_for_missing_volumes
