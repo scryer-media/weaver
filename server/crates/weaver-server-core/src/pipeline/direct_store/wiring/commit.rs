@@ -1231,6 +1231,47 @@ impl Pipeline {
             self.demote_direct_set(job_id, set_index, DemotionReason::PartChecksumMismatch)
                 .await;
         }
+        // Keep healthy members staged while another posted payload is missing.
+        // A recovery verdict can supersede the damaged posted copy, but an
+        // unrecoverable neighbour must fail before any set is committed.
+        let recovery_verified = self.par2_verified.contains(&job_id)
+            || self
+                .par3_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.verified(job_id));
+        if !recovery_verified
+            && self.jobs.get(&job_id).is_some_and(|state| {
+                state.assembly.files().any(|file| {
+                    !file.is_complete()
+                        && !matches!(
+                            file.role(),
+                            weaver_model::files::FileRole::Par2 { .. }
+                                | weaver_model::files::FileRole::Par3 { .. }
+                        )
+                })
+            })
+        {
+            return;
+        }
+        if self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .any(|(index, set)| {
+                if set.is_demoted() {
+                    return !self
+                        .extracted_archives
+                        .get(&job_id)
+                        .is_some_and(|names| names.contains(set.set_name()));
+                }
+                !set.is_finalized()
+                    && (!set.ready_to_finalize()
+                        || self.direct_set_has_pending_volume_tail(job_id, index))
+            })
+        {
+            return;
+        }
         let ready: Vec<usize> = self
             .direct_store
             .sets_for(job_id)

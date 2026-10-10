@@ -174,20 +174,36 @@ pub(super) fn cells() -> Vec<Par2Cell> {
 // combined cases.
 pub(super) const PER_UNIT: usize = 46;
 
-// 8,000 cells under three profiles, 46 schedules each.
-pub(super) const TOTAL: usize = 1_104_000;
+// Preserve every cell and profile, but sample fewer schedules for the cubic
+// thousands-block algebra. Weight those cases separately when sharding.
+const THOUSANDS_PER_UNIT: usize = 2;
+pub(super) const TOTAL: usize = 4_000 * 3 * (PER_UNIT + THOUSANDS_PER_UNIT);
 
 pub(super) fn family() -> Family<Par2Cell> {
     let cells = cells();
     assert_eq!(cells.len(), 8_000);
+    let mut indexed: Vec<_> = cells.into_iter().enumerate().collect();
+    let band_width = ALIGNMENTS.len() * PATTERNS.len() * CONTAINERS.len();
+    // Interleave the two costs so no shard collects a long run of cheap
+    // cases. Keep the original cell index as its schedule rotation seed.
+    indexed.sort_by_key(|(index, _)| {
+        (
+            index / (band_width * BANDS.len()),
+            index % band_width,
+            index / band_width % BANDS.len(),
+        )
+    });
     Family {
-        units: cells
+        units: indexed
             .into_iter()
-            .enumerate()
             .flat_map(|(index, cell)| {
+                let per = match cell.band {
+                    Band::Hundreds => PER_UNIT,
+                    Band::Thousands => THOUSANDS_PER_UNIT,
+                };
                 PROFILES
                     .into_iter()
-                    .map(move |profile| (cell, profile, Pool::Combined, PER_UNIT, index))
+                    .map(move |profile| (cell, profile, Pool::Combined, per, index))
             })
             .collect(),
     }
@@ -424,7 +440,11 @@ impl Cell for Par2Cell {
         // rebuild: a job that needed it may still end either way, named.
         let ruling = (!recovery::descriptions_survive(&post, &lost, interruption.fails())
             && recovery::needed(&post, geometry, &lost).0 > 0)
-            .then_some(Verdict::Either);
+            .then_some(Verdict::Either)
+            .or_else(|| {
+                recovery::all_missing_exact_par2_is_singular(&post, self.slice, &lost)
+                    .then_some(Verdict::Fails)
+            });
         Built {
             post,
             geometry: Some(geometry),
@@ -432,45 +452,68 @@ impl Cell for Par2Cell {
         }
     }
 
-    fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-        open_defect(self, profile)
-    }
-
     fn par2(self) -> bool {
         true
     }
-}
 
-// The defects each cell and profile is held open for. Every one blocks a
-// release: these are PAR2 rows.
-fn open_defect(cell: Par2Cell, profile: ExtractionProfile) -> Option<Defect> {
-    if cell.structure == Structure::IndexDamaged && cell.margin != Margin::OneShort {
-        return Some(Defect::Diverges(INDEX_DAMAGED_STRANDS_PROBED_VOLUMES));
+    fn case_weight(self) -> usize {
+        match self.band {
+            Band::Hundreds => 1,
+            Band::Thousands => 256,
+        }
     }
-    if cell.container == Container::Rar5EncryptedHeaders
-        && profile == ExtractionProfile::DirectStore
-        && cell.margin != Margin::OneShort
-    {
-        return Some(Defect::Diverges(
-            ENCRYPTED_HEADERS_REPAIRED_SET_HAS_NO_VOLUMES,
-        ));
-    }
-    None
 }
-
-// A header-encrypted direct set repaired in place keeps its clean volumes
-// virtual; extraction then finds no volume on disk and fails the job.
-const ENCRYPTED_HEADERS_REPAIRED_SET_HAS_NO_VOLUMES: &str = "encrypted headers: after an in-place PAR2 repair of a direct set, extraction fails with no on-disk RAR volumes";
-
-// With every index article damaged, the recovery volumes probed by prefix
-// for metadata are read back as volumes that cannot complete and are never
-// promoted, so the job fails short of recovery it was posted with.
-const INDEX_DAMAGED_STRANDS_PROBED_VOLUMES: &str = "index damaged: prefix-probed recovery volumes are never promoted; the job fails with enough recovery posted";
 
 macro_rules! par2_smokes {
     ($($name:ident $slice:literal $redundancy:ident $margin:ident $band:ident $alignment:ident $pattern:ident $structure:ident $container:ident;)+) => {
         mod par2_realism_smoke {
             use super::*;
+            #[tokio::test]
+            async fn repaired_encrypted_restart_finishes_member_edges() {
+                run_cell(
+                    Par2Cell {
+                        slice: 5240,
+                        redundancy: Redundancy::Ten,
+                        margin: Margin::With,
+                        band: Band::Hundreds,
+                        alignment: Alignment::Aligned,
+                        pattern: Pattern::MemberAbsent,
+                        structure: Structure::Plain,
+                        container: Container::Rar5EncryptedHeaders,
+                        creator: 2,
+                    },
+                    ExtractionProfile::DirectStore,
+                    vec![(941437, (vec![(0, 0), (0, 1), (0, 1)], Interruption::Combined {
+                        mask: 12,
+                        index_first: false,
+                        action: BoundaryAction::Restart,
+                        at: 1,
+                    }))],
+                ).await;
+            }
+            #[tokio::test]
+            async fn index_absent_restart_fetches_remaining_recovery() {
+                run_cell(
+                    Par2Cell {
+                        slice: 5240,
+                        redundancy: Redundancy::Ten,
+                        margin: Margin::With,
+                        band: Band::Hundreds,
+                        alignment: Alignment::Aligned,
+                        pattern: Pattern::MemberAbsent,
+                        structure: Structure::IndexAbsent,
+                        container: Container::SevenZip,
+                        creator: 2,
+                    },
+                    ExtractionProfile::DirectStore,
+                    vec![(941713, (vec![(0, 0), (0, 1), (0, 1)], Interruption::Combined {
+                        mask: 12,
+                        index_first: false,
+                        action: BoundaryAction::Restart,
+                        at: 3,
+                    }))],
+                ).await;
+            }
             $(
                 #[tokio::test]
                 async fn $name() {
@@ -506,8 +549,8 @@ par2_smokes! {
     headers_encrypted_with 1048 Twenty With Hundreds Aligned TwelveAcrossThree Plain Rar5EncryptedHeaders;
 }
 
-// The campaign: 2,200 shards of about 500 cases; half the cells carry a
-// set of thousands of blocks, whose cases run several times longer.
+// The campaign: 2,200 cost-balanced shards. Thousands-block cells retain
+// every profile with fewer schedules and a higher partition weight.
 mod combined_par2_realism {
     use super::*;
 

@@ -120,6 +120,7 @@ impl Family {
             .into_iter()
             .enumerate()
             .filter(|(case, (_, interruption))| match selection {
+                Selection::Case(selected) => *case == selected,
                 Selection::Shard(shard) => {
                     assert!(shard < shards);
                     case % shards == shard

@@ -624,6 +624,11 @@ impl Pipeline {
         // that finds the set clean retries extraction once and then fails the
         // job, and a repair clears the failed set before its retry.
         let par2_verdict_stale_after_failed_extraction = self.par2_verified.contains(&job_id)
+            && self.par2_runtime(job_id).is_some_and(|runtime| {
+                runtime
+                    .served()
+                    .is_some_and(|set_runtime| set_runtime.settled_via_strong_decode)
+            })
             && has_crc_failures
             && (self.job_has_live_rar_waiting_for_absent_volumes(job_id)
                 || self.job_has_failed_sevenz_set_with_all_volumes(job_id));
@@ -772,6 +777,15 @@ impl Pipeline {
         let authoritative_par2_verification_owed = rar_par2_repair_ready
             || self.par3_requires_authoritative_par2(job_id)
             || known_archive_damage
+            // Completed transport is not proof that a restored direct image
+            // decoded successfully. Its member gates must pass before the
+            // strong-decode shortcut can replace an authoritative read.
+            || self.direct_store.sets_for(job_id).iter().any(|set| {
+                !set.is_demoted()
+                    && !set.is_finalized()
+                    && set.all_volumes_complete()
+                    && !set.ready_to_finalize()
+            })
             || has_crc_failures
             || (has_incomplete_data_files && download_pipeline_exhausted)
             || rar_waiting_for_missing_volumes
@@ -1052,8 +1066,15 @@ impl Pipeline {
         // verdict still owed, report the actual missing part before a generic
         // exhausted-work failure obscures the topology defect.
         if download_pipeline_exhausted
-            && (par2_bypassed || !self.job_spec_has_par2_file(job_id))
-            && let Some(error) = self.missing_numbered_archive_part(job_id)
+            && (par2_bypassed
+                || !self.job_spec_has_par2_file(job_id)
+                || (!par2_verdict_open && self.par2_gate_settlement_complete(job_id)))
+            && let Some(error) = self.missing_numbered_archive_part(job_id).or_else(|| {
+                (!has_crc_failures
+                    && rar_waiting_for_missing_volumes
+                    && self.job_has_live_rar_waiting_for_absent_volumes(job_id))
+                .then(|| "missing RAR volume after recovery settled".to_string())
+            })
         {
             self.fail_job(job_id, error);
             return;
@@ -2938,7 +2959,21 @@ impl Pipeline {
                 // and a volume a repair rebuilt for it is spent once the set
                 // is finalized.
                 self.cleanup_installed_direct_set_volumes(job_id).await;
-                // No archives — move to complete and finish.
+                // Direct installation can expose another archive just as an
+                // extractor does. Settle that layer before publishing output.
+                match self.maybe_start_nested_extraction(job_id).await {
+                    Ok(NestedExtractionDecision::Deferred | NestedExtractionDecision::Started) => {
+                        return;
+                    }
+                    Ok(
+                        NestedExtractionDecision::NoNestedArchives
+                        | NestedExtractionDecision::PreserveOutputsAtDepthLimit,
+                    ) => {}
+                    Err(error) => {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                }
                 if let Err(error) = self.start_move_to_complete(job_id).await {
                     self.fail_job(job_id, error);
                 }
@@ -3087,7 +3122,9 @@ impl Pipeline {
                         reason = %reason,
                         "deferring completion until archive topology is available"
                     );
-                    self.schedule_job_completion_check(job_id);
+                    // The pending download or extraction re-arms completion
+                    // when it changes the topology. Re-queuing ourselves here
+                    // can monopolize the actor before that work is serviced.
                     return;
                 }
                 // Downloads, placement and recovery have settled above. With

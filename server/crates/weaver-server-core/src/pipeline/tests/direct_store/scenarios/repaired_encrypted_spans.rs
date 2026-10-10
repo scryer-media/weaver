@@ -332,6 +332,15 @@ async fn a_repaired_span_reroutes_into_a_header_encrypted_member() {
 // over a composition that is part downloaded and part rebuilt.
 #[tokio::test]
 async fn a_repaired_hole_completes_an_encrypted_part_and_passes_its_gate() {
+    check_repaired_encrypted_hole(120);
+}
+
+#[test]
+fn a_sub_block_repair_releases_held_cipher_edges() {
+    check_repaired_encrypted_hole(7);
+}
+
+fn check_repaired_encrypted_hole(hole_len: u64) {
     let payload: Vec<u8> = (0..600u32).map(|index| (index % 251) as u8).collect();
     let volumes = encrypted_store_set(
         REPAIR_MEMBER,
@@ -348,7 +357,6 @@ async fn a_repaired_hole_completes_an_encrypted_part_and_passes_its_gate() {
     // The lost article: a run inside the first volume's part, unaligned at both
     // ends, that never arrives on the wire.
     let hole_at = part_at + 37;
-    let hole_len = 120;
     let first = &volumes[0].1;
     router
         .route_bytes(0, 0, &first[..hole_at as usize])

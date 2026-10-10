@@ -20,21 +20,32 @@ pub(in super::super) fn with_embedded_par3(
     block_size: u64,
     recovery_count: u64,
 ) -> Vec<u8> {
-    let scratch = tempfile::tempdir().unwrap();
-    let source = SourceId(0);
-    let mut access = MemorySourceAccess::default();
-    access.insert(source, 1, Arc::from(archive));
-    let name = "silver.horizon.7z";
-    let path = scratch.path().join(name);
-    InsertionPlan::build(
-        Arc::new(access),
-        source,
-        name,
+    with_embedded_par3_named(
+        archive,
+        "silver.horizon.7z",
         CreationOptions {
             block_size,
             recovery_count,
             ..CreationOptions::default()
         },
+    )
+}
+
+pub(in super::super) fn with_embedded_par3_named(
+    archive: &[u8],
+    name: &str,
+    options: CreationOptions,
+) -> Vec<u8> {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = SourceId(0);
+    let mut access = MemorySourceAccess::default();
+    access.insert(source, 1, Arc::from(archive));
+    let path = scratch.path().join(name);
+    InsertionPlan::build(
+        Arc::new(access),
+        source,
+        name,
+        options,
         &ContainerLimits::default(),
     )
     .expect("an insertion plan over the fixture archive")

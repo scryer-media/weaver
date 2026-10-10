@@ -2,14 +2,12 @@
 // as posters author them, uuencode, and the wider shapes of real posts.
 //
 // Every family crosses its axes into cells, runs each cell under every
-// extraction profile, and samples the matrix's schedules for each by a fixed
-// stride. [`sizing`] holds each family's exact count. Every run must end the
-// same way: the expected files published byte for byte, or a named failure
-// that publishes none of them. A cell the product does not yet hold to that
-// is held open by name in its family's `open_defect`.
+// extraction profile, and samples the matrix's schedules by a fixed stride.
+// Every run must publish the expected files byte for byte, or end in a named
+// failure that publishes none of them. No resolved defect bypasses its verdict.
 //
-// The campaigns are opt-in and run only from the manually dispatched
-// extended workflow; each family's smokes run in the default suite.
+// Campaigns run only from the manually dispatched extended workflow;
+// small family smokes run in the default suite.
 use super::*;
 use crate::pipeline::direct_unpack::wiring::{AbortLatch, DemotionReason as ChaseDemotion};
 use std::ops::Range;
@@ -37,16 +35,6 @@ pub(super) const PROFILES: [ExtractionProfile; 3] = [
 // The password every encrypted tier-two fixture is written under.
 pub(super) const PASSWORD: &str = "lantern-quay";
 
-// A cell the product does not yet hold to its ruling.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum Defect {
-    // The cases run, and at least one must still miss the ruling: once none
-    // does, the entry is stale and the campaign says so.
-    Diverges(&'static str),
-    // The job never settles, so the cases are not run at all.
-    Hangs(&'static str),
-}
-
 // Which pool of schedules a family samples.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Pool {
@@ -59,7 +47,8 @@ pub(super) enum Pool {
 impl Pool {
     // The pool's cases the profile includes, built once per process.
     fn all(self, profile: ExtractionProfile) -> &'static [(usize, Schedule)] {
-        static POOLS: [[std::sync::OnceLock<Vec<(usize, Schedule)>>; 3]; 2] =
+        type ProfileCases = std::sync::OnceLock<Vec<(usize, Schedule)>>;
+        static POOLS: [[ProfileCases; 3]; 2] =
             [const { [const { std::sync::OnceLock::new() }; 3] }; 2];
         let at = PROFILES.iter().position(|&p| p == profile).unwrap();
         POOLS[self as usize][at].get_or_init(|| {
@@ -104,11 +93,13 @@ impl Pool {
 pub(super) trait Cell: Copy + std::fmt::Debug {
     // The post for a schedule's loss mask and whether it is starved.
     fn post(self, interruption: Interruption) -> Built;
-    // The defect the cell is held open for under `profile`, if any.
-    fn defect(self, profile: ExtractionProfile) -> Option<Defect>;
     // Whether the cell's recovery set is PAR2: a defect there blocks a
     // release.
     fn par2(self) -> bool;
+
+    fn case_weight(self) -> usize {
+        1
+    }
 }
 
 // A post and the recovery geometry its oracle counts in.
@@ -120,20 +111,13 @@ pub(super) struct Built {
     pub ruling: Option<Verdict>,
 }
 
-// Runs one cell under one profile over `cases`, holding each run to its
-// verdict, or to its defect where the cell is held open.
+// Run one cell under one profile, enforcing every case's verdict directly.
 pub(super) async fn run_cell<C: Cell>(
     cell: C,
     profile: ExtractionProfile,
     cases: Vec<(usize, Schedule)>,
 ) {
-    let defect = cell.defect(profile);
-    if let Some(Defect::Hangs(why)) = defect {
-        eprintln!("{cell:?} profile={profile:?} held open, not run: {why}");
-        return;
-    }
     let mut built: BTreeMap<(u8, bool), Built> = BTreeMap::new();
-    let mut diverged = 0;
     for (case, (order, interruption)) in cases {
         if !profile.includes(interruption) {
             continue;
@@ -153,25 +137,7 @@ pub(super) async fn run_cell<C: Cell>(
         );
         eprintln!("{context}");
         let ran = run::run(&fixture.post, profile, &order, interruption).await;
-        let check = || ran.assert(&fixture.post, profile, verdict, &context);
-        match defect {
-            Some(Defect::Diverges(why)) => {
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).is_err() {
-                    eprintln!("{context}: held open: {why}");
-                    diverged += 1;
-                }
-            }
-            _ => check(),
-        }
-    }
-    if let Some(Defect::Diverges(why)) = defect
-        && diverged == 0
-    {
-        // A hold covers the cases that trigger it; a run that samples none of
-        // them is not proof the hold is stale, so it is reported, not failed.
-        eprintln!(
-            "{cell:?} profile={profile:?} met its ruling on every case run while held open: {why}"
-        );
+        ran.assert(&fixture.post, profile, verdict, &context);
     }
 }
 
@@ -252,7 +218,11 @@ impl<C: Cell> Family<C> {
     // family's case indices that fall in the shard.
     pub(super) async fn shard(&self, shard: usize, shards: usize) {
         assert!(shard < shards);
-        let total = self.total();
+        let total: usize = self
+            .units
+            .iter()
+            .map(|&(cell, profile, pool, per, _)| pool.count(profile, per) * cell.case_weight())
+            .sum();
         let range = shard * total / shards..(shard + 1) * total / shards;
         let replay = std::env::var("WEAVER_TIER2_CASE").ok().map(|selection| {
             match selection.split_once("..") {
@@ -266,11 +236,16 @@ impl<C: Cell> Family<C> {
             }
         });
         let mut at = 0;
+        let mut weighted_at = 0;
         for &(cell, profile, pool, per, rotation) in &self.units {
             let count = pool.count(profile, per);
             let unit = at..at + count;
             at += count;
-            if unit.end <= range.start || unit.start >= range.end {
+            let weight = cell.case_weight();
+            assert!(weight > 0);
+            let weighted_start = weighted_at;
+            weighted_at += count * weight;
+            if weighted_at <= range.start || weighted_start >= range.end {
                 continue;
             }
             let cases: Vec<_> = pool
@@ -281,7 +256,7 @@ impl<C: Cell> Family<C> {
                     // The run names cases by family index so the printed
                     // number is the one the replay switch takes.
                     let index = unit.start + k;
-                    (range.contains(&index)
+                    (range.contains(&(weighted_start + k * weight))
                         && replay.as_ref().is_none_or(|replay| replay.contains(&index)))
                     .then_some((index, schedule))
                 })

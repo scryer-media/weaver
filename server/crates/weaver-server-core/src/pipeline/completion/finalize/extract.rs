@@ -112,10 +112,10 @@ fn verified_sevenz_part_paths(parts: &[(u32, PathBuf)]) -> Result<Vec<PathBuf>, 
                     if meta.len() == expected {
                         return true;
                     }
-                    // The single-volume PAR3 envelope follows the container.
+                    // A PAR3 envelope can follow the final container part.
                     // Match the direct router's signature rule; arbitrary
                     // excess bytes and split-volume size mismatches fail.
-                    if count != 1 || meta.len() <= expected {
+                    if u64::from(index) + 1 != count || meta.len() <= expected {
                         return false;
                     }
                     use std::io::{Seek, SeekFrom};
@@ -123,7 +123,7 @@ fn verified_sevenz_part_paths(parts: &[(u32, PathBuf)]) -> Result<Vec<PathBuf>, 
                         return false;
                     };
                     let mut magic = [0u8; 8];
-                    file.seek(SeekFrom::Start(total)).is_ok()
+                    file.seek(SeekFrom::Start(expected)).is_ok()
                         && file.read_exact(&mut magic).is_ok()
                         && magic == *par3_rs::MAGIC
                 }) && (index != 0 || valid_heads.iter().any(|(valid, _)| valid == path))

@@ -439,31 +439,32 @@ impl Cell for DamageCell {
         }
     }
 
-    fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-        open_defect(self, profile)
-    }
-
     fn par2(self) -> bool {
         matches!(self.recovery, Recovery::Par2(_))
     }
 }
 
-// The defects each cell and profile is held open for.
-fn open_defect(cell: DamageCell, profile: ExtractionProfile) -> Option<Defect> {
-    if cell.recovery == Recovery::Par3
-        && cell.container == Container::SevenZip
-        && cell.location == Location::SliceStraddle
-        && cell.kind == Damage::Truncated
-        && profile == ExtractionProfile::DirectStore
-    {
-        return Some(Defect::Diverges(PAR3_SOURCE_CHANGED_AFTER_DEMOTION));
-    }
-    None
+#[tokio::test]
+async fn swapped_encrypted_headers_repaired_after_restart() {
+    run_cell(
+        DamageCell {
+            kind: Damage::Swapped,
+            location: Location::FirstVolumeHead,
+            pattern: Pattern::TwelveAcrossThree,
+            recovery: Recovery::Par2(Margin::With),
+            container: Container::Rar5Encrypted,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(
+            0,
+            (
+                vec![(0, 0), (1, 1), (0, 1), (1, 0)],
+                Interruption::Restart(2),
+            ),
+        )],
+    )
+    .await;
 }
-
-// A demotion refetch re-publishes a PAR3 source whose retained assessment is
-// Ready, and the job fails instead of re-assessing it.
-const PAR3_SOURCE_CHANGED_AFTER_DEMOTION: &str = "PAR3: after a demotion refetch the job fails with \"PAR3 source changed\" instead of re-assessing";
 
 macro_rules! damage_smokes {
     ($($name:ident $kind:ident $location:ident $pattern:ident $recovery:expr, $container:ident;)+) => {
@@ -487,6 +488,9 @@ macro_rules! damage_smokes {
 }
 
 damage_smokes! {
+    crc_wrong_mid_volume_par3 CrcWrong MidVolume MostOfOne Recovery::Par3, Rar5;
+    no_checksum_middle_head_par2 NoChecksum MiddleVolumeHead Hundred Recovery::Par2(Margin::With), SevenZip;
+    truncated_index_exact Truncated RecoveryIndex MostOfOne Recovery::Par2(Margin::Exact), Rar5;
     recomputed_mid_volume_par2 Recomputed MidVolume Two Recovery::Par2(Margin::With), Rar5;
     truncated_first_head_exact Truncated FirstVolumeHead TwelveAcrossThree Recovery::Par2(Margin::Exact), Rar5Encrypted;
     crc_wrong_straddle_unprotected CrcWrong SliceStraddle Two Recovery::None, Rar4;
@@ -499,6 +503,58 @@ damage_smokes! {
 
 mod damage_loss_smoke {
     use super::*;
+
+    #[tokio::test]
+    async fn par3_restart_retains_the_decoded_prefix_as_repair_input() {
+        run_cell(
+            DamageCell {
+                kind: Damage::CrcWrong,
+                location: Location::RecoveryIndex,
+                pattern: Pattern::MemberAbsent,
+                recovery: Recovery::Par3,
+                container: Container::SevenZip,
+            },
+            ExtractionProfile::DirectStore,
+            vec![(
+                491760,
+                (
+                    vec![(1, 1), (0, 0), (0, 1), (1, 0)],
+                    Interruption::Restart(3),
+                ),
+            )],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn encrypted_par3_restart_retains_the_first_volume() {
+        for profile in [
+            ExtractionProfile::DirectStore,
+            ExtractionProfile::Chase,
+            ExtractionProfile::Conventional,
+        ] {
+            for at in [2, 3] {
+                run_cell(
+                    DamageCell {
+                        kind: Damage::Swapped,
+                        location: Location::RecoveryVolume,
+                        pattern: Pattern::MemberAbsent,
+                        recovery: Recovery::Par3,
+                        container: Container::Rar5Encrypted,
+                    },
+                    profile,
+                    vec![(
+                        0,
+                        (
+                            vec![(1, 0), (1, 1), (0, 1), (0, 0)],
+                            Interruption::Restart(at),
+                        ),
+                    )],
+                )
+                .await;
+            }
+        }
+    }
 
     #[tokio::test]
     async fn crc_wrong_mid_volume_par2() {

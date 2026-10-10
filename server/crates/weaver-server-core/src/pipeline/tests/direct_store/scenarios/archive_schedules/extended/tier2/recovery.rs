@@ -82,11 +82,11 @@ pub(in super::super) fn recovery_packets(bytes: &[u8]) -> Vec<Range<usize>> {
                 &packet[40..48] == b"PAR REC\0",
             )
         } else {
-            at += 4;
+            at += 1;
             continue;
         };
         if length < 48 || at + length > bytes.len() {
-            at += 4;
+            at += 1;
             continue;
         }
         if recovery {
@@ -95,6 +95,35 @@ pub(in super::super) fn recovery_packets(bytes: &[u8]) -> Vec<Range<usize>> {
         at += length;
     }
     packets
+}
+
+#[test]
+fn recovery_packet_counts_do_not_require_an_aligned_archive_tail() {
+    let sources = [("payload.bin".to_string(), vec![7; 2048])];
+    for files in [
+        par2_set(&sources, 512, 2, Par2Volumes::Uniform),
+        par3_set(&sources, 512, 2, Code::Cauchy, 1),
+    ] {
+        let mut count = 0;
+        for (_, bytes) in files {
+            let expected = recovery_packets(&bytes);
+            count += expected.len();
+            for prefix in 1..=3 {
+                let shifted: Vec<_> = vec![0; prefix]
+                    .into_iter()
+                    .chain(bytes.iter().copied())
+                    .collect();
+                assert_eq!(
+                    recovery_packets(&shifted),
+                    expected
+                        .iter()
+                        .map(|packet| packet.start + prefix..packet.end + prefix)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        assert_eq!(count, 2);
+    }
 }
 
 // Source blocks the post may leave wrong and certainly leaves wrong.
@@ -106,15 +135,82 @@ pub(in super::super) fn needed(
     let none = BTreeSet::new();
     let mut upper = 0;
     let mut lower = 0;
+    let mut readable_blocks = BTreeSet::new();
+    let mut missing_blocks = Vec::new();
+    let mut sources = Vec::new();
     for file in post.index_of(Role::Data) {
         let (may, must) = post.files[file].wrong_ranges(lost.get(&file).unwrap_or(&none));
         upper += blocks_touched(&may, geometry.block);
-        lower += blocks_touched(&must, geometry.block);
+        for (index, bytes) in post.files[file].bytes.chunks(geometry.block).enumerate() {
+            let start = index * geometry.block;
+            let end = start + bytes.len();
+            if must
+                .iter()
+                .any(|range| range.start < end && start < range.end)
+            {
+                missing_blocks.push(bytes);
+            } else {
+                readable_blocks.insert(bytes);
+            }
+        }
+        sources.push((&post.files[file].bytes, must));
     }
+    // Short slices can be found inside another block, not just at its start.
+    // The repair scanner uses a rolling search for precisely these tails.
+    let short_blocks: BTreeSet<_> = missing_blocks
+        .iter()
+        .copied()
+        .filter(|bytes| bytes.len() < geometry.block && !readable_blocks.contains(bytes))
+        .collect();
+    for bytes in short_blocks {
+        if sources.iter().any(|(source, wrong)| {
+            source
+                .windows(bytes.len())
+                .enumerate()
+                .any(|(at, candidate)| {
+                    candidate == bytes
+                        && !wrong
+                            .iter()
+                            .any(|range| range.start < at + bytes.len() && at < range.end)
+                })
+        }) {
+            readable_blocks.insert(bytes);
+        }
+    }
+    // Missing at its canonical offset does not mean unavailable: identical
+    // blocks, including repeated short archive tails, can be copied from an
+    // intact source. Keep the conservative upper bound, but never rule an
+    // unavoidable failure using a block whose bytes may still be readable.
+    lower += missing_blocks
+        .into_iter()
+        .filter(|bytes| !readable_blocks.contains(bytes))
+        .count();
     if geometry.packed {
         lower = lower.min(1);
     }
     (upper, lower)
+}
+
+#[test]
+fn missing_short_tail_can_be_supplied_by_an_intact_source() {
+    let mut missing = Posted::new("first.bin", vec![1, 2, 3, 4, 9, 8], 4, Role::Data);
+    missing.absent();
+    let donor = Posted::new("second.bin", vec![5, 6, 7, 0, 9, 8], 4, Role::Data);
+    let mut post = Post {
+        files: vec![missing, donor],
+        password: None,
+        expected: vec![],
+        allowed: vec![],
+    };
+    let geometry = Geometry {
+        block: 4,
+        packed: false,
+    };
+    assert_eq!(needed(&post, geometry, &BTreeMap::new()), (2, 1));
+    post.files[1].bytes = vec![5, 9, 8, 0];
+    assert_eq!(needed(&post, geometry, &BTreeMap::new()), (2, 1));
+    post.files[1].absent();
+    assert_eq!(needed(&post, geometry, &BTreeMap::new()), (3, 3));
 }
 
 // Recovery blocks that survive the post: at least and at most.
@@ -142,6 +238,78 @@ pub(in super::super) fn surviving(
         most += packets.iter().filter(|packet| !hit(&must, packet)).count();
     }
     (least, most)
+}
+
+fn exact_par2_matrix_is_singular(blocks: usize, exponents: Vec<u32>) -> bool {
+    type Cache = std::sync::Mutex<BTreeMap<(usize, Vec<u32>), bool>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (blocks, exponents);
+    if let Some(&singular) = cache.lock().unwrap().get(&key) {
+        return singular;
+    }
+    let missing: Vec<_> = (0..blocks).collect();
+    let constants = par2_rs::input_slice_constants(blocks);
+    let singular = match par2_rs::build_decode_matrix(&missing, &key.1, &constants) {
+        Ok(_) => false,
+        Err(par2_rs::Par2Error::ReedSolomonError { reason }) if reason.contains("singular") => true,
+        Err(error) => panic!("fixture matrix check failed: {error}"),
+    };
+    cache.lock().unwrap().insert(key, singular);
+    singular
+}
+
+pub(in super::super) fn all_missing_exact_par2_is_singular(
+    post: &Post,
+    block: usize,
+    lost: &BTreeMap<usize, BTreeSet<u32>>,
+) -> bool {
+    let data = post.index_of(Role::Data);
+    if data.is_empty()
+        || !data.iter().all(|&file| {
+            (0..post.files[file].articles()).all(|article| {
+                post.files[file].is_absent(article)
+                    || lost.get(&file).is_some_and(|lost| lost.contains(&article))
+            })
+        })
+    {
+        return false;
+    }
+    let blocks = data
+        .iter()
+        .map(|&file| post.files[file].bytes.len().div_ceil(block))
+        .sum();
+    let none = BTreeSet::new();
+    let mut exponents = BTreeSet::new();
+    for file in post.index_of(Role::Recovery) {
+        let posted = &post.files[file];
+        let (_, must) = posted.wrong_ranges(lost.get(&file).unwrap_or(&none));
+        for packet in recovery_packets(&posted.bytes) {
+            if !posted.bytes[packet.start..].starts_with(b"PAR2\0PKT")
+                || must
+                    .iter()
+                    .any(|range| range.start < packet.end && packet.start < range.end)
+            {
+                continue;
+            }
+            exponents.insert(u32::from_le_bytes(
+                posted.bytes[packet.start + 64..packet.start + 68]
+                    .try_into()
+                    .unwrap(),
+            ));
+        }
+    }
+    // Exactly N packets need not supply N independent equations. Check only
+    // the all-missing, exact-count case; a cache shares the expensive algebra
+    // across schedules with the same surviving exponents.
+    exponents.len() == blocks
+        && exact_par2_matrix_is_singular(blocks, exponents.into_iter().collect())
+}
+
+#[test]
+fn distinct_par2_exponents_need_not_be_independent() {
+    assert!(!exact_par2_matrix_is_singular(2, vec![0, 1]));
+    assert!(exact_par2_matrix_is_singular(2, vec![0, 65535]));
 }
 
 // What a run of `post` must end in, given what its schedule loses.
@@ -248,7 +416,33 @@ pub(in super::super) fn par2_set(
     let created = creator
         .create(&creator.plan().expect("a PAR2 plan over the fixture"))
         .expect("a PAR2 set over the fixture");
-    read_outputs(&created.output_paths)
+    let mut files = read_outputs(&created.output_paths);
+    // Exact zero-row posts still need an independent metadata carrier when
+    // the index is damaged or absent. Duplicate only critical packets: this
+    // preserves zero recovery power instead of silently widening the margin.
+    if recovery == 0 {
+        let metadata = files.first().expect("the creator emits an index").1.clone();
+        files.push(("silver.horizon.vol00+00.par2".to_string(), metadata));
+    }
+    files
+}
+
+#[test]
+fn zero_row_par2_keeps_metadata_redundancy_without_repair_power() {
+    let files = par2_set(
+        &[("payload.bin".to_string(), vec![7; 2048])],
+        512,
+        0,
+        Par2Volumes::Uniform,
+    );
+    assert_eq!(files.len(), 2);
+    for (_, bytes) in &files {
+        assert!(recovery_packets(bytes).is_empty());
+        let packets = par2_packets(bytes);
+        for kind in [par2_type::MAIN, par2_type::FILE_DESC, par2_type::IFSC] {
+            assert!(packets.iter().any(|packet| &packet.kind == kind));
+        }
+    }
 }
 
 // A PAR3 set over `sources`: the index first, then its recovery volumes.
@@ -379,7 +573,7 @@ pub(in super::super) fn par2_packets(bytes: &[u8]) -> Vec<Par2Packet> {
 // bytes and its hash computed as the format requires.
 pub(in super::super) fn par2_packet(set: &[u8], kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
     let mut body = body.to_vec();
-    while body.len() % 4 != 0 {
+    while !body.len().is_multiple_of(4) {
         body.push(0);
     }
     let mut hashed = Vec::with_capacity(32 + body.len());

@@ -260,28 +260,10 @@ impl Cell for UuCell {
         }
     }
 
-    fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-        open_defect(self, profile)
-    }
-
     fn par2(self) -> bool {
         self.has_par2()
     }
 }
-
-// The defects each cell and profile is held open for.
-fn open_defect(cell: UuCell, profile: ExtractionProfile) -> Option<Defect> {
-    let _ = profile;
-    cell.has_par2()
-        .then_some(Defect::Diverges(UU_PAR2_COUNTS_ONE_VOLUME))
-}
-
-// A uuencoded part carries no offset, so a part lost or cut short strands
-// every part behind it in its volume; the repair then needs blocks from more
-// than one PAR2 volume. The product fetches every volume but advertises only
-// the first volume's blocks and fails "not repairable" with the index intact,
-// under every profile. Release-blocking: PAR2 with sufficient margin.
-const UU_PAR2_COUNTS_ONE_VOLUME: &str = "PAR2 over a uuencoded set advertises one volume's recovery blocks and fails a repair the posted margin covers";
 
 macro_rules! uu_smokes {
     ($($name:ident $style:literal $shape:ident $damage:expr, $container:ident;)+) => {

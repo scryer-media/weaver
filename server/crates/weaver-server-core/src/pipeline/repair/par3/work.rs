@@ -353,6 +353,8 @@ pub(super) struct RepairCompletion {
     pub outputs: EngineResult<Vec<readback::VerifiedOutput>>,
     // True only when the embedded repair path installed a replacement.
     pub embedded_replacement: bool,
+    // Preserve the admitted carrier identity before repair invalidates its view.
+    pub embedded_source: Option<SourceId>,
     pub _reservation: Option<assessment::ViewReservation>,
 }
 
@@ -1676,29 +1678,39 @@ impl Coordinator {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return Ok(());
         };
-        if !job.known.contains_key(&source) {
+        // A concatenated split image can share backing bytes with any posted
+        // part, including a part not previously published on its own.
+        let affected: Vec<_> = job
+            .known
+            .keys()
+            .copied()
+            .filter(|id| *id == source || id.0 > u64::from(u32::MAX))
+            .collect();
+        if affected.is_empty() {
             return Ok(());
         }
         let epoch = job
             .epoch
             .checked_add(1)
             .ok_or(budget::host_limit("PAR3 source epochs"))?;
-        job.sources.withdraw(source)?;
-        job.known
-            .get_mut(&source)
-            .expect("known source")
-            .complete_disk_image = false;
+        for id in affected {
+            job.sources.withdraw(id)?;
+            job.known
+                .get_mut(&id)
+                .expect("known source")
+                .complete_disk_image = false;
+            job.pending.remove(&WorkKey::Source(id));
+            job.dirty.insert(id);
+            if let Some(runtime) = job.runtime.as_mut() {
+                for set in runtime.sets.values_mut() {
+                    set.invalidate(id);
+                }
+                runtime.carriers.remove(&id);
+            }
+        }
         job.epoch = epoch;
-        job.pending.remove(&WorkKey::Source(source));
         job.pending
             .retain(|key, _| !matches!(key, WorkKey::Repair(_)));
-        job.dirty.insert(source);
-        if let Some(runtime) = job.runtime.as_mut() {
-            for set in runtime.sets.values_mut() {
-                set.invalidate(source);
-            }
-            runtime.carriers.remove(&source);
-        }
         Ok(())
     }
 
@@ -2253,11 +2265,17 @@ impl Coordinator {
                                     result: Err(error),
                                     outputs: Ok(Vec::new()),
                                     embedded_replacement: false,
+                                    embedded_source: None,
                                     _reservation: Some(input.reservation),
                                 })),
                             );
                         }
                     };
+                    let embedded_source = runtime
+                        .sets
+                        .get(&set)
+                        .and_then(|set| set.view.as_ref())
+                        .and_then(|view| view.embedded_source);
                     let result = runtime.repair(set, &path);
                     let installed = match &result {
                         Ok(report) => report.installed.as_slice(),
@@ -2295,6 +2313,7 @@ impl Coordinator {
                             result,
                             outputs,
                             embedded_replacement,
+                            embedded_source,
                             _reservation: Some(input.reservation),
                         })),
                     );
@@ -2537,6 +2556,7 @@ impl Coordinator {
                     )),
                     outputs: Ok(Vec::new()),
                     embedded_replacement: false,
+                    embedded_source: None,
                     _reservation: None,
                 });
             } else if done.key == WorkKey::Readback {
@@ -2655,6 +2675,7 @@ impl Coordinator {
                             .unwrap_or(EngineError::InvalidState("missing PAR3 repair report"))),
                         outputs: Ok(Vec::new()),
                         embedded_replacement: false,
+                        embedded_source: None,
                         _reservation: None,
                     },
                 });
@@ -2668,6 +2689,10 @@ impl Coordinator {
                 job.errors.retain(
                     |_, error| !matches!(error, EngineError::SourceChanged(changed) if *changed == source),
                 );
+                if matches!(job.donor_error, Some(EngineError::SourceChanged(changed)) if changed == source)
+                {
+                    job.donor_error = None;
+                }
             }
             (WorkKey::Source(source), Err(error)) => {
                 if pressure.is_some() {

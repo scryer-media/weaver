@@ -167,10 +167,9 @@ pub(super) struct Route {
     // that arrives after the body names nothing in time and the set goes
     // conventional.
     pub named_by_early_index: bool,
-    // Each set is admitted from its own volumes and either finishes direct
-    // or leaves on its own, so a schedule may finish any number of them,
-    // all included. The campaign states the exact count where it is known.
-    pub sets_finish_independently: bool,
+    // Identity rediscovery can readmit every set on a successful job. Failed
+    // jobs still finalize zero sets; this only describes successful routing.
+    pub sets_can_be_readmitted: bool,
 }
 
 impl Route {
@@ -181,7 +180,7 @@ impl Route {
         unmapped_loss: |_| false,
         unnamed_loss: |_| false,
         named_by_early_index: false,
-        sets_finish_independently: false,
+        sets_can_be_readmitted: false,
     };
 
     // A set the layout refuses to route: it demotes for its shape and
@@ -194,7 +193,7 @@ impl Route {
             unmapped_loss: |_| false,
             unnamed_loss: |_| false,
             named_by_early_index: false,
-            sets_finish_independently: false,
+            sets_can_be_readmitted: false,
         }
     }
 }
@@ -368,7 +367,8 @@ impl ExtractionProfile {
             );
         } else if route.sets == 1 {
             assert_eq!(outcome.finalized, 0, "{trace:?}");
-        } else if route.sets_finish_independently {
+        } else if route.sets_can_be_readmitted {
+            assert_eq!(outcome.status, Some(JobStatus::Complete), "{trace:?}");
             assert!(outcome.finalized <= route.sets, "{trace:?}");
         } else {
             assert!(outcome.finalized < route.sets, "{trace:?}");
@@ -444,6 +444,8 @@ pub(super) enum Interruption {
 pub(super) enum Selection {
     // The default suite's bounded sample.
     Smoke,
+    // One deterministic regression from the combined schedule pool.
+    Case(usize),
     // One shard of the combined matrix.
     Shard(usize),
     // One of [`FINE_SHARDS`] shards of the combined matrix, for a layout
@@ -541,6 +543,13 @@ pub(super) fn combined_schedules(shard: usize, shards: usize) -> Vec<(usize, Sch
 pub(super) fn selected_schedules(selection: Selection) -> Vec<(usize, Schedule)> {
     match selection {
         Selection::Smoke => schedules().into_iter().enumerate().collect(),
+        Selection::Case(index) => {
+            let case = combined_schedule_cases()
+                .into_iter()
+                .find(|(case, _)| *case == index)
+                .expect("regression schedule exists");
+            vec![case]
+        }
         Selection::Shard(shard) => combined_schedules(shard, SHARDS),
         Selection::FineShard(shard) => combined_schedules(shard, FINE_SHARDS),
         Selection::WrongPassword | Selection::WrongPasswordPart(_) => Vec::new(),
@@ -2094,6 +2103,30 @@ grouping::grouping_cells! {
     }
 }
 
+fn late_index_direct_route(
+    order: &[(u32, u32)],
+    interruption: Interruption,
+    outcome: &Outcome,
+) -> bool {
+    let last_restart = interruption
+        .boundaries(order.len())
+        .into_iter()
+        .rev()
+        .find(|(_, action, _)| matches!(action, BoundaryAction::Restart | BoundaryAction::Crash))
+        .map(|(step, _, _)| step);
+    let mask = interruption.loss().map_or(0, |(mask, _)| mask);
+    // A queued restart refetch is not a delivered refetch. An opening article
+    // delivered before the late index commits that file to conventional
+    // assembly; an out-of-order tail can still wait in the prefix hold.
+    last_restart.is_some_and(|at| {
+        order[at..]
+            .iter()
+            .all(|&(file, article)| article != 0 || mask & (1 << (file * 2 + article)) != 0)
+    }) && [(0, 0), (1, 0)]
+        .iter()
+        .all(|article| outcome.rerequested.contains(article))
+}
+
 async fn campaign(format: Format, selection: Selection) {
     profile_campaign(format, selection, ExtractionProfile::DirectStore).await;
 }
@@ -2317,7 +2350,12 @@ async fn slot_campaign(
                 "{:?}",
                 outcome.trace
             );
-            profile.assert_delivery(&outcome, format.route(), &[name], interruption);
+            let mut route = format.route();
+            if matches!(format, Format::Rar4HexLateIndex) {
+                route.direct = late_index_direct_route(&order, interruption, &outcome);
+                route.unnamed_loss = |mask| mask & 0b0101 != 0;
+            }
+            profile.assert_delivery(&outcome, route, &[name], interruption);
             assert_eq!(outcome.files[name].as_deref(), Some(payload.as_slice()));
         }
     }
@@ -2358,12 +2396,8 @@ async fn slot_campaign(
             }
         }
         if matches!(format, Format::Rar4HexLateIndex) {
-            // The index names the volumes only once the body has landed, so
-            // the set routes direct exactly when a restart sent both volumes'
-            // offset-zero articles to be fetched again after it.
-            route.direct = [(0, 0), (1, 0)]
-                .iter()
-                .all(|article| actual.rerequested.contains(article));
+            route.direct = late_index_direct_route(&order, interruption, &actual);
+            route.unnamed_loss = |mask| mask & 0b0101 != 0;
         }
         assert_eq!(
             actual.status,
@@ -2484,6 +2518,12 @@ async fn rar5_hex_late_index_arrival_schedules() {
 #[tokio::test]
 async fn rar4_hex_late_index_arrival_schedules() {
     campaign(Format::Rar4HexLateIndex, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar4_late_index_restart_distinguishes_requested_and_delivered_prefixes() {
+    for case in [610, 1893, 4772] {
+        campaign(Format::Rar4HexLateIndex, Selection::Case(case)).await;
+    }
 }
 #[tokio::test]
 async fn rar5_hex_misnumbered_arrival_schedules() {
@@ -2685,7 +2725,7 @@ impl HexTwoSets {
             // members' exact bytes are checked in every case.
             Self::Rar5 => Route {
                 sets: 2,
-                sets_finish_independently: true,
+                sets_can_be_readmitted: true,
                 ..Route::refused(|reason| {
                     matches!(reason, DemotionReason::IdentityRosterUnfillable)
                 })

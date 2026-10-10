@@ -1172,7 +1172,19 @@ impl Pipeline {
         }
         // Preserve a live representative when a byte-identical repost arrives
         // later. A lexically earlier copy must not rename an established set.
-        paths.sort_by_key(|(index, _, _)| !volumes[*index].registered);
+        paths.sort_by_key(|(index, _, _)| {
+            let volume = &volumes[*index];
+            let established = self
+                .rar_sets
+                .get(&(job_id, volume.classification.set_name.clone()))
+                .is_some_and(|set| set.plan.is_some());
+            (
+                !self.rar_set_is_busy(job_id, &volume.classification.set_name),
+                !established,
+                !volume.registered,
+                volume.filename.clone(),
+            )
+        });
         let volume_count = volumes.len();
         let representatives = tokio::task::spawn_blocking(move || {
             use std::io::Read;
@@ -1226,7 +1238,7 @@ impl Pipeline {
         .await
         .unwrap_or_else(|_| (0..volume_count).collect());
 
-        let mut rebinds: Vec<(usize, DetectedArchiveIdentity)> = Vec::new();
+        let mut rebinds: Vec<(usize, DetectedArchiveIdentity, bool)> = Vec::new();
         for chain in Self::chain_nameless_rar_volumes(&volumes, &representatives) {
             let set_name = volumes[chain[0].0].classification.set_name.clone();
             for (volume, index) in chain {
@@ -1246,7 +1258,8 @@ impl Pipeline {
                     || current.volume_index.unwrap_or(0) != index
                     || !registered_equivalent
                 {
-                    rebinds.push((volume, wanted));
+                    let alias = registered_equivalent && representatives[volume] != volume;
+                    rebinds.push((volume, wanted, alias));
                 }
             }
         }
@@ -1256,12 +1269,14 @@ impl Pipeline {
         // that volume still holds.
         let mut touched_by_set: BTreeMap<String, HashSet<String>> = BTreeMap::new();
         let mut moved = Vec::new();
-        for (volume, wanted) in rebinds {
+        for (volume, wanted, alias) in rebinds {
             let volume = &volumes[volume];
             let old_set = volume.classification.set_name.clone();
-            // A set already extracting keeps the layout it started with.
+            // A proven byte-identical alias changes no extraction input. It
+            // may join an active set without replacing its registered reader;
+            // otherwise the copy remains an orphan waiting for a first volume.
             if self.rar_set_is_busy(job_id, &old_set)
-                || self.rar_set_is_busy(job_id, &wanted.set_name)
+                || (!alias && self.rar_set_is_busy(job_id, &wanted.set_name))
             {
                 continue;
             }
@@ -1287,7 +1302,9 @@ impl Pipeline {
                 .entry(old_set)
                 .or_default()
                 .insert(volume.filename.clone());
-            moved.push(volume.file_id);
+            if !alias {
+                moved.push(volume.file_id);
+            }
         }
         for (old_set, touched) in &touched_by_set {
             self.invalidate_archive_set_for_identity_rebind(job_id, old_set, touched);
