@@ -593,3 +593,20 @@ checksum_algo = "blake3"
 kind = "rust"
 hook_id = "default_unwanted_extensions_v56"
 scope = "upgrade_only"
+
+[[migration]]
+version = 57
+description = "post-processing entries whose turn has come, for resuming after a restart"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0057_post_processing_started/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0057_post_processing_started/schema.sql"
+engine = "postgres"
+scope = "all"

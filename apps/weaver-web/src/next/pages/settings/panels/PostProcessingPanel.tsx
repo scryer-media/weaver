@@ -85,14 +85,14 @@ interface ExecutionForm extends EventScriptOptions {
   unacceptableExtensions: string;
 }
 
-/** The daemon runs between one and eight scripts at once. */
-const CONCURRENCY_MAX = 8;
+/** The daemon runs between 1 and 128 scripts at once. */
+const CONCURRENCY_MAX = 128;
 
 const DEFAULTS: ExecutionForm = {
   ...eventScriptDefaults,
   executionEnabled: false,
   globalScriptsRun: "ALWAYS",
-  concurrency: 4,
+  concurrency: 32,
   terminationGraceSeconds: 10,
   pythonInterpreter: "",
   powershellInterpreter: "",

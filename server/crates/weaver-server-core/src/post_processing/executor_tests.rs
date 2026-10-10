@@ -1057,7 +1057,7 @@ fn a_job_keeps_the_instances_it_was_admitted_with_through_a_directory_change() {
     let new_root = normalize_script_directory(&root.path().join("new")).unwrap();
     db.replace_post_processing_script_directory(&old_root)
         .unwrap();
-    let executor = PostProcessingExecutor::new(db.clone(), old_root.clone(), 1);
+    let executor = PostProcessingExecutor::new(db.clone(), old_root.clone());
 
     // Nothing is captured while scripts are turned off.
     db.create_script_instance(draft("notify.sh", InstanceTrigger::PostProcessing))
@@ -1118,4 +1118,283 @@ fn job_results_and_summary_are_stored_on_the_job_and_read_back() {
     db.save_job_post_processing_results(7, PostProcessingSummary::Warning, &results)
         .unwrap();
     assert!(db.job_post_processing_results(7).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_waited_script_that_cannot_start_is_listed_among_the_jobs_runs() {
+    let db = Database::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let scripts = normalize_script_directory(&root.path().join("scripts")).unwrap();
+    db.replace_post_processing_script_directory(&scripts)
+        .unwrap();
+    db.save_post_processing_settings(&PostProcessingSettings {
+        execution_enabled: true,
+        ..PostProcessingSettings::default()
+    })
+    .unwrap();
+    db.insert_job_history(&crate::JobHistoryRow {
+        job_id: 51,
+        job_hash: None,
+        name: "unstarted".into(),
+        status: "complete".into(),
+        error_message: None,
+        total_bytes: 0,
+        downloaded_bytes: 0,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1,
+        completed_at: 1,
+        metadata: None,
+        server_attribution: None,
+    })
+    .unwrap();
+    // The job waits for a script the scripts directory does not hold.
+    db.create_script_instance(draft("missing.sh", InstanceTrigger::PostProcessing))
+        .unwrap();
+    let executor = PostProcessingExecutor::new(db.clone(), scripts.clone());
+    let admission = executor.admit_job_scripts(None).unwrap().unwrap();
+    let context = super::runner::JobExecutionContext {
+        job_id: 51,
+        name: "unstarted".into(),
+        nzb_filename: "unstarted.nzb".into(),
+        category: None,
+        group: None,
+        source_url: None,
+        working_directory: root.path().to_path_buf(),
+        final_directory: root.path().to_path_buf(),
+        pipeline_outcome: super::model::PipelineOutcome::Succeeded,
+        par_status: 0,
+        unpack_status: 0,
+        compatibility: Default::default(),
+    };
+    let report = executor
+        .execute_admitted_job(51, admission, context, None, None)
+        .await
+        .unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].status, ScriptStatus::Warning);
+
+    let runs = db.script_runs(Default::default(), None, 10).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].job_id, Some(51));
+    assert_eq!(runs[0].job_name.as_deref(), Some("unstarted"));
+    assert_eq!(runs[0].result.script.as_str(), "missing.sh");
+    assert_eq!(runs[0].result.status, ScriptStatus::Warning);
+    assert!(!runs[0].result.background);
+    assert!(runs[0].result.error_message.is_some());
+}
+
+// A job in post-processing with five waited scripts, none of which the
+// scripts directory holds, so a script that runs leaves a Warning run in the
+// Runs list and a script that does not leaves nothing.
+fn interrupted_job(
+    job_id: u64,
+) -> (
+    Database,
+    tempfile::TempDir,
+    PostProcessingExecutor,
+    Vec<ScriptInstance>,
+) {
+    let db = Database::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let scripts = normalize_script_directory(&root.path().join("scripts")).unwrap();
+    db.replace_post_processing_script_directory(&scripts)
+        .unwrap();
+    db.save_post_processing_settings(&PostProcessingSettings {
+        execution_enabled: true,
+        ..PostProcessingSettings::default()
+    })
+    .unwrap();
+    db.create_active_job(&crate::ActiveJob {
+        job_id: crate::JobId(job_id),
+        nzb_hash: [job_id as u8; 32],
+        nzb_path: "fixture.nzb".into(),
+        nzb_zstd: Vec::new(),
+        output_dir: "fixture".into(),
+        created_at: 1,
+        category: None,
+        metadata: Vec::new(),
+        status: "post_processing",
+        download_state: "complete",
+        post_state: "post_processing",
+        run_state: "active",
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
+        password_override: None,
+    })
+    .unwrap();
+    let instances = ["one.sh", "two.sh", "three.sh", "four.sh", "five.sh"]
+        .into_iter()
+        .map(|name| {
+            db.create_script_instance(draft(name, InstanceTrigger::PostProcessing))
+                .unwrap()
+        })
+        .collect();
+    let executor = PostProcessingExecutor::new(db.clone(), scripts);
+    (db, root, executor, instances)
+}
+
+fn started(instance: &ScriptInstance) -> super::model::StartedScript {
+    super::model::StartedScript {
+        id: instance.id.clone(),
+        name: instance.name.clone(),
+        script: instance.script.clone(),
+        waited: true,
+    }
+}
+
+fn finished(instance: &ScriptInstance) -> ScriptResult {
+    ScriptResult {
+        script: instance.script.clone(),
+        instance_id: Some(instance.id.clone()),
+        instance_name: Some(instance.name.clone()),
+        event: Default::default(),
+        adapter: ScriptAdapter::Sabnzbd,
+        status: ScriptStatus::Succeeded,
+        exit_code: Some(0),
+        duration_ms: 5,
+        output_tail: String::new(),
+        output_id: None,
+        background: false,
+        output_truncated: false,
+        error_message: None,
+        finished_at_epoch_ms: 1_000,
+    }
+}
+
+fn job_context(job_id: u64, root: &tempfile::TempDir) -> super::runner::JobExecutionContext {
+    super::runner::JobExecutionContext {
+        job_id,
+        name: "resumed".into(),
+        nzb_filename: "resumed.nzb".into(),
+        category: None,
+        group: None,
+        source_url: None,
+        working_directory: root.path().to_path_buf(),
+        final_directory: root.path().to_path_buf(),
+        pipeline_outcome: super::model::PipelineOutcome::Succeeded,
+        par_status: 0,
+        unpack_status: 0,
+        compatibility: Default::default(),
+    }
+}
+
+// What weaver left on the job row when it stopped, read back as a restart
+// reads it.
+fn stopped_with(
+    db: &Database,
+    job_id: u64,
+    resume: &super::model::PostProcessingResume,
+) -> super::model::PostProcessingResume {
+    db.mark_job_post_processing_resumed(job_id, resume).unwrap();
+    assert_eq!(db.recover_interrupted_post_processing().unwrap(), 1);
+    let stored = db.job_post_processing_resume(job_id).unwrap().unwrap();
+    assert_eq!(&stored, resume);
+    stored
+}
+
+fn run_scripts(db: &Database) -> Vec<String> {
+    db.script_runs(Default::default(), None, 10)
+        .unwrap()
+        .into_iter()
+        .map(|run| run.result.script.as_str().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_resumed_job_runs_only_the_scripts_that_had_not_started() {
+    let (db, root, executor, instances) = interrupted_job(71);
+    // Two finished, the third was running when weaver stopped, and the last
+    // two never had their turn.
+    let resume = stopped_with(
+        &db,
+        71,
+        &super::model::PostProcessingResume {
+            started: instances[..3].iter().map(started).collect(),
+            results: instances[..2].iter().map(finished).collect(),
+        },
+    );
+    let admission = executor.admit_job_scripts(None).unwrap().unwrap();
+
+    let report = executor
+        .resume_admitted_job(71, admission, job_context(71, &root), None, None, resume)
+        .await
+        .unwrap();
+
+    let mut runs = run_scripts(&db);
+    runs.sort();
+    assert_eq!(runs, ["five.sh", "four.sh"]);
+    assert_eq!(
+        report
+            .results
+            .iter()
+            .map(|result| (result.script.as_str(), result.status))
+            .collect::<Vec<_>>(),
+        [
+            ("one.sh", ScriptStatus::Succeeded),
+            ("two.sh", ScriptStatus::Succeeded),
+            ("three.sh", ScriptStatus::Failed),
+            ("four.sh", ScriptStatus::Warning),
+            ("five.sh", ScriptStatus::Warning),
+        ]
+    );
+    assert_eq!(
+        report.results[2].error_message.as_deref(),
+        Some(super::model::INTERRUPTED_SCRIPT_MESSAGE)
+    );
+    assert_eq!(report.summary, PostProcessingSummary::Interrupted);
+    assert_eq!(db.job_post_processing_results(71).unwrap(), report.results);
+    assert_eq!(
+        db.job_post_processing_summary(71).unwrap(),
+        Some(PostProcessingSummary::Interrupted)
+    );
+    // Every entry has started now, so a second restart would run none.
+    let after = db.job_post_processing_resume(71).unwrap().unwrap();
+    assert_eq!(
+        after
+            .started
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        instances
+            .iter()
+            .map(|instance| instance.id.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_job_whose_scripts_had_all_started_runs_none_of_them() {
+    let (db, root, executor, instances) = interrupted_job(72);
+    // Every entry had its turn; the last was running when weaver stopped.
+    let resume = stopped_with(
+        &db,
+        72,
+        &super::model::PostProcessingResume {
+            started: instances.iter().map(started).collect(),
+            results: instances[..4].iter().map(finished).collect(),
+        },
+    );
+    let admission = executor.admit_job_scripts(None).unwrap().unwrap();
+
+    let report = executor
+        .resume_admitted_job(72, admission, job_context(72, &root), None, None, resume)
+        .await
+        .unwrap();
+
+    assert!(run_scripts(&db).is_empty());
+    assert_eq!(report.results.len(), 5);
+    assert_eq!(report.results[4].status, ScriptStatus::Failed);
+    assert_eq!(
+        report.results[4].error_message.as_deref(),
+        Some(super::model::INTERRUPTED_SCRIPT_MESSAGE)
+    );
+    assert_eq!(report.summary, PostProcessingSummary::Interrupted);
+    assert_eq!(db.job_post_processing_results(72).unwrap(), report.results);
 }

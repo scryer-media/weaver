@@ -143,12 +143,8 @@ fn supervisor() -> PathBuf {
 }
 
 fn executor(db: &Database) -> PostProcessingExecutor {
-    PostProcessingExecutor::new(
-        db.clone(),
-        db.post_processing_script_directory().unwrap(),
-        1,
-    )
-    .with_supervisor_executable(supervisor())
+    PostProcessingExecutor::new(db.clone(), db.post_processing_script_directory().unwrap())
+        .with_supervisor_executable(supervisor())
 }
 
 fn config(data: &Path) -> SharedConfig {

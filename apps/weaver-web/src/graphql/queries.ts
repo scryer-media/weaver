@@ -1914,7 +1914,6 @@ const POST_PROCESSING_SETTINGS_FIELDS = gql`
     scriptDirectory
     executionEnabled
     concurrency
-    eventScriptConcurrency
     eventScriptTimeoutSeconds
     fileDownloadedEventInterval
     scriptOutputRunsPerJob

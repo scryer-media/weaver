@@ -21,7 +21,6 @@ import { type Row, literal, query, waitRows } from "./datastore";
 export const WEAVER_SCRIPTS_DIR = "/data/scripts";
 
 export type ScriptSettings = {
-  eventScriptConcurrency: number;
   eventScriptTimeoutSeconds: number;
   fileDownloadedEventInterval: number;
   scriptOutputRunsPerJob: number;
@@ -55,7 +54,7 @@ export type ScriptInstanceInput = {
   schedule?: ScriptSchedule;
 };
 
-const SETTINGS_FIELDS = `eventScriptConcurrency eventScriptTimeoutSeconds fileDownloadedEventInterval
+const SETTINGS_FIELDS = `eventScriptTimeoutSeconds fileDownloadedEventInterval
   scriptOutputRunsPerJob scriptOutputFailedRunsPerJob
   scriptDirectory executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution globalScriptsRun`;
 const INSTANCE_FIELDS = "id name script trigger queueEvent inputs { name value secret { id name } } categories enabled blocking timeoutSeconds runOrder schedule { days times runAtStartup }";
