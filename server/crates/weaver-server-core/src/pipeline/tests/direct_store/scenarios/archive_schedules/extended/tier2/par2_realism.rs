@@ -424,7 +424,11 @@ impl Cell for Par2Cell {
         // rebuild: a job that needed it may still end either way, named.
         let ruling = (!recovery::descriptions_survive(&post, &lost, interruption.fails())
             && recovery::needed(&post, geometry, &lost).0 > 0)
-            .then_some(Verdict::Either);
+            .then_some(Verdict::Either)
+            .or_else(|| {
+                recovery::all_missing_exact_par2_is_singular(&post, self.slice, &lost)
+                    .then_some(Verdict::Fails)
+            });
         Built {
             post,
             geometry: Some(geometry),

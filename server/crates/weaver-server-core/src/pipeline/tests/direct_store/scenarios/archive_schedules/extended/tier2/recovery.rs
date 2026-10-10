@@ -196,6 +196,66 @@ pub(in super::super) fn surviving(
     (least, most)
 }
 
+fn exact_par2_matrix_is_singular(blocks: usize, exponents: Vec<u32>) -> bool {
+    type Cache = std::sync::Mutex<BTreeMap<(usize, Vec<u32>), bool>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (blocks, exponents);
+    if let Some(&singular) = cache.lock().unwrap().get(&key) {
+        return singular;
+    }
+    let missing: Vec<_> = (0..blocks).collect();
+    let constants = par2_rs::input_slice_constants(blocks);
+    let singular = match par2_rs::build_decode_matrix(&missing, &key.1, &constants) {
+        Ok(_) => false,
+        Err(par2_rs::Par2Error::ReedSolomonError { reason }) if reason.contains("singular") => true,
+        Err(error) => panic!("fixture matrix check failed: {error}"),
+    };
+    cache.lock().unwrap().insert(key, singular);
+    singular
+}
+
+pub(in super::super) fn all_missing_exact_par2_is_singular(
+    post: &Post,
+    block: usize,
+    lost: &BTreeMap<usize, BTreeSet<u32>>,
+) -> bool {
+    let data = post.index_of(Role::Data);
+    if data.is_empty() || !data.iter().all(|&file| {
+        (0..post.files[file].articles()).all(|article| {
+            post.files[file].is_absent(article)
+                || lost.get(&file).is_some_and(|lost| lost.contains(&article))
+        })
+    }) {
+        return false;
+    }
+    let blocks = data.iter().map(|&file| post.files[file].bytes.len().div_ceil(block)).sum();
+    let none = BTreeSet::new();
+    let mut exponents = BTreeSet::new();
+    for file in post.index_of(Role::Recovery) {
+        let posted = &post.files[file];
+        let (_, must) = posted.wrong_ranges(lost.get(&file).unwrap_or(&none));
+        for packet in recovery_packets(&posted.bytes) {
+            if !posted.bytes[packet.start..].starts_with(b"PAR2\0PKT")
+                || must.iter().any(|range| range.start < packet.end && packet.start < range.end)
+            {
+                continue;
+            }
+            exponents.insert(u32::from_le_bytes(posted.bytes[packet.start + 64..packet.start + 68].try_into().unwrap()));
+        }
+    }
+    // Exactly N packets need not supply N independent equations. Check only
+    // the all-missing, exact-count case; a cache shares the expensive algebra
+    // across schedules with the same surviving exponents.
+    exponents.len() == blocks && exact_par2_matrix_is_singular(blocks, exponents.into_iter().collect())
+}
+
+#[test]
+fn distinct_par2_exponents_need_not_be_independent() {
+    assert!(!exact_par2_matrix_is_singular(2, vec![0, 1]));
+    assert!(exact_par2_matrix_is_singular(2, vec![0, 65535]));
+}
+
 /// What a run of `post` must end in, given what its schedule loses.
 pub(in super::super) fn verdict(
     post: &Post,
