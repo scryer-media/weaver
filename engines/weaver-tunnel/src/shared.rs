@@ -1,4 +1,4 @@
-//! Weaver's persistence and outcome adapters for the shared tunnel engine.
+// Weaver's persistence and outcome adapters for the shared tunnel engine.
 use crate::{TunnelError, TunnelObserver, TunnelProvider, TunnelStream};
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ impl proxy_tunnels::TunnelObserver for Observer {
     }
 }
 
-/// Attach Weaver's outcome-aware provider interface to a shared provider.
+// Attach Weaver's outcome-aware provider interface to a shared provider.
 pub struct SharedProvider<T>(pub(crate) T);
 
 // The kind of session a shared provider holds.

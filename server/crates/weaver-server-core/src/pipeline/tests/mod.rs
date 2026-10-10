@@ -364,14 +364,14 @@ fn insert_history_row_with_nzb_zstd(db: &Database, row: &crate::JobHistoryRow, n
     .unwrap();
 }
 
-/// The one server every harness pool points at.
-///
-/// It answers each dial with a greeting the lane refuses, so a worker that
-/// was handed a lease fails its dial at once and gives the permit back, and
-/// the refusal is a protocol answer rather than a transport fault: it records
-/// no cooldown, so the server stays eligible for the next pass. A name that
-/// does not resolve did the first half of that and not the second, and left
-/// each test racing the worker's health bookkeeping.
+// The one server every harness pool points at.
+//
+// It answers each dial with a greeting the lane refuses, so a worker that
+// was handed a lease fails its dial at once and gives the permit back, and
+// the refusal is a protocol answer rather than a transport fault: it records
+// no cooldown, so the server stays eligible for the next pass. A name that
+// does not resolve did the first half of that and not the second, and left
+// each test racing the worker's health bookkeeping.
 fn refusing_harness_server_port() -> u16 {
     static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
     *PORT.get_or_init(|| {
@@ -394,18 +394,18 @@ fn refusing_harness_server_port() -> u16 {
     })
 }
 
-/// Wait until every worker thread the passes so far handed a lease to has
-/// given its dial up and returned the server's permit.
-///
-/// The harness server refuses every session, so each worker fails its dial;
-/// but the pass that leased it returns before that, and before the worker has
-/// even taken the permit. A test that then describes one of those lanes as
-/// finished, by rewinding the pipeline's counters, must wait for the seat to
-/// be real: the dispatcher measures a server by the permits it can see, not
-/// by the counters. Counting free permits cannot tell a worker that gave its
-/// permit back from one that has not taken it yet, so this waits for each
-/// lane's own failure report instead, which the worker sends only after its
-/// permit is back.
+// Wait until every worker thread the passes so far handed a lease to has
+// given its dial up and returned the server's permit.
+//
+// The harness server refuses every session, so each worker fails its dial;
+// but the pass that leased it returns before that, and before the worker has
+// even taken the permit. A test that then describes one of those lanes as
+// finished, by rewinding the pipeline's counters, must wait for the seat to
+// be real: the dispatcher measures a server by the permits it can see, not
+// by the counters. Counting free permits cannot tell a worker that gave its
+// permit back from one that has not taken it yet, so this waits for each
+// lane's own failure report instead, which the worker sends only after its
+// permit is back.
 async fn settle_lane_dials(pipeline: &mut Pipeline) {
     for _ in 0..pipeline.download_lane_owners.len() {
         match pipeline
@@ -430,12 +430,12 @@ async fn new_direct_pipeline_with_buffers(
     new_direct_pipeline_with(temp_dir, buffer_config, total_connections, None).await
 }
 
-/// [`new_direct_pipeline_with_buffers`], plus the `[direct_store]` config table.
-///
-/// Everything else in this module reaches for `set_gate`, which bypasses
-/// configuration entirely. The tests that exist to prove the *config* is the
-/// gate — and that the kill switch's sweep fires off it — must come through
-/// here instead.
+// [`new_direct_pipeline_with_buffers`], plus the `[direct_store]` config table.
+//
+// Everything else in this module reaches for `set_gate`, which bypasses
+// configuration entirely. The tests that exist to prove the *config* is the
+// gate — and that the kill switch's sweep fires off it — must come through
+// here instead.
 async fn new_direct_pipeline_with(
     temp_dir: &TempDir,
     buffer_config: BufferPoolConfig,
@@ -454,13 +454,13 @@ async fn new_direct_pipeline_with(
     .await
 }
 
-/// [`new_direct_pipeline_with`] with the three roots given explicitly.
-///
-/// Everything else here puts `intermediate` and `complete` under one `TempDir`,
-/// which puts them on one filesystem — and the whole class of question this
-/// exists for ("is the publish a rename or a byte copy?") is unobservable there.
-/// The cross-device probe in `direct_store/scenarios/cross_device.rs` hands in two roots on
-/// genuinely different mounts.
+// [`new_direct_pipeline_with`] with the three roots given explicitly.
+//
+// Everything else here puts `intermediate` and `complete` under one `TempDir`,
+// which puts them on one filesystem — and the whole class of question this
+// exists for ("is the publish a rename or a byte copy?") is unobservable there.
+// The cross-device probe in `direct_store/scenarios/cross_device.rs` hands in two roots on
+// genuinely different mounts.
 #[allow(clippy::too_many_arguments)]
 async fn new_direct_pipeline_at_roots(
     data_dir: PathBuf,
@@ -503,8 +503,8 @@ async fn new_direct_pipeline_at_roots(
     .await
 }
 
-/// [`new_direct_pipeline_at_roots`] on a machine the test describes, for the
-/// tests whose subject is what the machine can honour.
+// [`new_direct_pipeline_at_roots`] on a machine the test describes, for the
+// tests whose subject is what the machine can honour.
 #[allow(clippy::too_many_arguments)]
 async fn new_direct_pipeline_on_machine(
     data_dir: PathBuf,
@@ -611,27 +611,27 @@ async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf)
     .await
 }
 
-/// End a pipeline incarnation before the next one opens its database.
-///
-/// A process that exits takes every database handle with it at once; dropping
-/// a `Pipeline` does not. It drops only the pipeline's own `Database`: the
-/// writer task keeps committing what was queued to it, other holders keep
-/// their clones, and each pooled connection is closed later on its own sqlx
-/// thread — the last one in WAL mode under an exclusive lock while it
-/// checkpoints. A reopen that runs while any of that is still going on races
-/// it for the file, and loses with `database is locked` once the race outlasts
-/// the busy timeout.
-///
-/// So the queued writes land first — the same writes the old writer task would
-/// have committed after the drop, now ordered before the reopen — and then the
-/// pool is closed, which waits for every checked-out connection to come back
-/// and closes each one before it returns.
-///
-/// A test that stands the drop in for a crash retires the same way. The drop
-/// never lost a queued write — the writer task goes on committing its queue
-/// after the drop — so the flush moves those writes ahead of the reopen
-/// instead of racing it, and loses nothing a plain drop would have kept. What
-/// a crash does lose is the state that was never queued, and that stays lost.
+// End a pipeline incarnation before the next one opens its database.
+//
+// A process that exits takes every database handle with it at once; dropping
+// a `Pipeline` does not. It drops only the pipeline's own `Database`: the
+// writer task keeps committing what was queued to it, other holders keep
+// their clones, and each pooled connection is closed later on its own sqlx
+// thread — the last one in WAL mode under an exclusive lock while it
+// checkpoints. A reopen that runs while any of that is still going on races
+// it for the file, and loses with `database is locked` once the race outlasts
+// the busy timeout.
+//
+// So the queued writes land first — the same writes the old writer task would
+// have committed after the drop, now ordered before the reopen — and then the
+// pool is closed, which waits for every checked-out connection to come back
+// and closes each one before it returns.
+//
+// A test that stands the drop in for a crash retires the same way. The drop
+// never lost a queued write — the writer task goes on committing its queue
+// after the drop — so the flush moves those writes ahead of the reopen
+// instead of racing it, and loses nothing a plain drop would have kept. What
+// a crash does lose is the state that was never queued, and that stays lost.
 async fn retire_pipeline_database(pipeline: Pipeline) {
     let db = pipeline.db.clone();
     drop(pipeline);
@@ -645,7 +645,7 @@ async fn retire_pipeline_database(pipeline: Pipeline) {
         .unwrap();
 }
 
-/// [`new_direct_pipeline`] whose direct-store gate comes from configuration.
+// [`new_direct_pipeline`] whose direct-store gate comes from configuration.
 async fn new_config_gated_direct_pipeline(
     temp_dir: &TempDir,
     direct_store: crate::settings::DirectStoreOverrides,
@@ -767,10 +767,10 @@ fn build_test_rar_file_header(
     )
 }
 
-/// A RAR5 file header carrying only a BLAKE2sp digest — no CRC32.
-///
-/// BLAKE2sp accepts bytes in order only, so a member whose *closing* header
-/// states one and nothing else can never be verified out of order.
+// A RAR5 file header carrying only a BLAKE2sp digest — no CRC32.
+//
+// BLAKE2sp accepts bytes in order only, so a member whose *closing* header
+// states one and nothing else can never be verified out of order.
 fn build_test_rar_blake2_extra(digest: [u8; 32]) -> Vec<u8> {
     // `vint(record size) || vint(record type = FILE_HASH) || vint(algo =
     // BLAKE2sp) || digest`, where the size covers everything after itself.
@@ -802,19 +802,19 @@ fn build_test_rar_file_header_with_extra(
     )
 }
 
-/// RAR5 compression info for a member that is **not** stored.
-///
-/// The field is bit-packed — version in bits 0-5 (0 = RAR5), the per-member
-/// solid flag in bit 6, the method in bits 7-9 — and the stored-layout
-/// classifier reads exactly those three: a non-zero method makes a member
-/// `Compressed`, and the solid bit makes it `Solid`, which the classifier checks
-/// first. The data area a header like this describes is not really compressed,
-/// so a fixture using it is only good for what the *classification* decides.
+// RAR5 compression info for a member that is **not** stored.
+//
+// The field is bit-packed — version in bits 0-5 (0 = RAR5), the per-member
+// solid flag in bit 6, the method in bits 7-9 — and the stored-layout
+// classifier reads exactly those three: a non-zero method makes a member
+// `Compressed`, and the solid bit makes it `Solid`, which the classifier checks
+// first. The data area a header like this describes is not really compressed,
+// so a fixture using it is only good for what the *classification* decides.
 fn test_rar_compression_info(method: u64, solid: bool) -> u64 {
     ((method & 0x07) << 7) | u64::from(solid) << 6
 }
 
-/// A RAR5 file header whose member is compressed (and optionally solid).
+// A RAR5 file header whose member is compressed (and optionally solid).
 fn build_test_rar_compressed_file_header(
     filename: &str,
     common_flags_extra: u64,
@@ -835,17 +835,17 @@ fn build_test_rar_compressed_file_header(
     )
 }
 
-/// A RAR5 **directory** header: dataless, with a Unix mode and mtime.
-///
-/// The shape every archiver writes a folder as — the DIRECTORY flag set, a zero
-/// data area, a zero unpacked size and no CRC32, because there is nothing to
-/// checksum. That absence is the point: it is what makes the entry ineligible
-/// for direct routing, and what a set of directory headers at the end of a
-/// closing volume used to demote a set for.
-///
-/// `unix_mode` lands in the attributes field and `host_os` is Unix, which is how
-/// [`crate::pipeline::extraction::apply_rar_member_filesystem_metadata`] reads
-/// the mode back out.
+// A RAR5 **directory** header: dataless, with a Unix mode and mtime.
+//
+// The shape every archiver writes a folder as — the DIRECTORY flag set, a zero
+// data area, a zero unpacked size and no CRC32, because there is nothing to
+// checksum. That absence is the point: it is what makes the entry ineligible
+// for direct routing, and what a set of directory headers at the end of a
+// closing volume used to demote a set for.
+//
+// `unix_mode` lands in the attributes field and `host_os` is Unix, which is how
+// [`crate::pipeline::extraction::apply_rar_member_filesystem_metadata`] reads
+// the mode back out.
 fn build_test_rar_directory_header(name: &str, unix_mode: u32, mtime: u32) -> Vec<u8> {
     let file_flags: u64 = 0x0001 | 0x0002;
     let mut type_body = Vec::new();
@@ -875,11 +875,11 @@ fn build_test_rar_directory_header(name: &str, unix_mode: u32, mtime: u32) -> Ve
     result
 }
 
-/// A RAR5 **service** header (type 3) with a data area.
-///
-/// Recovery records (`-rr`) and quick-open blocks take exactly this shape: the
-/// header body is a file header's, and the data area that follows belongs to no
-/// member — so a direct-store router files every byte of it into the envelope.
+// A RAR5 **service** header (type 3) with a data area.
+//
+// Recovery records (`-rr`) and quick-open blocks take exactly this shape: the
+// header body is a file header's, and the data area that follows belongs to no
+// member — so a direct-store router files every byte of it into the envelope.
 fn build_test_rar_service_header(name: &str, data_size: u64) -> Vec<u8> {
     build_test_rar_data_header(3, name, 0, data_size, data_size, None, &[])
 }
@@ -959,10 +959,10 @@ fn build_test_rar_data_header_with_compression(
 
 const TEST_RAR4_SIG: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
 
-/// RAR4's fixed-layout common header: `crc16, type, flags, header size`.
-///
-/// The CRC16 is left zero — the parser warns on a mismatch and carries on, which
-/// is deliberate recovery behaviour, so a fixture does not need to compute it.
+// RAR4's fixed-layout common header: `crc16, type, flags, header size`.
+//
+// The CRC16 is left zero — the parser warns on a mismatch and carries on, which
+// is deliberate recovery behaviour, so a fixture does not need to compute it.
 fn build_test_rar4_block(header_type: u8, flags: u16, body: &[u8]) -> Vec<u8> {
     let header_size = (7 + body.len()) as u16;
     let mut out = Vec::with_capacity(header_size as usize);
@@ -991,8 +991,8 @@ fn build_test_rar4_end_header(more_volumes: bool) -> Vec<u8> {
     build_test_rar4_block(0x7b, flags, &[])
 }
 
-/// A stored RAR4 file header. `unpack_version` 29 is what makes a split part's
-/// CRC32 describe that part's packed bytes rather than nothing at all.
+// A stored RAR4 file header. `unpack_version` 29 is what makes a split part's
+// CRC32 describe that part's packed bytes rather than nothing at all.
 fn build_test_rar4_file_header(
     filename: &str,
     split_flags: u16,
@@ -1421,13 +1421,13 @@ pub(super) fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size
     build_test_par2_index_for_files(&[(filename, file_data)], slice_size)
 }
 
-/// A `.volNN+CC.par2` byte stream carrying only the named recovery packets.
-///
-/// The index builders above stop at descriptions and slice checksums, and
-/// [`build_repairable_par2_set`] keeps its recovery slices in memory. Neither
-/// produces a *volume file*, which is what a test needs when the question is
-/// what weaver can read back off the disk — including from a volume that only
-/// partly arrived.
+// A `.volNN+CC.par2` byte stream carrying only the named recovery packets.
+//
+// The index builders above stop at descriptions and slice checksums, and
+// [`build_repairable_par2_set`] keeps its recovery slices in memory. Neither
+// produces a *volume file*, which is what a test needs when the question is
+// what weaver can read back off the disk — including from a volume that only
+// partly arrived.
 pub(super) fn build_test_par2_recovery_volume(
     recovery_set_id: [u8; 16],
     slices: &[(u32, &[u8])],
@@ -1446,12 +1446,12 @@ pub(super) fn build_test_par2_recovery_volume(
     stream
 }
 
-/// Zero the payload of the recovery packet at `packet_index` in a volume built
-/// by [`build_test_par2_recovery_volume`], leaving its header intact.
-///
-/// That is the on-disk shape of a volume whose interior article never arrived:
-/// the scanner still finds the packet by its magic and header, and only the
-/// packet's own MD5 can tell that the bytes behind it are a hole.
+// Zero the payload of the recovery packet at `packet_index` in a volume built
+// by [`build_test_par2_recovery_volume`], leaving its header intact.
+//
+// That is the on-disk shape of a volume whose interior article never arrived:
+// the scanner still finds the packet by its magic and header, and only the
+// packet's own MD5 can tell that the bytes behind it are a hole.
 pub(super) fn punch_recovery_packet_payload(
     volume: &mut [u8],
     packet_index: usize,
@@ -1549,10 +1549,10 @@ pub(super) fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_siz
     stream
 }
 
-/// A recovery set over several described files, with real recovery slices
-/// computed over the set's whole input-slice sequence (files in recovery-set
-/// order, each slice zero-padded to `slice_size`) — which is what makes a
-/// multi-file repair actually repairable in a test.
+// A recovery set over several described files, with real recovery slices
+// computed over the set's whole input-slice sequence (files in recovery-set
+// order, each slice zero-padded to `slice_size`) — which is what makes a
+// multi-file repair actually repairable in a test.
 pub(super) fn build_repairable_par2_set_for_files(
     files: &[(&str, &[u8])],
     slice_size: u64,
@@ -1682,23 +1682,23 @@ pub(super) fn build_repairable_par2_set_for_files(
     par2_set
 }
 
-/// A recovery set whose recovery slices are placeholders rather than encoded
-/// blocks.
-///
-/// [`build_repairable_par2_set`] and its multi-file sibling encode real
-/// recovery data, at one field multiply per (input slice, recovery block) pair.
-/// That is nothing for the handful of slices those fixtures carry and
-/// completely impractical for a set shaped to stress a decode matrix, where the
-/// pair count runs into the hundreds of millions.
-///
-/// A *verdict* never looks at recovery bytes: availability is the count of
-/// recovery slices whose length matches the set's slice size, and repairability
-/// compares that count against the damage. So a fixture that only ever asks
-/// what the verdict is — and stops before anything plans or solves a repair —
-/// is served exactly as well by placeholders, in milliseconds instead of hours.
-///
-/// Never use this for a fixture that actually repairs: the bytes are zeros and
-/// would reconstruct garbage.
+// A recovery set whose recovery slices are placeholders rather than encoded
+// blocks.
+//
+// [`build_repairable_par2_set`] and its multi-file sibling encode real
+// recovery data, at one field multiply per (input slice, recovery block) pair.
+// That is nothing for the handful of slices those fixtures carry and
+// completely impractical for a set shaped to stress a decode matrix, where the
+// pair count runs into the hundreds of millions.
+//
+// A *verdict* never looks at recovery bytes: availability is the count of
+// recovery slices whose length matches the set's slice size, and repairability
+// compares that count against the damage. So a fixture that only ever asks
+// what the verdict is — and stops before anything plans or solves a repair —
+// is served exactly as well by placeholders, in milliseconds instead of hours.
+//
+// Never use this for a fixture that actually repairs: the bytes are zeros and
+// would reconstruct garbage.
 pub(super) fn build_par2_set_with_uncomputed_recovery(
     filename: &str,
     file_data: &[u8],
@@ -1889,13 +1889,13 @@ async fn insert_active_job_with_persisted_nzb(
     insert_active_job_with_persisted_nzb_named(pipeline, job_id, spec, nzb_zstd, None).await
 }
 
-/// [`insert_active_job_with_persisted_nzb`] with the persisted NZB's **file
-/// name** chosen by the caller.
-///
-/// The name is not decoration: `nzb_password_candidates` reads a
-/// `{{password}}` convention out of the NZB path's stem, so it is the only way
-/// to exercise that candidate source. `None` keeps the job-id name every other
-/// caller gets.
+// [`insert_active_job_with_persisted_nzb`] with the persisted NZB's **file
+// name** chosen by the caller.
+//
+// The name is not decoration: `nzb_password_candidates` reads a
+// `{{password}}` convention out of the NZB path's stem, so it is the only way
+// to exercise that candidate source. `None` keeps the job-id name every other
+// caller gets.
 async fn insert_active_job_with_persisted_nzb_named(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -2285,13 +2285,13 @@ async fn submit_decoded_segment_with_part_crc_verified(
     .await;
 }
 
-/// [`submit_decoded_segment_with_part_crc_verified`] with the decoder's CRC
-/// segmentation chosen by the caller.
-///
-/// `None` is what a decoder emits with no PAR2 block size declared: one segment
-/// covering the whole article. `Some` is what it emits once the recovery set has
-/// parsed and the lease carries its block size — segments cut on the block grid,
-/// which is the only shape the dual-CRC grid can close a block from.
+// [`submit_decoded_segment_with_part_crc_verified`] with the decoder's CRC
+// segmentation chosen by the caller.
+//
+// `None` is what a decoder emits with no PAR2 block size declared: one segment
+// covering the whole article. `Some` is what it emits once the recovery set has
+// parsed and the lease carries its block size — segments cut on the block grid,
+// which is the only shape the dual-CRC grid can close a block from.
 #[allow(clippy::too_many_arguments)]
 async fn submit_decoded_segment_with_segments(
     pipeline: &mut Pipeline,
@@ -2325,14 +2325,14 @@ async fn submit_decoded_segment_with_segments(
     .await;
 }
 
-/// [`submit_decoded_segment_with_segments`] with the length the article's
-/// `=ybegin size=` states chosen by the caller.
-///
-/// The default above states the assembly's total, which is the NZB's sum of
-/// encoded segment sizes. A real post states the decoded length there, so a
-/// caller that knows the file's true length — every volume-aware helper does —
-/// states that instead; the two only coincide when the spec pretends its
-/// articles are not yEnc-inflated.
+// [`submit_decoded_segment_with_segments`] with the length the article's
+// `=ybegin size=` states chosen by the caller.
+//
+// The default above states the assembly's total, which is the NZB's sum of
+// encoded segment sizes. A real post states the decoded length there, so a
+// caller that knows the file's true length — every volume-aware helper does —
+// states that instead; the two only coincide when the spec pretends its
+// articles are not yEnc-inflated.
 #[allow(clippy::too_many_arguments)]
 async fn submit_decoded_segment_declaring(
     pipeline: &mut Pipeline,
@@ -2406,16 +2406,16 @@ async fn submit_decoded_segment_declaring(
     settle_direct_demotion_work(pipeline).await;
 }
 
-/// [`submit_decoded_segment`] delivered the way the orchestrator delivers a
-/// **queued** decode: through [`Pipeline::handle_decode_done`], the seam that
-/// owns the decode-stage bookkeeping.
-///
-/// The other submit helpers enter at `handle_decode_success`, which is the
-/// *streamed* shape — decoded on the download lane, before its download result
-/// is finished with. An article that went to the decode queue instead settles
-/// here, a turn of the select loop after the download result that queued it,
-/// and that ordering is what decides whether a health probe is still waited on
-/// or retired.
+// [`submit_decoded_segment`] delivered the way the orchestrator delivers a
+// **queued** decode: through [`Pipeline::handle_decode_done`], the seam that
+// owns the decode-stage bookkeeping.
+//
+// The other submit helpers enter at `handle_decode_success`, which is the
+// *streamed* shape — decoded on the download lane, before its download result
+// is finished with. An article that went to the decode queue instead settles
+// here, a turn of the select loop after the download result that queued it,
+// and that ordering is what decides whether a health probe is still waited on
+// or retired.
 async fn settle_queued_decode(
     pipeline: &mut Pipeline,
     file_id: NzbFileId,
@@ -2473,9 +2473,9 @@ async fn settle_queued_decode(
     settle_direct_demotion_work(pipeline).await;
 }
 
-/// Put a job in the state the download-result path leaves behind when it has
-/// just processed the *last* article of a job whose decode is still queued:
-/// the pass is open, the queues are empty, and one decode is outstanding.
+// Put a job in the state the download-result path leaves behind when it has
+// just processed the *last* article of a job whose decode is still queued:
+// the pass is open, the queues are empty, and one decode is outstanding.
 fn park_job_on_its_final_decode(pipeline: &mut Pipeline, segment_id: SegmentId, raw_size: u64) {
     let job_id = segment_id.file_id.job_id;
     pipeline.active_download_passes.insert(job_id);
@@ -2488,11 +2488,11 @@ fn park_job_on_its_final_decode(pipeline: &mut Pipeline, segment_id: SegmentId, 
     pipeline.note_decode_started(segment_id, raw_size);
 }
 
-/// Drives every routed article's placement to its commit, the way the
-/// orchestrator's select loop would: the destination writes run on a task of
-/// their own, and the commit waits for the done message.
-///
-/// It waits on the messages themselves, with no deadline.
+// Drives every routed article's placement to its commit, the way the
+// orchestrator's select loop would: the destination writes run on a task of
+// their own, and the commit waits for the done message.
+//
+// It waits on the messages themselves, with no deadline.
 async fn settle_direct_placement_work(pipeline: &mut Pipeline) {
     while !pipeline.direct_placement_lanes.is_empty() {
         let done = pipeline
@@ -2504,11 +2504,11 @@ async fn settle_direct_placement_work(pipeline: &mut Pipeline) {
     }
 }
 
-/// Drives every outstanding demotion reconstruction ticket to its handler, the
-/// way the orchestrator's select loop would.
-///
-/// It waits on the completion itself, with no deadline: how long a sweep takes
-/// depends on the machine, so a hang is the test runner's to catch.
+// Drives every outstanding demotion reconstruction ticket to its handler, the
+// way the orchestrator's select loop would.
+//
+// It waits on the completion itself, with no deadline: how long a sweep takes
+// depends on the machine, so a hang is the test runner's to catch.
 async fn settle_direct_demotion_work(pipeline: &mut Pipeline) {
     // A placement whose write failed is what demotes the set.
     settle_direct_placement_work(pipeline).await;
@@ -2803,14 +2803,14 @@ fn debug_job_state(pipeline: &Pipeline, job_id: JobId) -> String {
     lines.join("\n")
 }
 
-/// Drives every detached pipeline ticket — direct-store post-repair
-/// read-backs, tolerated extractions, demotion reconstruction sweeps and PAR2
-/// damaged-path analyses — to its handler, the way the orchestrator's select
-/// loop would, until none is in flight.
-///
-/// They are settled in one loop because they chain: an analysis verdict
-/// re-enters the completion check, which can decide on a repair whose
-/// read-back is a direct-store ticket of its own.
+// Drives every detached pipeline ticket — direct-store post-repair
+// read-backs, tolerated extractions, demotion reconstruction sweeps and PAR2
+// damaged-path analyses — to its handler, the way the orchestrator's select
+// loop would, until none is in flight.
+//
+// They are settled in one loop because they chain: an analysis verdict
+// re-enters the completion check, which can decide on a repair whose
+// read-back is a direct-store ticket of its own.
 async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
     enum Ticket {
         PostRepair(crate::pipeline::DirectPostRepairWorkDone),
@@ -2952,14 +2952,14 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
     }
 }
 
-/// Services the outstanding PAR2 damaged-path analysis tickets the way the
-/// orchestrator's select loop would, and then runs only the completion check
-/// each verdict re-arms.
-///
-/// This is the narrow stand-in for what used to be an inline `await`: the
-/// analysis returns and the *same* completion check continues on it. Nothing
-/// further is drained, so a test can assert on the state that check left
-/// behind rather than on the state a fully drained queue eventually reaches.
+// Services the outstanding PAR2 damaged-path analysis tickets the way the
+// orchestrator's select loop would, and then runs only the completion check
+// each verdict re-arms.
+//
+// This is the narrow stand-in for what used to be an inline `await`: the
+// analysis returns and the *same* completion check continues on it. Nothing
+// further is drained, so a test can assert on the state that check left
+// behind rather than on the state a fully drained queue eventually reaches.
 async fn settle_par2_analysis_work(pipeline: &mut Pipeline) {
     while !pipeline.par2_analysis_in_flight.is_empty() {
         let done = pipeline
@@ -2974,12 +2974,12 @@ async fn settle_par2_analysis_work(pipeline: &mut Pipeline) {
     }
 }
 
-/// The direct-store twin of [`settle_par2_analysis_work`]: waits for the
-/// job's detached verification read-back, if one is out, and runs only the
-/// completion check its verdict re-arms, so a test sees the state that check
-/// leaves behind and not the end of a fully drained queue. One round only: a
-/// verdict that starts a repair leaves the repair's own read-back ticket out,
-/// for the test to settle or to interpose on as it needs.
+// The direct-store twin of [`settle_par2_analysis_work`]: waits for the
+// job's detached verification read-back, if one is out, and runs only the
+// completion check its verdict re-arms, so a test sees the state that check
+// leaves behind and not the end of a fully drained queue. One round only: a
+// verdict that starts a repair leaves the repair's own read-back ticket out,
+// for the test to settle or to interpose on as it needs.
 async fn settle_direct_verification_read(pipeline: &mut Pipeline, job_id: JobId) {
     // The set's last article is committed when its placement lands, and that
     // commit is what submits the read-back.
@@ -3010,9 +3010,9 @@ async fn settle_direct_verification_read(pipeline: &mut Pipeline, job_id: JobId)
     }
 }
 
-/// Waits for the job's detached verification read-back and hands its verdict
-/// to the pipeline **without** running the completion check it re-arms, for
-/// tests that drive the verification seam themselves and call it again.
+// Waits for the job's detached verification read-back and hands its verdict
+// to the pipeline **without** running the completion check it re-arms, for
+// tests that drive the verification seam themselves and call it again.
 async fn park_direct_verification_verdict(pipeline: &mut Pipeline, job_id: JobId) {
     let Some(in_flight) = pipeline.direct_post_repair_in_flight.get(&job_id) else {
         return;
@@ -3053,10 +3053,10 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
     settle_inflight_moves(pipeline).await;
 }
 
-/// The next extraction result for a driver that steps `job_id` a fixed number
-/// of rounds. An extraction the pipeline has in flight for the job, whole-set
-/// or a RAR member worker, is waited for with no deadline, so a round never ends on a slow extraction; otherwise
-/// a result already sent is taken, and a turn is yielded to background work.
+// The next extraction result for a driver that steps `job_id` a fixed number
+// of rounds. An extraction the pipeline has in flight for the job, whole-set
+// or a RAR member worker, is waited for with no deadline, so a round never ends on a slow extraction; otherwise
+// a result already sent is taken, and a turn is yielded to background work.
 async fn next_owed_extraction(pipeline: &mut Pipeline, job_id: JobId) -> Option<ExtractionDone> {
     if pipeline
         .inflight_extractions
@@ -3087,8 +3087,8 @@ async fn next_extraction_done(pipeline: &mut Pipeline) -> ExtractionDone {
         .expect("extraction channel should stay open")
 }
 
-/// Polls until `predicate` holds. There is no deadline: the test runner
-/// bounds a condition that never arrives.
+// Polls until `predicate` holds. There is no deadline: the test runner
+// bounds a condition that never arrives.
 async fn wait_until(mut predicate: impl FnMut() -> bool) {
     while !predicate() {
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -3111,8 +3111,8 @@ async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
     settle_inflight_moves(pipeline).await;
 }
 
-/// Fill servers with the given retention windows (days, 0 = unlimited). No
-/// connections are opened — only the config matters.
+// Fill servers with the given retention windows (days, 0 = unlimited). No
+// connections are opened — only the config matters.
 fn retention_client(retention_days: &[u32]) -> weaver_nntp::client::NntpClient {
     let servers = retention_days
         .iter()
@@ -3135,7 +3135,7 @@ fn retention_client(retention_days: &[u32]) -> weaver_nntp::client::NntpClient {
     })
 }
 
-/// Two fill servers: index 0 holds 5 days of retention, index 1 is unlimited.
+// Two fill servers: index 0 holds 5 days of retention, index 1 is unlimited.
 fn two_server_retention_client() -> weaver_nntp::client::NntpClient {
     retention_client(&[5, 0])
 }

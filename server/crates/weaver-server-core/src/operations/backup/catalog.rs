@@ -32,8 +32,8 @@ macro_rules! table {
     };
 }
 
-/// Exhaustive policy for every application-owned table. Database engine tables
-/// such as `sqlite_sequence` are filtered before catalog validation.
+// Exhaustive policy for every application-owned table. Database engine tables
+// such as `sqlite_sequence` are filtered before catalog validation.
 pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("_sqlx_migrations", Ignore, Replace),
     table!("schema_version", Ignore, Replace),

@@ -799,14 +799,14 @@ fn available_recovery(job: &mut Par3Job) -> usize {
         .sum()
 }
 
-/// The fixture index's Root packet, so a test can damage exactly one copy of
-/// one vital packet and leave every other packet in the carrier intact.
+// The fixture index's Root packet, so a test can damage exactly one copy of
+// one vital packet and leave every other packet in the carrier intact.
 const ROOT_PACKET: std::ops::Range<usize> = 672..781;
 
-/// Damage a packet in place: past its 48-byte header, so the scanner still
-/// finds the packet and still reads its declared length, and only the hash it
-/// carries no longer describes the body behind it. That is what a bad sector
-/// or a truncated article looks like to the scanner.
+// Damage a packet in place: past its 48-byte header, so the scanner still
+// finds the packet and still reads its declared length, and only the hash it
+// carries no longer describes the body behind it. That is what a bad sector
+// or a truncated article looks like to the scanner.
 fn with_damaged_packet(carrier: &[u8], packet: std::ops::Range<usize>) -> Vec<u8> {
     let mut bytes = carrier.to_vec();
     for byte in &mut bytes[packet.start + 48..packet.end] {
@@ -815,14 +815,14 @@ fn with_damaged_packet(carrier: &[u8], packet: std::ops::Range<usize>) -> Vec<u8
     bytes
 }
 
-/// The input set every packet of the fixture carriers belongs to, read from
-/// the first packet's own header.
+// The input set every packet of the fixture carriers belongs to, read from
+// the first packet's own header.
 fn fixture_set_id() -> par3_rs::InputSetId {
     par3_rs::InputSetId(INDEX[32..40].try_into().expect("packet header"))
 }
 
-/// Append one packet of weaver's choosing to a carrier, built and hashed by
-/// the engine's own packet builder so it authenticates like any other.
+// Append one packet of weaver's choosing to a carrier, built and hashed by
+// the engine's own packet builder so it authenticates like any other.
 fn carrier_with(carrier: &[u8], body: par3_rs::packet::PacketBody) -> Vec<u8> {
     let mut bytes = carrier.to_vec();
     bytes.extend_from_slice(&par3_rs::packet::Packet::new(fixture_set_id(), body).to_bytes());
@@ -844,8 +844,8 @@ fn scan_carrier(bytes: &[u8]) -> Par3Job {
     job
 }
 
-/// Deliverable: a damaged copy of a vital packet is reported as a damaged byte
-/// range at its own offset, and the scan continues past it.
+// Deliverable: a damaged copy of a vital packet is reported as a damaged byte
+// range at its own offset, and the scan continues past it.
 #[test]
 fn a_damaged_vital_packet_is_reported_at_its_own_offset() {
     let bytes = with_damaged_packet(INDEX, ROOT_PACKET);
@@ -878,8 +878,8 @@ fn a_damaged_vital_packet_is_reported_at_its_own_offset() {
     assert_eq!(families[carriers::Par3PacketKind::Directory.index()], 1);
 }
 
-/// Deliverable: the volume carrier repeats every vital packet, so an index
-/// that never arrives costs the set nothing.
+// Deliverable: the volume carrier repeats every vital packet, so an index
+// that never arrives costs the set nothing.
 #[test]
 fn the_volume_carrier_alone_holds_every_vital_packet() {
     let job = scan_carrier(RECOVERY);
@@ -898,8 +898,8 @@ fn the_volume_carrier_alone_holds_every_vital_packet() {
     );
 }
 
-/// Deliverable: a set with no authenticated Root copy anywhere names Root as
-/// the packet family it is short of.
+// Deliverable: a set with no authenticated Root copy anywhere names Root as
+// the packet family it is short of.
 #[test]
 fn a_set_with_no_authenticated_root_names_the_missing_family() {
     let bytes = with_damaged_packet(INDEX, ROOT_PACKET);
@@ -923,12 +923,12 @@ fn a_set_with_no_authenticated_root_names_the_missing_family() {
     );
 }
 
-/// Deliverable: a link or permission packet is counted as present and ignored,
-/// never applied and never a reason to refuse the set.
-///
-/// The count is the set's own: an option packet is retained by the set that
-/// admitted it, so the set has to be resolved before anyone can be told how
-/// many it carries. That is the same moment the plan becomes reportable.
+// Deliverable: a link or permission packet is counted as present and ignored,
+// never applied and never a reason to refuse the set.
+//
+// The count is the set's own: an option packet is retained by the set that
+// admitted it, so the set has to be resolved before anyone can be told how
+// many it carries. That is the same moment the plan becomes reportable.
 #[test]
 fn an_option_packet_is_reported_and_never_applied() {
     let bytes = carrier_with(
@@ -956,8 +956,8 @@ fn an_option_packet_is_reported_and_never_applied() {
     );
 }
 
-/// Deliverable: an option packet a File packet points at but that nothing
-/// authenticated is counted as unresolved, and the carrier still scans.
+// Deliverable: an option packet a File packet points at but that nothing
+// authenticated is counted as unresolved, and the carrier still scans.
 #[test]
 fn an_unresolved_option_reference_is_counted_and_does_not_stop_the_scan() {
     let bytes = carrier_with(
@@ -981,8 +981,8 @@ fn an_unresolved_option_reference_is_counted_and_does_not_stop_the_scan() {
     );
 }
 
-/// Deliverable: hostile metadata stops at a named engine ceiling rather than
-/// at host exhaustion, and the ceiling reaches the pipeline as a typed limit.
+// Deliverable: hostile metadata stops at a named engine ceiling rather than
+// at host exhaustion, and the ceiling reaches the pipeline as a typed limit.
 #[test]
 fn hostile_metadata_stops_at_a_named_ceiling() {
     let mut bytes = Vec::new();
@@ -1033,9 +1033,9 @@ fn hostile_metadata_stops_at_a_named_ceiling() {
     );
 }
 
-/// A probe that never ran because the host budget was full says nothing about
-/// the file, so the attempt is forgotten and made again later; a probe that
-/// read the file and failed is a verdict about the file and stands.
+// A probe that never ran because the host budget was full says nothing about
+// the file, so the attempt is forgotten and made again later; a probe that
+// read the file and failed is a verdict about the file and stands.
 #[test]
 fn an_embedded_probe_is_retried_only_when_the_budget_refused_it() {
     let exhausted = budget::host_budget_limit("PAR3 host state", 66 << 10, 64 << 20, 0);

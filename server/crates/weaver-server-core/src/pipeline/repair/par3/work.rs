@@ -1,4 +1,4 @@
-//! Retained ownership and bounded dispatch for PAR3 blocking work.
+// Retained ownership and bounded dispatch for PAR3 blocking work.
 
 use super::*;
 use crate::operations::metrics::{
@@ -12,9 +12,9 @@ use tokio::sync::mpsc;
 const MAX_JOBS: usize = 256;
 const MAX_PENDING: usize = 4096;
 
-/// Engine counters sampled once at dispatch and once at handback. The deltas
-/// between the two are the only PAR3 engine telemetry weaver folds into its
-/// own metrics: nothing in this crate counts per byte, per block or per stripe.
+// Engine counters sampled once at dispatch and once at handback. The deltas
+// between the two are the only PAR3 engine telemetry weaver folds into its
+// own metrics: nothing in this crate counts per byte, per block or per stripe.
 #[derive(Debug, Default, Clone, Copy)]
 struct EngineCounters {
     source_read_bytes: u64,
@@ -34,38 +34,38 @@ struct EngineCounters {
     packets_authenticated: u64,
     packets_rejected: u64,
     ranges_unavailable: u64,
-    /// The engine's categorised ledger: current and peak reservations per
-    /// category. Absolute values, so these are published rather than folded.
+    // The engine's categorised ledger: current and peak reservations per
+    // category. Absolute values, so these are published rather than folded.
     ledger_bytes: [u64; PAR3_MEMORY_CATEGORIES],
     ledger_peak_bytes: [u64; PAR3_MEMORY_CATEGORIES],
-    /// The widths the engine last admitted. Also absolute by the engine's own
-    /// definition: each field holds the most recent admission.
+    // The widths the engine last admitted. Also absolute by the engine's own
+    // definition: each field holds the most recent admission.
     admitted: [u64; ADMITTED_WIDTHS],
-    /// Cumulative refusals by cause, narrowings by width, and the bytes a
-    /// bounded working set pushed onto the I/O layer. These fold in as deltas.
+    // Cumulative refusals by cause, narrowings by width, and the bytes a
+    // bounded working set pushed onto the I/O layer. These fold in as deltas.
     refusals: [u64; Par3EngineRefusal::COUNT],
     narrowed: [u64; Par3EngineNarrowing::COUNT],
     reread_bytes: u64,
     reconstructed_bytes: u64,
-    /// What the engine's admission caches currently hold. Absolute.
+    // What the engine's admission caches currently hold. Absolute.
     cache_entries: u64,
     cache_bytes: u64,
-    /// Transform and coefficient work the engine's codecs performed.
-    /// Cumulative, so these fold in as deltas.
+    // Transform and coefficient work the engine's codecs performed.
+    // Cumulative, so these fold in as deltas.
     codec: [u64; CODEC_COUNTERS],
-    /// Carrier bytes the scanner read and could not authenticate. Cumulative
-    /// per job, so this folds in as a delta.
+    // Carrier bytes the scanner read and could not authenticate. Cumulative
+    // per job, so this folds in as a delta.
     damaged_bytes: u64,
 }
 
-/// Admitted widths captured per handback, in the order the fields below are
-/// published. Fixed so the capture allocates nothing.
+// Admitted widths captured per handback, in the order the fields below are
+// published. Fixed so the capture allocates nothing.
 const ADMITTED_WIDTHS: usize = 6;
 
-/// Codec work counters captured per handback, in the order they are published.
+// Codec work counters captured per handback, in the order they are published.
 const CODEC_COUNTERS: usize = 6;
 
-/// The engine stage each tracked class maps to.
+// The engine stage each tracked class maps to.
 const TRACKED_STAGES: [(Par3Stage, par3_rs::runtime::Stage); Par3Stage::COUNT] = [
     (Par3Stage::Scan, par3_rs::runtime::Stage::Scan),
     (Par3Stage::Metadata, par3_rs::runtime::Stage::Metadata),
@@ -80,7 +80,7 @@ fn as_millis(elapsed: std::time::Duration) -> u64 {
     elapsed.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-/// The phase an engine stage puts a work slot in.
+// The phase an engine stage puts a work slot in.
 fn engine_phase(stage: par3_rs::runtime::Stage) -> Par3Phase {
     use par3_rs::runtime::Stage;
     match stage {
@@ -95,7 +95,7 @@ fn engine_phase(stage: par3_rs::runtime::Stage) -> Par3Phase {
     }
 }
 
-/// The phase a queued work unit puts its slot in before the engine speaks.
+// The phase a queued work unit puts its slot in before the engine speaks.
 fn pending_phase(input: &PendingInput) -> Par3Phase {
     match input {
         PendingInput::Assess => Par3Phase::Assessing,
@@ -198,8 +198,8 @@ impl EngineCounters {
         counters
     }
 
-    /// Fold this handback's deltas into the live metrics. One load per counter
-    /// and one `fetch_add` per non-zero delta; never called from a work loop.
+    // Fold this handback's deltas into the live metrics. One load per counter
+    // and one `fetch_add` per non-zero delta; never called from a work loop.
     fn apply(self, before: Self, metrics: &PipelineMetrics) {
         use std::sync::atomic::Ordering::Relaxed;
         let add = |counter: &std::sync::atomic::AtomicU64, delta: u64| {
@@ -346,12 +346,12 @@ enum WorkOutput {
     Readback(readback::ReadbackDone),
 }
 
-/// Keep output-path accounting alive through channel handback, partial-error
-/// handling and asynchronous assembly/database reconciliation.
+// Keep output-path accounting alive through channel handback, partial-error
+// handling and asynchronous assembly/database reconciliation.
 pub(super) struct RepairCompletion {
     pub result: EngineResult<par3_rs::session_repair::SessionRepairReport>,
     pub outputs: EngineResult<Vec<readback::VerifiedOutput>>,
-    /// True only when the embedded repair path installed a replacement.
+    // True only when the embedded repair path installed a replacement.
     pub embedded_replacement: bool,
     pub _reservation: Option<assessment::ViewReservation>,
 }
@@ -364,7 +364,7 @@ enum PendingInput {
         image: virtual_source::VirtualInput,
         name: String,
     },
-    /// A direct volume that carries its own recovery set after the container.
+    // A direct volume that carries its own recovery set after the container.
     EmbeddedVirtual {
         image: virtual_source::VirtualInput,
         name: String,
@@ -481,23 +481,23 @@ impl Drop for WorkTiming {
 pub(super) struct Acquisition {
     pub batch: Option<RecoveryBatch>,
     pub prefetched: bool,
-    /// Indices a drained window retracted while a worker held the engine
-    /// session. The retraction lands on the session at its handback, followed
-    /// by the reassessment that makes those indices askable again; dropping
-    /// it would leave them counted in flight for the rest of the job.
+    // Indices a drained window retracted while a worker held the engine
+    // session. The retraction lands on the session at its handback, followed
+    // by the reassessment that makes those indices askable again; dropping
+    // it would leave them counted in flight for the rest of the job.
     deferred_release: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, Vec<u64>)>,
 }
 
 pub(super) struct RecoveryBatch {
     pub articles: Vec<crate::jobs::ids::SegmentId>,
-    /// Whether this window's articles have already been accounted for as
-    /// arrivals or losses. Each admitted article is counted exactly once.
+    // Whether this window's articles have already been accounted for as
+    // arrivals or losses. Each admitted article is counted exactly once.
     settled: bool,
     job_id: JobId,
     cohorts: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, u64)>,
-    /// Recovery indices this window declared to the engine as being acquired,
-    /// so a reassessment taken while it is in flight does not ask for them
-    /// again. Retracted verbatim when the window drains.
+    // Recovery indices this window declared to the engine as being acquired,
+    // so a reassessment taken while it is in flight does not ask for them
+    // again. Retracted verbatim when the window drains.
     declared: Vec<(par3_rs::InputSetId, par3_rs::Fingerprint, Vec<u64>)>,
     epoch: u64,
     assessment: u64,
@@ -530,8 +530,8 @@ struct MaterializedRanges {
     _reservation: assessment::ViewReservation,
 }
 
-/// Committed availability held across a synchronous content-preserving rename.
-/// Verification evidence is deliberately not part of this handoff.
+// Committed availability held across a synchronous content-preserving rename.
+// Verification evidence is deliberately not part of this handoff.
 pub(super) struct MaterializedSources(BTreeMap<SourceId, EngineResult<MaterializedRanges>>);
 
 struct JobSlot {
@@ -551,29 +551,29 @@ struct JobSlot {
     errors: BTreeMap<SourceId, EngineError>,
     donor_error: Option<EngineError>,
     spill: Option<SourceId>,
-    /// The engine refusal that forced the spill, kept so the verdict can be
-    /// classified against the numbers the engine actually measured rather
-    /// than against the configured budget read back later.
+    // The engine refusal that forced the spill, kept so the verdict can be
+    // classified against the numbers the engine actually measured rather
+    // than against the configured budget read back later.
     spill_limit: Option<par3_rs::runtime::ResourceLimit>,
     spill_disk: Option<budget::DiskReservation>,
     completed_repair: Option<RepairCompletion>,
     completed_readback: Option<EngineResult<readback::ReadbackDone>>,
     installing: bool,
     verification: Option<verification::Receipt>,
-    /// Engine counters as of this job's last dispatch.
+    // Engine counters as of this job's last dispatch.
     engine_baseline: EngineCounters,
-    /// When this job's current wait for PAR3 memory began.
+    // When this job's current wait for PAR3 memory began.
     waiting_for_memory_since: Option<std::time::Instant>,
-    /// The last typed verdict this job reached, for tests and diagnostics.
+    // The last typed verdict this job reached, for tests and diagnostics.
     last_outcome: Option<outcome::Par3Outcome>,
-    /// Cohorts with losses named by the assessment the in-flight repair was
-    /// dispatched against, credited only once that repair comes back whole.
+    // Cohorts with losses named by the assessment the in-flight repair was
+    // dispatched against, credited only once that repair comes back whole.
     repair_cohorts: u64,
-    /// Whether this job has already said its carriers were damaged. The
-    /// summary is a job-level fact, not a per-handback one.
+    // Whether this job has already said its carriers were damaged. The
+    // summary is a job-level fact, not a per-handback one.
     damage_reported: bool,
-    /// Whether this job has already reported the option packets its set
-    /// carries that weaver does not apply.
+    // Whether this job has already reported the option packets its set
+    // carries that weaver does not apply.
     options_reported: bool,
 }
 
@@ -622,9 +622,9 @@ pub(crate) struct WorkDone {
     result: EngineResult<WorkOutput>,
 }
 
-/// Created only on PAR3 admission. Two job workers bound dispatch even
-/// when many jobs arrive together. Retired tickets hold capacity until their
-/// cancelled workers return; recreating a job cannot evade that bound.
+// Created only on PAR3 admission. Two job workers bound dispatch even
+// when many jobs arrive together. Retired tickets hold capacity until their
+// cancelled workers return; recreating a job cannot evade that bound.
 pub(in crate::pipeline) struct Coordinator {
     pub(in crate::pipeline) admission_paused: bool,
     jobs: BTreeMap<JobId, JobSlot>,
@@ -640,9 +640,9 @@ pub(in crate::pipeline) struct Coordinator {
     test_rx: Option<mpsc::Receiver<RepairWorkDone>>,
 }
 
-/// CPU workers PAR3 repair may run at once: every core but one, so the
-/// download path always keeps a core, and no more than `cap` when the
-/// hardware profile sets one. Never zero, or repair could not start.
+// CPU workers PAR3 repair may run at once: every core but one, so the
+// download path always keeps a core, and no more than `cap` when the
+// hardware profile sets one. Never zero, or repair could not start.
 fn cpu_limit(cap: Option<usize>) -> usize {
     cpu_limit_on(
         std::thread::available_parallelism().map_or(1, usize::from),
@@ -670,8 +670,8 @@ impl Coordinator {
         self.jobs.get(&job_id).map(|job| &job.acquisition)
     }
 
-    /// The articles of an acquisition window whose downloads have all
-    /// finished, handed back once so no article is accounted for twice.
+    // The articles of an acquisition window whose downloads have all
+    // finished, handed back once so no article is accounted for twice.
     pub(super) fn take_unsettled_articles(
         &mut self,
         job_id: JobId,
@@ -729,16 +729,16 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Declare the recovery indices the window just admitted is expected to
-    /// deliver, so a reassessment taken while it is in flight does not ask for
-    /// them again.
-    ///
-    /// `carriers` pairs each selected carrier's advertised index span with
-    /// how many of its articles this window admitted. Only indices the engine
-    /// itself named as still wanted are declared, only where a selected
-    /// carrier advertises them, and never more of one carrier's span than the
-    /// window will actually fetch from it: a carrier whose name says nothing
-    /// declares nothing, which merely means those indices stay askable.
+    // Declare the recovery indices the window just admitted is expected to
+    // deliver, so a reassessment taken while it is in flight does not ask for
+    // them again.
+    //
+    // `carriers` pairs each selected carrier's advertised index span with
+    // how many of its articles this window admitted. Only indices the engine
+    // itself named as still wanted are declared, only where a selected
+    // carrier advertises them, and never more of one carrier's span than the
+    // window will actually fetch from it: a carrier whose name says nothing
+    // declares nothing, which merely means those indices stay askable.
     pub(in crate::pipeline) fn declare_recovery_in_flight(
         &mut self,
         job_id: JobId,
@@ -807,10 +807,10 @@ impl Coordinator {
         self.queue_reassessment(job_id)
     }
 
-    /// Retract everything the drained window declared. The window is over, so
-    /// nothing it named is still being acquired: an index that arrived is now
-    /// the engine's own `available`, and one that did not must become askable
-    /// again rather than sit in flight forever.
+    // Retract everything the drained window declared. The window is over, so
+    // nothing it named is still being acquired: an index that arrived is now
+    // the engine's own `available`, and one that did not must become askable
+    // again rather than sit in flight forever.
     pub(in crate::pipeline) fn forget_recovery_in_flight(&mut self, job_id: JobId) {
         let Some(job) = self.jobs.get_mut(&job_id) else {
             return;
@@ -885,17 +885,17 @@ impl Coordinator {
         }
     }
 
-    /// Hold PAR3 workers to the hardware profile's cap, or `None` for every
-    /// core but one. Dispatch reads the limit each time it hands out workers,
-    /// so work already running keeps its allowance and only the next dispatch
-    /// sees the new value.
+    // Hold PAR3 workers to the hardware profile's cap, or `None` for every
+    // core but one. Dispatch reads the limit each time it hands out workers,
+    // so work already running keeps its allowance and only the next dispatch
+    // sees the new value.
     pub(in crate::pipeline) fn set_cpu_cap(&mut self, cap: Option<usize>) {
         self.cpu_limit = cpu_limit(cap);
     }
 
-    /// Record this job's typed verdict, counting it once per distinct value.
-    /// A job that keeps reaching the same verdict while it waits for more
-    /// bytes is one verdict, not one per completion check.
+    // Record this job's typed verdict, counting it once per distinct value.
+    // A job that keeps reaching the same verdict while it waits for more
+    // bytes is one verdict, not one per completion check.
     pub(in crate::pipeline) fn note_outcome(
         &mut self,
         job_id: JobId,
@@ -910,8 +910,8 @@ impl Coordinator {
         self.metrics.par3.note_outcome(outcome.class());
     }
 
-    /// Carriers whose scanner stopped short and still wants bytes it has not
-    /// seen. A nonzero count means metadata discovery is not finished.
+    // Carriers whose scanner stopped short and still wants bytes it has not
+    // seen. A nonzero count means metadata discovery is not finished.
     pub(in crate::pipeline) fn carriers_awaiting_bytes(&self, job_id: JobId) -> u64 {
         self.jobs
             .get(&job_id)
@@ -925,10 +925,10 @@ impl Coordinator {
             })
     }
 
-    /// The vital packet family no carrier of this job produced a single
-    /// authenticated copy of, if there is one. A set cannot be planned without
-    /// a Start, a matrix and a Root, and a family with a zero count is a
-    /// different complaint from a set that is merely still arriving.
+    // The vital packet family no carrier of this job produced a single
+    // authenticated copy of, if there is one. A set cannot be planned without
+    // a Start, a matrix and a Root, and a family with a zero count is a
+    // different complaint from a set that is merely still arriving.
     pub(in crate::pipeline) fn missing_vital_packet(
         &self,
         job_id: JobId,
@@ -943,7 +943,7 @@ impl Coordinator {
             .find(|kind| families[kind.index()] == 0)
     }
 
-    /// What this job's carriers have found damaged so far.
+    // What this job's carriers have found damaged so far.
     #[cfg(test)]
     pub(in crate::pipeline) fn carrier_damage(
         &self,
@@ -956,11 +956,11 @@ impl Coordinator {
             .unwrap_or_default()
     }
 
-    /// This job's option-packet tally, the first time it is asked for.
-    ///
-    /// Options are reported, never applied, so one line per job is the whole
-    /// obligation; later calls return nothing so a repeated completion check
-    /// cannot repeat the line.
+    // This job's option-packet tally, the first time it is asked for.
+    //
+    // Options are reported, never applied, so one line per job is the whole
+    // obligation; later calls return nothing so a repeated completion check
+    // cannot repeat the line.
     pub(in crate::pipeline) fn take_option_packet_report(
         &mut self,
         job_id: JobId,
@@ -973,13 +973,13 @@ impl Coordinator {
         Some(tally)
     }
 
-    /// Whether another job currently owns a PAR3 work unit, and with it the
-    /// share of the native budget this job's refusal collided with.
+    // Whether another job currently owns a PAR3 work unit, and with it the
+    // share of the native budget this job's refusal collided with.
     pub(in crate::pipeline) fn peer_holds_par3_memory(&self, job_id: JobId) -> bool {
         self.in_flight.values().any(|(owner, _)| *owner != job_id)
     }
 
-    /// Publish the queue depth, worker allowance and in-flight gauges.
+    // Publish the queue depth, worker allowance and in-flight gauges.
     fn publish_dispatch_gauges(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let par3 = &self.metrics.par3;
@@ -1031,9 +1031,9 @@ impl Coordinator {
             })
     }
 
-    /// Whether a worker currently owns the job's session, so a completion is
-    /// owed on the repair channel. Narrower than [`Self::has_work`], which
-    /// also counts work the next completion check has to dispatch or spill.
+    // Whether a worker currently owns the job's session, so a completion is
+    // owed on the repair channel. Narrower than [`Self::has_work`], which
+    // also counts work the next completion check has to dispatch or spill.
     #[cfg(test)]
     pub(in crate::pipeline) fn has_worker_in_flight(&self, job_id: JobId) -> bool {
         self.jobs
@@ -1041,9 +1041,9 @@ impl Coordinator {
             .is_some_and(|job| job.ticket.is_some())
     }
 
-    /// The job's published snapshot of `source`, `None` while none is
-    /// published. An image whose backing changed under it fails here the way
-    /// a worker's read of it would.
+    // The job's published snapshot of `source`, `None` while none is
+    // published. An image whose backing changed under it fails here the way
+    // a worker's read of it would.
     #[cfg(test)]
     pub(in crate::pipeline) fn source_snapshot(
         &self,
@@ -1053,8 +1053,8 @@ impl Coordinator {
         Ok(self.jobs[&job_id].sources.snapshot(source)?)
     }
 
-    /// The `(start, end)` ranges the job's published image of `source` can
-    /// read, empty while none is published or once it is withdrawn.
+    // The `(start, end)` ranges the job's published image of `source` can
+    // read, empty while none is published or once it is withdrawn.
     #[cfg(test)]
     pub(in crate::pipeline) fn source_ranges(
         &self,
@@ -1164,8 +1164,8 @@ impl Coordinator {
         )
     }
 
-    /// [`Self::enqueue_virtual`] for a direct volume whose recovery set
-    /// follows its container at `start`.
+    // [`Self::enqueue_virtual`] for a direct volume whose recovery set
+    // follows its container at `start`.
     pub(super) fn enqueue_embedded_virtual(
         &mut self,
         job_id: JobId,
@@ -1247,7 +1247,7 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Publish actual disk bytes as candidates; this does not admit verification evidence.
+    // Publish actual disk bytes as candidates; this does not admit verification evidence.
     pub(super) fn enqueue_complete_file(
         &mut self,
         job_id: JobId,
@@ -1394,9 +1394,9 @@ impl Coordinator {
         job.spill.take()
     }
 
-    /// The refusal that forced the pending spill, when the engine measured
-    /// one. A host-side ceiling refuses without a native measurement, so the
-    /// caller must still have a verdict for `None`.
+    // The refusal that forced the pending spill, when the engine measured
+    // one. A host-side ceiling refuses without a native measurement, so the
+    // caller must still have a verdict for `None`.
     pub(super) fn take_spill_limit(
         &mut self,
         job_id: JobId,
@@ -1426,10 +1426,10 @@ impl Coordinator {
         self.jobs.get_mut(&job_id)?.spill_disk.take()
     }
 
-    /// Re-arm a refused spill so the peer's handback drives another attempt,
-    /// and start or continue this job's wait for PAR3 memory. There is no
-    /// timer here: the wait ends when a peer hands its work unit back and the
-    /// completion check runs again.
+    // Re-arm a refused spill so the peer's handback drives another attempt,
+    // and start or continue this job's wait for PAR3 memory. There is no
+    // timer here: the wait ends when a peer hands its work unit back and the
+    // completion check runs again.
     pub(in crate::pipeline) fn park_for_memory(
         &mut self,
         job_id: JobId,
@@ -1457,9 +1457,9 @@ impl Coordinator {
             .store_phase(job_id.0, Par3Phase::AwaitingMemory, now_ms);
     }
 
-    /// Every job currently parked on PAR3 memory. A handback frees the share
-    /// of the budget they collided with, so each of them is owed another
-    /// completion check whether or not it is the job that handed back.
+    // Every job currently parked on PAR3 memory. A handback frees the share
+    // of the budget they collided with, so each of them is owed another
+    // completion check whether or not it is the job that handed back.
     pub(in crate::pipeline) fn jobs_awaiting_memory(&self) -> Vec<JobId> {
         self.jobs
             .iter()
@@ -1468,8 +1468,8 @@ impl Coordinator {
             .collect()
     }
 
-    /// End this job's memory wait, crediting however long it lasted. Safe to
-    /// call for a job that was never waiting.
+    // End this job's memory wait, crediting however long it lasted. Safe to
+    // call for a job that was never waiting.
     pub(in crate::pipeline) fn resume_from_memory(&mut self, job_id: JobId) {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(job) = self.jobs.get_mut(&job_id) else {
@@ -1484,8 +1484,8 @@ impl Coordinator {
             .fetch_add(as_millis(since.elapsed()), Relaxed);
     }
 
-    /// Occupy a coordinator slot with one real carrier work unit, the way the
-    /// dispatcher does, so a peer collision can be staged from the pipeline.
+    // Occupy a coordinator slot with one real carrier work unit, the way the
+    // dispatcher does, so a peer collision can be staged from the pipeline.
     #[cfg(test)]
     pub(in crate::pipeline) fn force_dispatch(
         &mut self,
@@ -1531,7 +1531,7 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Called only after the scheduler has exhausted available parity.
+    // Called only after the scheduler has exhausted available parity.
     pub(in crate::pipeline) fn request_donor_search(
         &mut self,
         job_id: JobId,
@@ -1639,8 +1639,8 @@ impl Coordinator {
             .is_some_and(|source| source.carrier)
     }
 
-    /// Identity learned from an authenticated layout, not a verification claim.
-    /// Ordinary publication changes invalidate evidence but preserve this binding.
+    // Identity learned from an authenticated layout, not a verification claim.
+    // Ordinary publication changes invalidate evidence but preserve this binding.
     pub(super) fn protects_source(&self, job_id: JobId, source: SourceId) -> bool {
         self.jobs
             .get(&job_id)
@@ -1867,14 +1867,14 @@ impl Coordinator {
                 == count
     }
 
-    /// A terminal claim must name a bound protected source. A clean job does
-    /// not establish evidence for its unprotected files or recovery carriers.
+    // A terminal claim must name a bound protected source. A clean job does
+    // not establish evidence for its unprotected files or recovery carriers.
     pub(in crate::pipeline) fn verified_file(&self, job_id: JobId, source: SourceId) -> bool {
         self.verified(job_id) && self.source_verified(job_id, source)
     }
 
-    /// Current native evidence for one bound source can survive damage in a
-    /// sibling. Terminal delivery still requires the aggregate verdict above.
+    // Current native evidence for one bound source can survive damage in a
+    // sibling. Terminal delivery still requires the aggregate verdict above.
     pub(in crate::pipeline) fn source_verified(&self, job_id: JobId, source: SourceId) -> bool {
         self.assessments(job_id)
             .any(|(_, view)| view.verified_sources.contains(&source))
@@ -1959,8 +1959,8 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Reclaim the least recently used recovery-waiting sessions before
-    /// admitting another work unit. PAR2 budgets and policy are independent.
+    // Reclaim the least recently used recovery-waiting sessions before
+    // admitting another work unit. PAR2 budgets and policy are independent.
     fn evict_idle_sessions(&mut self, protected: JobId, headroom: usize) {
         let Some(memory) = self
             .jobs
@@ -2385,7 +2385,7 @@ impl Coordinator {
         }
     }
 
-    /// Return the live job to recheck, or discard a forgotten/stale result.
+    // Return the live job to recheck, or discard a forgotten/stale result.
     pub(super) fn settle(&mut self, done: WorkDone) -> Option<JobId> {
         let (job_id, _) = self.in_flight.get(&done.ticket)?;
         if *job_id != done.job_id {

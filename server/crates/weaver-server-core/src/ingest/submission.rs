@@ -520,9 +520,9 @@ async fn submit_prepared_nzb(
     })
 }
 
-/// Materializes a durable SCORE claim without re-entering normal duplicate
-/// admission. This keeps the candidate's reserved job ID/source stable across
-/// retry and creates no work directory until scheduler enqueue succeeds.
+// Materializes a durable SCORE claim without re-entering normal duplicate
+// admission. This keeps the candidate's reserved job ID/source stable across
+// retry and creates no work directory until scheduler enqueue succeeds.
 pub async fn materialize_semantic_promotion(
     db: &Database,
     handle: &SchedulerHandle,
@@ -659,9 +659,9 @@ pub async fn materialize_semantic_promotion(
     Ok(job_id)
 }
 
-/// Replays durable promotion claims after scheduler restoration. Claims whose
-/// job is already restored are completed without a duplicate enqueue; failed
-/// materializations are returned to parked state by the materializer.
+// Replays durable promotion claims after scheduler restoration. Claims whose
+// job is already restored are completed without a duplicate enqueue; failed
+// materializations are returned to parked state by the materializer.
 pub async fn reconcile_semantic_promotions(
     db: &Database,
     handle: &SchedulerHandle,
@@ -687,10 +687,10 @@ pub async fn reconcile_semantic_promotions(
     Ok(materialized)
 }
 
-/// Parses one ordered historical NZB page off the async and scheduler threads,
-/// then commits its fingerprints and checkpoint atomically. Missing or malformed
-/// payloads advance the cursor with a bounded count so startup recovery cannot
-/// loop forever on old broken history.
+// Parses one ordered historical NZB page off the async and scheduler threads,
+// then commits its fingerprints and checkpoint atomically. Missing or malformed
+// payloads advance the cursor with a bounded count so startup recovery cannot
+// loop forever on old broken history.
 pub async fn run_duplicate_fingerprint_backfill_batch(
     db: &Database,
 ) -> Result<DuplicateBackfillReport, SubmitNzbError> {
@@ -780,8 +780,8 @@ pub async fn run_duplicate_fingerprint_backfill_batch(
     })
 }
 
-/// Bounded startup catch-up. Subsequent starts resume from the durable cursor;
-/// a complete marker prevents any further scans.
+// Bounded startup catch-up. Subsequent starts resume from the durable cursor;
+// a complete marker prevents any further scans.
 pub async fn reconcile_duplicate_fingerprint_backfill(
     db: &Database,
     max_batches: usize,

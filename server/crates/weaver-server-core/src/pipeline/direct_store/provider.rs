@@ -1,78 +1,78 @@
-//! The hybrid virtual-volume provider.
-//!
-//! A direct set has no volume files, and several things downstream of routing
-//! insist on reading one: PAR2 verification and repair, `extract_member_streaming`
-//! for a tolerated member, and demotion's byte-exact reconstruction. This module
-//! is what gives them a volume to read.
-//!
-//! A virtual volume is an **overlay of two on-disk images in one coordinate
-//! space** — the source volume's physical offsets:
-//!
-//! - the volume's envelope file is that space, minus the bytes routing carried
-//!   away: `<set>.vol00007.envelope` holds every non-member byte at its true
-//!   physical offset, with sparse holes where member data used to be;
-//! - each direct-routed member's `.direct.partial` fills those holes, read at
-//!   `logical_offset + (physical position - extent start)`.
-//!
-//! The extents come from [`DirectSetRouter::volume_member_extents`], which is
-//! `StoredLayoutBuilder::map_physical_range` run in reverse: routing asks it
-//! "which member owns this physical byte", and the provider asks the same
-//! question to decide which file to read the byte back from.
-//!
-//! # Holes are errors, never zeros
-//!
-//! Bytes that were never downloaded — or were downloaded, held, and lost — are
-//! present in neither image. A reader that answered them with zeros would let a
-//! PAR2 block, a header walk or a reconstruction sweep silently consume
-//! fabricated data. Every read that starts inside a hole fails with
-//! [`HoleError`], which [`is_hole`] recognises so a caller can tell "not
-//! downloaded yet" from "the disk is broken". This is the on-disk sibling of the
-//! in-memory `SparseImage` the router's header parser walks, with one deliberate
-//! difference: that image answers `Ok(0)` at a hole so a truncated header walk
-//! stops cleanly, while this one is read by callers that must never mistake a
-//! hole for the end of the data.
-//!
-//! Coverage is therefore tracked **per source, not per volume**. Knowing that a
-//! physical byte was placed says nothing about *which* file received it, and
-//! the envelope is a sparse file: a read at an offset the envelope never
-//! received returns the filesystem's zeros, indistinguishable from real data,
-//! as long as some later offset made the file that long. So the envelope
-//! answers only for [`VirtualVolume::envelope_covered`] — the ranges an
-//! envelope write actually recorded — and a member extent answers only inside
-//! itself. A byte the volume-level map calls covered but no source claims is a
-//! hole, which is the invariant this module's title states, held
-//! unconditionally rather than as a consequence of the extent list happening to
-//! be right.
-//!
-//! # The re-encrypting overlay
-//!
-//! For an **encrypted** set the two images no longer agree with the volume they
-//! describe. The envelope still holds what was posted — headers, service
-//! records, and the last cipher block's tail padding — but a routed member's
-//! `.direct.partial` holds its *plaintext*, because direct-store decrypts at write
-//! time so the payload lands once. Every caller of this module wants posted
-//! bytes: PAR2 checksums them, reconstruction writes them into a volume file, a
-//! repair reads them as Reed–Solomon inputs.
-//!
-//! So a member extent belonging to an encrypted member is re-encrypted on the
-//! way out ([`VirtualVolume::ciphers`]). AES-CBC encryption is deterministic
-//! given key, IV and plaintext, so the posted stream is always reproducible —
-//! the only question is where a read's CBC chain starts, since block *N*'s
-//! cipher needs block *N−1*'s:
-//!
-//! - a **sequential** sweep chains naturally from each member's start, and
-//!   [`VirtualVolumeReader::chains`] carries the frontier from one `read` to the
-//!   next so a whole-volume pass re-encrypts every byte exactly once;
-//! - a **ranged** read seeds from the nearest retained cipher checkpoint at or
-//!   below its offset ([`super::router::crypt::MemberCipher::seed`]), and where
-//!   there is none it chains from the member's IV — the sequential path, bounded
-//!   and honest, rather than a guessed predecessor.
-//!
-//! Three things make a read **refuse** rather than fabricate, all of them
-//! reported as [`HoleError`] because "refetch this" is exactly what they mean:
-//! plaintext missing anywhere between the seed and the requested bytes; a read
-//! touching the member's final cipher block with no retained tail padding; and a
-//! member extent whose member has no cipher facts at all.
+// The hybrid virtual-volume provider.
+//
+// A direct set has no volume files, and several things downstream of routing
+// insist on reading one: PAR2 verification and repair, `extract_member_streaming`
+// for a tolerated member, and demotion's byte-exact reconstruction. This module
+// is what gives them a volume to read.
+//
+// A virtual volume is an **overlay of two on-disk images in one coordinate
+// space** — the source volume's physical offsets:
+//
+// - the volume's envelope file is that space, minus the bytes routing carried
+//   away: `<set>.vol00007.envelope` holds every non-member byte at its true
+//   physical offset, with sparse holes where member data used to be;
+// - each direct-routed member's `.direct.partial` fills those holes, read at
+//   `logical_offset + (physical position - extent start)`.
+//
+// The extents come from [`DirectSetRouter::volume_member_extents`], which is
+// `StoredLayoutBuilder::map_physical_range` run in reverse: routing asks it
+// "which member owns this physical byte", and the provider asks the same
+// question to decide which file to read the byte back from.
+//
+// # Holes are errors, never zeros
+//
+// Bytes that were never downloaded — or were downloaded, held, and lost — are
+// present in neither image. A reader that answered them with zeros would let a
+// PAR2 block, a header walk or a reconstruction sweep silently consume
+// fabricated data. Every read that starts inside a hole fails with
+// [`HoleError`], which [`is_hole`] recognises so a caller can tell "not
+// downloaded yet" from "the disk is broken". This is the on-disk sibling of the
+// in-memory `SparseImage` the router's header parser walks, with one deliberate
+// difference: that image answers `Ok(0)` at a hole so a truncated header walk
+// stops cleanly, while this one is read by callers that must never mistake a
+// hole for the end of the data.
+//
+// Coverage is therefore tracked **per source, not per volume**. Knowing that a
+// physical byte was placed says nothing about *which* file received it, and
+// the envelope is a sparse file: a read at an offset the envelope never
+// received returns the filesystem's zeros, indistinguishable from real data,
+// as long as some later offset made the file that long. So the envelope
+// answers only for [`VirtualVolume::envelope_covered`] — the ranges an
+// envelope write actually recorded — and a member extent answers only inside
+// itself. A byte the volume-level map calls covered but no source claims is a
+// hole, which is the invariant this module's title states, held
+// unconditionally rather than as a consequence of the extent list happening to
+// be right.
+//
+// # The re-encrypting overlay
+//
+// For an **encrypted** set the two images no longer agree with the volume they
+// describe. The envelope still holds what was posted — headers, service
+// records, and the last cipher block's tail padding — but a routed member's
+// `.direct.partial` holds its *plaintext*, because direct-store decrypts at write
+// time so the payload lands once. Every caller of this module wants posted
+// bytes: PAR2 checksums them, reconstruction writes them into a volume file, a
+// repair reads them as Reed–Solomon inputs.
+//
+// So a member extent belonging to an encrypted member is re-encrypted on the
+// way out ([`VirtualVolume::ciphers`]). AES-CBC encryption is deterministic
+// given key, IV and plaintext, so the posted stream is always reproducible —
+// the only question is where a read's CBC chain starts, since block *N*'s
+// cipher needs block *N−1*'s:
+//
+// - a **sequential** sweep chains naturally from each member's start, and
+//   [`VirtualVolumeReader::chains`] carries the frontier from one `read` to the
+//   next so a whole-volume pass re-encrypts every byte exactly once;
+// - a **ranged** read seeds from the nearest retained cipher checkpoint at or
+//   below its offset ([`super::router::crypt::MemberCipher::seed`]), and where
+//   there is none it chains from the member's IV — the sequential path, bounded
+//   and honest, rather than a guessed predecessor.
+//
+// Three things make a read **refuse** rather than fabricate, all of them
+// reported as [`HoleError`] because "refetch this" is exactly what they mean:
+// plaintext missing anywhere between the seed and the requested bytes; a read
+// touching the member's final cipher block with no retained tail padding; and a
+// member extent whose member has no cipher facts at all.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -88,21 +88,21 @@ use super::ByteRanges;
 use super::router::crypt::{MemberCipher, block_ceil, block_floor};
 use super::router::{HoldsScratchPin, MemberExtent};
 
-/// How much plaintext a chain-to-seed pass re-encrypts per iteration.
-///
-/// Only the last 16 bytes of each pass survive it, so this bounds the transient
-/// buffer a checkpoint miss costs — not the work, which is whatever the distance
-/// to the seed is.
+// How much plaintext a chain-to-seed pass re-encrypts per iteration.
+//
+// Only the last 16 bytes of each pass survive it, so this bounds the transient
+// buffer a checkpoint miss costs — not the work, which is whatever the distance
+// to the seed is.
 const CHAIN_CHUNK_BYTES: usize = 256 * 1024;
 
-/// One held run of a virtual volume: `len` posted bytes at physical `start`,
-/// read on demand from wherever the router is keeping them.
-///
-/// The provider never owns a copy of a hold. A run the router has in RAM is
-/// the router's own buffer, shared; a run the holds budget paged out is a pin
-/// on the scratch image and an offset into it, read positionally when a read
-/// lands on it. That is the whole difference between a provider whose RAM cost
-/// is the holds budget and one whose RAM cost is the size of the holds.
+// One held run of a virtual volume: `len` posted bytes at physical `start`,
+// read on demand from wherever the router is keeping them.
+//
+// The provider never owns a copy of a hold. A run the router has in RAM is
+// the router's own buffer, shared; a run the holds budget paged out is a pin
+// on the scratch image and an offset into it, read positionally when a read
+// lands on it. That is the whole difference between a provider whose RAM cost
+// is the holds budget and one whose RAM cost is the size of the holds.
 #[derive(Debug, Clone)]
 pub(crate) struct HeldRun {
     pub(crate) start: u64,
@@ -112,9 +112,12 @@ pub(crate) struct HeldRun {
 
 #[derive(Debug, Clone)]
 enum HeldSource {
-    /// `len` bytes at `offset` inside the router's own staged buffer.
-    Memory { bytes: Bytes, offset: u64 },
-    /// `len` bytes at `offset` inside the pinned scratch image.
+    // `len` bytes at `offset` inside the router's own staged buffer.
+    Memory {
+        bytes: Bytes,
+        offset: u64,
+    },
+    // `len` bytes at `offset` inside the pinned scratch image.
     Scratch {
         pin: Arc<HoldsScratchPin>,
         offset: u64,
@@ -139,14 +142,14 @@ impl HeldRun {
         }
     }
 
-    /// One past the last physical offset this run answers for.
+    // One past the last physical offset this run answers for.
     pub(crate) fn end(&self) -> u64 {
         self.start.saturating_add(self.len)
     }
 
-    /// Reads from `offset` bytes into the run, as much as fits in `out` and
-    /// remains in the run. A scratch image that cannot deliver a region it
-    /// handed out is a real I/O failure, not a hole.
+    // Reads from `offset` bytes into the run, as much as fits in `out` and
+    // remains in the run. A scratch image that cannot deliver a region it
+    // handed out is a real I/O failure, not a hole.
     fn read_at(&self, offset: u64, out: &mut [u8]) -> std::io::Result<usize> {
         let take = usize::try_from(self.len.saturating_sub(offset))
             .unwrap_or(usize::MAX)
@@ -170,7 +173,7 @@ impl HeldRun {
     }
 }
 
-/// A read landed on a byte the set never placed.
+// A read landed on a byte the set never placed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HoleError {
     pub(crate) volume_index: u32,
@@ -189,16 +192,16 @@ impl std::fmt::Display for HoleError {
 
 impl std::error::Error for HoleError {}
 
-/// Whether an I/O error is a virtual volume reporting a hole rather than a real
-/// failure. A hole means "refetch this"; anything else means the disk is wrong.
+// Whether an I/O error is a virtual volume reporting a hole rather than a real
+// failure. A hole means "refetch this"; anything else means the disk is wrong.
 pub(crate) fn is_hole(error: &std::io::Error) -> bool {
     error
         .get_ref()
         .is_some_and(|inner| inner.downcast_ref::<HoleError>().is_some())
 }
 
-/// The end of the coalesced run of `ranges` containing `position`, or `None`
-/// when `position` is outside every run.
+// The end of the coalesced run of `ranges` containing `position`, or `None`
+// when `position` is outside every run.
 fn covered_run_end(ranges: &ByteRanges, position: u64) -> Option<u64> {
     let runs = ranges.ranges();
     let index = runs
@@ -218,61 +221,61 @@ fn hole(volume_index: u32, offset: u64) -> std::io::Error {
     )
 }
 
-/// Everything one virtual volume needs, with no borrows, so the whole provider
-/// can be moved onto the blocking pool.
+// Everything one virtual volume needs, with no borrows, so the whole provider
+// can be moved onto the blocking pool.
 #[derive(Debug, Clone)]
 pub(crate) struct VirtualVolume {
     pub(crate) volume_index: u32,
-    /// Absolute path of this volume's sparse envelope file.
+    // Absolute path of this volume's sparse envelope file.
     pub(crate) envelope: PathBuf,
-    /// Direct-routed member extents in physical order, disjoint. The order is
-    /// what makes the binary searches in [`VirtualVolumeReader`] valid, and
-    /// `map_physical_range` produces it that way.
+    // Direct-routed member extents in physical order, disjoint. The order is
+    // what makes the binary searches in [`VirtualVolumeReader`] valid, and
+    // `map_physical_range` produces it that way.
     pub(crate) extents: Vec<MemberExtent>,
-    /// Absolute `.direct.partial` path per member id.
-    ///
-    /// Shared rather than owned: every volume of a set resolves member ids
-    /// against the same map, and the provider only ever reads it.
+    // Absolute `.direct.partial` path per member id.
+    //
+    // Shared rather than owned: every volume of a set resolves member ids
+    // against the same map, and the provider only ever reads it.
     pub(crate) partials: Arc<HashMap<u32, PathBuf>>,
-    /// Physical ranges that were actually placed. Everything else is a hole.
+    // Physical ranges that were actually placed. Everything else is a hole.
     pub(crate) covered: ByteRanges,
-    /// Of `covered`, the physical ranges the **envelope file** received.
-    ///
-    /// Never derived here from `covered` minus the extents: the whole failure
-    /// this exists to stop is an extent going missing, and a derivation would
-    /// hand the missing member's range straight back to the envelope. It comes
-    /// from the writes recorded against the envelope destination, so a range no
-    /// envelope write ever claimed reads as a hole no matter what the extent
-    /// list says.
+    // Of `covered`, the physical ranges the **envelope file** received.
+    //
+    // Never derived here from `covered` minus the extents: the whole failure
+    // this exists to stop is an extent going missing, and a derivation would
+    // hand the missing member's range straight back to the envelope. It comes
+    // from the writes recorded against the envelope destination, so a range no
+    // envelope write ever claimed reads as a hole no matter what the extent
+    // list says.
     pub(crate) envelope_covered: ByteRanges,
-    /// The volume's holds: staged bytes no destination has taken yet, as
-    /// [`HeldRun`]s in ascending order, disjoint from everything `covered`
-    /// claims, each read on demand from the router's buffer or the scratch.
-    ///
-    /// Posted bytes verbatim, and a source in their own right. An encrypted
-    /// member holds the cipher block on either side of a lost article — its
-    /// other half is in the article that never came — and a read that could
-    /// answer only from what was *placed* reported those bytes as a hole, so a
-    /// volume whose every posted byte was in hand read as damaged at exactly
-    /// the offsets a repair needed as input. Shared rather than owned because
-    /// a set's volumes are assembled per provider, and a provider is assembled
-    /// per pass.
+    // The volume's holds: staged bytes no destination has taken yet, as
+    // [`HeldRun`]s in ascending order, disjoint from everything `covered`
+    // claims, each read on demand from the router's buffer or the scratch.
+    //
+    // Posted bytes verbatim, and a source in their own right. An encrypted
+    // member holds the cipher block on either side of a lost article — its
+    // other half is in the article that never came — and a read that could
+    // answer only from what was *placed* reported those bytes as a hole, so a
+    // volume whose every posted byte was in hand read as damaged at exactly
+    // the offsets a repair needed as input. Shared rather than owned because
+    // a set's volumes are assembled per provider, and a provider is assembled
+    // per pass.
     pub(crate) held: Arc<Vec<HeldRun>>,
-    /// Logical length of the volume: what a `SeekFrom::End` means and where
-    /// reads stop returning bytes.
+    // Logical length of the volume: what a `SeekFrom::End` means and where
+    // reads stop returning bytes.
     pub(crate) len: u64,
-    /// Read-side crypt facts per member id, for the re-encrypting overlay.
-    /// Empty for every unencrypted set, which is the overlay
-    /// switched off by construction.
-    ///
-    /// Shared with the partial paths and for the same reason: every volume of a
-    /// set resolves the same member ids, and the facts carry a checkpoint map
-    /// that is not free to clone per volume.
+    // Read-side crypt facts per member id, for the re-encrypting overlay.
+    // Empty for every unencrypted set, which is the overlay
+    // switched off by construction.
+    //
+    // Shared with the partial paths and for the same reason: every volume of a
+    // set resolves the same member ids, and the facts carry a checkpoint map
+    // that is not free to clone per volume.
     pub(crate) ciphers: Arc<HashMap<u32, MemberCipher>>,
 }
 
-/// What the re-encrypting overlay did, so a test can prove which path a read
-/// took rather than only that it produced the right bytes.
+// What the re-encrypting overlay did, so a test can prove which path a read
+// took rather than only that it produced the right bytes.
 #[derive(Debug, Default)]
 pub(crate) struct CipherOverlayCounters {
     reencrypted_bytes: AtomicU64,
@@ -283,38 +286,38 @@ pub(crate) struct CipherOverlayCounters {
 }
 
 impl CipherOverlayCounters {
-    /// Member bytes the overlay turned back into cipher and handed to a caller.
+    // Member bytes the overlay turned back into cipher and handed to a caller.
     pub(crate) fn reencrypted_bytes(&self) -> u64 {
         self.reencrypted_bytes.load(Ordering::Relaxed)
     }
 
-    /// Bytes re-encrypted **only** to reach a read's CBC seed and then thrown
-    /// away. The whole cost of a checkpoint miss, and the number
-    /// [`super::router::crypt::CHECKPOINT_STRIDE`] exists to bound.
+    // Bytes re-encrypted **only** to reach a read's CBC seed and then thrown
+    // away. The whole cost of a checkpoint miss, and the number
+    // [`super::router::crypt::CHECKPOINT_STRIDE`] exists to bound.
     pub(crate) fn chained_bytes(&self) -> u64 {
         self.chained_bytes.load(Ordering::Relaxed)
     }
 
-    /// Reads whose chain started at a retained checkpoint or at the frontier the
-    /// previous read left, i.e. those that paid nothing to seed.
+    // Reads whose chain started at a retained checkpoint or at the frontier the
+    // previous read left, i.e. those that paid nothing to seed.
     pub(crate) fn seeded_from_checkpoint(&self) -> u64 {
         self.seeded_from_checkpoint.load(Ordering::Relaxed)
     }
 
-    /// Reads that had to chain from the member's IV — the sequential fallback.
+    // Reads that had to chain from the member's IV — the sequential fallback.
     pub(crate) fn seeded_from_start(&self) -> u64 {
         self.seeded_from_start.load(Ordering::Relaxed)
     }
 
-    /// Reads the overlay refused rather than fabricate: missing plaintext below
-    /// the requested bytes, or a final block with no retained tail padding.
+    // Reads the overlay refused rather than fabricate: missing plaintext below
+    // the requested bytes, or a final block with no retained tail padding.
     pub(crate) fn refusals(&self) -> u64 {
         self.refusals.load(Ordering::Relaxed)
     }
 }
 
 impl VirtualVolume {
-    /// Conservative image charge for consumers without shared payload leases.
+    // Conservative image charge for consumers without shared payload leases.
     pub(crate) fn retained_bytes(&self) -> usize {
         self.retained_payloads()
             .fold(self.retained_metadata_bytes(), |total, bytes| {
@@ -322,8 +325,8 @@ impl VirtualVolume {
             })
     }
 
-    /// Metadata retained by an image. Payload allocations are separately leased
-    /// by consumers so readers of the same buffer do not multiply its charge.
+    // Metadata retained by an image. Payload allocations are separately leased
+    // by consumers so readers of the same buffer do not multiply its charge.
     pub(crate) fn retained_metadata_bytes(&self) -> usize {
         let mut bytes = 4096usize
             .saturating_add(self.envelope.capacity().saturating_mul(4))
@@ -341,8 +344,8 @@ impl VirtualVolume {
         bytes.saturating_add(self.held.len().saturating_mul(256))
     }
 
-    /// Even a short range can pin a whole allocation. Callers must lease the
-    /// allocation, not just the readable length, while any image retains it.
+    // Even a short range can pin a whole allocation. Callers must lease the
+    // allocation, not just the readable length, while any image retains it.
     pub(crate) fn retained_payloads(&self) -> impl Iterator<Item = &Bytes> {
         self.held.iter().filter_map(|run| match &run.source {
             HeldSource::Memory { bytes, .. } => Some(bytes),
@@ -350,8 +353,8 @@ impl VirtualVolume {
         })
     }
 
-    /// Distinct pinned scratch handles retained by this image. The pins read
-    /// positionally from their existing handle; readers never reopen them.
+    // Distinct pinned scratch handles retained by this image. The pins read
+    // positionally from their existing handle; readers never reopen them.
     pub(crate) fn retained_handles(&self) -> usize {
         self.held
             .iter()
@@ -363,13 +366,13 @@ impl VirtualVolume {
             .len()
     }
 
-    /// The physical ranges a [`VirtualVolumeReader`] can actually answer, in
-    /// order: covered, inside the volume, and claimed by a source that holds
-    /// them — a member extent, or an envelope write that really happened.
-    ///
-    /// This is [`VirtualVolumeReader::run_end`]'s decision, hoisted out of the
-    /// read loop so a caller can ask about the volume's *shape* without reading
-    /// a byte of it.
+    // The physical ranges a [`VirtualVolumeReader`] can actually answer, in
+    // order: covered, inside the volume, and claimed by a source that holds
+    // them — a member extent, or an envelope write that really happened.
+    //
+    // This is [`VirtualVolumeReader::run_end`]'s decision, hoisted out of the
+    // read loop so a caller can ask about the volume's *shape* without reading
+    // a byte of it.
     pub(crate) fn readable_ranges(&self) -> Vec<(u64, u64)> {
         let mut sources = ByteRanges::new();
         for extent in &self.extents {
@@ -404,21 +407,21 @@ impl VirtualVolume {
         readable
     }
 
-    /// `Some(end)` when everything readable is one run from zero — the volume
-    /// reads exactly like a whole or truncated file — and `None` when an
-    /// **interior hole** sits below readable bytes.
-    ///
-    /// The distinction is the one the `FileAccess` adapter turns on, and it is
-    /// a damage-accounting fact rather than a performance one. A sequential
-    /// reader has no way to say "these bytes are unknown, the next ones are
-    /// fine": it stops at the hole, and every PAR2 slice after it reads zero
-    /// bytes and is counted damaged. Sizing a repair from that count rebuilds
-    /// slices that were never broken — wasting recovery capacity, and able to
-    /// flip a repairable set to unrepairable. A ranged read seeks past the hole
-    /// and attributes damage to the slices that actually touch it, which is
-    /// exactly the verdict a physically sparse volume produces, so refusing the
-    /// sequential path here is what keeps direct and conventional verdicts the
-    /// same shape.
+    // `Some(end)` when everything readable is one run from zero — the volume
+    // reads exactly like a whole or truncated file — and `None` when an
+    // **interior hole** sits below readable bytes.
+    //
+    // The distinction is the one the `FileAccess` adapter turns on, and it is
+    // a damage-accounting fact rather than a performance one. A sequential
+    // reader has no way to say "these bytes are unknown, the next ones are
+    // fine": it stops at the hole, and every PAR2 slice after it reads zero
+    // bytes and is counted damaged. Sizing a repair from that count rebuilds
+    // slices that were never broken — wasting recovery capacity, and able to
+    // flip a repairable set to unrepairable. A ranged read seeks past the hole
+    // and attributes damage to the slices that actually touch it, which is
+    // exactly the verdict a physically sparse volume produces, so refusing the
+    // sequential path here is what keeps direct and conventional verdicts the
+    // same shape.
     pub(crate) fn readable_prefix(&self) -> Option<u64> {
         match self.readable_ranges().as_slice() {
             [] => Some(0),
@@ -427,21 +430,21 @@ impl VirtualVolume {
         }
     }
 
-    /// Whether an interior hole makes a sequential sweep lie about which slices
-    /// are damaged. The inverse of [`Self::readable_prefix`], named for the
-    /// question the adapter asks.
+    // Whether an interior hole makes a sequential sweep lie about which slices
+    // are damaged. The inverse of [`Self::readable_prefix`], named for the
+    // question the adapter asks.
     pub(crate) fn has_interior_hole(&self) -> bool {
         self.readable_prefix().is_none()
     }
 }
 
-/// A [`VolumeProvider`] over a direct set's partials and envelopes.
+// A [`VolumeProvider`] over a direct set's partials and envelopes.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HybridVolumeProvider {
     volumes: HashMap<u32, VirtualVolume>,
-    /// Shared across clones on purpose: the provider is cloned into every
-    /// `spawn_blocking` that reads it, and the overlay accounting is about the
-    /// whole pass rather than about one closure.
+    // Shared across clones on purpose: the provider is cloned into every
+    // `spawn_blocking` that reads it, and the overlay accounting is about the
+    // whole pass rather than about one closure.
     cipher_counters: Arc<CipherOverlayCounters>,
 }
 
@@ -456,21 +459,21 @@ impl HybridVolumeProvider {
         }
     }
 
-    /// What the re-encrypting overlay has done through this provider.
+    // What the re-encrypting overlay has done through this provider.
     pub(crate) fn cipher_counters(&self) -> Arc<CipherOverlayCounters> {
         Arc::clone(&self.cipher_counters)
     }
 
-    /// The registered shape of one virtual volume. The PAR2 adapter reads
-    /// existence and length off it: a `FileAccess` has to answer both without
-    /// touching the filesystem, because for a direct volume there is nothing
-    /// there to `stat`.
+    // The registered shape of one virtual volume. The PAR2 adapter reads
+    // existence and length off it: a `FileAccess` has to answer both without
+    // touching the filesystem, because for a direct volume there is nothing
+    // there to `stat`.
     pub(crate) fn volume(&self, volume_index: u32) -> Option<&VirtualVolume> {
         self.volumes.get(&volume_index)
     }
 
-    /// Opens one virtual volume directly, without the trait's `usize` index and
-    /// boxing. Reconstruction and this module's tests use it.
+    // Opens one virtual volume directly, without the trait's `usize` index and
+    // boxing. Reconstruction and this module's tests use it.
     pub(crate) fn open(&self, volume_index: u32) -> Option<VirtualVolumeReader> {
         self.volumes
             .get(&volume_index)
@@ -495,66 +498,66 @@ impl VolumeProvider for HybridVolumeProvider {
     }
 }
 
-/// Which file answers one physical byte, and how much of the request it can
-/// answer in one go.
+// Which file answers one physical byte, and how much of the request it can
+// answer in one go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
-    /// The member partial for `member_id`, starting at `offset` inside it.
+    // The member partial for `member_id`, starting at `offset` inside it.
     Member { member_id: u32, offset: u64 },
-    /// The envelope file, at the same physical offset.
+    // The envelope file, at the same physical offset.
     Envelope { offset: u64 },
-    /// The `index`th held run, `offset` bytes into it: posted bytes still in
-    /// staging, served as they are.
+    // The `index`th held run, `offset` bytes into it: posted bytes still in
+    // staging, served as they are.
     Held { index: usize, offset: u64 },
 }
 
-/// A seekable reader over one virtual volume.
-///
-/// File handles are opened lazily and kept for the reader's life: a sequential
-/// sweep of a multi-member volume alternates between the envelope and each
-/// partial many times, and reopening per read would turn one pass into thousands
-/// of `open` calls.
-/// The bounded specialization retains one partial handle and one cipher
-/// frontier. The default specialization preserves the existing PAR2 cache.
+// A seekable reader over one virtual volume.
+//
+// File handles are opened lazily and kept for the reader's life: a sequential
+// sweep of a multi-member volume alternates between the envelope and each
+// partial many times, and reopening per read would turn one pass into thousands
+// of `open` calls.
+// The bounded specialization retains one partial handle and one cipher
+// frontier. The default specialization preserves the existing PAR2 cache.
 pub(crate) struct VirtualVolumeReader<const BOUNDED: bool = false> {
     volume: VirtualVolume,
     position: u64,
     envelope_handle: Option<File>,
     partial_handles: HashMap<u32, File>,
-    /// Per-member CBC frontier: the cipher offset the last re-encryption ended
-    /// at and the 16 cipher bytes ending there.
-    ///
-    /// This is what makes a sequential sweep of an encrypted volume linear:
-    /// every `read` continues the previous one's chain instead of seeding
-    /// itself. It also carries a *ranged* caller forward when its reads happen
-    /// to ascend, which a PAR2 slice sweep's do.
+    // Per-member CBC frontier: the cipher offset the last re-encryption ended
+    // at and the 16 cipher bytes ending there.
+    //
+    // This is what makes a sequential sweep of an encrypted volume linear:
+    // every `read` continues the previous one's chain instead of seeding
+    // itself. It also carries a *ranged* caller forward when its reads happen
+    // to ascend, which a PAR2 slice sweep's do.
     chains: HashMap<u32, CipherChain>,
     counters: Arc<CipherOverlayCounters>,
 }
 
-/// One member's CBC frontier inside a reader.
-///
-/// Two seeds, not one, because a read rarely ends on a block boundary: a
-/// sequential sweep's runs are article- and extent-shaped, so the next read
-/// usually starts *inside* the last block this one produced. `frontier` answers
-/// a read that starts where the last one stopped; `resume` answers one that
-/// re-enters the last block. Without the second, every unaligned continuation
-/// would fall back to a checkpoint and a whole-volume sweep would be quadratic.
+// One member's CBC frontier inside a reader.
+//
+// Two seeds, not one, because a read rarely ends on a block boundary: a
+// sequential sweep's runs are article- and extent-shaped, so the next read
+// usually starts *inside* the last block this one produced. `frontier` answers
+// a read that starts where the last one stopped; `resume` answers one that
+// re-enters the last block. Without the second, every unaligned continuation
+// would fall back to a checkpoint and a whole-volume sweep would be quadratic.
 #[derive(Debug, Clone, Copy)]
 struct CipherChain {
-    /// Cipher offset immediately past the last block produced.
+    // Cipher offset immediately past the last block produced.
     frontier: u64,
-    /// The 16 cipher bytes ending at `frontier`.
+    // The 16 cipher bytes ending at `frontier`.
     frontier_block: [u8; 16],
-    /// Start of the last block produced.
+    // Start of the last block produced.
     resume: u64,
-    /// The 16 cipher bytes ending at `resume` — that block's CBC predecessor.
+    // The 16 cipher bytes ending at `resume` — that block's CBC predecessor.
     resume_block: [u8; 16],
 }
 
 impl CipherChain {
-    /// The predecessor of the block starting at `block_start`, if this frontier
-    /// happens to hold it.
+    // The predecessor of the block starting at `block_start`, if this frontier
+    // happens to hold it.
     fn seed_for(&self, block_start: u64) -> Option<[u8; 16]> {
         if self.frontier == block_start {
             return Some(self.frontier_block);
@@ -586,18 +589,18 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         }
     }
 
-    /// Same: the reconstruction sweep carries its own length, so this exists for
-    /// the tests that hold the reader to a real file's `SeekFrom::End` semantics.
+    // Same: the reconstruction sweep carries its own length, so this exists for
+    // the tests that hold the reader to a real file's `SeekFrom::End` semantics.
     #[cfg(test)]
     pub(crate) fn len(&self) -> u64 {
         self.volume.len
     }
 
-    /// The member extent containing `position`, if any.
-    ///
-    /// Binary search rather than a scan: a header walk over a many-member volume
-    /// issues thousands of small reads, and a linear probe per read would make
-    /// that quadratic in the member count.
+    // The member extent containing `position`, if any.
+    //
+    // Binary search rather than a scan: a header walk over a many-member volume
+    // issues thousands of small reads, and a linear probe per read would make
+    // that quadratic in the member count.
     fn extent_at(&self, position: u64) -> Option<&MemberExtent> {
         let candidate = self
             .volume
@@ -608,13 +611,13 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         (position < extent.physical_offset.saturating_add(extent.len)).then_some(extent)
     }
 
-    /// How far the current run of the *same* source reaches: the nearest of the
-    /// volume's covered run end, the run end of the source that answers this
-    /// byte, the source's own boundary (the member extent's end, or the next
-    /// extent's start when the envelope owns these bytes), and the volume's end.
-    ///
-    /// `None` means `position` is a hole — either nothing was placed there, or
-    /// something was and no source on disk backs it.
+    // How far the current run of the *same* source reaches: the nearest of the
+    // volume's covered run end, the run end of the source that answers this
+    // byte, the source's own boundary (the member extent's end, or the next
+    // extent's start when the envelope owns these bytes), and the volume's end.
+    //
+    // `None` means `position` is a hole — either nothing was placed there, or
+    // something was and no source on disk backs it.
     fn run_end(&self, position: u64) -> Option<u64> {
         // A hold answers for itself: it is not in the coverage map, because
         // nothing placed it, and it needs no file, because it carries its bytes.
@@ -654,7 +657,7 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         )
     }
 
-    /// The held run containing `position`, with its index.
+    // The held run containing `position`, with its index.
     fn held_at(&self, position: u64) -> Option<(usize, &HeldRun)> {
         let index = self
             .volume
@@ -683,10 +686,10 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         }
     }
 
-    /// A destination file that is not there holds no bytes, which is what a hole
-    /// *is*. Reporting it as a plain `NotFound` would make a caller treat a
-    /// deleted partial as an infrastructure failure rather than as "refetch
-    /// this", which is the whole distinction [`is_hole`] exists to draw.
+    // A destination file that is not there holds no bytes, which is what a hole
+    // *is*. Reporting it as a plain `NotFound` would make a caller treat a
+    // deleted partial as an infrastructure failure rather than as "refetch
+    // this", which is the whole distinction [`is_hole`] exists to draw.
     fn open_or_hole(&self, path: &std::path::Path) -> std::io::Result<File> {
         File::open(path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -726,8 +729,8 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         }
     }
 
-    /// One member's bytes straight out of its partial, which for an unencrypted
-    /// member is what was posted.
+    // One member's bytes straight out of its partial, which for an unencrypted
+    // member is what was posted.
     fn read_member_plain(
         &mut self,
         member_id: u32,
@@ -759,18 +762,18 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
 
     // ---- The re-encrypting overlay -----------------------------------------
 
-    /// One encrypted member's **posted** bytes for `[offset, offset + out.len())`.
-    ///
-    /// Whole blocks are re-encrypted and the requested window sliced out of
-    /// them, because CBC has no smaller unit. The blocks needed are
-    /// `[floor(offset), ceil(offset + len))`, clamped at the member's cipher
-    /// size — the final one of which runs past `unpacked_size` into the retained
-    /// tail padding, which is exactly why that padding is retained.
-    ///
-    /// A read whose window *is* those blocks — which is what an aligned slice
-    /// sweep asks for — reads its plaintext straight into the caller's buffer
-    /// and encrypts it there, so the bytes are touched once instead of copied
-    /// out of a scratch `Vec` afterwards.
+    // One encrypted member's **posted** bytes for `[offset, offset + out.len())`.
+    //
+    // Whole blocks are re-encrypted and the requested window sliced out of
+    // them, because CBC has no smaller unit. The blocks needed are
+    // `[floor(offset), ceil(offset + len))`, clamped at the member's cipher
+    // size — the final one of which runs past `unpacked_size` into the retained
+    // tail padding, which is exactly why that padding is retained.
+    //
+    // A read whose window *is* those blocks — which is what an aligned slice
+    // sweep asks for — reads its plaintext straight into the caller's buffer
+    // and encrypts it there, so the bytes are touched once instead of copied
+    // out of a scratch `Vec` afterwards.
     fn read_member_cipher(
         &mut self,
         member_id: u32,
@@ -817,12 +820,12 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         Ok(out.len())
     }
 
-    /// The 16 cipher bytes immediately before `block_start`, chaining forward
-    /// from the nearest seed when no checkpoint sits exactly there.
-    ///
-    /// The chain is the *sequential path*, taken deliberately rather than
-    /// guessing a predecessor: a wrong one corrupts exactly the first block and
-    /// leaves the rest correct, which no checksum downstream could attribute.
+    // The 16 cipher bytes immediately before `block_start`, chaining forward
+    // from the nearest seed when no checkpoint sits exactly there.
+    //
+    // The chain is the *sequential path*, taken deliberately rather than
+    // guessing a predecessor: a wrong one corrupts exactly the first block and
+    // leaves the rest correct, which no checksum downstream could attribute.
     fn chain_to(
         &mut self,
         member_id: u32,
@@ -871,16 +874,16 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         Ok(preceding)
     }
 
-    /// The plaintext behind `[from, to)` of a member's cipher stream: its
-    /// partial below `unpacked_size` — with a retained edge block standing in
-    /// for a straddling block's share the partial does not hold yet — and the
-    /// retained tail padding above it.
-    ///
-    /// Refuses — as a hole, because "refetch this" is what it means — whenever a
-    /// byte of that range is not really there. The coverage test is the load
-    /// bearing one: a partial is a sparse file, so a gap reads back as zeros,
-    /// and CBC would turn those zeros into perfectly well-formed cipher for
-    /// every block from there to the member's end.
+    // The plaintext behind `[from, to)` of a member's cipher stream: its
+    // partial below `unpacked_size` — with a retained edge block standing in
+    // for a straddling block's share the partial does not hold yet — and the
+    // retained tail padding above it.
+    //
+    // Refuses — as a hole, because "refetch this" is what it means — whenever a
+    // byte of that range is not really there. The coverage test is the load
+    // bearing one: a partial is a sparse file, so a gap reads back as zeros,
+    // and CBC would turn those zeros into perfectly well-formed cipher for
+    // every block from there to the member's end.
     fn member_plaintext(
         &mut self,
         member_id: u32,
@@ -893,8 +896,8 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         Ok(plain)
     }
 
-    /// [`Self::member_plaintext`] into a buffer the caller already owns, which
-    /// is `to - from` bytes long. The allocating form is this one plus a `vec!`.
+    // [`Self::member_plaintext`] into a buffer the caller already owns, which
+    // is `to - from` bytes long. The allocating form is this one plus a `vec!`.
     fn member_plaintext_into(
         &mut self,
         member_id: u32,
@@ -947,8 +950,8 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         Ok(())
     }
 
-    /// Fills `plain` from the member's partial starting at `offset`, or refuses
-    /// when the partial ends first.
+    // Fills `plain` from the member's partial starting at `offset`, or refuses
+    // when the partial ends first.
     fn read_member_plain_exact(
         &mut self,
         member_id: u32,
@@ -965,8 +968,8 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         Ok(())
     }
 
-    /// Files both seeds a following read could want: the frontier, and the
-    /// predecessor of the last block produced.
+    // Files both seeds a following read could want: the frontier, and the
+    // predecessor of the last block produced.
     fn remember_chain(
         &mut self,
         member_id: u32,
@@ -997,7 +1000,7 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         );
     }
 
-    /// A refusal by the overlay, counted and reported as a hole.
+    // A refusal by the overlay, counted and reported as a hole.
     fn refuse(&self) -> std::io::Error {
         self.counters.refusals.fetch_add(1, Ordering::Relaxed);
         hole(self.volume.volume_index, self.position)

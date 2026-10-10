@@ -98,12 +98,12 @@ pub(crate) async fn flush_server_transfer_usage(
     }
 }
 
-/// Spawn the event-persistence subscriber and return its `JoinHandle` so the
-/// shutdown path can await the final `flush_write_queue`. `shutdown` is an
-/// explicit exit signal: the broadcast channel's senders (held by the long-lived
-/// `SchedulerHandle` and its clones in the GraphQL schema, RSS/backup/watch
-/// services, etc.) outlive the pipeline, so `rx.recv()` never observes `Closed`
-/// at shutdown — the caller notifies `shutdown` to make the task drain and exit.
+// Spawn the event-persistence subscriber and return its `JoinHandle` so the
+// shutdown path can await the final `flush_write_queue`. `shutdown` is an
+// explicit exit signal: the broadcast channel's senders (held by the long-lived
+// `SchedulerHandle` and its clones in the GraphQL schema, RSS/backup/watch
+// services, etc.) outlive the pipeline, so `rx.recv()` never observes `Closed`
+// at shutdown — the caller notifies `shutdown` to make the task drain and exit.
 pub(crate) fn spawn_event_persistence_task(
     event_rx: broadcast::Receiver<PipelineEvent>,
     db: Database,

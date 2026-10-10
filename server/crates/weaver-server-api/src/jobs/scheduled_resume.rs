@@ -67,7 +67,7 @@ impl ScheduledResumeCoordinator {
             .unwrap_or(0)
     }
 
-    /// Restore the persisted NZBGet resume deadline once during server startup.
+    // Restore the persisted NZBGet resume deadline once during server startup.
     pub async fn recover(&self) -> Result<(), ScheduledResumeError> {
         let Some(value) = Self::read_setting(self.inner.db.clone()).await? else {
             return Ok(());
@@ -117,12 +117,12 @@ impl ScheduledResumeCoordinator {
         self.set_paused(false).await
     }
 
-    /// Serialize user-initiated pause/resume operations with NZBGet timer expiry.
-    ///
-    /// Core bandwidth schedule actions update the pipeline directly and deliberately
-    /// bypass this API-layer coordinator. An armed NZBGet timer can therefore still
-    /// supersede `ScheduleAction::Pause`; moving that ownership into core is outside
-    /// this coordinator's scope.
+    // Serialize user-initiated pause/resume operations with NZBGet timer expiry.
+    //
+    // Core bandwidth schedule actions update the pipeline directly and deliberately
+    // bypass this API-layer coordinator. An armed NZBGet timer can therefore still
+    // supersede `ScheduleAction::Pause`; moving that ownership into core is outside
+    // this coordinator's scope.
     async fn set_paused(&self, paused: bool) -> Result<(), ScheduledResumeError> {
         let mut state = self.inner.state.lock().await;
         state.invalidate();

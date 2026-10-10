@@ -1,14 +1,14 @@
-//! Cross-format repair ordering and source-evidence handoff.
-//!
-//! Engine-native verdicts remain separate; shared bytes are freshly verified
-//! after the other engine repairs them. PAR2-only jobs allocate no handoff state.
+// Cross-format repair ordering and source-evidence handoff.
+//
+// Engine-native verdicts remain separate; shared bytes are freshly verified
+// after the other engine repairs them. PAR2-only jobs allocate no handoff state.
 
 use super::*;
 use par3_rs::session::RepairStatus;
 
 impl Pipeline {
-    /// A native PAR2 write retires PAR3 evidence for its write set before the
-    /// filesystem changes. Clean siblings keep their retained PAR3 evidence.
+    // A native PAR2 write retires PAR3 evidence for its write set before the
+    // filesystem changes. Clean siblings keep their retained PAR3 evidence.
     pub(in crate::pipeline) fn fence_par3_before_par2_repair(
         &mut self,
         job_id: JobId,
@@ -47,8 +47,8 @@ impl Pipeline {
         Ok(())
     }
 
-    /// A failed PAR2 ladder may hand the job to admitted PAR3 work. This does
-    /// not clear the PAR2 failure or turn a PAR3 proof into a PAR2 checksum.
+    // A failed PAR2 ladder may hand the job to admitted PAR3 work. This does
+    // not clear the PAR2 failure or turn a PAR3 proof into a PAR2 checksum.
     pub(in crate::pipeline) fn par3_has_work_after_par2_failure(&self, job_id: JobId) -> bool {
         self.par3_runtime.as_ref().is_some_and(|runtime| {
             runtime.contains_job(job_id)
@@ -65,9 +65,9 @@ impl Pipeline {
         })
     }
 
-    /// An unavailable PAR2 index has no authenticated source descriptions to
-    /// settle. It may be omitted only when current PAR3 evidence covers every
-    /// payload; an unrelated verified set cannot excuse unverified bytes.
+    // An unavailable PAR2 index has no authenticated source descriptions to
+    // settle. It may be omitted only when current PAR3 evidence covers every
+    // payload; an unrelated verified set cannot excuse unverified bytes.
     pub(in crate::pipeline) fn par3_verifies_all_payloads(&self, job_id: JobId) -> bool {
         let Some(runtime) = self.par3_runtime.as_ref() else {
             return false;
@@ -160,8 +160,8 @@ impl Pipeline {
         })
     }
 
-    /// A bound PAR3 damage report requires the selected PAR2 set to hash its
-    /// own bytes. An archive-type shortcut supplies no contradictory digest.
+    // A bound PAR3 damage report requires the selected PAR2 set to hash its
+    // own bytes. An archive-type shortcut supplies no contradictory digest.
     pub(in crate::pipeline) fn par3_requires_authoritative_par2(&self, job_id: JobId) -> bool {
         self.par3_runtime.is_some()
             && self
@@ -211,8 +211,8 @@ impl Pipeline {
         reopened
     }
 
-    /// PAR2's installed bytes are candidates for fresh PAR3 verification. A
-    /// PAR2 MD5 verdict cannot become a PAR3 fingerprint or fill an old hole.
+    // PAR2's installed bytes are candidates for fresh PAR3 verification. A
+    // PAR2 MD5 verdict cannot become a PAR3 fingerprint or fill an old hole.
     pub(in crate::pipeline) fn refresh_par3_after_par2_repair(
         &mut self,
         job_id: JobId,
@@ -241,8 +241,8 @@ impl Pipeline {
             .dispatch()
     }
 
-    /// Cross-format handoff lists share the bounded PAR3 host pool. They are
-    /// allocated only for a job already admitted to the PAR3 coordinator.
+    // Cross-format handoff lists share the bounded PAR3 host pool. They are
+    // allocated only for a job already admitted to the PAR3 coordinator.
     fn par3_bound_par2_files(
         &self,
         job_id: JobId,

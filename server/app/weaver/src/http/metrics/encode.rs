@@ -1,12 +1,12 @@
-//! Prometheus text-exposition encoder.
-//!
-//! The exporter used to be a long run of `push_str` calls that interleaved
-//! `# HELP`/`# TYPE` comments with samples by hand. That shape let a missing
-//! newline swallow a whole metric family, and it let new samples ship with no
-//! descriptor at all. Here a sample can only be written *through* its
-//! [`MetricFamily`], and the encoder emits the descriptor the first time it
-//! sees one — so "sample without HELP/TYPE" and "duplicate HELP/TYPE" are both
-//! unrepresentable.
+// Prometheus text-exposition encoder.
+//
+// The exporter used to be a long run of `push_str` calls that interleaved
+// `# HELP`/`# TYPE` comments with samples by hand. That shape let a missing
+// newline swallow a whole metric family, and it let new samples ship with no
+// descriptor at all. Here a sample can only be written *through* its
+// [`MetricFamily`], and the encoder emits the descriptor the first time it
+// sees one — so "sample without HELP/TYPE" and "duplicate HELP/TYPE" are both
+// unrepresentable.
 
 use std::collections::HashSet;
 use std::fmt::Display;
@@ -28,23 +28,23 @@ impl MetricKind {
     }
 }
 
-/// One metric family: the unit that owns a `# HELP` and a `# TYPE` line.
-///
-/// `labels` is the declared label set. It documents the family and is the
-/// thing the catalogue test checks the rendered output against; the
-/// encoder does not enforce it, because state-set families legitimately vary
-/// which label values appear.
+// One metric family: the unit that owns a `# HELP` and a `# TYPE` line.
+//
+// `labels` is the declared label set. It documents the family and is the
+// thing the catalogue test checks the rendered output against; the
+// encoder does not enforce it, because state-set families legitimately vary
+// which label values appear.
 #[derive(Debug)]
 pub(crate) struct MetricFamily {
     pub(crate) name: &'static str,
     pub(crate) kind: MetricKind,
-    /// Read by the catalogue and documentation tests rather than by rendering.
+    // Read by the catalogue and documentation tests rather than by rendering.
     #[allow(dead_code)]
     pub(crate) labels: &'static [&'static str],
     pub(crate) help: &'static str,
-    /// Set when this family is kept only for backwards compatibility. The
-    /// replacement name is appended to the rendered HELP text and drives the
-    /// naming-convention allow-list in the exposition tests.
+    // Set when this family is kept only for backwards compatibility. The
+    // replacement name is appended to the rendered HELP text and drives the
+    // naming-convention allow-list in the exposition tests.
     pub(crate) deprecated_by: Option<&'static str>,
 }
 
@@ -61,11 +61,11 @@ impl Encoder {
         }
     }
 
-    /// Emit `# HELP`/`# TYPE` for `family` unless they were already written.
-    ///
-    /// Callers rarely need this: every `sample*` entry point calls it. It is
-    /// public so a family whose samples are all conditional can still be
-    /// declared deliberately.
+    // Emit `# HELP`/`# TYPE` for `family` unless they were already written.
+    //
+    // Callers rarely need this: every `sample*` entry point calls it. It is
+    // public so a family whose samples are all conditional can still be
+    // declared deliberately.
     pub(crate) fn family(&mut self, family: &'static MetricFamily) {
         if !self.declared.insert(family.name) {
             return;
@@ -87,9 +87,9 @@ impl Encoder {
         self.out.push('\n');
     }
 
-    /// Write one sample whose value renders through [`Display`] — integers and
-    /// booleans-as-integers. Floats must use [`Encoder::sample_f64`] so that
-    /// non-finite values get their Prometheus spellings.
+    // Write one sample whose value renders through [`Display`] — integers and
+    // booleans-as-integers. Floats must use [`Encoder::sample_f64`] so that
+    // non-finite values get their Prometheus spellings.
     pub(crate) fn sample<T: Display>(
         &mut self,
         family: &'static MetricFamily,
@@ -110,13 +110,13 @@ impl Encoder {
         self.write_line(family.name, "", labels, &format_prometheus_f64(value));
     }
 
-    /// Emit a histogram family from a bucketed snapshot.
-    ///
-    /// `counts` holds the per-bucket (not cumulative) observation counts and is
-    /// one longer than `bounds`; the trailing entry is the `+Inf` overflow
-    /// bucket. This is the shape the pipeline's latency recorders produce, so
-    /// the conversion to Prometheus' cumulative `le` series lives here rather
-    /// than at every call site.
+    // Emit a histogram family from a bucketed snapshot.
+    //
+    // `counts` holds the per-bucket (not cumulative) observation counts and is
+    // one longer than `bounds`; the trailing entry is the `+Inf` overflow
+    // bucket. This is the shape the pipeline's latency recorders produce, so
+    // the conversion to Prometheus' cumulative `le` series lives here rather
+    // than at every call site.
     pub(crate) fn histogram(
         &mut self,
         family: &'static MetricFamily,

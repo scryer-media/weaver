@@ -96,7 +96,7 @@ pub struct HardwareProfileSettings {
 }
 
 impl HardwareProfileSettings {
-    /// The whole answer, resolved against one probe of the machine.
+    // The whole answer, resolved against one probe of the machine.
     pub(crate) fn resolve(selected: Option<HardwareProfile>, probe: &SystemProfile) -> Self {
         let available = HardwareProfile::available(probe);
         Self {
@@ -123,8 +123,8 @@ impl HardwareProfileSettings {
         }
     }
 
-    /// The same answer with the profile the pipeline reports in force. Without
-    /// a report, the choice or the recommendation is what is in force.
+    // The same answer with the profile the pipeline reports in force. Without
+    // a report, the choice or the recommendation is what is in force.
     pub(crate) fn with_in_force(
         mut self,
         in_force: Option<weaver_server_core::HardwareProfileInForce>,
@@ -554,8 +554,8 @@ pub struct ScheduleInput {
 }
 
 impl ScheduleInput {
-    /// The changes a `speed_limit` rule makes, global first, then each egress,
-    /// then each provider. A target named twice keeps its last value.
+    // The changes a `speed_limit` rule makes, global first, then each egress,
+    // then each provider. A target named twice keeps its last value.
     fn speed_limit_changes(
         &self,
     ) -> Result<Vec<weaver_server_core::bandwidth::SpeedLimitChange>, String> {
@@ -593,10 +593,10 @@ impl ScheduleInput {
         Ok(changes)
     }
 
-    /// Refuse a rule [`Self::into_entry`] would not build as asked. A
-    /// `hardware_profile` rule needs a profile, and one this machine can
-    /// honour: a rule that could never apply is refused by name here rather
-    /// than saved and skipped every time it fires.
+    // Refuse a rule [`Self::into_entry`] would not build as asked. A
+    // `hardware_profile` rule needs a profile, and one this machine can
+    // honour: a rule that could never apply is refused by name here rather
+    // than saved and skipped every time it fires.
     pub fn validate(&self, probe: &SystemProfile) -> Result<(), String> {
         if !matches!(
             self.action_type.as_str(),

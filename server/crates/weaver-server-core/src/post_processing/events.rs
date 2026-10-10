@@ -139,8 +139,8 @@ pub(crate) async fn script_slot(
     }
 }
 
-/// One fire-and-forget run, registered from the moment it is decided on so
-/// that a cancel reaches it while it still waits for its turn.
+// One fire-and-forget run, registered from the moment it is decided on so
+// that a cancel reaches it while it still waits for its turn.
 pub(crate) struct BackgroundRun {
     db: Database,
     runtime: std::sync::Arc<ScriptRuntime>,
@@ -213,8 +213,8 @@ pub(crate) struct ScriptRuntime {
     pub(super) effects_writer: std::sync::Mutex<()>,
     admission_hint: std::sync::Mutex<(u64, Option<AdmissionHint>)>,
     pub(super) dispatch_jobs: std::sync::Mutex<(u64, Option<super::instances::DispatchJobs>)>,
-    /// The schedule jobs the script evaluator works from, read once after
-    /// each change to the jobs rather than on every tick.
+    // The schedule jobs the script evaluator works from, read once after
+    // each change to the jobs rather than on every tick.
     pub(super) schedule_jobs: std::sync::Mutex<(
         u64,
         Option<std::sync::Arc<Vec<super::instances::ScriptInstance>>>,
@@ -283,7 +283,7 @@ impl Drop for RunRegistration {
     }
 }
 
-/// Snapshot of an event's inputs. Jobless events have no synthetic job id.
+// Snapshot of an event's inputs. Jobless events have no synthetic job id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventContext {
     pub job_id: Option<u64>,
@@ -292,13 +292,13 @@ pub struct EventContext {
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
     pub facts: CompatibilityFacts,
-    /// The instances to run in place of the ones saved for the event's
-    /// trigger. A queued event never carries any: the saved ones are read
-    /// when its turn comes.
+    // The instances to run in place of the ones saved for the event's
+    // trigger. A queued event never carries any: the saved ones are read
+    // when its turn comes.
     #[serde(skip)]
     pub instances: Option<Vec<ScriptInstance>>,
-    /// Scratch files the run reads. A script nothing waits for keeps them
-    /// until it ends, after whatever raised the event has gone on.
+    // Scratch files the run reads. A script nothing waits for keeps them
+    // until it ends, after whatever raised the event has gone on.
     #[serde(skip)]
     pub scratch: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
@@ -364,7 +364,7 @@ impl EventContext {
         }
     }
 
-    /// What weaver's own variables say about the thing the event is about.
+    // What weaver's own variables say about the thing the event is about.
     pub(super) fn weaver_env(&self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
         if let Some(job_id) = self.job_id {
@@ -388,8 +388,8 @@ impl EventContext {
     }
 }
 
-/// The instances an event runs: the ones handed to it, or the ones saved for
-/// its trigger and category.
+// The instances an event runs: the ones handed to it, or the ones saved for
+// its trigger and category.
 pub fn selected_scripts(
     db: &Database,
     context: &EventContext,
@@ -404,8 +404,8 @@ pub fn selected_scripts(
     db.script_instances_for(&context.event, context.category.as_deref())
 }
 
-/// Record whether a queue event could have anything to run, and return
-/// whether script execution is refused altogether.
+// Record whether a queue event could have anything to run, and return
+// whether script execution is refused altogether.
 pub(crate) fn refresh_admission_hint(db: &Database) -> Result<bool, StateError> {
     let (revision, cached) = *db
         .script_runtime
@@ -455,10 +455,10 @@ pub fn has_subscriber(db: &Database, context: &EventContext) -> Result<bool, Sta
     Ok(!selected_scripts(db, context)?.is_empty())
 }
 
-/// Run the event's instances in order. A scan script may move the download to
-/// another category, so the instances are read again before each one. An
-/// instance the event does not wait for is started at its place in the order
-/// and left to finish on its own; it has no part in what this returns.
+// Run the event's instances in order. A scan script may move the download to
+// another category, so the instances are read again before each one. An
+// instance the event does not wait for is started at its place in the order
+// and left to finish on its own; it has no part in what this returns.
 pub async fn run_event(
     db: &Database,
     context: &mut EventContext,
@@ -594,8 +594,8 @@ pub async fn run_event(
     Ok(results)
 }
 
-/// One instance of an event, ready to run. `script` is why it cannot, when
-/// its script is not in the scripts directory.
+// One instance of an event, ready to run. `script` is why it cannot, when
+// its script is not in the scripts directory.
 struct EntryRun {
     entry: ScriptInstance,
     script: Result<DiscoveredScript, String>,
@@ -605,8 +605,8 @@ struct EntryRun {
     background: bool,
 }
 
-/// Start an entry nothing waits for. It takes its turn among the other
-/// fire-and-forget runs and records its own result.
+// Start an entry nothing waits for. It takes its turn among the other
+// fire-and-forget runs and records its own result.
 fn spawn_background_entry(db: &Database, context: &EventContext, mut run: EntryRun) {
     let registration = BackgroundRun::register(db, context.job_id);
     let db = db.clone();
@@ -635,7 +635,7 @@ fn spawn_background_entry(db: &Database, context: &EventContext, mut run: EntryR
     });
 }
 
-/// Execute one entry and record what it did.
+// Execute one entry and record what it did.
 async fn run_entry(
     db: &Database,
     context: &mut EventContext,
@@ -817,8 +817,8 @@ async fn run_entry(
     Ok(result)
 }
 
-/// Take what the script prints and what it asks for through the API until it
-/// has ended. Both are applied here, one at a time.
+// Take what the script prints and what it asks for through the API until it
+// has ended. Both are applied here, one at a time.
 async fn consume_events(
     db: &Database,
     context: &mut EventContext,
@@ -867,8 +867,8 @@ async fn consume_events(
     }
 }
 
-/// Apply one command to what the event is about. The context is left as it
-/// was when the command is refused.
+// Apply one command to what the event is about. The context is left as it
+// was when the command is refused.
 async fn apply_to_context(
     db: &Database,
     context: &mut EventContext,
@@ -1090,8 +1090,8 @@ impl Database {
             || self.has_pending_script_admission(job_id)
     }
 
-    /// Preserve actor event order while resolving manifests and writing SQL off
-    /// the actor. Only one pending file notification per job is necessary.
+    // Preserve actor event order while resolving manifests and writing SQL off
+    // the actor. Only one pending file notification per job is necessary.
     pub(crate) fn admit_queue_script_event(
         &self,
         context: EventContext,
@@ -1192,8 +1192,8 @@ impl Database {
         self.cancel_background_scripts(job_id);
     }
 
-    /// Signal every fire-and-forget run of `job_id` to stop. Returns whether
-    /// there was one.
+    // Signal every fire-and-forget run of `job_id` to stop. Returns whether
+    // there was one.
     pub fn cancel_background_scripts(&self, job_id: u64) -> bool {
         let mut cancelled = false;
         for (job, sender) in self
@@ -1212,8 +1212,8 @@ impl Database {
         cancelled
     }
 
-    /// Resolves once no fire-and-forget run is registered. Nothing in weaver
-    /// waits on this; it exists so a test can.
+    // Resolves once no fire-and-forget run is registered. Nothing in weaver
+    // waits on this; it exists so a test can.
     #[doc(hidden)]
     pub async fn background_scripts_settled(&self) {
         loop {
@@ -1532,9 +1532,9 @@ pub async fn wait_for_event(db: &Database, run_id: &str) -> Result<(), StateErro
     }
 }
 
-/// Terminal scripts also wait for deletion/health queue events. A streamed BAD
-/// directive stops downloading immediately without racing the remaining lines
-/// of that queue run against terminal post-processing and archival.
+// Terminal scripts also wait for deletion/health queue events. A streamed BAD
+// directive stops downloading immediately without racing the remaining lines
+// of that queue run against terminal post-processing and archival.
 pub async fn wait_for_job_events(db: &Database, job_id: u64) -> Result<(), StateError> {
     wait_for_job_events_inner(db, job_id, true).await
 }

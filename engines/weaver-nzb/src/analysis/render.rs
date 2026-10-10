@@ -1,16 +1,16 @@
-//! The text form of a report: ASCII, at most 80 columns, short enough to
-//! paste into a fenced block.
+// The text form of a report: ASCII, at most 80 columns, short enough to
+// paste into a fenced block.
 
 use std::fmt::Write as _;
 
 use super::{FileSummary, NzbReport, RedFlag, anomalous_files};
 
-/// No line of the text form is wider than this.
+// No line of the text form is wider than this.
 pub const MAX_COLUMNS: usize = 80;
-/// Repeats of one red flag kind shown before the rest are summarized.
+// Repeats of one red flag kind shown before the rest are summarized.
 const MAX_FLAGS_PER_KIND: usize = 3;
-/// Archive sets, and recovery sets of each kind, shown before the rest are
-/// left to the JSON.
+// Archive sets, and recovery sets of each kind, shown before the rest are
+// left to the JSON.
 const MAX_SETS: usize = 4;
 
 pub(super) fn render(report: &NzbReport) -> String {

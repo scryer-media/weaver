@@ -202,25 +202,25 @@ pub struct CompiledMigration {
     pub filename: String,
     pub checksum_algo: ChecksumAlgorithm,
     pub checksum: Vec<u8>,
-    /// Checksums this migration would have had under the pre-canonicalization
-    /// rule, where the SQL was hashed exactly as it sat on disk.
-    ///
-    /// `checksum` is now computed over an LF-canonical body, so a build from an
-    /// LF checkout and a build from a CRLF checkout agree. Databases written
-    /// before that change recorded whichever form their build happened to
-    /// embed, so both variants stay acceptable at startup and are healed to the
-    /// canonical value in place. Empty when the body has no line breaks at all
-    /// (every variant collapses onto `checksum`).
+    // Checksums this migration would have had under the pre-canonicalization
+    // rule, where the SQL was hashed exactly as it sat on disk.
+    //
+    // `checksum` is now computed over an LF-canonical body, so a build from an
+    // LF checkout and a build from a CRLF checkout agree. Databases written
+    // before that change recorded whichever form their build happened to
+    // embed, so both variants stay acceptable at startup and are healed to the
+    // canonical value in place. Empty when the body has no line breaks at all
+    // (every variant collapses onto `checksum`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub legacy_line_ending_checksums: Vec<Vec<u8>>,
     pub steps: Vec<CompiledMigrationStep>,
 }
 
 impl CompiledMigration {
-    /// True when `checksum` (under algorithm `checksum_algo`) is a ledger value
-    /// this migration used to produce before the checksum was made independent
-    /// of line endings. Callers that accept one must rewrite the ledger to
-    /// `self.checksum`.
+    // True when `checksum` (under algorithm `checksum_algo`) is a ledger value
+    // this migration used to produce before the checksum was made independent
+    // of line endings. Callers that accept one must rewrite the ledger to
+    // `self.checksum`.
     pub(crate) fn is_legacy_line_ending_checksum(
         &self,
         checksum_algo: &str,
@@ -490,17 +490,17 @@ fn compile_migration(
     })
 }
 
-/// Which line-ending form a SQL body is hashed in.
+// Which line-ending form a SQL body is hashed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SqlLineEndings {
-    /// LF-canonical: every CRLF collapsed to LF. What `checksum` uses.
+    // LF-canonical: every CRLF collapsed to LF. What `checksum` uses.
     Canonical,
-    /// The body exactly as an LF checkout stores it. Identical to `Canonical`
-    /// in practice, and computed separately so the legacy set stays explicit
-    /// rather than implied.
+    // The body exactly as an LF checkout stores it. Identical to `Canonical`
+    // in practice, and computed separately so the legacy set stays explicit
+    // rather than implied.
     Lf,
-    /// The body as a `core.autocrlf=true` checkout stores it: every LF written
-    /// as CRLF.
+    // The body as a `core.autocrlf=true` checkout stores it: every LF written
+    // as CRLF.
     Crlf,
 }
 
@@ -514,8 +514,8 @@ impl SqlLineEndings {
     }
 }
 
-/// Drops the CR of every CRLF pair, leaving a lone CR (which `core.autocrlf`
-/// never introduces) untouched.
+// Drops the CR of every CRLF pair, leaving a lone CR (which `core.autocrlf`
+// never introduces) untouched.
 fn to_lf(sql: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(sql.len());
     let mut index = 0;
@@ -530,7 +530,7 @@ fn to_lf(sql: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Expands every LF of an already-LF-canonical body back to CRLF.
+// Expands every LF of an already-LF-canonical body back to CRLF.
 fn to_crlf(canonical: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(canonical.len());
     for byte in canonical {
@@ -629,41 +629,41 @@ pub fn checksum_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|value| format!("{value:02x}")).collect()
 }
 
-/// Historical per-migration ledger checksums that must remain acceptable after a
-/// migration's already-shipped payload is deliberately superseded in place.
-///
-/// The per-migration checksum is derived from the migration's SQL (see
-/// `compile_migration`) and is persisted in every install's `_sqlx_migrations`
-/// ledger when the migration is applied. On every subsequent startup the runners
-/// (`schema_migrations::validate_known_migrations` and
-/// `postgres_migrations::validate_known_migrations`) compare the ledger value
-/// against the freshly recomputed embedded value. Editing a released migration's
-/// payload therefore changes its checksum and would otherwise brick every install
-/// that already applied it with a "checksum mismatch" hard failure.
-///
-/// Each entry here whitelists exactly one prior `(version, algo, checksum)` for a
-/// migration whose payload we intentionally rewrote. This only ever *additionally
-/// accepts* a specific known-old value for a specific version; it never weakens
-/// detection of any other unexpected/corrupt ledger checksum.
-///
-/// Entry rationale:
-/// - v27 "history poll indexes": shipped in weaver-v0.6.9. Its Postgres backfill
-///   used `h.metadata::jsonb` / `jsonb_array_elements(...)`, which raise on
-///   corrupt (unparseable or non-array) `job_history.metadata` rows and abort the
-///   upgrade. The payload was rewritten to skip such rows (matching the SQLite
-///   payload). Because the per-migration checksum spans both the SQLite and
-///   Postgres steps, editing the Postgres step shifts the checksum for BOTH
-///   engines' installs, so this one entry protects v27 SQLite and Postgres alike.
+// Historical per-migration ledger checksums that must remain acceptable after a
+// migration's already-shipped payload is deliberately superseded in place.
+//
+// The per-migration checksum is derived from the migration's SQL (see
+// `compile_migration`) and is persisted in every install's `_sqlx_migrations`
+// ledger when the migration is applied. On every subsequent startup the runners
+// (`schema_migrations::validate_known_migrations` and
+// `postgres_migrations::validate_known_migrations`) compare the ledger value
+// against the freshly recomputed embedded value. Editing a released migration's
+// payload therefore changes its checksum and would otherwise brick every install
+// that already applied it with a "checksum mismatch" hard failure.
+//
+// Each entry here whitelists exactly one prior `(version, algo, checksum)` for a
+// migration whose payload we intentionally rewrote. This only ever *additionally
+// accepts* a specific known-old value for a specific version; it never weakens
+// detection of any other unexpected/corrupt ledger checksum.
+//
+// Entry rationale:
+// - v27 "history poll indexes": shipped in weaver-v0.6.9. Its Postgres backfill
+//   used `h.metadata::jsonb` / `jsonb_array_elements(...)`, which raise on
+//   corrupt (unparseable or non-array) `job_history.metadata` rows and abort the
+//   upgrade. The payload was rewritten to skip such rows (matching the SQLite
+//   payload). Because the per-migration checksum spans both the SQLite and
+//   Postgres steps, editing the Postgres step shifts the checksum for BOTH
+//   engines' installs, so this one entry protects v27 SQLite and Postgres alike.
 const SUPERSEDED_MIGRATION_LEDGER_CHECKSUMS: &[(i64, ChecksumAlgorithm, &str)] = &[(
     27,
     ChecksumAlgorithm::Blake3,
     "e05da91d94e32687581efb95f0cbeb0562d3aa5617d74b2d3254395f3ea1d286",
 )];
 
-/// Returns true if `checksum` (with algorithm `checksum_algo`) is an explicitly
-/// whitelisted historical ledger checksum for migration `version` whose payload
-/// was superseded in place. Used by the runners to avoid bricking installs that
-/// already applied the pre-edit payload.
+// Returns true if `checksum` (with algorithm `checksum_algo`) is an explicitly
+// whitelisted historical ledger checksum for migration `version` whose payload
+// was superseded in place. Used by the runners to avoid bricking installs that
+// already applied the pre-edit payload.
 pub(crate) fn is_superseded_migration_checksum(
     version: i64,
     checksum_algo: &str,
@@ -803,8 +803,8 @@ kind = "sql"
 file = "0021.sql"
 "#;
 
-    /// Writes a one-migration source tree whose SQL body carries `line_ending`,
-    /// standing in for the two ways a checkout can land the same commit.
+    // Writes a one-migration source tree whose SQL body carries `line_ending`,
+    // standing in for the two ways a checkout can land the same commit.
     fn line_ending_source_tree(body: &str, line_ending: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("migrations")).unwrap();

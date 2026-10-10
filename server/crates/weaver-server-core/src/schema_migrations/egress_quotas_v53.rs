@@ -1,14 +1,14 @@
-//! Migration 53, upgrade step: the bandwidth cap earlier builds kept for the
-//! whole instance becomes the download quota of the System egress.
-//!
-//! An enabled cap is copied onto egress 0 as its download quota, and the
-//! bytes the cap had already counted in its current window are carried into
-//! that egress's usage, so the quota resumes where the cap left off. The
-//! settings that held the cap are removed either way.
-//!
-//! The settings keys and the cap's stored forms are spelled out here as they
-//! stood at schema 53. The one thing borrowed from the running build is the
-//! calendar arithmetic that places a window, which the quota shares.
+// Migration 53, upgrade step: the bandwidth cap earlier builds kept for the
+// whole instance becomes the download quota of the System egress.
+//
+// An enabled cap is copied onto egress 0 as its download quota, and the
+// bytes the cap had already counted in its current window are carried into
+// that egress's usage, so the quota resumes where the cap left off. The
+// settings that held the cap are removed either way.
+//
+// The settings keys and the cap's stored forms are spelled out here as they
+// stood at schema 53. The one thing borrowed from the running build is the
+// calendar arithmetic that places a window, which the quota shares.
 
 use chrono::{DateTime, Local};
 
@@ -18,8 +18,8 @@ use crate::persistence::sql_runtime::{SqlArg, SqlConn};
 use crate::servers::{ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod};
 
 pub(crate) const HOOK_ID: &str = "move_isp_cap_to_system_egress_v53";
-/// The schema that first keeps quotas on egresses. A backup taken below it
-/// can carry the cap instead.
+// The schema that first keeps quotas on egresses. A backup taken below it
+// can carry the cap instead.
 pub(crate) const SCHEMA_VERSION: i64 = 53;
 
 const ENABLED_KEY: &str = "bandwidth_cap.enabled";
@@ -39,8 +39,8 @@ const KEYS: [&str; 6] = [
 
 const SYSTEM_EGRESS_ID: i64 = 0;
 
-/// Run the step on a connection that is already inside the transaction it
-/// belongs to.
+// Run the step on a connection that is already inside the transaction it
+// belongs to.
 pub(crate) async fn move_isp_cap_to_system_egress(
     conn: &mut SqlConn<'_>,
 ) -> Result<(), StateError> {
@@ -83,7 +83,7 @@ async fn move_at(conn: &mut SqlConn<'_>, now: DateTime<Local>) -> Result<(), Sta
     Ok(())
 }
 
-/// The saved cap, read as the download quota it becomes.
+// The saved cap, read as the download quota it becomes.
 fn saved_cap(
     saved: &std::collections::BTreeMap<String, String>,
 ) -> Option<ServerDownloadQuotaConfig> {
@@ -201,7 +201,7 @@ mod tests {
     use super::*;
     use crate::migration_assets::MigrationInstallKind;
 
-    /// A database as the build before egress quotas left it.
+    // A database as the build before egress quotas left it.
     async fn at_schema_52() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)

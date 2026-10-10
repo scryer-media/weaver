@@ -114,13 +114,13 @@ fn decode_current_yenc(payload: &BytesMut) -> usize {
     decoder.finish(output).unwrap().data.len()
 }
 
-/// Decoded byte count of a benchmark article, which is yEnc by construction.
-///
-/// The fused decoder now returns a sum type, because an article can also come
-/// back as uuencode. Every payload these benchmarks build carries a `=ybegin`,
-/// so the yEnc arm is the only reachable one — and asserting that keeps the
-/// uuencode sniffer honest: if it ever claimed one of these articles, the
-/// benchmark would fail rather than quietly measure a different decoder.
+// Decoded byte count of a benchmark article, which is yEnc by construction.
+//
+// The fused decoder now returns a sum type, because an article can also come
+// back as uuencode. Every payload these benchmarks build carries a `=ybegin`,
+// so the yEnc arm is the only reachable one — and asserting that keeps the
+// uuencode sniffer honest: if it ever claimed one of these articles, the
+// benchmark would fail rather than quietly measure a different decoder.
 fn fused_yenc_bytes_written(article: &FusedYencArticle) -> usize {
     article
         .body

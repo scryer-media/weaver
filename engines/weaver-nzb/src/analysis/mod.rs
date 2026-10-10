@@ -1,16 +1,16 @@
-//! Offline analysis of an NZB into a report that is safe to paste in public.
-//!
-//! An NZB cannot be shared where support happens, yet nearly every question
-//! about a failed download is a question about the NZB: how it is laid out,
-//! what is missing from it, how much recovery data it carries. [`NzbReport`]
-//! answers those questions without carrying the NZB.
-//!
-//! Redaction is a property of the types, not of a filter run afterwards. No
-//! field in this module can hold a subject, message-ID, poster, group, file
-//! name, URL or password: every string in a report is either a compile-time
-//! constant or a token Weaver generates (`f03`, `a1`, `p1`). Anything that
-//! identifies the content is dropped, counted, bucketed, or replaced by such a
-//! token, and the fingerprint is a one-way digest of the message-IDs.
+// Offline analysis of an NZB into a report that is safe to paste in public.
+//
+// An NZB cannot be shared where support happens, yet nearly every question
+// about a failed download is a question about the NZB: how it is laid out,
+// what is missing from it, how much recovery data it carries. [`NzbReport`]
+// answers those questions without carrying the NZB.
+//
+// Redaction is a property of the types, not of a filter run afterwards. No
+// field in this module can hold a subject, message-ID, poster, group, file
+// name, URL or password: every string in a report is either a compile-time
+// constant or a token Weaver generates (`f03`, `a1`, `p1`). Anything that
+// identifies the content is dropped, counted, bucketed, or replaced by such a
+// token, and the fingerprint is a one-way digest of the message-IDs.
 
 mod classify;
 mod render;
@@ -33,21 +33,21 @@ use self::classify::{
     name_mentions_password, par_base_name, parse_subject_numbers, poster_tool, stem_class,
 };
 
-/// Bumped whenever a field changes meaning or disappears.
+// Bumped whenever a field changes meaning or disappears.
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
 
-/// A recovery set below this share of its protected bytes is thin anywhere.
+// A recovery set below this share of its protected bytes is thin anywhere.
 const THIN_RECOVERY_PERMILLE: u32 = 10;
-/// Below this share, a post old enough to have lost articles is thin too.
+// Below this share, a post old enough to have lost articles is thin too.
 const STALE_RECOVERY_PERMILLE: u32 = 50;
-/// Age past which articles are routinely gone from some providers.
+// Age past which articles are routinely gone from some providers.
 const STALE_AGE_DAYS: u64 = 365;
-/// Age past which a post is near the edge of the longest retention on offer.
+// Age past which a post is near the edge of the longest retention on offer.
 const RETENTION_EDGE_DAYS: u64 = 4_000;
-/// The anomalous-file listing is for a human reading a paste, not a dump.
+// The anomalous-file listing is for a human reading a paste, not a dump.
 const MAX_LISTED_FILES: usize = 10;
 
-/// A report about one NZB. See the module documentation for what it may hold.
+// A report about one NZB. See the module documentation for what it may hold.
 #[derive(Debug, Clone, Serialize)]
 pub struct NzbReport {
     pub identity: Identity,
@@ -58,17 +58,17 @@ pub struct NzbReport {
     pub files: Vec<FileSummary>,
 }
 
-/// What lets two reports of the same NZB be matched, and what produced them.
+// What lets two reports of the same NZB be matched, and what produced them.
 #[derive(Debug, Clone, Serialize)]
 pub struct Identity {
     pub schema_version: u32,
-    /// BLAKE3 over the sorted, de-duplicated message-IDs, truncated to 128 bits.
+    // BLAKE3 over the sorted, de-duplicated message-IDs, truncated to 128 bits.
     pub fingerprint: Fingerprint,
-    /// Filled in by whoever runs the analysis inside Weaver.
+    // Filled in by whoever runs the analysis inside Weaver.
     pub weaver_version: Option<&'static str>,
 }
 
-/// A one-way digest that correlates reports of the same NZB.
+// A one-way digest that correlates reports of the same NZB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fingerprint([u8; 16]);
 
@@ -99,7 +99,7 @@ impl Serialize for Fingerprint {
     }
 }
 
-/// A file's stand-in in the report: `f01` is the first file in the NZB.
+// A file's stand-in in the report: `f01` is the first file in the NZB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileToken(u32);
 
@@ -115,7 +115,7 @@ impl Serialize for FileToken {
     }
 }
 
-/// An archive or recovery set's stand-in: `a1`, `p1`, `q1`.
+// An archive or recovery set's stand-in: `a1`, `p1`, `q1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetToken {
     prefix: SetPrefix,
@@ -146,13 +146,13 @@ impl Serialize for SetToken {
     }
 }
 
-/// Counts and sizes over the whole NZB.
+// Counts and sizes over the whole NZB.
 #[derive(Debug, Clone, Serialize)]
 pub struct Shape {
     pub file_count: u32,
-    /// `<file>` elements with no usable segment, which a download never sees.
+    // `<file>` elements with no usable segment, which a download never sees.
     pub files_without_segments: u32,
-    /// The highest `[NN/MM]` file total any subject declares.
+    // The highest `[NN/MM]` file total any subject declares.
     pub declared_file_count: Option<u32>,
     pub segment_count: u64,
     pub summed_bytes: u64,
@@ -162,28 +162,28 @@ pub struct Shape {
     pub invalid_dates: u32,
     pub group_count: u32,
     pub poster_count: u32,
-    /// Files whose subject declares a segment count other than the one listed.
+    // Files whose subject declares a segment count other than the one listed.
     pub segment_count_mismatch_files: u32,
-    /// Files with holes in their segment numbering, and the holes in total.
+    // Files with holes in their segment numbering, and the holes in total.
     pub files_missing_segments: u32,
     pub missing_segments: u64,
     pub malformed_segments: u64,
-    /// Segments a file listed twice, by number or by message-ID.
+    // Segments a file listed twice, by number or by message-ID.
     pub duplicate_segments: u64,
-    /// Message-IDs that more than one file lists.
+    // Message-IDs that more than one file lists.
     pub shared_message_ids: u64,
-    /// Files that repeat an earlier file's segments outright.
+    // Files that repeat an earlier file's segments outright.
     pub duplicate_files: u32,
     pub out_of_order_files: u32,
 }
 
-/// Sizes declared in subjects against the segment sizes summed for them.
+// Sizes declared in subjects against the segment sizes summed for them.
 #[derive(Debug, Clone, Serialize)]
 pub struct DeclaredBytes {
     pub files: u32,
     pub declared: u64,
     pub summed: u64,
-    /// Files whose segments sum to less than the subject declares.
+    // Files whose segments sum to less than the subject declares.
     pub short_files: u32,
 }
 
@@ -192,12 +192,12 @@ pub struct SegmentSizes {
     pub min: u32,
     pub median: u32,
     pub max: u32,
-    /// The most frequent size, and its share of all segments in permille.
+    // The most frequent size, and its share of all segments in permille.
     pub common: u32,
     pub common_permille: u32,
 }
 
-/// Posting dates, relative to the analysis time so no timestamp is kept.
+// Posting dates, relative to the analysis time so no timestamp is kept.
 #[derive(Debug, Clone, Serialize)]
 pub struct PostedRange {
     pub oldest_age_days: u64,
@@ -205,7 +205,7 @@ pub struct PostedRange {
     pub span_secs: u64,
 }
 
-/// How the files fit together.
+// How the files fit together.
 #[derive(Debug, Clone, Serialize)]
 pub struct Layout {
     pub payload: PayloadKind,
@@ -213,7 +213,7 @@ pub struct Layout {
     pub par2_sets: Vec<RecoverySet>,
     pub par3_sets: Vec<RecoverySet>,
     pub extras: Extras,
-    /// Archive sets whose own name ends in another archive's extension.
+    // Archive sets whose own name ends in another archive's extension.
     pub nested_archive_sets: u32,
     pub unclassified_files: u32,
     pub obfuscation: Obfuscation,
@@ -270,12 +270,12 @@ pub struct ArchiveSet {
     pub kind: ArchiveKind,
     pub scheme: NameShape,
     pub volumes: u32,
-    /// Lowest and highest zero-based volume number present.
+    // Lowest and highest zero-based volume number present.
     pub first_volume: u32,
     pub last_volume: u32,
-    /// Volume numbers absent between zero and the highest present.
+    // Volume numbers absent between zero and the highest present.
     pub missing_volumes: u32,
-    /// Volume numbers listed by more than one file.
+    // Volume numbers listed by more than one file.
     pub repeated_volumes: u32,
     pub bytes: u64,
     pub stem: StemClass,
@@ -287,15 +287,15 @@ pub struct RecoverySet {
     pub token: SetToken,
     pub has_index: bool,
     pub volumes: u32,
-    /// Recovery blocks the volume names declare. PAR3 names carry none.
+    // Recovery blocks the volume names declare. PAR3 names carry none.
     pub declared_blocks: u32,
     pub bytes: u64,
     pub recovery_bytes: u64,
-    /// The files this set appears to protect, matched by name.
+    // The files this set appears to protect, matched by name.
     pub protected_files: u32,
     pub protected_bytes: u64,
-    /// Recovery bytes over protected bytes, in permille. An estimate from
-    /// posted sizes: block size and packet overhead are not visible here.
+    // Recovery bytes over protected bytes, in permille. An estimate from
+    // posted sizes: block size and packet overhead are not visible here.
     pub estimated_recovery_permille: Option<u32>,
     pub files: Vec<FileToken>,
 }
@@ -315,13 +315,13 @@ pub struct Extras {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObfuscationLevel {
-    /// Readable names in every subject.
+    // Readable names in every subject.
     None,
-    /// Some readable names, some hashed or missing.
+    // Some readable names, some hashed or missing.
     Partial,
-    /// Names are present but hashed or random.
+    // Names are present but hashed or random.
     HashedNames,
-    /// No subject carries a name; it exists only in the yEnc header.
+    // No subject carries a name; it exists only in the yEnc header.
     NamesInYencOnly,
 }
 
@@ -350,14 +350,14 @@ pub struct PasswordSignals {
     pub in_name: bool,
 }
 
-/// What the message-IDs and posters say about the posting tool.
+// What the message-IDs and posters say about the posting tool.
 #[derive(Debug, Clone, Serialize)]
 pub struct PosterSignals {
     pub tool: PosterTool,
     pub message_id_domains: DomainSpread,
 }
 
-/// One file, by token.
+// One file, by token.
 #[derive(Debug, Clone, Serialize)]
 pub struct FileSummary {
     pub token: FileToken,
@@ -393,7 +393,7 @@ impl FileSummary {
     }
 }
 
-/// One finding worth reading first.
+// One finding worth reading first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RedFlag {
@@ -441,25 +441,25 @@ pub enum RedFlag {
 }
 
 impl NzbReport {
-    /// Pretty JSON, for the download button and `--json`.
+    // Pretty JSON, for the download button and `--json`.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("report types always serialize")
     }
 
-    /// The compact text form, meant to be pasted inside a fenced block.
+    // The compact text form, meant to be pasted inside a fenced block.
     pub fn to_text(&self) -> String {
         render::render(self)
     }
 
-    /// Record which Weaver produced this report.
+    // Record which Weaver produced this report.
     pub fn with_weaver_version(mut self, version: &'static str) -> Self {
         self.identity.weaver_version = Some(version);
         self
     }
 }
 
-/// Analyze a parsed NZB. `now_epoch_secs` is the instant posting ages are
-/// measured from; it is an argument so the analysis stays a pure function.
+// Analyze a parsed NZB. `now_epoch_secs` is the instant posting ages are
+// measured from; it is an argument so the analysis stays a pure function.
 pub fn analyze(nzb: &Nzb, diagnostics: &ParseDiagnostics, now_epoch_secs: u64) -> NzbReport {
     let files = analyze_files(nzb, diagnostics);
     let shape = shape(nzb, diagnostics, &files, now_epoch_secs);
@@ -492,8 +492,8 @@ pub fn analyze(nzb: &Nzb, diagnostics: &ParseDiagnostics, now_epoch_secs: u64) -
     }
 }
 
-/// Everything known about one file, before it is reduced to a summary. This
-/// borrows from the NZB and never leaves the module.
+// Everything known about one file, before it is reduced to a summary. This
+// borrows from the NZB and never leaves the module.
 struct AnalyzedFile<'a> {
     token: FileToken,
     file: &'a NzbFile,
@@ -571,8 +571,8 @@ fn analyze_files<'a>(nzb: &'a Nzb, diagnostics: &ParseDiagnostics) -> Vec<Analyz
         .collect()
 }
 
-/// The part of a name that identifies its set, without volume or archive
-/// suffixes. Only ever classified, never reported.
+// The part of a name that identifies its set, without volume or archive
+// suffixes. Only ever classified, never reported.
 fn set_stem(name: &str, role: &FileRole) -> String {
     match role {
         FileRole::Par2 { .. } | FileRole::Par3 { .. } => par_base_name(name).to_string(),
@@ -1159,7 +1159,7 @@ fn red_flags(shape: &Shape, layout: &Layout) -> Vec<RedFlag> {
     flags
 }
 
-/// The files worth naming in the text form, by token.
+// The files worth naming in the text form, by token.
 fn anomalous_files(report: &NzbReport) -> impl Iterator<Item = &FileSummary> {
     report
         .files

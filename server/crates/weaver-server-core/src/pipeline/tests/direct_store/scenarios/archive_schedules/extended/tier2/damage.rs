@@ -1,40 +1,40 @@
-//! The damage axis: articles that arrive wrong rather than not at all.
-//!
-//! A cell is a damage kind, where it lands, how many articles carry it, the
-//! recovery posted beside the set, and the container. The fixtures are the
-//! field's shape at one thousandth of its size: 768-byte articles over
-//! 1,048-byte PAR2 slices (768,000 over 1 MiB), so an article straddles a
-//! slice boundary, and four volumes of 32 articles, so the first 16 KiB of a
-//! volume is a run of articles of its own.
+// The damage axis: articles that arrive wrong rather than not at all.
+//
+// A cell is a damage kind, where it lands, how many articles carry it, the
+// recovery posted beside the set, and the container. The fixtures are the
+// field's shape at one thousandth of its size: 768-byte articles over
+// 1,048-byte PAR2 slices (768,000 over 1 MiB), so an article straddles a
+// slice boundary, and four volumes of 32 articles, so the first 16 KiB of a
+// volume is a run of articles of its own.
 use super::fixtures::{Container, payload};
 use super::post::{DAMAGES, Damage, Post, Posted, Role, Wire};
 use super::recovery::{self, Code, Geometry, Margin, Par2Volumes};
 use super::*;
 
-/// Decoded bytes per article.
+// Decoded bytes per article.
 pub(in super::super) const ARTICLE: usize = 768;
-/// PAR2 slice: 1 MiB at a thousandth, rounded to a multiple of four.
+// PAR2 slice: 1 MiB at a thousandth, rounded to a multiple of four.
 const SLICE: usize = 1048;
-/// PAR3 block.
+// PAR3 block.
 const BLOCK: usize = 1024;
 const VOLUMES: usize = 4;
 const ARTICLES_PER_VOLUME: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Location {
-    /// The first 16 KiB of volume 0, where the archive's headers live.
+    // The first 16 KiB of volume 0, where the archive's headers live.
     FirstVolumeHead,
-    /// The first 16 KiB of a middle volume.
+    // The first 16 KiB of a middle volume.
     MiddleVolumeHead,
-    /// The middle of a volume's data.
+    // The middle of a volume's data.
     MidVolume,
-    /// Articles that straddle a recovery-slice boundary.
+    // Articles that straddle a recovery-slice boundary.
     SliceStraddle,
-    /// The tail of the last volume, where the end header lives.
+    // The tail of the last volume, where the end header lives.
     LastVolumeTail,
-    /// The recovery index.
+    // The recovery index.
     RecoveryIndex,
-    /// A recovery volume.
+    // A recovery volume.
     RecoveryVolume,
 }
 
@@ -50,15 +50,15 @@ const LOCATIONS: [Location; 7] = [
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in super::super) enum Pattern {
-    /// Two articles in one volume.
+    // Two articles in one volume.
     Two,
-    /// Twelve articles, four in each of three volumes.
+    // Twelve articles, four in each of three volumes.
     TwelveAcrossThree,
-    /// A hundred contiguous articles.
+    // A hundred contiguous articles.
     Hundred,
-    /// Every article of one volume but its first and last.
+    // Every article of one volume but its first and last.
     MostOfOne,
-    /// A whole file absent, and one article damaged elsewhere.
+    // A whole file absent, and one article damaged elsewhere.
     MemberAbsent,
 }
 
@@ -73,7 +73,7 @@ pub(in super::super) const PATTERNS: [Pattern; 5] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Recovery {
     Par2(Margin),
-    /// PAR3 with margin, its code alternating between cells.
+    // PAR3 with margin, its code alternating between cells.
     Par3,
     None,
 }
@@ -102,8 +102,8 @@ pub(super) struct DamageCell {
     pub container: Container,
 }
 
-/// Whether a single job can present the cell: damage to a recovery file
-/// needs a recovery set to be posted.
+// Whether a single job can present the cell: damage to a recovery file
+// needs a recovery set to be posted.
 fn possible(cell: DamageCell) -> bool {
     !(cell.recovery == Recovery::None
         && matches!(
@@ -137,11 +137,11 @@ pub(super) fn cells() -> Vec<DamageCell> {
     cells
 }
 
-/// Schedules each (cell, profile) unit samples from the matrix's smoke
-/// schedules.
+// Schedules each (cell, profile) unit samples from the matrix's smoke
+// schedules.
 const PER_UNIT: usize = 283;
 
-/// 15,840 possible cells under three profiles, 283 schedules each.
+// 15,840 possible cells under three profiles, 283 schedules each.
 pub(super) const TOTAL: usize = 4_482_720;
 
 pub(super) fn family() -> Family<DamageCell> {
@@ -160,9 +160,9 @@ pub(super) fn family() -> Family<DamageCell> {
     }
 }
 
-/// The articles a pattern names, starting in `files` (the files of one
-/// role, in posted order) at `first` and article `start`, or counted back
-/// from the end of the last one.
+// The articles a pattern names, starting in `files` (the files of one
+// role, in posted order) at `first` and article `start`, or counted back
+// from the end of the last one.
 pub(in super::super) fn place(
     post: &Post,
     files: &[usize],
@@ -242,8 +242,8 @@ pub(in super::super) fn place(
     }
 }
 
-/// The first article of `file` at or after its middle third whose bytes
-/// cross a `slice` boundary.
+// The first article of `file` at or after its middle third whose bytes
+// cross a `slice` boundary.
 fn straddling(posted: &Posted, slice: usize) -> u32 {
     (posted.articles() / 3..posted.articles())
         .find(|&article| {
@@ -253,7 +253,7 @@ fn straddling(posted: &Posted, slice: usize) -> u32 {
         .unwrap_or(0)
 }
 
-/// Marks the cell's damage on the files its location names.
+// Marks the cell's damage on the files its location names.
 fn damage(post: &mut Post, cell: DamageCell, recovery_files: bool) {
     let data = post.index_of(Role::Data);
     let (files, first, start, backward) = match cell.location {
@@ -336,8 +336,8 @@ impl DamageCell {
     }
 }
 
-/// Authors the recovery set for `post` so the blocks that survive its own
-/// damage meet `margin`, rebuilding until the set's layout settles.
+// Authors the recovery set for `post` so the blocks that survive its own
+// damage meet `margin`, rebuilding until the set's layout settles.
 pub(in super::super) fn with_recovery(
     mut post: Post,
     lost: impl Fn(&Post) -> BTreeMap<usize, BTreeSet<u32>>,
@@ -448,7 +448,7 @@ impl Cell for DamageCell {
     }
 }
 
-/// The defects each cell and profile is held open for.
+// The defects each cell and profile is held open for.
 fn open_defect(cell: DamageCell, profile: ExtractionProfile) -> Option<Defect> {
     if cell.recovery == Recovery::Par3
         && cell.container == Container::SevenZip
@@ -461,8 +461,8 @@ fn open_defect(cell: DamageCell, profile: ExtractionProfile) -> Option<Defect> {
     None
 }
 
-/// A demotion refetch re-publishes a PAR3 source whose retained assessment is
-/// Ready, and the job fails instead of re-assessing it.
+// A demotion refetch re-publishes a PAR3 source whose retained assessment is
+// Ready, and the job fails instead of re-assessing it.
 const PAR3_SOURCE_CHANGED_AFTER_DEMOTION: &str = "PAR3: after a demotion refetch the job fails with \"PAR3 source changed\" instead of re-assessing";
 
 macro_rules! damage_smokes {
@@ -525,7 +525,7 @@ mod damage_loss_smoke {
     }
 }
 
-/// The campaign: 4,500 shards of about a thousand cases.
+// The campaign: 4,500 shards of about a thousand cases.
 mod combined_damage {
     use super::*;
 

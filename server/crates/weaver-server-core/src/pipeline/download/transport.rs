@@ -1,71 +1,71 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Latency bands. A band picks the starting rung, labels a server in the UI,
-/// and labels a connection test. It never gates a depth on its own: the depth
-/// comes from the measured latency/transfer ratio.
+// Latency bands. A band picks the starting rung, labels a server in the UI,
+// and labels a connection test. It never gates a depth on its own: the depth
+// comes from the measured latency/transfer ratio.
 pub(crate) const LATENCY_BAND_GOOD_MAX: Duration = Duration::from_millis(400);
 pub(crate) const LATENCY_BAND_MODERATE_MAX: Duration = Duration::from_millis(800);
 
-/// Depths the explorer will actually run. `1` is sequential; a failure drops
-/// off the bottom of the pipelined rungs onto it.
+// Depths the explorer will actually run. `1` is sequential; a failure drops
+// off the bottom of the pipelined rungs onto it.
 const RUNGS: [u8; 4] = [1, 2, 4, 8];
 const MIN_TARGET_DEPTH: u32 = 2;
 const MAX_TARGET_DEPTH: u32 = 8;
 
-/// Clean responses observed at one rung before the explorer acts on what it
-/// measured there. Also bounds rung changes to one per window.
+// Clean responses observed at one rung before the explorer acts on what it
+// measured there. Also bounds rung changes to one per window.
 const RUNG_WINDOW_RESPONSES: u64 = 32;
 
-/// Responses in each of the first [`RUNG_WARMUP_WINDOWS`] windows.
-///
-/// A server the lanes have never measured has no article transfer time and so
-/// no depth target at all, and thirty-two responses is a long time to wait for
-/// one: a job of a few hundred articles can be most of the way finished before
-/// the first window closes, which is the whole download running at the seeded
-/// rung. Eight is enough for a median body size and a wire rate — the two
-/// halves the depth model divides — while costing a fraction of the job.
+// Responses in each of the first [`RUNG_WARMUP_WINDOWS`] windows.
+//
+// A server the lanes have never measured has no article transfer time and so
+// no depth target at all, and thirty-two responses is a long time to wait for
+// one: a job of a few hundred articles can be most of the way finished before
+// the first window closes, which is the whole download running at the seeded
+// rung. Eight is enough for a median body size and a wire rate — the two
+// halves the depth model divides — while costing a fraction of the job.
 const RUNG_WARMUP_WINDOW_RESPONSES: u64 = 8;
 
-/// How many short windows a fresh explorer runs: one to measure the link and
-/// pick a rung, one to judge the rung it picked. After that the full window
-/// applies, because by then the depth is settled and the only question left is
-/// whether the link has changed.
+// How many short windows a fresh explorer runs: one to measure the link and
+// pick a rung, one to judge the rung it picked. After that the full window
+// applies, because by then the depth is settled and the only question left is
+// whether the link has changed.
 const RUNG_WARMUP_WINDOWS: u8 = 2;
 
-/// Status-line waits held before their minimum folds into the round-trip
-/// estimate, independently of the rung window. Matches the short warm-up
-/// window, so a server whose rung window never closes refreshes its round
-/// trip about as often as one whose window is still short.
+// Status-line waits held before their minimum folds into the round-trip
+// estimate, independently of the rung window. Matches the short warm-up
+// window, so a server whose rung window never closes refreshes its round
+// trip about as often as one whose window is still short.
 const LATENCY_FOLD_SAMPLES: u32 = RUNG_WARMUP_WINDOW_RESPONSES as u32;
 
-/// A rung is only kept when it beats the rung below it by this much; anything
-/// less is noise on a shared link.
+// A rung is only kept when it beats the rung below it by this much; anything
+// less is noise on a shared link.
 const RUNG_KEEP_THROUGHPUT_RATIO: f64 = 1.05;
 
-/// How long a server is left alone after a revert or an unclean batch.
+// How long a server is left alone after a revert or an unclean batch.
 const RUNG_HOLD: Duration = Duration::from_secs(10 * 60);
 
-/// Body sizes kept for the median the depth formula divides by.
-///
-/// A median, not a mean: a file's last article is a fraction of the others and
-/// a PAR2 index is a fraction again, and either one drags a mean far enough to
-/// ask for a rung the link does not need. Sixteen samples is half a rung window
-/// — enough to be steady, short enough to follow a job whose article size
-/// genuinely changed.
+// Body sizes kept for the median the depth formula divides by.
+//
+// A median, not a mean: a file's last article is a fraction of the others and
+// a PAR2 index is a fraction again, and either one drags a mean far enough to
+// ask for a rung the link does not need. Sixteen samples is half a rung window
+// — enough to be steady, short enough to follow a job whose article size
+// genuinely changed.
 const BODY_SIZE_SAMPLES: usize = 16;
 
-/// The bandwidth-delay depth: how many BODY requests must be outstanding for a
-/// lane to have something arriving for the whole round trip.
-///
-/// `1 + ceil(rtt / article_transfer)` — one request being served, plus enough
-/// queued behind it to cover the wait for the next status line. At the bench's
-/// 100 ms round trip with a 750 KiB article taking 25 ms on the wire, that is
-/// `1 + ceil(100/25) = 5`, which the ladder rounds up to 8; with an article
-/// that takes as long as the round trip it is 2, and pipelining buys almost
-/// nothing.
-///
-/// Returned unclamped so the caller decides which ladder it is walking.
+// The bandwidth-delay depth: how many BODY requests must be outstanding for a
+// lane to have something arriving for the whole round trip.
+//
+// `1 + ceil(rtt / article_transfer)` — one request being served, plus enough
+// queued behind it to cover the wait for the next status line. At the bench's
+// 100 ms round trip with a 750 KiB article taking 25 ms on the wire, that is
+// `1 + ceil(100/25) = 5`, which the ladder rounds up to 8; with an article
+// that takes as long as the round trip it is 2, and pipelining buys almost
+// nothing.
+//
+// Returned unclamped so the caller decides which ladder it is walking.
 fn bandwidth_delay_depth(rtt: Duration, article_transfer: Duration) -> u32 {
     if article_transfer.is_zero() {
         // An article that costs no measurable time is all round trip.
@@ -78,13 +78,13 @@ fn bandwidth_delay_depth(rtt: Duration, article_transfer: Duration) -> u32 {
     (ratio.ceil() as u32).saturating_add(1)
 }
 
-/// The wire time one article costs at a measured per-lane rate.
-///
-/// This is the `median body bytes / per-lane rate` half of the depth formula.
-/// The rate handed in must be bytes over wire time — the caller's
-/// `window_wire_rate_bps` — so that the idle round trips the depth exists to
-/// fill are not part of the divisor; deepening a lane then cannot inflate its
-/// own target, and a shallow lane cannot talk itself out of the depth it needs.
+// The wire time one article costs at a measured per-lane rate.
+//
+// This is the `median body bytes / per-lane rate` half of the depth formula.
+// The rate handed in must be bytes over wire time — the caller's
+// `window_wire_rate_bps` — so that the idle round trips the depth exists to
+// fill are not part of the divisor; deepening a lane then cannot inflate its
+// own target, and a shallow lane cannot talk itself out of the depth it needs.
 fn article_transfer_time(median_body_bytes: u64, throughput_bps: f64) -> Option<Duration> {
     if median_body_bytes == 0 || !throughput_bps.is_finite() || throughput_bps <= 0.0 {
         return None;
@@ -152,8 +152,8 @@ impl LatencyBand {
         }
     }
 
-    /// Where a server with no measurement of its own starts. A further-away
-    /// server has more round trip to hide, so it starts deeper.
+    // Where a server with no measurement of its own starts. A further-away
+    // server has more round trip to hide, so it starts deeper.
     pub(crate) fn starting_depth(self) -> u8 {
         match self {
             Self::Good => 2,
@@ -173,19 +173,19 @@ pub(crate) enum LaneParkReason {
     Error,
 }
 
-/// What the explorer decided at the end of a window, for the one log line a
-/// rung change is allowed to write.
+// What the explorer decided at the end of a window, for the one log line a
+// rung change is allowed to write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RungChange {
-    /// Moved one rung toward the physical target.
+    // Moved one rung toward the physical target.
     Stepped { from: u8, to: u8 },
-    /// The step up paid for itself and is now the baseline.
+    // The step up paid for itself and is now the baseline.
     Kept { depth: u8 },
-    /// The step up did not pay for itself; back one rung and hold.
+    // The step up did not pay for itself; back one rung and hold.
     Reverted { from: u8, to: u8 },
-    /// An unclean pipelined batch cost a rung.
+    // An unclean pipelined batch cost a rung.
     Dropped { from: u8, to: u8 },
-    /// A second unclean batch inside the hold: this server does not pipeline.
+    // A second unclean batch inside the hold: this server does not pipeline.
     PinnedSequential,
 }
 
@@ -196,7 +196,7 @@ fn rung_index(depth: u8) -> usize {
         .unwrap_or_else(|| RUNGS.iter().filter(|rung| **rung <= depth).count().max(1) - 1)
 }
 
-/// The lowest rung that covers `depth`, so a physical target of 3 asks for 4.
+// The lowest rung that covers `depth`, so a physical target of 3 asks for 4.
 fn rung_at_or_above(depth: u8) -> u8 {
     RUNGS
         .iter()
@@ -205,12 +205,12 @@ fn rung_at_or_above(depth: u8) -> u8 {
         .unwrap_or(*RUNGS.last().expect("rung ladder is not empty"))
 }
 
-/// Per-server depth explorer.
-///
-/// It holds two measurements the lanes take apart for it — how long a request
-/// waits for its status line, and how long the article itself takes on the
-/// wire — and walks the rung ladder toward the depth that would keep the link
-/// busy, keeping a rung only when it measurably paid for itself.
+// Per-server depth explorer.
+//
+// It holds two measurements the lanes take apart for it — how long a request
+// waits for its status line, and how long the article itself takes on the
+// wire — and walks the rung ladder toward the depth that would keep the link
+// busy, keeping a rung only when it measurably paid for itself.
 #[derive(Debug, Clone)]
 pub(crate) struct ServerPipelineExplorer {
     supports_pipelining: bool,
@@ -218,56 +218,56 @@ pub(crate) struct ServerPipelineExplorer {
     latency: Option<Duration>,
     transfer: Option<Duration>,
     current_depth: u8,
-    /// Rung the current window is being compared against, and its throughput.
+    // Rung the current window is being compared against, and its throughput.
     baseline_depth: Option<u8>,
     baseline_throughput_bps: Option<f64>,
-    /// Set while the current rung is a step up still on trial.
+    // Set while the current rung is a step up still on trial.
     on_trial: bool,
-    /// Set until the explorer has moved to — or found itself already sitting
-    /// on — the rung its own measurements ask for. The first move goes
-    /// straight there; every later one walks the ladder a rung at a time.
+    // Set until the explorer has moved to — or found itself already sitting
+    // on — the rung its own measurements ask for. The first move goes
+    // straight there; every later one walks the ladder a rung at a time.
     first_climb_pending: bool,
-    /// Short windows left before the full window length applies.
+    // Short windows left before the full window length applies.
     warmup_windows_left: u8,
-    /// Every response folded into this window, at the current rung or below.
+    // Every response folded into this window, at the current rung or below.
     window_responses: u64,
-    /// Shortest status-line wait any lane measured on a request it issued
-    /// alone during this window, split by whether the connection had already
-    /// delivered an article before. The minimum is the round trip; the mean of
-    /// the same samples carries server think time, a re-authentication after
-    /// an idle spell, or whatever else queued ahead of the status line, and
-    /// each of those asks for depth the link cannot use.
+    // Shortest status-line wait any lane measured on a request it issued
+    // alone during this window, split by whether the connection had already
+    // delivered an article before. The minimum is the round trip; the mean of
+    // the same samples carries server think time, a re-authentication after
+    // an idle spell, or whatever else queued ahead of the status line, and
+    // each of those asks for depth the link cannot use.
     window_latency_warm_min: Option<Duration>,
     window_latency_cold_min: Option<Duration>,
-    /// Status-line waits held since the last fold, warm and cold.
+    // Status-line waits held since the last fold, warm and cold.
     window_latency_samples: u32,
-    /// Bytes and wire time of every response in the window, whatever rung it
-    /// was issued at. These feed the link model — body size and wire rate —
-    /// which describes the link rather than the depth, so a lane still
-    /// draining a shallower lease is a perfectly good sample for it.
+    // Bytes and wire time of every response in the window, whatever rung it
+    // was issued at. These feed the link model — body size and wire rate —
+    // which describes the link rather than the depth, so a lane still
+    // draining a shallower lease is a perfectly good sample for it.
     window_model_bytes: u64,
-    /// The window's wire time alone: the per-article transfer the lane
-    /// reported with each response, summed. `window_rung_elapsed` also carries
-    /// the status-line waits, which is what the rung trials compare on but
-    /// exactly what the depth model must divide out.
+    // The window's wire time alone: the per-article transfer the lane
+    // reported with each response, summed. `window_rung_elapsed` also carries
+    // the status-line waits, which is what the rung trials compare on but
+    // exactly what the depth model must divide out.
     window_wire_elapsed: Duration,
-    /// Responses in the window issued at exactly the current rung, and their
-    /// bytes and wall clock. Only these may judge a rung against the one below
-    /// it: a shallower lane is slower by construction and would argue every
-    /// step up back out of existence.
+    // Responses in the window issued at exactly the current rung, and their
+    // bytes and wall clock. Only these may judge a rung against the one below
+    // it: a shallower lane is slower by construction and would argue every
+    // step up back out of existence.
     window_rung_responses: u64,
     window_rung_bytes: u64,
     window_rung_elapsed: Duration,
-    /// Ring of recent decoded body sizes; the depth formula takes its median.
+    // Ring of recent decoded body sizes; the depth formula takes its median.
     body_bytes: [u64; BODY_SIZE_SAMPLES],
     body_bytes_len: usize,
     body_bytes_next: usize,
-    /// `median body bytes / per-lane read rate`, taken as one pair at each
-    /// window close and blended across windows. The depth formula's divisor.
+    // `median body bytes / per-lane read rate`, taken as one pair at each
+    // window close and blended across windows. The depth formula's divisor.
     modelled_transfer: Option<Duration>,
     hold_until: Option<Instant>,
     last_unclean_at: Option<Instant>,
-    /// Depth the servers table already holds, so a kept rung only writes once.
+    // Depth the servers table already holds, so a kept rung only writes once.
     persisted_depth: Option<u8>,
 }
 
@@ -305,18 +305,18 @@ impl Default for ServerPipelineExplorer {
 }
 
 impl ServerPipelineExplorer {
-    /// Start from what the last run proved, or from what the round trip and a
-    /// known article transfer time say the link needs, or from the band of the
-    /// connection test's first-byte latency, or from the shallowest pipelined
-    /// rung.
-    ///
-    /// The order is deliberate. A rung a previous run proved on this server is
-    /// evidence and outranks any estimate. The bandwidth-delay estimate is the
-    /// real answer whenever both of its halves are known — an article transfer
-    /// time carried over from a pool that has already run, say — and the
-    /// latency band is only the coarse stand-in for when they are not: it says
-    /// 2 for everything nearer than 400 ms, which on a 100 ms link carrying
-    /// ordinary articles is a quarter of the depth the link can use.
+    // Start from what the last run proved, or from what the round trip and a
+    // known article transfer time say the link needs, or from the band of the
+    // connection test's first-byte latency, or from the shallowest pipelined
+    // rung.
+    //
+    // The order is deliberate. A rung a previous run proved on this server is
+    // evidence and outranks any estimate. The bandwidth-delay estimate is the
+    // real answer whenever both of its halves are known — an article transfer
+    // time carried over from a pool that has already run, say — and the
+    // latency band is only the coarse stand-in for when they are not: it says
+    // 2 for everything nearer than 400 ms, which on a 100 ms link carrying
+    // ordinary articles is a quarter of the depth the link can use.
     pub(crate) fn seeded(
         proven_depth: Option<u8>,
         probe_latency: Option<Duration>,
@@ -346,8 +346,8 @@ impl ServerPipelineExplorer {
         }
     }
 
-    /// The depth to write through, if the proven rung has moved since the last
-    /// write. Consumed, so a rung held across many windows writes once.
+    // The depth to write through, if the proven rung has moved since the last
+    // write. Consumed, so a rung held across many windows writes once.
     pub(super) fn take_persist_request(&mut self) -> Option<u8> {
         if self.persisted_depth == Some(self.current_depth) {
             return None;
@@ -381,16 +381,16 @@ impl ServerPipelineExplorer {
         self.latency = Some(blend(self.latency, sample));
     }
 
-    /// One status-line wait from a request a lane issued with nothing queued
-    /// ahead of it. `cold` marks the connection's first article: that wait
-    /// carries the handshake's tail — TLS session setup, authentication, the
-    /// group probe — and none of it recurs once the connection is warm.
-    ///
-    /// Samples are held and only their minimum reaches the round-trip
-    /// estimate; see `window_latency_warm_min`. They fold when the rung window
-    /// closes, and also every [`LATENCY_FOLD_SAMPLES`] samples on their own,
-    /// so a server pinned sequential or held under pressure — whose rung
-    /// window never closes — still keeps its round trip current.
+    // One status-line wait from a request a lane issued with nothing queued
+    // ahead of it. `cold` marks the connection's first article: that wait
+    // carries the handshake's tail — TLS session setup, authentication, the
+    // group probe — and none of it recurs once the connection is warm.
+    //
+    // Samples are held and only their minimum reaches the round-trip
+    // estimate; see `window_latency_warm_min`. They fold when the rung window
+    // closes, and also every [`LATENCY_FOLD_SAMPLES`] samples on their own,
+    // so a server pinned sequential or held under pressure — whose rung
+    // window never closes — still keeps its round trip current.
     pub(in crate::pipeline) fn note_latency_sample(&mut self, sample: Duration, cold: bool) {
         let slot = if cold {
             &mut self.window_latency_cold_min
@@ -404,11 +404,11 @@ impl ServerPipelineExplorer {
         }
     }
 
-    /// Fold the shortest status-line wait held so far into the round-trip
-    /// estimate and start holding afresh. A warm sample always wins; a cold
-    /// one is only ever a stand-in for a server that has not yet measured a
-    /// round trip at all, so a handshake never drags an estimate the warm
-    /// lanes have already settled.
+    // Fold the shortest status-line wait held so far into the round-trip
+    // estimate and start holding afresh. A warm sample always wins; a cold
+    // one is only ever a stand-in for a server that has not yet measured a
+    // round trip at all, so a handshake never drags an estimate the warm
+    // lanes have already settled.
     fn fold_window_latency(&mut self) {
         if let Some(warm) = self.window_latency_warm_min {
             self.latency = Some(blend(self.latency, warm));
@@ -428,7 +428,7 @@ impl ServerPipelineExplorer {
         self.supports_pipelining = supports_pipelining;
     }
 
-    /// Median of the recent decoded body sizes, or `None` before any landed.
+    // Median of the recent decoded body sizes, or `None` before any landed.
     fn median_body_bytes(&self) -> Option<u64> {
         if self.body_bytes_len == 0 {
             return None;
@@ -438,41 +438,41 @@ impl ServerPipelineExplorer {
         Some(samples[self.body_bytes_len / 2])
     }
 
-    /// What one article costs on this lane's wire, as the depth formula wants
-    /// it: `median body bytes / measured per-lane wire rate`.
-    ///
-    /// Preferred over the raw per-article EWMA because both halves are taken
-    /// from the same closed window of 32 responses, so it does not swing on one
-    /// slow article the way a four-deep EWMA does. `None` until a window has
-    /// closed.
-    ///
-    /// The rate is bytes over *wire* time, not over the window's wall clock.
-    /// The wall clock includes every status-line wait, and on a shallow pipe
-    /// that wait is most of the round trip: dividing by it would fold the
-    /// round trip into the divisor and the formula would ask for less depth
-    /// than the link needs — precisely at the rung where the answer matters.
-    ///
-    /// The two halves must come from the same window or the quotient is
-    /// meaningless: a job whose articles got smaller and a link that got slower
-    /// look identical to a median and a rate blended on different clocks, and
-    /// the pair would ask for a deep rung on a link that had just halved.
+    // What one article costs on this lane's wire, as the depth formula wants
+    // it: `median body bytes / measured per-lane wire rate`.
+    //
+    // Preferred over the raw per-article EWMA because both halves are taken
+    // from the same closed window of 32 responses, so it does not swing on one
+    // slow article the way a four-deep EWMA does. `None` until a window has
+    // closed.
+    //
+    // The rate is bytes over *wire* time, not over the window's wall clock.
+    // The wall clock includes every status-line wait, and on a shallow pipe
+    // that wait is most of the round trip: dividing by it would fold the
+    // round trip into the divisor and the formula would ask for less depth
+    // than the link needs — precisely at the rung where the answer matters.
+    //
+    // The two halves must come from the same window or the quotient is
+    // meaningless: a job whose articles got smaller and a link that got slower
+    // look identical to a median and a rate blended on different clocks, and
+    // the pair would ask for a deep rung on a link that had just halved.
     pub(crate) fn modelled_article_transfer(&self) -> Option<Duration> {
         self.modelled_transfer
     }
 
-    /// The article transfer time the depth decision runs on: the modelled one
-    /// once the link has been measured, and the directly sampled EWMA before
-    /// then so a fresh lane is not left without a target for its first window.
+    // The article transfer time the depth decision runs on: the modelled one
+    // once the link has been measured, and the directly sampled EWMA before
+    // then so a fresh lane is not left without a target for its first window.
     fn effective_article_transfer(&self) -> Option<Duration> {
         self.modelled_article_transfer().or(self.transfer)
     }
 
-    /// Depth that would keep one connection busy across the round trip:
-    /// enough requests in flight to cover the wait, plus the one being served.
-    ///
-    /// See [`bandwidth_delay_depth`]. Clamped to the rungs the ladder actually
-    /// runs — `RUNGS` tops out at 8, and the lane code carries any depth the
-    /// enum can hold, so nothing here needs to clamp lower.
+    // Depth that would keep one connection busy across the round trip:
+    // enough requests in flight to cover the wait, plus the one being served.
+    //
+    // See [`bandwidth_delay_depth`]. Clamped to the rungs the ladder actually
+    // runs — `RUNGS` tops out at 8, and the lane code carries any depth the
+    // enum can hold, so nothing here needs to clamp lower.
     pub(crate) fn physical_target_depth(&self) -> Option<u8> {
         let latency = self.latency?;
         let transfer = self.effective_article_transfer()?;
@@ -489,7 +489,7 @@ impl ServerPipelineExplorer {
         self.body_bytes_len = (self.body_bytes_len + 1).min(BODY_SIZE_SAMPLES);
     }
 
-    /// The rung the explorer is walking toward.
+    // The rung the explorer is walking toward.
     pub(crate) fn target_rung(&self) -> u8 {
         self.physical_target_depth()
             .map_or(self.current_depth, rung_at_or_above)
@@ -502,8 +502,8 @@ impl ServerPipelineExplorer {
         DownloadLaneMode::from_depth(self.current_depth)
     }
 
-    /// Fold one clean response into the current window and, once the window is
-    /// full, decide whether the rung stays, reverts, or advances.
+    // Fold one clean response into the current window and, once the window is
+    // full, decide whether the rung stays, reverts, or advances.
     pub(super) fn note_response(
         &mut self,
         now: Instant,
@@ -654,7 +654,7 @@ impl ServerPipelineExplorer {
         Some(RungChange::Stepped { from, to })
     }
 
-    /// Responses this window closes on.
+    // Responses this window closes on.
     fn window_target_responses(&self) -> u64 {
         if self.warmup_windows_left > 0 {
             RUNG_WARMUP_WINDOW_RESPONSES
@@ -663,8 +663,8 @@ impl ServerPipelineExplorer {
         }
     }
 
-    /// An unclean pipelined batch: one rung off, and hands off this server for
-    /// ten minutes. A second one inside that window settles the question.
+    // An unclean pipelined batch: one rung off, and hands off this server for
+    // ten minutes. A second one inside that window settles the question.
     pub(super) fn note_unclean_batch(&mut self, now: Instant) -> Option<RungChange> {
         if self.pinned_sequential {
             return None;
@@ -714,7 +714,7 @@ impl ServerPipelineExplorer {
         self.window_rung_bytes as f64 / seconds
     }
 
-    /// Bytes per second of wire time: the rate the depth model divides by.
+    // Bytes per second of wire time: the rate the depth model divides by.
     fn window_wire_rate_bps(&self) -> f64 {
         let seconds = self.window_wire_elapsed.as_secs_f64();
         if seconds <= 0.0 {
@@ -745,11 +745,11 @@ fn blend(current: Option<Duration>, sample: Duration) -> Duration {
 #[derive(Debug, Default)]
 pub(crate) struct DownloadLaneRuntimeState {
     pub(in crate::pipeline) servers: HashMap<usize, ServerPipelineExplorer>,
-    /// Durable identity of each explorer's pool position, recorded when the
-    /// explorer is created. A pool rebuild renumbers the positions, so the
-    /// mapping has to be the one that was true while the measurements were
-    /// taken — looking it up afterwards resolves against the new pool and
-    /// silently throws every measurement away.
+    // Durable identity of each explorer's pool position, recorded when the
+    // explorer is created. A pool rebuild renumbers the positions, so the
+    // mapping has to be the one that was true while the measurements were
+    // taken — looking it up afterwards resolves against the new pool and
+    // silently throws every measurement away.
     pub(in crate::pipeline) stable_ids: HashMap<usize, u32>,
 }
 
@@ -765,13 +765,13 @@ mod tests {
         explorer
     }
 
-    /// `depth = 1 + ceil(rtt / per-lane article transfer time)`.
-    ///
-    /// One article's transfer covers one article's worth of the round trip, so
-    /// the pipe needs one more request in flight than the number of article
-    /// transfers that fit inside the round trip. A link whose articles cost
-    /// more than the round trip needs no pipelining at all; a 100 ms link
-    /// carrying ~10 ms articles needs eleven, which the ladder caps at eight.
+    // `depth = 1 + ceil(rtt / per-lane article transfer time)`.
+    //
+    // One article's transfer covers one article's worth of the round trip, so
+    // the pipe needs one more request in flight than the number of article
+    // transfers that fit inside the round trip. A link whose articles cost
+    // more than the round trip needs no pipelining at all; a 100 ms link
+    // carrying ~10 ms articles needs eleven, which the ladder caps at eight.
     #[test]
     fn bandwidth_delay_depth_follows_the_ratio_of_rtt_to_article_time() {
         let cases = [
@@ -802,7 +802,7 @@ mod tests {
         );
     }
 
-    /// The formula only chooses the trial target; the ladder still bounds it.
+    // The formula only chooses the trial target; the ladder still bounds it.
     #[test]
     fn physical_target_depth_clamps_the_formula_to_the_rung_ladder() {
         let mut fast_link = explorer(100, 10);
@@ -822,7 +822,7 @@ mod tests {
         );
     }
 
-    /// The two halves of the quotient have to come from the same window.
+    // The two halves of the quotient have to come from the same window.
     #[test]
     fn article_transfer_time_divides_median_bytes_by_the_measured_rate() {
         assert_eq!(
@@ -835,10 +835,10 @@ mod tests {
         assert_eq!(article_transfer_time(750_000, -1.0), None);
     }
 
-    /// A sequential lane's wall clock is one round trip plus one article per
-    /// response. The model must divide by the article, not the sum: at 100 ms
-    /// over 25 ms articles the link needs depth 5 (rung 8), and a divisor that
-    /// kept the round trip would have said 2.
+    // A sequential lane's wall clock is one round trip plus one article per
+    // response. The model must divide by the article, not the sum: at 100 ms
+    // over 25 ms articles the link needs depth 5 (rung 8), and a divisor that
+    // kept the round trip would have said 2.
     #[test]
     fn modelled_transfer_excludes_the_status_line_wait() {
         let mut explorer = explorer(100, 25);
@@ -856,8 +856,8 @@ mod tests {
         assert_eq!(explorer.target_rung(), 8);
     }
 
-    /// The median is what keeps a file's short tail article and a PAR2 index
-    /// from moving the modelled article size.
+    // The median is what keeps a file's short tail article and a PAR2 index
+    // from moving the modelled article size.
     #[test]
     fn median_body_bytes_ignores_the_odd_short_article() {
         let mut explorer = ServerPipelineExplorer::default();
@@ -868,8 +868,8 @@ mod tests {
         assert_eq!(explorer.median_body_bytes(), Some(750_000));
     }
 
-    /// Feed exactly one window at the explorer's current rung, whichever
-    /// length that window is.
+    // Feed exactly one window at the explorer's current rung, whichever
+    // length that window is.
     fn run_window(
         explorer: &mut ServerPipelineExplorer,
         now: Instant,
@@ -893,9 +893,9 @@ mod tests {
         change
     }
 
-    /// A connection's first article never counts toward the window, so a
-    /// job whose lanes have all just connected does not close its opening
-    /// window on handshake-era samples.
+    // A connection's first article never counts toward the window, so a
+    // job whose lanes have all just connected does not close its opening
+    // window on handshake-era samples.
     #[test]
     fn cold_responses_do_not_fill_the_window() {
         let mut explorer = explorer(300, 50);
@@ -912,8 +912,8 @@ mod tests {
         assert_eq!(explorer.current_depth(), 2);
     }
 
-    /// The window's shortest warm status-line wait is the round trip; one
-    /// slow outlier in the same window, warm or cold, does not move it.
+    // The window's shortest warm status-line wait is the round trip; one
+    // slow outlier in the same window, warm or cold, does not move it.
     #[test]
     fn the_window_folds_its_shortest_warm_latency() {
         let mut explorer = explorer(300, 50);
@@ -931,8 +931,8 @@ mod tests {
         assert_eq!(explorer.window_latency_cold_min, None);
     }
 
-    /// A server whose rung window never closes — pinned sequential here —
-    /// still folds its round trip every few samples.
+    // A server whose rung window never closes — pinned sequential here —
+    // still folds its round trip every few samples.
     #[test]
     fn latency_folds_on_its_own_when_the_rung_window_never_closes() {
         let mut explorer = explorer(300, 50);
@@ -951,8 +951,8 @@ mod tests {
         assert_eq!(explorer.window_latency_samples, 0);
     }
 
-    /// A cold sample stands in only while the server has no round trip at
-    /// all, and never once a warm one has been measured.
+    // A cold sample stands in only while the server has no round trip at
+    // all, and never once a warm one has been measured.
     #[test]
     fn a_cold_latency_only_seeds_an_unmeasured_server() {
         let mut explorer = ServerPipelineExplorer::default();
@@ -1019,15 +1019,15 @@ mod tests {
         );
     }
 
-    /// The first decision goes straight to the rung the measured link asks
-    /// for.
-    ///
-    /// This test used to assert a single rung of movement — `2 -> 4` on a link
-    /// whose target is 8 — which is the behaviour that left a short download
-    /// running most of its articles at the seeded depth: each further rung
-    /// cost a window to step and another to judge. The ladder's caution is
-    /// still there, in the trial that follows and in every later change; what
-    /// moved is only how the explorer arrives at its first rung.
+    // The first decision goes straight to the rung the measured link asks
+    // for.
+    //
+    // This test used to assert a single rung of movement — `2 -> 4` on a link
+    // whose target is 8 — which is the behaviour that left a short download
+    // running most of its articles at the seeded depth: each further rung
+    // cost a window to step and another to judge. The ladder's caution is
+    // still there, in the trial that follows and in every later change; what
+    // moved is only how the explorer arrives at its first rung.
     #[test]
     fn the_first_window_moves_straight_to_the_bandwidth_delay_rung() {
         let mut explorer = explorer(300, 50);
@@ -1044,7 +1044,7 @@ mod tests {
         );
     }
 
-    /// Later changes still walk the ladder a rung at a time.
+    // Later changes still walk the ladder a rung at a time.
     #[test]
     fn a_later_change_steps_one_rung_at_a_time() {
         let mut explorer = explorer(300, 200);
@@ -1221,10 +1221,10 @@ mod tests {
         );
     }
 
-    /// A carried-over article transfer time turns the seed into the real
-    /// bandwidth-delay answer, which the coarse band cannot reach: 100 ms is
-    /// deep inside the "good" band, and the band would start such a link two
-    /// deep when it can use eight.
+    // A carried-over article transfer time turns the seed into the real
+    // bandwidth-delay answer, which the coarse band cannot reach: 100 ms is
+    // deep inside the "good" band, and the band would start such a link two
+    // deep when it can use eight.
     #[test]
     fn a_seeded_explorer_prefers_the_bandwidth_delay_rung_over_the_band() {
         let seeded = ServerPipelineExplorer::seeded(
@@ -1259,11 +1259,11 @@ mod tests {
         );
     }
 
-    /// The first leases every lane takes are booked before any response has
-    /// come back, so they run at whatever depth the seed chose. Discarding
-    /// their responses — which is what an exact-depth match does the moment the
-    /// explorer moves — left the window that is supposed to pick a depth
-    /// unable to fill from the lanes still draining those leases.
+    // The first leases every lane takes are booked before any response has
+    // come back, so they run at whatever depth the seed chose. Discarding
+    // their responses — which is what an exact-depth match does the moment the
+    // explorer moves — left the window that is supposed to pick a depth
+    // unable to fill from the lanes still draining those leases.
     #[test]
     fn responses_from_a_shallower_lease_still_fill_the_window() {
         let mut deep = ServerPipelineExplorer::seeded(Some(8), None, None);
@@ -1300,9 +1300,9 @@ mod tests {
         assert_eq!(shallow.current_depth(), 2);
     }
 
-    /// The opening windows are short on purpose: a server with no measurement
-    /// has no depth target at all, and a download of a few hundred articles
-    /// would otherwise spend most of itself waiting for the first window.
+    // The opening windows are short on purpose: a server with no measurement
+    // has no depth target at all, and a download of a few hundred articles
+    // would otherwise spend most of itself waiting for the first window.
     #[test]
     fn the_opening_windows_are_short_and_then_the_full_window_applies() {
         let mut explorer = explorer(300, 50);
@@ -1315,8 +1315,8 @@ mod tests {
         assert_eq!(explorer.window_target_responses(), RUNG_WINDOW_RESPONSES);
     }
 
-    /// The persisted column must only ever hold a rung the explorer settled
-    /// on, and a settled rung must only be written once.
+    // The persisted column must only ever hold a rung the explorer settled
+    // on, and a settled rung must only be written once.
     #[test]
     fn only_a_settled_rung_is_offered_for_persistence() {
         let mut explorer = explorer(300, 50);
@@ -1342,8 +1342,8 @@ mod tests {
         assert_eq!(explorer.take_persist_request(), Some(4));
     }
 
-    /// A server seeded deep from a previous run keeps that rung: the explorer
-    /// has nothing to walk toward until it has measured the link itself.
+    // A server seeded deep from a previous run keeps that rung: the explorer
+    // has nothing to walk toward until it has measured the link itself.
     #[test]
     fn a_seeded_rung_is_held_until_the_explorer_has_its_own_measurements() {
         let mut explorer = ServerPipelineExplorer::seeded(Some(8), None, None);
@@ -1361,8 +1361,8 @@ mod tests {
         assert_eq!(explorer.current_depth(), 8);
     }
 
-    /// Responses that belong to another rung — a batch already in flight when
-    /// the depth moved — must not be folded into the window under test.
+    // Responses that belong to another rung — a batch already in flight when
+    // the depth moved — must not be folded into the window under test.
     #[test]
     fn responses_from_a_stale_rung_are_discarded() {
         let mut explorer = explorer(300, 50);
@@ -1376,8 +1376,8 @@ mod tests {
         assert_eq!(explorer.current_depth(), 2);
     }
 
-    /// A step down toward a shallower target is a measured decision, not a
-    /// trial: it becomes the baseline immediately rather than being re-judged.
+    // A step down toward a shallower target is a measured decision, not a
+    // trial: it becomes the baseline immediately rather than being re-judged.
     #[test]
     fn a_step_down_toward_a_shallower_target_is_not_put_on_trial() {
         let mut explorer = ServerPipelineExplorer::seeded(Some(8), None, None);

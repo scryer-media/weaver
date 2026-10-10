@@ -1,4 +1,4 @@
-//! Bounded native assessment views returned by blocking workers.
+// Bounded native assessment views returned by blocking workers.
 
 use super::*;
 use crate::pipeline::repair::backend::RepairBackend;
@@ -18,7 +18,7 @@ impl ViewReservation {
             })
     }
 
-    /// Retained host bytes this lease charges, for the queue-depth gauge.
+    // Retained host bytes this lease charges, for the queue-depth gauge.
     pub fn bytes(&self) -> usize {
         self._reservation.bytes()
     }
@@ -84,17 +84,17 @@ impl AssessmentView {
     }
 }
 
-/// Retained host bytes one requirement costs the view that holds it.
-///
-/// Every vector the host keeps a copy of is charged here. The requirement
-/// itself is cloned into the view, so `available` and `next_indices` are held
-/// twice over — once in the engine's answer and once here. `recovery_indices`
-/// is a range, not a vector, so it costs nothing beyond the struct.
-///
-/// The cohort plan built from this view (see [`super::cohorts::CohortPlan`])
-/// copies `next_indices` again and a subset of `available` into each window,
-/// and has no reservation of its own: those copies live exactly as long as the
-/// view they were derived from, so the view is what pays for them.
+// Retained host bytes one requirement costs the view that holds it.
+//
+// Every vector the host keeps a copy of is charged here. The requirement
+// itself is cloned into the view, so `available` and `next_indices` are held
+// twice over — once in the engine's answer and once here. `recovery_indices`
+// is a range, not a vector, so it costs nothing beyond the struct.
+//
+// The cohort plan built from this view (see [`super::cohorts::CohortPlan`])
+// copies `next_indices` again and a subset of `available` into each window,
+// and has no reservation of its own: those copies live exactly as long as the
+// view they were derived from, so the view is what pays for them.
 fn requirement_view_cost(requirement: &RecoveryRequirement) -> Option<usize> {
     const INDEX_BYTES: usize = std::mem::size_of::<u64>();
     let available = requirement.available.len();
@@ -220,10 +220,10 @@ mod tests {
         }
     }
 
-    /// Every index vector the host retains is paid for. A requirement naming
-    /// the indices still to fetch costs more than one naming none, and a
-    /// requirement holding more available indices costs more again — nothing
-    /// the view and the cohort windows keep is free.
+    // Every index vector the host retains is paid for. A requirement naming
+    // the indices still to fetch costs more than one naming none, and a
+    // requirement holding more available indices costs more again — nothing
+    // the view and the cohort windows keep is free.
     #[test]
     fn the_view_cost_grows_with_every_retained_index_vector() {
         let bare = requirement_view_cost(&requirement_with(&[], &[])).unwrap();

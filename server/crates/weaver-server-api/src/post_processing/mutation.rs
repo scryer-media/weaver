@@ -23,7 +23,7 @@ fn refused(error: impl std::fmt::Display) -> async_graphql::Error {
     async_graphql::Error::new(error.to_string())
 }
 
-/// Run blocking store work off the async threads and flatten its errors.
+// Run blocking store work off the async threads and flatten its errors.
 async fn blocking<T, E, F>(work: F) -> Result<T>
 where
     T: Send + 'static,
@@ -36,8 +36,8 @@ where
         .map_err(refused)
 }
 
-/// A script job can only be pointed at a script that is there to run. One whose
-/// script has since gone can still be edited, so long as it keeps naming it.
+// A script job can only be pointed at a script that is there to run. One whose
+// script has since gone can still be edited, so long as it keeps naming it.
 fn require_script(db: &Database, script: &ScriptName) -> std::result::Result<(), String> {
     let directory = db
         .post_processing_script_directory()
@@ -47,7 +47,7 @@ fn require_script(db: &Database, script: &ScriptName) -> std::result::Result<(),
         .map_err(|error| error.to_string())
 }
 
-/// The messages carry names only, never a secret's value.
+// The messages carry names only, never a secret's value.
 fn secret_error(error: SecretError) -> async_graphql::Error {
     let message = error.to_string();
     match error {

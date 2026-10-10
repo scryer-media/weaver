@@ -65,33 +65,33 @@ pub struct ServerRuntime {
     pub config: SharedConfig,
     pub base_url: String,
     pub security: RuntimeSecurityConfig,
-    /// Handle the restart endpoint pulls to ask the serve loop to tear down
-    /// and start again.
+    // Handle the restart endpoint pulls to ask the serve loop to tear down
+    // and start again.
     pub restart: weaver_server_core::runtime::restart::RestartController,
-    /// The pipeline's background free-space samplers for the data,
-    /// intermediate and complete roots. The exporter and the NZBGet status
-    /// read their cached readings; nothing here stats a filesystem.
+    // The pipeline's background free-space samplers for the data,
+    // intermediate and complete roots. The exporter and the NZBGet status
+    // read their cached readings; nothing here stats a filesystem.
     pub(crate) disk_space: Arc<StorageCapacity>,
-    /// Per-route HTTP request counters and latency, written by the
-    /// `request_metrics` middleware and read by the exporter.
+    // Per-route HTTP request counters and latency, written by the
+    // `request_metrics` middleware and read by the exporter.
     pub(crate) http_metrics: HttpMetricsHandle,
 }
 
 impl ServerRuntime {
-    /// Free/total capacity for the configured directory roles, from the
-    /// samplers' last readings.
-    ///
-    /// `build_router` consumes the runtime, so the exporter reads the same
-    /// samplers through the `Extension<Arc<StorageCapacity>>` the router
-    /// installs; this accessor is the equivalent for anything still holding the
-    /// runtime itself.
+    // Free/total capacity for the configured directory roles, from the
+    // samplers' last readings.
+    //
+    // `build_router` consumes the runtime, so the exporter reads the same
+    // samplers through the `Extension<Arc<StorageCapacity>>` the router
+    // installs; this accessor is the equivalent for anything still holding the
+    // runtime itself.
     #[allow(dead_code, reason = "read by the Prometheus exporter")]
     pub(crate) fn disk_space_snapshot(&self) -> Vec<DiskSpaceSnapshot> {
         self.disk_space.snapshots()
     }
 
-    /// Per-route HTTP request counters and latency. Also reachable from a
-    /// handler as `Extension<HttpMetricsHandle>`.
+    // Per-route HTTP request counters and latency. Also reachable from a
+    // handler as `Extension<HttpMetricsHandle>`.
     #[allow(dead_code, reason = "read by the Prometheus exporter")]
     pub(crate) fn http_metrics_snapshot(&self) -> HttpMetricsSnapshot {
         self.http_metrics.snapshot()
@@ -179,10 +179,10 @@ fn browser_extension_origin(origin: &HeaderValue) -> bool {
         && url.fragment().is_none()
 }
 
-/// Runs the HTTP server on a listener the caller already bound. Binding
-/// happens in `serve.rs` so an unbindable configured address can fall back to
-/// loopback (and be reported) before the security snapshot is captured by the
-/// GraphQL schema — the never-brick rule for stored network settings.
+// Runs the HTTP server on a listener the caller already bound. Binding
+// happens in `serve.rs` so an unbindable configured address can fall back to
+// loopback (and be reported) before the security snapshot is captured by the
+// GraphQL schema — the never-brick rule for stored network settings.
 pub async fn run_server(
     runtime: ServerRuntime,
     listener: tokio::net::TcpListener,

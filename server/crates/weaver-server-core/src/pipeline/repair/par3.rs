@@ -1,5 +1,5 @@
-//! Authenticated PAR3 carrier discovery. All scanning runs on blocking workers;
-//! the actor retains packet locations and incomplete metadata between arrivals.
+// Authenticated PAR3 carrier discovery. All scanning runs on blocking workers;
+// the actor retains packet locations and incomplete metadata between arrivals.
 
 use super::sources::PublishedSources;
 use crate::jobs::ids::{JobId, NzbFileId};
@@ -62,7 +62,7 @@ struct Carrier {
     revision: u64,
     needed: Option<u64>,
     resume: Option<u64>,
-    /// What this carrier's own scan has found so far.
+    // What this carrier's own scan has found so far.
     scan: carriers::CarrierScan,
 }
 
@@ -85,50 +85,50 @@ pub(in crate::pipeline) struct Par3Job {
     donor_search: donors::Cache,
     publication_memory: BTreeMap<SourceId, assessment::ViewReservation>,
     virtual_readers: Arc<virtual_source::ReaderCache>,
-    /// Carrier-scan tallies. Plain integers advanced by the scan loop and
-    /// folded into the process metrics once, at the work unit's handback.
+    // Carrier-scan tallies. Plain integers advanced by the scan loop and
+    // folded into the process metrics once, at the work unit's handback.
     packets_authenticated: u64,
     packets_rejected: u64,
     ranges_unavailable: u64,
-    /// Option packets that File, Directory and Root packets point at.
+    // Option packets that File, Directory and Root packets point at.
     referenced_options: std::collections::BTreeSet<par3_rs::Fingerprint>,
-    /// Whether any authenticated Root declares the set's paths absolute.
+    // Whether any authenticated Root declares the set's paths absolute.
     absolute_paths: bool,
-    /// Each admitted set's input block size, from its own Start packet. A File
-    /// packet cannot be read without it. Bounded by the set ceiling, because
-    /// an entry is only made for a set that was admitted.
+    // Each admitted set's input block size, from its own Start packet. A File
+    // packet cannot be read without it. Bounded by the set ceiling, because
+    // an entry is only made for a set that was admitted.
     set_block_sizes: std::collections::BTreeMap<par3_rs::InputSetId, u64>,
 }
 
-/// What one authenticated metadata packet says about option packets, captured
-/// before the packet is handed to its set.
+// What one authenticated metadata packet says about option packets, captured
+// before the packet is handed to its set.
 enum PacketNote {
     Nothing,
-    /// This packet points at option packets, and may declare absolute paths.
+    // This packet points at option packets, and may declare absolute paths.
     References {
         hashes: Vec<par3_rs::Fingerprint>,
         absolute: bool,
     },
 }
 
-/// What one job's carriers said about option packets. Weaver applies no
-/// option packet, so this exists to be reported, never to change a plan.
+// What one job's carriers said about option packets. Weaver applies no
+// option packet, so this exists to be reported, never to change a plan.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(in crate::pipeline) struct OptionPacketTally {
-    /// Distinct link and permission packets the resolved sets retained. The
-    /// engine keeps them verbatim and interprets none of them, so this is the
-    /// count it already holds rather than one weaver keeps beside it.
+    // Distinct link and permission packets the resolved sets retained. The
+    // engine keeps them verbatim and interprets none of them, so this is the
+    // count it already holds rather than one weaver keeps beside it.
     pub present: u64,
-    /// Distinct option packets File, Directory and Root packets point at.
+    // Distinct option packets File, Directory and Root packets point at.
     pub referenced: u64,
-    /// Pointers naming an option packet nothing authenticated.
+    // Pointers naming an option packet nothing authenticated.
     pub unresolved: u64,
-    /// Whether a Root declared the set's paths absolute.
+    // Whether a Root declared the set's paths absolute.
     pub absolute_paths: bool,
 }
 
 impl OptionPacketTally {
-    /// Whether there is anything worth saying about this job's options.
+    // Whether there is anything worth saying about this job's options.
     pub fn is_silent(&self) -> bool {
         self.present == 0 && self.referenced == 0 && !self.absolute_paths
     }
@@ -148,21 +148,21 @@ impl std::fmt::Display for OptionPacketTally {
     }
 }
 
-/// The most option-packet pointers one job remembers. Past this the reference
-/// count stops rising, so a set with a hostile number of pointers cannot grow
-/// this set without bound. The option packets themselves are not counted here:
-/// the engine already holds each resolved set's own tally.
+// The most option-packet pointers one job remembers. Past this the reference
+// count stops rising, so a set with a hostile number of pointers cannot grow
+// this set without bound. The option packets themselves are not counted here:
+// the engine already holds each resolved set's own tally.
 const MAX_OPTION_HASHES: usize = 4096;
 
 impl PacketNote {
-    /// Read what one authenticated packet says about option packets.
-    ///
-    /// A File packet's body cannot be parsed without its set's block size, so
-    /// the scanner retains it verbatim. `block_size` is what this job has
-    /// learned from that set's Start packet, and is `None` until the Start
-    /// packet authenticates: a File packet that arrives ahead of its own Start
-    /// contributes no reference, which under-reports option pointers and never
-    /// over-reports them.
+    // Read what one authenticated packet says about option packets.
+    //
+    // A File packet's body cannot be parsed without its set's block size, so
+    // the scanner retains it verbatim. `block_size` is what this job has
+    // learned from that set's Start packet, and is `None` until the Start
+    // packet authenticates: a File packet that arrives ahead of its own Start
+    // contributes no reference, which under-reports option pointers and never
+    // over-reports them.
     fn of(packet: &par3_rs::packet::Packet, block_size: Option<u64>) -> Self {
         use par3_rs::packet::{PacketBody, PacketType, file::FilePacket};
         match packet.body() {
@@ -364,8 +364,8 @@ impl Par3Job {
             .map(|_| ())
     }
 
-    /// Keep bounded scheduling facts while releasing idle native analysis.
-    /// Only recovery-waiting jobs are eligible; no queued repair loses its plan.
+    // Keep bounded scheduling facts while releasing idle native analysis.
+    // Only recovery-waiting jobs are eligible; no queued repair loses its plan.
     fn evict_native_sessions(&mut self) {
         for (id, mut set) in std::mem::take(&mut self.sets) {
             if let Some(view) = set.view.take() {
@@ -456,9 +456,9 @@ impl Par3Job {
         })
     }
 
-    /// Disk carrier publication. Live downloads supply committed ranges.
-    /// Completed carriers restored without placements use their actual disk
-    /// extent; every admitted packet still requires authentication.
+    // Disk carrier publication. Live downloads supply committed ranges.
+    // Completed carriers restored without placements use their actual disk
+    // extent; every admitted packet still requires authentication.
     fn scan_file(
         &mut self,
         source: SourceId,
@@ -519,11 +519,11 @@ impl Par3Job {
         Ok(())
     }
 
-    /// [`Self::scan_embedded`] over a direct volume's image.
-    ///
-    /// The scan starts where the volume's router placed the tail, which the
-    /// container's own start header fixed, so no damaged-framing rewind is
-    /// needed to find it. The same image is the set's protected source.
+    // [`Self::scan_embedded`] over a direct volume's image.
+    //
+    // The scan starts where the volume's router placed the tail, which the
+    // container's own start header fixed, so no damaged-framing rewind is
+    // needed to find it. The same image is the set's protected source.
     fn scan_embedded_virtual(
         &mut self,
         source: SourceId,
@@ -781,8 +781,8 @@ impl Par3Job {
         }
     }
 
-    /// Every carrier that reported damage, newest scan state, bounded so one
-    /// summary can never grow with the carrier count.
+    // Every carrier that reported damage, newest scan state, bounded so one
+    // summary can never grow with the carrier count.
     fn damage_report(&self) -> Vec<carriers::CarrierDamage> {
         const SHOWN: usize = 8;
         self.carriers
@@ -799,7 +799,7 @@ impl Par3Job {
             .collect()
     }
 
-    /// Authenticated packets of each family across every carrier of this job.
+    // Authenticated packets of each family across every carrier of this job.
     fn authenticated_families(&self) -> [u64; carriers::Par3PacketKind::COUNT] {
         let mut totals = [0u64; carriers::Par3PacketKind::COUNT];
         for carrier in self.carriers.values() {
@@ -810,15 +810,15 @@ impl Par3Job {
         totals
     }
 
-    /// What this job said about option packets: how many each resolved set
-    /// retained, how many distinct option packets the metadata points at, and
-    /// how many of those pointers name nothing the set holds.
-    ///
-    /// The packets themselves are the engine's own tally, read off each
-    /// resolved set rather than kept a second time here. The pointers are not:
-    /// a resolved set exposes the File and Directory packets its Root tree
-    /// reaches, so a pointer in an authenticated packet the tree never names
-    /// is invisible there and is counted from the scan instead.
+    // What this job said about option packets: how many each resolved set
+    // retained, how many distinct option packets the metadata points at, and
+    // how many of those pointers name nothing the set holds.
+    //
+    // The packets themselves are the engine's own tally, read off each
+    // resolved set rather than kept a second time here. The pointers are not:
+    // a resolved set exposes the File and Directory packets its Root tree
+    // reaches, so a pointer in an authenticated packet the tree never names
+    // is invisible there and is counted from the scan instead.
     fn option_packet_tally(&self) -> OptionPacketTally {
         let resolved = || self.sets.values().filter_map(|set| set.native.set());
         OptionPacketTally {
@@ -835,8 +835,8 @@ impl Par3Job {
         }
     }
 
-    /// Readable carrier bytes across this job that produced no authenticated
-    /// packet.
+    // Readable carrier bytes across this job that produced no authenticated
+    // packet.
     fn damaged_bytes(&self) -> u64 {
         self.carriers.values().fold(0u64, |bytes, carrier| {
             bytes.saturating_add(carrier.scan.damaged_bytes)
@@ -844,8 +844,8 @@ impl Par3Job {
     }
 }
 
-/// Whether an engine refusal is about the job's exhausted budget rather than
-/// about the one packet it was handed.
+// Whether an engine refusal is about the job's exhausted budget rather than
+// about the one packet it was handed.
 fn is_admission_exhausted(error: &EngineError) -> bool {
     matches!(
         error,
@@ -856,8 +856,8 @@ fn is_admission_exhausted(error: &EngineError) -> bool {
 }
 
 impl Pipeline {
-    /// The PAR3 coordinator, created on first admission with its workers held
-    /// to the hardware profile in force.
+    // The PAR3 coordinator, created on first admission with its workers held
+    // to the hardware profile in force.
     pub(in crate::pipeline) fn par3_coordinator(&mut self) -> &mut work::Coordinator {
         let cpu_cap = self.tuner.profile_tuning().par3_cpu_cap;
         self.par3_runtime.get_or_insert_with(|| {
@@ -958,8 +958,8 @@ impl Pipeline {
         self.admit_par3_carrier(job_id, file_id, embedded, admitted);
     }
 
-    /// Admits a carrier the job just found, publishes it, and on a job's
-    /// first carrier also the protected files already committed.
+    // Admits a carrier the job just found, publishes it, and on a job's
+    // first carrier also the protected files already committed.
     fn admit_par3_carrier(
         &mut self,
         job_id: JobId,
@@ -1060,8 +1060,8 @@ impl Pipeline {
         }
     }
 
-    /// The direct set that owns `file_id` as a volume, unless it was demoted.
-    /// Such a volume is never a file in the working directory.
+    // The direct set that owns `file_id` as a volume, unless it was demoted.
+    // Such a volume is never a file in the working directory.
     fn live_direct_set_of(&self, file_id: NzbFileId) -> Option<usize> {
         self.direct_store
             .sets_for(file_id.job_id)
@@ -1071,14 +1071,14 @@ impl Pipeline {
             })
     }
 
-    /// Admits the recovery set a live direct container carries after its end
-    /// header.
-    ///
-    /// The router admitted that tail when it parsed the start header, so where
-    /// the packets begin is already known and nothing is read to find them. A
-    /// set that can finalize on its own members' checksums never asks:
-    /// checking it against the tail as well would be a pass over every byte
-    /// that nothing needs.
+    // Admits the recovery set a live direct container carries after its end
+    // header.
+    //
+    // The router admitted that tail when it parsed the start header, so where
+    // the packets begin is already known and nothing is read to find them. A
+    // set that can finalize on its own members' checksums never asks:
+    // checking it against the tail as well would be a pass over every byte
+    // that nothing needs.
     fn discover_direct_embedded_par3(&mut self, job_id: JobId) {
         let found: Vec<(NzbFileId, u64)> = self
             .direct_store
@@ -1350,8 +1350,8 @@ impl Pipeline {
             .find(|volume| volume.volume_index == index)
     }
 
-    /// Declared carriers and authenticated late discovery can hold archive
-    /// checks through either engine's attempt. PAR2-only jobs keep their policy.
+    // Declared carriers and authenticated late discovery can hold archive
+    // checks through either engine's attempt. PAR2-only jobs keep their policy.
     pub(in crate::pipeline) fn par3_direct_checks_available(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|state| {
             crate::pipeline::direct_store::plan::spec_defers_to_par3(&state.spec)
@@ -1446,13 +1446,13 @@ impl Pipeline {
         }
     }
 
-    /// Where a placement lands: publishes the PAR3 images held back while a
-    /// set of this job had placements out, once that set has none.
-    ///
-    /// Without this the images would wait for whatever completion check runs
-    /// next, and none is bound to while the job still downloads: the sources
-    /// the routing retired would offer no view to assess, and no repair to
-    /// start, until some unrelated file or pass moved.
+    // Where a placement lands: publishes the PAR3 images held back while a
+    // set of this job had placements out, once that set has none.
+    //
+    // Without this the images would wait for whatever completion check runs
+    // next, and none is bound to while the job still downloads: the sources
+    // the routing retired would offer no view to assess, and no repair to
+    // start, until some unrelated file or pass moved.
     pub(in crate::pipeline) fn republish_par3_awaiting_placements(&mut self, job_id: JobId) {
         let drained: Vec<(JobId, usize)> = self
             .par3_publications_awaiting_placements

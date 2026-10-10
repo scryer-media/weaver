@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use crate::servers::ServerConfig;
 
-/// How long a server connection may take to dial, for the pool's routes and
-/// for the connectivity probe alike.
+// How long a server connection may take to dial, for the pool's routes and
+// for the connectivity probe alike.
 pub(crate) const SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
@@ -11,21 +11,21 @@ pub struct ServerConnectivityResult {
     pub success: bool,
     pub message: String,
     pub latency_ms: Option<u64>,
-    /// Command-to-status-line round trip on the established session, which is
-    /// what BODY pipelining actually has to hide. Taken from the CAPABILITIES
-    /// exchange setup already sends; no extra command is issued for it. `latency_ms` above is the
-    /// whole connect — TCP, TLS and authentication — and is far larger.
+    // Command-to-status-line round trip on the established session, which is
+    // what BODY pipelining actually has to hide. Taken from the CAPABILITIES
+    // exchange setup already sends; no extra command is issued for it. `latency_ms` above is the
+    // whole connect — TCP, TLS and authentication — and is far larger.
     pub first_byte_latency_ms: Option<u64>,
-    /// "good", "moderate" or "slow" for `first_byte_latency_ms`. Descriptive
-    /// only: nothing the operator has to act on follows from it.
+    // "good", "moderate" or "slow" for `first_byte_latency_ms`. Descriptive
+    // only: nothing the operator has to act on follows from it.
     pub first_byte_latency_band: Option<String>,
     pub supports_pipelining: bool,
     pub adoptable_tls_name_mismatch_certificate_der: Option<Vec<u8>>,
-    /// IANA name of the TLS suite negotiated with weaver's CPU-preferred
-    /// cipher family offered first; `None` for plaintext or failed probes.
+    // IANA name of the TLS suite negotiated with weaver's CPU-preferred
+    // cipher family offered first; `None` for plaintext or failed probes.
     pub tls_cipher_suite: Option<String>,
-    /// Whether the negotiated suite is the family weaver offered first, i.e.
-    /// the server follows client order. `None` for plaintext or failed probes.
+    // Whether the negotiated suite is the family weaver offered first, i.e.
+    // the server follows client order. `None` for plaintext or failed probes.
     pub tls_honors_client_cipher_order: Option<bool>,
 }
 
@@ -135,8 +135,8 @@ pub async fn probe_server_connection_with_route(
     }
 }
 
-/// Descriptive label for a first-byte latency, on the same thresholds the
-/// download depth explorer uses.
+// Descriptive label for a first-byte latency, on the same thresholds the
+// download depth explorer uses.
 fn latency_band_label(latency: Duration) -> &'static str {
     crate::pipeline::download::transport::LatencyBand::from_latency(latency).label()
 }

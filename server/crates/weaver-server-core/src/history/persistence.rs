@@ -187,9 +187,9 @@ impl Database {
         result
     }
 
-    /// Permanently removes visible history and the duplicate identity it owns.
-    /// Unlike scheduler-internal history cleanup, this records a tombstone so a
-    /// stale backfill cannot restore the identity after the delete commits.
+    // Permanently removes visible history and the duplicate identity it owns.
+    // Unlike scheduler-internal history cleanup, this records a tombstone so a
+    // stale backfill cannot restore the identity after the delete commits.
     pub fn delete_job_history_and_forget_duplicate_identity(
         &self,
         job_id: u64,
@@ -241,8 +241,8 @@ impl Database {
         result.map(|job_ids| job_ids.len())
     }
 
-    /// Permanently removes all visible history and each associated duplicate
-    /// identity in the same transaction.
+    // Permanently removes all visible history and each associated duplicate
+    // identity in the same transaction.
     pub fn delete_all_job_history_and_forget_duplicate_identities(
         &self,
     ) -> Result<usize, StateError> {

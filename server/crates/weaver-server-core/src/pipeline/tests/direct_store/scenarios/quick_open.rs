@@ -1,15 +1,15 @@
-//! Quick Open: the cache is a hint, and direct-store never routes on one
-//! The confirming parse
-//! PAR2 over virtual volumes
-//! Destinations, finalization and demotion accounting
-//! Holds budget, and the demotion round trip it makes cheap to reach
-//! Chain-close eligibility
-//! The yEnc whole-volume gate
-//! Suppression and runtime lifetime
-//! Format detection
-//! Multi-member sets
-//! Envelope v2: recovery records route
-//! The hybrid virtual-volume provider, differentially
+// Quick Open: the cache is a hint, and direct-store never routes on one
+// The confirming parse
+// PAR2 over virtual volumes
+// Destinations, finalization and demotion accounting
+// Holds budget, and the demotion round trip it makes cheap to reach
+// Chain-close eligibility
+// The yEnc whole-volume gate
+// Suppression and runtime lifetime
+// Format detection
+// Multi-member sets
+// Envelope v2: recovery records route
+// The hybrid virtual-volume provider, differentially
 
 use super::*;
 
@@ -561,15 +561,15 @@ async fn member_checksum_demotion_hands_the_live_tail_to_a_reconstructed_prefix(
 // The confirming parse
 // ---------------------------------------------------------------------------
 
-/// The first shape's
-/// `direct_store_refuses_a_set_whose_last_volume_hides_a_second_member`,
-/// upgraded: the hidden member is now **adopted** rather than demoting the set.
-///
-/// The first shape had two reasons to demote here — the layout refused the
-/// re-add, and even if it had not, a second routable member was out of scope.
-/// Both are gone now: the router rebuilds its layout from every volume's newest
-/// facts when a longer prefix reveals a header, and routes as many members as
-/// the archive has.
+// The first shape's
+// `direct_store_refuses_a_set_whose_last_volume_hides_a_second_member`,
+// upgraded: the hidden member is now **adopted** rather than demoting the set.
+//
+// The first shape had two reasons to demote here — the layout refused the
+// re-add, and even if it had not, a second routable member was out of scope.
+// Both are gone now: the router rebuilds its layout from every volume's newest
+// facts when a longer prefix reveals a header, and routes as many members as
+// the archive has.
 #[tokio::test]
 async fn a_member_hiding_past_the_first_is_adopted_and_routes_direct() {
     let member_name = "Silver.Horizon.S01E07.mkv";
@@ -2200,8 +2200,8 @@ async fn a_demotion_returns_before_its_reconstruction_sweep_finishes() {
     );
 }
 
-/// Receives the sweep's next message for `job_id` and hands it to the actor,
-/// returning which volume it reported, or `None` for the finish.
+// Receives the sweep's next message for `job_id` and hands it to the actor,
+// returning which volume it reported, or `None` for the finish.
 async fn hand_back_next_swept_volume(pipeline: &mut Pipeline) -> Option<u32> {
     let done = pipeline
         .direct_demotion_done_rx
@@ -2504,16 +2504,16 @@ async fn the_completion_gate_refuses_to_judge_a_job_whose_demotion_sweep_is_outs
     );
 }
 
-/// The handoff that completes a RAR member can be the volume's *first* article,
-/// arriving last: the tail articles were staged as holds, segment zero brought
-/// the headers, the router placed everything, the chain closed, and the
-/// member's CRC refused. That article's offset is already at the write cursor,
-/// so with the sweep detached the seam used to write and commit it on the spot
-/// — completing an assembly whose other articles were routed into the overlay
-/// and existed nowhere else yet — and the whole-file CRC, judged over a file
-/// one article long, failed the job. (Witnessed live as a mixed-grid two-set
-/// posting failing with a yEnc whole-file CRC32 mismatch over 768000 of
-/// 5243027 bytes, three milliseconds after its demotion ticket was submitted.)
+// The handoff that completes a RAR member can be the volume's *first* article,
+// arriving last: the tail articles were staged as holds, segment zero brought
+// the headers, the router placed everything, the chain closed, and the
+// member's CRC refused. That article's offset is already at the write cursor,
+// so with the sweep detached the seam used to write and commit it on the spot
+// — completing an assembly whose other articles were routed into the overlay
+// and existed nowhere else yet — and the whole-file CRC, judged over a file
+// one article long, failed the job. (Witnessed live as a mixed-grid two-set
+// posting failing with a yEnc whole-file CRC32 mismatch over 768000 of
+// 5243027 bytes, three milliseconds after its demotion ticket was submitted.)
 #[tokio::test]
 async fn a_handoff_at_the_write_cursor_waits_for_its_demotion_sweep() {
     let member_name = "Silver.Horizon.S01E27.mkv";
@@ -2820,16 +2820,16 @@ async fn a_demoted_set_materializes_its_covered_volumes_instead_of_refetching_th
     );
 }
 
-/// A demoted set's volumes must re-enter the conventional completion seam.
-///
-/// While the set was direct, `refresh_archive_state_for_completed_file`
-/// suppressed itself for its files, so none of them ever reached the RAR
-/// facts parser or the archive topology — correctly, because a direct set
-/// never extracts through the topology. Demotion ends that: the volumes are
-/// ordinary files now, and a materialized-complete volume that never gets
-/// its facts registered is invisible to the extraction planner forever —
-/// the plan waits on a volume whose bytes sit finished on disk, and no
-/// event ever arrives to change its mind.
+// A demoted set's volumes must re-enter the conventional completion seam.
+//
+// While the set was direct, `refresh_archive_state_for_completed_file`
+// suppressed itself for its files, so none of them ever reached the RAR
+// facts parser or the archive topology — correctly, because a direct set
+// never extracts through the topology. Demotion ends that: the volumes are
+// ordinary files now, and a materialized-complete volume that never gets
+// its facts registered is invisible to the extraction planner forever —
+// the plan waits on a volume whose bytes sit finished on disk, and no
+// event ever arrives to change its mind.
 #[tokio::test]
 async fn a_demoted_sets_materialized_volumes_register_their_rar_facts() {
     let member_name = "Silver.Horizon.S01E14.mkv";
@@ -3083,11 +3083,11 @@ async fn a_volume_whose_envelope_is_gone_refetches_alone() {
 // Holds budget, and the demotion round trip it makes cheap to reach
 // ---------------------------------------------------------------------------
 
-/// Paging, at the seam the RAM budget used to demote at.
-///
-/// The first article is pure payload with no header yet, so it has nowhere to
-/// go and is held; the budget is far below it. The router pages it to the set's
-/// scratch file instead of demoting, and the set stays live.
+// Paging, at the seam the RAM budget used to demote at.
+//
+// The first article is pure payload with no header yet, so it has nowhere to
+// go and is held; the budget is far below it. The router pages it to the set's
+// scratch file instead of demoting, and the set stays live.
 #[tokio::test]
 async fn direct_store_pages_held_bytes_to_scratch_instead_of_demoting() {
     let member_name = "Silver.Horizon.S01E12.mkv";
@@ -3135,11 +3135,11 @@ async fn direct_store_pages_held_bytes_to_scratch_instead_of_demoting() {
     );
 }
 
-/// Every set of a pipeline charges its holds to one accountant, and the limit
-/// it enforces is the process total: a set well inside its own budget still
-/// pages when the sets around it have spent the shared allowance. The set that
-/// pages is the one routing at the time; the one that was there first keeps
-/// its holds resident.
+// Every set of a pipeline charges its holds to one accountant, and the limit
+// it enforces is the process total: a set well inside its own budget still
+// pages when the sets around it have spent the shared allowance. The set that
+// pages is the one routing at the time; the one that was there first keeps
+// its holds resident.
 #[tokio::test]
 async fn two_sets_share_one_resident_limit_and_the_one_routing_pages() {
     use crate::pipeline::direct_store::accountant::HoldsLimits;
@@ -3264,10 +3264,10 @@ async fn two_sets_share_one_resident_limit_and_the_one_routing_pages() {
     );
 }
 
-/// The shared scratch total is judged on every set's scratch together, and a
-/// spill that would exceed it demotes the set that asked — after that set has
-/// compacted its own scratch and found nothing to reclaim — while the sets
-/// already inside the total keep routing.
+// The shared scratch total is judged on every set's scratch together, and a
+// spill that would exceed it demotes the set that asked — after that set has
+// compacted its own scratch and found nothing to reclaim — while the sets
+// already inside the total keep routing.
 #[tokio::test]
 async fn the_shared_scratch_total_demotes_the_set_that_asked_last() {
     use crate::pipeline::direct_store::accountant::HoldsLimits;
@@ -3355,9 +3355,9 @@ async fn the_shared_scratch_total_demotes_the_set_that_asked_last() {
     assert_eq!(pipeline.direct_store.holds_accountant().scratch_bytes(), 0);
 }
 
-/// A spill that would leave the working directory's filesystem with less than
-/// its reserve is refused before the write, and the refusal is named for what
-/// ran out — the disk — rather than for this set's scratch.
+// A spill that would leave the working directory's filesystem with less than
+// its reserve is refused before the write, and the refusal is named for what
+// ran out — the disk — rather than for this set's scratch.
 #[tokio::test]
 async fn the_disk_reserve_refuses_a_spill_before_it_is_written() {
     use crate::pipeline::direct_store::accountant::HoldsLimits;
@@ -3422,12 +3422,12 @@ async fn the_disk_reserve_refuses_a_spill_before_it_is_written() {
     );
 }
 
-/// A pass that reads a paged hold pins the scratch image, and the pin, not the
-/// set, decides how long the image lives. The set's commit unlinks the path;
-/// a provider still holding a pin reads the hold through the unlinked file,
-/// exactly as posted; and the last pin dropping is what gives the bytes back.
-/// Nothing the set does can strand a scratch image behind it, and nothing a
-/// reader does can lose the bytes it was handed.
+// A pass that reads a paged hold pins the scratch image, and the pin, not the
+// set, decides how long the image lives. The set's commit unlinks the path;
+// a provider still holding a pin reads the hold through the unlinked file,
+// exactly as posted; and the last pin dropping is what gives the bytes back.
+// Nothing the set does can strand a scratch image behind it, and nothing a
+// reader does can lose the bytes it was handed.
 #[tokio::test]
 async fn a_pinned_scratch_outlives_its_set_and_no_longer_than_its_last_reader() {
     use std::io::{Read as _, Seek as _};
@@ -3551,8 +3551,8 @@ async fn a_pinned_scratch_outlives_its_set_and_no_longer_than_its_last_reader() 
     assert_eq!(holds_left(&working_dir), 0);
 }
 
-/// The paged holds are not merely stored — they route, and the set finishes
-/// byte-identically to a run that never breached its budget.
+// The paged holds are not merely stored — they route, and the set finishes
+// byte-identically to a run that never breached its budget.
 #[tokio::test]
 async fn a_set_that_paged_its_holds_still_one_passes_byte_identically() {
     let member_name = "Silver.Horizon.S01E13.mkv";
@@ -3620,13 +3620,13 @@ async fn a_set_that_paged_its_holds_still_one_passes_byte_identically() {
     );
 }
 
-/// A ceiling breach is not the same thing as a full scratch.
-///
-/// The scratch is an append-only log, so a hold that gets placed leaves its
-/// region behind: a set that pages, places, and pages again walks the cursor up
-/// to the ceiling while holding almost nothing. Reclaiming that space is what
-/// keeps such a set from demoting — and demotion here is expensive, because it
-/// materializes the volumes and can refetch them.
+// A ceiling breach is not the same thing as a full scratch.
+//
+// The scratch is an append-only log, so a hold that gets placed leaves its
+// region behind: a set that pages, places, and pages again walks the cursor up
+// to the ceiling while holding almost nothing. Reclaiming that space is what
+// keeps such a set from demoting — and demotion here is expensive, because it
+// materializes the volumes and can refetch them.
 #[tokio::test]
 async fn a_reclaimable_scratch_breach_spills_instead_of_demoting() {
     let member_name = "Silver.Horizon.S01E15.mkv";
@@ -3674,8 +3674,8 @@ async fn a_reclaimable_scratch_breach_spills_instead_of_demoting() {
     );
 }
 
-/// The scratch ceiling is the last lever: past it there is nowhere left to put
-/// the holds, and the set demotes with its own reason rather than the RAM one.
+// The scratch ceiling is the last lever: past it there is nowhere left to put
+// the holds, and the set demotes with its own reason rather than the RAM one.
 #[tokio::test]
 async fn a_scratch_ceiling_breach_demotes_the_set() {
     let member_name = "Silver.Horizon.S01E14.mkv";
@@ -3701,13 +3701,13 @@ async fn a_scratch_ceiling_breach_demotes_the_set() {
     assert!(!direct_partial(&temp_dir, JobId(41054), member_name).exists());
 }
 
-/// A compaction under a pin cannot rewrite the image in place: the reader was
-/// handed offsets into the file it holds open. The pack goes into a second
-/// file that then takes over the path, and the retired image stays on disk,
-/// unlinked, for as long as its last reader does. Both images are disk in use,
-/// so both are charged to the shared total until that reader lets go; the
-/// path carries no sibling files once the take-over is done; and the reader
-/// keeps reading the bytes it was handed, as posted, through the retired image.
+// A compaction under a pin cannot rewrite the image in place: the reader was
+// handed offsets into the file it holds open. The pack goes into a second
+// file that then takes over the path, and the retired image stays on disk,
+// unlinked, for as long as its last reader does. Both images are disk in use,
+// so both are charged to the shared total until that reader lets go; the
+// path carries no sibling files once the take-over is done; and the reader
+// keeps reading the bytes it was handed, as posted, through the retired image.
 #[tokio::test]
 async fn a_pinned_compaction_charges_the_retired_image_until_its_reader_lets_go() {
     use std::io::{Read as _, Seek as _};
@@ -3873,10 +3873,10 @@ async fn a_pinned_compaction_charges_the_retired_image_until_its_reader_lets_go(
     );
 }
 
-/// The packed copy a pinned compaction writes is a spill like any other: it is
-/// admitted against the shared scratch total before it is written, and a
-/// refusal demotes the set — it does not write a second image the process has
-/// no room for, and it does not strand the half-written copy.
+// The packed copy a pinned compaction writes is a spill like any other: it is
+// admitted against the shared scratch total before it is written, and a
+// refusal demotes the set — it does not write a second image the process has
+// no room for, and it does not strand the half-written copy.
 #[tokio::test]
 async fn a_pinned_compaction_the_shared_total_cannot_admit_demotes_the_set() {
     use crate::pipeline::direct_store::accountant::HoldsLimits;
@@ -4718,16 +4718,16 @@ async fn damaged_article_waits_for_reconstruction_before_writing_and_retrying() 
     );
 }
 
-/// Once nothing in a job's pipeline can move, a demoted volume that is still
-/// waiting is waiting for nothing.
-///
-/// The gate only ever asked *who owns this article*, never *can that owner
-/// still finish*. An owner that had been dropped — a retry whose carrier is
-/// gone, a handoff whose article never came back — therefore held the whole
-/// recovery set behind it, and the job sat in `Downloading` with every counter
-/// at zero until it was cancelled. With no sweep in flight, nothing queued, no
-/// download, decode, retry or released result outstanding, the missing
-/// articles are holes, and holes are what the recovery pass exists to read.
+// Once nothing in a job's pipeline can move, a demoted volume that is still
+// waiting is waiting for nothing.
+//
+// The gate only ever asked *who owns this article*, never *can that owner
+// still finish*. An owner that had been dropped — a retry whose carrier is
+// gone, a handoff whose article never came back — therefore held the whole
+// recovery set behind it, and the job sat in `Downloading` with every counter
+// at zero until it was cancelled. With no sweep in flight, nothing queued, no
+// download, decode, retry or released result outstanding, the missing
+// articles are holes, and holes are what the recovery pass exists to read.
 #[tokio::test]
 async fn a_demoted_volume_owned_by_nothing_that_can_finish_is_settled_as_damaged() {
     let member_name = "Copper.Meridian.S02E04.mkv";

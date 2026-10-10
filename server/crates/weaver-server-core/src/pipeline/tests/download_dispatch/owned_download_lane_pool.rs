@@ -1,4 +1,4 @@
-//! `download_dispatch` tests, part of a mechanical split of the original file.
+// `download_dispatch` tests, part of a mechanical split of the original file.
 
 use super::*;
 
@@ -801,13 +801,13 @@ async fn par2_metadata_bootstrap_does_not_hold_payload_for_late_indexless_discov
     );
 }
 
-/// Recovery rides the same owned lanes as ordinary work.
-///
-/// Recovery used to be pushed onto the async pool and pinned to sequential
-/// mode: the work a job is *waiting on* to finish paid a cold dial and gave
-/// back the round trip pipelining exists to hide. A recovery lease is now an
-/// ordinary lease as far as lane selection and depth are concerned: depth is a
-/// property of the server the lane sits on, and nothing reads the class.
+// Recovery rides the same owned lanes as ordinary work.
+//
+// Recovery used to be pushed onto the async pool and pinned to sequential
+// mode: the work a job is *waiting on* to finish paid a cold dial and gave
+// back the round trip pipelining exists to hide. A recovery lease is now an
+// ordinary lease as far as lane selection and depth are concerned: depth is a
+// property of the server the lane sits on, and nothing reads the class.
 #[tokio::test]
 async fn a_recovery_lease_takes_an_owned_lane() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -869,11 +869,11 @@ async fn a_recovery_lease_takes_an_owned_lane() {
     );
 }
 
-/// Dispatching recovery must never tear the lane fleet down.
-///
-/// Recovery once came off a separate engine and had to prise a connection
-/// permit away from the idle owned lanes to get one; a lease that resets the
-/// fleet throws away every warm connection the job is about to need.
+// Dispatching recovery must never tear the lane fleet down.
+//
+// Recovery once came off a separate engine and had to prise a connection
+// permit away from the idle owned lanes to get one; a lease that resets the
+// fleet throws away every warm connection the job is about to need.
 #[tokio::test]
 async fn a_recovery_lease_keeps_the_owned_lane_fleet_intact() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -919,12 +919,12 @@ async fn a_recovery_lease_keeps_the_owned_lane_fleet_intact() {
     );
 }
 
-/// One refill carries a lane two ring turns, and no more.
-///
-/// The worker asks again once its pending tail falls to `2 * depth + 1`, so a
-/// handout one deeper than that keeps the cadence at one refill per turn. A
-/// wider handout would pre-lease articles the job's other lanes could be
-/// fetching now, and leave the last lane draining a long tail alone.
+// One refill carries a lane two ring turns, and no more.
+//
+// The worker asks again once its pending tail falls to `2 * depth + 1`, so a
+// handout one deeper than that keeps the cadence at one refill per turn. A
+// wider handout would pre-lease articles the job's other lanes could be
+// fetching now, and leave the last lane draining a long tail alone.
 #[tokio::test]
 async fn a_refill_handout_is_two_ring_turns_deep() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -953,8 +953,8 @@ async fn a_refill_handout_is_two_ring_turns_deep() {
     );
 }
 
-/// A handout is exactly what the lane asked for while the queue can fill it,
-/// and never more — the queue's remainder is left for the other lanes.
+// A handout is exactly what the lane asked for while the queue can fill it,
+// and never more — the queue's remainder is left for the other lanes.
 #[tokio::test]
 async fn a_handout_is_bounded_by_the_want_not_by_the_queue() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -991,9 +991,9 @@ async fn a_handout_is_bounded_by_the_want_not_by_the_queue() {
     );
 }
 
-/// Promoted completion-critical work leads its own job's queue, and is handed
-/// out under the same bound as anything else: a promotion is not a licence for
-/// one lane to take the whole burst.
+// Promoted completion-critical work leads its own job's queue, and is handed
+// out under the same bound as anything else: a promotion is not a licence for
+// one lane to take the whole burst.
 #[tokio::test]
 async fn promoted_completion_critical_work_leads_the_queue_under_the_ordinary_bound() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1231,12 +1231,12 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
     assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES);
 }
 
-/// A transport-failure retry must point away from the server that just
-/// failed when an alternative exists (`avoid_server`), without entering the
-/// 430-exhaustion ledger — otherwise sustained stochastic stall on a
-/// healthy-looking primary can burn every retry on the same server while a
-/// clean backup idles, and one transient timeout could later help declare an
-/// article missing.
+// A transport-failure retry must point away from the server that just
+// failed when an alternative exists (`avoid_server`), without entering the
+// 430-exhaustion ledger — otherwise sustained stochastic stall on a
+// healthy-looking primary can burn every retry on the same server while a
+// clean backup idles, and one transient timeout could later help declare an
+// article missing.
 #[tokio::test]
 async fn transport_failure_retry_rotates_off_the_failed_server() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1298,8 +1298,8 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
     assert_eq!(retry.retry_count, 0);
 }
 
-/// With a single configured server there is nowhere to rotate to: the retry
-/// must stay eligible for that server instead of dead-ending.
+// With a single configured server there is nowhere to rotate to: the retry
+// must stay eligible for that server instead of dead-ending.
 #[tokio::test]
 async fn transport_failure_retry_keeps_single_server_eligible() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1357,10 +1357,10 @@ async fn transport_failure_retry_keeps_single_server_eligible() {
     assert!(retry.exclude_servers.is_empty());
 }
 
-/// A backfill server is not a rotation target: the avoid hint joins the
-/// lease's effective excludes, and excluding the whole fill tier would
-/// unlock backfill (`fill_servers_exhausted`) for work the fill server can
-/// serve on the next attempt — backfill is reserved for missing articles.
+// A backfill server is not a rotation target: the avoid hint joins the
+// lease's effective excludes, and excluding the whole fill tier would
+// unlock backfill (`fill_servers_exhausted`) for work the fill server can
+// serve on the next attempt — backfill is reserved for missing articles.
 #[tokio::test]
 async fn transport_failure_retry_does_not_rotate_toward_backfill() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1446,8 +1446,8 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
     );
 }
 
-/// Fails `segment_id` on an established connection and returns the delay its
-/// retry was parked for plus the retry count the requeued work carries.
+// Fails `segment_id` on an established connection and returns the delay its
+// retry was parked for plus the retry count the requeued work carries.
 async fn fail_segment_on_transport(
     pipeline: &mut Pipeline,
     segment_id: SegmentId,
@@ -2167,9 +2167,9 @@ async fn terminal_accounting_is_idempotent() {
     assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
 }
 
-/// Every segment of a file dies, some of them only after a retry that also
-/// died. The ledger is the sum of the declared segment sizes, counted once
-/// each — not once per attempt.
+// Every segment of a file dies, some of them only after a retry that also
+// died. The ledger is the sum of the declared segment sizes, counted once
+// each — not once per attempt.
 #[tokio::test]
 async fn a_file_whose_every_segment_dies_books_each_declared_size_exactly_once() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2226,9 +2226,9 @@ async fn a_file_whose_every_segment_dies_books_each_declared_size_exactly_once()
     );
 }
 
-/// A mixed pass: some segments fail, retry, and fail again; others fail once
-/// and then arrive. Only the terminal failures are booked, and the segments
-/// that landed contribute nothing however many times they failed first.
+// A mixed pass: some segments fail, retry, and fail again; others fail once
+// and then arrive. Only the terminal failures are booked, and the segments
+// that landed contribute nothing however many times they failed first.
 #[tokio::test]
 async fn segments_that_arrive_after_a_failure_leave_the_ledger_untouched() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2277,9 +2277,9 @@ async fn segments_that_arrive_after_a_failure_leave_the_ledger_untouched() {
     assert_eq!(pipeline.segment_terminal_states.len(), 2);
 }
 
-/// `weaver_files_missing_total` counts **files**, not failed segments, and it
-/// counts them where the download pass gives up rather than at each permanent
-/// segment failure: two dead segments in one file are one missing file.
+// `weaver_files_missing_total` counts **files**, not failed segments, and it
+// counts them where the download pass gives up rather than at each permanent
+// segment failure: two dead segments in one file are one missing file.
 #[tokio::test]
 async fn exhausted_download_counts_one_missing_file_with_its_missing_segments() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2340,8 +2340,8 @@ async fn exhausted_download_counts_one_missing_file_with_its_missing_segments() 
     );
 }
 
-/// The completion check re-enters many times per job, so the per-file guard is
-/// what keeps `weaver_files_missing_total` from climbing on every pass.
+// The completion check re-enters many times per job, so the per-file guard is
+// what keeps `weaver_files_missing_total` from climbing on every pass.
 #[tokio::test]
 async fn missing_files_are_counted_once_across_repeated_completion_checks() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2367,9 +2367,9 @@ async fn missing_files_are_counted_once_across_repeated_completion_checks() {
     assert_eq!(snapshot.missing_segments_total, 3);
 }
 
-/// A job with no PAR2 set can never produce an `intact`/`damaged`/`missing`
-/// verdict, so it is accounted for as `unverifiable` at its terminal
-/// transition instead of being left out of `weaver_verifications_total`.
+// A job with no PAR2 set can never produce an `intact`/`damaged`/`missing`
+// verdict, so it is accounted for as `unverifiable` at its terminal
+// transition instead of being left out of `weaver_verifications_total`.
 #[tokio::test]
 async fn job_without_par2_records_one_unverifiable_verification() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2410,8 +2410,8 @@ async fn job_without_par2_records_one_unverifiable_verification() {
     assert_eq!(unverifiable(&pipeline), 1);
 }
 
-/// The same terminal transition on a job that *does* carry a recovery set
-/// records nothing: that job's verdict is the verification pass's to report.
+// The same terminal transition on a job that *does* carry a recovery set
+// records nothing: that job's verdict is the verification pass's to report.
 #[tokio::test]
 async fn job_with_par2_set_records_no_unverifiable_verification() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3776,11 +3776,11 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
     );
 }
 
-/// The job an article belongs to rides on the result itself, so per-job
-/// accounting never has to ask which job holds the lane the article arrived
-/// on. This result closes its lane — it carries the lane's last outstanding
-/// work and its connection slot — so the owner entry is struck from the map
-/// before any of that accounting runs, and the job is still booked correctly.
+// The job an article belongs to rides on the result itself, so per-job
+// accounting never has to ask which job holds the lane the article arrived
+// on. This result closes its lane — it carries the lane's last outstanding
+// work and its connection slot — so the owner entry is struck from the map
+// before any of that accounting runs, and the job is still booked correctly.
 #[tokio::test]
 async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3861,14 +3861,14 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
     );
 }
 
-/// An article that already failed on one server and 430s on the other is
-/// missing everywhere. The completion path can only see that when the result
-/// carries the article's own exclusions: a lane's batch is cut for one job,
-/// not for one exclusion set, so the lease's set says nothing about which
-/// servers this article has already been refused by. Reporting the lease's
-/// set instead leaves the exclusion set one server wide forever, and because
-/// a sourced 430 spends no retry budget and waits no delay, the article
-/// ping-pongs between the two servers for as long as the job lives.
+// An article that already failed on one server and 430s on the other is
+// missing everywhere. The completion path can only see that when the result
+// carries the article's own exclusions: a lane's batch is cut for one job,
+// not for one exclusion set, so the lease's set says nothing about which
+// servers this article has already been refused by. Reporting the lease's
+// set instead leaves the exclusion set one server wide forever, and because
+// a sourced 430 spends no retry budget and waits no delay, the article
+// ping-pongs between the two servers for as long as the job lives.
 #[tokio::test]
 async fn article_not_found_exhausts_when_the_work_already_failed_elsewhere() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3932,10 +3932,10 @@ async fn article_not_found_exhausts_when_the_work_already_failed_elsewhere() {
     );
 }
 
-/// A 430 whose server is already in the article's exclusion set taught the
-/// retry nothing: the next attempt asks the same servers, gets the same
-/// answer, spends no retry budget and waits no delay. Book it rather than
-/// spin, even with servers left over in the pool.
+// A 430 whose server is already in the article's exclusion set taught the
+// retry nothing: the next attempt asks the same servers, gets the same
+// answer, spends no retry budget and waits no delay. Book it rather than
+// spin, even with servers left over in the pool.
 #[tokio::test]
 async fn article_not_found_that_learns_no_new_server_books_instead_of_retrying() {
     let temp_dir = tempfile::tempdir().unwrap();

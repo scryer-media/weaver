@@ -209,9 +209,9 @@ async fn par3_failed_name_move_rolls_back_live_and_restored_identity() {
     );
 }
 
-/// A move that reached the directory but not the identity row leaves an intent
-/// whose source is gone and whose target is there. Restore adopts the file that
-/// exists rather than treating the job as broken.
+// A move that reached the directory but not the identity row leaves an intent
+// whose source is gone and whose target is there. Restore adopts the file that
+// exists rather than treating the job as broken.
 #[tokio::test]
 async fn par3_name_intent_completed_on_disk_is_adopted_by_restore() {
     use crate::jobs::record::FileIdentitySource;

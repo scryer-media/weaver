@@ -1,9 +1,9 @@
-//! Whether this deployment may restart Weaver from its own UI, and the
-//! in-process channel that asks the serve loop to do it.
-//!
-//! The mechanism is platform-specific and has to run after graceful teardown,
-//! so it lives in the binary. What lives here is the decision and the
-//! plumbing, so the REST and GraphQL surfaces answer from one rule.
+// Whether this deployment may restart Weaver from its own UI, and the
+// in-process channel that asks the serve loop to do it.
+//
+// The mechanism is platform-specific and has to run after graceful teardown,
+// so it lives in the binary. What lives here is the decision and the
+// plumbing, so the REST and GraphQL surfaces answer from one rule.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,30 +15,30 @@ use super::environment::{
     DeploymentEnvironment, OperatingSystem, RuntimeEnvironment, detect_runtime_environment,
 };
 
-/// Escape hatch: set to a false value to remove the restart button and refuse
-/// the restart endpoint on an otherwise-supported install.
-///
-/// This exists for supervisors Weaver cannot see — a Windows service wrapper
-/// around `weaver.exe`, say, which would read the restart's exit as a crash
-/// and start a second copy. The operator knows their supervisor; Weaver can
-/// only know the deployment.
+// Escape hatch: set to a false value to remove the restart button and refuse
+// the restart endpoint on an otherwise-supported install.
+//
+// This exists for supervisors Weaver cannot see — a Windows service wrapper
+// around `weaver.exe`, say, which would read the restart's exit as a crash
+// and start a second copy. The operator knows their supervisor; Weaver can
+// only know the deployment.
 pub const ENV_UI_RESTART: &str = "WEAVER_UI_RESTART";
 
-/// Whether the operator has left UI-driven restarts enabled.
-///
-/// Unset and every truthy spelling mean enabled. A false value — or an
-/// unparsable one, because a mangled attempt to disable the hatch must not
-/// quietly re-enable it — means disabled.
+// Whether the operator has left UI-driven restarts enabled.
+//
+// Unset and every truthy spelling mean enabled. A false value — or an
+// unparsable one, because a mangled attempt to disable the hatch must not
+// quietly re-enable it — means disabled.
 pub fn ui_restart_enabled() -> bool {
     crate::security::parse_bool_env(ENV_UI_RESTART, true).unwrap_or(false)
 }
 
-/// Whether the running process can replace itself, and what to do instead
-/// when it cannot.
+// Whether the running process can replace itself, and what to do instead
+// when it cannot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestartCapability {
     pub supported: bool,
-    /// Set only when unsupported: the refusal, in the operator's terms.
+    // Set only when unsupported: the refusal, in the operator's terms.
     pub reason: Option<String>,
 }
 
@@ -58,24 +58,24 @@ impl RestartCapability {
     }
 }
 
-/// The running program file, when it can still be started again: resolved and
-/// present on disk.
-///
-/// `None` when either is untrue. An upgrade that replaced the binary under the
-/// running process must not cost the operator that process.
+// The running program file, when it can still be started again: resolved and
+// present on disk.
+//
+// `None` when either is untrue. An upgrade that replaced the binary under the
+// running process must not cost the operator that process.
 pub fn resolvable_executable() -> Option<PathBuf> {
     let executable = launched_executable()?;
     executable.is_file().then(|| executable.to_path_buf())
 }
 
-/// The program file this process was started from, asked of the operating
-/// system once and kept.
-///
-/// Linux answers from the file the process has open, not from the name it was
-/// started by, so the answer follows a rename. An upgrade renames the running
-/// program to its backup and puts the new build under the old name; asked
-/// after that, Linux names the backup, and a restart would start the build
-/// the upgrade just replaced. Serving asks before anything can be renamed.
+// The program file this process was started from, asked of the operating
+// system once and kept.
+//
+// Linux answers from the file the process has open, not from the name it was
+// started by, so the answer follows a rename. An upgrade renames the running
+// program to its backup and puts the new build under the old name; asked
+// after that, Linux names the backup, and a restart would start the build
+// the upgrade just replaced. Serving asks before anything can be renamed.
 fn launched_executable() -> Option<&'static Path> {
     static LAUNCHED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     LAUNCHED
@@ -83,10 +83,10 @@ fn launched_executable() -> Option<&'static Path> {
         .as_deref()
 }
 
-/// Settle the restart rules for one deployment.
-///
-/// Pure over its inputs so both HTTP surfaces and the tests decide identically
-/// without depending on the process the test happens to run in.
+// Settle the restart rules for one deployment.
+//
+// Pure over its inputs so both HTTP surfaces and the tests decide identically
+// without depending on the process the test happens to run in.
 pub fn restart_capability(
     environment: &RuntimeEnvironment,
     executable: Option<&Path>,
@@ -137,7 +137,7 @@ pub fn restart_capability(
     }
 }
 
-/// The restart rules as they stand for the running process.
+// The restart rules as they stand for the running process.
 pub fn current_restart_capability() -> RestartCapability {
     restart_capability(
         &detect_runtime_environment(),
@@ -146,29 +146,29 @@ pub fn current_restart_capability() -> RestartCapability {
     )
 }
 
-/// What the serve loop should do once it has torn the server down.
-///
-/// One channel rather than three, because every one of these ends the same way
-/// — graceful teardown first — and only the last step differs. An in-app
-/// upgrade needs the two non-restart endings: a Windows helper has already been
-/// detached and only wants this process out of the way, and a replaced macOS
-/// application bundle needs the desktop wrapper to start the new build because
-/// the binary this process would re-exec no longer exists.
+// What the serve loop should do once it has torn the server down.
+//
+// One channel rather than three, because every one of these ends the same way
+// — graceful teardown first — and only the last step differs. An in-app
+// upgrade needs the two non-restart endings: a Windows helper has already been
+// detached and only wants this process out of the way, and a replaced macOS
+// application bundle needs the desktop wrapper to start the new build because
+// the binary this process would re-exec no longer exists.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RestartAction {
-    /// Replace this process with a fresh one from the program file.
+    // Replace this process with a fresh one from the program file.
     #[default]
     Restart,
-    /// Exit without launching a replacement.
+    // Exit without launching a replacement.
     ExitOnly,
-    /// Exit with the code that asks the supervising desktop wrapper to relaunch
-    /// the application bundle.
+    // Exit with the code that asks the supervising desktop wrapper to relaunch
+    // the application bundle.
     BundleRelaunch,
 }
 
 impl RestartAction {
-    /// What the action cell holds before any request. Distinct from every
-    /// action, so a first request for a plain restart still claims the cell.
+    // What the action cell holds before any request. Distinct from every
+    // action, so a first request for a plain restart still claims the cell.
     const UNSET: u8 = u8::MAX;
 
     const fn as_u8(self) -> u8 {
@@ -188,31 +188,31 @@ impl RestartAction {
     }
 }
 
-/// The restart surface the HTTP layer holds: whether a restart is allowed
-/// here, and the request that reaches the serve loop.
-///
-/// A `Notify` rather than a flag because the request is a one-shot edge, and
-/// `notify_one` stores a permit when the loop is not parked on
-/// [`RestartController::requested`] yet, so a request cannot be lost to timing.
+// The restart surface the HTTP layer holds: whether a restart is allowed
+// here, and the request that reaches the serve loop.
+//
+// A `Notify` rather than a flag because the request is a one-shot edge, and
+// `notify_one` stores a permit when the loop is not parked on
+// [`RestartController::requested`] yet, so a request cannot be lost to timing.
 #[derive(Clone)]
 pub struct RestartController {
     requested: Arc<Notify>,
-    /// The action the first request asked for. First writer wins: once a
-    /// teardown is under way, a later request must not change what it ends in.
+    // The action the first request asked for. First writer wins: once a
+    // teardown is under way, a later request must not change what it ends in.
     action: Arc<AtomicU8>,
     capability: Arc<dyn Fn() -> RestartCapability + Send + Sync>,
 }
 
 impl RestartController {
-    /// The controller a running server holds. The capability is settled on
-    /// every ask rather than cached, so a program file an upgrade replaced is
-    /// noticed before the process is torn down for it.
+    // The controller a running server holds. The capability is settled on
+    // every ask rather than cached, so a program file an upgrade replaced is
+    // noticed before the process is torn down for it.
     pub fn new() -> Self {
         Self::with_capability_source(current_restart_capability)
     }
 
-    /// A controller whose capability comes from `source` rather than from this
-    /// process — how a caller presents a deployment it is not running in.
+    // A controller whose capability comes from `source` rather than from this
+    // process — how a caller presents a deployment it is not running in.
     pub fn with_capability_source(
         source: impl Fn() -> RestartCapability + Send + Sync + 'static,
     ) -> Self {
@@ -223,27 +223,27 @@ impl RestartController {
         }
     }
 
-    /// Whether this deployment may restart Weaver at all.
+    // Whether this deployment may restart Weaver at all.
     pub fn capability(&self) -> RestartCapability {
         (self.capability)()
     }
 
-    /// Ask for a restart. Never blocks and never fails: the serve loop decides
-    /// when the process is safe to replace.
+    // Ask for a restart. Never blocks and never fails: the serve loop decides
+    // when the process is safe to replace.
     pub fn request_restart(&self) {
         self.request(RestartAction::Restart);
     }
 
-    /// Ask the serve loop to shut down without launching a replacement.
-    ///
-    /// The Windows upgrade helper is already detached and waiting for this
-    /// process to release its own executable; it starts the new build itself.
+    // Ask the serve loop to shut down without launching a replacement.
+    //
+    // The Windows upgrade helper is already detached and waiting for this
+    // process to release its own executable; it starts the new build itself.
     pub fn request_exit(&self) {
         self.request(RestartAction::ExitOnly);
     }
 
-    /// Ask the serve loop to exit with the relaunch signal for the desktop
-    /// wrapper, after an in-place application-bundle upgrade.
+    // Ask the serve loop to exit with the relaunch signal for the desktop
+    // wrapper, after an in-place application-bundle upgrade.
     pub fn request_bundle_relaunch(&self) {
         self.request(RestartAction::BundleRelaunch);
     }
@@ -261,7 +261,7 @@ impl RestartController {
         self.requested.notify_one();
     }
 
-    /// Resolves once a restart has been requested, with what to do about it.
+    // Resolves once a restart has been requested, with what to do about it.
     pub async fn requested(&self) -> RestartAction {
         self.requested.notified().await;
         RestartAction::from_u8(self.action.load(Ordering::SeqCst))
@@ -406,9 +406,9 @@ mod tests {
         assert!(!controller.capability().supported);
     }
 
-    /// Each request names the ending the serve loop must use, and the first
-    /// one wins: a second ask during teardown must not turn a replaced bundle's
-    /// relaunch into an ordinary restart.
+    // Each request names the ending the serve loop must use, and the first
+    // one wins: a second ask during teardown must not turn a replaced bundle's
+    // relaunch into an ordinary restart.
     #[tokio::test]
     async fn each_request_carries_the_ending_the_serve_loop_must_use() {
         for (request, expected) in [

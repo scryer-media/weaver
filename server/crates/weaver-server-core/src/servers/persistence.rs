@@ -89,9 +89,9 @@ impl Database {
         })
     }
 
-    /// Write through one proven BODY pipelining depth. Narrow on purpose: the
-    /// download runtime learns this while a user may be editing the same row,
-    /// so it must not carry the rest of the record with it.
+    // Write through one proven BODY pipelining depth. Narrow on purpose: the
+    // download runtime learns this while a user may be editing the same row,
+    // so it must not carry the rest of the record with it.
     pub fn update_server_pipelining_depth(
         &self,
         id: u32,

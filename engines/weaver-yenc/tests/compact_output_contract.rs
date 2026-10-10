@@ -1,32 +1,32 @@
-//! The output-bounds contract of the safe decode APIs, exercised from outside
-//! the crate.
-//!
-//! `weaver-yenc` splits its public decode surface into three tiers, and each
-//! tier promises something different about the destination buffer:
-//!
-//! 1. The whole-article entries (`decode`, `decode_nntp`, `decode_with_options`)
-//!    reject `output.len() < input.len()` up front with
-//!    [`YencError::BufferTooSmall`], *before* parsing — the contract is a
-//!    property of the call, not of how compressible the article turned out.
-//! 2. The self-sizing entries (`decode_nntp_append`,
-//!    `decode_body_chunk_until_control`) reserve `input.len()` of spare capacity
-//!    themselves and write into it.
-//! 3. The byte-level entries (`decode_body`, `decode_chunk`, and the
-//!    `decode_rapidyenc*` family) *accept* a compact destination and quietly
-//!    drop from the full-width SIMD kernels to a checked scalar one.
-//!
-//! Tier 3 is the interesting one: it is the only place where the same input can
-//! be decoded by two different kernels, so it is the only place where the two
-//! can disagree. Every test here therefore runs the same input twice — once
-//! into `vec![0; input.len()]` (the roomy, SIMD-eligible oracle) and once into a
-//! compact window — and demands one of exactly two outcomes: byte-for-byte
-//! agreement, or a typed `BufferTooSmall`. A short write, a silent truncation,
-//! or a store outside the caller's slice is a contract violation.
-//!
-//! Every compact call runs inside a 0xAB canary buffer whose window is a
-//! sub-slice, so an over-store in either direction is caught by the padding
-//! rather than by luck. Only safe, publicly re-exported APIs are used; nothing
-//! here reaches into `simd::` or constructs decoder state by hand.
+// The output-bounds contract of the safe decode APIs, exercised from outside
+// the crate.
+//
+// `weaver-yenc` splits its public decode surface into three tiers, and each
+// tier promises something different about the destination buffer:
+//
+// 1. The whole-article entries (`decode`, `decode_nntp`, `decode_with_options`)
+//    reject `output.len() < input.len()` up front with
+//    [`YencError::BufferTooSmall`], *before* parsing — the contract is a
+//    property of the call, not of how compressible the article turned out.
+// 2. The self-sizing entries (`decode_nntp_append`,
+//    `decode_body_chunk_until_control`) reserve `input.len()` of spare capacity
+//    themselves and write into it.
+// 3. The byte-level entries (`decode_body`, `decode_chunk`, and the
+//    `decode_rapidyenc*` family) *accept* a compact destination and quietly
+//    drop from the full-width SIMD kernels to a checked scalar one.
+//
+// Tier 3 is the interesting one: it is the only place where the same input can
+// be decoded by two different kernels, so it is the only place where the two
+// can disagree. Every test here therefore runs the same input twice — once
+// into `vec![0; input.len()]` (the roomy, SIMD-eligible oracle) and once into a
+// compact window — and demands one of exactly two outcomes: byte-for-byte
+// agreement, or a typed `BufferTooSmall`. A short write, a silent truncation,
+// or a store outside the caller's slice is a contract violation.
+//
+// Every compact call runs inside a 0xAB canary buffer whose window is a
+// sub-slice, so an over-store in either direction is caught by the padding
+// rather than by luck. Only safe, publicly re-exported APIs are used; nothing
+// here reaches into `simd::` or constructs decoder state by hand.
 
 use weaver_yenc::crc::Crc32;
 use weaver_yenc::{
@@ -38,15 +38,15 @@ use weaver_yenc::{
 
 // ── canary scaffolding ──────────────────────────────────────────────────────
 
-/// Fill byte for the guard region around (and inside) every output window.
+// Fill byte for the guard region around (and inside) every output window.
 const CANARY: u8 = 0xAB;
 
-/// Guard bytes on each side of the output window. Wider than the widest SIMD
-/// store in the crate (64 bytes) so a single over-wide store cannot step clean
-/// over the guard and land in untouched memory.
+// Guard bytes on each side of the output window. Wider than the widest SIMD
+// store in the crate (64 bytes) so a single over-wide store cannot step clean
+// over the guard and land in untouched memory.
 const PAD: usize = 96;
 
-/// One decode call, reduced to everything the contract says must be reproducible.
+// One decode call, reduced to everything the contract says must be reproducible.
 #[derive(Debug, PartialEq, Eq)]
 struct Run {
     written: usize,
@@ -54,7 +54,7 @@ struct Run {
     end: RapidyencDecodeEnd,
     crc: u32,
     bytes: Vec<u8>,
-    /// Decoder carry state after the call, for the APIs that expose one.
+    // Decoder carry state after the call, for the APIs that expose one.
     carry: Option<RapidyencDecodeState>,
 }
 
@@ -86,15 +86,15 @@ impl Run {
     }
 }
 
-/// Run one decode into a `out_len`-byte window carved out of a canary-filled
-/// buffer, then prove the call stayed inside that window.
-///
-/// The guards on both sides are checked unconditionally, including on the error
-/// path — a decode that overflows must not have scribbled outside the slice on
-/// its way to reporting that. The *tail* of the window (past `bytes_written`)
-/// is checked only on the compact path: the SIMD kernels legitimately store
-/// full vectors inside the caller's slice past the last decoded byte, and the
-/// crate only promises they stay within it.
+// Run one decode into a `out_len`-byte window carved out of a canary-filled
+// buffer, then prove the call stayed inside that window.
+//
+// The guards on both sides are checked unconditionally, including on the error
+// path — a decode that overflows must not have scribbled outside the slice on
+// its way to reporting that. The *tail* of the window (past `bytes_written`)
+// is checked only on the compact path: the SIMD kernels legitimately store
+// full vectors inside the caller's slice past the last decoded byte, and the
+// crate only promises they stay within it.
 fn canary_run(
     label: &str,
     input_len: usize,
@@ -131,28 +131,28 @@ fn canary_run(
     Ok(run)
 }
 
-/// Which arm of the contract a comparison landed on.
-///
-/// Reported so a sweep can prove it actually drove the scalar fallback, rather
-/// than quietly comparing the SIMD kernel against itself: a window is only
-/// compact when it is shorter than the input, and for an all-plain body the
-/// "exactly the decoded length" window is not.
+// Which arm of the contract a comparison landed on.
+//
+// Reported so a sweep can prove it actually drove the scalar fallback, rather
+// than quietly comparing the SIMD kernel against itself: a window is only
+// compact when it is shorter than the input, and for an all-plain body the
+// "exactly the decoded length" window is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
-    /// A window shorter than the input decoded successfully — the scalar
-    /// fallback did real work and agreed with the SIMD kernels byte for byte.
+    // A window shorter than the input decoded successfully — the scalar
+    // fallback did real work and agreed with the SIMD kernels byte for byte.
     CompactOk,
-    /// A window at or above `input.len()`, where the SIMD kernels are eligible.
+    // A window at or above `input.len()`, where the SIMD kernels are eligible.
     RoomyOk,
-    /// A window too small for the output, correctly refused.
+    // A window too small for the output, correctly refused.
     Refused,
 }
 
-/// The whole compact contract in one assertion.
-///
-/// A window that can hold the roomy run's output must reproduce it exactly. A
-/// window that cannot must refuse with `BufferTooSmall` naming its own size —
-/// never a partial success.
+// The whole compact contract in one assertion.
+//
+// A window that can hold the roomy run's output must reproduce it exactly. A
+// window that cannot must refuse with `BufferTooSmall` naming its own size —
+// never a partial success.
 fn assert_compact_run(
     compact: Result<Run, YencError>,
     roomy: &Run,
@@ -201,20 +201,20 @@ fn assert_compact_run(
 
 // ── deterministic encoded-body fixtures ─────────────────────────────────────
 
-/// Shapes of *encoded* yEnc body bytes. Each one drives a different arm of the
-/// decoder: the flat copy loop, the escape-compaction path, the line-boundary
-/// machine, and the NNTP dot-unstuffing machine.
+// Shapes of *encoded* yEnc body bytes. Each one drives a different arm of the
+// decoder: the flat copy loop, the escape-compaction path, the line-boundary
+// machine, and the NNTP dot-unstuffing machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
-    /// No specials at all: the widest SIMD fast path.
+    // No specials at all: the widest SIMD fast path.
     Plain,
-    /// Every payload byte escaped (`=` + escapee): pure compaction.
+    // Every payload byte escaped (`=` + escapee): pure compaction.
     DenseEscapes,
-    /// Short encoded lines separated by CRLF.
+    // Short encoded lines separated by CRLF.
     Lines,
-    /// CRLF lines whose first byte is a stuffed dot (`..`).
+    // CRLF lines whose first byte is a stuffed dot (`..`).
     DotLines,
-    /// Plain runs, escapes, line breaks and stuffed dots interleaved.
+    // Plain runs, escapes, line breaks and stuffed dots interleaved.
     Mixed,
 }
 
@@ -226,19 +226,19 @@ const SHAPES: [Shape; 5] = [
     Shape::Mixed,
 ];
 
-/// An encoded byte that is never a yEnc special (`=`, CR, LF), never `.`
-/// (which would collide with dot-stuffing at a line start) and never `y`
-/// (which would turn a preceding `=` at a line start into a `=y` control line).
+// An encoded byte that is never a yEnc special (`=`, CR, LF), never `.`
+// (which would collide with dot-stuffing at a line start) and never `y`
+// (which would turn a preceding `=` at a line start into a `=y` control line).
 fn plain_byte(i: usize) -> u8 {
     const ALPHABET: &[u8] = b"AZ09az!~Bb-_MmQq{}Ww";
     ALPHABET[i % ALPHABET.len()]
 }
 
-/// Exactly `len` bytes of encoded yEnc body in the requested shape.
-///
-/// Tokens are emitted whole or not at all, so a body never ends on a dangling
-/// `=` or a lone CR. That keeps one fixture legal for both the entry points
-/// that carry a pending escape across calls and the ones that reject it.
+// Exactly `len` bytes of encoded yEnc body in the requested shape.
+//
+// Tokens are emitted whole or not at all, so a body never ends on a dangling
+// `=` or a lone CR. That keeps one fixture legal for both the entry points
+// that carry a pending escape across calls and the ones that reject it.
 fn encoded_body(shape: Shape, len: usize) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(len);
     let mut i = 0usize;
@@ -277,13 +277,13 @@ fn encoded_body(shape: Shape, len: usize) -> Vec<u8> {
     out
 }
 
-/// Sizes that bracket every vector width the crate dispatches on (16/32/64) and
-/// the ~128-byte point where the raw kernels have enough runway to engage at
-/// all (`WIDTH + tail`), so both the SIMD loop and its scalar prologue/epilogue
-/// are exercised on each side of the switch.
+// Sizes that bracket every vector width the crate dispatches on (16/32/64) and
+// the ~128-byte point where the raw kernels have enough runway to engage at
+// all (`WIDTH + tail`), so both the SIMD loop and its scalar prologue/epilogue
+// are exercised on each side of the switch.
 const BOUNDARY_SIZES: [usize; 14] = [15, 16, 17, 31, 32, 33, 63, 64, 65, 126, 127, 128, 129, 130];
 
-/// Sizes well past the point where the SIMD loop runs many full iterations.
+// Sizes well past the point where the SIMD loop runs many full iterations.
 const BULK_SIZES: [usize; 4] = [257, 512, 1000, 4096];
 
 fn with_suffix(body: &[u8], suffix: &[u8]) -> Vec<u8> {
@@ -292,10 +292,10 @@ fn with_suffix(body: &[u8], suffix: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The raw NNTP article terminator.
+// The raw NNTP article terminator.
 const TERMINATOR: &[u8] = b"\r\n.\r\n";
 
-/// A `=yend` control line, the other thing an end-detecting decode stops on.
+// A `=yend` control line, the other thing an end-detecting decode stops on.
 const CONTROL: &[u8] = b"\r\n=yend size=7 crc32=00000000\r\n";
 
 // ── per-API runners ─────────────────────────────────────────────────────────
@@ -375,7 +375,7 @@ fn run_decode_rapidyenc_incremental(
     )
 }
 
-/// The compact window sizes the contract calls out, deduped and ordered.
+// The compact window sizes the contract calls out, deduped and ordered.
 fn output_ladder(input_len: usize, decoded_len: usize) -> Vec<usize> {
     let mut lens = vec![
         0,
@@ -389,7 +389,7 @@ fn output_ladder(input_len: usize, decoded_len: usize) -> Vec<usize> {
     lens
 }
 
-/// A `DecodeState`'s observable state, for comparing two streaming decodes.
+// A `DecodeState`'s observable state, for comparing two streaming decodes.
 #[derive(Debug, PartialEq, Eq)]
 struct ChunkCarry {
     escape_pending: bool,
@@ -411,9 +411,9 @@ fn chunk_carry(state: &DecodeState) -> ChunkCarry {
 
 // ── §1  the rapidyenc family, compact vs roomy ──────────────────────────────
 
-/// `decode_rapidyenc` into every window size the contract names, over every
-/// body shape and every size that brackets a vector width, must either
-/// reproduce the roomy decode byte for byte or refuse with `BufferTooSmall`.
+// `decode_rapidyenc` into every window size the contract names, over every
+// body shape and every size that brackets a vector width, must either
+// reproduce the roomy decode byte for byte or refuse with `BufferTooSmall`.
 #[test]
 fn rapidyenc_compact_windows_match_the_roomy_run() {
     let mut tally = Vec::new();
@@ -447,9 +447,9 @@ fn count_verdicts(tally: &[Verdict], want: Verdict) -> usize {
     tally.iter().filter(|&&verdict| verdict == want).count()
 }
 
-/// A sweep only means something if a real share of it drove the scalar
-/// fallback. Without this the whole battery could degenerate into comparing the
-/// SIMD kernel against itself and still pass.
+// A sweep only means something if a real share of it drove the scalar
+// fallback. Without this the whole battery could degenerate into comparing the
+// SIMD kernel against itself and still pass.
 fn assert_verdicts(tally: &[Verdict], min_total: usize, label: &str) {
     let compact_ok = count_verdicts(tally, Verdict::CompactOk);
     eprintln!(
@@ -470,7 +470,7 @@ fn assert_verdicts(tally: &[Verdict], min_total: usize, label: &str) {
     );
 }
 
-/// The ladder sweeps also have to prove the refusal arm is reachable.
+// The ladder sweeps also have to prove the refusal arm is reachable.
 fn assert_saw_refusals(tally: &[Verdict], label: &str) {
     assert!(
         count_verdicts(tally, Verdict::Refused) > 0,
@@ -478,9 +478,9 @@ fn assert_saw_refusals(tally: &[Verdict], label: &str) {
     );
 }
 
-/// The same ladder for `decode_rapidyenc_ex`, across both `is_raw` modes and
-/// every carry-in state — the carry-out state must survive the compact kernel
-/// unchanged too, not just the bytes.
+// The same ladder for `decode_rapidyenc_ex`, across both `is_raw` modes and
+// every carry-in state — the carry-out state must survive the compact kernel
+// unchanged too, not just the bytes.
 #[test]
 fn rapidyenc_ex_compact_windows_match_the_roomy_run() {
     const STATES: [RapidyencDecodeState; 7] = [
@@ -528,10 +528,10 @@ fn rapidyenc_ex_compact_windows_match_the_roomy_run() {
 
 // ── §2  incremental decode across chunk boundaries ──────────────────────────
 
-/// Feed a body to `decode_rapidyenc_incremental` in several pieces, each into a
-/// window sized to exactly that piece's decoded length, and require the
-/// concatenation — bytes, total consumed, and end detection — to equal one
-/// roomy whole-input call.
+// Feed a body to `decode_rapidyenc_incremental` in several pieces, each into a
+// window sized to exactly that piece's decoded length, and require the
+// concatenation — bytes, total consumed, and end detection — to equal one
+// roomy whole-input call.
 #[test]
 fn rapidyenc_incremental_compact_chunks_match_one_roomy_call() {
     let mut checked = 0usize;
@@ -620,8 +620,8 @@ fn rapidyenc_incremental_compact_chunks_match_one_roomy_call() {
 
 // ── §3  decode_chunk and the until-control hook ─────────────────────────────
 
-/// `decode_chunk` fed whole, into every window on the ladder, must match the
-/// roomy run — including the state it leaves behind for the next chunk.
+// `decode_chunk` fed whole, into every window on the ladder, must match the
+// roomy run — including the state it leaves behind for the next chunk.
 #[test]
 fn decode_chunk_compact_windows_match_the_roomy_run() {
     let mut tally = Vec::new();
@@ -650,11 +650,11 @@ fn decode_chunk_compact_windows_match_the_roomy_run() {
     assert_saw_refusals(&tally, "decode_chunk");
 }
 
-/// `decode_body_chunk_until_control` sizes its own destination, so its
-/// "compact" dimension is the destination vector's spare capacity rather than a
-/// slice length. A vector with nothing to spare must produce exactly what a
-/// generously pre-reserved one does, and must stop at the same `=y` control
-/// line either way.
+// `decode_body_chunk_until_control` sizes its own destination, so its
+// "compact" dimension is the destination vector's spare capacity rather than a
+// slice length. A vector with nothing to spare must produce exactly what a
+// generously pre-reserved one does, and must stop at the same `=y` control
+// line either way.
 #[test]
 fn until_control_agrees_whatever_spare_capacity_the_destination_has() {
     let mut checked = 0usize;
@@ -713,9 +713,9 @@ fn until_control_agrees_whatever_spare_capacity_the_destination_has() {
     assert!(checked > 100, "until-control cases checked {checked}");
 }
 
-/// The `=y` control line is where an end-detecting body decode must stop, and
-/// it must stop at exactly the same source offset whether it is the SIMD or the
-/// scalar kernel doing the looking.
+// The `=y` control line is where an end-detecting body decode must stop, and
+// it must stop at exactly the same source offset whether it is the SIMD or the
+// scalar kernel doing the looking.
 #[test]
 fn until_control_stops_at_the_control_line() {
     let body = with_suffix(&encoded_body(Shape::Mixed, 200), CONTROL);
@@ -753,10 +753,10 @@ fn until_control_stops_at_the_control_line() {
 
 // ── §4  appending into a non-empty destination ──────────────────────────────
 
-/// `decode_nntp_append` writes into the destination's spare capacity. It must
-/// leave everything already in the vector alone, append exactly what a fresh
-/// decode produces, and do so even when the vector had no spare capacity at all
-/// and the reservation inside had to move it.
+// `decode_nntp_append` writes into the destination's spare capacity. It must
+// leave everything already in the vector alone, append exactly what a fresh
+// decode produces, and do so even when the vector had no spare capacity at all
+// and the reservation inside had to move it.
 #[test]
 fn nntp_append_preserves_a_nonempty_destination() {
     for len in [0usize, 1, 63, 128, 1000] {
@@ -810,9 +810,9 @@ fn nntp_append_preserves_a_nonempty_destination() {
     }
 }
 
-/// A raw-NNTP article wrapped around an already-encoded, already-dot-stuffed
-/// body, with `=ybegin`/`=yend` fields taken from the roomy decode of that body
-/// so the article is self-consistent by construction.
+// A raw-NNTP article wrapped around an already-encoded, already-dot-stuffed
+// body, with `=ybegin`/`=yend` fields taken from the roomy decode of that body
+// so the article is self-consistent by construction.
 fn nntp_article(body: &[u8], name: &str) -> Vec<u8> {
     let mut scratch = vec![0u8; max_decoded_len(body.len())];
     let mut crc = Crc32::new();
@@ -838,9 +838,9 @@ fn nntp_article(body: &[u8], name: &str) -> Vec<u8> {
 
 // ── §5  sizes around the vector and raw-kernel boundaries ───────────────────
 
-/// One sweep that puts every byte-level entry point through the same body at
-/// every size that brackets a SIMD vector width or the raw kernel's activation
-/// runway, compact against roomy.
+// One sweep that puts every byte-level entry point through the same body at
+// every size that brackets a SIMD vector width or the raw kernel's activation
+// runway, compact against roomy.
 #[test]
 fn boundary_sizes_decode_identically_compact_and_roomy() {
     let mut tally = Vec::new();
@@ -853,9 +853,9 @@ fn boundary_sizes_decode_identically_compact_and_roomy() {
     assert_verdicts(&tally, 500, "boundary sizes");
 }
 
-/// The same sweep at sizes where the SIMD loop runs many full iterations, so a
-/// compact/roomy divergence in the steady state cannot hide behind the
-/// prologue.
+// The same sweep at sizes where the SIMD loop runs many full iterations, so a
+// compact/roomy divergence in the steady state cannot hide behind the
+// prologue.
 #[test]
 fn bulk_sizes_decode_identically_compact_and_roomy() {
     let mut tally = Vec::new();
@@ -868,8 +868,8 @@ fn bulk_sizes_decode_identically_compact_and_roomy() {
     assert_verdicts(&tally, 100, "bulk sizes");
 }
 
-/// Run `body` through every compact-tolerant entry point at an exactly-sized
-/// window and compare against the roomy run.
+// Run `body` through every compact-tolerant entry point at an exactly-sized
+// window and compare against the roomy run.
 fn assert_every_byte_level_api_agrees(body: &[u8], label: &str, tally: &mut Vec<Verdict>) {
     let n = body.len();
 
@@ -940,9 +940,9 @@ fn assert_every_byte_level_api_agrees(body: &[u8], label: &str, tally: &mut Vec<
 
 // ── §6  carried state across a chunk boundary ───────────────────────────────
 
-/// A body containing, in order, every carry shape a chunk boundary can land on:
-/// a pending `=`, a lone CR, a completed CRLF, and a CRLF followed by a
-/// line-start dot.
+// A body containing, in order, every carry shape a chunk boundary can land on:
+// a pending `=`, a lone CR, a completed CRLF, and a CRLF followed by a
+// line-start dot.
 const CARRY_BODY: &[u8] = b"Aa=Jbb\r\ncc\r\n..dd=K=L\r\nee\r\n.ff\r\ngg";
 
 fn find_at(body: &[u8], needle: &[u8]) -> usize {
@@ -951,7 +951,7 @@ fn find_at(body: &[u8], needle: &[u8]) -> usize {
         .unwrap_or_else(|| panic!("fixture is missing {needle:?}"))
 }
 
-/// The four boundaries the contract names, as `(name, split offset)`.
+// The four boundaries the contract names, as `(name, split offset)`.
 fn named_carry_splits() -> Vec<(&'static str, usize)> {
     vec![
         ("after a pending `=`", find_at(CARRY_BODY, b"=") + 1),
@@ -961,9 +961,9 @@ fn named_carry_splits() -> Vec<(&'static str, usize)> {
     ]
 }
 
-/// Splitting a body at a boundary that leaves decoder state pending must not
-/// change what comes out — with each half decoded into a window sized to
-/// exactly that half's output.
+// Splitting a body at a boundary that leaves decoder state pending must not
+// change what comes out — with each half decoded into a window sized to
+// exactly that half's output.
 #[test]
 fn carried_state_splits_agree_with_the_unsplit_decode() {
     // Every named boundary is distinct, so the sweep below really does cover
@@ -1092,9 +1092,9 @@ fn assert_incremental_split_agrees(body: &[u8], split: usize, name: &str) {
 
 // ── §7  terminators and trailers ────────────────────────────────────────────
 
-/// `\r\n.\r\n` ends a raw NNTP body, and it must be found at the same offset by
-/// the compact and the roomy kernel — including when the terminator itself is
-/// what the window has no room to reach past.
+// `\r\n.\r\n` ends a raw NNTP body, and it must be found at the same offset by
+// the compact and the roomy kernel — including when the terminator itself is
+// what the window has no room to reach past.
 #[test]
 fn raw_terminator_is_detected_identically_compact_and_roomy() {
     let mut tally = Vec::new();
@@ -1143,9 +1143,9 @@ fn raw_terminator_is_detected_identically_compact_and_roomy() {
     assert_saw_refusals(&tally, "raw terminator");
 }
 
-/// A complete article with a `=yend` trailer decodes to the same bytes and the
-/// same verified CRC through every whole-article entry point, single-part and
-/// multi-part alike.
+// A complete article with a `=yend` trailer decodes to the same bytes and the
+// same verified CRC through every whole-article entry point, single-part and
+// multi-part alike.
 #[test]
 fn article_trailers_agree_across_the_whole_article_entry_points() {
     for len in [0usize, 1, 15, 16, 17, 127, 128, 129, 1000, 4096] {
@@ -1194,11 +1194,11 @@ fn article_trailers_agree_across_the_whole_article_entry_points() {
     }
 }
 
-/// The shared shape of every tier-1 entry point.
+// The shared shape of every tier-1 entry point.
 type WholeArticleEntry = fn(&[u8], &mut [u8]) -> Result<DecodeResult, YencError>;
 
-/// Tier 1: the whole-article entries refuse a compact destination before they
-/// parse anything, and refuse it without touching the buffer they were handed.
+// Tier 1: the whole-article entries refuse a compact destination before they
+// parse anything, and refuse it without touching the buffer they were handed.
 #[test]
 fn whole_article_entries_reject_a_compact_destination() {
     let payload: Vec<u8> = (0..600).map(|i| ((i * 17 + 3) % 256) as u8).collect();
@@ -1248,16 +1248,16 @@ fn whole_article_entries_reject_a_compact_destination() {
 
 // ── §9  zero-length output windows ──────────────────────────────────────────
 
-/// A zero-length destination with non-empty input is a legitimate call. It must
-/// answer with an honest `Ok(0)` when the input really decodes to nothing, or a
-/// typed `BufferTooSmall` when it does not — never a panic, never a write,
-/// never a silent short decode.
-///
-/// Which of the two applies is not a property of the input alone: `\r\n.\r\n`
-/// decodes to nothing under NNTP dot-unstuffing but to one `.` byte without it,
-/// and `\r\n=y` is an end marker to the end-detecting entries and an ordinary
-/// escape to the rest. So each API is judged against its own roomy oracle
-/// rather than against a hand-declared expectation.
+// A zero-length destination with non-empty input is a legitimate call. It must
+// answer with an honest `Ok(0)` when the input really decodes to nothing, or a
+// typed `BufferTooSmall` when it does not — never a panic, never a write,
+// never a silent short decode.
+//
+// Which of the two applies is not a property of the input alone: `\r\n.\r\n`
+// decodes to nothing under NNTP dot-unstuffing but to one `.` byte without it,
+// and `\r\n=y` is an end marker to the end-detecting entries and an ordinary
+// escape to the rest. So each API is judged against its own roomy oracle
+// rather than against a hand-declared expectation.
 #[test]
 fn zero_length_windows_are_honest_never_a_panic() {
     const INPUTS: [&[u8]; 12] = [
@@ -1354,8 +1354,8 @@ fn zero_length_windows_are_honest_never_a_panic() {
     assert!(refused > 10, "no zero-length refusals ({refused})");
 }
 
-/// An empty input is a no-op for every compact-tolerant entry point, whatever
-/// the destination looks like.
+// An empty input is a no-op for every compact-tolerant entry point, whatever
+// the destination looks like.
 #[test]
 fn empty_input_writes_nothing() {
     for out_len in [0usize, 1, 64] {

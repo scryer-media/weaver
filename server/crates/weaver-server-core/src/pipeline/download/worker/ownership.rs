@@ -43,11 +43,11 @@ impl Pipeline {
         );
     }
 
-    /// Re-book a live lane for the batch it was just granted: its job, the
-    /// server it turned out to be on, the class and depth it now runs, and the
-    /// articles it owes results for. Moves the per-job connection gauges when
-    /// the job or the class changed, so what a park releases is what is
-    /// booked here.
+    // Re-book a live lane for the batch it was just granted: its job, the
+    // server it turned out to be on, the class and depth it now runs, and the
+    // articles it owes results for. Moves the per-job connection gauges when
+    // the job or the class changed, so what a park releases is what is
+    // booked here.
     pub(in crate::pipeline) fn rebook_download_lane_owner(
         &mut self,
         lane_id: u64,
@@ -138,11 +138,11 @@ impl Pipeline {
         accepted
     }
 
-    /// Tear down every lane still fetching for `job_id` and give its
-    /// articles back. A lane the job owns only on paper, with nothing in
-    /// flight, is a hot worker between leases: its next refill is answered
-    /// from whichever job the scheduler names, so it stays up, cached
-    /// connection and all, rather than dying with the job it last served.
+    // Tear down every lane still fetching for `job_id` and give its
+    // articles back. A lane the job owns only on paper, with nothing in
+    // flight, is a hot worker between leases: its next refill is answered
+    // from whichever job the scheduler names, so it stays up, cached
+    // connection and all, rather than dying with the job it last served.
     pub(in crate::pipeline) fn retire_stalled_download_lanes(&mut self, job_id: JobId) -> usize {
         let ids: Vec<_> = self
             .download_lane_owners

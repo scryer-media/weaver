@@ -1,7 +1,7 @@
-//! Event-driven campaigns against retained PAR3 state. No wall clock, network,
-//! reference executable, or optional corpus is needed. Each assertion names its
-//! seed and a minimized event trace. WEAVER_PAR3_SCHEDULE_SEED replays one seed;
-//! WEAVER_PAR3_SCHEDULE_CASES increases the default four-seed campaign.
+// Event-driven campaigns against retained PAR3 state. No wall clock, network,
+// reference executable, or optional corpus is needed. Each assertion names its
+// seed and a minimized event trace. WEAVER_PAR3_SCHEDULE_SEED replays one seed;
+// WEAVER_PAR3_SCHEDULE_CASES increases the default four-seed campaign.
 
 use super::*;
 use par3_rs::creation::{
@@ -45,7 +45,7 @@ struct Fixture {
     data_only: bool,
 }
 
-/// SplitMix64 fixes the stream independently of library versions and host RNGs.
+// SplitMix64 fixes the stream independently of library versions and host RNGs.
 fn random(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e3779b97f4a7c15);
     let mut value = *state;
@@ -236,8 +236,8 @@ enum Event {
     Assess,
 }
 
-/// Each source/packet has a partial then complete publication. Choosing an
-/// enabled chain head explores legal orders without racing background tasks.
+// Each source/packet has a partial then complete publication. Choosing an
+// enabled chain head explores legal orders without racing background tasks.
 fn schedule(fixture: &Fixture, seed: u64) -> Vec<Event> {
     let mut chains: Vec<Vec<Event>> = (0..fixture.inputs.len())
         .map(|i| {
@@ -468,8 +468,8 @@ fn signature(job: &Par3Job) -> Vec<String> {
         .collect()
 }
 
-/// Deletion shrinking retains the same violated contract, so a shorter trace
-/// that merely creates a different error is not reported as the reproducer.
+// Deletion shrinking retains the same violated contract, so a shorter trace
+// that merely creates a different error is not reported as the reproducer.
 fn minimize(events: &[Event], mut fails: impl FnMut(&[Event]) -> bool) -> Vec<Event> {
     let mut result = events.to_vec();
     let mut width = result.len() / 2;
@@ -622,8 +622,8 @@ variant_test!(nested_inline_empty_schedules, Nested);
 variant_test!(alias_schedules, Aliases);
 variant_test!(independent_cauchy_and_fft_set_schedules, MultipleSets);
 
-/// Every order in which the chains' heads can be taken, each chain keeping
-/// its own order.
+// Every order in which the chains' heads can be taken, each chain keeping
+// its own order.
 fn interleavings(chains: &mut [Vec<Event>], prefix: &mut Vec<Event>, output: &mut Vec<Vec<Event>>) {
     if chains.iter().all(Vec::is_empty) {
         output.push(prefix.clone());
@@ -641,14 +641,14 @@ fn interleavings(chains: &mut [Vec<Event>], prefix: &mut Vec<Event>, output: &mu
     }
 }
 
-/// The seeded campaigns sample a large event space. This one is exhaustive
-/// over a small one: the protected source's three publications, and the
-/// index and the last recovery carrier each published with a hole and then
-/// whole, in every interleaving, with an assessment checked against a fresh
-/// one after each event, under every damage. The index is also left out
-/// altogether, since every recovery carrier repeats the metadata it holds.
-/// Carriers outside the interleaving arrive whole afterwards, so each damage
-/// finishes against the same recovery whichever order came first.
+// The seeded campaigns sample a large event space. This one is exhaustive
+// over a small one: the protected source's three publications, and the
+// index and the last recovery carrier each published with a hole and then
+// whole, in every interleaving, with an assessment checked against a fresh
+// one after each event, under every damage. The index is also left out
+// altogether, since every recovery carrier repeats the metadata it holds.
+// Carriers outside the interleaving arrive whole afterwards, so each damage
+// finishes against the same recovery whichever order came first.
 #[test]
 fn every_interleaving_of_source_index_and_recovery() {
     let fixture = Fixture::new(Variant::Cauchy8);

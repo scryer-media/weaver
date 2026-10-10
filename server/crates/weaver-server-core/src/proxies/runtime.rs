@@ -106,11 +106,11 @@ struct Cooldown {
     until: Instant,
     probing: bool,
 }
-/// Whether a policy change touches what a legacy route is built from. Its
-/// legs and failover live in the network runtime, which applies them to the
-/// live route in place: a reweight moves connections between legs, a changed
-/// path revokes that leg alone. Rebuilding the legacy route for them would
-/// revoke every socket it tracks for a change that was meant to keep them.
+// Whether a policy change touches what a legacy route is built from. Its
+// legs and failover live in the network runtime, which applies them to the
+// live route in place: a reweight moves connections between legs, a changed
+// path revokes that leg alone. Rebuilding the legacy route for them would
+// revoke every socket it tracks for a change that was meant to keep them.
 fn legacy_policy_changed(current: &RoutingPolicy, next: &RoutingPolicy) -> bool {
     current.proxy_ids != next.proxy_ids || current.allow_direct != next.allow_direct
 }
@@ -454,8 +454,8 @@ impl ProxyRuntime {
     pub fn new(db: Database, handle: tokio::runtime::Handle) -> Result<Arc<Self>, String> {
         Self::with_quota_policy(db, handle, None)
     }
-    /// A runtime whose egresses are metered by the long-lived download
-    /// policies, so every egress quota is enforced.
+    // A runtime whose egresses are metered by the long-lived download
+    // policies, so every egress quota is enforced.
     pub fn with_quota_policy(
         db: Database,
         handle: tokio::runtime::Handle,

@@ -21,25 +21,25 @@ const MAX_SQLITE_CONNECTIONS_CAP: u32 = 64;
 const DEFAULT_POSTGRES_MAX_CONNECTIONS: u32 = 16;
 const MAX_POSTGRES_CONNECTIONS_CAP: u32 = 128;
 const POSTGRES_WARM_MIN_CONNECTIONS: u32 = 2;
-/// The pg pool must hold at least this many connections: the migration runner
-/// pins one connection to hold a session advisory lock while the migration
-/// steps acquire another from the pool, so a pool of 1 would deadlock at
-/// startup.
+// The pg pool must hold at least this many connections: the migration runner
+// pins one connection to hold a session advisory lock while the migration
+// steps acquire another from the pool, so a pool of 1 would deadlock at
+// startup.
 const MIN_POSTGRES_MAX_CONNECTIONS: u32 = 2;
-/// Only validate (ping) a pooled connection that has been idle at least this
-/// long — long enough that a proxy or idle-timeout may have dropped it. Hot
-/// connections skip the round-trip.
+// Only validate (ping) a pooled connection that has been idle at least this
+// long — long enough that a proxy or idle-timeout may have dropped it. Hot
+// connections skip the round-trip.
 const POSTGRES_PING_IDLE_THRESHOLD: Duration = Duration::from_secs(30);
-/// Default `synchronous_commit` for every weaver Postgres session.
-///
-/// `off` matches the durability posture the SQLite side has always run
-/// (`PRAGMA synchronous = NORMAL` under WAL): a host crash can lose the last
-/// instant of commits but never corrupts or reorders state, and everything in
-/// active state is re-derived on restart by design. Leaving Postgres at its
-/// server default meant every commit paid a full WAL flush that the SQLite
-/// side does not — the single largest per-write latency gap between the two
-/// engines. Asynchronous commit is still fully ordered and atomic; only
-/// durability of the tail is relaxed.
+// Default `synchronous_commit` for every weaver Postgres session.
+//
+// `off` matches the durability posture the SQLite side has always run
+// (`PRAGMA synchronous = NORMAL` under WAL): a host crash can lose the last
+// instant of commits but never corrupts or reorders state, and everything in
+// active state is re-derived on restart by design. Leaving Postgres at its
+// server default meant every commit paid a full WAL flush that the SQLite
+// side does not — the single largest per-write latency gap between the two
+// engines. Asynchronous commit is still fully ordered and atomic; only
+// durability of the tail is relaxed.
 const DEFAULT_POSTGRES_SYNCHRONOUS_COMMIT: &str = "off";
 const SLOW_STATEMENT_WARN_MS: u64 = 1000;
 
@@ -87,9 +87,9 @@ pub(crate) struct SqliteServices {
     pool: sqlx::SqlitePool,
     encryption_key: Arc<RwLock<Option<crate::persistence::encryption::EncryptionKey>>>,
     writer_gate: SqliteWriterGate,
-    /// Migration ledger maximum as it stood when this handle opened the
-    /// database, captured before the migration run below could move it.
-    /// `None` for a database nothing had ever migrated.
+    // Migration ledger maximum as it stood when this handle opened the
+    // database, captured before the migration run below could move it.
+    // `None` for a database nothing had ever migrated.
     pre_migration_schema_version: Option<i64>,
 }
 
@@ -214,7 +214,7 @@ impl SqliteServices {
 pub(crate) struct PostgresServices {
     pool: sqlx::PgPool,
     encryption_key: Arc<RwLock<Option<crate::persistence::encryption::EncryptionKey>>>,
-    /// See [`SqliteServices::pre_migration_schema_version`].
+    // See [`SqliteServices::pre_migration_schema_version`].
     pre_migration_schema_version: Option<i64>,
 }
 
@@ -373,10 +373,10 @@ pub(crate) fn postgres_max_connections_from_env() -> u32 {
         .clamp(MIN_POSTGRES_MAX_CONNECTIONS, MAX_POSTGRES_CONNECTIONS_CAP)
 }
 
-/// Resolves the per-session `synchronous_commit` setting, defaulting to
-/// [`DEFAULT_POSTGRES_SYNCHRONOUS_COMMIT`]. Values outside PostgreSQL's own
-/// vocabulary for the setting are rejected (with a warning) rather than passed
-/// through, because the value lands in the connection's startup options.
+// Resolves the per-session `synchronous_commit` setting, defaulting to
+// [`DEFAULT_POSTGRES_SYNCHRONOUS_COMMIT`]. Values outside PostgreSQL's own
+// vocabulary for the setting are rejected (with a warning) rather than passed
+// through, because the value lands in the connection's startup options.
 pub(crate) fn postgres_synchronous_commit_from_env() -> String {
     parse_postgres_synchronous_commit(
         std::env::var("WEAVER_POSTGRES_SYNCHRONOUS_COMMIT")

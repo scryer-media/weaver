@@ -137,8 +137,8 @@ fn storage_seek_penalty_requires_device_evidence() {
     assert_eq!(storage_class_from_seek_penalty(None), StorageClass::Unknown);
 }
 
-/// Memory and filesystem queries must answer on the runner. A device may
-/// decline the optional seek-penalty query, so its class can remain Unknown.
+// Memory and filesystem queries must answer on the runner. A device may
+// decline the optional seek-penalty query, so its class can remain Unknown.
 #[cfg(windows)]
 #[test]
 fn windows_probes_read_real_memory_and_disk() {

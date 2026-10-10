@@ -1,16 +1,16 @@
-//! Schedule evaluator — background task that applies time-based download rules.
-//!
-//! Every 60 seconds, evaluates all enabled schedule entries against the current
-//! local time and day-of-week. When the most recent applicable entry changes,
-//! sends the appropriate command to the scheduler.
-//!
-//! A rule stays in force until the next rule on its track fires, across midnight and across
-//! days the rules skip, so "pause at 23:00, resume at 06:00" pauses all night.
-//!
-//! Downloads, watch-folder scanning, RSS, each speed limit, hardware profile,
-//! quota metering and each server hold independently. Deleting the last rule
-//! on a track does not undo its last applied state, except one egress's quota
-//! metering, which goes back to the setting for every egress.
+// Schedule evaluator — background task that applies time-based download rules.
+//
+// Every 60 seconds, evaluates all enabled schedule entries against the current
+// local time and day-of-week. When the most recent applicable entry changes,
+// sends the appropriate command to the scheduler.
+//
+// A rule stays in force until the next rule on its track fires, across midnight and across
+// days the rules skip, so "pause at 23:00, resume at 06:00" pauses all night.
+//
+// Downloads, watch-folder scanning, RSS, each speed limit, hardware profile,
+// quota metering and each server hold independently. Deleting the last rule
+// on a track does not undo its last applied state, except one egress's quota
+// metering, which goes back to the setting for every egress.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -27,11 +27,11 @@ use crate::bandwidth::{QuotaTarget, ScheduleAction, ScheduleEntry, ScheduleTrack
 use crate::jobs::handle::SchedulerHandle;
 use crate::watch_folder::WatchFolderService;
 
-/// State shared between the evaluator and the API layer for reloading schedules.
+// State shared between the evaluator and the API layer for reloading schedules.
 pub type SharedSchedules = Arc<RwLock<Vec<ScheduleEntry>>>;
 
-/// Cooperative cancellation: owned database and intake transactions drain;
-/// interruptible network reads and admission waits observe this signal.
+// Cooperative cancellation: owned database and intake transactions drain;
+// interruptible network reads and admission waits observe this signal.
 #[derive(Clone)]
 pub(crate) struct ScheduleCancellation(tokio::sync::watch::Sender<bool>);
 impl ScheduleCancellation {
@@ -58,11 +58,11 @@ pub struct ScheduleServices {
     pub db: Option<crate::Database>,
 }
 
-/// Spawn the schedule evaluator background task.
-///
-/// The evaluator loads schedules from the shared state (populated by the API on
-/// startup and on config changes), evaluates them against the current time every
-/// 60 seconds, and sends commands to the scheduler when the active action changes.
+// Spawn the schedule evaluator background task.
+//
+// The evaluator loads schedules from the shared state (populated by the API on
+// startup and on config changes), evaluates them against the current time every
+// 60 seconds, and sends commands to the scheduler when the active action changes.
 pub fn spawn_evaluator(handle: SchedulerHandle, schedules: SharedSchedules) {
     spawn_evaluator_with_watch_folder(handle, schedules, None);
 }
@@ -82,8 +82,8 @@ pub fn spawn_evaluator_with_watch_folder(
     );
 }
 
-/// Owns orderly shutdown of schedule work. Dropping it detaches the evaluator,
-/// preserving the behavior of the convenience spawn functions.
+// Owns orderly shutdown of schedule work. Dropping it detaches the evaluator,
+// preserving the behavior of the convenience spawn functions.
 pub struct ScheduleEvaluatorTask {
     stop: tokio::sync::oneshot::Sender<()>,
     cancellation: crate::bandwidth::schedule::ScheduleCancellation,
@@ -91,7 +91,7 @@ pub struct ScheduleEvaluatorTask {
 }
 
 impl ScheduleEvaluatorTask {
-    /// Stop admitting actions and finish running work before its services stop.
+    // Stop admitting actions and finish running work before its services stop.
     pub async fn shutdown(self) {
         self.cancellation.cancel();
         let _ = self.stop.send(());
@@ -377,7 +377,7 @@ pub fn spawn_evaluator_with_services(
     )
 }
 
-/// Whether any enabled rule, left unapplied, would have to hold admission.
+// Whether any enabled rule, left unapplied, would have to hold admission.
 fn holds_admission(entries: &[ScheduleEntry]) -> bool {
     entries
         .iter()
@@ -400,8 +400,8 @@ async fn apply_one_shot(
 
 const MAX_RUNNING_ONE_SHOTS: usize = 32;
 
-/// Bound concurrent work without losing occurrences already accepted by the
-/// evaluator. Pending actions do not block hold transitions or the next tick.
+// Bound concurrent work without losing occurrences already accepted by the
+// evaluator. Pending actions do not block hold transitions or the next tick.
 #[derive(Default)]
 struct OneShotDispatcher {
     pending: VecDeque<ScheduleEntry>,
@@ -430,8 +430,8 @@ struct AppliedRule {
     action: ScheduleAction,
 }
 
-/// At most one successful occurrence per track. Failures remain pending, and
-/// editing an action on the current occurrence reapplies that action.
+// At most one successful occurrence per track. Failures remain pending, and
+// editing an action on the current occurrence reapplies that action.
 #[derive(Clone, Default)]
 struct HoldEvaluator {
     applied: BTreeMap<ScheduleTrack, AppliedRule>,
@@ -439,14 +439,14 @@ struct HoldEvaluator {
     last_utc: Option<NaiveDateTime>,
     repeated_until: Option<NaiveDateTime>,
     pause_all_seen: bool,
-    /// Set when a pause or server disable failed this tick. New downloads
-    /// stay held until it applies, so the rule's intent is not overrun.
+    // Set when a pause or server disable failed this tick. New downloads
+    // stay held until it applies, so the rule's intent is not overrun.
     admission_hold: Option<String>,
-    /// Egresses whose quota metering a rule set on its own. Kept across
-    /// clock jumps, which forget `applied`.
+    // Egresses whose quota metering a rule set on its own. Kept across
+    // clock jumps, which forget `applied`.
     egress_quotas_set: BTreeSet<u32>,
-    /// Egresses no enabled rule sets metering for any more, to hand back to
-    /// the setting for every egress.
+    // Egresses no enabled rule sets metering for any more, to hand back to
+    // the setting for every egress.
     egress_quotas_released: Vec<u32>,
 }
 
@@ -615,8 +615,8 @@ impl HoldEvaluator {
         failures
     }
 
-    /// The egresses to hand back to the quota metering for every egress,
-    /// each once.
+    // The egresses to hand back to the quota metering for every egress,
+    // each once.
     fn take_released_egress_quotas(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.egress_quotas_released)
     }
@@ -725,9 +725,9 @@ async fn apply_schedule_action(
     result.map_err(ScheduleApplyError::Failed)
 }
 
-/// Set each limit a speed rule names. The global limit is the scheduler's;
-/// an egress's or a provider's is that holder's own speed limit, saved and
-/// put in force as an edit on the Networking or Servers screen would be.
+// Set each limit a speed rule names. The global limit is the scheduler's;
+// an egress's or a provider's is that holder's own speed limit, saved and
+// put in force as an edit on the Networking or Servers screen would be.
 async fn apply_speed_limits(
     handle: &SchedulerHandle,
     servers: Option<&crate::servers::service::ServersService>,
@@ -759,14 +759,14 @@ async fn apply_speed_limits(
     Ok(())
 }
 
-/// The enabled rule among `candidate`s that fired most recently.
-///
-/// A rule stays in force until the next one fires, however long that takes:
-/// today's rules up to now are considered first, then each earlier day's in
-/// turn, back to the rest of this weekday a week ago. A pause set at 23:00 is
-/// therefore still in force at 00:05, and a rule that runs on Fridays only is
-/// still in force on Sunday. Among rules at the same minute the last one
-/// wins.
+// The enabled rule among `candidate`s that fired most recently.
+//
+// A rule stays in force until the next one fires, however long that takes:
+// today's rules up to now are considered first, then each earlier day's in
+// turn, back to the rest of this weekday a week ago. A pause set at 23:00 is
+// therefore still in force at 00:05, and a rule that runs on Fridays only is
+// still in force on Sunday. Among rules at the same minute the last one
+// wins.
 fn most_recently_fired(
     entries: &[ScheduleEntry],
     current_day: Weekday,

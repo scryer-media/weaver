@@ -16,15 +16,15 @@ use weaver_server_core::{
     HistoryDeleteOperationRow, SchedulerError, SchedulerHandle,
 };
 
-/// How long one target waits for the pipeline to answer its history delete.
-///
-/// The pipeline actor answers deletes between its other work, so a slow
-/// answer is normal; no answer at all is not. Without a bound, a pipeline
-/// that never replies leaves the whole operation claimed forever and every
-/// target in it showing as in progress. Past this the target is failed as
-/// unanswered and the operation finalises, so the rows can be retried. The
-/// pipeline may still carry the delete out after the deadline; the error
-/// text says so, and a retry settles which way it went.
+// How long one target waits for the pipeline to answer its history delete.
+//
+// The pipeline actor answers deletes between its other work, so a slow
+// answer is normal; no answer at all is not. Without a bound, a pipeline
+// that never replies leaves the whole operation claimed forever and every
+// target in it showing as in progress. Past this the target is failed as
+// unanswered and the operation finalises, so the rows can be retried. The
+// pipeline may still carry the delete out after the deadline; the error
+// text says so, and a retry settles which way it went.
 const HISTORY_DELETE_REPLY_DEADLINE: Duration = Duration::from_secs(300);
 
 const PIPELINE_DID_NOT_ANSWER: &str = "pipeline did not answer the history delete within the deadline; the delete may still finish, retry to confirm";

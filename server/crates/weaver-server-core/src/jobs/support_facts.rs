@@ -1,53 +1,53 @@
-//! Two facts about a job that a support reader needs and nothing else keeps.
-//!
-//! A direct-store demotion and a job's article gaps are both logged as they
-//! happen, and both are gone once the log rotates: the per-article events
-//! that describe gaps are deliberately never recorded as job events, because
-//! a job can raise thousands of them. This is the bounded summary that stands
-//! in for them.
-//!
-//! Everything here is reporting only. Nothing in the scheduling, failover,
-//! repair or extraction path reads it, and its size is fixed whatever the job
-//! does: one demotion record of two short identifiers and a timestamp, four
-//! counters, at most [`MAX_GAP_SERVERS`] server counts and at most
-//! [`MAX_GAP_SAMPLE`] segment positions. It names no file, subject or
-//! message-id; a position is a file's index in the NZB and a segment number.
+// Two facts about a job that a support reader needs and nothing else keeps.
+//
+// A direct-store demotion and a job's article gaps are both logged as they
+// happen, and both are gone once the log rotates: the per-article events
+// that describe gaps are deliberately never recorded as job events, because
+// a job can raise thousands of them. This is the bounded summary that stands
+// in for them.
+//
+// Everything here is reporting only. Nothing in the scheduling, failover,
+// repair or extraction path reads it, and its size is fixed whatever the job
+// does: one demotion record of two short identifiers and a timestamp, four
+// counters, at most [`MAX_GAP_SERVERS`] server counts and at most
+// [`MAX_GAP_SAMPLE`] segment positions. It names no file, subject or
+// message-id; a position is a file's index in the NZB and a segment number.
 
 use serde::{Deserialize, Serialize};
 
-/// How many gap positions the summary keeps: the first ones booked.
+// How many gap positions the summary keeps: the first ones booked.
 pub const MAX_GAP_SAMPLE: usize = 16;
 
-/// The most servers one job's gaps are counted against. Matches the cap on
-/// the per-job server attribution, for the same reason.
+// The most servers one job's gaps are counted against. Matches the cap on
+// the per-job server attribution, for the same reason.
 pub const MAX_GAP_SERVERS: usize = 32;
 
-/// The longest identifier a stored record may carry. Every identifier written
-/// is a short static label; anything longer was not written by this code.
+// The longest identifier a stored record may carry. Every identifier written
+// is a short static label; anything longer was not written by this code.
 const MAX_IDENTIFIER_LEN: usize = 48;
 
-/// Why a gap became terminal.
+// Why a gap became terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GapKind {
-    /// Every server that could be asked said the article is not there.
+    // Every server that could be asked said the article is not there.
     Missing,
-    /// The article was asked for until the retry or decode budget ran out.
+    // The article was asked for until the retry or decode budget ran out.
     Failed,
 }
 
-/// The first direct-store demotion a job took, and how many sets followed.
+// The first direct-store demotion a job took, and how many sets followed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DemotionFact {
-    /// The demotion reason's stable label, such as `par2_damaged`.
+    // The demotion reason's stable label, such as `par2_damaged`.
     #[serde(rename = "r")]
     pub reason: String,
-    /// The job's status when it happened, such as `downloading`.
+    // The job's status when it happened, such as `downloading`.
     #[serde(rename = "s")]
     pub stage: String,
-    /// When it happened, in seconds since the Unix epoch.
+    // When it happened, in seconds since the Unix epoch.
     #[serde(rename = "t")]
     pub at_epoch_secs: u64,
-    /// How many of the job's sets were demoted, this one included.
+    // How many of the job's sets were demoted, this one included.
     #[serde(rename = "n", default = "one")]
     pub sets: u32,
 }
@@ -56,28 +56,28 @@ fn one() -> u32 {
     1
 }
 
-/// A position in the job: the file's index in the NZB and the segment number.
+// A position in the job: the file's index in the NZB and the segment number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GapPosition(pub u32, pub u32);
 
-/// Gaps booked against one server, by its durable id.
+// Gaps booked against one server, by its durable id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerGaps(pub u32, pub u32);
 
-/// The job's articles that reached a terminal state without arriving.
+// The job's articles that reached a terminal state without arriving.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArticleGapSummary {
-    /// Articles no server had.
+    // Articles no server had.
     #[serde(rename = "m", default)]
     pub missing: u32,
-    /// Segments that failed permanently after their retries or decodes ran out.
+    // Segments that failed permanently after their retries or decodes ran out.
     #[serde(rename = "f", default)]
     pub failed: u32,
-    /// Per server: how many of those gaps it was asked for and refused.
-    /// An article several servers refused counts once against each.
+    // Per server: how many of those gaps it was asked for and refused.
+    // An article several servers refused counts once against each.
     #[serde(rename = "s", default, skip_serializing_if = "Vec::is_empty")]
     pub servers: Vec<ServerGaps>,
-    /// The first gaps booked, in booking order.
+    // The first gaps booked, in booking order.
     #[serde(rename = "i", default, skip_serializing_if = "Vec::is_empty")]
     pub sample: Vec<GapPosition>,
 }
@@ -87,7 +87,7 @@ impl ArticleGapSummary {
         self.missing == 0 && self.failed == 0 && self.servers.is_empty() && self.sample.is_empty()
     }
 
-    /// The sample in position order, which is how gaps are read for clustering.
+    // The sample in position order, which is how gaps are read for clustering.
     pub fn sorted_sample(&self) -> Vec<GapPosition> {
         let mut sample = self.sample.clone();
         sample.sort_unstable();
@@ -95,8 +95,8 @@ impl ArticleGapSummary {
     }
 }
 
-/// The per-job record, stored as compact JSON on the job's active and history
-/// rows.
+// The per-job record, stored as compact JSON on the job's active and history
+// rows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobSupportFacts {
     #[serde(rename = "d", default, skip_serializing_if = "Option::is_none")]
@@ -107,10 +107,10 @@ pub struct JobSupportFacts {
         skip_serializing_if = "ArticleGapSummary::is_empty"
     )]
     pub gaps: ArticleGapSummary,
-    /// Read back from a previous run. A restarted download re-asks for every
-    /// article it does not hold and books each gap again, so the first gap
-    /// booked after a restore starts the summary over instead of counting the
-    /// same gaps twice. A job restored past its download keeps what it read.
+    // Read back from a previous run. A restarted download re-asks for every
+    // article it does not hold and books each gap again, so the first gap
+    // booked after a restore starts the summary over instead of counting the
+    // same gaps twice. A job restored past its download keeps what it read.
     #[serde(skip)]
     restored_gaps: bool,
 }
@@ -120,8 +120,8 @@ impl JobSupportFacts {
         self.demotion.is_none() && self.gaps.is_empty()
     }
 
-    /// Record a set's demotion. The first one is kept, since it is the one
-    /// that explains the job; later ones only add to the count.
+    // Record a set's demotion. The first one is kept, since it is the one
+    // that explains the job; later ones only add to the count.
     pub fn note_demotion(&mut self, reason: &str, stage: &str, at_epoch_secs: u64) {
         match &mut self.demotion {
             Some(existing) => existing.sets = existing.sets.saturating_add(1),
@@ -136,7 +136,7 @@ impl JobSupportFacts {
         }
     }
 
-    /// Record one gap on its pending-to-terminal edge.
+    // Record one gap on its pending-to-terminal edge.
     pub fn note_gap(&mut self, kind: GapKind, position: GapPosition) {
         self.start_fresh_after_restore();
         let gaps = &mut self.gaps;
@@ -149,7 +149,7 @@ impl JobSupportFacts {
         }
     }
 
-    /// Charge one gap to each server that refused it.
+    // Charge one gap to each server that refused it.
     pub fn note_gap_servers(&mut self, server_ids: impl IntoIterator<Item = u32>) {
         self.start_fresh_after_restore();
         for server_id in server_ids {
@@ -162,8 +162,8 @@ impl JobSupportFacts {
         }
     }
 
-    /// Undo one gap a verified late replacement filled. The server counts
-    /// stay: those servers did refuse it.
+    // Undo one gap a verified late replacement filled. The server counts
+    // stay: those servers did refuse it.
     pub fn forget_gap(&mut self, kind: GapKind, position: GapPosition) {
         let gaps = &mut self.gaps;
         match kind {
@@ -173,7 +173,7 @@ impl JobSupportFacts {
         gaps.sample.retain(|entry| *entry != position);
     }
 
-    /// Drop the gaps, when the job's terminal segment states are dropped.
+    // Drop the gaps, when the job's terminal segment states are dropped.
     pub fn clear_gaps(&mut self) {
         self.gaps = ArticleGapSummary::default();
         self.restored_gaps = false;
@@ -186,8 +186,8 @@ impl JobSupportFacts {
         }
     }
 
-    /// The compact JSON for the job's row, or `None` when there is nothing to
-    /// say and the column stays NULL.
+    // The compact JSON for the job's row, or `None` when there is nothing to
+    // say and the column stays NULL.
     pub fn to_storage_json(&self) -> Option<String> {
         if self.is_empty() {
             return None;
@@ -195,9 +195,9 @@ impl JobSupportFacts {
         serde_json::to_string(self).ok()
     }
 
-    /// Read a stored record. One written by a newer version, or corrupted in
-    /// place, reads as nothing rather than failing the report it belongs to,
-    /// and the caps hold whatever the row says.
+    // Read a stored record. One written by a newer version, or corrupted in
+    // place, reads as nothing rather than failing the report it belongs to,
+    // and the caps hold whatever the row says.
     pub fn from_storage_json(raw: &str) -> Self {
         let mut facts: Self = serde_json::from_str(raw).unwrap_or_default();
         if let Some(demotion) = &mut facts.demotion {
@@ -210,15 +210,15 @@ impl JobSupportFacts {
         facts
     }
 
-    /// Read an optional stored column.
+    // Read an optional stored column.
     pub fn from_storage(raw: Option<&str>) -> Self {
         raw.map(Self::from_storage_json).unwrap_or_default()
     }
 }
 
-/// Keep a label only when it is made of what a label is made of. Anything
-/// else reads as `unknown`, so a row edited by hand cannot carry text into a
-/// report.
+// Keep a label only when it is made of what a label is made of. Anything
+// else reads as `unknown`, so a row edited by hand cannot carry text into a
+// report.
 fn identifier(raw: &str) -> String {
     let is_label = !raw.is_empty()
         && raw.len() <= MAX_IDENTIFIER_LEN

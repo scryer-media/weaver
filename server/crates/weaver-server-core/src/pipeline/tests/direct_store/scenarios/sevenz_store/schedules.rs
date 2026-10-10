@@ -1,4 +1,4 @@
-//! Tail-metadata discovery under every bounded arrival/duplicate schedule.
+// Tail-metadata discovery under every bounded arrival/duplicate schedule.
 use super::super::archive_schedules::{
     ExtractionProfile, Interruption, RecoveryFormat, Route, Schedule, ScheduleOptions, Selection,
     combined_campaign, run_schedule_with, selected_schedules, wrong_password_schedules,
@@ -8,9 +8,9 @@ use crate::pipeline::direct_store::router::sevenz::SevenZipRefusal;
 
 mod extended;
 
-/// Bytes in which no slice recurs. A recovery set mends a lost slice from any
-/// copy of it elsewhere in the set, so a payload that repeats survives a loss
-/// the set carries no recovery data for.
+// Bytes in which no slice recurs. A recovery set mends a lost slice from any
+// copy of it elsewhere in the set, so a payload that repeats survives a loss
+// the set carries no recovery data for.
 pub(in super::super) fn unrepeated_payload(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed;
     (0..len)
@@ -23,7 +23,7 @@ pub(in super::super) fn unrepeated_payload(seed: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Reads one 7z variable-length number at `*at`, advancing past it.
+// Reads one 7z variable-length number at `*at`, advancing past it.
 fn sevenz_number(bytes: &[u8], at: &mut usize) -> u64 {
     let first = bytes[*at];
     *at += 1;
@@ -39,11 +39,11 @@ fn sevenz_number(bytes: &[u8], at: &mut usize) -> u64 {
     value
 }
 
-/// The archive byte ranges a reader needs before it knows the container's
-/// layout: the start header, the end header it points at, and, when that end
-/// header only names a compressed header stored earlier, that stream too. An
-/// encrypted header refuses the set from the end header alone, so its stream
-/// is never needed.
+// The archive byte ranges a reader needs before it knows the container's
+// layout: the start header, the end header it points at, and, when that end
+// header only names a compressed header stored earlier, that stream too. An
+// encrypted header refuses the set from the end header alone, so its stream
+// is never needed.
 fn map_extents(archive: &[u8]) -> Vec<(usize, usize)> {
     const SIGNATURE_HEADER: usize = 32;
     const ENCODED_HEADER: u8 = 0x17;
@@ -71,7 +71,7 @@ fn map_extents(archive: &[u8]) -> Vec<(usize, usize)> {
     extents
 }
 
-/// The schedule slots holding any byte of [`map_extents`], as a loss mask.
+// The schedule slots holding any byte of [`map_extents`], as a loss mask.
 pub(in super::super) fn map_slots(archive: &[u8], count: usize, articles: usize) -> u8 {
     let chunk = archive.len().div_ceil(count);
     let extents = map_extents(archive);
@@ -90,12 +90,12 @@ pub(in super::super) fn map_slots(archive: &[u8], count: usize, articles: usize)
     slots
 }
 
-/// `mask` loses an article of `MAP`.
+// `mask` loses an article of `MAP`.
 fn loses<const MAP: u8>(mask: u8) -> bool {
     mask & MAP != 0
 }
 
-/// [`loses`] for every four-slot map, indexed by the map's own mask.
+// [`loses`] for every four-slot map, indexed by the map's own mask.
 pub(in super::super) const LOSES: [fn(u8) -> bool; 16] = [
     loses::<0>,
     loses::<1>,
@@ -118,10 +118,10 @@ pub(in super::super) const LOSES: [fn(u8) -> bool; 16] = [
 #[derive(Clone, Copy, Debug)]
 enum Shape {
     Copy,
-    /// Four single-article volumes, so two of the volumes are middle volumes.
+    // Four single-article volumes, so two of the volumes are middle volumes.
     CopyFourVolumes,
-    /// One four-article volume: the start header opens it, the end header
-    /// closes it, and nothing else is posted besides the recovery set.
+    // One four-article volume: the start header opens it, the end header
+    // closes it, and nothing else is posted besides the recovery set.
     CopySingle,
     Multiple,
     EmptyEntry,
@@ -133,11 +133,11 @@ enum Shape {
     Solid,
     SolidEncrypted,
     SolidHeaders,
-    /// Volume names that say nothing. The recovery set carries the real
-    /// names, as an obfuscated post's does.
+    // Volume names that say nothing. The recovery set carries the real
+    // names, as an obfuscated post's does.
     CopyObfuscated,
-    /// One whole container under a name that says nothing: its own signature
-    /// header is the only identity it needs.
+    // One whole container under a name that says nothing: its own signature
+    // header is the only identity it needs.
     CopySingleObfuscated,
 }
 
@@ -164,8 +164,8 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
     .await;
 }
 
-/// Runs `cases`, and `wrong_password` under a password the archive does not
-/// open with, over `shape` and holds each to what `profile` allows.
+// Runs `cases`, and `wrong_password` under a password the archive does not
+// open with, over `shape` and holds each to what `profile` allows.
 async fn run_shape(
     shape: Shape,
     profile: ExtractionProfile,

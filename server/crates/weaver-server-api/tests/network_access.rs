@@ -1,4 +1,4 @@
-//! Contract coverage for the additive combined network-access query surface.
+// Contract coverage for the additive combined network-access query surface.
 
 mod common;
 

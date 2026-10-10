@@ -1,4 +1,4 @@
-//! `rar_extraction` tests, part of a mechanical split of the original file.
+// `rar_extraction` tests, part of a mechanical split of the original file.
 
 use super::*;
 

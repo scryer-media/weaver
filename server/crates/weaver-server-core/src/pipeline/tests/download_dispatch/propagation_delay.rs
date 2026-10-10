@@ -1,4 +1,4 @@
-//! propagation delay
+// propagation delay
 
 use super::*;
 
@@ -82,10 +82,10 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
     assert_eq!(restored.retry_count, 0);
 }
 
-/// Health-mutex contention is not a tiering verdict. Before it had its own
-/// variant it arrived as `NoEligibleServer`, which fails every leased article
-/// and resets the owned lane pool — churning a healthy cached TLS lane over a
-/// microsecond-long lock collision.
+// Health-mutex contention is not a tiering verdict. Before it had its own
+// variant it arrived as `NoEligibleServer`, which fails every leased article
+// and resets the owned lane pool — churning a healthy cached TLS lane over a
+// microsecond-long lock collision.
 #[tokio::test]
 async fn owned_download_lane_selection_contention_requeues_without_failing_the_articles() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1799,13 +1799,13 @@ async fn no_par2_retry_clears_detected_archive_identity_before_redownload() {
     );
 }
 
-/// A probe that is still in flight when the last segment settles must not hold
-/// the completion checkpoint.
-///
-/// The probe estimates a release's health from a sample while bytes are still
-/// arriving. Once the download pass ends, the job's own terminal states are the
-/// answer, and waiting on the probe only postpones the checkpoint — and PAR2
-/// recovery promotion with it — for the probe's whole soft timeout.
+// A probe that is still in flight when the last segment settles must not hold
+// the completion checkpoint.
+//
+// The probe estimates a release's health from a sample while bytes are still
+// arriving. Once the download pass ends, the job's own terminal states are the
+// answer, and waiting on the probe only postpones the checkpoint — and PAR2
+// recovery promotion with it — for the probe's whole soft timeout.
 #[tokio::test]
 async fn drained_download_pass_retires_the_probe_instead_of_waiting_for_it() {
     let temp_dir = tempfile::tempdir().unwrap();

@@ -1,6 +1,6 @@
-//! Continuation of the `impl Pipeline` block from `finalize/check.rs`.
-//! Split out mechanically to keep the parent file readable; no behavior lives here
-//! that is not simply a method of the same type.
+// Continuation of the `impl Pipeline` block from `finalize/check.rs`.
+// Split out mechanically to keep the parent file readable; no behavior lives here
+// that is not simply a method of the same type.
 
 use super::*;
 
@@ -426,13 +426,13 @@ impl Pipeline {
         ))
     }
 
-    /// Test-only entry onto [`Self::quick_verify_par2_with_placement`].
-    ///
-    /// The quick pass is private to this module, but its `Some`/`None` verdict
-    /// and the placement plan it hands back are exactly what a diagnostic for a
-    /// misplaced-payload shape needs to read first-hand, rather than inferring
-    /// them from the completion gate's downstream effects. Compiled only under
-    /// test, so it adds nothing to the shipped path.
+    // Test-only entry onto [`Self::quick_verify_par2_with_placement`].
+    //
+    // The quick pass is private to this module, but its `Some`/`None` verdict
+    // and the placement plan it hands back are exactly what a diagnostic for a
+    // misplaced-payload shape needs to read first-hand, rather than inferring
+    // them from the completion gate's downstream effects. Compiled only under
+    // test, so it adds nothing to the shipped path.
     #[cfg(test)]
     pub(in crate::pipeline) async fn quick_verify_par2_with_placement_for_test(
         &mut self,
@@ -460,12 +460,12 @@ impl Pipeline {
         )
     }
 
-    /// Shared completion handling for a clean PAR2 verdict.
-    ///
-    /// Every fast path that proves a job clean without the authoritative pass
-    /// funnels through here, so their downstream effects — placement, identity,
-    /// reconciliation, `par2_verified`, status transitions — are the same code,
-    /// not parallel copies that can drift.
+    // Shared completion handling for a clean PAR2 verdict.
+    //
+    // Every fast path that proves a job clean without the authoritative pass
+    // funnels through here, so their downstream effects — placement, identity,
+    // reconciliation, `par2_verified`, status transitions — are the same code,
+    // not parallel copies that can drift.
     pub(super) async fn finish_clean_par2_verification(
         &mut self,
         job_id: JobId,
@@ -574,9 +574,9 @@ impl Pipeline {
         .await;
     }
 
-    /// Run the pre-existing job-level continuation exactly once, after the
-    /// final clean set has settled. Earlier sets re-arm the gate instead, so a
-    /// one-set job still follows this path in the same completion check.
+    // Run the pre-existing job-level continuation exactly once, after the
+    // final clean set has settled. Earlier sets re-arm the gate instead, so a
+    // one-set job still follows this path in the same completion check.
     pub(super) async fn continue_after_aggregate_clean_par2_settlement(
         &mut self,
         job_id: JobId,
@@ -637,29 +637,29 @@ impl Pipeline {
         self.schedule_job_completion_check(job_id);
     }
 
-    /// Bind a PAR2 verification back onto the assembly and promote every file
-    /// it vouches for.
-    ///
-    /// # Identity, not string equality
-    ///
-    /// Binding runs through [`Self::resolve_par2_file_binding`] — the same
-    /// resolver the dual-CRC grid measures its in-stream block verdicts
-    /// against — so it inherits the sanitized comparison, the full alias set
-    /// (posted, current, source, canonical), the 16 KiB content fallback that
-    /// binds an obfuscated post by its bytes, and outright refusal of
-    /// ambiguity.
-    ///
-    /// What this replaces compared *raw* assembly names against descriptions
-    /// that had already been sanitized on the way in, so every name that needed
-    /// sanitizing silently bound to nothing; it resolved a duplicate alias
-    /// first-writer-wins; and it answered with a bare count, which cannot tell
-    /// "nothing needed doing" apart from "a repaired, re-verified file bound to
-    /// nothing and is still sitting incomplete". The caller needs that
-    /// distinction to classify its veto, so the report carries it.
-    ///
-    /// A name-keyed fallback is kept for the files the resolver declines, but
-    /// it is sanitized on both sides and refuses duplicates rather than taking
-    /// the first.
+    // Bind a PAR2 verification back onto the assembly and promote every file
+    // it vouches for.
+    //
+    // # Identity, not string equality
+    //
+    // Binding runs through [`Self::resolve_par2_file_binding`] — the same
+    // resolver the dual-CRC grid measures its in-stream block verdicts
+    // against — so it inherits the sanitized comparison, the full alias set
+    // (posted, current, source, canonical), the 16 KiB content fallback that
+    // binds an obfuscated post by its bytes, and outright refusal of
+    // ambiguity.
+    //
+    // What this replaces compared *raw* assembly names against descriptions
+    // that had already been sanitized on the way in, so every name that needed
+    // sanitizing silently bound to nothing; it resolved a duplicate alias
+    // first-writer-wins; and it answered with a bare count, which cannot tell
+    // "nothing needed doing" apart from "a repaired, re-verified file bound to
+    // nothing and is still sitting incomplete". The caller needs that
+    // distinction to classify its veto, so the report carries it.
+    //
+    // A name-keyed fallback is kept for the files the resolver declines, but
+    // it is sanitized on both sides and refuses duplicates rather than taking
+    // the first.
     pub(in crate::pipeline) async fn reconcile_verified_par2_files(
         &mut self,
         job_id: JobId,
@@ -1014,51 +1014,51 @@ impl Pipeline {
         Ok(report)
     }
 
-    /// Classify a job that still has incomplete data files after a PAR2 pass
-    /// reconciled — into the failure it actually is, or into no failure at all.
-    ///
-    /// # Why a bare count was the wrong question
-    ///
-    /// The veto this replaces compared `complete_data_file_count()` against
-    /// `data_file_count()` and failed the job on the difference, so every cause
-    /// reported identically: a genuinely undownloadable unprotected file, an
-    /// obfuscated name the reconciler could not bind, and a contested alias
-    /// were one message. Job 11737 was the middle case wearing the first one's
-    /// clothes — a standalone MKV that PAR2 had repaired and re-verified, failed
-    /// for an article bitmap that the repair had already made irrelevant.
-    ///
-    /// # The invariant
-    ///
-    /// Once PAR2 has repaired and re-verified a protected output, that
-    /// verification is authoritative. Missing article state remains diagnostic
-    /// history; it cannot independently fail the repaired file.
-    ///
-    /// # Nothing here fails the job
-    ///
-    /// The invariant is about the *pass*, not about one file: once a PAR2
-    /// verification has succeeded, no article-completeness state may fail the
-    /// job — protected or unprotected.
-    ///
-    /// The concrete case that forced this: a 1.09 GB job whose payload PAR2
-    /// repaired and re-verified, failed because a 738 KB `.nfo` — which no
-    /// recovery set ever covered — was short a few articles. Health 999. Both
-    /// oracles deliver that job. So does the final move, which relocates the
-    /// working directory wholesale rather than a completeness-filtered
-    /// selection, so the bytes reach the user either way and refusing them buys
-    /// nothing.
-    ///
-    /// What survives is the *distinction*. An unprotected file short of
-    /// articles is ordinary Usenet damage: warn, deliver, never fail. A
-    /// protected file left incomplete after an authoritative pass is our own
-    /// reconciliation failing — the recovery set had a verdict for it either
-    /// way — and what to do about that turns on one question: are the verified
-    /// bytes still reachable?
-    ///
-    /// If they are (a real file of the described length, or a volume of a
-    /// direct set still routing), the defect is bookkeeping. Warn loudly, keep
-    /// the download. If they are not, the verdict is vouching for bytes that
-    /// are nowhere, and delivering the job would ship a hole as if it were
-    /// verified — so that, and only that, still fails.
+    // Classify a job that still has incomplete data files after a PAR2 pass
+    // reconciled — into the failure it actually is, or into no failure at all.
+    //
+    // # Why a bare count was the wrong question
+    //
+    // The veto this replaces compared `complete_data_file_count()` against
+    // `data_file_count()` and failed the job on the difference, so every cause
+    // reported identically: a genuinely undownloadable unprotected file, an
+    // obfuscated name the reconciler could not bind, and a contested alias
+    // were one message. Job 11737 was the middle case wearing the first one's
+    // clothes — a standalone MKV that PAR2 had repaired and re-verified, failed
+    // for an article bitmap that the repair had already made irrelevant.
+    //
+    // # The invariant
+    //
+    // Once PAR2 has repaired and re-verified a protected output, that
+    // verification is authoritative. Missing article state remains diagnostic
+    // history; it cannot independently fail the repaired file.
+    //
+    // # Nothing here fails the job
+    //
+    // The invariant is about the *pass*, not about one file: once a PAR2
+    // verification has succeeded, no article-completeness state may fail the
+    // job — protected or unprotected.
+    //
+    // The concrete case that forced this: a 1.09 GB job whose payload PAR2
+    // repaired and re-verified, failed because a 738 KB `.nfo` — which no
+    // recovery set ever covered — was short a few articles. Health 999. Both
+    // oracles deliver that job. So does the final move, which relocates the
+    // working directory wholesale rather than a completeness-filtered
+    // selection, so the bytes reach the user either way and refusing them buys
+    // nothing.
+    //
+    // What survives is the *distinction*. An unprotected file short of
+    // articles is ordinary Usenet damage: warn, deliver, never fail. A
+    // protected file left incomplete after an authoritative pass is our own
+    // reconciliation failing — the recovery set had a verdict for it either
+    // way — and what to do about that turns on one question: are the verified
+    // bytes still reachable?
+    //
+    // If they are (a real file of the described length, or a volume of a
+    // direct set still routing), the defect is bookkeeping. Warn loudly, keep
+    // the download. If they are not, the verdict is vouching for bytes that
+    // are nowhere, and delivering the job would ship a hole as if it were
+    // verified — so that, and only that, still fails.
     pub(in crate::pipeline) fn classify_incomplete_after_par2(
         &self,
         job_id: JobId,
@@ -1183,12 +1183,12 @@ impl Pipeline {
         })
     }
 
-    /// Incomplete data files the recovery set actually describes.
-    ///
-    /// The completion gate's question after a PAR2 verdict is not "is every
-    /// file whole" but "is anything left that PAR2 could still act on".
-    /// Ignorable furniture is not: it is delivered as it stands, so counting it
-    /// here would re-arm the gate on a file nothing is going to change.
+    // Incomplete data files the recovery set actually describes.
+    //
+    // The completion gate's question after a PAR2 verdict is not "is every
+    // file whole" but "is anything left that PAR2 could still act on".
+    // Ignorable furniture is not: it is delivered as it stands, so counting it
+    // here would re-arm the gate on a file nothing is going to change.
     pub(in crate::pipeline) fn incomplete_par2_protected_data_file_count(
         &self,
         job_id: JobId,
@@ -1223,19 +1223,19 @@ impl Pipeline {
             .count()
     }
 
-    /// Whether a settled verdict has left protected files outstanding whose
-    /// verified bytes are demonstrably still on disk.
-    ///
-    /// The current set's portion of
-    /// [`Self::incomplete_par2_protected_data_file_count`], narrowed to an
-    /// incomplete file whose verified bytes can be shown to be present at its
-    /// described length.
-    ///
-    /// That narrowing carries the whole distinction. Bytes that are present
-    /// under a verdict which already vouched for them mean the download is
-    /// sound and our own binding is not, and re-reading the recovery set cannot
-    /// change either fact. Bytes that are absent or short mean something really
-    /// is missing, which is a question the authoritative pass alone can answer.
+    // Whether a settled verdict has left protected files outstanding whose
+    // verified bytes are demonstrably still on disk.
+    //
+    // The current set's portion of
+    // [`Self::incomplete_par2_protected_data_file_count`], narrowed to an
+    // incomplete file whose verified bytes can be shown to be present at its
+    // described length.
+    //
+    // That narrowing carries the whole distinction. Bytes that are present
+    // under a verdict which already vouched for them mean the download is
+    // sound and our own binding is not, and re-reading the recovery set cannot
+    // change either fact. Bytes that are absent or short mean something really
+    // is missing, which is a question the authoritative pass alone can answer.
     pub(super) fn settled_verdict_left_only_proven_protected_files(
         &self,
         job_id: JobId,
@@ -1275,12 +1275,12 @@ impl Pipeline {
                 .all(|file_id| self.par2_output_presence_proven(job_id, file_id))
     }
 
-    /// The ignore-extension list in force for this job.
-    ///
-    /// Process-global configuration, read where it is used rather than cached,
-    /// exactly as the repair memory limit is. The test hook exists so the
-    /// "override disables it" case can be exercised without mutating a
-    /// process-global environment other tests are reading concurrently.
+    // The ignore-extension list in force for this job.
+    //
+    // Process-global configuration, read where it is used rather than cached,
+    // exactly as the repair memory limit is. The test hook exists so the
+    // "override disables it" case can be exercised without mutating a
+    // process-global environment other tests are reading concurrently.
     pub(in crate::pipeline) fn par2_ignore_extensions(&self) -> Vec<String> {
         #[cfg(test)]
         if let Some(extensions) = self.par2_ignore_extensions_override.as_ref() {
@@ -1289,9 +1289,9 @@ impl Pipeline {
         configured_par2_ignore_extensions()
     }
 
-    /// Whether the file this assembly entry binds to is ignorable furniture,
-    /// judged by the name the recovery set describes it under as well as the
-    /// name it currently carries.
+    // Whether the file this assembly entry binds to is ignorable furniture,
+    // judged by the name the recovery set describes it under as well as the
+    // name it currently carries.
     pub(super) fn par2_bound_file_is_ignorable(
         &self,
         job_id: JobId,
@@ -1316,19 +1316,19 @@ impl Pipeline {
             .is_some_and(|filename| par2_damage_ignorable(&filename, ignore_extensions))
     }
 
-    /// The damaged and missing descriptions in a verdict, when every one of
-    /// them is ignorable furniture.
-    ///
-    /// `None` means the ordinary repair/fail ladder applies: either the verdict
-    /// carries no damage at all, or something that is not furniture is damaged
-    /// too. That second case still fails on short recovery, and deliberately —
-    /// a payload file's missing slices are unknowns in every equation the solve
-    /// has, so the furniture's blocks cannot be excused out of it. Both
-    /// reference downloaders draw the line in the same place.
-    ///
-    /// A `Renamed` verdict is not damage but it is not this function's business
-    /// either: placement decides what to do with it, so its presence sends the
-    /// verdict down the ordinary path untouched.
+    // The damaged and missing descriptions in a verdict, when every one of
+    // them is ignorable furniture.
+    //
+    // `None` means the ordinary repair/fail ladder applies: either the verdict
+    // carries no damage at all, or something that is not furniture is damaged
+    // too. That second case still fails on short recovery, and deliberately —
+    // a payload file's missing slices are unknowns in every equation the solve
+    // has, so the furniture's blocks cannot be excused out of it. Both
+    // reference downloaders draw the line in the same place.
+    //
+    // A `Renamed` verdict is not damage but it is not this function's business
+    // either: placement decides what to do with it, so its presence sends the
+    // verdict down the ordinary path untouched.
     pub(super) fn par2_damage_is_only_ignorable(
         &self,
         verification: &par2_rs::VerificationResult,
@@ -1356,13 +1356,13 @@ impl Pipeline {
         (!ignorable.is_empty()).then_some(ignorable)
     }
 
-    /// Whether the bytes a PAR2 verdict vouched for are still reachable.
-    ///
-    /// Two ways they can be: a real file of the described length at the
-    /// canonical or the current name, or a volume of a direct set that is still
-    /// routing — those are verified through the set's own access layer and are
-    /// never written under their own name, so having no file is what correct
-    /// looks like for them.
+    // Whether the bytes a PAR2 verdict vouched for are still reachable.
+    //
+    // Two ways they can be: a real file of the described length at the
+    // canonical or the current name, or a volume of a direct set that is still
+    // routing — those are verified through the set's own access layer and are
+    // never written under their own name, so having no file is what correct
+    // looks like for them.
     pub(super) fn par2_output_presence_proven(&self, job_id: JobId, file_id: NzbFileId) -> bool {
         let Some(binding) = self.resolve_par2_file_binding(file_id) else {
             return false;
@@ -1397,13 +1397,13 @@ impl Pipeline {
             })
     }
 
-    /// Reconcile a PAR2 verification onto the assembly, then decide whether what
-    /// is left standing is a failure.
-    ///
-    /// Every PAR2 exit — the clean fast paths and both repair paths — funnels
-    /// through here, so the binding rules and the classification are stated once
-    /// instead of once per exit. They had already drifted apart across five
-    /// copies; each copy is a place for the next one to drift again.
+    // Reconcile a PAR2 verification onto the assembly, then decide whether what
+    // is left standing is a failure.
+    //
+    // Every PAR2 exit — the clean fast paths and both repair paths — funnels
+    // through here, so the binding rules and the classification are stated once
+    // instead of once per exit. They had already drifted apart across five
+    // copies; each copy is a place for the next one to drift again.
     pub(in crate::pipeline) async fn reconcile_and_classify_par2_verification(
         &mut self,
         job_id: JobId,

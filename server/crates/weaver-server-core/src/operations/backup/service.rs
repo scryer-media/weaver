@@ -63,15 +63,15 @@ struct LoadedBackup {
     warnings: Vec<String>,
 }
 
-/// How long cancelled backup work may take to stop before it is abandoned.
+// How long cancelled backup work may take to stop before it is abandoned.
 pub(super) const BACKUP_CANCEL_DRAIN: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Cancellation is cooperative: retain and drain the future so its blocking writers
-/// have exited before reporting failure. Work that does not stop within
-/// [`BACKUP_CANCEL_DRAIN`] (a query waiting on a lock, a hung file system) is
-/// abandoned so the caller is not held behind it. Blocking writers keep the
-/// execution guard they own until they exit, so no second backup can start
-/// over one that is still writing.
+// Cancellation is cooperative: retain and drain the future so its blocking writers
+// have exited before reporting failure. Work that does not stop within
+// [`BACKUP_CANCEL_DRAIN`] (a query waiting on a lock, a hung file system) is
+// abandoned so the caller is not held behind it. Blocking writers keep the
+// execution guard they own until they exit, so no second backup can start
+// over one that is still writing.
 pub(super) async fn run_backup_work<T>(
     work: impl std::future::Future<Output = Result<T, BackupServiceError>>,
     cancellation: super::archive::BackupCancellation,
@@ -125,8 +125,8 @@ impl BackupService {
         }
     }
 
-    /// Stop accepting backups, cancel and drain accepted work, including archive tasks
-    /// whose HTTP request or automatic scheduler has already gone away.
+    // Stop accepting backups, cancel and drain accepted work, including archive tasks
+    // whose HTTP request or automatic scheduler has already gone away.
     pub async fn shutdown(&self) {
         self.inner
             .shutting_down

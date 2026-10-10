@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::args::{DEFAULT_REPORT_URL, NzbCommand};
 
-/// Largest NZB, after decompression, the analyzer will read.
+// Largest NZB, after decompression, the analyzer will read.
 const MAX_NZB_BYTES: u64 = 512 * 1024 * 1024;
 
 const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
@@ -14,13 +14,13 @@ const URL_ENV: &str = "WEAVER_URL";
 const API_KEY_ENV: &str = "WEAVER_API_KEY";
 const API_KEY_FILE_ENV: &str = "WEAVER_API_KEY_FILE";
 
-/// The job report query. It asks for the redacted report only, so nothing
-/// else about the job crosses the wire.
+// The job report query. It asks for the redacted report only, so nothing
+// else about the job crosses the wire.
 const JOB_REPORT_QUERY: &str =
     "query JobSupportReport($jobId: Int!) { jobSupportReport(jobId: $jobId) { text json } }";
 
-/// Exit code 0 when a report was printed, 1 when the file could not be read
-/// or is not an NZB, or the server could not give the job's report.
+// Exit code 0 when a report was printed, 1 when the file could not be read
+// or is not an NZB, or the server could not give the job's report.
 pub(crate) async fn run(command: NzbCommand) -> i32 {
     match command {
         NzbCommand::Analyze { file, json } => match analyze_file(&file, json) {
@@ -76,7 +76,7 @@ fn api_key_from_env() -> Result<Option<String>, String> {
     Ok((!key.is_empty()).then(|| key.to_string()))
 }
 
-/// The GraphQL endpoint under a server address that may carry a base path.
+// The GraphQL endpoint under a server address that may carry a base path.
 fn graphql_endpoint(base: &str) -> String {
     format!("{}/graphql", base.trim_end_matches('/'))
 }
@@ -114,7 +114,7 @@ async fn fetch_job_report(
     report_from_response(&body, json)
 }
 
-/// The report out of a GraphQL response, or the server's errors.
+// The report out of a GraphQL response, or the server's errors.
 fn report_from_response(body: &serde_json::Value, json: bool) -> Result<String, String> {
     if let Some(errors) = body["errors"]
         .as_array()
@@ -148,9 +148,9 @@ fn too_large(limit: u64) -> String {
     format!("NZB is larger than {limit} bytes")
 }
 
-/// Reads an NZB as a stream, holding no more than `limit` bytes of the file
-/// or of its decompressed XML. The compression is read from the bytes, so a
-/// renamed file still opens.
+// Reads an NZB as a stream, holding no more than `limit` bytes of the file
+// or of its decompressed XML. The compression is read from the bytes, so a
+// renamed file still opens.
 fn read_nzb(source: impl Read, limit: u64) -> Result<Vec<u8>, String> {
     let mut raw = BufReader::new(source.take(limit + 1));
     let decoded = decompress(&mut raw, limit);
@@ -323,8 +323,8 @@ mod tests {
         assert!(report_from_response(&serde_json::json!({}), false).is_err());
     }
 
-    /// A one-route server stands in for weaver: the request must carry the
-    /// key as a bearer token and the job ID as a variable.
+    // A one-route server stands in for weaver: the request must carry the
+    // key as a bearer token and the job ID as a variable.
     #[tokio::test]
     async fn the_report_is_fetched_with_the_key_and_the_job_id() {
         use axum::{Json, Router, http::HeaderMap, routing::post};

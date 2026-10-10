@@ -4,10 +4,10 @@ use crate::HardwareProfileInForce;
 use crate::runtime::HardwareProfile;
 
 impl Pipeline {
-    /// Make `profile` the operator's choice. A profile this machine cannot
-    /// honour is never offered, so one arriving here means the machine shrank
-    /// since it was offered; the recommendation stands in, as it does at
-    /// startup.
+    // Make `profile` the operator's choice. A profile this machine cannot
+    // honour is never offered, so one arriving here means the machine shrank
+    // since it was offered; the recommendation stands in, as it does at
+    // startup.
     pub(super) fn set_configured_hardware_profile(&mut self, profile: HardwareProfile) {
         let probe = self.tuner.system_profile();
         self.configured_hardware_profile = match profile.unmet_requirement(probe) {
@@ -26,10 +26,10 @@ impl Pipeline {
         self.apply_hardware_profile_in_force();
     }
 
-    /// Record the profile the schedule asks for, or `None` when no schedule
-    /// rule asks for one. A profile this machine cannot honour is skipped:
-    /// the operator's choice stays in force and the skip is logged once here,
-    /// since the schedule only sends a profile when it changes.
+    // Record the profile the schedule asks for, or `None` when no schedule
+    // rule asks for one. A profile this machine cannot honour is skipped:
+    // the operator's choice stays in force and the skip is logged once here,
+    // since the schedule only sends a profile when it changes.
     pub(super) fn set_scheduled_hardware_profile(&mut self, profile: Option<HardwareProfile>) {
         if let Some(profile) = profile
             && let Some(requirement) = profile.unmet_requirement(self.tuner.system_profile())
@@ -45,8 +45,8 @@ impl Pipeline {
         self.apply_hardware_profile_in_force();
     }
 
-    /// The scheduled profile when there is one this machine can honour, the
-    /// operator's choice otherwise.
+    // The scheduled profile when there is one this machine can honour, the
+    // operator's choice otherwise.
     fn hardware_profile_in_force(&self) -> HardwareProfileInForce {
         let probe = self.tuner.system_profile();
         let scheduled = self
@@ -58,16 +58,16 @@ impl Pipeline {
         }
     }
 
-    /// Put the limits of the profile in force behind everything that starts
-    /// from now on.
-    ///
-    /// Nothing running is stopped or resized. Each limit is taken where an
-    /// activity starts: a download reads the tuner when it is dispatched, a
-    /// decode when it is spawned, an extraction or repair clones the pool,
-    /// the extraction limits and its memory-budget view when it is admitted.
-    /// Replacing them here therefore leaves running work with what it started
-    /// on and gives the next activity the new values. A replaced pool is
-    /// dropped when the last activity holding it finishes.
+    // Put the limits of the profile in force behind everything that starts
+    // from now on.
+    //
+    // Nothing running is stopped or resized. Each limit is taken where an
+    // activity starts: a download reads the tuner when it is dispatched, a
+    // decode when it is spawned, an extraction or repair clones the pool,
+    // the extraction limits and its memory-budget view when it is admitted.
+    // Replacing them here therefore leaves running work with what it started
+    // on and gives the next activity the new values. A replaced pool is
+    // dropped when the last activity holding it finishes.
     fn apply_hardware_profile_in_force(&mut self) {
         let in_force = self.hardware_profile_in_force();
         self.shared_state.set_hardware_profile_in_force(in_force);

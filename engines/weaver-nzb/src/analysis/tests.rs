@@ -5,7 +5,7 @@ use super::render::MAX_COLUMNS;
 use super::*;
 use crate::parser::parse_nzb_with_diagnostics;
 
-/// 2026-01-01T00:00:00Z, the instant every test measures ages from.
+// 2026-01-01T00:00:00Z, the instant every test measures ages from.
 const NOW: u64 = 1_767_225_600;
 const DAY: u64 = 86_400;
 
@@ -27,7 +27,7 @@ fn file(subject: impl Into<String>, segments: Vec<(u32, u32, String)>) -> FileSp
     }
 }
 
-/// `count` segments of `size` bytes with ids `<prefix>-<n>@<domain>`.
+// `count` segments of `size` bytes with ids `<prefix>-<n>@<domain>`.
 fn segments(prefix: &str, domain: &str, count: u32, size: u32) -> Vec<(u32, u32, String)> {
     (1..=count)
         .map(|number| (number, size, format!("{prefix}-{number}@{domain}")))
@@ -82,7 +82,7 @@ fn report_of(xml: &[u8]) -> NzbReport {
     analyze(&nzb, &diagnostics, NOW)
 }
 
-/// A clean five-volume RAR post with one PAR2 index and two PAR2 volumes.
+// A clean five-volume RAR post with one PAR2 index and two PAR2 volumes.
 fn clean_release() -> Vec<FileSpec<'static>> {
     let mut files = Vec::new();
     let total = 8;

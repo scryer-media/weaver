@@ -1,9 +1,9 @@
-//! Process execution for one script.
-//!
-//! The SABnzbd and NZBGet environment contracts are the load-bearing asset here:
-//! the existing ecosystem of scripts runs unmodified because `SAB_*`,
-//! `NZBPP_*`, `NZBPO_*` and `NZBOP_*` are built exactly as those programs build
-//! them, and the exit codes are interpreted the same way.
+// Process execution for one script.
+//
+// The SABnzbd and NZBGet environment contracts are the load-bearing asset here:
+// the existing ecosystem of scripts runs unmodified because `SAB_*`,
+// `NZBPP_*`, `NZBPO_*` and `NZBOP_*` are built exactly as those programs build
+// them, and the exit codes are interpreted the same way.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
@@ -27,15 +27,15 @@ use super::model::{
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 pub const DEFAULT_TERMINATION_GRACE: Duration = Duration::from_secs(10);
-/// A user cancellation must not inherit an arbitrarily long script shutdown grace.
+// A user cancellation must not inherit an arbitrarily long script shutdown grace.
 const MAX_USER_CANCELLATION_GRACE: Duration = Duration::from_secs(5);
-/// The most of a run's output that is kept: the newest bytes, stdout and
-/// stderr interleaved as they arrived.
+// The most of a run's output that is kept: the newest bytes, stdout and
+// stderr interleaved as they arrived.
 pub const MAX_SCRIPT_OUTPUT_BYTES: u64 = 32 * 1024;
-/// How much of a stream is read at once.
+// How much of a stream is read at once.
 const READ_CHUNK_BYTES: usize = 8 * 1024;
-/// The longest line that is read for directives. Past this a line is only
-/// output, and only its tail is kept.
+// The longest line that is read for directives. Past this a line is only
+// output, and only its tail is kept.
 pub const MAX_LOGICAL_LINE_BYTES: usize = MAX_SCRIPT_OUTPUT_BYTES as usize + READ_CHUNK_BYTES;
 const REDACTED: &[u8] = b"[REDACTED]";
 
@@ -109,23 +109,23 @@ pub struct CompatibilityFacts {
     pub previous_script_status: NzbgetScriptStatus,
 }
 
-/// Which run this is, as the script itself is told.
+// Which run this is, as the script itself is told.
 #[derive(Debug, Clone, Default)]
 pub struct RunIdentity {
     pub run_id: String,
     pub instance_id: String,
     pub instance_name: String,
     pub trigger: String,
-    /// Where the script can call weaver back, and the token that lets it for
-    /// as long as this run lasts.
+    // Where the script can call weaver back, and the token that lets it for
+    // as long as this run lasts.
     pub api_url: Option<String>,
     pub token: Option<String>,
-    /// Where lines the script sends through the API join what it printed.
+    // Where lines the script sends through the API join what it printed.
     pub output: OutputInjector,
 }
 
 impl RunIdentity {
-    /// A fresh run of `instance`.
+    // A fresh run of `instance`.
     pub fn of(instance: &super::instances::ScriptInstance) -> Result<Self, RunnerError> {
         let mut entropy = [0_u8; 12];
         getrandom::fill(&mut entropy).map_err(|error| RunnerError::Io(io::Error::other(error)))?;
@@ -144,7 +144,7 @@ impl RunIdentity {
 #[derive(Debug, Clone)]
 pub struct ScriptExecutionRequest {
     pub manifest: ScriptManifest,
-    /// Package directory for a manifest package, or the scripts directory for a bare script.
+    // Package directory for a manifest package, or the scripts directory for a bare script.
     pub root: PathBuf,
     pub options: Vec<ResolvedOption>,
     pub context: JobExecutionContext,
@@ -159,7 +159,7 @@ pub struct ScriptExecutionRequest {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ExecutionDisposition {
     Succeeded,
-    /// Exit 95: the script decided it had nothing to do.
+    // Exit 95: the script decided it had nothing to do.
     Skipped,
     Failed,
     Cancelled,
@@ -170,9 +170,9 @@ pub enum ExecutionDisposition {
 pub struct ScriptExecutionResult {
     pub disposition: ExecutionDisposition,
     pub exit_code: Option<i32>,
-    /// Captured stdout/stderr, already truncated to the tail budget and redacted.
+    // Captured stdout/stderr, already truncated to the tail budget and redacted.
     pub output: Vec<u8>,
-    /// Every byte the script wrote, including what `output` no longer holds.
+    // Every byte the script wrote, including what `output` no longer holds.
     pub output_bytes: u64,
     pub output_truncated: bool,
     pub error_message: Option<String>,
@@ -200,12 +200,12 @@ struct SupervisorRequest {
     args: Vec<OsStringWire>,
     env: BTreeMap<OsStringWire, OsStringWire>,
     cwd: PathBuf,
-    /// Compile the Go source before executing it with the script arguments.
+    // Compile the Go source before executing it with the script arguments.
     go_run: bool,
-    /// `args` is an already escaped cmd.exe command line.
+    // `args` is an already escaped cmd.exe command line.
     #[serde(default)]
     raw_args: bool,
-    /// The directory a Go script is built under.
+    // The directory a Go script is built under.
     #[serde(default)]
     go_build_root: Option<PathBuf>,
 }
@@ -227,7 +227,7 @@ impl OsStringWire {
     }
 }
 
-/// Run one script to completion, honouring cancellation and the timeout.
+// Run one script to completion, honouring cancellation and the timeout.
 pub async fn execute_script(
     request: ScriptExecutionRequest,
     cancellation: Option<watch::Receiver<bool>>,
@@ -243,8 +243,8 @@ pub async fn execute_script_observed(
     execute_script_tapped(request, cancellation, events, None).await
 }
 
-/// [`execute_script_observed`], with each captured line also handed to `tap`
-/// as it arrives.
+// [`execute_script_observed`], with each captured line also handed to `tap`
+// as it arrives.
 pub async fn execute_script_tapped(
     request: ScriptExecutionRequest,
     cancellation: Option<watch::Receiver<bool>>,
@@ -342,7 +342,7 @@ pub async fn execute_script_tapped(
     result.map_err(|error| redact_runner_error(error, &secrets))
 }
 
-/// An invocation without job lifecycle authority. All kinds share this runner.
+// An invocation without job lifecycle authority. All kinds share this runner.
 pub struct ExecutionSpec {
     pub manifest: ScriptManifest,
     pub root: PathBuf,
@@ -368,8 +368,8 @@ pub async fn execute_spec(
     execute_spec_tapped(spec, cancellation, events, None).await
 }
 
-/// [`execute_spec`], with each captured line also handed to `tap` as it
-/// arrives.
+// [`execute_spec`], with each captured line also handed to `tap` as it
+// arrives.
 pub async fn execute_spec_tapped(
     spec: ExecutionSpec,
     cancellation: Option<watch::Receiver<bool>>,
@@ -462,8 +462,8 @@ pub async fn execute_spec_tapped(
     Ok(result)
 }
 
-/// Receives each line of a run's captured output as it arrives: redacted, and
-/// with the commands the script issued already taken out.
+// Receives each line of a run's captured output as it arrives: redacted, and
+// with the commands the script issued already taken out.
 pub type OutputTap = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 #[derive(Clone, Default)]
@@ -481,9 +481,9 @@ struct PreparedExecution {
     injector: OutputInjector,
 }
 
-/// Adds lines to a run's captured output that the script did not print: what
-/// it logged through the API. It reaches the output only while the script is
-/// running; a line offered at any other time is dropped.
+// Adds lines to a run's captured output that the script did not print: what
+// it logged through the API. It reaches the output only while the script is
+// running; a line offered at any other time is dropped.
 #[derive(Clone, Default)]
 pub struct OutputInjector(Arc<Mutex<Option<InjectionTarget>>>);
 
@@ -513,16 +513,16 @@ impl OutputInjector {
         BoundInjector(self.clone())
     }
 
-    /// `text` with the run's secrets taken out, or `None` when the script is
-    /// not running and nothing is known about what must be kept out.
+    // `text` with the run's secrets taken out, or `None` when the script is
+    // not running and nothing is known about what must be kept out.
     pub(crate) fn redact(&self, text: &str) -> Option<String> {
         let target = self.target();
         let target = target.as_ref()?;
         Some(redact_string(text, &target.secrets))
     }
 
-    /// Add `text` to the output as lines of its own. False when the script is
-    /// not running.
+    // Add `text` to the output as lines of its own. False when the script is
+    // not running.
     pub(crate) fn push(&self, text: &str) -> bool {
         let target = self.target();
         let Some(target) = target.as_ref() else {
@@ -543,7 +543,7 @@ impl OutputInjector {
     }
 }
 
-/// Lets go of the output when the capture that owns it is over.
+// Lets go of the output when the capture that owns it is over.
 struct BoundInjector(OutputInjector);
 
 impl Drop for BoundInjector {
@@ -610,13 +610,13 @@ fn is_batch_script(entrypoint: &Path) -> bool {
     matches!(script_extension(entrypoint).as_str(), "bat" | "cmd")
 }
 
-/// Adds the script's positional arguments. Returns true when `args` is a
-/// finished cmd.exe command line that the supervisor must pass verbatim.
-///
-/// std only escapes for cmd.exe when the program it spawns is the batch file
-/// itself; here the program is the configured interpreter, so std's ordinary
-/// quoting would reach cmd.exe unescaped. The batch tail is built with the
-/// same rules std uses for batch files instead.
+// Adds the script's positional arguments. Returns true when `args` is a
+// finished cmd.exe command line that the supervisor must pass verbatim.
+//
+// std only escapes for cmd.exe when the program it spawns is the batch file
+// itself; here the program is the configured interpreter, so std's ordinary
+// quoting would reach cmd.exe unescaped. The batch tail is built with the
+// same rules std uses for batch files instead.
 fn append_script_arguments(
     entrypoint: &Path,
     args: &mut Vec<OsString>,
@@ -647,11 +647,11 @@ fn append_script_arguments(
     Ok(true)
 }
 
-/// Quotes one argument for a batch file's command line, after std's
-/// `append_bat_arg`: anything but a known-safe character forces quotes, `"`
-/// is doubled, `%` is defused with an empty `%cd:~,%` substring so no
-/// variable can expand, and backslashes before a quote are doubled. A line
-/// break would end the command, so it is refused.
+// Quotes one argument for a batch file's command line, after std's
+// `append_bat_arg`: anything but a known-safe character forces quotes, `"`
+// is doubled, `%` is defused with an empty `%cd:~,%` substring so no
+// variable can expand, and backslashes before a quote are doubled. A line
+// break would end the command, so it is refused.
 fn append_batch_argument(line: &mut String, value: &str) -> Result<(), RunnerError> {
     if value.contains(['\r', '\n', '\0']) {
         return Err(RunnerError::InvalidBatchArgument);
@@ -954,8 +954,8 @@ fn adapter_environment_and_args(
     Ok(arguments)
 }
 
-/// What weaver tells every run about itself: which run and instance this is,
-/// where weaver keeps its files, and the instance's inputs.
+// What weaver tells every run about itself: which run and instance this is,
+// where weaver keeps its files, and the instance's inputs.
 fn insert_weaver_env(
     env: &mut BTreeMap<OsStringWire, OsStringWire>,
     identity: &RunIdentity,
@@ -1089,10 +1089,10 @@ fn sanitized_platform_environment() -> Result<BTreeMap<OsStringWire, OsStringWir
     Ok(env)
 }
 
-/// The Go build cache, kept under weaver's data directory.
+// The Go build cache, kept under weaver's data directory.
 const GO_BUILD_CACHE_DIR: &str = ".weaver-go-cache";
-/// Where a Go script's executable is built, beside the cache: the system
-/// temporary directory may be mounted noexec.
+// Where a Go script's executable is built, beside the cache: the system
+// temporary directory may be mounted noexec.
 const GO_BUILD_OUTPUT_DIR: &str = ".weaver-go-build";
 
 fn go_build_root(facts: &CompatibilityFacts) -> Result<Option<PathBuf>, RunnerError> {
@@ -1102,12 +1102,12 @@ fn go_build_root(facts: &CompatibilityFacts) -> Result<Option<PathBuf>, RunnerEr
     })
 }
 
-/// What `go run` needs beyond the platform environment. Go will not build
-/// without a build cache and looks for one under a home directory the daemon
-/// may not have, so the cache is weaver's own: nothing is written beside the
-/// scripts, and a read-only scripts directory still works. `GOPROXY=off` keeps
-/// a build off the network, which is why a Go script is a single file that
-/// imports the standard library only.
+// What `go run` needs beyond the platform environment. Go will not build
+// without a build cache and looks for one under a home directory the daemon
+// may not have, so the cache is weaver's own: nothing is written beside the
+// scripts, and a read-only scripts directory still works. `GOPROXY=off` keeps
+// a build off the network, which is why a Go script is a single file that
+// imports the standard library only.
 fn insert_go_environment(
     env: &mut BTreeMap<OsStringWire, OsStringWire>,
     facts: &CompatibilityFacts,
@@ -1185,9 +1185,9 @@ pub(super) fn option_value_text(value: &OptionValue) -> String {
     }
 }
 
-/// A fetched URL can carry a credential in userinfo or a query parameter.
-/// Keep ordinary source URLs visible, but protect credential-bearing ones before
-/// their script output is parsed into logs, directives or retained output.
+// A fetched URL can carry a credential in userinfo or a query parameter.
+// Keep ordinary source URLs visible, but protect credential-bearing ones before
+// their script output is parsed into logs, directives or retained output.
 fn append_source_url_secrets(secrets: &mut Vec<Vec<u8>>, source_url: &str) {
     let Ok(url) = reqwest::Url::parse(source_url) else {
         return;
@@ -1280,7 +1280,7 @@ fn redact_bytes(input: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
     output
 }
 
-/// What redaction looks for, longest first.
+// What redaction looks for, longest first.
 fn redaction_patterns(secrets: &[Vec<u8>]) -> Vec<&[u8]> {
     // Capture emits complete lines independently. Multiline credentials must
     // therefore also redact each nonempty line before logs or directives leave
@@ -1495,20 +1495,20 @@ async fn execute_supervised(
     })
 }
 
-/// The newest [`MAX_SCRIPT_OUTPUT_BYTES`] of a run's output. Older bytes are
-/// dropped as newer ones arrive, mid-line if need be, so the ring never holds
-/// more than it hands over.
+// The newest [`MAX_SCRIPT_OUTPUT_BYTES`] of a run's output. Older bytes are
+// dropped as newer ones arrive, mid-line if need be, so the ring never holds
+// more than it hands over.
 #[derive(Default)]
 struct BoundedOutput {
     ring: VecDeque<u8>,
-    /// Every byte the script wrote, kept or not.
+    // Every byte the script wrote, kept or not.
     written: u64,
-    /// Set exactly when a byte of output was dropped.
+    // Set exactly when a byte of output was dropped.
     truncated: bool,
-    /// Bytes the capture tasks hold as unfinished lines, which will displace
-    /// the oldest kept bytes once they arrive.
+    // Bytes the capture tasks hold as unfinished lines, which will displace
+    // the oldest kept bytes once they arrive.
     pending: usize,
-    /// The most the ring and the unfinished lines held at once.
+    // The most the ring and the unfinished lines held at once.
     #[cfg(test)]
     peak: usize,
 }
@@ -1536,9 +1536,9 @@ impl BoundedOutput {
         }
     }
 
-    /// Record how much a capture task now holds as an unfinished line, and
-    /// make room for it: together they stay within the ring's capacity and
-    /// one read. Only a line longer than a read can drop kept bytes early.
+    // Record how much a capture task now holds as an unfinished line, and
+    // make room for it: together they stay within the ring's capacity and
+    // one read. Only a line longer than a read can drop kept bytes early.
     fn hold_pending(&mut self, before: usize, now: usize) {
         self.pending = self.pending.saturating_sub(before).saturating_add(now);
         let over =
@@ -1555,8 +1555,8 @@ impl BoundedOutput {
     #[cfg(not(test))]
     fn observe(&mut self) {}
 
-    /// The kept bytes. When the oldest were dropped, a character the cut went
-    /// through is dropped whole rather than handed over in part.
+    // The kept bytes. When the oldest were dropped, a character the cut went
+    // through is dropped whole rather than handed over in part.
     fn into_bytes(self) -> Vec<u8> {
         let mut bytes = Vec::from(self.ring);
         if self.truncated {
@@ -1653,8 +1653,8 @@ async fn capture_stream<R: AsyncRead + Unpin>(
     Ok(())
 }
 
-/// Keep the tail of a line too long to read for directives. Its head is gone,
-/// so it is never taken as a directive, only kept as output.
+// Keep the tail of a line too long to read for directives. Its head is gone,
+// so it is never taken as a directive, only kept as output.
 fn capture_oversized_line(
     line: &[u8],
     head_lost: bool,
@@ -1670,12 +1670,12 @@ fn capture_oversized_line(
     output.push(tail);
 }
 
-/// The last `keep` bytes of `line`, redacted. A secret the cut would go
-/// through is replaced whole, so no part of it is kept. When the line's head
-/// was already dropped (`head_lost`), a secret may have begun before what is
-/// held: if what is held begins with the end of a secret that reaches past the
-/// cut, that end is treated as the secret, at the cost of sometimes replacing
-/// a few bytes that only looked like one.
+// The last `keep` bytes of `line`, redacted. A secret the cut would go
+// through is replaced whole, so no part of it is kept. When the line's head
+// was already dropped (`head_lost`), a secret may have begun before what is
+// held: if what is held begins with the end of a secret that reaches past the
+// cut, that end is treated as the secret, at the cost of sometimes replacing
+// a few bytes that only looked like one.
 fn redacted_tail(line: &[u8], head_lost: bool, keep: usize, secrets: &[Vec<u8>]) -> Vec<u8> {
     let patterns = redaction_patterns(secrets);
     let mut cut = line.len().saturating_sub(keep);
@@ -1740,9 +1740,9 @@ async fn capture_line(line: Vec<u8>, output: &Arc<Mutex<BoundedOutput>>, policy:
     }
 }
 
-/// One reading of an exit status for every script and every trigger, so a
-/// script may use whichever convention it was written for: 0 and NZBGet's 92
-/// and 93 are success, 95 is "nothing to do", and anything else is a failure.
+// One reading of an exit status for every script and every trigger, so a
+// script may use whichever convention it was written for: 0 and NZBGet's 92
+// and 93 are success, 95 is "nothing to do", and anything else is a failure.
 fn exit_disposition(exit_code: Option<i32>) -> ExecutionDisposition {
     match exit_code {
         Some(0 | 92 | 93) => ExecutionDisposition::Succeeded,
@@ -1783,7 +1783,7 @@ async fn terminate_supervisor(
     Ok(())
 }
 
-/// Hidden same-binary supervisor entrypoint. Call before normal CLI/config initialization.
+// Hidden same-binary supervisor entrypoint. Call before normal CLI/config initialization.
 pub fn maybe_run_supervisor_from_process_args() -> Option<i32> {
     (std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(SUPERVISOR_ARG)))
         .then(run_supervisor_stdio)
@@ -1925,7 +1925,7 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
     Ok(0)
 }
 
-/// Bounded diagnostic tail retained by the relay.
+// Bounded diagnostic tail retained by the relay.
 const RELAY_TAIL_BYTES: usize = 64;
 
 fn read_supervisor_request<R: Read>(reader: &mut R) -> Result<SupervisorRequest, RunnerError> {
@@ -1998,8 +1998,8 @@ pub(crate) fn adapter_contract_for_test(
     adapter_contract(request)
 }
 
-/// The arguments and environment the adapter hands a post-processing script,
-/// without the platform environment it inherits.
+// The arguments and environment the adapter hands a post-processing script,
+// without the platform environment it inherits.
 pub(crate) fn adapter_contract(
     request: &ScriptExecutionRequest,
 ) -> Result<(Vec<String>, BTreeMap<String, String>), RunnerError> {
@@ -2262,7 +2262,7 @@ mod capture_tests {
         );
     }
 
-    /// Run `input` through capture without directive reading.
+    // Run `input` through capture without directive reading.
     async fn capture(input: &[u8], secrets: Vec<Vec<u8>>) -> (Vec<u8>, bool, u64) {
         let output = Arc::new(Mutex::new(BoundedOutput::default()));
         let policy = CapturePolicy {
@@ -2407,8 +2407,8 @@ mod capture_tests {
         assert!(text.ends_with("yyy\n"));
     }
 
-    /// Feed `input` to capture through a pipe and return the most the ring
-    /// and the unfinished line ever held at once.
+    // Feed `input` to capture through a pipe and return the most the ring
+    // and the unfinished line ever held at once.
     async fn peak_held(input: Vec<u8>) -> (usize, Vec<u8>) {
         let output = Arc::new(Mutex::new(BoundedOutput::default()));
         let (mut writer, reader) = tokio::io::duplex(READ_CHUNK_BYTES);

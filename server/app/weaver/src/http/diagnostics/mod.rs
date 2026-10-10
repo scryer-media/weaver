@@ -1,21 +1,21 @@
-//! The admin-only diagnostics package endpoint.
-//!
-//! One request produces one `weaver-diagnostics-<timestamp>.tar.zst` holding
-//! everything a stall investigation asks for: two Prometheus samples ten
-//! seconds apart, the GraphQL surfaces a maintainer would otherwise ask the
-//! reporter to paste one at a time, the real log files, the redacted
-//! configuration, and the pipeline internals that are reachable from nowhere
-//! else.
-//!
-//! Two rules govern everything here:
-//!
-//! 1. **No credential leaves the host.** Every GraphQL payload passes through
-//!    [`redact`], every configuration file is parsed and re-serialized with its
-//!    secrets removed, and a configuration file that cannot be parsed is left
-//!    out rather than copied verbatim.
-//! 2. **A failed component never fails the package.** Each piece records
-//!    either its bytes or its error, and the error is written into the manifest.
-//!    A report that is missing one section is still a report; a 500 is not.
+// The admin-only diagnostics package endpoint.
+//
+// One request produces one `weaver-diagnostics-<timestamp>.tar.zst` holding
+// everything a stall investigation asks for: two Prometheus samples ten
+// seconds apart, the GraphQL surfaces a maintainer would otherwise ask the
+// reporter to paste one at a time, the real log files, the redacted
+// configuration, and the pipeline internals that are reachable from nowhere
+// else.
+//
+// Two rules govern everything here:
+//
+// 1. **No credential leaves the host.** Every GraphQL payload passes through
+//    [`redact`], every configuration file is parsed and re-serialized with its
+//    secrets removed, and a configuration file that cannot be parsed is left
+//    out rather than copied verbatim.
+// 2. **A failed component never fails the package.** Each piece records
+//    either its bytes or its error, and the error is written into the manifest.
+//    A report that is missing one section is still a report; a 500 is not.
 
 mod archive;
 mod graphql;
@@ -41,25 +41,25 @@ use self::archive::Component;
 use self::graphql::SchemaShape;
 use self::redact::{is_sensitive_json_key, redact_json};
 
-/// Gap between the two Prometheus samples. Long enough for a rate to be
-/// meaningful, short enough that the browser request does not look hung.
+// Gap between the two Prometheus samples. Long enough for a rate to be
+// meaningful, short enough that the browser request does not look hung.
 const METRICS_SAMPLE_GAP: Duration = Duration::from_secs(10);
 
-/// Per-file ceiling on copied log text. The tail is what matters, so an
-/// oversized log contributes its last 32 MiB.
+// Per-file ceiling on copied log text. The tail is what matters, so an
+// oversized log contributes its last 32 MiB.
 const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Ceiling on a single copied configuration file. A config this large is not a
-/// config, and reading it into memory to redact it should stay bounded.
+// Ceiling on a single copied configuration file. A config this large is not a
+// config, and reading it into memory to redact it should stay bounded.
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Arguments for the two bounded root fields. The ring buffer holds far fewer
-/// lines than the service-log limit, so that one asks for all of them; the job
-/// limit is a real ceiling on a very long history.
+// Arguments for the two bounded root fields. The ring buffer holds far fewer
+// lines than the service-log limit, so that one asks for all of them; the job
+// limit is a real ceiling on a very long history.
 const SERVICE_LOG_ARGUMENTS: &str = "limit: 100000";
 const JOBS_ARGUMENTS: &str = "limit: 2000";
 
-/// Per-directory host facts.
+// Per-directory host facts.
 #[derive(Debug, Serialize)]
 struct HostStorage {
     role: &'static str,
@@ -72,8 +72,8 @@ struct HostStorage {
     error: Option<String>,
 }
 
-/// `host.json`: the facts about the machine that the rest of the package is
-/// only meaningful against.
+// `host.json`: the facts about the machine that the rest of the package is
+// only meaningful against.
 #[derive(Debug, Serialize)]
 struct HostFacts {
     operating_system: &'static str,
@@ -219,12 +219,12 @@ async fn collect_components(
     components
 }
 
-/// Everything reachable over GraphQL, each root group in its own file.
-///
-/// Every root field is executed as its own request. One combined query would be
-/// simpler, but the schema caps query complexity, and the whole point of a
-/// generated selection is that it grows: a shared budget would mean a new field
-/// on `Metrics` silently costing `queueSnapshot` its place in the package.
+// Everything reachable over GraphQL, each root group in its own file.
+//
+// Every root field is executed as its own request. One combined query would be
+// simpler, but the schema caps query complexity, and the whole point of a
+// generated selection is that it grows: a shared budget would mean a new field
+// on `Metrics` silently costing `queueSnapshot` its place in the package.
 async fn collect_graphql_components(
     schema: &WeaverSchema,
     caller: &super::auth::ResolvedCaller,
@@ -287,7 +287,7 @@ async fn collect_graphql_components(
 
 const SERVICE_LOG_FILE: &str = "service-log.txt";
 
-/// One output file and the root fields that fill it.
+// One output file and the root fields that fill it.
 struct GraphqlComponent {
     file: &'static str,
     fields: &'static [(&'static str, Option<&'static str>)],
@@ -337,7 +337,7 @@ const GRAPHQL_COMPONENTS: &[GraphqlComponent] = &[
     },
 ];
 
-/// Flattens the `serviceLogs` payload into the plain text a reader wants.
+// Flattens the `serviceLogs` payload into the plain text a reader wants.
 fn service_log_text(data: &serde_json::Value) -> String {
     let Some(lines) = data
         .get("serviceLogs")
@@ -356,7 +356,7 @@ fn service_log_text(data: &serde_json::Value) -> String {
     text
 }
 
-/// The read-only pipeline snapshot, which exists nowhere else.
+// The read-only pipeline snapshot, which exists nowhere else.
 async fn collect_pipeline_internals(handle: &SchedulerHandle) -> Component {
     const FILE: &str = "pipeline-internals.json";
     // A wedged pipeline is exactly the case this endpoint is for, so the
@@ -372,7 +372,7 @@ async fn collect_pipeline_internals(handle: &SchedulerHandle) -> Component {
     }
 }
 
-/// Host facts, including a storage classification per configured directory.
+// Host facts, including a storage classification per configured directory.
 fn collect_host_facts(dirs: (PathBuf, PathBuf, PathBuf)) -> HostFacts {
     use weaver_server_core::runtime::{environment, system_probe};
 
@@ -427,7 +427,7 @@ fn collect_host_facts(dirs: (PathBuf, PathBuf, PathBuf)) -> HostFacts {
     }
 }
 
-/// The rolling log files, as the running process resolved their location.
+// The rolling log files, as the running process resolved their location.
 async fn collect_log_files() -> Vec<Component> {
     let paths = weaver_server_core::runtime::log_buffer::existing_log_files();
     if paths.is_empty() {
@@ -475,7 +475,7 @@ async fn collect_log_files() -> Vec<Component> {
     components
 }
 
-/// Every TOML file sitting directly in the data directory, redacted.
+// Every TOML file sitting directly in the data directory, redacted.
 async fn collect_config_files(data_dir: &Path) -> Vec<Component> {
     let mut entries = match tokio::fs::read_dir(data_dir).await {
         Ok(entries) => entries,
@@ -535,7 +535,7 @@ async fn collect_config_files(data_dir: &Path) -> Vec<Component> {
     components
 }
 
-/// Reads at most `max_bytes` from the end of a file.
+// Reads at most `max_bytes` from the end of a file.
 async fn read_file_tail(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 

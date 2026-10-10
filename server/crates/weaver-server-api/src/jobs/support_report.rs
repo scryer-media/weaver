@@ -1,5 +1,5 @@
-//! GraphQL surface for support reports. The reports themselves, and the
-//! redaction they guarantee, live in `weaver_server_core::support`.
+// GraphQL surface for support reports. The reports themselves, and the
+// redaction they guarantee, live in `weaver_server_core::support`.
 
 use std::io::Read;
 

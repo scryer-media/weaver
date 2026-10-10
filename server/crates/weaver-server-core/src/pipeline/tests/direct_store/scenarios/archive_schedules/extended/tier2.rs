@@ -1,15 +1,15 @@
-//! Tier two of the archive matrix: articles that arrive wrong, recovery sets
-//! as posters author them, uuencode, and the wider shapes of real posts.
-//!
-//! Every family crosses its axes into cells, runs each cell under every
-//! extraction profile, and samples the matrix's schedules for each by a fixed
-//! stride. [`sizing`] holds each family's exact count. Every run must end the
-//! same way: the expected files published byte for byte, or a named failure
-//! that publishes none of them. A cell the product does not yet hold to that
-//! is held open by name in its family's `open_defect`.
-//!
-//! The campaigns are opt-in and run only from the manually dispatched
-//! extended workflow; each family's smokes run in the default suite.
+// Tier two of the archive matrix: articles that arrive wrong, recovery sets
+// as posters author them, uuencode, and the wider shapes of real posts.
+//
+// Every family crosses its axes into cells, runs each cell under every
+// extraction profile, and samples the matrix's schedules for each by a fixed
+// stride. [`sizing`] holds each family's exact count. Every run must end the
+// same way: the expected files published byte for byte, or a named failure
+// that publishes none of them. A cell the product does not yet hold to that
+// is held open by name in its family's `open_defect`.
+//
+// The campaigns are opt-in and run only from the manually dispatched
+// extended workflow; each family's smokes run in the default suite.
 use super::*;
 use crate::pipeline::direct_unpack::wiring::{AbortLatch, DemotionReason as ChaseDemotion};
 use std::ops::Range;
@@ -34,30 +34,30 @@ pub(super) const PROFILES: [ExtractionProfile; 3] = [
     ExtractionProfile::Conventional,
 ];
 
-/// The password every encrypted tier-two fixture is written under.
+// The password every encrypted tier-two fixture is written under.
 pub(super) const PASSWORD: &str = "lantern-quay";
 
-/// A cell the product does not yet hold to its ruling.
+// A cell the product does not yet hold to its ruling.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Defect {
-    /// The cases run, and at least one must still miss the ruling: once none
-    /// does, the entry is stale and the campaign says so.
+    // The cases run, and at least one must still miss the ruling: once none
+    // does, the entry is stale and the campaign says so.
     Diverges(&'static str),
-    /// The job never settles, so the cases are not run at all.
+    // The job never settles, so the cases are not run at all.
     Hangs(&'static str),
 }
 
-/// Which pool of schedules a family samples.
+// Which pool of schedules a family samples.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Pool {
-    /// The matrix's smoke schedules: every case family once.
+    // The matrix's smoke schedules: every case family once.
     Smoke,
-    /// The archive matrix's combined cases.
+    // The archive matrix's combined cases.
     Combined,
 }
 
 impl Pool {
-    /// The pool's cases the profile includes, built once per process.
+    // The pool's cases the profile includes, built once per process.
     fn all(self, profile: ExtractionProfile) -> &'static [(usize, Schedule)] {
         static POOLS: [[std::sync::OnceLock<Vec<(usize, Schedule)>>; 3]; 2] =
             [const { [const { std::sync::OnceLock::new() }; 3] }; 2];
@@ -74,9 +74,9 @@ impl Pool {
         })
     }
 
-    /// `per` of the pool's cases the profile includes, by a fixed stride
-    /// from an offset that turns with `rotation`, so neighbouring cells see
-    /// different schedules and every schedule is reached across the cells.
+    // `per` of the pool's cases the profile includes, by a fixed stride
+    // from an offset that turns with `rotation`, so neighbouring cells see
+    // different schedules and every schedule is reached across the cells.
     pub(super) fn sampled(
         self,
         profile: ExtractionProfile,
@@ -94,34 +94,34 @@ impl Pool {
             .collect()
     }
 
-    /// How many cases [`Self::sampled`] yields for the profile.
+    // How many cases [`Self::sampled`] yields for the profile.
     pub(super) fn count(self, profile: ExtractionProfile, per: usize) -> usize {
         self.all(profile).len().min(per)
     }
 }
 
-/// One cell of a tier-two family.
+// One cell of a tier-two family.
 pub(super) trait Cell: Copy + std::fmt::Debug {
-    /// The post for a schedule's loss mask and whether it is starved.
+    // The post for a schedule's loss mask and whether it is starved.
     fn post(self, interruption: Interruption) -> Built;
-    /// The defect the cell is held open for under `profile`, if any.
+    // The defect the cell is held open for under `profile`, if any.
     fn defect(self, profile: ExtractionProfile) -> Option<Defect>;
-    /// Whether the cell's recovery set is PAR2: a defect there blocks a
-    /// release.
+    // Whether the cell's recovery set is PAR2: a defect there blocks a
+    // release.
     fn par2(self) -> bool;
 }
 
-/// A post and the recovery geometry its oracle counts in.
+// A post and the recovery geometry its oracle counts in.
 pub(super) struct Built {
     pub post: Post,
     pub geometry: Option<Geometry>,
-    /// A ruling that overrides the oracle, for a cell whose outcome follows
-    /// from what it is rather than from what it loses.
+    // A ruling that overrides the oracle, for a cell whose outcome follows
+    // from what it is rather than from what it loses.
     pub ruling: Option<Verdict>,
 }
 
-/// Runs one cell under one profile over `cases`, holding each run to its
-/// verdict, or to its defect where the cell is held open.
+// Runs one cell under one profile over `cases`, holding each run to its
+// verdict, or to its defect where the cell is held open.
 pub(super) async fn run_cell<C: Cell>(
     cell: C,
     profile: ExtractionProfile,
@@ -175,8 +175,8 @@ pub(super) async fn run_cell<C: Cell>(
     }
 }
 
-/// A cell's smoke: every data group in order and then reversed, under every
-/// profile, with nothing lost.
+// A cell's smoke: every data group in order and then reversed, under every
+// profile, with nothing lost.
 pub(super) async fn smoke<C: Cell>(cell: C) {
     let forward = slot_arrivals(4);
     let mut backward = forward.clone();
@@ -194,8 +194,8 @@ pub(super) async fn smoke<C: Cell>(cell: C) {
     }
 }
 
-/// A cell's smoke under a loss: the first and last groups each lose their
-/// middle article, in order and reversed, under every profile.
+// A cell's smoke under a loss: the first and last groups each lose their
+// middle article, in order and reversed, under every profile.
 pub(super) async fn loss_smoke<C: Cell>(cell: C) {
     let forward = slot_arrivals(4);
     let mut backward = forward.clone();
@@ -231,9 +231,9 @@ pub(super) async fn loss_smoke<C: Cell>(cell: C) {
     }
 }
 
-/// One family's work: its (cell, profile) units with the cases each runs,
-/// laid end to end and cut into contiguous shards so a shard rebuilds as few
-/// fixtures as it can.
+// One family's work: its (cell, profile) units with the cases each runs,
+// laid end to end and cut into contiguous shards so a shard rebuilds as few
+// fixtures as it can.
 pub(super) struct Family<C> {
     pub units: Vec<(C, ExtractionProfile, Pool, usize, usize)>,
 }
@@ -246,10 +246,10 @@ impl<C: Cell> Family<C> {
             .sum()
     }
 
-    /// Runs shard `shard` of `shards`.
-    ///
-    /// `WEAVER_TIER2_CASE=<n>` (or `<start>..<end>`) runs those of the
-    /// family's case indices that fall in the shard.
+    // Runs shard `shard` of `shards`.
+    //
+    // `WEAVER_TIER2_CASE=<n>` (or `<start>..<end>`) runs those of the
+    // family's case indices that fall in the shard.
     pub(super) async fn shard(&self, shard: usize, shards: usize) {
         assert!(shard < shards);
         let total = self.total();
@@ -293,8 +293,8 @@ impl<C: Cell> Family<C> {
     }
 }
 
-/// Emits `shards` ignored campaign tests for a family, as nested modules of
-/// hundreds, tens and units, so shard `h d s` runs shard `100h + 10d + s`.
+// Emits `shards` ignored campaign tests for a family, as nested modules of
+// hundreds, tens and units, so shard `h d s` runs shard `100h + 10d + s`.
 macro_rules! tier2_shards {
     ($family:path, $shards:expr; $($h:ident $hv:literal)+) => {
         const _: () = assert!(100 * [$($hv),+].len() == $shards);
@@ -324,7 +324,7 @@ macro_rules! tier2_shards {
 }
 pub(super) use tier2_shards;
 
-/// Every family's scenario count, as its enumerator yields it.
+// Every family's scenario count, as its enumerator yields it.
 #[test]
 fn tier2_sizing() {
     let damage = damage::family().total();
@@ -341,6 +341,6 @@ fn tier2_sizing() {
     assert_eq!(total, TOTAL);
 }
 
-/// Tier two's scenarios across every family.
+// Tier two's scenarios across every family.
 const TOTAL: usize =
     damage::TOTAL + par2_realism::TOTAL + par3_breadth::TOTAL + uu::TOTAL + breadth::TOTAL;

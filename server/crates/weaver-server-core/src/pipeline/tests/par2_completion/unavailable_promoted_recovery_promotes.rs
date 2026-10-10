@@ -1,4 +1,4 @@
-//! `par2_completion` tests, part of a mechanical split of the original file.
+// `par2_completion` tests, part of a mechanical split of the original file.
 
 use super::*;
 
@@ -842,9 +842,9 @@ async fn health_below_critical_without_par2_still_fails() {
     ));
 }
 
-/// A job whose two payload files are protected by one single-block recovery
-/// volume: enough advertised recovery for the deferral, little enough real
-/// recovery for the ceiling.
+// A job whose two payload files are protected by one single-block recovery
+// volume: enough advertised recovery for the deferral, little enough real
+// recovery for the ceiling.
 fn par2_health_job_spec(name: &str) -> JobSpec {
     JobSpec {
         name: name.to_string(),
@@ -915,12 +915,12 @@ async fn health_below_critical_with_par2_defers_to_completion() {
     assert!(pipeline.pending_completion_checks.contains(&job_id));
 }
 
-/// Recovery data that cannot be obtained is not recovery data.
-///
-/// The deferral used to ride on the byte count the posting *advertises* for
-/// its recovery files, which a dead posting advertises exactly as a live one
-/// does. A job whose recovery articles are all answered for therefore waited
-/// out its whole retry budget on repair that could never be attempted.
+// Recovery data that cannot be obtained is not recovery data.
+//
+// The deferral used to ride on the byte count the posting *advertises* for
+// its recovery files, which a dead posting advertises exactly as a live one
+// does. A job whose recovery articles are all answered for therefore waited
+// out its whole retry budget on repair that could never be attempted.
 #[tokio::test]
 async fn health_below_critical_without_obtainable_recovery_fails_now() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1159,11 +1159,11 @@ async fn pause_rejects_queued_repair_state() {
     );
 }
 
-/// A clean two-segment payload plus its index verifies and completes.
-///
-/// The payload's first segment stops mid-block, so block 0 is only ever staged
-/// across an article boundary while block 1 closes whole — the shape that keeps
-/// this honest about a job the in-stream grid cannot claim outright.
+// A clean two-segment payload plus its index verifies and completes.
+//
+// The payload's first segment stops mid-block, so block 0 is only ever staged
+// across an article boundary while block 1 closes whole — the shape that keeps
+// this honest about a job the in-stream grid cannot claim outright.
 #[tokio::test]
 async fn a_clean_job_verifies_and_completes() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1195,9 +1195,9 @@ async fn a_clean_job_verifies_and_completes() {
     );
 }
 
-/// The same job with one payload byte flipped reaches the authoritative
-/// analyzer exactly once and fails as unrepairable — no quick arm may conclude
-/// verification over bytes that contradict the recovery set.
+// The same job with one payload byte flipped reaches the authoritative
+// analyzer exactly once and fails as unrepairable — no quick arm may conclude
+// verification over bytes that contradict the recovery set.
 #[tokio::test]
 async fn a_damaged_job_runs_the_authoritative_analyzer_and_fails() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1396,16 +1396,16 @@ async fn waiting_on_present_volumes_is_not_repair_ready_until_a_volume_is_truly_
     );
 }
 
-/// The job 11737 shape, end to end.
-///
-/// A standalone payload with one article that never arrived, a recovery block
-/// that covers the hole, and a PAR2 repair that puts the file right. The
-/// article bitmap is *not* backfilled by the repair — nothing rewrites history
-/// — so the job used to fail its final completeness veto despite holding a
-/// verified, byte-correct output.
-///
-/// Once PAR2 has repaired and re-verified a protected output, that verification
-/// is authoritative and the bitmap is diagnostic history.
+// The job 11737 shape, end to end.
+//
+// A standalone payload with one article that never arrived, a recovery block
+// that covers the hole, and a PAR2 repair that puts the file right. The
+// article bitmap is *not* backfilled by the repair — nothing rewrites history
+// — so the job used to fail its final completeness veto despite holding a
+// verified, byte-correct output.
+//
+// Once PAR2 has repaired and re-verified a protected output, that verification
+// is authoritative and the bitmap is diagnostic history.
 #[tokio::test]
 async fn missing_article_repaired_by_par2_completes_despite_incomplete_bitmap() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1586,15 +1586,15 @@ async fn missing_article_repaired_by_par2_completes_despite_incomplete_bitmap() 
     );
 }
 
-/// A payload posted under an obfuscated name reconciles through PAR2 content
-/// identity, not string equality.
-///
-/// The reconciler this replaces matched the verification's filename against the
-/// assembly's stored names and did nothing at all when no exact string matched:
-/// no promotion, no error, just a silently unreconciled file for the
-/// completeness veto downstream to fail the whole job on. An obfuscated post is
-/// exactly the case that never matches — the subject lies about the name and
-/// tells the truth about the bytes — so the binding has to ask the bytes.
+// A payload posted under an obfuscated name reconciles through PAR2 content
+// identity, not string equality.
+//
+// The reconciler this replaces matched the verification's filename against the
+// assembly's stored names and did nothing at all when no exact string matched:
+// no promotion, no error, just a silently unreconciled file for the
+// completeness veto downstream to fail the whole job on. An obfuscated post is
+// exactly the case that never matches — the subject lies about the name and
+// tells the truth about the bytes — so the binding has to ask the bytes.
 #[tokio::test]
 async fn obfuscated_payload_reconciles_through_par2_content_identity() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1766,12 +1766,12 @@ async fn reconciliation_adopts_the_verified_canonical_file_over_a_duplicate_alia
     assert_eq!(identity.classification_source, FileIdentitySource::Par2);
 }
 
-/// Two assembly files that both answer to one description bind to neither.
-///
-/// Content cannot break a tie that two files both satisfy, so the binding is
-/// refused outright and named. The reconciler this replaces resolved the same
-/// contest first-writer-wins — whichever file the iteration happened to reach
-/// first was promoted, and the other silently was not.
+// Two assembly files that both answer to one description bind to neither.
+//
+// Content cannot break a tie that two files both satisfy, so the binding is
+// refused outright and named. The reconciler this replaces resolved the same
+// contest first-writer-wins — whichever file the iteration happened to reach
+// first was promoted, and the other silently was not.
 #[tokio::test]
 async fn contested_par2_binding_is_refused_and_named() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1853,16 +1853,16 @@ async fn contested_par2_binding_is_refused_and_named() {
     );
 }
 
-/// An unprotected file short of articles is reported, and delivered anyway.
-///
-/// Job 10000 forced this: a 1.09 GB payload that PAR2 repaired and re-verified,
-/// failed because a 738 KB `.nfo` no recovery set ever covered was missing a few
-/// articles. Health 999. Weaver's final move relocates the working
-/// directory wholesale, so the bytes reach the user regardless. Refusing the job
-/// destroys a good download to report damage on a text file.
-///
-/// The distinction still has to survive in the *message*, because a protected
-/// file left incomplete means something entirely different.
+// An unprotected file short of articles is reported, and delivered anyway.
+//
+// Job 10000 forced this: a 1.09 GB payload that PAR2 repaired and re-verified,
+// failed because a 738 KB `.nfo` no recovery set ever covered was missing a few
+// articles. Health 999. Weaver's final move relocates the working
+// directory wholesale, so the bytes reach the user regardless. Refusing the job
+// destroys a good download to report damage on a text file.
+//
+// The distinction still has to survive in the *message*, because a protected
+// file left incomplete means something entirely different.
 #[tokio::test]
 async fn unprotected_incomplete_file_is_reported_but_does_not_fail_the_job() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1998,13 +1998,13 @@ async fn unprotected_incomplete_file_is_reported_but_does_not_fail_the_job() {
     );
 }
 
-/// A verdict vouching for bytes that are at neither name is refused.
-///
-/// The presence gate was relaxed to unblock direct-store, whose routing volumes
-/// are verified through the set's own access layer and legitimately have no
-/// file. Relaxing it for *every* binding went too far: an ordinary file that is
-/// simply gone would be promoted to complete on the strength of a verdict about
-/// bytes that are nowhere.
+// A verdict vouching for bytes that are at neither name is refused.
+//
+// The presence gate was relaxed to unblock direct-store, whose routing volumes
+// are verified through the set's own access layer and legitimately have no
+// file. Relaxing it for *every* binding went too far: an ordinary file that is
+// simply gone would be promoted to complete on the strength of a verdict about
+// bytes that are nowhere.
 #[tokio::test]
 async fn missing_ordinary_file_is_refused_by_the_presence_gate() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2054,11 +2054,11 @@ async fn missing_ordinary_file_is_refused_by_the_presence_gate() {
     );
 }
 
-/// Two descriptions claiming one assembly file bind to neither.
-///
-/// The mirror of the `by_identity` contest. `or_insert` used to keep whichever
-/// description was visited first and drop the other silently, calling the file
-/// complete under one of two names with no reason to prefer either.
+// Two descriptions claiming one assembly file bind to neither.
+//
+// The mirror of the `by_identity` contest. `or_insert` used to keep whichever
+// description was visited first and drop the other silently, calling the file
+// complete under one of two names with no reason to prefer either.
 #[tokio::test]
 async fn two_descriptions_claiming_one_file_are_contested() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2119,7 +2119,7 @@ async fn two_descriptions_claiming_one_file_are_contested() {
     );
 }
 
-/// Accepted repairs shed their leftovers; failed ones keep them.
+// Accepted repairs shed their leftovers; failed ones keep them.
 #[tokio::test]
 async fn repair_leftovers_are_purged_only_after_acceptance() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2188,10 +2188,10 @@ async fn repair_leftovers_are_purged_only_after_acceptance() {
     assert!(!pipeline.par2_pre_repair_dir_entries.contains_key(&job_id));
 }
 
-/// A job that spent its aggregate verification on a clean claim the
-/// authoritative pass then contradicted still sheds the backup its repair
-/// renamed aside — the repaired RAR set is replanned and extracted, and the
-/// working directory carries nothing but the payload into the final move.
+// A job that spent its aggregate verification on a clean claim the
+// authoritative pass then contradicted still sheds the backup its repair
+// renamed aside — the repaired RAR set is replanned and extracted, and the
+// working directory carries nothing but the payload into the final move.
 #[tokio::test]
 async fn a_repair_after_a_contradicted_clean_verdict_still_sheds_its_leftovers() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2382,13 +2382,13 @@ async fn a_repair_after_a_contradicted_clean_verdict_still_sheds_its_leftovers()
     );
 }
 
-/// A protected file left incomplete whose verified bytes are nowhere still
-/// fails the job; one whose bytes are on disk only warns.
-///
-/// The invariant frees the job from its article bitmap, not from its bytes. If
-/// reconciliation could not promote a protected file *and* the bytes it was
-/// vouched for cannot be found, delivering would ship a hole under a
-/// verification claiming otherwise — the one case still worth refusing.
+// A protected file left incomplete whose verified bytes are nowhere still
+// fails the job; one whose bytes are on disk only warns.
+//
+// The invariant frees the job from its article bitmap, not from its bytes. If
+// reconciliation could not promote a protected file *and* the bytes it was
+// vouched for cannot be found, delivering would ship a hole under a
+// verification claiming otherwise — the one case still worth refusing.
 #[tokio::test]
 async fn protected_defect_fails_only_when_the_bytes_are_gone() {
     let payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
@@ -2472,13 +2472,13 @@ async fn protected_defect_fails_only_when_the_bytes_are_gone() {
     }
 }
 
-/// A stray on disk is never renamed into a duplicate of a verified file.
-///
-/// The pre-repair backup par2-rs leaves behind still matches the description
-/// over its first 16 KiB, so the renamer offers to move it onto the canonical
-/// name. That name is taken by the file the repair just produced, so the
-/// allocator used to mint a `.duplicateN` sibling — and the final move, which
-/// relocates the whole directory, delivered both copies.
+// A stray on disk is never renamed into a duplicate of a verified file.
+//
+// The pre-repair backup par2-rs leaves behind still matches the description
+// over its first 16 KiB, so the renamer offers to move it onto the canonical
+// name. That name is taken by the file the repair just produced, so the
+// allocator used to mint a `.duplicateN` sibling — and the final move, which
+// relocates the whole directory, delivered both copies.
 #[tokio::test]
 async fn stray_file_is_not_renamed_into_a_duplicate() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2703,18 +2703,18 @@ async fn a_unique_same_length_obfuscated_rename_still_lands() {
     );
 }
 
-/// Two pairs of files posted under each other's names, nothing damaged: the
-/// repairer must never be asked to fix a set whose only fault is placement.
-///
-/// The repairer's own scanner reports every one of them `Renamed`, which makes
-/// `needs_repair()` true, and the old ladder read that as "repair required" —
-/// with zero damaged slices and zero blocks needed, the tell that there was
-/// nothing to repair. Running it anyway installed each file at its canonical
-/// name and left the displaced originals behind as `<name>.N`, after which the
-/// job's own post-repair pass could no longer tell a backup from the file it had
-/// been displaced by. Placement is the whole job here, and the plan for it has
-/// to come from a directory scan: a swap is two files each holding the other's
-/// content, and only something that looks at what is on each name can see it.
+// Two pairs of files posted under each other's names, nothing damaged: the
+// repairer must never be asked to fix a set whose only fault is placement.
+//
+// The repairer's own scanner reports every one of them `Renamed`, which makes
+// `needs_repair()` true, and the old ladder read that as "repair required" —
+// with zero damaged slices and zero blocks needed, the tell that there was
+// nothing to repair. Running it anyway installed each file at its canonical
+// name and left the displaced originals behind as `<name>.N`, after which the
+// job's own post-repair pass could no longer tell a backup from the file it had
+// been displaced by. Placement is the whole job here, and the plan for it has
+// to come from a directory scan: a swap is two files each holding the other's
+// content, and only something that looks at what is on each name can see it.
 #[tokio::test]
 async fn a_placement_only_verdict_is_placed_without_running_the_repairer() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2782,17 +2782,17 @@ async fn a_placement_only_verdict_is_placed_without_running_the_repairer() {
     );
 }
 
-/// Partial quick evidence is recognized and the set still settles correctly.
-///
-/// Half the set is proven by zero-read digest evidence; the other half is a
-/// swapped pair with no evidence at all. The quick pass now reports Partial
-/// instead of throwing the proof away, and the swap is still seen and fixed —
-/// through the repairer-analysis arm, whose whole-set pass places by 16 KiB
-/// prefix proposal rather than the old full-MD5 directory scan, so the set is
-/// read once there instead of twice. The analysis arm does not yet consume
-/// the partial evidence to narrow its read to the unproven pair — that
-/// consumption exists only at the verification fallback today — which is why
-/// this test pins one authoritative pass, not a selective one.
+// Partial quick evidence is recognized and the set still settles correctly.
+//
+// Half the set is proven by zero-read digest evidence; the other half is a
+// swapped pair with no evidence at all. The quick pass now reports Partial
+// instead of throwing the proof away, and the swap is still seen and fixed —
+// through the repairer-analysis arm, whose whole-set pass places by 16 KiB
+// prefix proposal rather than the old full-MD5 directory scan, so the set is
+// read once there instead of twice. The analysis arm does not yet consume
+// the partial evidence to narrow its read to the unproven pair — that
+// consumption exists only at the verification fallback today — which is why
+// this test pins one authoritative pass, not a selective one.
 #[tokio::test]
 async fn partial_quick_evidence_is_reported_and_the_swap_still_settles() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2873,14 +2873,14 @@ async fn partial_quick_evidence_is_reported_and_the_swap_still_settles() {
     );
 }
 
-/// Damage alongside misplacement still runs the repairer, and the files it
-/// placed are read back where it placed them.
-///
-/// This is the row the placement-only rule must not swallow: one holed file
-/// means slices to reconstruct, so the ladder below it — capacity, promotion,
-/// repair — is exactly what the job needs. The renamed files then come back
-/// through the post-repair read at their canonical names, because that is where
-/// the repair put them.
+// Damage alongside misplacement still runs the repairer, and the files it
+// placed are read back where it placed them.
+//
+// This is the row the placement-only rule must not swallow: one holed file
+// means slices to reconstruct, so the ladder below it — capacity, promotion,
+// repair — is exactly what the job needs. The renamed files then come back
+// through the post-repair read at their canonical names, because that is where
+// the repair put them.
 #[tokio::test]
 async fn damage_alongside_misplacement_still_repairs_and_reads_back_the_placed_files() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2944,18 +2944,18 @@ async fn damage_alongside_misplacement_still_repairs_and_reads_back_the_placed_f
     );
 }
 
-/// The field shape: a clean swapped pair under canonical names, downloaded
-/// metadata-early, so no whole-file MD5 was ever streamed and no article closed
-/// a block on the dual-CRC grid. Quick verify has no evidence keyed to content
-/// — only names and lengths — and names are exactly what a swap makes lie, so it
-/// must stay inconclusive and leave the authoritative read to decide.
-///
-/// The per-file loop finds neither a closed in-stream block verdict nor a
-/// current-generation measured digest, so neither protected description is
-/// matched and the final unresolved check refuses the verdict. The companion test
-/// `a_misplaced_pair_proven_by_measured_digests_returns_a_swap_plan` shows the
-/// identical fixture resolving the swap the moment a digest is present, which is
-/// what pins the absence of evidence — not a broken fixture — as the cause here.
+// The field shape: a clean swapped pair under canonical names, downloaded
+// metadata-early, so no whole-file MD5 was ever streamed and no article closed
+// a block on the dual-CRC grid. Quick verify has no evidence keyed to content
+// — only names and lengths — and names are exactly what a swap makes lie, so it
+// must stay inconclusive and leave the authoritative read to decide.
+//
+// The per-file loop finds neither a closed in-stream block verdict nor a
+// current-generation measured digest, so neither protected description is
+// matched and the final unresolved check refuses the verdict. The companion test
+// `a_misplaced_pair_proven_by_measured_digests_returns_a_swap_plan` shows the
+// identical fixture resolving the swap the moment a digest is present, which is
+// what pins the absence of evidence — not a broken fixture — as the cause here.
 #[tokio::test]
 async fn a_misplaced_pair_with_no_content_evidence_is_correctly_inconclusive() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3011,10 +3011,10 @@ async fn a_misplaced_pair_with_no_content_evidence_is_correctly_inconclusive() {
     );
 }
 
-/// A complete file outside the current recovery set must not veto a digest
-/// match for that set merely because the unrelated file has no MD5. This is the
-/// multi-set late-discovery shape: an earlier grid-only payload remains in the
-/// assembly while a later set is proved by the digest its own payload streamed.
+// A complete file outside the current recovery set must not veto a digest
+// match for that set merely because the unrelated file has no MD5. This is the
+// multi-set late-discovery shape: an earlier grid-only payload remains in the
+// assembly while a later set is proved by the digest its own payload streamed.
 #[tokio::test]
 async fn an_unrelated_grid_only_file_does_not_veto_a_digest_proven_set() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3067,13 +3067,13 @@ async fn an_unrelated_grid_only_file_does_not_veto_a_digest_proven_set() {
     assert_ne!(evidence, QuickPar2Evidence::Grid);
 }
 
-/// The same swapped pair, now carrying the trusted whole-file MD5 that a
-/// non-metadata-early download would have streamed. The measured digest keys the
-/// match to the description its *content* reproduces, not the one its current
-/// name implies, so the swap already resolves today: `Ok(Some(..))` with a
-/// two-entry swap plan and a clean verdict. This is the control that proves the
-/// swap machinery is sound and the inconclusive verdict above is caused solely
-/// by absent content evidence.
+// The same swapped pair, now carrying the trusted whole-file MD5 that a
+// non-metadata-early download would have streamed. The measured digest keys the
+// match to the description its *content* reproduces, not the one its current
+// name implies, so the swap already resolves today: `Ok(Some(..))` with a
+// two-entry swap plan and a clean verdict. This is the control that proves the
+// swap machinery is sound and the inconclusive verdict above is caused solely
+// by absent content evidence.
 #[tokio::test]
 async fn a_misplaced_pair_proven_by_measured_digests_returns_a_swap_plan() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3119,12 +3119,12 @@ async fn a_misplaced_pair_proven_by_measured_digests_returns_a_swap_plan() {
     assert_eq!(pipeline.par2_quick_verify_calls, 1);
 }
 
-/// Fail-closed: damage alongside the swap. `silver-horizon-a.bin` holds its
-/// partner's clean bytes (a valid swap half), but `silver-horizon-b.bin` holds
-/// bytes that reproduce no description's hash. The damaged file matches nothing,
-/// its partner description is left unresolved, and the pass refuses — a damaged
-/// file must never leave this path with a clean verdict, even with digests
-/// present that would otherwise resolve the swap.
+// Fail-closed: damage alongside the swap. `silver-horizon-a.bin` holds its
+// partner's clean bytes (a valid swap half), but `silver-horizon-b.bin` holds
+// bytes that reproduce no description's hash. The damaged file matches nothing,
+// its partner description is left unresolved, and the pass refuses — a damaged
+// file must never leave this path with a clean verdict, even with digests
+// present that would otherwise resolve the swap.
 #[tokio::test]
 async fn a_damaged_file_in_the_misplaced_shape_is_never_quick_verified() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3160,11 +3160,11 @@ async fn a_damaged_file_in_the_misplaced_shape_is_never_quick_verified() {
     assert_eq!(pipeline.par2_quick_verify_calls, 0);
 }
 
-/// Fail-closed: one hash claimed by two descriptions. Both descriptions carry
-/// the same `hash_full`, so a file matching it is ambiguous — the match count
-/// for the chosen id trips two, the id is dropped as a conflict, and its partner
-/// description is left unresolved. Ambiguity of this kind is exactly what the
-/// authoritative read owns, so the quick pass refuses.
+// Fail-closed: one hash claimed by two descriptions. Both descriptions carry
+// the same `hash_full`, so a file matching it is ambiguous — the match count
+// for the chosen id trips two, the id is dropped as a conflict, and its partner
+// description is left unresolved. Ambiguity of this kind is exactly what the
+// authoritative read owns, so the quick pass refuses.
 #[tokio::test]
 async fn a_hash_claimed_by_two_descriptions_is_never_quick_verified() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3196,11 +3196,11 @@ async fn a_hash_claimed_by_two_descriptions_is_never_quick_verified() {
     assert_eq!(pipeline.par2_quick_verify_calls, 0);
 }
 
-/// Fail-closed: a swap whose partner never arrived. One file is present at
-/// `silver-horizon-b.bin`'s canonical name but holds `silver-horizon-a.bin`'s
-/// content; the file that should hold the other half never completed. The
-/// present half resolves to its content's description, but the absent partner's
-/// description has no disk file, so it is left unresolved and the pass refuses.
+// Fail-closed: a swap whose partner never arrived. One file is present at
+// `silver-horizon-b.bin`'s canonical name but holds `silver-horizon-a.bin`'s
+// content; the file that should hold the other half never completed. The
+// present half resolves to its content's description, but the absent partner's
+// description has no disk file, so it is left unresolved and the pass refuses.
 #[tokio::test]
 async fn a_swap_whose_partner_is_absent_is_never_quick_verified() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3232,8 +3232,8 @@ async fn a_swap_whose_partner_is_absent_is_never_quick_verified() {
     assert_eq!(pipeline.par2_quick_verify_calls, 0);
 }
 
-/// Quarantining the damaged source beside repaired canonical bytes must not
-/// force a second read of the whole recovery set.
+// Quarantining the damaged source beside repaired canonical bytes must not
+// force a second read of the whole recovery set.
 #[tokio::test]
 async fn repaired_obfuscated_rar_quarantine_keeps_the_selective_repair_tail() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3507,8 +3507,8 @@ async fn repaired_obfuscated_rar_quarantine_keeps_the_selective_repair_tail() {
     );
 }
 
-/// A free canonical rename is still only a 16 KiB identity match until the
-/// settled-layout pass proves the full digest.
+// A free canonical rename is still only a 16 KiB identity match until the
+// settled-layout pass proves the full digest.
 #[tokio::test]
 async fn canonical_non_recovery_rename_rejects_corruption_after_the_prefix() {
     let temp_dir = tempfile::tempdir().unwrap();

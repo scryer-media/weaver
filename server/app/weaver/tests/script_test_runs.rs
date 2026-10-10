@@ -73,8 +73,8 @@ fn supervisor() -> Option<PathBuf> {
     Some(PathBuf::from(env!("CARGO_BIN_EXE_weaver")))
 }
 
-/// A pipe a test script stops at for good: nothing ever writes to it, so the
-/// script stays there until its run is cancelled.
+// A pipe a test script stops at for good: nothing ever writes to it, so the
+// script stays there until its run is cancelled.
 fn gate(directory: &Path, name: &str) -> PathBuf {
     let path = directory.join(name);
     let made = std::process::Command::new("mkfifo")
@@ -85,7 +85,7 @@ fn gate(directory: &Path, name: &str) -> PathBuf {
     path
 }
 
-/// A saved instance of `script` that `trigger` starts.
+// A saved instance of `script` that `trigger` starts.
 fn instance(fixture: &Fixture, script: &ScriptName, trigger: InstanceTrigger) -> ScriptInstance {
     fixture
         .db
@@ -106,7 +106,7 @@ async fn start(
     .await
 }
 
-/// The test run `id` once its script has ended, however long that takes.
+// The test run `id` once its script has ended, however long that takes.
 async fn ended(fixture: &Fixture, id: &str) -> ScriptTestSnapshot {
     fixture
         .db
@@ -120,8 +120,8 @@ async fn run_to_end(fixture: &Fixture, instance: &ScriptInstance) -> ScriptTestS
     ended(fixture, &started.id).await
 }
 
-/// Test a new instance of `script` on `trigger` and return the run once it
-/// has ended.
+// Test a new instance of `script` on `trigger` and return the run once it
+// has ended.
 async fn test_on(
     fixture: &Fixture,
     script: &ScriptName,
@@ -141,7 +141,7 @@ fn input<'a>(run: &'a ScriptTestSnapshot, name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-/// The scratch directories test runs have left under the data directory.
+// The scratch directories test runs have left under the data directory.
 fn scratch_directories(fixture: &Fixture) -> Vec<PathBuf> {
     fs::read_dir(fixture.data.path())
         .unwrap()
@@ -403,7 +403,7 @@ async fn a_running_test_shows_its_output_and_ends_when_cancelled() {
     assert!(!fixture.db.cancel_script_test("no-such-run"));
 }
 
-/// A shell loop printing `lines` lines of 99 characters and a newline.
+// A shell loop printing `lines` lines of 99 characters and a newline.
 fn printing(lines: usize) -> String {
     format!(
         "i=0\nwhile [ $i -lt {lines} ]; do printf '%099d\\n' $i; i=$((i + 1)); done\nprintf 'last line\\n'\n"

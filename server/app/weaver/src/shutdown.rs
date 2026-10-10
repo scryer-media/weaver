@@ -57,7 +57,7 @@ pub(crate) fn spawn_metrics_history_task(
     })
 }
 
-/// Writes metrics history samples, skipping one that only repeats the last.
+// Writes metrics history samples, skipping one that only repeats the last.
 #[derive(Default)]
 struct MetricsHistorySampler {
     cadence: MetricsHistoryCadence,

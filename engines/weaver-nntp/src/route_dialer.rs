@@ -3,7 +3,7 @@ use weaver_tunnel::pipe::{Dialed, DialedStream, Dialer, Purpose, Target};
 
 use crate::{NntpError, ServerConfig, route_stream::BlockingSocket};
 
-/// One address race per direct leg. The blocking driver owns every race attempt.
+// One address race per direct leg. The blocking driver owns every race attempt.
 pub struct AddressPlanned {
     pub plan: Arc<crate::address_plan::AddressPlan>,
     pub egress: Arc<weaver_tunnel::pipe::Egress>,
@@ -84,7 +84,7 @@ impl Dialer for AddressPlanned {
     }
 }
 
-/// Slack past the route budget before the outer deadline abandons a dial.
+// Slack past the route budget before the outer deadline abandons a dial.
 const ROUTE_BUDGET_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub struct RouteDialer {

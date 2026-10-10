@@ -31,7 +31,7 @@ const DEFAULT_LIMITS: ParserLimits = ParserLimits {
 };
 
 impl ParserLimits {
-    /// Read once per submission, before any job or network work is created.
+    // Read once per submission, before any job or network work is created.
     fn from_env() -> Result<Self, NzbError> {
         fn limit<T: std::str::FromStr>(name: &str, default: T) -> Result<T, NzbError> {
             match std::env::var(name) {
@@ -58,42 +58,42 @@ impl ParserLimits {
     }
 }
 
-/// Parse an NZB XML document from bytes.
+// Parse an NZB XML document from bytes.
 pub fn parse_nzb(xml: &[u8]) -> Result<Nzb, NzbError> {
     parse_nzb_reader(Cursor::new(xml))
 }
 
-/// What the parser dropped, repaired, or reordered on its way to an [`Nzb`].
-///
-/// The parsed document is the clean view the pipeline downloads from; these
-/// counts are the part of the original document that view no longer shows.
+// What the parser dropped, repaired, or reordered on its way to an [`Nzb`].
+//
+// The parsed document is the clean view the pipeline downloads from; these
+// counts are the part of the original document that view no longer shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParseDiagnostics {
-    /// `<file>` elements dropped because no segment survived.
+    // `<file>` elements dropped because no segment survived.
     pub files_without_segments: u32,
-    /// `<file>` elements whose `date` attribute did not parse.
+    // `<file>` elements whose `date` attribute did not parse.
     pub invalid_dates: u32,
-    /// Malformed segments inside the dropped files, which have no entry in
-    /// `files`.
+    // Malformed segments inside the dropped files, which have no entry in
+    // `files`.
     pub malformed_segments_in_dropped_files: u32,
-    /// One entry per file in [`Nzb::files`], in the same order.
+    // One entry per file in [`Nzb::files`], in the same order.
     pub files: Vec<FileParseDiagnostics>,
 }
 
-/// Per-file parse findings, aligned with [`Nzb::files`].
+// Per-file parse findings, aligned with [`Nzb::files`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileParseDiagnostics {
-    /// Segments skipped for a missing or invalid number, size, or message-ID.
+    // Segments skipped for a missing or invalid number, size, or message-ID.
     pub malformed_segments: u32,
-    /// Segments skipped because their number was already listed.
+    // Segments skipped because their number was already listed.
     pub duplicate_segment_numbers: u32,
-    /// Segments skipped because their message-ID was already listed.
+    // Segments skipped because their message-ID was already listed.
     pub duplicate_message_ids: u32,
-    /// The document listed a segment number lower than one before it.
+    // The document listed a segment number lower than one before it.
     pub out_of_order: bool,
 }
 
-/// Parse an NZB XML document from bytes, keeping what the parse dropped.
+// Parse an NZB XML document from bytes, keeping what the parse dropped.
 pub fn parse_nzb_with_diagnostics(xml: &[u8]) -> Result<(Nzb, ParseDiagnostics), NzbError> {
     let mut diagnostics = ParseDiagnostics::default();
     let nzb = parse_nzb_reader_limited(
@@ -109,7 +109,7 @@ fn parse_nzb_with_limits(xml: &[u8], limits: ParserLimits) -> Result<Nzb, NzbErr
     parse_nzb_reader_limited(Cursor::new(xml), limits, &mut ParseDiagnostics::default())
 }
 
-/// Parse an NZB XML document incrementally from a buffered reader.
+// Parse an NZB XML document incrementally from a buffered reader.
 pub fn parse_nzb_reader<R: BufRead>(reader: R) -> Result<Nzb, NzbError> {
     parse_nzb_reader_limited(
         reader,
@@ -465,7 +465,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
     })
 }
 
-/// Strip namespace prefix from an element name (e.g. `nzb:file` -> `file`).
+// Strip namespace prefix from an element name (e.g. `nzb:file` -> `file`).
 fn local_name(name: &str) -> &str {
     match name.find(':') {
         Some(pos) => &name[pos + 1..],
@@ -486,12 +486,12 @@ struct FileBuilder {
     last_number: Option<u32>,
 }
 
-/// The duplicate segments skipped while one file's `<segments>` were read.
-///
-/// A posting whose segment list repeats itself does not repeat it once: the
-/// same file arrives with tens of thousands of duplicates, and a line each
-/// buries every other thing the log had to say. They are counted here and
-/// reported once, when the file ends.
+// The duplicate segments skipped while one file's `<segments>` were read.
+//
+// A posting whose segment list repeats itself does not repeat it once: the
+// same file arrives with tens of thousands of duplicates, and a line each
+// buries every other thing the log had to say. They are counted here and
+// reported once, when the file ends.
 #[derive(Debug, Default)]
 struct DuplicateSegmentTally {
     numbers: u64,
@@ -520,7 +520,7 @@ impl DuplicateSegmentTally {
         self.numbers.saturating_add(self.message_ids)
     }
 
-    /// Emit the one warning this file's duplicates are worth, if any.
+    // Emit the one warning this file's duplicates are worth, if any.
     fn report(&self, subject: &str) {
         if self.total() == 0 {
             return;
@@ -951,8 +951,8 @@ mod tests {
         assert_eq!(segments[1].message_id, "next-id");
     }
 
-    /// A file whose segment list repeats itself is worth one line, not one
-    /// line per repeat: the tally is what the single warning reports.
+    // A file whose segment list repeats itself is worth one line, not one
+    // line per repeat: the tally is what the single warning reports.
     #[test]
     fn duplicate_segments_are_reported_once_per_file() {
         let mut tally = DuplicateSegmentTally::default();
@@ -979,8 +979,8 @@ mod tests {
         );
     }
 
-    /// The parse itself keeps one segment per duplicated id, however many
-    /// copies the document carries.
+    // The parse itself keeps one segment per duplicated id, however many
+    // copies the document carries.
     #[test]
     fn duplicate_segment_message_ids_collapse_to_one_segment() {
         let mut xml = String::from(
@@ -1342,7 +1342,7 @@ mod tests {
         assert!(matches!(err, NzbError::ResourceLimit(_)));
     }
 
-    /// Helper to create an NzbFile with just a subject for filename/role tests.
+    // Helper to create an NzbFile with just a subject for filename/role tests.
     fn make_file(subject: &str) -> NzbFile {
         NzbFile {
             poster: String::new(),

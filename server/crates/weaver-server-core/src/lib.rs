@@ -25,7 +25,7 @@ pub mod servers;
 pub mod settings;
 pub mod support;
 pub mod update_check;
-/// Transitional, removed in 0.9.1. See the module docs.
+// Transitional, removed in 0.9.1. See the module docs.
 pub mod upgrade_compat;
 pub mod watch_folder;
 
@@ -89,12 +89,12 @@ pub use runtime::affinity::{
 pub use runtime::hardware_profile::{HardwareProfile, ProfileTuning};
 pub use runtime::tuning::{RuntimeTuner, TunedParameters};
 
-/// Allocation counter for the tests that assert a hot path allocates nothing.
-///
-/// Test builds only. It forwards every request to the system allocator and
-/// counts allocations *per thread*, which is the only way to prove from inside
-/// a multi-threaded test binary that one closure performed none: a
-/// process-wide counter would pick up every other test running beside it.
+// Allocation counter for the tests that assert a hot path allocates nothing.
+//
+// Test builds only. It forwards every request to the system allocator and
+// counts allocations *per thread*, which is the only way to prove from inside
+// a multi-threaded test binary that one closure performed none: a
+// process-wide counter would pick up every other test running beside it.
 #[cfg(test)]
 pub(crate) mod alloc_probe {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -128,7 +128,7 @@ pub(crate) mod alloc_probe {
         }
     }
 
-    /// Allocations the calling thread has made so far.
+    // Allocations the calling thread has made so far.
     pub(crate) fn allocations() -> u64 {
         ALLOCATIONS.try_with(Cell::get).unwrap_or(0)
     }

@@ -47,12 +47,12 @@ fn script(db: &Database, name: &str, body: &str) -> ScriptName {
 
 const DOWNLOADED: InstanceTrigger = InstanceTrigger::Queue(QueueEvent::NzbDownloaded);
 
-/// An instance of `script` that `trigger` starts.
+// An instance of `script` that `trigger` starts.
 fn on(trigger: InstanceTrigger, script: &ScriptName) -> ScriptInstanceDraft {
     ScriptInstanceDraft::new(script.clone(), trigger)
 }
 
-/// Replaces the saved instances with `drafts`, in that order.
+// Replaces the saved instances with `drafts`, in that order.
 fn select(db: &Database, drafts: Vec<ScriptInstanceDraft>) {
     for instance in db.script_instances().unwrap() {
         assert!(db.delete_script_instance(&instance.id).unwrap());
@@ -123,7 +123,7 @@ fn supervisor() -> Option<PathBuf> {
     Some(PathBuf::from(env!("CARGO_BIN_EXE_weaver")))
 }
 
-/// A pipe a test script stops at, so the test decides when the script goes on.
+// A pipe a test script stops at, so the test decides when the script goes on.
 fn gate(directory: &Path, name: &str) -> PathBuf {
     let path = directory.join(name);
     let made = std::process::Command::new("mkfifo")
@@ -134,15 +134,15 @@ fn gate(directory: &Path, name: &str) -> PathBuf {
     path
 }
 
-/// Lets the script stopped at `gate` go on. Returns once the script is there
-/// to be let through, however long it takes to arrive.
+// Lets the script stopped at `gate` go on. Returns once the script is there
+// to be let through, however long it takes to arrive.
 async fn open_gate(gate: PathBuf) {
     tokio::task::spawn_blocking(move || fs::write(gate, "go\n").unwrap())
         .await
         .unwrap();
 }
 
-/// Returns once the script has written to `gate`, which it does when it starts.
+// Returns once the script has written to `gate`, which it does when it starts.
 async fn wait_at_gate(gate: PathBuf) {
     tokio::task::spawn_blocking(move || fs::read(gate).unwrap())
         .await
@@ -204,8 +204,8 @@ async fn scan_distinguishes_supervisor_launch_failure_from_script_exit_127() {
     );
 }
 
-/// Stands in for the Go toolchain, which a machine running these tests need
-/// not have. It emits an executable which exits with `status`.
+// Stands in for the Go toolchain, which a machine running these tests need
+// not have. It emits an executable which exits with `status`.
 fn stub_go(directory: &Path, status: i32) -> String {
     let path = directory.join("stub-go");
     fs::write(

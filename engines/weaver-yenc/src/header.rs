@@ -2,25 +2,25 @@ use crate::decode::DecodeOptions;
 use crate::error::YencError;
 use crate::types::{YencHeaderDefects, YencMetadata};
 
-/// Parsed =yend trailer fields.
+// Parsed =yend trailer fields.
 #[derive(Debug, Default)]
 pub struct YendFields {
     pub size: Option<u64>,
     pub part: Option<u32>,
     pub pcrc32: Option<u32>,
     pub crc32: Option<u32>,
-    /// Trailer damage that was tolerated (unparseable `size=`/`crc32=`).
+    // Trailer damage that was tolerated (unparseable `size=`/`crc32=`).
     pub defects: YencHeaderDefects,
 }
 
-/// Match `keyword` at the start of `line`, requiring a space or tab separator
-/// immediately after it.
-///
-/// A bare `=ybegin` with no separator is not a header.
-/// The separator requirement also keeps junk lines that merely
-/// share a prefix (`=yb`, `=ybeginner notes`) from being mistaken for headers.
-///
-/// Returns the field content after the keyword, line ending trimmed.
+// Match `keyword` at the start of `line`, requiring a space or tab separator
+// immediately after it.
+//
+// A bare `=ybegin` with no separator is not a header.
+// The separator requirement also keeps junk lines that merely
+// share a prefix (`=yb`, `=ybeginner notes`) from being mistaken for headers.
+//
+// Returns the field content after the keyword, line ending trimmed.
 fn strip_keyword<'a>(line: &'a [u8], keyword: &[u8]) -> Option<&'a [u8]> {
     let rest = line.strip_prefix(keyword)?;
     match rest.first() {
@@ -29,8 +29,8 @@ fn strip_keyword<'a>(line: &'a [u8], keyword: &[u8]) -> Option<&'a [u8]> {
     }
 }
 
-/// True when `line` begins a yEnc control line for `keyword` (`=ybegin`,
-/// `=ypart`, `=yend`).
+// True when `line` begins a yEnc control line for `keyword` (`=ybegin`,
+// `=ypart`, `=yend`).
 pub fn is_control_line(line: &[u8], keyword: &[u8]) -> bool {
     strip_keyword(line, keyword).is_some()
 }
@@ -167,8 +167,8 @@ pub fn parse_yend_line(line: &[u8]) -> Result<YendFields, YencError> {
     })
 }
 
-/// Small helper so `Option`-returning field parses can flag their own defect
-/// inline without an intermediate `match`.
+// Small helper so `Option`-returning field parses can flag their own defect
+// inline without an intermediate `match`.
 trait InspectNone: Sized {
     fn inspect_none(self, flag: &mut bool) -> Self;
 }
@@ -182,9 +182,9 @@ impl<T> InspectNone for Option<T> {
     }
 }
 
-/// Parse an optional integer field, reporting `(value, missing, invalid)`.
-/// An unparseable value is reported as absent so callers degrade the same way
-/// for "not written" and "written as garbage".
+// Parse an optional integer field, reporting `(value, missing, invalid)`.
+// An unparseable value is reported as absent so callers degrade the same way
+// for "not written" and "written as garbage".
 fn tolerant_u64(field: Option<&[u8]>) -> (Option<u64>, bool, bool) {
     match field {
         None => (None, true, false),
@@ -199,7 +199,7 @@ fn saturating_u32(value: u64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
-/// Result of parsing all yEnc headers from an article.
+// Result of parsing all yEnc headers from an article.
 #[derive(Debug)]
 pub struct ParsedHeaders {
     pub metadata: YencMetadata,
@@ -208,17 +208,17 @@ pub struct ParsedHeaders {
     pub yend: Option<YendFields>,
 }
 
-/// Find a line starting with the given yEnc control keyword. Returns the byte
-/// offset of the keyword within `input`, or `None`.
-///
-/// The keyword must be followed by ASCII whitespace or end-of-line, so junk
-/// lines that merely share a prefix (`=yb`, `=ybegin_notes`) never match.
-/// Give up once a candidate line would start past `max_start`.
-///
-/// The bound matters for `=ybegin`: the streaming and fused decoders both stop
-/// scanning after [`crate::decode::MAX_HEADER_SCAN_BYTES`] of leading junk, and
-/// the whole-buffer path has to agree with them about which articles are
-/// header-less rather than scanning an arbitrarily long body.
+// Find a line starting with the given yEnc control keyword. Returns the byte
+// offset of the keyword within `input`, or `None`.
+//
+// The keyword must be followed by ASCII whitespace or end-of-line, so junk
+// lines that merely share a prefix (`=yb`, `=ybegin_notes`) never match.
+// Give up once a candidate line would start past `max_start`.
+//
+// The bound matters for `=ybegin`: the streaming and fused decoders both stop
+// scanning after [`crate::decode::MAX_HEADER_SCAN_BYTES`] of leading junk, and
+// the whole-buffer path has to agree with them about which articles are
+// header-less rather than scanning an arbitrarily long body.
 fn find_line_start_within(input: &[u8], keyword: &[u8], max_start: usize) -> Option<usize> {
     // Check if the input itself starts with the keyword.
     if is_control_line(input, keyword) {
@@ -243,22 +243,22 @@ fn find_line_start_within(input: &[u8], keyword: &[u8], max_start: usize) -> Opt
     None
 }
 
-/// The yEnc control line that ends a body, located by the same rule the SIMD
-/// kernel's `search_end` uses.
+// The yEnc control line that ends a body, located by the same rule the SIMD
+// kernel's `search_end` uses.
 #[derive(Debug, Clone, Copy)]
 struct BodyControlLine {
-    /// First byte that is no longer body data (the `\r` of the `\r\n`, or
-    /// `data_start` when the body is empty). The kernel emits nothing for the
-    /// line break or for the `=y` that follows it, so this is exactly where its
-    /// decoded output stops.
+    // First byte that is no longer body data (the `\r` of the `\r\n`, or
+    // `data_start` when the body is empty). The kernel emits nothing for the
+    // line break or for the `=y` that follows it, so this is exactly where its
+    // decoded output stops.
     data_end: usize,
-    /// Offset of the `=` that begins the control line, after any NNTP-stuffed
-    /// dot the kernel would have stripped.
+    // Offset of the `=` that begins the control line, after any NNTP-stuffed
+    // dot the kernel would have stripped.
     keyword_start: usize,
 }
 
-/// `=y` at `at`, allowing the one NNTP-stuffed `.` the kernel strips at line
-/// start in raw mode.
+// `=y` at `at`, allowing the one NNTP-stuffed `.` the kernel strips at line
+// start in raw mode.
 fn control_keyword_at(input: &[u8], at: usize, dot_unstuffing: bool) -> Option<usize> {
     let rest = input.get(at..)?;
     if rest.starts_with(b"=y") {
@@ -270,18 +270,18 @@ fn control_keyword_at(input: &[u8], at: usize, dot_unstuffing: bool) -> Option<u
     None
 }
 
-/// Find the control line that ends the body, matching the SIMD kernel's stop
-/// rule byte for byte.
-///
-/// The kernel reaches its line-start state only through a literal `\r\n` (a
-/// bare `\n` leaves it mid-line) and then stops at *any* `=y`, not specifically
-/// at `=yend`. Scanning for `=yend` lines instead — which is what this used to
-/// do — made the whole-buffer path disagree with the streaming and fused paths
-/// on three reachable inputs: a `\r\n=y…` line that is not `=yend` (the kernel
-/// stops and the article fails; the line scan decoded it as body data), a bare
-/// `\n=yend ` (the line scan accepted a trailer the kernel never stops at), and
-/// a dot-stuffed `\r\n.=yend ` (the kernel strips the dot, the line scan did
-/// not).
+// Find the control line that ends the body, matching the SIMD kernel's stop
+// rule byte for byte.
+//
+// The kernel reaches its line-start state only through a literal `\r\n` (a
+// bare `\n` leaves it mid-line) and then stops at *any* `=y`, not specifically
+// at `=yend`. Scanning for `=yend` lines instead — which is what this used to
+// do — made the whole-buffer path disagree with the streaming and fused paths
+// on three reachable inputs: a `\r\n=y…` line that is not `=yend` (the kernel
+// stops and the article fails; the line scan decoded it as body data), a bare
+// `\n=yend ` (the line scan accepted a trailer the kernel never stops at), and
+// a dot-stuffed `\r\n.=yend ` (the kernel strips the dot, the line scan did
+// not).
 fn find_body_control_line(
     input: &[u8],
     from: usize,
@@ -314,13 +314,13 @@ fn find_body_control_line(
     None
 }
 
-/// Find first LF byte using SIMD-accelerated memchr.
+// Find first LF byte using SIMD-accelerated memchr.
 fn memchr_lf(haystack: &[u8]) -> Option<usize> {
     memchr::memchr(b'\n', haystack)
 }
 
-/// Find the end of the current line (position of \r\n or \n).
-/// Returns the index of the line terminator start, and the index after the full terminator.
+// Find the end of the current line (position of \r\n or \n).
+// Returns the index of the line terminator start, and the index after the full terminator.
 fn line_end(input: &[u8], start: usize) -> (usize, usize) {
     if let Some(rel) = memchr::memchr(b'\n', &input[start..]) {
         let i = start + rel;
@@ -335,7 +335,7 @@ fn line_end(input: &[u8], start: usize) -> (usize, usize) {
     }
 }
 
-/// Convert bytes to a string, trying UTF-8 first, falling back to Latin-1.
+// Convert bytes to a string, trying UTF-8 first, falling back to Latin-1.
 fn bytes_to_string(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
@@ -413,11 +413,11 @@ fn visit_fields<'a>(line: &'a [u8], mut visit: impl FnMut(&[u8], &'a [u8])) {
     }
 }
 
-/// Parse an unsigned decimal field value. Zero-alloc and overflow-checked:
-/// `None` for empty, non-digit, or wider-than-`u64` input.
-///
-/// After trimming surrounding whitespace, every character must be a digit.
-/// Negative values such as `size=-1000` are rejected.
+// Parse an unsigned decimal field value. Zero-alloc and overflow-checked:
+// `None` for empty, non-digit, or wider-than-`u64` input.
+//
+// After trimming surrounding whitespace, every character must be a digit.
+// Negative values such as `size=-1000` are rejected.
 fn parse_u64_opt(value: &[u8]) -> Option<u64> {
     let value = value.trim_ascii();
     if value.is_empty() {
@@ -437,20 +437,20 @@ fn parse_u64_opt(value: &[u8]) -> Option<u64> {
     Some(parsed)
 }
 
-/// Parse a `crc32=`/`pcrc32=` hex value, zero-alloc and overflow-checked.
-///
-/// Returns `None` for anything that is not a usable CRC. Callers treat `None`
-/// as "the poster did not give us a CRC": an unparseable CRC carries no
-/// verification value.
-///
-/// Accepted representations:
-///  * fewer than 8 digits is fine — some encoders omit leading zeros;
-///  * up to 16 digits is accepted and truncated to the low 32 bits for
-///    posters that emit over-long hashes;
-///  * wider than 64 bits is unusable.
-///
-/// Empty values and values containing non-hex bytes are treated as absent;
-/// neither supplies a usable expected CRC.
+// Parse a `crc32=`/`pcrc32=` hex value, zero-alloc and overflow-checked.
+//
+// Returns `None` for anything that is not a usable CRC. Callers treat `None`
+// as "the poster did not give us a CRC": an unparseable CRC carries no
+// verification value.
+//
+// Accepted representations:
+//  * fewer than 8 digits is fine — some encoders omit leading zeros;
+//  * up to 16 digits is accepted and truncated to the low 32 bits for
+//    posters that emit over-long hashes;
+//  * wider than 64 bits is unusable.
+//
+// Empty values and values containing non-hex bytes are treated as absent;
+// neither supplies a usable expected CRC.
 fn parse_crc_hex_bytes(value: &[u8]) -> Option<u32> {
     let value = value.trim_ascii();
     if value.is_empty() {
@@ -479,24 +479,24 @@ fn key_eq_ascii_ignore_case(actual: &[u8], expected: &[u8]) -> bool {
             .all(|(&a, &b)| a.eq_ignore_ascii_case(&b))
 }
 
-/// Parse all yEnc headers from an article body.
-///
-/// Returns parsed metadata, the byte range of encoded data, and =yend fields.
-///
-/// This is a thin composition over the byte-wise line parsers above
-/// ([`parse_ybegin_line`], [`apply_ypart_line`], [`parse_yend_line`]) so that
-/// the whole-buffer path and the streaming/fused paths share exactly one set of
-/// header semantics — same case-insensitivity, same tab handling, same
-/// tolerance for missing fields.
+// Parse all yEnc headers from an article body.
+//
+// Returns parsed metadata, the byte range of encoded data, and =yend fields.
+//
+// This is a thin composition over the byte-wise line parsers above
+// ([`parse_ybegin_line`], [`apply_ypart_line`], [`parse_yend_line`]) so that
+// the whole-buffer path and the streaming/fused paths share exactly one set of
+// header semantics — same case-insensitivity, same tab handling, same
+// tolerance for missing fields.
 pub fn parse_headers(input: &[u8]) -> Result<ParsedHeaders, YencError> {
     parse_headers_with_options(input, DecodeOptions::default())
 }
 
-/// [`parse_headers`] told whether the article still carries NNTP dot-stuffing.
-///
-/// Only the trailer scan cares: in raw mode the kernel strips one leading `.`
-/// at line start before looking for `=y`, so `\r\n.=yend ` is a trailer there
-/// and body data otherwise.
+// [`parse_headers`] told whether the article still carries NNTP dot-stuffing.
+//
+// Only the trailer scan cares: in raw mode the kernel strips one leading `.`
+// at line start before looking for `=y`, so `\r\n.=yend ` is a trailer there
+// and body data otherwise.
 pub fn parse_headers_with_options(
     input: &[u8],
     options: DecodeOptions,
@@ -521,8 +521,8 @@ pub fn parse_headers_with_options(
     })
 }
 
-/// Parse the `=ybegin` line and any `=ypart` line, returning the metadata and
-/// the offset of the first body byte.
+// Parse the `=ybegin` line and any `=ypart` line, returning the metadata and
+// the offset of the first body byte.
 pub(crate) fn parse_leading_headers(input: &[u8]) -> Result<(YencMetadata, usize), YencError> {
     // Scan for the =ybegin line so leading junk (headers
     // left in the body, poster banners, blank lines) does not kill the article.
@@ -559,8 +559,8 @@ pub(crate) fn parse_leading_headers(input: &[u8]) -> Result<(YencMetadata, usize
     Ok((metadata, data_start))
 }
 
-/// Parse the control line that begins at `keyword_start`, the `=` of the `=y`
-/// the body stopped at. Only `=yend` may end a body.
+// Parse the control line that begins at `keyword_start`, the `=` of the `=y`
+// the body stopped at. Only `=yend` may end a body.
 pub(crate) fn parse_trailer_at(
     input: &[u8],
     keyword_start: usize,
@@ -581,15 +581,15 @@ pub(crate) fn parse_trailer_at(
     parse_yend_line(line)
 }
 
-/// Extract a filename from a yEnc-style NNTP subject line.
-///
-/// yEnc subjects typically follow patterns like:
-/// - `"filename.rar" yEnc (1/10)`
-/// - `[group] "filename.rar" yEnc (1/10)`
-/// - `some description - "filename.rar" yEnc (01/10)`
-/// - `filename.rar yEnc (1/10)` (unquoted)
-///
-/// Returns `None` if no filename can be extracted.
+// Extract a filename from a yEnc-style NNTP subject line.
+//
+// yEnc subjects typically follow patterns like:
+// - `"filename.rar" yEnc (1/10)`
+// - `[group] "filename.rar" yEnc (1/10)`
+// - `some description - "filename.rar" yEnc (01/10)`
+// - `filename.rar yEnc (1/10)` (unquoted)
+//
+// Returns `None` if no filename can be extracted.
 pub fn extract_filename_from_subject(subject: &str) -> Option<String> {
     // Strategy 1: Look for a quoted filename before "yEnc"
     if let Some(yenc_pos) = subject.find("yEnc") {
@@ -648,8 +648,8 @@ mod tests {
         assert_eq!(metadata.end, Some(512));
     }
 
-    /// `=ypart end=` past `=ybegin size=` is a known broken-poster class.
-    /// Weaver records the inconsistency instead of failing the article.
+    // `=ypart end=` past `=ybegin size=` is a known broken-poster class.
+    // Weaver records the inconsistency instead of failing the article.
     #[test]
     fn apply_ypart_line_tolerates_end_past_declared_file_size() {
         let mut metadata =
@@ -674,7 +674,7 @@ mod tests {
         assert!(!metadata.defects.any());
     }
 
-    /// A reversed end does not change placement by a valid begin.
+    // A reversed end does not change placement by a valid begin.
     #[test]
     fn apply_ypart_line_records_end_before_begin() {
         let mut metadata =
@@ -771,12 +771,12 @@ mod tests {
         assert_eq!(yend.crc32, Some(0xABCDEF01));
     }
 
-    /// Bare-LF articles: the `=ybegin` scan accepts them (all three entry
-    /// points find headers line-wise, LF-anchored), but the *trailer* does not
-    /// — the SIMD kernel reaches its line-start state only through a literal
-    /// CRLF, so `\n=yend` is body data to the streaming and fused decoders and
-    /// must be body data here too. See
-    /// `decode::tests::bare_lf_trailer_is_body_data_in_every_entry_point`.
+    // Bare-LF articles: the `=ybegin` scan accepts them (all three entry
+    // points find headers line-wise, LF-anchored), but the *trailer* does not
+    // — the SIMD kernel reaches its line-start state only through a literal
+    // CRLF, so `\n=yend` is body data to the streaming and fused decoders and
+    // must be body data here too. See
+    // `decode::tests::bare_lf_trailer_is_body_data_in_every_entry_point`.
     #[test]
     fn bare_lf_line_endings_find_ybegin_but_not_the_trailer() {
         let input = b"=ybegin line=128 size=100 name=test.bin\n\
@@ -788,7 +788,7 @@ mod tests {
         assert_eq!(parsed.data_end, input.len());
     }
 
-    /// The same article with CRLF endings does find its trailer.
+    // The same article with CRLF endings does find its trailer.
     #[test]
     fn crlf_trailer_is_found() {
         let input = b"=ybegin line=128 size=100 name=test.bin\r\n\
@@ -815,7 +815,7 @@ mod tests {
         assert_eq!(parsed.data_end, input.len());
     }
 
-    /// Missing `=ybegin size=` defaults to zero.
+    // Missing `=ybegin size=` defaults to zero.
     #[test]
     fn missing_size_field_is_tolerated() {
         let input = b"=ybegin line=128 name=test.bin\r\ndata\r\n=yend size=100\r\n";

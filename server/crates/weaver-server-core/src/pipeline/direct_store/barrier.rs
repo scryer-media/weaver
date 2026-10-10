@@ -1,28 +1,28 @@
-//! The per-set coverage barrier.
-//!
-//! Between barriers nothing durable happens: successfully written bytes
-//! accumulate as coalesced source ranges in memory. A barrier converts that
-//! into one replaced checkpoint row, in a fixed order:
-//!
-//! 1. **Drain** — stop new writes for the set and drain the mapped batch
-//!    already in flight. Overshoot is bounded to one decoded write batch.
-//! 2. **Sync** — sync every destination and envelope file touched *since the
-//!    previous successful barrier*, not only the files in the final batch. The
-//!    published floors cover the whole interval, so a file touched early and not
-//!    again would otherwise be claimed but unsynced.
-//! 3. **Persist** — write and commit the single snapshot row. The commit is the
-//!    checkpoint's sync.
-//! 4. **Publish** — only now are the floors visible in memory, and only now is
-//!    the transient state cleared.
-//!
-//! A failure at any step leaves the previous checkpoint authoritative and the
-//! touched-file set uncleared, so the next successful barrier still syncs
-//! everything the interval touched. It also starts a cooldown: the dirty bytes
-//! that provoked the barrier are still dirty, so the age trigger would
-//! otherwise be due again immediately and retry a wedged sync or a down
-//! database as fast as the caller polls. The cooldown damps **only** that
-//! trigger — the byte threshold and every explicit demand still fire, because a
-//! shutdown must always get its attempt.
+// The per-set coverage barrier.
+//
+// Between barriers nothing durable happens: successfully written bytes
+// accumulate as coalesced source ranges in memory. A barrier converts that
+// into one replaced checkpoint row, in a fixed order:
+//
+// 1. **Drain** — stop new writes for the set and drain the mapped batch
+//    already in flight. Overshoot is bounded to one decoded write batch.
+// 2. **Sync** — sync every destination and envelope file touched *since the
+//    previous successful barrier*, not only the files in the final batch. The
+//    published floors cover the whole interval, so a file touched early and not
+//    again would otherwise be claimed but unsynced.
+// 3. **Persist** — write and commit the single snapshot row. The commit is the
+//    checkpoint's sync.
+// 4. **Publish** — only now are the floors visible in memory, and only now is
+//    the transient state cleared.
+//
+// A failure at any step leaves the previous checkpoint authoritative and the
+// touched-file set uncleared, so the next successful barrier still syncs
+// everything the interval touched. It also starts a cooldown: the dirty bytes
+// that provoked the barrier are still dirty, so the age trigger would
+// otherwise be due again immediately and retry a wedged sync or a down
+// database as fast as the caller polls. The cooldown damps **only** that
+// trigger — the byte threshold and every explicit demand still fire, because a
+// shutdown must always get its attempt.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -34,25 +34,25 @@ use super::snapshot::{
 use crate::e2e_failpoint;
 use crate::jobs::ids::JobId;
 
-/// Aggregate unique dirty bytes across the set that force a barrier.
+// Aggregate unique dirty bytes across the set that force a barrier.
 pub(crate) const BARRIER_DIRTY_BYTES: u64 = 256 * 1024 * 1024;
 
-/// How long dirty data may exist before a barrier is forced, so an idle set
-/// still checkpoints.
+// How long dirty data may exist before a barrier is forced, so an idle set
+// still checkpoints.
 pub(crate) const BARRIER_DIRTY_AGE: Duration = Duration::from_secs(5);
 
-/// How long the [`BarrierTrigger::DirtyAge`] trigger is suppressed after a
-/// failed barrier. A failing barrier keeps its dirty bytes, so without this the
-/// age trigger is due again immediately and the set retries a failing sync or a
-/// failing transaction as fast as the loop can call it.
+// How long the [`BarrierTrigger::DirtyAge`] trigger is suppressed after a
+// failed barrier. A failing barrier keeps its dirty bytes, so without this the
+// age trigger is due again immediately and the set retries a failing sync or a
+// failing transaction as fast as the loop can call it.
 pub(crate) const BARRIER_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
 
-/// The ceiling the backoff doubles up to. A wedged disk or a down database
-/// should cost one attempt every few minutes, not one per loop iteration.
+// The ceiling the backoff doubles up to. A wedged disk or a down database
+// should cost one attempt every few minutes, not one per loop iteration.
 pub(crate) const BARRIER_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(300);
 
-/// The cooldown after `consecutive_failures` failed barriers: 5 s doubling per
-/// failure, capped at 5 min.
+// The cooldown after `consecutive_failures` failed barriers: 5 s doubling per
+// failure, capped at 5 min.
 fn failure_backoff(consecutive_failures: u32) -> Duration {
     let doublings = consecutive_failures.saturating_sub(1).min(16);
     BARRIER_FAILURE_BACKOFF
@@ -60,8 +60,8 @@ fn failure_backoff(consecutive_failures: u32) -> Duration {
         .min(BARRIER_FAILURE_BACKOFF_MAX)
 }
 
-/// Why the caller is demanding a barrier. The caller decides when these happen;
-/// the controller only records which one it served.
+// Why the caller is demanding a barrier. The caller decides when these happen;
+// the controller only records which one it served.
 // `Demotion` still has no caller: demotion by reconstruction *deletes* the row
 // rather than checkpointing it, so the demand exists in the vocabulary the seam
 // is specified in without a path that raises it. `Pause` and `PhaseChange` are
@@ -74,28 +74,28 @@ pub(crate) enum BarrierDemand {
     PhaseChange,
     Demotion,
     Finalization,
-    /// A PAR2 repair rewrote bytes the deleted row used to claim.
-    /// Demanded immediately after the repaired spans are routed, so the window
-    /// where the set has no durable coverage at all is as short as the code can
-    /// make it rather than one 5 s timer.
+    // A PAR2 repair rewrote bytes the deleted row used to claim.
+    // Demanded immediately after the repaired spans are routed, so the window
+    // where the set has no durable coverage at all is as short as the code can
+    // make it rather than one 5 s timer.
     RepairRecreate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BarrierTrigger {
-    /// Aggregate unique dirty bytes reached [`BARRIER_DIRTY_BYTES`].
+    // Aggregate unique dirty bytes reached [`BARRIER_DIRTY_BYTES`].
     DirtyBytes,
-    /// Dirty data has existed for [`BARRIER_DIRTY_AGE`].
+    // Dirty data has existed for [`BARRIER_DIRTY_AGE`].
     DirtyAge,
-    /// The set's plan digest has moved since the committed row was written, so
-    /// that row would be refused at restart even though it describes this very
-    /// set (see [`CoverageBarrier::set_plan_digest`]).
-    ///
-    /// Fires with no dirty bytes at all, which no other automatic trigger does:
-    /// the work it exists to save is already durable, and what is stale is the
-    /// label the restart reader validates it against. It is damped by the same
-    /// failure cooldown as the age trigger, because a set whose persist is
-    /// failing must not re-stamp on every turn of the pipeline loop.
+    // The set's plan digest has moved since the committed row was written, so
+    // that row would be refused at restart even though it describes this very
+    // set (see [`CoverageBarrier::set_plan_digest`]).
+    //
+    // Fires with no dirty bytes at all, which no other automatic trigger does:
+    // the work it exists to save is already durable, and what is stale is the
+    // label the restart reader validates it against. It is damped by the same
+    // failure cooldown as the age trigger, because a set whose persist is
+    // failing must not re-stamp on every turn of the pipeline loop.
     PlanDigestChanged,
     Demand(BarrierDemand),
 }
@@ -111,17 +111,14 @@ pub(crate) enum BarrierStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BarrierError {
     Drain(String),
-    Sync {
-        destination: String,
-        error: String,
-    },
-    /// Encoding failed, so nothing was written. Classified as a persist-step
-    /// failure because it happens inside step 3.
+    Sync { destination: String, error: String },
+    // Encoding failed, so nothing was written. Classified as a persist-step
+    // failure because it happens inside step 3.
     Encode(SnapshotError),
     Persist(String),
-    /// The controller or its checkpoint row was retired while the barrier was
-    /// in flight, so the snapshot describes a row that no longer exists. Not
-    /// a failure: nothing broke, the interval is simply given back.
+    // The controller or its checkpoint row was retired while the barrier was
+    // in flight, so the snapshot describes a row that no longer exists. Not
+    // a failure: nothing broke, the interval is simply given back.
     Retired(&'static str),
 }
 
@@ -135,7 +132,7 @@ impl BarrierError {
         }
     }
 
-    /// True when the barrier was overtaken rather than broken.
+    // True when the barrier was overtaken rather than broken.
     pub(crate) fn is_retired(&self) -> bool {
         matches!(self, Self::Retired(_))
     }
@@ -159,46 +156,46 @@ impl std::fmt::Display for BarrierError {
     }
 }
 
-/// Step 1. The caller owns quiescing: it knows the write pool, the reorder
-/// buffer and the lease state, none of which belong in this module.
+// Step 1. The caller owns quiescing: it knows the write pool, the reorder
+// buffer and the lease state, none of which belong in this module.
 pub(crate) trait BarrierDrain {
     fn drain(&mut self) -> Result<(), String>;
 }
 
-/// Step 2. One call per destination file touched during the interval.
+// Step 2. One call per destination file touched during the interval.
 pub(crate) trait DestinationSync {
     fn sync(&mut self, relative_path: &str) -> Result<(), String>;
 }
 
-/// Step 3. Exactly one replaced row per archive set — no history, no append,
-/// and no per-volume statements.
+// Step 3. Exactly one replaced row per archive set — no history, no append,
+// and no per-volume statements.
 pub(crate) trait CoveragePersist {
-    /// Replaces the set's checkpoint row.
-    ///
-    /// **Single writer per (job, set).** The row is replaced wholesale and the
-    /// generation counter lives in the blob, not in a compare-and-set: nothing
-    /// here serializes two writers, so a stale one would silently clobber a
-    /// newer generation with older floors. The invariant that makes that
-    /// impossible is structural — one pipeline owns a job, and one
-    /// [`CoverageBarrier`] owns each of its archive sets — and it is the
-    /// caller's to keep. If a second writer ever becomes possible (a
-    /// concurrently repairing job, a second process on the same database), this
-    /// needs a real generation guard in the statement, not a comment.
+    // Replaces the set's checkpoint row.
+    //
+    // **Single writer per (job, set).** The row is replaced wholesale and the
+    // generation counter lives in the blob, not in a compare-and-set: nothing
+    // here serializes two writers, so a stale one would silently clobber a
+    // newer generation with older floors. The invariant that makes that
+    // impossible is structural — one pipeline owns a job, and one
+    // [`CoverageBarrier`] owns each of its archive sets — and it is the
+    // caller's to keep. If a second writer ever becomes possible (a
+    // concurrently repairing job, a second process on the same database), this
+    // needs a real generation guard in the statement, not a comment.
     fn write(&mut self, job_id: JobId, set_name: &str, blob: &[u8]) -> Result<(), String>;
 
-    /// Retires the set's checkpoint. Repair over checkpoint-covered output
-    /// deletes the row and lets the next barrier recreate coverage from
-    /// scratch.
+    // Retires the set's checkpoint. Repair over checkpoint-covered output
+    // deletes the row and lets the next barrier recreate coverage from
+    // scratch.
     fn delete(&mut self, job_id: JobId, set_name: &str) -> Result<(), String>;
 }
 
-/// The production [`CoveragePersist`]: a thin adapter over the two
-/// `active_direct_coverage` statements, so the barrier's persist step is the
-/// real database write rather than only a test double.
-///
-/// Both calls block on the SQL runtime, which is what step 3 wants — the commit
-/// *is* the checkpoint's sync, and the barrier may not publish floors until it
-/// returns.
+// The production [`CoveragePersist`]: a thin adapter over the two
+// `active_direct_coverage` statements, so the barrier's persist step is the
+// real database write rather than only a test double.
+//
+// Both calls block on the SQL runtime, which is what step 3 wants — the commit
+// *is* the checkpoint's sync, and the barrier may not publish floors until it
+// returns.
 #[derive(Clone)]
 pub(crate) struct DatabaseCoveragePersist {
     database: crate::Database,
@@ -230,36 +227,36 @@ impl CoveragePersist for DatabaseCoveragePersist {
     }
 }
 
-/// One routed source span that reached its destination successfully.
-///
-/// Recorded only after the write returned: partial failure leaves orphan bytes,
-/// and the coverage map is the truth, not the bytes.
+// One routed source span that reached its destination successfully.
+//
+// Recorded only after the write returned: partial failure leaves orphan bytes,
+// and the coverage map is the truth, not the bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutedWrite {
     pub(crate) volume_index: u32,
-    /// Offset within the source volume.
+    // Offset within the source volume.
     pub(crate) source_offset: u64,
     pub(crate) len: u64,
     pub(crate) member_index: u32,
-    /// Offset within the destination file.
+    // Offset within the destination file.
     pub(crate) destination_offset: u64,
 }
 
-/// Why a routed write was not recorded.
-///
-/// Every variant is a caller bug: the write named an identity the controller
-/// was never told about, and the coverage map cannot invent it. The write is
-/// refused **entirely** — no floor advances, nothing becomes dirty and no
-/// destination is marked for sync — because a checkpoint that claims bytes it
-/// cannot attribute to a synced file is worse than no checkpoint.
+// Why a routed write was not recorded.
+//
+// Every variant is a caller bug: the write named an identity the controller
+// was never told about, and the coverage map cannot invent it. The write is
+// refused **entirely** — no floor advances, nothing becomes dirty and no
+// destination is marked for sync — because a checkpoint that claims bytes it
+// cannot attribute to a synced file is worse than no checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteRefused {
-    /// No destination is registered for this member index, so the write's
-    /// bytes would never be claimed, synced or attributed.
+    // No destination is registered for this member index, so the write's
+    // bytes would never be claimed, synced or attributed.
     UnregisteredMember { member_index: u32 },
-    /// No source volume is registered for this volume index, so its floor
-    /// would be published against a defaulted NZB file index — refetch would
-    /// then target the wrong file.
+    // No source volume is registered for this volume index, so its floor
+    // would be published against a defaulted NZB file index — refetch would
+    // then target the wrong file.
     UnregisteredVolume { volume_index: u32 },
 }
 
@@ -281,30 +278,30 @@ impl std::fmt::Display for WriteRefused {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BarrierReport {
     pub(crate) trigger: BarrierTrigger,
-    /// The generation now committed.
+    // The generation now committed.
     pub(crate) generation: u64,
-    /// The order the four steps actually ran in.
+    // The order the four steps actually ran in.
     pub(crate) steps: Vec<BarrierStep>,
     pub(crate) synced_destinations: usize,
     pub(crate) snapshot_bytes: usize,
-    /// Volume index to published contiguous floor.
+    // Volume index to published contiguous floor.
     pub(crate) published_floors: BTreeMap<u32, u64>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct VolumeCoverage {
     file_index: u32,
-    /// The volume's decoded length, once every article of it has arrived. `None`
-    /// while it is still downloading.
-    ///
-    /// Deliberately the *length* rather than a `complete` flag: the snapshot's
-    /// bit means "all bytes durable", which is the conjunction of this and the
-    /// published floor, and a flag latched here would publish that claim for a
-    /// volume whose bytes are still held. See
-    /// [`super::snapshot::VolumeFloor::complete`].
+    // The volume's decoded length, once every article of it has arrived. `None`
+    // while it is still downloading.
+    //
+    // Deliberately the *length* rather than a `complete` flag: the snapshot's
+    // bit means "all bytes durable", which is the conjunction of this and the
+    // published floor, and a flag latched here would publish that claim for a
+    // volume whose bytes are still held. See
+    // [`super::snapshot::VolumeFloor::complete`].
     decoded_len: Option<u64>,
-    /// Last published contiguous floor. Bytes below it have been trimmed out of
-    /// `ranges`, so the floor itself is what continuity is measured from.
+    // Last published contiguous floor. Bytes below it have been trimmed out of
+    // `ranges`, so the floor itself is what continuity is measured from.
     floor: u64,
     ranges: ByteRanges,
 }
@@ -315,68 +312,68 @@ struct DestinationCoverage {
     ranges: ByteRanges,
 }
 
-/// Per-archive-set coverage tracker and barrier driver.
+// Per-archive-set coverage tracker and barrier driver.
 #[derive(Debug)]
 pub(crate) struct CoverageBarrier {
     job_id: JobId,
     set_name: String,
-    /// The digest the **next** snapshot stamps. Pushed by the set on every
-    /// registration, because it is a function of facts that grow as volumes
-    /// arrive; see [`Self::set_plan_digest`].
+    // The digest the **next** snapshot stamps. Pushed by the set on every
+    // registration, because it is a function of facts that grow as volumes
+    // arrive; see [`Self::set_plan_digest`].
     plan_digest: [u8; 32],
-    /// The digest the **committed** row carries. Only
-    /// [`BarrierTrigger::PlanDigestChanged`] reads it, and only against
-    /// `plan_digest`.
+    // The digest the **committed** row carries. Only
+    // [`BarrierTrigger::PlanDigestChanged`] reads it, and only against
+    // `plan_digest`.
     committed_digest: [u8; 32],
     committed_generation: u64,
-    /// Transient coalesced source ranges, per source volume. In memory only —
-    /// nothing per-segment is ever persisted.
+    // Transient coalesced source ranges, per source volume. In memory only —
+    // nothing per-segment is ever persisted.
     volumes: BTreeMap<u32, VolumeCoverage>,
-    /// Accumulated destination claims for the whole set, across barriers.
+    // Accumulated destination claims for the whole set, across barriers.
     destinations: BTreeMap<u32, DestinationCoverage>,
-    /// Destination member indices touched since the last **successful**
-    /// barrier. Cleared only on success.
+    // Destination member indices touched since the last **successful**
+    // barrier. Cleared only on success.
     touched: BTreeSet<u32>,
-    /// Aggregate unique dirty bytes across the set. Out-of-order writes count
-    /// even when a volume's contiguous floor is stalled.
+    // Aggregate unique dirty bytes across the set. Out-of-order writes count
+    // even when a volume's contiguous floor is stalled.
     dirty_bytes: u64,
     dirty_since: Option<Instant>,
     published_floors: BTreeMap<u32, u64>,
-    /// Barriers that have failed in a row. Reset by any success.
+    // Barriers that have failed in a row. Reset by any success.
     consecutive_failures: u32,
-    /// While set, the age trigger is suppressed. Byte-threshold and demanded
-    /// barriers ignore it.
+    // While set, the age trigger is suppressed. Byte-threshold and demanded
+    // barriers ignore it.
     cooldown_until: Option<Instant>,
-    /// The crypt rows the next checkpoint carries, by member index. Empty for
-    /// every set with no encrypted member, which is every unencrypted set.
+    // The crypt rows the next checkpoint carries, by member index. Empty for
+    // every set with no encrypted member, which is every unencrypted set.
     member_crypt: BTreeMap<u32, super::router::crypt::MemberCryptSnapshot>,
-    /// The identity binding the next checkpoint carries: the plan an
-    /// identity-admitted set was admitted with, so restart can rebuild it.
-    /// `None` for a set its file names admitted.
+    // The identity binding the next checkpoint carries: the plan an
+    // identity-admitted set was admitted with, so restart can rebuild it.
+    // `None` for a set its file names admitted.
     identity: Option<super::snapshot::IdentityBinding>,
-    /// The fingerprints the next checkpoint carries, pushed beside the
-    /// identity binding.
+    // The fingerprints the next checkpoint carries, pushed beside the
+    // identity binding.
     fingerprints: Vec<super::snapshot::ProvenFingerprint>,
-    /// A [`PreparedBarrier`] is out, its sync running elsewhere. While it is,
-    /// no automatic trigger is due and no second one can be prepared: two
-    /// barriers in flight would both persist generation `n + 1`, and the one
-    /// finishing last would clobber the newer floors with the older.
+    // A [`PreparedBarrier`] is out, its sync running elsewhere. While it is,
+    // no automatic trigger is due and no second one can be prepared: two
+    // barriers in flight would both persist generation `n + 1`, and the one
+    // finishing last would clobber the newer floors with the older.
     in_flight: bool,
-    /// Bumped whenever the committed row is deleted (a repair). A prepared
-    /// barrier carries the epoch it was prepared under; one that outlived its
-    /// row is a claim over bytes a repair has since rewritten, and is refused.
+    // Bumped whenever the committed row is deleted (a repair). A prepared
+    // barrier carries the epoch it was prepared under; one that outlived its
+    // row is a claim over bytes a repair has since rewritten, and is refused.
     row_epoch: u64,
 }
 
-/// A barrier between its prepare and its commit: the checkpoint the pipeline
-/// captured **before** the sync, so the sync can run off the pipeline task
-/// while writes keep landing.
-///
-/// Everything the row will claim is fixed here. Writes recorded after the
-/// prepare go into the controller's fresh transient state and are the next
-/// barrier's business; they are never claimed by this one, which is what
-/// keeps "claimed" a subset of "synced" — the bytes this snapshot names were
-/// all written before the sync it waits for was even requested.
+// A barrier between its prepare and its commit: the checkpoint the pipeline
+// captured **before** the sync, so the sync can run off the pipeline task
+// while writes keep landing.
+//
+// Everything the row will claim is fixed here. Writes recorded after the
+// prepare go into the controller's fresh transient state and are the next
+// barrier's business; they are never claimed by this one, which is what
+// keeps "claimed" a subset of "synced" — the bytes this snapshot names were
+// all written before the sync it waits for was even requested.
 #[derive(Debug)]
 pub(crate) struct PreparedBarrier {
     trigger: BarrierTrigger,
@@ -385,12 +382,12 @@ pub(crate) struct PreparedBarrier {
     floors: BTreeMap<u32, u64>,
     plan_digest: [u8; 32],
     blob: Vec<u8>,
-    /// The interval's touched members, taken out of the controller so the
-    /// members a later write touches start a fresh interval. Restored whole on
-    /// failure or abandonment, because a failed sync leaves them unsynced.
+    // The interval's touched members, taken out of the controller so the
+    // members a later write touches start a fresh interval. Restored whole on
+    // failure or abandonment, because a failed sync leaves them unsynced.
     touched: BTreeSet<u32>,
-    /// The touched members and their destination paths, in member order: what
-    /// the caller syncs and what the commit replays.
+    // The touched members and their destination paths, in member order: what
+    // the caller syncs and what the commit replays.
     sync_targets: Vec<(u32, String)>,
     dirty_bytes: u64,
     dirty_since: Option<Instant>,
@@ -420,12 +417,12 @@ impl CoverageBarrier {
         }
     }
 
-    /// Hands the barrier the crypt rows its next checkpoint must carry.
-    ///
-    /// Pushed rather than pulled because the barrier owns no router: the set
-    /// reads them off the router immediately before every run, so a checkpoint
-    /// can never carry padding or checkpoints older than the coverage beside
-    /// them.
+    // Hands the barrier the crypt rows its next checkpoint must carry.
+    //
+    // Pushed rather than pulled because the barrier owns no router: the set
+    // reads them off the router immediately before every run, so a checkpoint
+    // can never carry padding or checkpoints older than the coverage beside
+    // them.
     pub(crate) fn set_member_crypt(
         &mut self,
         rows: BTreeMap<u32, super::router::crypt::MemberCryptSnapshot>,
@@ -433,9 +430,9 @@ impl CoverageBarrier {
         self.member_crypt = rows;
     }
 
-    /// Hands the barrier the identity binding its next checkpoint must carry,
-    /// pushed immediately before every run beside the crypt rows so a
-    /// checkpoint always names the plan its coverage was produced against.
+    // Hands the barrier the identity binding its next checkpoint must carry,
+    // pushed immediately before every run beside the crypt rows so a
+    // checkpoint always names the plan its coverage was produced against.
     pub(crate) fn set_identity_binding(
         &mut self,
         identity: Option<super::snapshot::IdentityBinding>,
@@ -443,7 +440,7 @@ impl CoverageBarrier {
         self.identity = identity;
     }
 
-    /// Hands the barrier the fingerprints its next checkpoint must carry.
+    // Hands the barrier the fingerprints its next checkpoint must carry.
     pub(crate) fn set_proven_fingerprints(
         &mut self,
         fingerprints: Vec<super::snapshot::ProvenFingerprint>,
@@ -451,60 +448,60 @@ impl CoverageBarrier {
         self.fingerprints = fingerprints;
     }
 
-    /// Points the next snapshot at the plan the set is **currently** routing
-    /// against.
-    ///
-    /// # Why this is pushed at all
-    ///
-    /// The digest binds the member names and their declared unpacked sizes, and
-    /// a set learns those as its volumes arrive: a two-member archive whose
-    /// second member's header lives in volume 3 has a one-member digest until
-    /// volume 3 lands, and a member that migrates into the envelope leaves the
-    /// digest again. Stamping once — at the first adopted member, which is where
-    /// the barrier is built — froze a digest that was true for one instant, and
-    /// every row written afterwards was refused at restart with
-    /// `PlanDigestMismatch` on a set that was in perfect health. That is a silent
-    /// whole-set redownload, and it is the *normal* case for a multi-member set.
-    ///
-    /// # What a digest change does to already-committed coverage: nothing
-    ///
-    /// Deliberately nothing, and this is the load-bearing half. Discovering a
-    /// member does not move one byte of an existing member's destination: the
-    /// layout's logical offsets are prefix sums a later volume only extends, and
-    /// the library guarantees no offset moves while a member still routes. So
-    /// every floor and every claim already accumulated still describes exactly
-    /// the bytes it did before, and they are carried into the next snapshot
-    /// unchanged — the digest is a *label* for validating the row against a
-    /// rebuilt plan, not a checksum of the coverage. Clearing coverage here
-    /// would throw away durable work to record a fact about the plan.
-    ///
-    /// What *is* stale is the committed row's label, which is why the change
-    /// makes the barrier due: see [`BarrierTrigger::PlanDigestChanged`].
+    // Points the next snapshot at the plan the set is **currently** routing
+    // against.
+    //
+    // # Why this is pushed at all
+    //
+    // The digest binds the member names and their declared unpacked sizes, and
+    // a set learns those as its volumes arrive: a two-member archive whose
+    // second member's header lives in volume 3 has a one-member digest until
+    // volume 3 lands, and a member that migrates into the envelope leaves the
+    // digest again. Stamping once — at the first adopted member, which is where
+    // the barrier is built — froze a digest that was true for one instant, and
+    // every row written afterwards was refused at restart with
+    // `PlanDigestMismatch` on a set that was in perfect health. That is a silent
+    // whole-set redownload, and it is the *normal* case for a multi-member set.
+    //
+    // # What a digest change does to already-committed coverage: nothing
+    //
+    // Deliberately nothing, and this is the load-bearing half. Discovering a
+    // member does not move one byte of an existing member's destination: the
+    // layout's logical offsets are prefix sums a later volume only extends, and
+    // the library guarantees no offset moves while a member still routes. So
+    // every floor and every claim already accumulated still describes exactly
+    // the bytes it did before, and they are carried into the next snapshot
+    // unchanged — the digest is a *label* for validating the row against a
+    // rebuilt plan, not a checksum of the coverage. Clearing coverage here
+    // would throw away durable work to record a fact about the plan.
+    //
+    // What *is* stale is the committed row's label, which is why the change
+    // makes the barrier due: see [`BarrierTrigger::PlanDigestChanged`].
     pub(crate) fn set_plan_digest(&mut self, plan_digest: [u8; 32]) {
         self.plan_digest = plan_digest;
     }
 
-    /// Drops a destination the set no longer owns, so the next snapshot carries
-    /// no claim for it.
-    ///
-    /// The reachable caller is the split-BLAKE2sp migration, which moves a
-    /// member's routed bytes into the envelope and **unlinks its partial**. A
-    /// claim on a file that no longer exists is refused at restart as a missing
-    /// destination, taking the whole row down to a redownload. Keeping it in the
-    /// sync set is worse than useless besides: the write pool opens for sync with
-    /// `create(true)`, so the barrier either fsyncs an unlinked inode or puts an
-    /// empty `.direct.partial` back beside the member it just migrated.
-    ///
-    /// The entry is **removed**, not emptied. The rule is that a claim over
-    /// zero bytes is not a claim and is omitted from the blob, and a
-    /// destination that is gone must land in the same place rather than
-    /// becoming a zero-byte claim on a path restart would then probe.
-    ///
-    /// The path is checked, not just the key: member ids are in-run counters,
-    /// and retiring a live destination because an id was reused would drop
-    /// claims on bytes that really are on disk. A mismatch keeps the claim,
-    /// which is the safe direction — the row is refused and the set redownloads,
-    /// exactly as it did before this existed.
+    // Drops a destination the set no longer owns, so the next snapshot carries
+    // no claim for it.
+    //
+    // The reachable caller is the split-BLAKE2sp migration, which moves a
+    // member's routed bytes into the envelope and **unlinks its partial**. A
+    // claim on a file that no longer exists is refused at restart as a missing
+    // destination, taking the whole row down to a redownload. Keeping it in the
+    // sync set is worse than useless besides: the write pool opens for sync with
+    // `create(true)`, so the barrier either fsyncs an unlinked inode or puts an
+    // empty `.direct.partial` back beside the member it just migrated.
+    //
+    // The entry is **removed**, not emptied. The rule is that a claim over
+    // zero bytes is not a claim and is omitted from the blob, and a
+    // destination that is gone must land in the same place rather than
+    // becoming a zero-byte claim on a path restart would then probe.
+    //
+    // The path is checked, not just the key: member ids are in-run counters,
+    // and retiring a live destination because an id was reused would drop
+    // claims on bytes that really are on disk. A mismatch keeps the claim,
+    // which is the safe direction — the row is refused and the set redownloads,
+    // exactly as it did before this existed.
     pub(crate) fn retire_destination(&mut self, member_index: u32, relative_path: &str) -> bool {
         let matches = self
             .destinations
@@ -520,11 +517,11 @@ impl CoverageBarrier {
         true
     }
 
-    /// Rebuilds a controller from a validated checkpoint after restart.
-    ///
-    /// The floors and destination claims come back; the transient per-segment
-    /// ranges deliberately do not, because they were never persisted. Coverage
-    /// above a floor is redownloaded.
+    // Rebuilds a controller from a validated checkpoint after restart.
+    //
+    // The floors and destination claims come back; the transient per-segment
+    // ranges deliberately do not, because they were never persisted. Coverage
+    // above a floor is redownloaded.
     pub(crate) fn resume(
         job_id: JobId,
         set_name: impl Into<String>,
@@ -564,8 +561,8 @@ impl CoverageBarrier {
         barrier
     }
 
-    /// Reporting accessors the barrier publishes for a health surface the
-    /// wiring does not wire; exercised by this module's own tests.
+    // Reporting accessors the barrier publishes for a health surface the
+    // wiring does not wire; exercised by this module's own tests.
     #[allow(dead_code)]
     pub(crate) fn generation(&self) -> u64 {
         self.committed_generation
@@ -581,30 +578,30 @@ impl CoverageBarrier {
         &self.published_floors
     }
 
-    /// Barriers that have failed in a row, for the caller's health reporting.
-    /// Zero after any success.
+    // Barriers that have failed in a row, for the caller's health reporting.
+    // Zero after any success.
     #[allow(dead_code)]
     pub(crate) fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures
     }
 
-    /// When the age trigger becomes eligible again after a failure. `None` when
-    /// no barrier is in backoff. A caller scheduling its own wake-ups can use
-    /// this instead of polling.
+    // When the age trigger becomes eligible again after a failure. `None` when
+    // no barrier is in backoff. A caller scheduling its own wake-ups can use
+    // this instead of polling.
     #[allow(dead_code)]
     pub(crate) fn cooldown_until(&self) -> Option<Instant> {
         self.cooldown_until
     }
 
-    /// Everything the controller knows is durably on disk for one source
-    /// volume: the published floor, plus the coalesced ranges above it that
-    /// have been written but not yet checkpointed.
-    ///
-    /// This is the truth demotion-by-reconstruction reads. Deliberately *this*
-    /// rather than the router's own routed map: the controller is only told
-    /// about writes whose every destination returned, so a span whose write
-    /// failed is absent here and will be refetched rather than read back from a
-    /// file that never received it.
+    // Everything the controller knows is durably on disk for one source
+    // volume: the published floor, plus the coalesced ranges above it that
+    // have been written but not yet checkpointed.
+    //
+    // This is the truth demotion-by-reconstruction reads. Deliberately *this*
+    // rather than the router's own routed map: the controller is only told
+    // about writes whose every destination returned, so a span whose write
+    // failed is absent here and will be refetched rather than read back from a
+    // file that never received it.
     pub(crate) fn volume_coverage(&self, volume_index: u32) -> Option<ByteRanges> {
         let volume = self.volumes.get(&volume_index)?;
         let mut coverage = ByteRanges::new();
@@ -617,29 +614,29 @@ impl CoverageBarrier {
         Some(coverage)
     }
 
-    /// Everything durably placed in **one destination's own space**.
-    ///
-    /// Unlike [`Self::volume_coverage`] these ranges are never trimmed against
-    /// a floor, because a destination's claim is what restart re-probes and
-    /// what the hybrid provider reads back: a floor describes a *source
-    /// volume*'s refetch point and says nothing about which file holds a byte.
-    /// For a volume's envelope the destination space **is** the physical space,
-    /// so this is the exact answer to "did the envelope ever receive this
-    /// offset".
+    // Everything durably placed in **one destination's own space**.
+    //
+    // Unlike [`Self::volume_coverage`] these ranges are never trimmed against
+    // a floor, because a destination's claim is what restart re-probes and
+    // what the hybrid provider reads back: a floor describes a *source
+    // volume*'s refetch point and says nothing about which file holds a byte.
+    // For a volume's envelope the destination space **is** the physical space,
+    // so this is the exact answer to "did the envelope ever receive this
+    // offset".
     pub(crate) fn destination_coverage(&self, member_index: u32) -> Option<&ByteRanges> {
         self.destinations
             .get(&member_index)
             .map(|destination| &destination.ranges)
     }
 
-    /// Destination keys and their relative paths, for everything touched since
-    /// the last successful barrier, in member order.
-    ///
-    /// The key rides along because a relative path alone no longer says which
-    /// root it hangs off: member payload resolves under the job's staging root
-    /// and envelopes under its working directory, and the key band is what
-    /// separates them (see
-    /// [`super::plan::DirectSetPlan::barrier_destination_path`]).
+    // Destination keys and their relative paths, for everything touched since
+    // the last successful barrier, in member order.
+    //
+    // The key rides along because a relative path alone no longer says which
+    // root it hangs off: member payload resolves under the job's staging root
+    // and envelopes under its working directory, and the key band is what
+    // separates them (see
+    // [`super::plan::DirectSetPlan::barrier_destination_path`]).
     pub(crate) fn touched_destinations(&self) -> Vec<(u32, &str)> {
         self.touched
             .iter()
@@ -651,19 +648,19 @@ impl CoverageBarrier {
             .collect()
     }
 
-    /// Binds a source volume to its NZB file index and a member to its
-    /// destination path. Idempotent.
+    // Binds a source volume to its NZB file index and a member to its
+    // destination path. Idempotent.
     pub(crate) fn register_volume(&mut self, volume_index: u32, file_index: u32) {
         self.volumes.entry(volume_index).or_default().file_index = file_index;
     }
 
-    /// Records that every article of a source volume has arrived, and how long
-    /// the volume decoded to.
-    ///
-    /// The length is what makes this a fact rather than a latch: the snapshot's
-    /// `complete` bit is re-derived at every barrier from this length against the
-    /// floor being published, so a volume that finished downloading into *held*
-    /// bytes publishes `complete: false` until those bytes are actually durable.
+    // Records that every article of a source volume has arrived, and how long
+    // the volume decoded to.
+    //
+    // The length is what makes this a fact rather than a latch: the snapshot's
+    // `complete` bit is re-derived at every barrier from this length against the
+    // floor being published, so a volume that finished downloading into *held*
+    // bytes publishes `complete: false` until those bytes are actually durable.
     pub(crate) fn note_volume_complete(&mut self, volume_index: u32, decoded_len: u64) {
         self.volumes.entry(volume_index).or_default().decoded_len = Some(decoded_len);
     }
@@ -681,15 +678,15 @@ impl CoverageBarrier {
             });
     }
 
-    /// Records one successfully written routed span and returns the number of
-    /// bytes it newly made dirty.
-    ///
-    /// A destination the write touches becomes part of this interval's sync
-    /// set, whether or not it is touched again before the barrier.
-    ///
-    /// A write the controller cannot attribute is **refused whole**: see
-    /// [`WriteRefused`]. Refusing in debug builds is loud, because every
-    /// refusal is a routing bug in the caller, not a runtime condition.
+    // Records one successfully written routed span and returns the number of
+    // bytes it newly made dirty.
+    //
+    // A destination the write touches becomes part of this interval's sync
+    // set, whether or not it is touched again before the barrier.
+    //
+    // A write the controller cannot attribute is **refused whole**: see
+    // [`WriteRefused`]. Refusing in debug builds is loud, because every
+    // refusal is a routing bug in the caller, not a runtime condition.
     pub(crate) fn record_write(
         &mut self,
         write: &RoutedWrite,
@@ -705,9 +702,9 @@ impl CoverageBarrier {
         result
     }
 
-    /// [`Self::record_write`] without the debug assertion, so this module's own
-    /// tests can exercise the refusal path that the original wiring must never
-    /// reach.
+    // [`Self::record_write`] without the debug assertion, so this module's own
+    // tests can exercise the refusal path that the original wiring must never
+    // reach.
     pub(super) fn try_record_write(
         &mut self,
         write: &RoutedWrite,
@@ -749,9 +746,9 @@ impl CoverageBarrier {
         Ok(fresh)
     }
 
-    /// The automatic triggers. Explicit demands come through
-    /// [`BarrierTrigger::Demand`] and are always honoured — a shutdown must
-    /// still attempt a barrier, however many have just failed.
+    // The automatic triggers. Explicit demands come through
+    // [`BarrierTrigger::Demand`] and are always honoured — a shutdown must
+    // still attempt a barrier, however many have just failed.
     pub(crate) fn due(&self, now: Instant) -> Option<BarrierTrigger> {
         // The one out already carries everything up to its prepare; what is
         // dirty now is the next interval's, and it becomes due once that one
@@ -789,7 +786,7 @@ impl CoverageBarrier {
         None
     }
 
-    /// Candidate per-volume contiguous floors, computed after the drain.
+    // Candidate per-volume contiguous floors, computed after the drain.
     fn candidate_floors(&self) -> BTreeMap<u32, u64> {
         self.volumes
             .iter()
@@ -856,17 +853,17 @@ impl CoverageBarrier {
         }
     }
 
-    /// Runs the four-step barrier inline. On error nothing is published, the
-    /// touched set is not cleared, and the previously committed checkpoint
-    /// stays authoritative.
-    ///
-    /// The same two halves the split form runs — [`Self::prepare`] then
-    /// [`Self::commit`] — with the sync replayed between them, so the inline
-    /// and the off-task barrier cannot drift apart.
-    ///
-    /// `now` is the caller's clock, and only failure handling uses it: a failed
-    /// barrier starts a cooldown that suppresses the age trigger (see
-    /// [`failure_backoff`]), and a successful one clears it.
+    // Runs the four-step barrier inline. On error nothing is published, the
+    // touched set is not cleared, and the previously committed checkpoint
+    // stays authoritative.
+    //
+    // The same two halves the split form runs — [`Self::prepare`] then
+    // [`Self::commit`] — with the sync replayed between them, so the inline
+    // and the off-task barrier cannot drift apart.
+    //
+    // `now` is the caller's clock, and only failure handling uses it: a failed
+    // barrier starts a cooldown that suppresses the age trigger (see
+    // [`failure_backoff`]), and a successful one clears it.
     pub(crate) fn barrier<D, S, P>(
         &mut self,
         trigger: BarrierTrigger,
@@ -884,15 +881,15 @@ impl CoverageBarrier {
         self.commit(prepared, now, sync, persist)
     }
 
-    /// Steps 1 and 3a: drain, then capture the checkpoint this barrier will
-    /// commit, with the interval's touched members taken out of the
-    /// controller. The caller syncs [`PreparedBarrier::sync_targets`] — on the
-    /// pipeline task or off it — and then calls [`Self::commit`] or
-    /// [`Self::abandon`].
-    ///
-    /// Refused while another prepared barrier is out; see
-    /// [`CoverageBarrier::in_flight`]. A drain failure counts as a failed
-    /// barrier and starts the cooldown.
+    // Steps 1 and 3a: drain, then capture the checkpoint this barrier will
+    // commit, with the interval's touched members taken out of the
+    // controller. The caller syncs [`PreparedBarrier::sync_targets`] — on the
+    // pipeline task or off it — and then calls [`Self::commit`] or
+    // [`Self::abandon`].
+    //
+    // Refused while another prepared barrier is out; see
+    // [`CoverageBarrier::in_flight`]. A drain failure counts as a failed
+    // barrier and starts the cooldown.
     pub(crate) fn prepare<D>(
         &mut self,
         trigger: BarrierTrigger,
@@ -959,16 +956,16 @@ impl CoverageBarrier {
         })
     }
 
-    /// Steps 2 (replayed), 3 and 4 for a prepared barrier. `sync` answers for
-    /// the syncs the caller ran; a destination that did not sync fails the
-    /// barrier and nothing is published.
-    ///
-    /// The checkpoint row the barrier increments must still be the one it was
-    /// prepared against: a repair that deleted the row while the sync ran, or
-    /// a demotion that retired the controller, makes the prepared snapshot a
-    /// claim over bytes that are no longer there. Both are refused here rather
-    /// than left to the caller's guards alone, and neither counts as a failed
-    /// barrier.
+    // Steps 2 (replayed), 3 and 4 for a prepared barrier. `sync` answers for
+    // the syncs the caller ran; a destination that did not sync fails the
+    // barrier and nothing is published.
+    //
+    // The checkpoint row the barrier increments must still be the one it was
+    // prepared against: a repair that deleted the row while the sync ran, or
+    // a demotion that retired the controller, makes the prepared snapshot a
+    // claim over bytes that are no longer there. Both are refused here rather
+    // than left to the caller's guards alone, and neither counts as a failed
+    // barrier.
     pub(crate) fn commit<S, P>(
         &mut self,
         prepared: PreparedBarrier,
@@ -1004,9 +1001,9 @@ impl CoverageBarrier {
         }
     }
 
-    /// Gives a prepared barrier up without committing it. The interval's
-    /// touched members and dirty bytes go back into the controller, so the
-    /// next barrier syncs and claims them; the cooldown is untouched.
+    // Gives a prepared barrier up without committing it. The interval's
+    // touched members and dirty bytes go back into the controller, so the
+    // next barrier syncs and claims them; the cooldown is untouched.
     pub(crate) fn abandon(&mut self, prepared: PreparedBarrier) {
         if !self.in_flight {
             // Retired underneath the flight: the controller is fresh and the
@@ -1088,21 +1085,21 @@ impl CoverageBarrier {
         })
     }
 
-    /// Deletes the durable row and **keeps** the in-memory controller.
-    ///
-    /// The difference from [`Self::retire`] is the whole of the distinction
-    /// between its two transitions. A demotion is leaving: the destinations are
-    /// about to be deleted, so every extent and floor is meaningless and
-    /// keeping one would let the next barrier write a checkpoint strictly worse
-    /// than none. A repair is *staying*: the destinations keep existing, at the
-    /// same offsets, holding better bytes than before — so the controller's
-    /// account of what is on disk is still exactly right, and it is also what
-    /// the hybrid provider reads to answer the re-verify.
-    ///
-    /// What must not survive is the **row**, because a crash mid-repair would
-    /// otherwise leave floors claiming bytes that are half-rewritten. Clearing
-    /// the committed generation is what makes the next barrier write a fresh row
-    /// from scratch rather than an increment of a row that is gone.
+    // Deletes the durable row and **keeps** the in-memory controller.
+    //
+    // The difference from [`Self::retire`] is the whole of the distinction
+    // between its two transitions. A demotion is leaving: the destinations are
+    // about to be deleted, so every extent and floor is meaningless and
+    // keeping one would let the next barrier write a checkpoint strictly worse
+    // than none. A repair is *staying*: the destinations keep existing, at the
+    // same offsets, holding better bytes than before — so the controller's
+    // account of what is on disk is still exactly right, and it is also what
+    // the hybrid provider reads to answer the re-verify.
+    //
+    // What must not survive is the **row**, because a crash mid-repair would
+    // otherwise leave floors claiming bytes that are half-rewritten. Clearing
+    // the committed generation is what makes the next barrier write a fresh row
+    // from scratch rather than an increment of a row that is gone.
     pub(crate) fn delete_committed_row<P: CoveragePersist + ?Sized>(
         &mut self,
         persist: &mut P,
@@ -1115,20 +1112,20 @@ impl CoverageBarrier {
         Ok(())
     }
 
-    /// Deletes the set's checkpoint row **and retires the controller with it**.
-    /// Demotion's half of the pair; [`Self::delete_committed_row`] is the
-    /// repair's.
-    ///
-    /// The controller is reset to a fresh one, not merely un-generationed.
-    /// Demotion deletes the destinations outright, so every extent, floor and
-    /// touched entry retire with the row. Anything kept would let the next
-    /// barrier write a checkpoint claiming extents in files that no longer
-    /// contain them — a checkpoint strictly worse than none, because restart
-    /// trusts it.
-    ///
-    /// A retired controller is therefore unregistered: the caller re-registers
-    /// its volumes and destinations before routing resumes, and until it does,
-    /// [`Self::record_write`] refuses every write.
+    // Deletes the set's checkpoint row **and retires the controller with it**.
+    // Demotion's half of the pair; [`Self::delete_committed_row`] is the
+    // repair's.
+    //
+    // The controller is reset to a fresh one, not merely un-generationed.
+    // Demotion deletes the destinations outright, so every extent, floor and
+    // touched entry retire with the row. Anything kept would let the next
+    // barrier write a checkpoint claiming extents in files that no longer
+    // contain them — a checkpoint strictly worse than none, because restart
+    // trusts it.
+    //
+    // A retired controller is therefore unregistered: the caller re-registers
+    // its volumes and destinations before routing resumes, and until it does,
+    // [`Self::record_write`] refuses every write.
     pub(crate) fn retire<P: CoveragePersist + ?Sized>(
         &mut self,
         persist: &mut P,

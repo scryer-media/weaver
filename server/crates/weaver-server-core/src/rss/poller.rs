@@ -17,7 +17,7 @@ pub(super) enum RssSyncTarget {
 }
 
 impl RssService {
-    /// Fetch and filter without recording seen items or submitting downloads.
+    // Fetch and filter without recording seen items or submitting downloads.
     pub async fn preview_feed(
         &self,
         feed_id: u32,
@@ -126,11 +126,11 @@ impl RssService {
         })
     }
 
-    /// How long the poller sleeps before looking again: until the earliest
-    /// enabled feed falls due, and never longer than one tick, so a wall-clock
-    /// jump after a host suspend is noticed. Pauses and an empty feed list
-    /// park the timer; edits and resume transitions wake the loop through
-    /// watch channels.
+    // How long the poller sleeps before looking again: until the earliest
+    // enabled feed falls due, and never longer than one tick, so a wall-clock
+    // jump after a host suspend is noticed. Pauses and an empty feed list
+    // park the timer; edits and resume transitions wake the loop through
+    // watch channels.
     pub(super) fn next_due_sync_delay(&self) -> Option<std::time::Duration> {
         if self.is_scheduled_paused() {
             return None;
@@ -181,11 +181,11 @@ impl RssService {
         }
     }
 
-    /// Fire-and-forget trigger used by the NZBGet `fetchfeeds` facade.
-    ///
-    /// Spawns a background sync and returns immediately. Concurrent callers
-    /// are coalesced: if a sync is already running, this drops the request
-    /// instead of queueing another full indexer sweep behind `sync_lock`.
+    // Fire-and-forget trigger used by the NZBGet `fetchfeeds` facade.
+    //
+    // Spawns a background sync and returns immediately. Concurrent callers
+    // are coalesced: if a sync is already running, this drops the request
+    // instead of queueing another full indexer sweep behind `sync_lock`.
     pub fn request_background_sync(&self) {
         let service = self.clone();
         tokio::spawn(async move {

@@ -8,7 +8,7 @@ use super::runner::JobExecutionContext;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::persistence::{Database, StateError};
 
-/// Applied directives survive process termination independently of runner results.
+// Applied directives survive process termination independently of runner results.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JobScriptEffects {
     pub parameters: BTreeMap<String, String>,
@@ -102,7 +102,7 @@ impl Database {
         Ok(())
     }
 
-    /// Serialises writes to `script_job_state` with the effects cache.
+    // Serialises writes to `script_job_state` with the effects cache.
     pub(crate) fn lock_script_effects_writer(&self) -> std::sync::MutexGuard<'_, ()> {
         self.script_runtime
             .effects_writer
@@ -110,7 +110,7 @@ impl Database {
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    /// Callers hold `lock_script_effects_writer` across the committed write.
+    // Callers hold `lock_script_effects_writer` across the committed write.
     pub(crate) fn cache_script_effects(&self, job_id: u64, effects: JobScriptEffects) {
         if let Some(cache) = self
             .script_runtime

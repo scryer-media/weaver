@@ -1,33 +1,33 @@
-//! Recovery sets authored over a post, and the oracle that says what they can
-//! mend.
-//!
-//! Sets come from the real writers, `par2_rs::create` and `par3_rs::creation`,
-//! over the true bytes of the data files. The oracle counts source blocks in
-//! the writers' own geometry: what a run may leave wrong (an upper bound) and
-//! what it certainly leaves wrong (a lower bound), against the recovery blocks
-//! that survive the post's own damage to its recovery files.
+// Recovery sets authored over a post, and the oracle that says what they can
+// mend.
+//
+// Sets come from the real writers, `par2_rs::create` and `par3_rs::creation`,
+// over the true bytes of the data files. The oracle counts source blocks in
+// the writers' own geometry: what a run may leave wrong (an upper bound) and
+// what it certainly leaves wrong (a lower bound), against the recovery blocks
+// that survive the post's own damage to its recovery files.
 use super::post::{Post, Posted, Role};
 use super::run::Verdict;
 use super::*;
 
-/// How much recovery a set carries against what the post loses.
+// How much recovery a set carries against what the post loses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in super::super) enum Margin {
-    /// Enough and more: a tenth over, at least two blocks, and never under
-    /// the redundancy the set was posted with.
+    // Enough and more: a tenth over, at least two blocks, and never under
+    // the redundancy the set was posted with.
     With,
-    /// Exactly the blocks the worst case needs.
+    // Exactly the blocks the worst case needs.
     Exact,
-    /// One block short of what the post certainly lost.
+    // One block short of what the post certainly lost.
     OneShort,
-    /// One block more than the worst case needs.
+    // One block more than the worst case needs.
     OneOver,
 }
 
 pub(in super::super) const MARGINS: [Margin; 3] = [Margin::With, Margin::Exact, Margin::OneShort];
 
-/// The PAR2 realism family's margins: the three above and the one-block
-/// edge above exact.
+// The PAR2 realism family's margins: the three above and the one-block
+// edge above exact.
 pub(in super::super) const PAR2_MARGINS: [Margin; 4] = [
     Margin::With,
     Margin::OneOver,
@@ -41,17 +41,17 @@ pub(in super::super) enum Code {
     Fft,
 }
 
-/// The geometry a run's recovery set was authored in.
+// The geometry a run's recovery set was authored in.
 #[derive(Clone, Copy, Debug)]
 pub(in super::super) struct Geometry {
-    /// Source block size.
+    // Source block size.
     pub block: usize,
-    /// Small files share tail blocks, so a certain loss cannot be counted
-    /// per file: the lower bound is not used to rule a failure.
+    // Small files share tail blocks, so a certain loss cannot be counted
+    // per file: the lower bound is not used to rule a failure.
     pub packed: bool,
 }
 
-/// Distinct `block`-sized blocks the ranges touch.
+// Distinct `block`-sized blocks the ranges touch.
 fn blocks_touched(ranges: &[Range<usize>], block: usize) -> usize {
     let mut touched = BTreeSet::new();
     for range in ranges {
@@ -65,7 +65,7 @@ fn blocks_touched(ranges: &[Range<usize>], block: usize) -> usize {
     touched.len()
 }
 
-/// Byte ranges of each recovery packet in a PAR2 or PAR3 file.
+// Byte ranges of each recovery packet in a PAR2 or PAR3 file.
 pub(in super::super) fn recovery_packets(bytes: &[u8]) -> Vec<Range<usize>> {
     let mut packets = Vec::new();
     let mut at = 0;
@@ -97,7 +97,7 @@ pub(in super::super) fn recovery_packets(bytes: &[u8]) -> Vec<Range<usize>> {
     packets
 }
 
-/// Source blocks the post may leave wrong and certainly leaves wrong.
+// Source blocks the post may leave wrong and certainly leaves wrong.
 pub(in super::super) fn needed(
     post: &Post,
     geometry: Geometry,
@@ -117,7 +117,7 @@ pub(in super::super) fn needed(
     (upper, lower)
 }
 
-/// Recovery blocks that survive the post: at least and at most.
+// Recovery blocks that survive the post: at least and at most.
 pub(in super::super) fn surviving(
     post: &Post,
     lost: &BTreeMap<usize, BTreeSet<u32>>,
@@ -144,7 +144,7 @@ pub(in super::super) fn surviving(
     (least, most)
 }
 
-/// What a run of `post` must end in, given what its schedule loses.
+// What a run of `post` must end in, given what its schedule loses.
 pub(in super::super) fn verdict(
     post: &Post,
     geometry: Option<Geometry>,
@@ -179,7 +179,7 @@ pub(in super::super) fn verdict(
     }
 }
 
-/// Writes `sources` under a scratch directory, returning it and the paths.
+// Writes `sources` under a scratch directory, returning it and the paths.
 fn scratch_sources(sources: &[(String, Vec<u8>)]) -> (TempDir, PathBuf, Vec<PathBuf>) {
     let scratch = tempfile::tempdir().unwrap();
     let base = scratch.path().join("protected");
@@ -205,19 +205,19 @@ fn read_outputs(paths: &[PathBuf]) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// How a PAR2 set's recovery volumes are cut.
+// How a PAR2 set's recovery volumes are cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in super::super) enum Par2Volumes {
-    /// One recovery volume.
+    // One recovery volume.
     One,
-    /// Volumes that double in size, the exponent scheme posters name
-    /// `vol00+01`, `vol01+02`, `vol03+04`.
+    // Volumes that double in size, the exponent scheme posters name
+    // `vol00+01`, `vol01+02`, `vol03+04`.
     Exponent,
-    /// Equal volumes.
+    // Equal volumes.
     Uniform,
 }
 
-/// A PAR2 set over `sources`: the index first, then its recovery volumes.
+// A PAR2 set over `sources`: the index first, then its recovery volumes.
 pub(in super::super) fn par2_set(
     sources: &[(String, Vec<u8>)],
     slice: usize,
@@ -251,7 +251,7 @@ pub(in super::super) fn par2_set(
     read_outputs(&created.output_paths)
 }
 
-/// A PAR3 set over `sources`: the index first, then its recovery volumes.
+// A PAR3 set over `sources`: the index first, then its recovery volumes.
 pub(in super::super) fn par3_set(
     sources: &[(String, Vec<u8>)],
     block: usize,
@@ -299,8 +299,8 @@ pub(in super::super) fn par3_set(
     written
 }
 
-/// Appends a recovery set's files to the post: the index as an index, the
-/// rest as recovery volumes, each posted in `article`-sized articles.
+// Appends a recovery set's files to the post: the index as an index, the
+// rest as recovery volumes, each posted in `article`-sized articles.
 pub(in super::super) fn post_set(post: &mut Post, set: Vec<(String, Vec<u8>)>, article: usize) {
     for (name, bytes) in set {
         let role = if name.contains(".vol") {
@@ -312,8 +312,8 @@ pub(in super::super) fn post_set(post: &mut Post, set: Vec<(String, Vec<u8>)>, a
     }
 }
 
-/// How many recovery blocks a margin asks for, given what the post needs and
-/// what its damage to the recovery files takes.
+// How many recovery blocks a margin asks for, given what the post needs and
+// what its damage to the recovery files takes.
 pub(in super::super) fn blocks_for(
     margin: Margin,
     (upper, lower): (usize, usize),
@@ -335,7 +335,7 @@ pub(in super::super) fn blocks_for(
     }
 }
 
-/// PAR2 packet types the structure axis rewrites.
+// PAR2 packet types the structure axis rewrites.
 pub(in super::super) mod par2_type {
     pub const MAIN: &[u8; 16] = b"PAR 2.0\0Main\0\0\0\0";
     pub const FILE_DESC: &[u8; 16] = b"PAR 2.0\0FileDesc";
@@ -344,14 +344,14 @@ pub(in super::super) mod par2_type {
     pub const UNICODE_NAME: &[u8; 16] = b"PAR 2.0\0UniFileN";
 }
 
-/// One PAR2 packet in a file: where it is and what it is.
+// One PAR2 packet in a file: where it is and what it is.
 #[derive(Clone, Debug)]
 pub(in super::super) struct Par2Packet {
     pub range: Range<usize>,
     pub kind: [u8; 16],
 }
 
-/// Every well-formed PAR2 packet in `bytes`, in order.
+// Every well-formed PAR2 packet in `bytes`, in order.
 pub(in super::super) fn par2_packets(bytes: &[u8]) -> Vec<Par2Packet> {
     let mut packets = Vec::new();
     let mut at = 0;
@@ -375,8 +375,8 @@ pub(in super::super) fn par2_packets(bytes: &[u8]) -> Vec<Par2Packet> {
     packets
 }
 
-/// A PAR2 packet of `kind` in recovery set `set`, its body padded to four
-/// bytes and its hash computed as the format requires.
+// A PAR2 packet of `kind` in recovery set `set`, its body padded to four
+// bytes and its hash computed as the format requires.
 pub(in super::super) fn par2_packet(set: &[u8], kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
     let mut body = body.to_vec();
     while body.len() % 4 != 0 {
@@ -394,7 +394,7 @@ pub(in super::super) fn par2_packet(set: &[u8], kind: &[u8; 16], body: &[u8]) ->
     packet
 }
 
-/// The recovery set ID every packet in `bytes` carries.
+// The recovery set ID every packet in `bytes` carries.
 pub(in super::super) fn par2_set_id(bytes: &[u8]) -> Vec<u8> {
     let packet = par2_packets(bytes)
         .into_iter()
@@ -403,7 +403,7 @@ pub(in super::super) fn par2_set_id(bytes: &[u8]) -> Vec<u8> {
     bytes[packet.range.start + 32..packet.range.start + 48].to_vec()
 }
 
-/// The file IDs of every FileDesc packet in a PAR2 set.
+// The file IDs of every FileDesc packet in a PAR2 set.
 fn described(set: &[(String, Vec<u8>)]) -> BTreeSet<Vec<u8>> {
     set.iter()
         .flat_map(|(_, bytes)| {
@@ -415,8 +415,8 @@ fn described(set: &[(String, Vec<u8>)]) -> BTreeSet<Vec<u8>> {
         .collect()
 }
 
-/// Whether every file the set describes keeps at least one FileDesc packet
-/// in bytes the post certainly delivers whole.
+// Whether every file the set describes keeps at least one FileDesc packet
+// in bytes the post certainly delivers whole.
 pub(in super::super) fn descriptions_survive(
     post: &Post,
     lost: &BTreeMap<usize, BTreeSet<u32>>,

@@ -11,7 +11,7 @@ use tempfile::Builder;
 const MAX_DEFERRED_FILE_HASH_DATA_BYTES: usize = 128 * 1024 * 1024;
 const OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS: usize = 16;
 const UU_SPOOL_FILE_PREFIX: &str = "part-";
-/// How often one file may report articles arriving that it already holds.
+// How often one file may report articles arriving that it already holds.
 const DUPLICATE_ARRIVAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug)]
@@ -26,8 +26,8 @@ enum OutOfOrderPersistReason {
     GlobalWriteBacklog,
     QuiescentFlush,
     DirectUnpack,
-    /// A demoted volume handed back to the conventional path, whose buffer is
-    /// emptied outright rather than to a threshold.
+    // A demoted volume handed back to the conventional path, whose buffer is
+    // emptied outright rather than to a threshold.
     HandedBackVolume,
 }
 
@@ -43,18 +43,18 @@ impl OutOfOrderPersistReason {
     }
 }
 
-/// Where a uuencode part can go right now.
+// Where a uuencode part can go right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UuPlacement {
-    /// Its prefix is complete; place it at this decoded offset.
+    // Its prefix is complete; place it at this decoded offset.
     Place(u64),
-    /// Its prefix has not arrived; hold it.
+    // Its prefix has not arrived; hold it.
     Park,
-    /// The park is full and this part is the furthest from the cursor. Its
-    /// bytes are dropped and its ordinal goes back to the download queue.
+    // The park is full and this part is the furthest from the cursor. Its
+    // bytes are dropped and its ordinal goes back to the download queue.
     Displaced,
-    /// The cursor already shifted past this ordinal after it was booked failed,
-    /// so its bytes have no home and never will. Dropped terminally.
+    // The cursor already shifted past this ordinal after it was booked failed,
+    // so its bytes have no home and never will. Dropped terminally.
     Stale,
 }
 
@@ -111,11 +111,11 @@ impl Pipeline {
         })
     }
 
-    /// Obfuscated posts routinely name articles (yEnc) differently from both
-    /// the subject-declared filename and the PAR2 canonical name. Once PAR2
-    /// metadata is loaded the recovery set is the naming authority: the yEnc
-    /// name either already matches the canonical name, or the rebind that
-    /// follows completion settles the disagreement.
+    // Obfuscated posts routinely name articles (yEnc) differently from both
+    // the subject-declared filename and the PAR2 canonical name. Once PAR2
+    // metadata is loaded the recovery set is the naming authority: the yEnc
+    // name either already matches the canonical name, or the rebind that
+    // follows completion settles the disagreement.
     pub(crate) fn yenc_name_expected_from_par2_identity(
         &self,
         job_id: JobId,
@@ -495,38 +495,38 @@ impl Pipeline {
         }
     }
 
-    /// Whether this file's completed-file checksum can be produced without the
-    /// streamed MD5 *and* without reading the file back.
-    ///
-    /// The streamed per-file MD5 has exactly one consumer that turns it into a
-    /// decision: PAR2 committed-file evidence, which uses it to bind a finished
-    /// file to a recovery-set description by hash identity and admit it as a
-    /// repair source without a re-read. That consumer has a substitute — the
-    /// contiguous-assembly proof, which pairs the whole-file CRC32 this
-    /// pipeline already composes from part CRCs with a 16 KiB head read — and
-    /// the substitute needs the recovery set's per-slice checksums to derive the
-    /// expected whole-file CRC32 from. A set without them can serve neither the
-    /// substitute nor in-stream block verification, so the streamed hash stays.
-    ///
-    /// No posted `=yend crc32` is required. Two independent CRC alignments
-    /// already adjudicate every assembled byte on this path: the decoder
-    /// verifies each article's yEnc pcrc32, and PAR2 evidence checks the
-    /// recovery set's IFSC CRC32s — in stream on the slice grid, and again as
-    /// the composed whole-file CRC32 the contiguous-assembly proof carries.
-    /// Bytes no slice verdict vouches for are settled by read-back hashing,
-    /// and repair re-derives CRC32 and MD5 over every byte it consumes. The
-    /// aggregate `=yend` CRC is still checked whenever a poster supplies one,
-    /// but multipart posts routinely omit it, and holding the MD5 skip
-    /// hostage to it kept the hash alive on most real downloads.
-    ///
-    /// The whole-file MD5 defends nothing the CRCs leave open: a recovery set
-    /// travels with the payload it describes, so whoever can substitute the
-    /// payload can post a self-consistent set beside it and the MD5
-    /// comparison passes anyway; defending that would take an out-of-band
-    /// trust root no client has. Completing clean downloads on CRC evidence
-    /// is also the ecosystem default — mainstream clients rest on a single
-    /// combined CRC32 equality where this path demands two independent
-    /// alignments agree.
+    // Whether this file's completed-file checksum can be produced without the
+    // streamed MD5 *and* without reading the file back.
+    //
+    // The streamed per-file MD5 has exactly one consumer that turns it into a
+    // decision: PAR2 committed-file evidence, which uses it to bind a finished
+    // file to a recovery-set description by hash identity and admit it as a
+    // repair source without a re-read. That consumer has a substitute — the
+    // contiguous-assembly proof, which pairs the whole-file CRC32 this
+    // pipeline already composes from part CRCs with a 16 KiB head read — and
+    // the substitute needs the recovery set's per-slice checksums to derive the
+    // expected whole-file CRC32 from. A set without them can serve neither the
+    // substitute nor in-stream block verification, so the streamed hash stays.
+    //
+    // No posted `=yend crc32` is required. Two independent CRC alignments
+    // already adjudicate every assembled byte on this path: the decoder
+    // verifies each article's yEnc pcrc32, and PAR2 evidence checks the
+    // recovery set's IFSC CRC32s — in stream on the slice grid, and again as
+    // the composed whole-file CRC32 the contiguous-assembly proof carries.
+    // Bytes no slice verdict vouches for are settled by read-back hashing,
+    // and repair re-derives CRC32 and MD5 over every byte it consumes. The
+    // aggregate `=yend` CRC is still checked whenever a poster supplies one,
+    // but multipart posts routinely omit it, and holding the MD5 skip
+    // hostage to it kept the hash alive on most real downloads.
+    //
+    // The whole-file MD5 defends nothing the CRCs leave open: a recovery set
+    // travels with the payload it describes, so whoever can substitute the
+    // payload can post a self-consistent set beside it and the MD5
+    // comparison passes anyway; defending that would take an out-of-band
+    // trust root no client has. Completing clean downloads on CRC evidence
+    // is also the ecosystem default — mainstream clients rest on a single
+    // combined CRC32 equality where this path demands two independent
+    // alignments agree.
     fn completed_file_md5_substitutable(&self, file_id: NzbFileId) -> bool {
         self.par2_md5_substitution_is_cached(file_id)
     }
@@ -560,33 +560,33 @@ impl Pipeline {
         )
     }
 
-    /// Whether the completed-file MD5 has no consumer, so neither the streamed
-    /// hash nor a read-back has to produce one.
-    ///
-    /// The consumer is PAR2: committed-file evidence binds a finished file to a
-    /// recovery-set description by hash identity. A job with no recovery set
-    /// has nobody to compare a whole-file MD5 against, and that is true
-    /// whatever the file's role — the role only ever stood in for "is this
-    /// likely to end up in front of PAR2", which the recovery set itself
-    /// answers directly. Restricting it to standalone files meant every split
-    /// archive volume in a job with no recovery set was hashed in full on the
-    /// orchestrator task for a value nothing would read.
-    ///
-    /// A recovery set discovered *after* a file settled is handled where it
-    /// always was: this predicate is re-evaluated at finalize, and a set that
-    /// has appeared by then sends the file down the read-back path instead.
+    // Whether the completed-file MD5 has no consumer, so neither the streamed
+    // hash nor a read-back has to produce one.
+    //
+    // The consumer is PAR2: committed-file evidence binds a finished file to a
+    // recovery-set description by hash identity. A job with no recovery set
+    // has nobody to compare a whole-file MD5 against, and that is true
+    // whatever the file's role — the role only ever stood in for "is this
+    // likely to end up in front of PAR2", which the recovery set itself
+    // answers directly. Restricting it to standalone files meant every split
+    // archive volume in a job with no recovery set was hashed in full on the
+    // orchestrator task for a value nothing would read.
+    //
+    // A recovery set discovered *after* a file settled is handled where it
+    // always was: this predicate is re-evaluated at finalize, and a set that
+    // has appeared by then sends the file down the read-back path instead.
     fn can_defer_completed_file_md5(&self, file_id: NzbFileId) -> bool {
         self.par2_set(file_id.job_id).is_none()
     }
 
-    /// Record the whole-file CRC32 a part's trailer claims.
-    ///
-    /// Parts that disagree do not make the download wrong: posters exist that
-    /// write a running checksum, or zeros, on every part but the last. The
-    /// only honest conclusion is that this file has no usable whole-file
-    /// expectation, so the value is dropped and the file is remembered as
-    /// untrusted for the rest of its life. The per-part `pcrc32` is unaffected
-    /// and remains the article-level verdict.
+    // Record the whole-file CRC32 a part's trailer claims.
+    //
+    // Parts that disagree do not make the download wrong: posters exist that
+    // write a running checksum, or zeros, on every part but the last. The
+    // only honest conclusion is that this file has no usable whole-file
+    // expectation, so the value is dropped and the file is remembered as
+    // untrusted for the rest of its life. The per-part `pcrc32` is unaffected
+    // and remains the article-level verdict.
     pub(crate) fn note_expected_file_crc(
         &mut self,
         file_id: NzbFileId,
@@ -868,13 +868,13 @@ impl Pipeline {
         self.publish_active_stage_metrics();
     }
 
-    /// Whether the decode stage holds nothing at all for `job_id`: no decode
-    /// running and none queued behind the decode semaphore.
-    ///
-    /// This is deliberately narrower than
-    /// [`Self::job_has_pending_download_work_beyond_health_probe`] — it asks
-    /// only about the decode stage, and is the cheap gate that decides whether
-    /// a settling decode is worth re-running the download-drain sequence for.
+    // Whether the decode stage holds nothing at all for `job_id`: no decode
+    // running and none queued behind the decode semaphore.
+    //
+    // This is deliberately narrower than
+    // [`Self::job_has_pending_download_work_beyond_health_probe`] — it asks
+    // only about the decode stage, and is the cheap gate that decides whether
+    // a settling decode is worth re-running the download-drain sequence for.
     pub(in crate::pipeline) fn job_decode_stage_drained(&self, job_id: JobId) -> bool {
         self.active_decodes_by_job
             .get(&job_id)
@@ -1224,7 +1224,7 @@ impl Pipeline {
         }
     }
 
-    /// Handle a completed decode — persist the segment, update assembly, journal.
+    // Handle a completed decode — persist the segment, update assembly, journal.
     pub(crate) async fn handle_decode_done(&mut self, result: DecodeDone) {
         let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_done");
 
@@ -1283,15 +1283,15 @@ impl Pipeline {
         }
     }
 
-    /// Handle a decode failure by re-queuing the segment for re-download.
-    ///
-    /// yEnc decode failures (CRC/size mismatch, malformed data) indicate the
-    /// article body was corrupted — either in transit or on the server. The
-    /// segment is re-downloaded with the source server excluded, so the
-    /// retry lands on another server. Once every server has produced a bad
-    /// body (immediately on a one-server setup) or `MAX_SEGMENT_RETRIES`
-    /// decode failures have accrued, the segment is marked permanently
-    /// failed and health is updated so repair can take over.
+    // Handle a decode failure by re-queuing the segment for re-download.
+    //
+    // yEnc decode failures (CRC/size mismatch, malformed data) indicate the
+    // article body was corrupted — either in transit or on the server. The
+    // segment is re-downloaded with the source server excluded, so the
+    // retry lands on another server. Once every server has produced a bad
+    // body (immediately on a one-server setup) or `MAX_SEGMENT_RETRIES`
+    // decode failures have accrued, the segment is marked permanently
+    // failed and health is updated so repair can take over.
     pub(crate) fn handle_decode_failure(
         &mut self,
         segment_id: SegmentId,
@@ -1446,15 +1446,15 @@ impl Pipeline {
         }
     }
 
-    /// Commit a decoded segment, then release any parked parts its arrival
-    /// unblocked: uuencode parts behind the sequential cursor, and yEnc parts
-    /// that could not say where they start.
-    ///
-    /// Sequential assembly means one part's placement can make the next one
-    /// placeable, and that one the next again. Released parts re-enter through
-    /// the same path rather than through a second copy of the commit logic, so
-    /// there is exactly one place where a segment is placed, written and
-    /// accounted for.
+    // Commit a decoded segment, then release any parked parts its arrival
+    // unblocked: uuencode parts behind the sequential cursor, and yEnc parts
+    // that could not say where they start.
+    //
+    // Sequential assembly means one part's placement can make the next one
+    // placeable, and that one the next again. Released parts re-enter through
+    // the same path rather than through a second copy of the commit logic, so
+    // there is exactly one place where a segment is placed, written and
+    // accounted for.
     pub(crate) async fn handle_decode_success(
         &mut self,
         result: DecodeResult,
@@ -2223,13 +2223,13 @@ impl Pipeline {
         .await;
     }
 
-    /// The conventional half of a decoded article: into the file's reorder
-    /// buffer, then out to disk as far as the buffer is contiguous, with the
-    /// write backlog relieved behind it.
-    ///
-    /// `direct_handoff` marks an article direct routing handed back — a set
-    /// that demoted around it, or a placement whose destination write failed —
-    /// whose materialization handoff this seam now settles.
+    // The conventional half of a decoded article: into the file's reorder
+    // buffer, then out to disk as far as the buffer is contiguous, with the
+    // write backlog relieved behind it.
+    //
+    // `direct_handoff` marks an article direct routing handed back — a set
+    // that demoted around it, or a placement whose destination write failed —
+    // whose materialization handoff this seam now settles.
     pub(in crate::pipeline) async fn buffer_decoded_segment_conventionally(
         &mut self,
         segment_id: SegmentId,
@@ -2308,34 +2308,34 @@ impl Pipeline {
         }
     }
 
-    /// Retain the file's first [`crate::pipeline::PAR2_HASH_16K_BYTES`] decoded
-    /// bytes, so an obfuscated file can be bound to its PAR2 description by
-    /// content when its name matches nothing.
-    ///
-    /// # Placement, not durability
-    ///
-    /// This runs at the placement seam rather than at either commit seam, and
-    /// that is deliberate. It is the one point both encodings and both routes
-    /// pass through — conventional assembly, direct-store routing (whose commit
-    /// seam is handed a length, not bytes) and uuencode alike — so one call site
-    /// covers what would otherwise be three, and the direct case is the one the
-    /// binder exists for.
-    ///
-    /// It costs nothing in soundness, because a binding is an **identity**
-    /// question and not a durability claim: it decides which description a
-    /// file's verdicts are measured against, and every claim that asserts
-    /// anything about bytes on disk is gated at its own seam, after its own
-    /// write returned. A prefix captured here and a prefix read back later can
-    /// only disagree if the disk lied, which is the window workstream C's
-    /// post-repair read-back closes and which no binding could have caught.
-    ///
-    /// # Only an offset-0-anchored, contiguous prefix
-    ///
-    /// The buffer grows only from its own end. An article that starts past what
-    /// has been captured is skipped rather than stitched in at its offset —
-    /// a hash over bytes with a hole in them is not the hash of anything, and a
-    /// file whose first article never arrives simply never content-binds, which
-    /// is the correct answer rather than a special case.
+    // Retain the file's first [`crate::pipeline::PAR2_HASH_16K_BYTES`] decoded
+    // bytes, so an obfuscated file can be bound to its PAR2 description by
+    // content when its name matches nothing.
+    //
+    // # Placement, not durability
+    //
+    // This runs at the placement seam rather than at either commit seam, and
+    // that is deliberate. It is the one point both encodings and both routes
+    // pass through — conventional assembly, direct-store routing (whose commit
+    // seam is handed a length, not bytes) and uuencode alike — so one call site
+    // covers what would otherwise be three, and the direct case is the one the
+    // binder exists for.
+    //
+    // It costs nothing in soundness, because a binding is an **identity**
+    // question and not a durability claim: it decides which description a
+    // file's verdicts are measured against, and every claim that asserts
+    // anything about bytes on disk is gated at its own seam, after its own
+    // write returned. A prefix captured here and a prefix read back later can
+    // only disagree if the disk lied, which is the window workstream C's
+    // post-repair read-back closes and which no binding could have caught.
+    //
+    // # Only an offset-0-anchored, contiguous prefix
+    //
+    // The buffer grows only from its own end. An article that starts past what
+    // has been captured is skipped rather than stitched in at its offset —
+    // a hash over bytes with a hole in them is not the hash of anything, and a
+    // file whose first article never arrives simply never content-binds, which
+    // is the correct answer rather than a special case.
     fn note_par2_binding_prefix(
         &mut self,
         file_id: NzbFileId,
@@ -2412,7 +2412,7 @@ impl Pipeline {
         }
     }
 
-    /// Retain the first yEnc size hint for metadata probing, never identity rejection.
+    // Retain the first yEnc size hint for metadata probing, never identity rejection.
     fn note_par2_binding_declared_size(&mut self, file_id: NzbFileId, declared_size: u64) {
         if declared_size == 0 {
             return;
@@ -2422,13 +2422,13 @@ impl Pipeline {
             .or_insert(declared_size);
     }
 
-    /// Retain the name a uuencode `begin` header stated for this file.
-    ///
-    /// First non-empty wins. A well-formed post states it once, and a
-    /// duplicate of that part restates the same thing; if two parts of one file
-    /// somehow disagree, the earlier claim is the one the assembly has already
-    /// been reasoning about, so changing identity mid-file would be the more
-    /// surprising answer.
+    // Retain the name a uuencode `begin` header stated for this file.
+    //
+    // First non-empty wins. A well-formed post states it once, and a
+    // duplicate of that part restates the same thing; if two parts of one file
+    // somehow disagree, the earlier claim is the one the assembly has already
+    // been reasoning about, so changing identity mid-file would be the more
+    // surprising answer.
     fn note_uu_filename(&mut self, file_id: NzbFileId, name: &str) {
         let uu = self.uu_files.entry(file_id).or_default();
         if uu.filename.is_none() {
@@ -2436,11 +2436,11 @@ impl Pipeline {
         }
     }
 
-    /// Decide where a uuencode part goes, or that it cannot go anywhere yet.
-    ///
-    /// Every offset here is a sum of DECODED lengths. No NZB-declared byte
-    /// count participates: those are encoded sizes, and mixing the two units is
-    /// exactly how a uuencode file gets scattered.
+    // Decide where a uuencode part goes, or that it cannot go anywhere yet.
+    //
+    // Every offset here is a sum of DECODED lengths. No NZB-declared byte
+    // count participates: those are encoded sizes, and mixing the two units is
+    // exactly how a uuencode file gets scattered.
     fn place_uu_segment(
         &mut self,
         file_id: NzbFileId,
@@ -2496,14 +2496,14 @@ impl Pipeline {
         UuPlacement::Park
     }
 
-    /// Hold a part that arrived ahead of its prefix, returning any part the
-    /// park had to displace to stay inside its bound.
-    ///
-    /// The displaced part's bytes are dropped here, so the caller **must**
-    /// return its ordinal to the download queue. The download layer already
-    /// considers that segment finished; without a fresh fetch its data exists
-    /// nowhere, and the cursor would wedge permanently the moment it reached
-    /// that ordinal.
+    // Hold a part that arrived ahead of its prefix, returning any part the
+    // park had to displace to stay inside its bound.
+    //
+    // The displaced part's bytes are dropped here, so the caller **must**
+    // return its ordinal to the download queue. The download layer already
+    // considers that segment finished; without a fresh fetch its data exists
+    // nowhere, and the cursor would wedge permanently the moment it reached
+    // that ordinal.
     async fn spill_uu_segment(
         &self,
         file_id: NzbFileId,
@@ -2554,9 +2554,9 @@ impl Pipeline {
         self.release_uu_parked_segment();
     }
 
-    /// Store an ahead-of-cursor part after its memory-or-disk form has been
-    /// fully prepared. Memory is charged only after insertion succeeds; disk
-    /// spill writes complete before their entry becomes visible to the cursor.
+    // Store an ahead-of-cursor part after its memory-or-disk form has been
+    // fully prepared. Memory is charged only after insertion succeeds; disk
+    // spill writes complete before their entry becomes visible to the cursor.
     async fn park_uu_segment(
         &mut self,
         file_id: NzbFileId,
@@ -2623,25 +2623,25 @@ impl Pipeline {
         Ok(displaced)
     }
 
-    /// Return a uuencode segment to the download queue because of park
-    /// pressure, without charging it any retry budget.
-    ///
-    /// Park pressure is an ORDERING condition, not a data condition: the
-    /// segment downloaded and decoded perfectly, it simply arrived too far
-    /// ahead of the cursor to be held. Charging it against
-    /// `MAX_SEGMENT_RETRIES` would let a pathological arrival order manufacture
-    /// permanent file damage out of articles that were never actually bad, so
-    /// this mirrors the zero-burn requeue the 430-exclusion path uses.
-    ///
-    /// The per-segment counter here exists only to bound livelock, and is
-    /// deliberately not the decode-failure counter. It counts displacements
-    /// seen while the file's cursor stood at one ordinal, and starts over once
-    /// the cursor has moved: a part of a long file legitimately bounces many
-    /// times while lanes ahead of the cursor drain, and each of those bounces
-    /// follows cursor progress. Only a run of displacements with no progress
-    /// between them is a cycle, and that is what the bound catches.
-    /// Return a park-displaced segment to the download queue, falling back to
-    /// the counted failure path only if it has been displaced implausibly often.
+    // Return a uuencode segment to the download queue because of park
+    // pressure, without charging it any retry budget.
+    //
+    // Park pressure is an ORDERING condition, not a data condition: the
+    // segment downloaded and decoded perfectly, it simply arrived too far
+    // ahead of the cursor to be held. Charging it against
+    // `MAX_SEGMENT_RETRIES` would let a pathological arrival order manufacture
+    // permanent file damage out of articles that were never actually bad, so
+    // this mirrors the zero-burn requeue the 430-exclusion path uses.
+    //
+    // The per-segment counter here exists only to bound livelock, and is
+    // deliberately not the decode-failure counter. It counts displacements
+    // seen while the file's cursor stood at one ordinal, and starts over once
+    // the cursor has moved: a part of a long file legitimately bounces many
+    // times while lanes ahead of the cursor drain, and each of those bounces
+    // follows cursor progress. Only a run of displacements with no progress
+    // between them is a cycle, and that is what the bound catches.
+    // Return a park-displaced segment to the download queue, falling back to
+    // the counted failure path only if it has been displaced implausibly often.
     fn requeue_displaced_uu_segment(&mut self, segment_id: SegmentId) {
         if self.requeue_uu_segment_for_ordering(segment_id) {
             return;
@@ -2658,16 +2658,16 @@ impl Pipeline {
         );
     }
 
-    /// An article that could not say where it starts, arriving before the
-    /// ordinal it must follow.
-    ///
-    /// The bytes are fine; they simply have nowhere to go yet. They are held,
-    /// decoded, until the predecessor is placed, and released through the same
-    /// commit path the moment it is — so an out-of-order arrival costs memory
-    /// for a while, not another fetch. The hold is bounded by the same soft
-    /// write threshold and per-file part count as the uuencode reorder park, and
-    /// is never spilled: an article that does not fit is asked for again
-    /// instead, without its retry budget.
+    // An article that could not say where it starts, arriving before the
+    // ordinal it must follow.
+    //
+    // The bytes are fine; they simply have nowhere to go yet. They are held,
+    // decoded, until the predecessor is placed, and released through the same
+    // commit path the moment it is — so an out-of-order arrival costs memory
+    // for a while, not another fetch. The hold is bounded by the same soft
+    // write threshold and per-file part count as the uuencode reorder park, and
+    // is never spilled: an article that does not fit is asked for again
+    // instead, without its retry budget.
     fn park_or_requeue_unanchored(&mut self, result: DecodeResult, source: SegmentSource) {
         let segment_id = result.segment_id;
         let file_id = segment_id.file_id;
@@ -2720,10 +2720,10 @@ impl Pipeline {
         );
     }
 
-    /// The parked article that directly follows `predecessor`, once
-    /// `predecessor` has an end for it to start at: a placement, or — once no
-    /// further copy of it is coming — the extent its damaged bytes occupy. A
-    /// part that left neither behind anchors nothing and releases nothing.
+    // The parked article that directly follows `predecessor`, once
+    // `predecessor` has an end for it to start at: a placement, or — once no
+    // further copy of it is coming — the extent its damaged bytes occupy. A
+    // part that left neither behind anchors nothing and releases nothing.
     fn take_unanchored_successor(
         &mut self,
         file_id: NzbFileId,
@@ -2761,9 +2761,9 @@ impl Pipeline {
         Some(entry)
     }
 
-    /// Parked articles that were waiting on `segment_id`, which has just been
-    /// given up. Each of them anchors on the one before it, so the whole run
-    /// after it has lost its only way to be placed.
+    // Parked articles that were waiting on `segment_id`, which has just been
+    // given up. Each of them anchors on the one before it, so the whole run
+    // after it has lost its only way to be placed.
     pub(crate) fn take_unanchored_dependents(&mut self, segment_id: SegmentId) -> Vec<SegmentId> {
         let file_id = segment_id.file_id;
         let Some(parked) = self.unanchored_parked.get_mut(&file_id) else {
@@ -2789,13 +2789,13 @@ impl Pipeline {
         released
     }
 
-    /// Release the articles held behind an ordinal that has just settled for
-    /// good with its damaged bytes left on disk.
-    ///
-    /// The booking that settles an ordinal is not a place where a decoded part
-    /// can be written, so it only notes which ordinals it unblocked; the run
-    /// behind each of them is released here, through the same commit path
-    /// every other part takes, and each part placed anchors the next.
+    // Release the articles held behind an ordinal that has just settled for
+    // good with its damaged bytes left on disk.
+    //
+    // The booking that settles an ordinal is not a place where a decoded part
+    // can be written, so it only notes which ordinals it unblocked; the run
+    // behind each of them is released here, through the same commit path
+    // every other part takes, and each part placed anchors the next.
     pub(crate) async fn release_settled_unanchored_runs(&mut self) {
         while let Some(settled) = self.pending_unanchored_release.pop() {
             let file_id = settled.file_id;
@@ -2807,9 +2807,9 @@ impl Pipeline {
         }
     }
 
-    /// Retire an unanchored article whose predecessor was given up. It is
-    /// booked like any other article that never decoded into a placement, so
-    /// repair accounts for it and the job does not wait on it.
+    // Retire an unanchored article whose predecessor was given up. It is
+    // booked like any other article that never decoded into a placement, so
+    // repair accounts for it and the job does not wait on it.
     pub(crate) fn give_up_unanchored(&mut self, segment_id: SegmentId) {
         warn!(
             segment = %segment_id,
@@ -2822,11 +2822,11 @@ impl Pipeline {
         self.book_terminal_segment(segment_id, SegmentTerminalState::DecodeExhausted);
     }
 
-    /// The fallback when an unanchored article cannot be held: ask for it
-    /// again, without excluding the server that served it and without spending
-    /// its retry budget. The bound counts attempts since the file last placed
-    /// anything, so a long file that is steadily filling in never exhausts it,
-    /// while an article behind an ordinal that never arrives still stops.
+    // The fallback when an unanchored article cannot be held: ask for it
+    // again, without excluding the server that served it and without spending
+    // its retry budget. The bound counts attempts since the file last placed
+    // anything, so a long file that is steadily filling in never exhausts it,
+    // while an article behind an ordinal that never arrives still stops.
     fn requeue_segment_awaiting_predecessor(&mut self, segment_id: SegmentId) {
         const MAX_ANCHOR_REQUEUES: u32 = 8;
 
@@ -2897,9 +2897,9 @@ impl Pipeline {
         true
     }
 
-    /// Queue a segment again exactly as first dispatched: full retry budget,
-    /// no excluded server. Used where an article has to come back for an
-    /// ordering reason rather than because anything was wrong with it.
+    // Queue a segment again exactly as first dispatched: full retry budget,
+    // no excluded server. Used where an article has to come back for an
+    // ordering reason rather than because anything was wrong with it.
     fn push_requeued_segment(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
         let completion_critical = self.segment_is_completion_critical(segment_id);
@@ -2935,13 +2935,13 @@ impl Pipeline {
         true
     }
 
-    /// The next parked part the cursor can release, if any.
-    ///
-    /// Called after a placement advances the cursor. Exactly one part is
-    /// released per call: it goes back through the ordinary placement path,
-    /// which advances the cursor again and so makes the call after it the one
-    /// that finds the next part. That keeps a single place where a segment is
-    /// placed, written and accounted for, however long the released run is.
+    // The next parked part the cursor can release, if any.
+    //
+    // Called after a placement advances the cursor. Exactly one part is
+    // released per call: it goes back through the ordinary placement path,
+    // which advances the cursor again and so makes the call after it the one
+    // that finds the next part. That keeps a single place where a segment is
+    // placed, written and accounted for, however long the released run is.
     async fn take_next_ready_uu_segment(
         &mut self,
         file_id: NzbFileId,
@@ -3013,32 +3013,32 @@ impl Pipeline {
         }
     }
 
-    /// Close out a uuencode file's sequential state and report its condition.
-    ///
-    /// Three things can make a completed uuencode file untrustworthy, and none
-    /// of them is visible to any later stage on its own:
-    ///
-    /// - a part decoded with a bad line,
-    /// - a part never arrived and the file was shifted to close the gap, so
-    ///   everything past the hole is misaligned rather than merely missing,
-    /// - the `end` marker never appeared, meaning the post itself was truncated
-    ///   even though every ordinal the NZB listed did arrive.
-    ///
-    /// None of these can be caught downstream the way a yEnc CRC mismatch is,
-    /// because uuencode ships no checksum. Every uuencode segment is already
-    /// committed with `part_crc_verified: false`, so the file can never claim a
-    /// fast-path verification and always faces a real read; this records *why*
-    /// so the reason survives into the log rather than being inferred.
-    ///
-    /// Returns the name the file's `begin` header stated, for the identity seam
-    /// that runs just after this — a uuencode file's name arrives on the part
-    /// that opened the body, which is not the part that finishes it.
-    ///
-    /// The entry is left in place as a tombstone rather than removed: parked
-    /// bytes are released, but the fact that this file is uuencode has to
-    /// outlive completion so the restart-checkpoint suppression in
-    /// [`Self::note_file_progress_floor`] still holds for the file's final
-    /// write. Teardown drops it with the rest of the job's per-file state.
+    // Close out a uuencode file's sequential state and report its condition.
+    //
+    // Three things can make a completed uuencode file untrustworthy, and none
+    // of them is visible to any later stage on its own:
+    //
+    // - a part decoded with a bad line,
+    // - a part never arrived and the file was shifted to close the gap, so
+    //   everything past the hole is misaligned rather than merely missing,
+    // - the `end` marker never appeared, meaning the post itself was truncated
+    //   even though every ordinal the NZB listed did arrive.
+    //
+    // None of these can be caught downstream the way a yEnc CRC mismatch is,
+    // because uuencode ships no checksum. Every uuencode segment is already
+    // committed with `part_crc_verified: false`, so the file can never claim a
+    // fast-path verification and always faces a real read; this records *why*
+    // so the reason survives into the log rather than being inferred.
+    //
+    // Returns the name the file's `begin` header stated, for the identity seam
+    // that runs just after this — a uuencode file's name arrives on the part
+    // that opened the body, which is not the part that finishes it.
+    //
+    // The entry is left in place as a tombstone rather than removed: parked
+    // bytes are released, but the fact that this file is uuencode has to
+    // outlive completion so the restart-checkpoint suppression in
+    // [`Self::note_file_progress_floor`] still holds for the file's final
+    // write. Teardown drops it with the rest of the job's per-file state.
     fn finish_uu_file(&mut self, file_id: NzbFileId) -> Option<String> {
         self.uu_park_requeues
             .retain(|segment_id, _| segment_id.file_id != file_id);
@@ -3134,8 +3134,8 @@ impl Pipeline {
         }
     }
 
-    /// Reconcile damage at handoff, after any demotion reset. Protect both
-    /// durable ownership and accepted writes still waiting in this batch/buffer.
+    // Reconcile damage at handoff, after any demotion reset. Protect both
+    // durable ownership and accepted writes still waiting in this batch/buffer.
     fn prepare_damaged_writes(
         &self,
         file_id: NzbFileId,
@@ -3333,16 +3333,16 @@ impl Pipeline {
         }
     }
 
-    /// Empty a file's write buffer outright, whatever its pending thresholds
-    /// say.
-    ///
-    /// The threshold drains exist to bound memory while a file is still
-    /// arriving, and they deliberately leave a small buffer alone. A volume a
-    /// demotion sweep has just handed back is not still arriving on that path:
-    /// what it accepted and did not persist is bytes no durable floor accounts
-    /// for, and a file resting in "accepted but not durable" is exactly what
-    /// leaves the materialization gate holding an owner nothing clears. So its
-    /// buffer is emptied, not trimmed.
+    // Empty a file's write buffer outright, whatever its pending thresholds
+    // say.
+    //
+    // The threshold drains exist to bound memory while a file is still
+    // arriving, and they deliberately leave a small buffer alone. A volume a
+    // demotion sweep has just handed back is not still arriving on that path:
+    // what it accepted and did not persist is bytes no durable floor accounts
+    // for, and a file resting in "accepted but not durable" is exactly what
+    // leaves the materialization gate holding an owner nothing clears. So its
+    // buffer is emptied, not trimmed.
     async fn drain_file_write_buffer(
         &mut self,
         file_id: NzbFileId,
@@ -3378,16 +3378,16 @@ impl Pipeline {
             .await
     }
 
-    /// Spill the write backlog off the hard-pressure latch without waiting
-    /// for a decode landing.
-    ///
-    /// The landing path's relief runs only when an article lands, and under
-    /// a hard latch none does: dispatch is stopped until the backlog falls
-    /// below the soft limit, while the landing relief stops at the budget.
-    /// Bytes left between the two limits by the last landing, or parked for a
-    /// demotion sweep and handed back after it, would otherwise sit there with
-    /// nothing to move them. Runs from the tune tick and from the sweep
-    /// handback, and wakes dispatch once the latch is gone.
+    // Spill the write backlog off the hard-pressure latch without waiting
+    // for a decode landing.
+    //
+    // The landing path's relief runs only when an article lands, and under
+    // a hard latch none does: dispatch is stopped until the backlog falls
+    // below the soft limit, while the landing relief stops at the budget.
+    // Bytes left between the two limits by the last landing, or parked for a
+    // demotion sweep and handed back after it, would otherwise sit there with
+    // nothing to move them. Runs from the tune tick and from the sweep
+    // handback, and wakes dispatch once the latch is gone.
     pub(crate) async fn relieve_latched_write_backlog(&mut self) {
         if !self.download_write_hard_pressure_latched {
             return;
@@ -3403,13 +3403,13 @@ impl Pipeline {
         }
     }
 
-    /// Spill the articles a demotion sweep parked, now that the files are
-    /// ordinary again.
-    ///
-    /// The handback drained what was contiguous; whatever landed out of order
-    /// while the sweep owned the files is still resident, and the per-file and
-    /// global relief both skipped these files for as long as it ran. The hold
-    /// on their queued work lifts here too, so dispatch is owed a pass.
+    // Spill the articles a demotion sweep parked, now that the files are
+    // ordinary again.
+    //
+    // The handback drained what was contiguous; whatever landed out of order
+    // while the sweep owned the files is still resident, and the per-file and
+    // global relief both skipped these files for as long as it ran. The hold
+    // on their queued work lifts here too, so dispatch is owed a pass.
     pub(crate) async fn relieve_handed_back_write_backlog(&mut self, volume_files: &[NzbFileId]) {
         for file_id in volume_files {
             if let Err(error) = self.drain_file_write_buffer(*file_id).await {
@@ -3564,18 +3564,18 @@ impl Pipeline {
         Ok(())
     }
 
-    /// The file's write reorder buffer, created on demand and positioned for
-    /// the article about to be inserted.
-    ///
-    /// Every insert goes through here for one reason: a file that resumed
-    /// after a restart already holds its leading parts on disk and never
-    /// fetches them again, so a buffer whose cursor started at zero would
-    /// never release anything in order. Its bytes would only ever reach disk
-    /// through backlog eviction, whose out-of-order writes record no contiguous
-    /// coverage — and the contiguous coverage is what the file's durable floor,
-    /// and with it the restart guard's lead, is made of. The offset where the
-    /// resumed prefix ends is knowable only from the part that directly follows
-    /// it, so the buffer adopts that part's offset the first time it decodes.
+    // The file's write reorder buffer, created on demand and positioned for
+    // the article about to be inserted.
+    //
+    // Every insert goes through here for one reason: a file that resumed
+    // after a restart already holds its leading parts on disk and never
+    // fetches them again, so a buffer whose cursor started at zero would
+    // never release anything in order. Its bytes would only ever reach disk
+    // through backlog eviction, whose out-of-order writes record no contiguous
+    // coverage — and the contiguous coverage is what the file's durable floor,
+    // and with it the restart guard's lead, is made of. The offset where the
+    // resumed prefix ends is knowable only from the part that directly follows
+    // it, so the buffer adopts that part's offset the first time it decodes.
     pub(in crate::pipeline) fn write_buffer_for_article(
         &mut self,
         file_id: NzbFileId,
@@ -4358,8 +4358,8 @@ impl Pipeline {
     }
 }
 
-/// Every whole-file checksum read, by path, so a test can count how many
-/// times a completed file was read back.
+// Every whole-file checksum read, by path, so a test can count how many
+// times a completed file was read back.
 #[cfg(test)]
 static COMPLETED_FILE_CHECKSUM_READS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
@@ -4367,7 +4367,7 @@ static COMPLETED_FILE_CHECKSUM_READS: std::sync::LazyLock<
 
 #[cfg(test)]
 impl Pipeline {
-    /// How many whole-file checksum reads `path` has had in this process.
+    // How many whole-file checksum reads `path` has had in this process.
     pub(in crate::pipeline) fn completed_file_checksum_reads(path: &std::path::Path) -> usize {
         COMPLETED_FILE_CHECKSUM_READS
             .lock()

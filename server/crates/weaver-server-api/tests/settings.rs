@@ -687,9 +687,9 @@ async fn a_profile_the_machine_cannot_honour_is_refused_by_name() {
     assert!(h.db.load_config().unwrap().hardware_profile.is_none());
 }
 
-/// A choice saved on a machine that could honour it, read back on one that no
-/// longer can, is not what runs: startup falls back to the recommendation, and
-/// the answer says so rather than naming a profile it does not offer.
+// A choice saved on a machine that could honour it, read back on one that no
+// longer can, is not what runs: startup falls back to the recommendation, and
+// the answer says so rather than naming a profile it does not offer.
 #[tokio::test]
 async fn a_saved_profile_the_machine_can_no_longer_honour_reads_as_not_chosen() {
     let h = TestHarness::new().await;

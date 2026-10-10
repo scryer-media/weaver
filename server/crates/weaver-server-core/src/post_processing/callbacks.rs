@@ -1,10 +1,10 @@
-//! What a running script may ask of weaver through the API.
-//!
-//! Every run is handed a token that is good for as long as that run lasts and
-//! no longer. What the script asks for with it is the vocabulary of the
-//! `[NZB]` commands it may print, held to the same allow-list and applied by
-//! the same code: whatever is reading the script's output also takes these
-//! requests, one at a time, in the order they arrive.
+// What a running script may ask of weaver through the API.
+//
+// Every run is handed a token that is good for as long as that run lasts and
+// no longer. What the script asks for with it is the vocabulary of the
+// `[NZB]` commands it may print, held to the same allow-list and applied by
+// the same code: whatever is reading the script's output also takes these
+// requests, one at a time, in the order they arrive.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -20,32 +20,32 @@ use crate::auth::service::{
     ScriptRunClaims, create_script_run_jwt, is_script_run_token_shape, verify_script_run_jwt,
 };
 
-/// Requests of one run that may wait to be taken.
+// Requests of one run that may wait to be taken.
 const WAITING_REQUESTS: usize = 16;
-/// How far past the end of its own time limit a run's token is dated. The run
-/// ending is what ends the token; the date only bounds a token that outlives
-/// the process that issued it.
+// How far past the end of its own time limit a run's token is dated. The run
+// ending is what ends the token; the date only bounds a token that outlives
+// the process that issued it.
 const TOKEN_MARGIN: Duration = Duration::from_secs(5 * 60);
-/// The date on the token of a run that has no time limit.
+// The date on the token of a run that has no time limit.
 const UNLIMITED_RUN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// The longest text one `log` request may carry.
+// The longest text one `log` request may carry.
 pub const MAX_LOG_TEXT_BYTES: usize = 8 * 1024;
-/// The longest reason one `fail` request may carry.
+// The longest reason one `fail` request may carry.
 pub const MAX_FAIL_REASON_BYTES: usize = 1024;
 
-/// One thing a running script asked for.
+// One thing a running script asked for.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum RunAction {
-    /// A command, as `[NZB]` would have carried it.
+    // A command, as `[NZB]` would have carried it.
     Command(Directive),
-    /// A line for the run's log.
+    // A line for the run's log.
     Log { level: ScriptLogLevel, text: String },
-    /// End the run as failed, whatever the script goes on to exit with.
+    // End the run as failed, whatever the script goes on to exit with.
     Fail(String),
 }
 
 impl RunAction {
-    /// Whether a run for `event` may ask for this at all.
+    // Whether a run for `event` may ask for this at all.
     pub fn check(&self, event: &ScriptEventLabel) -> Result<(), RunActionError> {
         match self {
             Self::Command(directive) => {
@@ -81,12 +81,12 @@ impl RunAction {
     }
 }
 
-/// Why a script did not get what it asked for.
+// Why a script did not get what it asked for.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum RunActionError {
     #[error("the script run has ended")]
     Ended,
-    /// The run's trigger does not allow the command.
+    // The run's trigger does not allow the command.
     #[error("{0}")]
     NotAllowed(String),
     #[error("{0}")]
@@ -97,35 +97,35 @@ fn ended() -> String {
     RunActionError::Ended.to_string()
 }
 
-/// A script run that is going on now.
+// A script run that is going on now.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LiveScriptRun {
     pub run_id: String,
     pub instance_id: String,
     pub instance_name: String,
-    /// The download the run is about, when it is about one.
+    // The download the run is about, when it is about one.
     pub job_id: Option<u64>,
     pub event: ScriptEventLabel,
-    /// A test run: what it asks for is reported and never applied.
+    // A test run: what it asks for is reported and never applied.
     pub test: bool,
 }
 
-/// A request on its way to the run it is for.
+// A request on its way to the run it is for.
 pub struct RunRequest {
     pub action: RunAction,
-    /// Answered once the request has been dealt with. Dropping it tells the
-    /// script the run has ended.
+    // Answered once the request has been dealt with. Dropping it tells the
+    // script the run has ended.
     pub reply: oneshot::Sender<Result<(), String>>,
 }
 
 struct Registered {
     run: LiveScriptRun,
     requests: mpsc::Sender<RunRequest>,
-    /// Takes the run's secrets out of what the script sends.
+    // Takes the run's secrets out of what the script sends.
     output: OutputInjector,
 }
 
-/// The runs going on now, and where their scripts reach this server.
+// The runs going on now, and where their scripts reach this server.
 #[derive(Default)]
 pub(crate) struct LiveRuns {
     runs: Mutex<HashMap<String, Registered>>,
@@ -145,13 +145,13 @@ impl LiveRuns {
     }
 }
 
-/// A run's place among the live runs, and what its script asks for while it
-/// holds that place. Dropping it ends the run's token.
+// A run's place among the live runs, and what its script asks for while it
+// holds that place. Dropping it ends the run's token.
 pub struct RunRequests {
     live: Arc<LiveRuns>,
     run_id: String,
-    /// False when another run already held this id: this one was never put
-    /// among the live runs, and so must not take that one out of them.
+    // False when another run already held this id: this one was never put
+    // among the live runs, and so must not take that one out of them.
     registered: bool,
     receiver: mpsc::Receiver<RunRequest>,
     output: OutputInjector,
@@ -159,8 +159,8 @@ pub struct RunRequests {
 }
 
 impl RunRequests {
-    /// The next thing the script asks for. Never resolves when it asks for
-    /// nothing more.
+    // The next thing the script asks for. Never resolves when it asks for
+    // nothing more.
     pub async fn next(&mut self) -> RunRequest {
         match self.receiver.recv().await {
             Some(request) => request,
@@ -169,8 +169,8 @@ impl RunRequests {
         }
     }
 
-    /// Take a line the script logged. It joins the run's output, and comes
-    /// back with the run's secrets taken out for whatever else records it.
+    // Take a line the script logged. It joins the run's output, and comes
+    // back with the run's secrets taken out for whatever else records it.
     pub(crate) fn log(&self, text: &str) -> Result<String, String> {
         let text = self.output.redact(text).ok_or_else(ended)?;
         if !self.output.push(&text) {
@@ -179,19 +179,19 @@ impl RunRequests {
         Ok(text)
     }
 
-    /// Take the script's word that it failed.
+    // Take the script's word that it failed.
     pub(crate) fn fail(&mut self, reason: &str) -> Result<(), String> {
         self.failure = Some(self.output.redact(reason).ok_or_else(ended)?);
         Ok(())
     }
 
-    /// The reason the script gave for failing, when it gave one.
+    // The reason the script gave for failing, when it gave one.
     pub(crate) fn failure(&self) -> Option<&str> {
         self.failure.as_deref()
     }
 
-    /// Count the script's own word that it failed into how its run came out.
-    /// A run that was stopped is still reported as stopped.
+    // Count the script's own word that it failed into how its run came out.
+    // A run that was stopped is still reported as stopped.
     pub(crate) fn settle(&self, result: &mut ScriptExecutionResult) {
         if let Some(reason) = self.failure()
             && matches!(
@@ -216,8 +216,8 @@ impl Drop for RunRequests {
 }
 
 impl Database {
-    /// Where scripts reach this server's API. Set by the server once it is
-    /// listening; until then runs are handed no address and no token.
+    // Where scripts reach this server's API. Set by the server once it is
+    // listening; until then runs are handed no address and no token.
     pub fn set_script_api_url(&self, url: impl Into<String>) {
         *self
             .script_runtime
@@ -227,11 +227,11 @@ impl Database {
             .unwrap_or_else(|error| error.into_inner()) = Some(url.into());
     }
 
-    /// Put a run among the live runs and tell `identity` how its script may
-    /// call back. `time_limit` is how long the run is allowed to last.
-    ///
-    /// Whoever holds what this returns is the run: it must take what the
-    /// script asks for, and the run is over when it lets go.
+    // Put a run among the live runs and tell `identity` how its script may
+    // call back. `time_limit` is how long the run is allowed to last.
+    //
+    // Whoever holds what this returns is the run: it must take what the
+    // script asks for, and the run is over when it lets go.
     #[doc(hidden)]
     pub fn open_script_run(
         &self,
@@ -307,7 +307,7 @@ impl Database {
         }
     }
 
-    /// The live run `run_id`, or `None` once it has ended.
+    // The live run `run_id`, or `None` once it has ended.
     pub fn live_script_run(&self, run_id: &str) -> Option<LiveScriptRun> {
         self.script_runtime
             .live
@@ -316,8 +316,8 @@ impl Database {
             .map(|registered| registered.run.clone())
     }
 
-    /// The run `token` was issued to, when that run is still going on. A token
-    /// is worth nothing once its run has ended, whatever date it carries.
+    // The run `token` was issued to, when that run is still going on. A token
+    // is worth nothing once its run has ended, whatever date it carries.
     pub fn script_run_for_token(&self, token: &str) -> Option<LiveScriptRun> {
         if !is_script_run_token_shape(token) {
             return None;
@@ -328,7 +328,7 @@ impl Database {
         (run.instance_id == claims.instance_id && run.job_id == claims.job_id).then_some(run)
     }
 
-    /// Hand `action` to the live run `run_id` and wait for what came of it.
+    // Hand `action` to the live run `run_id` and wait for what came of it.
     pub async fn script_run_action(
         &self,
         run_id: &str,

@@ -171,11 +171,11 @@ async fn recovered_batch_tries_unsent_articles_before_leaving_the_provider() {
     server.await.unwrap();
 }
 
-/// A server that has been re-enabled but still owes a recovery probe refuses
-/// extra connections through the recovery gate, not through the permit
-/// semaphore. The two must answer differently: this one happens with every
-/// permit free and every socket idle, and calling it saturation sends the
-/// reader hunting a permit leak that does not exist.
+// A server that has been re-enabled but still owes a recovery probe refuses
+// extra connections through the recovery gate, not through the permit
+// semaphore. The two must answer differently: this one happens with every
+// permit free and every socket idle, and calling it saturation sends the
+// reader hunting a permit leak that does not exist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_recovery_gate_refusal_is_not_capacity_saturation() {
     let client = NntpClient::new(NntpClientConfig {
@@ -235,7 +235,7 @@ async fn a_recovery_gate_refusal_is_not_capacity_saturation() {
         .expect("a recovered server takes warm dials again");
 }
 
-/// The label the refusal travels under is the whole point of the variant.
+// The label the refusal travels under is the whole point of the variant.
 #[test]
 fn a_recovery_refusal_reports_its_own_kind() {
     use crate::client::BlockingBodyLaneAcquireError;

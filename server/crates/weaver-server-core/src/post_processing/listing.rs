@@ -1,8 +1,8 @@
-//! Live listing of the configured scripts directory.
-//!
-//! Nothing here is persisted: a script is whatever is in the directory when the
-//! listing runs, which is also when execution resolves it. Editing or renaming a
-//! script is editing or renaming a script.
+// Live listing of the configured scripts directory.
+//
+// Nothing here is persisted: a script is whatever is in the directory when the
+// listing runs, which is also when execution resolves it. Editing or renaming a
+// script is editing or renaming a script.
 
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -16,23 +16,23 @@ use super::model::{PostProcessingValidationError, ScriptAdapter, ScriptManifest,
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
-/// A script that is present and parseable right now.
+// A script that is present and parseable right now.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DiscoveredScript {
     pub name: ScriptName,
-    /// Package directory for a manifest package, or the scripts directory for a bare script.
+    // Package directory for a manifest package, or the scripts directory for a bare script.
     pub root: PathBuf,
     pub manifest: ScriptManifest,
 }
 
-/// Something in the scripts directory that could not be listed, surfaced instead of hidden.
+// Something in the scripts directory that could not be listed, surfaced instead of hidden.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ScriptProblem {
     pub name: String,
     pub message: String,
 }
 
-/// Everything the scripts directory currently offers.
+// Everything the scripts directory currently offers.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct ScriptListing {
     pub scripts: Vec<DiscoveredScript>,
@@ -51,7 +51,7 @@ pub enum ListingError {
     Io(#[from] io::Error),
 }
 
-/// List every script under `root`, creating it when absent.
+// List every script under `root`, creating it when absent.
 pub fn list_scripts(root: &Path) -> Result<ScriptListing, ListingError> {
     if !root.exists() {
         fs::create_dir_all(root)?;
@@ -111,7 +111,7 @@ pub fn list_scripts(root: &Path) -> Result<ScriptListing, ListingError> {
     Ok(listing)
 }
 
-/// Resolve one script by name at execution time.
+// Resolve one script by name at execution time.
 pub fn resolve_script(root: &Path, name: &ScriptName) -> Result<DiscoveredScript, ListingError> {
     let path = root.join(name.as_str());
     let metadata =
@@ -181,9 +181,9 @@ fn read_bare_script(
     })
 }
 
-/// A regular file counts as a script when it carries a known script extension or
-/// the executable bit, which is what both oracles list. A Go source file is
-/// weaver's own addition to the extensions.
+// A regular file counts as a script when it carries a known script extension or
+// the executable bit, which is what both oracles list. A Go source file is
+// weaver's own addition to the extensions.
 fn is_bare_script_candidate(path: &Path, metadata: &fs::Metadata) -> bool {
     let known_extension = path
         .extension()

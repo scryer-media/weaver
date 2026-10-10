@@ -1,23 +1,23 @@
-//! The boundary between Weaver's upgrade errors and the shared upgrade core.
-//!
-//! Weaver's own [`crate::error::Error`] covers configuration and I/O, which is
-//! not the shape an upgrade fails in: the three outcomes that matter to the API
-//! are "the request was wrong", "the machine was wrong", and "there is nothing
-//! there". Those are exactly the shared core's non-host variants, so this type
-//! maps onto them one-for-one and a host error that travels through an injected
-//! seam comes back as the very same variant and message it left as.
+// The boundary between Weaver's upgrade errors and the shared upgrade core.
+//
+// Weaver's own [`crate::error::Error`] covers configuration and I/O, which is
+// not the shape an upgrade fails in: the three outcomes that matter to the API
+// are "the request was wrong", "the machine was wrong", and "there is nothing
+// there". Those are exactly the shared core's non-host variants, so this type
+// maps onto them one-for-one and a host error that travels through an injected
+// seam comes back as the very same variant and message it left as.
 
-/// Why an in-application upgrade could not proceed.
+// Why an in-application upgrade could not proceed.
 #[derive(Debug, thiserror::Error)]
 pub enum ApplicationUpgradeError {
-    /// The request, the manifest or the installation is not acceptable. Maps to
-    /// a client error on the API surface.
+    // The request, the manifest or the installation is not acceptable. Maps to
+    // a client error on the API surface.
     #[error("{0}")]
     Validation(String),
-    /// The machine, the network or the filesystem let us down.
+    // The machine, the network or the filesystem let us down.
     #[error("{0}")]
     Repository(String),
-    /// A release asset or a run that should exist does not.
+    // A release asset or a run that should exist does not.
     #[error("{0}")]
     NotFound(String),
 }
@@ -25,7 +25,7 @@ pub enum ApplicationUpgradeError {
 pub type ApplicationUpgradeResult<T> = Result<T, ApplicationUpgradeError>;
 
 impl ApplicationUpgradeError {
-    /// The stable snake_case code the API reports alongside the message.
+    // The stable snake_case code the API reports alongside the message.
     pub fn code(&self) -> &'static str {
         match self {
             Self::Validation(_) => "validation",
@@ -35,12 +35,12 @@ impl ApplicationUpgradeError {
     }
 }
 
-/// Wrap an upgrade error so it can travel through the shared core unchanged.
+// Wrap an upgrade error so it can travel through the shared core unchanged.
 pub fn to_updater_error(error: ApplicationUpgradeError) -> application_updater::Error {
     application_updater::Error::host(error)
 }
 
-/// Map a shared-core error onto the upgrade error it is reported as.
+// Map a shared-core error onto the upgrade error it is reported as.
 pub fn map_updater_error(error: application_updater::Error) -> ApplicationUpgradeError {
     match error {
         application_updater::Error::Validation(message) => {

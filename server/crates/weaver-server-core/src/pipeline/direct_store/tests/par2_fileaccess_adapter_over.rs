@@ -1,16 +1,16 @@
-//! The PAR2 `FileAccess` adapter over virtual volumes
-//! Restart primitives — the pieces the end-to-end restart tests exercise only in
-//! The restart gate re-arm, over a router rebuilt from cached facts
-//! The holds scratch and its region index
-//! Damage accounting over an interior hole
-//! CRC composition under repair
-//! The ordering rule, and what a crash in its window costs
-//! What the repair is sized from
-//! Sparse marking
-//! Snapshot schema 4: the crypt row
-//! The member tolerance's kind gate
-//! What a demoted set's consumers need under it
-//! A cipher block straddling a held neighbour
+// The PAR2 `FileAccess` adapter over virtual volumes
+// Restart primitives — the pieces the end-to-end restart tests exercise only in
+// The restart gate re-arm, over a router rebuilt from cached facts
+// The holds scratch and its region index
+// Damage accounting over an interior hole
+// CRC composition under repair
+// The ordering rule, and what a crash in its window costs
+// What the repair is sized from
+// Sparse marking
+// Snapshot schema 4: the crypt row
+// The member tolerance's kind gate
+// What a demoted set's consumers need under it
+// A cipher block straddling a held neighbour
 
 use super::*;
 
@@ -812,11 +812,11 @@ fn holds_scratch_compaction_refuses_extents_it_cannot_pack_safely() {
     );
 }
 
-/// A provider that reads holds from the scratch on demand keeps offsets past
-/// the call that handed them out, and compaction is the one thing that moves
-/// a region. Under a pin it packs into a fresh image instead, so the pinned
-/// reader's offsets stay true for the image it holds while the router goes on
-/// with the packed copy at the same path.
+// A provider that reads holds from the scratch on demand keeps offsets past
+// the call that handed them out, and compaction is the one thing that moves
+// a region. Under a pin it packs into a fresh image instead, so the pinned
+// reader's offsets stay true for the image it holds while the router goes on
+// with the packed copy at the same path.
 #[test]
 fn a_pinned_scratch_compacts_into_a_fresh_image_and_the_pin_keeps_the_old_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -891,10 +891,10 @@ fn dropping_the_last_pin_unpins_the_scratch() {
     assert!(!scratch.is_pinned());
 }
 
-/// A retained provider can outlive the set: finalization and demotion both
-/// discard the scratch, and a pin must keep its bytes readable through that.
-/// The handle does the keeping; the path is gone. Unix only, where an unlinked
-/// file stays readable through an open handle by contract.
+// A retained provider can outlive the set: finalization and demotion both
+// discard the scratch, and a pin must keep its bytes readable through that.
+// The handle does the keeping; the path is gone. Unix only, where an unlinked
+// file stays readable through an open handle by contract.
 #[cfg(unix)]
 #[test]
 fn a_pin_reads_through_a_discard() {
@@ -2049,18 +2049,18 @@ fn every_older_schema_is_refused_rather_than_read_as_something_it_is_not() {
     ));
 }
 
-/// A member name direct finalization records must be one completion can resolve
-/// back to a file on disk.
-///
-/// RAR4 writes paths with `\` separators. The destination is derived through
-/// `resolve_member_path`, which rewrites those to `/`, so recording the raw
-/// archive name left the two disagreeing: completion looked for
-/// `work\sample.mkv` under the working directory, found nothing, treated the
-/// member as a stale extracted record and re-ran conventional extraction, which
-/// failed with "no on-disk RAR volumes" — direct finalization having correctly
-/// never written any. Only a member with a directory component shows it; a flat
-/// name has no separator to disagree about, which is why one RAR4 fixture failed
-/// while its multi-member sibling passed.
+// A member name direct finalization records must be one completion can resolve
+// back to a file on disk.
+//
+// RAR4 writes paths with `\` separators. The destination is derived through
+// `resolve_member_path`, which rewrites those to `/`, so recording the raw
+// archive name left the two disagreeing: completion looked for
+// `work\sample.mkv` under the working directory, found nothing, treated the
+// member as a stale extracted record and re-ran conventional extraction, which
+// failed with "no on-disk RAR volumes" — direct finalization having correctly
+// never written any. Only a member with a directory component shows it; a flat
+// name has no separator to disagree about, which is why one RAR4 fixture failed
+// while its multi-member sibling passed.
 #[test]
 fn a_rar4_member_name_records_under_the_path_it_was_written_to() {
     let raw = r"work\sample.mkv";
@@ -2088,15 +2088,15 @@ fn a_rar4_member_name_records_under_the_path_it_was_written_to() {
 // The member tolerance's kind gate
 // ---------------------------------------------------------------------------
 
-/// Every `IneligibilityReason` classified once, exhaustively, so adding a
-/// variant to the library lands here as a decision rather than as a silent
-/// default.
-///
-/// Size is deliberately absent from the inputs: the tolerance carries a shape
-/// it can stream-extract whatever that member weighs, and refuses a shape it
-/// cannot however small it is. The sizes below are the ones the retired
-/// `min(64 MiB, 1% of packed archive bytes)` / 256 MiB ceilings would have
-/// demoted on, and none of them changes an answer.
+// Every `IneligibilityReason` classified once, exhaustively, so adding a
+// variant to the library lands here as a decision rather than as a silent
+// default.
+//
+// Size is deliberately absent from the inputs: the tolerance carries a shape
+// it can stream-extract whatever that member weighs, and refuses a shape it
+// cannot however small it is. The sizes below are the ones the retired
+// `min(64 MiB, 1% of packed archive bytes)` / 256 MiB ceilings would have
+// demoted on, and none of them changes an answer.
 #[test]
 fn the_member_tolerance_gates_on_shape_and_never_on_size() {
     use super::super::router::member_shape_is_tolerable;
@@ -2184,14 +2184,14 @@ fn the_member_tolerance_gates_on_shape_and_never_on_size() {
 // What a demoted set's consumers need under it
 // ---------------------------------------------------------------------------
 
-/// Every [`DemotionReason`] classified once, exhaustively, into "the virtual
-/// volumes are still a truthful image" and "real files are required".
-///
-/// The list is written out variant by variant rather than derived, because
-/// deriving it is exactly the mistake: a reason added later must arrive here as
-/// a decision. `metric()` is the exhaustiveness witness — a new variant fails to
-/// compile there, and the count assertion below fails if one is added to the
-/// enum without being added to this table.
+// Every [`DemotionReason`] classified once, exhaustively, into "the virtual
+// volumes are still a truthful image" and "real files are required".
+//
+// The list is written out variant by variant rather than derived, because
+// deriving it is exactly the mistake: a reason added later must arrive here as
+// a decision. `metric()` is the exhaustiveness witness — a new variant fails to
+// compile there, and the count assertion below fails if one is added to the
+// enum without being added to this table.
 #[test]
 fn every_demotion_reason_states_what_its_consumers_need() {
     use super::super::router::crypt::{CryptRefusal, HeaderCryptRefusal};
@@ -2302,9 +2302,9 @@ fn every_demotion_reason_states_what_its_consumers_need() {
 // A cipher block straddling a held neighbour
 // ---------------------------------------------------------------------------
 
-/// A one-member volume claiming `[claimed_from, len)`, over a partial that holds
-/// the member's plaintext everywhere except `[hole_start, hole_end)`, which
-/// reads back as zeros the way a sparse partial does.
+// A one-member volume claiming `[claimed_from, len)`, over a partial that holds
+// the member's plaintext everywhere except `[hole_start, hole_end)`, which
+// reads back as zeros the way a sparse partial does.
 fn straddling_volume(
     dir: &Path,
     plain: &[u8],

@@ -1,23 +1,23 @@
 use super::*;
 
-/// Maintenance contract: this Rust kernel and the intrinsic path selected by
-/// `WEAVER_YENC_RAW_ASM=0` are the tunable source of truth behind the frozen
-/// `asm!` kernel. For future tuning or bug fixes, change this implementation,
-/// validate and measure it through the `=0` escape hatch, and only then update
-/// `avx2_raw_kernel_oracle` (both instantiations) from the winning emission.
-/// The oracle differential suite detects semantic drift between the Rust and
-/// assembly implementations.
-///
-/// Faithful port of rapidyenc `do_decode_avx2` (decoder_avx2_base.h), the
-/// `isRaw=true, searchEnd=false` instantiation — the realshape decode path.
-/// 1:1 translation of the oracle's HOT LOOP: decoder state lives entirely in
-/// registers (`esc_first`/`yenc_offset`/`min_mask`/`next_mask`, exactly the
-/// oracle's `escFirst`/`yencOffset`/`minMask`/`nextMask`); `\r\n.` dot-stuffing
-/// is stripped IN-LOOP via `min_mask` + a `mask` merge (never a scalar bail);
-/// no per-window enum dispatch, no `span_end_state` trailing-byte read. The
-/// per-window decode math (escape unescape, 2-lane LUT compaction, `fix_eq_mask`)
-/// reuses weaver's existing byte-exact helpers (already identical to the oracle).
-/// This removes the ~47 µops/window of weaver-specific scaffolding.
+// Maintenance contract: this Rust kernel and the intrinsic path selected by
+// `WEAVER_YENC_RAW_ASM=0` are the tunable source of truth behind the frozen
+// `asm!` kernel. For future tuning or bug fixes, change this implementation,
+// validate and measure it through the `=0` escape hatch, and only then update
+// `avx2_raw_kernel_oracle` (both instantiations) from the winning emission.
+// The oracle differential suite detects semantic drift between the Rust and
+// assembly implementations.
+//
+// Faithful port of rapidyenc `do_decode_avx2` (decoder_avx2_base.h), the
+// `isRaw=true, searchEnd=false` instantiation — the realshape decode path.
+// 1:1 translation of the oracle's HOT LOOP: decoder state lives entirely in
+// registers (`esc_first`/`yenc_offset`/`min_mask`/`next_mask`, exactly the
+// oracle's `escFirst`/`yencOffset`/`minMask`/`nextMask`); `\r\n.` dot-stuffing
+// is stripped IN-LOOP via `min_mask` + a `mask` merge (never a scalar bail);
+// no per-window enum dispatch, no `span_end_state` trailing-byte read. The
+// per-window decode math (escape unescape, 2-lane LUT compaction, `fix_eq_mask`)
+// reuses weaver's existing byte-exact helpers (already identical to the oracle).
+// This removes the ~47 µops/window of weaver-specific scaffolding.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -470,13 +470,13 @@ unsafe fn decode_kernel_avx2_raw<const SEARCH_END: bool>(
     })
 }
 
-/// AVX2 decode: a flat span loop carrying the escape/line state in registers,
-/// one special-char mask per 64-byte window, a straight `add(-42)` + store on
-/// the common window with no specials, and a single 2-lane LUT compaction on
-/// windows that contain `= \r \n`. Escape resolution runs through
-/// `fix_eq_mask` + `avx2_decode_with_escape_mask`. The rare dot-stuffing
-/// (`\r\n.`) and end-marker (`=y`) cases fall back to the scalar decoder for
-/// that one window.
+// AVX2 decode: a flat span loop carrying the escape/line state in registers,
+// one special-char mask per 64-byte window, a straight `add(-42)` + store on
+// the common window with no specials, and a single 2-lane LUT compaction on
+// windows that contain `= \r \n`. Escape resolution runs through
+// `fix_eq_mask` + `avx2_decode_with_escape_mask`. The rare dot-stuffing
+// (`\r\n.`) and end-marker (`=y`) cases fall back to the scalar decoder for
+// that one window.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -797,17 +797,17 @@ pub(super) unsafe fn decode_kernel_avx2(
     })
 }
 
-/// Raw end-searching decode of `input` that stops at `limit` instead of the
-/// end of `input`, for a caller that folds the CRC behind each stretch while
-/// the output is still in cache.
-///
-/// The bytes after `limit` stay visible: the SIMD span keeps its lookahead
-/// reserve inside `input`, so an end probe in the last window sees exactly
-/// what an unbounded call would, and the span ends on `limit` itself when
-/// `limit` is 64-byte aligned with the reserve still ahead of it. That skips
-/// the scalar tail an unbounded call on the stretch alone would pay. The
-/// decode can run past `limit` only to finish an escape or reach an end
-/// marker. `None` when the asm kernel is not built in.
+// Raw end-searching decode of `input` that stops at `limit` instead of the
+// end of `input`, for a caller that folds the CRC behind each stretch while
+// the output is still in cache.
+//
+// The bytes after `limit` stay visible: the SIMD span keeps its lookahead
+// reserve inside `input`, so an end probe in the last window sees exactly
+// what an unbounded call would, and the span ends on `limit` itself when
+// `limit` is 64-byte aligned with the reserve still ahead of it. That skips
+// the scalar tail an unbounded call on the stretch alone would pay. The
+// decode can run past `limit` only to finish an escape or reach an end
+// marker. `None` when the asm kernel is not built in.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -864,29 +864,29 @@ pub(super) unsafe fn decode_raw_bounded_avx2(
     })
 }
 
-/// 2×2-lane LUT compaction + store for one 64-byte window, in the oracle's
-/// exact addressing shape (rapidyenc `decoder_avx2_base.h:556-600`, the
-/// `PLATFORM_AMD64` arm). Byte-for-byte identical output to the previous
-/// open-coded form; only the index/cursor arithmetic changed:
-///
-///   * table offsets are computed as **byte** offsets, not element indices, so
-///     each lane costs one shift + one AND instead of shift + AND + scale
-///     (`(skip >> 12) & 0x7fff0` is `((skip >> 16) & 0x7fff) * 16`);
-///   * a single `skip >> 28` is shared between lane 2's table offset AND lane
-///     2's popcount, replacing two independent extractions;
-///   * popcounts use position-invariant masks (`skip & 0xffff_0000` rather than
-///     `(skip >> 16) & 0xffff`) — popcount ignores bit position, so the shift
-///     is pure waste;
-///   * the four `+16` lane advances fold into one `+64` at the end, and the
-///     cursor is a running pointer instead of a `(base, offset)` pair, which
-///     also stops the output base from being spilled and reloaded per window.
-///
-/// Measured on Haswell (E5-2666 v3) the old form cost 29 scalar µops here
-/// against the oracle's 27; combined with the loop-induction fix this closes
-/// the specials-path µop gap (see `yenc-avx2-lever` notes).
-///
-/// `out` must have 64 writable bytes; the returned pointer is
-/// `out + 64 - popcount(skip)`.
+// 2×2-lane LUT compaction + store for one 64-byte window, in the oracle's
+// exact addressing shape (rapidyenc `decoder_avx2_base.h:556-600`, the
+// `PLATFORM_AMD64` arm). Byte-for-byte identical output to the previous
+// open-coded form; only the index/cursor arithmetic changed:
+//
+//   * table offsets are computed as **byte** offsets, not element indices, so
+//     each lane costs one shift + one AND instead of shift + AND + scale
+//     (`(skip >> 12) & 0x7fff0` is `((skip >> 16) & 0x7fff) * 16`);
+//   * a single `skip >> 28` is shared between lane 2's table offset AND lane
+//     2's popcount, replacing two independent extractions;
+//   * popcounts use position-invariant masks (`skip & 0xffff_0000` rather than
+//     `(skip >> 16) & 0xffff`) — popcount ignores bit position, so the shift
+//     is pure waste;
+//   * the four `+16` lane advances fold into one `+64` at the end, and the
+//     cursor is a running pointer instead of a `(base, offset)` pair, which
+//     also stops the output base from being spilled and reloaded per window.
+//
+// Measured on Haswell (E5-2666 v3) the old form cost 29 scalar µops here
+// against the oracle's 27; combined with the loop-induction fix this closes
+// the specials-path µop gap (see `yenc-avx2-lever` notes).
+//
+// `out` must have 64 writable bytes; the returned pointer is
+// `out + 64 - popcount(skip)`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline]
@@ -945,10 +945,10 @@ pub(super) unsafe fn avx2_compact_store64(
     p.wrapping_add(64)
 }
 
-/// Byte-replication shuffle indices expanding a broadcast `escaped` u64 into
-/// per-byte mask lanes (lane A: source bytes 0..3, lane B: bytes 4..7) — the
-/// RIP-relative twins of the `_mm256_set_epi32` constants in
-/// [`avx2_decode_with_escape_mask`], laid out little-endian.
+// Byte-replication shuffle indices expanding a broadcast `escaped` u64 into
+// per-byte mask lanes (lane A: source bytes 0..3, lane B: bytes 4..7) — the
+// RIP-relative twins of the `_mm256_set_epi32` constants in
+// [`avx2_decode_with_escape_mask`], laid out little-endian.
 #[cfg(target_arch = "x86_64")]
 #[repr(C, align(32))]
 struct Align32([u8; 32]);
@@ -960,14 +960,14 @@ static AVX2_ESC_IDX_A: Align32 = Align32([
 static AVX2_ESC_IDX_B: Align32 = Align32([
     4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
 ]);
-/// One-bit-per-lane selectors within a replicated byte (`0x8040201008040201`),
-/// broadcast per-quadword — the RIP twin of `bit_lanes` in
-/// [`avx2_decode_with_escape_mask`].
+// One-bit-per-lane selectors within a replicated byte (`0x8040201008040201`),
+// broadcast per-quadword — the RIP twin of `bit_lanes` in
+// [`avx2_decode_with_escape_mask`].
 #[cfg(target_arch = "x86_64")]
 static AVX2_ESC_BIT_LANES: u64 = 0x8040_2010_0804_0201;
 
-/// Broadcast sources for the end-search probes' needle rematerialization in
-/// the asm kernel, which has no spare vector register to pin them.
+// Broadcast sources for the end-search probes' needle rematerialization in
+// the asm kernel, which has no spare vector register to pin them.
 #[cfg(target_arch = "x86_64")]
 static YB_CR: u8 = 0x0d;
 #[cfg(target_arch = "x86_64")]
@@ -977,51 +977,51 @@ static YB_Y: u8 = 0x79;
 #[cfg(target_arch = "x86_64")]
 static YW_EQY: u16 = 0x793d;
 
-/// The whole raw kernel in the oracle's own shape — a transliteration of
-/// rapidyenc's compiled `do_decode_avx2` (`isRaw=true`) as emitted by GCC,
-/// for both `searchEnd` instantiations. The differential suite verifies
-/// byte-for-byte parity with the reference implementation.
-///
-/// `SEARCH_END = true` adds the oracle's end probes and nothing else: the
-/// non-dot arm tests `\r\n=y` (`=y` at +2/+3 first, the CR/LF pair only on
-/// a hit, in an out-of-line block), and the dot arm builds `\r\n.\r\n` /
-/// `\r\n.=y` / `\r\n=y` from the pre-merge needle masks before the dot
-/// merge. A hit leaves the window unconsumed and hands the pre-merge mask
-/// and pre-window `escFirst` to [`x86_break_state`], so the scalar epilogue
-/// resumes at the window head with no backtrack.
-///
-/// The oracle's structure, faithfully kept:
-/// - the input cursor is HEAD-ALIGNED to 64 bytes by a scalar prelude (in
-///   Rust below), then the loop runs pure ALIGNED loads off one mid-window
-///   cursor (`c` points 32 bytes in; lanes live at `[c-32]` and `[c]`) —
-///   no cacheline-split window loads, and every memory operand is
-///   base+disp8 (no index register, so load+op µops stay micro-fused);
-/// - specials take a BACKWARD branch to a block laid above the loop head;
-///   the store falls through into the next window's loads; the clean path
-///   is the head's fallthrough with its own back edge;
-/// - `skip == mask` on the common path (escaped bytes are never
-///   special-table matches except `=\r`/`=\n`, which the collision path
-///   handles by correcting `mask` with the resolved escape mask);
-/// - the collision predicate is the oracle's WIDER `mask & eq_shift1`;
-/// - `escFirst` is recomputed at the join (`meq >> 63`) and the
-///   `yenc_offset` rebuild is interleaved into the store head;
-/// - the CR/LF/dot needles are rematerialized inside their rare blocks
-///   (3 rename-free µops) instead of pinning two more ymm constants;
-/// - `min_mask` doubles as scratch in the CRLF probe and is rewritten on
-///   every specials path before the back edge (dot-clamp or plain dot).
-///
-/// Deliberate deviations, each strictly smaller: LUT rows load via
-/// `vmovdqu` (the heap table only guarantees byte alignment; unaligned
-/// loads are same-speed on aligned rows), the collision expansion reads the
-/// escape-select constants from this module's RIP statics and reuses the
-/// pinned `sub42`/`esc_off` registers instead of reloading them from
-/// rodata.
-///
-/// Safety: the caller guarantees the raw-path contract (`dot_unstuffing`,
-/// entry state in {None,Eq,Cr,CrLf}); the scalar prelude/epilogue share the
-/// kernel's usual bounds; the span keeps the 67-byte tail reserve, and the
-/// deepest lookahead reads `c + 4 + 31 < span end + reserve`. Flags are
-/// clobbered; the block reads input + LUT and writes output; no stack use.
+// The whole raw kernel in the oracle's own shape — a transliteration of
+// rapidyenc's compiled `do_decode_avx2` (`isRaw=true`) as emitted by GCC,
+// for both `searchEnd` instantiations. The differential suite verifies
+// byte-for-byte parity with the reference implementation.
+//
+// `SEARCH_END = true` adds the oracle's end probes and nothing else: the
+// non-dot arm tests `\r\n=y` (`=y` at +2/+3 first, the CR/LF pair only on
+// a hit, in an out-of-line block), and the dot arm builds `\r\n.\r\n` /
+// `\r\n.=y` / `\r\n=y` from the pre-merge needle masks before the dot
+// merge. A hit leaves the window unconsumed and hands the pre-merge mask
+// and pre-window `escFirst` to [`x86_break_state`], so the scalar epilogue
+// resumes at the window head with no backtrack.
+//
+// The oracle's structure, faithfully kept:
+// - the input cursor is HEAD-ALIGNED to 64 bytes by a scalar prelude (in
+//   Rust below), then the loop runs pure ALIGNED loads off one mid-window
+//   cursor (`c` points 32 bytes in; lanes live at `[c-32]` and `[c]`) —
+//   no cacheline-split window loads, and every memory operand is
+//   base+disp8 (no index register, so load+op µops stay micro-fused);
+// - specials take a BACKWARD branch to a block laid above the loop head;
+//   the store falls through into the next window's loads; the clean path
+//   is the head's fallthrough with its own back edge;
+// - `skip == mask` on the common path (escaped bytes are never
+//   special-table matches except `=\r`/`=\n`, which the collision path
+//   handles by correcting `mask` with the resolved escape mask);
+// - the collision predicate is the oracle's WIDER `mask & eq_shift1`;
+// - `escFirst` is recomputed at the join (`meq >> 63`) and the
+//   `yenc_offset` rebuild is interleaved into the store head;
+// - the CR/LF/dot needles are rematerialized inside their rare blocks
+//   (3 rename-free µops) instead of pinning two more ymm constants;
+// - `min_mask` doubles as scratch in the CRLF probe and is rewritten on
+//   every specials path before the back edge (dot-clamp or plain dot).
+//
+// Deliberate deviations, each strictly smaller: LUT rows load via
+// `vmovdqu` (the heap table only guarantees byte alignment; unaligned
+// loads are same-speed on aligned rows), the collision expansion reads the
+// escape-select constants from this module's RIP statics and reuses the
+// pinned `sub42`/`esc_off` registers instead of reloading them from
+// rodata.
+//
+// Safety: the caller guarantees the raw-path contract (`dot_unstuffing`,
+// entry state in {None,Eq,Cr,CrLf}); the scalar prelude/epilogue share the
+// kernel's usual bounds; the span keeps the 67-byte tail reserve, and the
+// deepest lookahead reads `c + 4 + 31 < span end + reserve`. Flags are
+// clobbered; the block reads input + LUT and writes output; no stack use.
 #[cfg(target_arch = "x86_64")]
 #[cfg_attr(not(weaver_yenc_raw_asm), allow(dead_code))]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
@@ -1716,7 +1716,7 @@ pub(super) unsafe fn avx2_decode_with_escape_mask(
     (decoded_a, decoded_b)
 }
 
-/// AVX2 implementation: process 32 bytes at a time.
+// AVX2 implementation: process 32 bytes at a time.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 pub(super) unsafe fn decode_normal_run_avx2(

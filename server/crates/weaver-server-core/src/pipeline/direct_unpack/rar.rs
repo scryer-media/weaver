@@ -1,4 +1,4 @@
-//! RAR member extraction shared by disk-backed and mixed direct-store chases.
+// RAR member extraction shared by disk-backed and mixed direct-store chases.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -190,8 +190,8 @@ pub(crate) fn extract(
     })
 }
 
-/// Install only the verified member manifest. Retained files from an earlier
-/// process must never become output merely because they share a staging tree.
+// Install only the verified member manifest. Retained files from an earlier
+// process must never become output merely because they share a staging tree.
 pub(crate) fn install(from: &Path, to: &Path, names: &[String]) -> Result<(), String> {
     let mut entries = Vec::with_capacity(names.len());
     let mut destinations = HashSet::new();

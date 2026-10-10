@@ -23,24 +23,24 @@ use crate::transfer::{
     ActiveTransferBudget, QuotaRejection, ServerTransferSnapshot, StableServerId,
 };
 
-/// Configuration for the high-level NNTP client.
+// Configuration for the high-level NNTP client.
 pub struct NntpClientConfig {
-    /// Server configurations in priority order (primary first).
+    // Server configurations in priority order (primary first).
     pub servers: Vec<ServerPoolConfig>,
-    /// Maximum age for idle connections before eviction.
+    // Maximum age for idle connections before eviction.
     pub max_idle_age: Duration,
-    /// Maximum number of retries on the same server for transient errors
-    /// before failing over to the next server. A value of 1 means try once,
-    /// then retry once (2 total attempts per server).
+    // Maximum number of retries on the same server for transient errors
+    // before failing over to the next server. A value of 1 means try once,
+    // then retry once (2 total attempts per server).
     pub max_retries_per_server: u32,
-    /// Per-article active-time budget. Deliberate local rate-limit waits are
-    /// excluded; exceeding the budget triggers failover to the next server.
-    /// This is separate from the connection-level `command_timeout`.
+    // Per-article active-time budget. Deliberate local rate-limit waits are
+    // excluded; exceeding the budget triggers failover to the next server.
+    // This is separate from the connection-level `command_timeout`.
     pub soft_timeout: Duration,
 }
 
 impl NntpClientConfig {
-    /// Create a client config with a single server.
+    // Create a client config with a single server.
     pub fn single(server: ServerConfig, max_connections: usize) -> Self {
         NntpClientConfig {
             servers: vec![ServerPoolConfig {
@@ -55,44 +55,44 @@ impl NntpClientConfig {
     }
 }
 
-/// High-level NNTP client with multi-server failover.
-///
-/// Provides a simple API for fetching articles, automatically managing
-/// connection pooling and falling back to backup servers when an article
-/// is not found on the primary server.
+// High-level NNTP client with multi-server failover.
+//
+// Provides a simple API for fetching articles, automatically managing
+// connection pooling and falling back to backup servers when an article
+// is not found on the primary server.
 #[derive(Clone)]
 pub struct NntpClient {
     pool: Arc<NntpPool>,
     max_retries_per_server: u32,
-    /// Per-article active-time budget, excluding deliberate local rate waits.
+    // Per-article active-time budget, excluding deliberate local rate waits.
     soft_timeout: Duration,
 }
 
-/// How many yielding `try_lock` attempts an owned-lane server selection makes
-/// on the shared health mutex before reporting contention. The critical
-/// sections behind that mutex are microseconds long, so a handful of retries
-/// absorbs ordinary collisions without ever blocking a worker thread.
+// How many yielding `try_lock` attempts an owned-lane server selection makes
+// on the shared health mutex before reporting contention. The critical
+// sections behind that mutex are microseconds long, so a handful of retries
+// absorbs ordinary collisions without ever blocking a worker thread.
 const BLOCKING_HEALTH_LOCK_SPINS: usize = 4;
 
-/// Why a synchronous owned BODY lane could not be acquired.
-///
-/// Capacity outcomes are separated from server availability and transport
-/// failures so callers can return leased work to the scheduler without
-/// tearing down healthy cached lanes or consuming a download retry.
+// Why a synchronous owned BODY lane could not be acquired.
+//
+// Capacity outcomes are separated from server availability and transport
+// failures so callers can return leased work to the scheduler without
+// tearing down healthy cached lanes or consuming a download retry.
 #[derive(Debug)]
 pub enum BlockingBodyLaneAcquireError {
     ProviderCapacity(NntpError),
     LocalCapacity,
-    /// Every candidate server is recovering and its one probe connection is
-    /// already out. Self-clearing like local capacity, but not the same
-    /// thing: the permits are free and the sockets are idle, and reporting it
-    /// as saturation points the reader at a leak that is not there.
+    // Every candidate server is recovering and its one probe connection is
+    // already out. Self-clearing like local capacity, but not the same
+    // thing: the permits are free and the sockets are idle, and reporting it
+    // as saturation points the reader at a leak that is not there.
     ServerRecovering,
     NoEligibleServer,
-    /// The health mutex was held elsewhere, so candidates could not be ranked.
-    /// This says nothing about server availability — the caller should hand
-    /// the work back to the scheduler and try again, not conclude that no
-    /// server can serve it.
+    // The health mutex was held elsewhere, so candidates could not be ranked.
+    // This says nothing about server availability — the caller should hand
+    // the work back to the scheduler and try again, not conclude that no
+    // server can serve it.
     SelectionContended,
     Other(NntpError),
 }
@@ -116,9 +116,9 @@ impl BlockingBodyLaneAcquireError {
         )
     }
 
-    /// The transport error behind this refusal, where there is one. Local
-    /// capacity, selection contention and an empty candidate list are the
-    /// lane's own bookkeeping and carry no server answer to report.
+    // The transport error behind this refusal, where there is one. Local
+    // capacity, selection contention and an empty candidate list are the
+    // lane's own bookkeeping and carry no server answer to report.
     pub fn nntp_error(&self) -> Option<&NntpError> {
         match self {
             Self::ProviderCapacity(error) | Self::Other(error) => Some(error),
@@ -129,18 +129,18 @@ impl BlockingBodyLaneAcquireError {
         }
     }
 
-    /// Whether the leased work should be handed straight back to the scheduler
-    /// and retried on the owned fast path, rather than falling back to an
-    /// async lane. Capacity admission and selection contention are both
-    /// "ask again shortly", not verdicts about the servers.
+    // Whether the leased work should be handed straight back to the scheduler
+    // and retried on the owned fast path, rather than falling back to an
+    // async lane. Capacity admission and selection contention are both
+    // "ask again shortly", not verdicts about the servers.
     pub fn should_requeue_owned_work(&self) -> bool {
         self.is_capacity_admission() || matches!(self, Self::SelectionContended)
     }
 
-    /// A short, stable label for metrics and logs. Distinguishing the kinds is
-    /// the whole point of the counters: local capacity and selection contention
-    /// are self-clearing, provider capacity is the provider refusing sockets,
-    /// and `other` is a transport failure that deserves attention.
+    // A short, stable label for metrics and logs. Distinguishing the kinds is
+    // the whole point of the counters: local capacity and selection contention
+    // are self-clearing, provider capacity is the provider refusing sockets,
+    // and `other` is a transport failure that deserves attention.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::ProviderCapacity(_) => "provider_capacity",
@@ -170,37 +170,37 @@ impl std::fmt::Display for BlockingBodyLaneAcquireError {
 
 impl std::error::Error for BlockingBodyLaneAcquireError {}
 
-/// How a server selection asks each server's quota.
+// How a server selection asks each server's quota.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QuotaCheck {
-    /// A dispatch choosing its server: a server skipped for headroom has
-    /// turned the work away, and its blocked signal says so.
+    // A dispatch choosing its server: a server skipped for headroom has
+    // turned the work away, and its blocked signal says so.
     Dispatch,
-    /// A question about the servers: reads the quota, changes nothing.
+    // A question about the servers: reads the quota, changes nothing.
     ReadOnly,
 }
 
-/// Whether the synchronous owned lanes can be given a batch.
+// Whether the synchronous owned lanes can be given a batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockingBodyLaneCandidacy {
-    /// At least one eligible server can carry an owned blocking lane.
+    // At least one eligible server can carry an owned blocking lane.
     Candidate,
-    /// No eligible server can. This is the only answer that justifies the
-    /// asynchronous path.
+    // No eligible server can. This is the only answer that justifies the
+    // asynchronous path.
     None,
-    /// The shared server health state was busy, so the candidates could not be
-    /// ranked. Says nothing about the servers: ask again in a moment, on the
-    /// owned lanes.
+    // The shared server health state was busy, so the candidates could not be
+    // ranked. Says nothing about the servers: ask again in a moment, on the
+    // owned lanes.
     Contended,
 }
 
-/// A BODY fetch that was streamed and decoded inline.
+// A BODY fetch that was streamed and decoded inline.
 #[derive(Debug)]
 pub struct DecodedBody {
     pub raw_size: u32,
     pub decoded: Vec<Box<[u8]>>,
-    /// What the body decoded to. yEnc and uuencode carry different evidence, so
-    /// this is a sum type rather than a yEnc result with absent fields.
+    // What the body decoded to. yEnc and uuencode carry different evidence, so
+    // this is a sum type rather than a yEnc result with absent fields.
     pub body: FusedArticleBody,
     pub cpu: DecodedBodyCpu,
     pub io: DecodedBodyIo,
@@ -235,7 +235,7 @@ pub struct DecodedBodyIo {
     pub throttle_wait: Duration,
 }
 
-/// Errors from the streamed BODY decode path.
+// Errors from the streamed BODY decode path.
 #[derive(Debug)]
 pub enum DecodedBodyError {
     Nntp(NntpError),
@@ -285,7 +285,7 @@ fn decoded_raw_size_from_fused_stats(stats: &FusedYencArticleStats) -> u32 {
     )
 }
 
-/// Existence results used by the health probe pipeline.
+// Existence results used by the health probe pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeBatchResult {
     pub exists: Vec<bool>,
@@ -338,13 +338,13 @@ pub struct DecodedBodyTrace {
     pub result: std::result::Result<DecodedBody, DecodedBodyError>,
 }
 
-/// BODY servers that can be leased now, plus the most useful quota block when
-/// quota filtering removed an otherwise eligible server.
+// BODY servers that can be leased now, plus the most useful quota block when
+// quota filtering removed an otherwise eligible server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BodyServerSelection {
     pub eligible: Vec<ServerId>,
-    /// Prefers the earliest scheduled retry; manual-only blocks are retained
-    /// when no scheduled retry is available.
+    // Prefers the earliest scheduled retry; manual-only blocks are retained
+    // when no scheduled retry is available.
     pub quota_blocked: Option<QuotaRejection>,
 }
 
@@ -384,28 +384,28 @@ fn blend_ewma(current: Option<Duration>, sample: Duration) -> Duration {
     }
 }
 
-/// Whether an owned blocking BODY lane can serve this server.
-///
-/// It always can. Owned lanes are the only download engine, and the blocking
-/// transport carries every arrangement a server config can describe:
-/// plaintext, implicit TLS, and the in-band STARTTLS upgrade. A TLS backend
-/// that cannot build trust for a given config — the s2n lane without a pinned
-/// CA PEM — yields to the rustls lane rather than leaving the server unserved.
-///
-/// The predicate is kept because its callers read as a question about one
-/// server, and because a transport that genuinely could not be lane-served
-/// would have to answer here.
+// Whether an owned blocking BODY lane can serve this server.
+//
+// It always can. Owned lanes are the only download engine, and the blocking
+// transport carries every arrangement a server config can describe:
+// plaintext, implicit TLS, and the in-band STARTTLS upgrade. A TLS backend
+// that cannot build trust for a given config — the s2n lane without a pinned
+// CA PEM — yields to the rustls lane rather than leaving the server unserved.
+//
+// The predicate is kept because its callers read as a question about one
+// server, and because a transport that genuinely could not be lane-served
+// would have to answer here.
 fn supports_blocking_body_lane(_config: &ServerConfig) -> bool {
     true
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct BodyLaneBatchStats {
-    /// Work offered to this lane, capped by pipeline depth.
+    // Work offered to this lane, capped by pipeline depth.
     pub offered: usize,
-    /// BODY commands actually admitted and issued.
+    // BODY commands actually admitted and issued.
     pub requested: usize,
-    /// Offered work left unrequested after quota admission stopped the prefix.
+    // Offered work left unrequested after quota admission stopped the prefix.
     pub unrequested: usize,
     pub quota_rejection: Option<QuotaRejection>,
     pub completed: usize,
@@ -433,13 +433,13 @@ pub struct BodyLaneLease {
     route_feedback: RouteFeedback,
     groups: Vec<String>,
     mode: BodyLaneMode,
-    /// Command-to-status-line wait, sampled only when nothing else was
-    /// outstanding on the connection.
+    // Command-to-status-line wait, sampled only when nothing else was
+    // outstanding on the connection.
     latency_ewma: Option<Duration>,
-    /// Status-line-to-terminator wait: the article's own cost on the wire.
+    // Status-line-to-terminator wait: the article's own cost on the wire.
     transfer_ewma: Option<Duration>,
-    /// Successful responses this connection has produced. The first is cold
-    /// and moves neither average; see the blocking lane for why.
+    // Successful responses this connection has produced. The first is cold
+    // and moves neither average; see the blocking lane for why.
     responses_completed: u64,
     checkpoint_plan: CheckpointPlan,
 }
@@ -497,12 +497,12 @@ impl BodyLaneLease {
             .is_some_and(|conn| conn.capabilities().supports_pipelining())
     }
 
-    /// Checkpoint every decoded article according to the immutable geometry
-    /// snapshot captured by its batch.
-    ///
-    /// A download batch belongs to one job, so the caller sets this once per
-    /// batch. It is re-applied before every response, including `None`, so a
-    /// pooled connection cannot carry another job's geometry.
+    // Checkpoint every decoded article according to the immutable geometry
+    // snapshot captured by its batch.
+    //
+    // A download batch belongs to one job, so the caller sets this once per
+    // batch. It is re-applied before every response, including `None`, so a
+    // pooled connection cannot carry another job's geometry.
     pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
         self.checkpoint_plan = checkpoint_plan;
     }
@@ -936,8 +936,8 @@ impl BodyLaneLease {
         }
     }
 
-    /// Book one successful response. The connection's first response is
-    /// skipped: it carries setup costs no later one repeats.
+    // Book one successful response. The connection's first response is
+    // skipped: it carries setup costs no later one repeats.
     fn book_response(&mut self, latency: Option<Duration>, transfer: Duration) {
         let cold = self.responses_completed == 0;
         self.responses_completed = self.responses_completed.saturating_add(1);
@@ -950,8 +950,8 @@ impl BodyLaneLease {
         self.transfer_ewma = Some(blend_ewma(self.transfer_ewma, transfer));
     }
 
-    /// Consume the last article's status-line wait so one response's latency
-    /// cannot be credited to the next.
+    // Consume the last article's status-line wait so one response's latency
+    // cannot be credited to the next.
     fn take_response_line_wait(&mut self) -> Duration {
         self.conn
             .as_mut()
@@ -968,7 +968,7 @@ impl BodyLaneLease {
 }
 
 impl NntpClient {
-    /// Create a new NNTP client from the given configuration.
+    // Create a new NNTP client from the given configuration.
     pub fn new(config: NntpClientConfig) -> Self {
         let max_retries_per_server = config.max_retries_per_server;
         let soft_timeout = config.soft_timeout;
@@ -987,7 +987,7 @@ impl NntpClient {
         }
     }
 
-    /// Create a client wrapping an existing pool.
+    // Create a client wrapping an existing pool.
     pub fn from_pool(pool: Arc<NntpPool>) -> Self {
         pool.start_route_probes();
         NntpClient {
@@ -1041,10 +1041,10 @@ impl NntpClient {
         }
     }
 
-    /// Return the current request-specific quota rejection for one server.
-    /// Cached owned lanes use this to revalidate admission without touching
-    /// connection health or acquiring a new lane. It is a dispatch decision,
-    /// so a rejection latches the server's blocked signal.
+    // Return the current request-specific quota rejection for one server.
+    // Cached owned lanes use this to revalidate admission without touching
+    // connection health or acquiring a new lane. It is a dispatch decision,
+    // so a rejection latches the server's blocked signal.
     pub fn server_quota_rejection(
         &self,
         server: ServerId,
@@ -1055,9 +1055,9 @@ impl NntpClient {
             .and_then(|control| control.quota_rejection_for_dispatch(requested_body_bytes))
     }
 
-    /// True only when the active pool contains at least one normal fill server
-    /// and every such fill is at its absolute quota limit. Backfill servers do
-    /// not participate in this global presentation predicate.
+    // True only when the active pool contains at least one normal fill server
+    // and every such fill is at its absolute quota limit. Backfill servers do
+    // not participate in this global presentation predicate.
     pub fn all_normal_fill_servers_quota_blocked(&self) -> bool {
         let backfill = self.pool.server_backfill_flags();
         let mut saw_fill = false;
@@ -1168,13 +1168,13 @@ impl NntpClient {
         }
     }
 
-    /// Check whether articles exist anywhere in the configured server set.
-    ///
-    /// Returns one boolean per message-id: true if any usable server reports
-    /// the article exists, false if every usable server definitively reports it
-    /// missing. If a transient server failure leaves the batch inconclusive,
-    /// this returns an error so callers do not treat missing samples as
-    /// authoritative.
+    // Check whether articles exist anywhere in the configured server set.
+    //
+    // Returns one boolean per message-id: true if any usable server reports
+    // the article exists, false if every usable server definitively reports it
+    // missing. If a transient server failure leaves the batch inconclusive,
+    // this returns an error so callers do not treat missing samples as
+    // authoritative.
     pub async fn stat_many(&self, message_ids: &[&str]) -> Result<Vec<bool>> {
         if message_ids.is_empty() {
             return Ok(Vec::new());
@@ -1187,7 +1187,7 @@ impl NntpClient {
         self.stat_many_in_order(message_ids, order).await
     }
 
-    /// [`Self::stat_many`] over an already chosen, non-empty server order.
+    // [`Self::stat_many`] over an already chosen, non-empty server order.
     async fn stat_many_in_order(
         &self,
         message_ids: &[&str],
@@ -1246,15 +1246,15 @@ impl NntpClient {
         }
     }
 
-    /// Confirm article existence for health probes.
-    ///
-    /// The fast path uses batched pipelined STAT checks. Any article that STAT
-    /// reports missing is re-checked with a HEAD before the result is treated
-    /// as authoritative — unless no usable server implements HEAD, in which
-    /// case the STAT verdict is the final one rather than an excuse to call
-    /// the whole batch inconclusive. Transport or probe errors during
-    /// confirmation mark the entire batch inconclusive so callers can unwind
-    /// without applying projected health damage.
+    // Confirm article existence for health probes.
+    //
+    // The fast path uses batched pipelined STAT checks. Any article that STAT
+    // reports missing is re-checked with a HEAD before the result is treated
+    // as authoritative — unless no usable server implements HEAD, in which
+    // case the STAT verdict is the final one rather than an excuse to call
+    // the whole batch inconclusive. Transport or probe errors during
+    // confirmation mark the entire batch inconclusive so callers can unwind
+    // without applying projected health damage.
     pub async fn confirm_exists_for_probe(&self, message_ids: &[&str]) -> ProbeBatchResult {
         self.confirm_exists_for_probe_excluding(message_ids, &[])
             .await
@@ -1264,15 +1264,15 @@ impl NntpClient {
             })
     }
 
-    /// [`Self::confirm_exists_for_probe`] that leaves the servers in
-    /// `exclude` out entirely.
-    ///
-    /// The caller has usually had those servers answer already, on a warm
-    /// connection it is holding — an owned download lane's — and asking them
-    /// again here would queue behind the very permits those lanes are sitting
-    /// on. Returns `None` when nothing usable is left once they are excluded,
-    /// which is not a fault: it means the batch has been put to every server
-    /// that could answer and the caller's verdict stands.
+    // [`Self::confirm_exists_for_probe`] that leaves the servers in
+    // `exclude` out entirely.
+    //
+    // The caller has usually had those servers answer already, on a warm
+    // connection it is holding — an owned download lane's — and asking them
+    // again here would queue behind the very permits those lanes are sitting
+    // on. Returns `None` when nothing usable is left once they are excluded,
+    // which is not a fault: it means the batch has been put to every server
+    // that could answer and the caller's verdict stands.
     pub async fn confirm_exists_for_probe_excluding(
         &self,
         message_ids: &[&str],
@@ -1369,21 +1369,21 @@ impl NntpClient {
         })
     }
 
-    /// Fetch the body of an article by message-id, with multi-server failover.
-    ///
-    /// Tries each server in priority order. Falls back to the next server
-    /// on `ArticleNotFound` (430). Retries on the same server for transient
-    /// errors before escalating.
+    // Fetch the body of an article by message-id, with multi-server failover.
+    //
+    // Tries each server in priority order. Falls back to the next server
+    // on `ArticleNotFound` (430). Retries on the same server for transient
+    // errors before escalating.
     pub async fn fetch_body(&self, message_id: &str) -> Result<Bytes> {
         self.fetch_with_failover(message_id, FetchKind::Body).await
     }
 
-    /// Fetch the body of an article, selecting a newsgroup first if required.
-    ///
-    /// Some NNTP servers require a GROUP command before BODY will succeed.
-    /// This method tries each group in `groups` until one succeeds, then
-    /// issues the BODY command. If `groups` is empty it behaves identically
-    /// to [`fetch_body`](Self::fetch_body).
+    // Fetch the body of an article, selecting a newsgroup first if required.
+    //
+    // Some NNTP servers require a GROUP command before BODY will succeed.
+    // This method tries each group in `groups` until one succeeds, then
+    // issues the BODY command. If `groups` is empty it behaves identically
+    // to [`fetch_body`](Self::fetch_body).
     pub async fn fetch_body_with_groups(
         &self,
         message_id: &str,
@@ -1394,9 +1394,9 @@ impl NntpClient {
             .result
     }
 
-    /// Like [`fetch_body_with_groups`](Self::fetch_body_with_groups) but skips
-    /// the specified servers. Used after decode failures to avoid re-downloading
-    /// from a server that returned corrupt data.
+    // Like [`fetch_body_with_groups`](Self::fetch_body_with_groups) but skips
+    // the specified servers. Used after decode failures to avoid re-downloading
+    // from a server that returned corrupt data.
     pub async fn fetch_body_with_groups_excluding(
         &self,
         message_id: &str,
@@ -1577,7 +1577,7 @@ impl NntpClient {
         }
     }
 
-    /// Fetch and decode a yEnc BODY by message-id using streamed NNTP chunks.
+    // Fetch and decode a yEnc BODY by message-id using streamed NNTP chunks.
     pub async fn fetch_body_decoded_with_groups(
         &self,
         message_id: &str,
@@ -2091,8 +2091,8 @@ impl NntpClient {
         }
     }
 
-    /// Like [`fetch_body_decoded_with_groups`](Self::fetch_body_decoded_with_groups)
-    /// but skips the specified servers.
+    // Like [`fetch_body_decoded_with_groups`](Self::fetch_body_decoded_with_groups)
+    // but skips the specified servers.
     pub async fn fetch_body_decoded_with_groups_excluding(
         &self,
         message_id: &str,
@@ -2385,29 +2385,29 @@ impl NntpClient {
         }
     }
 
-    /// Fetch the headers of an article by message-id, with multi-server failover.
+    // Fetch the headers of an article by message-id, with multi-server failover.
     pub async fn fetch_head(&self, message_id: &str) -> Result<Bytes> {
         self.fetch_with_failover(message_id, FetchKind::Head).await
     }
 
-    /// Fetch a complete article (headers + body) by message-id, with multi-server failover.
+    // Fetch a complete article (headers + body) by message-id, with multi-server failover.
     pub async fn fetch_article(&self, message_id: &str) -> Result<Bytes> {
         self.fetch_with_failover(message_id, FetchKind::Article)
             .await
     }
 
-    /// Gracefully shut down the client and all pooled connections.
+    // Gracefully shut down the client and all pooled connections.
     pub async fn shutdown(&self) {
         self.pool.shutdown().await;
     }
 
-    /// Access the underlying connection pool.
+    // Access the underlying connection pool.
     pub fn pool(&self) -> &Arc<NntpPool> {
         &self.pool
     }
 
-    /// Feed the fetch times of successful attempts to the address plans of
-    /// the servers that served them.
+    // Feed the fetch times of successful attempts to the address plans of
+    // the servers that served them.
     pub fn record_fetch_attempts(&self, attempts: &[FetchAttemptTrace]) {
         for attempt in attempts {
             if attempt.outcome != FetchAttemptOutcome::Success {
@@ -2426,11 +2426,11 @@ impl NntpClient {
         }
     }
 
-    /// Book one decoded article's bytes and wire time against the address
-    /// that served it, for the address plan's delivery comparison. `attempts`
-    /// is the fetch's trace; the successful attempt names the server and the
-    /// address. The caller leaves out a connection's first fetch and any fetch
-    /// made while the job could not take bytes as fast as the wire offered.
+    // Book one decoded article's bytes and wire time against the address
+    // that served it, for the address plan's delivery comparison. `attempts`
+    // is the fetch's trace; the successful attempt names the server and the
+    // address. The caller leaves out a connection's first fetch and any fetch
+    // made while the job could not take bytes as fast as the wire offered.
     pub fn record_address_delivery(
         &self,
         attempts: &[FetchAttemptTrace],
@@ -2461,13 +2461,13 @@ impl NntpClient {
         self.try_acquire_blocking_body_lane_with_estimate(groups, exclude, 0)
     }
 
-    /// Inspect the synchronous owned-lane candidates without acquiring a
-    /// connection permit or opening a connection.
-    ///
-    /// `None` means the shared health state was busy, not that no server is
-    /// eligible. The two must not be folded together: a caller that reads
-    /// contention as "nothing can serve this" takes a permanent decision on a
-    /// momentary lock collision.
+    // Inspect the synchronous owned-lane candidates without acquiring a
+    // connection permit or opening a connection.
+    //
+    // `None` means the shared health state was busy, not that no server is
+    // eligible. The two must not be folded together: a caller that reads
+    // contention as "nothing can serve this" takes a permanent decision on a
+    // momentary lock collision.
     pub fn try_blocking_body_server_selection_with_estimate(
         &self,
         exclude: &[usize],
@@ -2633,18 +2633,18 @@ impl NntpClient {
         }
     }
 
-    /// Whether the owned blocking lanes could take this work, and whether the
-    /// answer is one at all.
-    ///
-    /// [`BlockingBodyLaneCandidacy::Contended`] is the reason this is not a
-    /// `bool`: the shared health state was busy for the length of the spin, so
-    /// nothing is known about the servers. Treating that as "no candidate"
-    /// sends the work to the asynchronous lanes, which then queue for the very
-    /// connection permits the idle owned lanes are holding and wait out the
-    /// whole acquire deadline for it.
-    /// The servers a new owned lane would try, in the order the pool ranks
-    /// them right now. A question, not a dispatch: it reserves nothing and
-    /// clears no quota latch. `None` while the health state is contended.
+    // Whether the owned blocking lanes could take this work, and whether the
+    // answer is one at all.
+    //
+    // [`BlockingBodyLaneCandidacy::Contended`] is the reason this is not a
+    // `bool`: the shared health state was busy for the length of the spin, so
+    // nothing is known about the servers. Treating that as "no candidate"
+    // sends the work to the asynchronous lanes, which then queue for the very
+    // connection permits the idle owned lanes are holding and wait out the
+    // whole acquire deadline for it.
+    // The servers a new owned lane would try, in the order the pool ranks
+    // them right now. A question, not a dispatch: it reserves nothing and
+    // clears no quota latch. `None` while the health state is contended.
     pub fn blocking_body_server_order(&self, exclude: &[usize]) -> Option<Vec<ServerId>> {
         self.try_blocking_body_server_selection(exclude, 0, QuotaCheck::ReadOnly)
             .map(|selection| selection.eligible)
@@ -2742,13 +2742,13 @@ impl NntpClient {
         }
     }
 
-    /// Ranked owned-lane candidates, or `None` when the health mutex was held
-    /// by someone else for the whole (short) spin.
-    ///
-    /// The distinction matters: an empty selection means "no server can serve
-    /// this request", while contention means "ask again in a moment". Folding
-    /// the two together made every contended selection look like a permanent
-    /// tiering verdict and silently pushed the work off the owned fast path.
+    // Ranked owned-lane candidates, or `None` when the health mutex was held
+    // by someone else for the whole (short) spin.
+    //
+    // The distinction matters: an empty selection means "no server can serve
+    // this request", while contention means "ask again in a moment". Folding
+    // the two together made every contended selection look like a permanent
+    // tiering verdict and silently pushed the work off the owned fast path.
     fn try_blocking_body_server_selection(
         &self,
         exclude: &[usize],
@@ -2964,12 +2964,12 @@ impl NntpClient {
         }
     }
 
-    /// Drop the connection that just failed, and only that one.
-    ///
-    /// One socket's fault says nothing about the server's other sockets: they
-    /// were opened at different times, may run over different addresses, and
-    /// are the warm capacity the next request is about to reuse. Throwing them
-    /// away turned a single refused command into a fleet-wide cold dial.
+    // Drop the connection that just failed, and only that one.
+    //
+    // One socket's fault says nothing about the server's other sockets: they
+    // were opened at different times, may run over different addresses, and
+    // are the warm capacity the next request is about to reuse. Throwing them
+    // away turned a single refused command into a fleet-wide cold dial.
     async fn discard_connection_error(&self, server_idx: usize, conn: PooledConnection) {
         let age = conn.created_at().elapsed();
         if let Some(lease) = &conn.health_lease {
@@ -2980,8 +2980,8 @@ impl NntpClient {
         self.record_premature_death_if_needed(server_idx, age).await;
     }
 
-    /// Whether `server` could hand out a normal lease right now without
-    /// waiting on its connection semaphore.
+    // Whether `server` could hand out a normal lease right now without
+    // waiting on its connection semaphore.
     pub fn has_available_permit(&self, server: ServerId) -> bool {
         self.pool.has_available_permit(server)
     }
@@ -3031,32 +3031,32 @@ impl NntpClient {
         NntpError::SoftTimeout(self.soft_timeout.as_secs())
     }
 
-    /// The acquire-side twin of [`Self::soft_timeout_error`], for deadlines
-    /// that expire while we are still queued behind our own connection
-    /// semaphore.
+    // The acquire-side twin of [`Self::soft_timeout_error`], for deadlines
+    // that expire while we are still queued behind our own connection
+    // semaphore.
     fn acquire_timeout_error(&self) -> NntpError {
         NntpError::AcquireTimeout(self.soft_timeout.as_secs())
     }
 
-    /// Build the server try-order, exhausting lower-priority fill groups
-    /// before higher-priority ones, with backfill servers reachable only
-    /// once every fill server is excluded for this request.
-    ///
-    /// Servers in `exclude` are skipped entirely. Disabled servers and
-    /// short-lived cooldown servers are excluded so we don't waste time on
-    /// servers that are known to be failing right now.
-    ///
-    /// A `CoolingDown` fill tier does NOT unlock backfill: those are 5–10 s
-    /// blips, so the order is temporarily empty and callers wait rather than
-    /// spilling ordinary work onto backfill accounts. Neither does an outage
-    /// disable (`ConsecutiveFailures` / `FailureRatio`): it heals on its own,
-    /// and spilling the whole queue onto a paid backfill account for a 30 s
-    /// primary blip is the wrong trade. An `AuthFailure` disable does unlock
-    /// it — a fill server that keeps failing authentication never produces
-    /// the 430 that would put it in `exclude`, so without this an article the
-    /// other fill servers do not have would be pinned out of backfill until
-    /// the operator fixes the credentials. Within a priority group, immediately acquirable
-    /// servers are preferred over fully saturated peers.
+    // Build the server try-order, exhausting lower-priority fill groups
+    // before higher-priority ones, with backfill servers reachable only
+    // once every fill server is excluded for this request.
+    //
+    // Servers in `exclude` are skipped entirely. Disabled servers and
+    // short-lived cooldown servers are excluded so we don't waste time on
+    // servers that are known to be failing right now.
+    //
+    // A `CoolingDown` fill tier does NOT unlock backfill: those are 5–10 s
+    // blips, so the order is temporarily empty and callers wait rather than
+    // spilling ordinary work onto backfill accounts. Neither does an outage
+    // disable (`ConsecutiveFailures` / `FailureRatio`): it heals on its own,
+    // and spilling the whole queue onto a paid backfill account for a 30 s
+    // primary blip is the wrong trade. An `AuthFailure` disable does unlock
+    // it — a fill server that keeps failing authentication never produces
+    // the 430 that would put it in `exclude`, so without this an article the
+    // other fill servers do not have would be pinned out of backfill until
+    // the operator fixes the credentials. Within a priority group, immediately acquirable
+    // servers are preferred over fully saturated peers.
     #[allow(clippy::needless_range_loop)]
     async fn build_server_order(&self, exclude: &[usize]) -> Vec<usize> {
         let server_count = self.pool.server_count();
@@ -3149,12 +3149,12 @@ impl NntpClient {
         result
     }
 
-    /// Rank servers within a single priority group using weighted random selection
-    /// based on latency EWMA and current load.
-    ///
-    /// The first server is chosen probabilistically (weight = 1/score), and the
-    /// rest are appended in ascending score order. This ensures that faster,
-    /// less-loaded servers are tried first while still providing load distribution.
+    // Rank servers within a single priority group using weighted random selection
+    // based on latency EWMA and current load.
+    //
+    // The first server is chosen probabilistically (weight = 1/score), and the
+    // rest are appended in ascending score order. This ensures that faster,
+    // less-loaded servers are tried first while still providing load distribution.
     async fn rank_servers_in_group(&self, servers: &[usize]) -> Vec<usize> {
         if servers.len() <= 1 {
             return servers.to_vec();
@@ -3208,7 +3208,7 @@ impl NntpClient {
         result
     }
 
-    /// Internal: fetch with multi-server failover logic.
+    // Internal: fetch with multi-server failover logic.
     async fn fetch_with_failover(&self, message_id: &str, kind: FetchKind) -> Result<Bytes> {
         self.fetch_with_failover_excluding(message_id, kind, &[])
             .await
@@ -3296,10 +3296,10 @@ impl NntpClient {
             .unwrap_or(NntpError::PoolExhausted))
     }
 
-    /// Try to select one of the given groups on the connection.
-    ///
-    /// Returns `Ok(true)` if a group was selected, `Ok(false)` if none were
-    /// accepted, or `Err` on a connection-level error.
+    // Try to select one of the given groups on the connection.
+    //
+    // Returns `Ok(true)` if a group was selected, `Ok(false)` if none were
+    // accepted, or `Err` on a connection-level error.
     async fn try_select_group(conn: &mut PooledConnection, groups: &[String]) -> Result<bool> {
         for group in groups {
             match conn.select_group(group).await {
@@ -3311,15 +3311,15 @@ impl NntpClient {
         Ok(false)
     }
 
-    /// Fetch from a specific server, selecting a newsgroup first.
-    ///
-    /// Tries each group in order. If selecting a group fails, tries the next.
-    /// Once a group is selected, issues the BODY command. Retries on transient
-    /// errors up to `max_retries_per_server` times.
-    ///
-    /// Connection acquisition, group setup, and retry delay are bounded by a
-    /// per-attempt soft timeout. BODY payload reads use an active-time budget
-    /// that excludes deliberate transfer-policy waits.
+    // Fetch from a specific server, selecting a newsgroup first.
+    //
+    // Tries each group in order. If selecting a group fails, tries the next.
+    // Once a group is selected, issues the BODY command. Retries on transient
+    // errors up to `max_retries_per_server` times.
+    //
+    // Connection acquisition, group setup, and retry delay are bounded by a
+    // per-attempt soft timeout. BODY payload reads use an active-time budget
+    // that excludes deliberate transfer-policy waits.
     async fn fetch_from_server_with_groups(
         &self,
         server: ServerId,
@@ -3585,10 +3585,10 @@ impl NntpClient {
         }
     }
 
-    /// Check a batch of articles on a specific server, retrying on transient
-    /// errors and using pipelining when the server supports it.
-    /// Whether `server` still answers STAT, as far as this process has been
-    /// able to tell.
+    // Check a batch of articles on a specific server, retrying on transient
+    // errors and using pipelining when the server supports it.
+    // Whether `server` still answers STAT, as far as this process has been
+    // able to tell.
     fn server_supports_stat(&self, server: ServerId) -> bool {
         self.pool
             .server_configs()
@@ -3596,14 +3596,14 @@ impl NntpClient {
             .is_none_or(|config| crate::server_caps::supports_stat(&config.host, config.port))
     }
 
-    /// Existence by HEAD, for a server that has refused STAT outright and for
-    /// re-checking what STAT reported missing.
-    ///
-    /// One connection serves the whole batch. On a server that pipelines it is
-    /// one write and one round trip, exactly as a STAT batch is; otherwise a
-    /// round trip per article, but still no extra dials. Transient faults are
-    /// retried on the same server the way a STAT batch is, so a re-check is
-    /// not turned inconclusive by one dropped socket.
+    // Existence by HEAD, for a server that has refused STAT outright and for
+    // re-checking what STAT reported missing.
+    //
+    // One connection serves the whole batch. On a server that pipelines it is
+    // one write and one round trip, exactly as a STAT batch is; otherwise a
+    // round trip per article, but still no extra dials. Transient faults are
+    // retried on the same server the way a STAT batch is, so a re-check is
+    // not turned inconclusive by one dropped socket.
     async fn head_many_from_server(
         &self,
         server: ServerId,
@@ -3789,11 +3789,11 @@ impl NntpClient {
         }
     }
 
-    /// Fetch from a specific server, retrying on transient errors.
-    ///
-    /// Connection acquisition and retry delay are bounded by a per-attempt
-    /// soft timeout. BODY payload reads use an active-time budget that excludes
-    /// deliberate transfer-policy waits.
+    // Fetch from a specific server, retrying on transient errors.
+    //
+    // Connection acquisition and retry delay are bounded by a per-attempt
+    // soft timeout. BODY payload reads use an active-time budget that excludes
+    // deliberate transfer-policy waits.
     async fn fetch_from_server(
         &self,
         server: ServerId,
@@ -3881,7 +3881,7 @@ impl NntpClient {
     }
 }
 
-/// The type of article fetch to perform.
+// The type of article fetch to perform.
 #[derive(Debug, Clone, Copy)]
 enum FetchKind {
     Body,
@@ -3889,13 +3889,13 @@ enum FetchKind {
     Article,
 }
 
-/// Whether a decoded BODY outcome left the connection fully consumed and
-/// reusable for the rest of the pipelined batch.
-///
-/// See the blocking lane's twin of this helper: a 430 is a complete server
-/// response with no body to drain, so it must not mark a batch dirty and
-/// block the server's pipelining proof. Decode failures stay dirty because
-/// the decoder can fail on a body the transport never finished delivering.
+// Whether a decoded BODY outcome left the connection fully consumed and
+// reusable for the rest of the pipelined batch.
+//
+// See the blocking lane's twin of this helper: a 430 is a complete server
+// response with no body to drain, so it must not mark a batch dirty and
+// block the server's pipelining proof. Decode failures stay dirty because
+// the decoder can fail on a body the transport never finished delivering.
 fn decoded_result_keeps_connection(
     result: &std::result::Result<DecodedBody, DecodedBodyError>,
 ) -> bool {
@@ -3906,7 +3906,7 @@ fn decoded_result_keeps_connection(
     }
 }
 
-/// Returns true if the error is transient and the request might succeed on retry.
+// Returns true if the error is transient and the request might succeed on retry.
 fn is_transient(err: &NntpError) -> bool {
     matches!(
         err,
@@ -3960,12 +3960,12 @@ fn stat_cooldown_reason(err: &NntpError) -> Option<CooldownReason> {
     })
 }
 
-/// Whether the egress the connection runs over refused the body for quota.
-///
-/// The socket is sound, but it is bound to a route leg with no quota left;
-/// pooling it would hand the next request the same refusal. It is dropped
-/// without a health penalty so the next dial takes whatever leg the route
-/// now offers.
+// Whether the egress the connection runs over refused the body for quota.
+//
+// The socket is sound, but it is bound to a route leg with no quota left;
+// pooling it would hand the next request the same refusal. It is dropped
+// without a health penalty so the next dial takes whatever leg the route
+// now offers.
 fn is_egress_quota_rejection(err: &NntpError) -> bool {
     matches!(
         err,
@@ -3973,8 +3973,8 @@ fn is_egress_quota_rejection(err: &NntpError) -> bool {
     )
 }
 
-/// Returns true if the error indicates the connection itself is bad
-/// and should be discarded rather than returned to the pool.
+// Returns true if the error indicates the connection itself is bad
+// and should be discarded rather than returned to the pool.
 fn is_connection_error(err: &NntpError) -> bool {
     matches!(
         err,

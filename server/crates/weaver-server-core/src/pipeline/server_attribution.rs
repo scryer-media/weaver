@@ -11,10 +11,10 @@ impl Pipeline {
         }
     }
 
-    /// Batch reporting checkpoints independently of file floors: direct-store
-    /// and uuencode jobs must retain attribution too. The ordered DB writer
-    /// keeps older snapshots from replacing newer ones. Abrupt termination can
-    /// lose the current interval, as with other progress telemetry.
+    // Batch reporting checkpoints independently of file floors: direct-store
+    // and uuencode jobs must retain attribution too. The ordered DB writer
+    // keeps older snapshots from replacing newer ones. Abrupt termination can
+    // lose the current interval, as with other progress telemetry.
     pub(crate) fn flush_server_attribution(&mut self) {
         let snapshots: Vec<_> = self
             .dirty_server_attribution

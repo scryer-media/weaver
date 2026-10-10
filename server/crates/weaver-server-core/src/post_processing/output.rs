@@ -13,7 +13,7 @@ fn error(error: impl std::fmt::Display) -> StateError {
     StateError::Database(error.to_string())
 }
 
-/// Which recorded runs to list. An unset field matches every run.
+// Which recorded runs to list. An unset field matches every run.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct ScriptRunFilter {
     pub job_id: Option<u64>,
@@ -22,15 +22,15 @@ pub struct ScriptRunFilter {
     pub status: Option<ScriptStatus>,
 }
 
-/// One recorded run of a script, whatever started it.
+// One recorded run of a script, whatever started it.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ScriptRun {
-    /// Names the run's kept output, when `output_retained`.
+    // Names the run's kept output, when `output_retained`.
     pub id: String,
-    /// Position in the order runs were recorded; later runs are higher.
+    // Position in the order runs were recorded; later runs are higher.
     pub seq: i64,
     pub job_id: Option<u64>,
-    /// Known once the job has reached history.
+    // Known once the job has reached history.
     pub job_name: Option<String>,
     pub output_retained: bool,
     pub result: ScriptResult,
@@ -63,11 +63,11 @@ pub fn decode_output(bytes: &[u8], ceiling: usize) -> Result<String, StateError>
     Ok(String::from_utf8_lossy(&decoded).into_owned())
 }
 
-/// Kept output is small and written once, so it is compressed hard.
+// Kept output is small and written once, so it is compressed hard.
 const COMPRESSION_LEVEL: i32 = 19;
 
-/// Record a run and its kept output. `raw_bytes` is everything the script
-/// wrote, of which `output` is the newest part.
+// Record a run and its kept output. `raw_bytes` is everything the script
+// wrote, of which `output` is the newest part.
 pub async fn retain_output(
     db: Database,
     job_id: Option<u64>,
@@ -90,8 +90,8 @@ pub async fn retain_output(
     .map_err(error)?
 }
 
-/// A run counts against the failed-run allowance when it did not finish its
-/// work: it failed, ran out of time, or was cancelled.
+// A run counts against the failed-run allowance when it did not finish its
+// work: it failed, ran out of time, or was cancelled.
 fn retained_as_failure(status: ScriptStatus) -> bool {
     matches!(
         status,
@@ -102,9 +102,9 @@ fn retained_as_failure(status: ScriptStatus) -> bool {
     )
 }
 
-/// Of one job's runs (or one event kind's jobless runs), newest first, the
-/// ids the limits no longer keep: past the newest `runs_per_job`, only the
-/// newest `failed_runs_per_job` failed runs stay.
+// Of one job's runs (or one event kind's jobless runs), newest first, the
+// ids the limits no longer keep: past the newest `runs_per_job`, only the
+// newest `failed_runs_per_job` failed runs stay.
 fn expired_runs(runs: &[(String, bool)], limits: &EventScriptSettings) -> Vec<String> {
     let mut failed_kept = 0;
     runs.iter()
@@ -118,7 +118,7 @@ fn expired_runs(runs: &[(String, bool)], limits: &EventScriptSettings) -> Vec<St
         .collect()
 }
 
-/// A run's id and whether its stored `status` column counts it as failed.
+// A run's id and whether its stored `status` column counts it as failed.
 fn run_and_failure(row: &SqlRow) -> Result<(String, bool), StateError> {
     let failed =
         ScriptStatus::from_persisted(&row.text("status")?).is_some_and(retained_as_failure);
@@ -137,7 +137,7 @@ async fn delete_runs(tx: &mut SqlTx<'_>, ids: Vec<String>) -> Result<(), StateEr
     Ok(())
 }
 
-/// Apply the retention limits to every job and event kind at once.
+// Apply the retention limits to every job and event kind at once.
 async fn trim_all_tx(tx: &mut SqlTx<'_>, limits: &EventScriptSettings) -> Result<u64, StateError> {
     tx.execute(
         "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
@@ -182,8 +182,8 @@ async fn trim_all_tx(tx: &mut SqlTx<'_>, limits: &EventScriptSettings) -> Result
     Ok(orphans + trimmed)
 }
 
-/// Background trims after a retention limit was lowered: one at a time, and a
-/// request made while one runs folds into a single further pass.
+// Background trims after a retention limit was lowered: one at a time, and a
+// request made while one runs folds into a single further pass.
 #[derive(Default)]
 pub(crate) struct RetentionTrim {
     state: std::sync::Mutex<TrimState>,
@@ -203,8 +203,8 @@ impl RetentionTrim {
     }
 }
 
-/// Record a result that has no output to keep, such as a script that could
-/// not be started.
+// Record a result that has no output to keep, such as a script that could
+// not be started.
 pub(crate) async fn retain_result(
     db: Database,
     job_id: Option<u64>,
@@ -286,9 +286,9 @@ impl Database {
         .inspect(|_| committed.commit())
     }
 
-    /// Trim every job and event kind to the stored retention limits, in the
-    /// background, after a limit was lowered. Returns at once; see
-    /// [`Database::script_output_trims_settled`].
+    // Trim every job and event kind to the stored retention limits, in the
+    // background, after a limit was lowered. Returns at once; see
+    // [`Database::script_output_trims_settled`].
     pub fn request_script_output_trim(&self) {
         let trim = &self.script_runtime.trim;
         {
@@ -343,7 +343,7 @@ impl Database {
         }
     }
 
-    /// Wait until every trim requested before this call has finished.
+    // Wait until every trim requested before this call has finished.
     pub async fn script_output_trims_settled(&self) {
         let trim = &self.script_runtime.trim;
         let target = trim.state().requested;
@@ -358,7 +358,7 @@ impl Database {
         }
     }
 
-    /// Apply the stored retention limits to every recorded run now.
+    // Apply the stored retention limits to every recorded run now.
     pub fn trim_script_outputs(&self) -> Result<u64, StateError> {
         let limits = self.post_processing_settings()?.event_scripts;
         let datastore = self.datastore();
@@ -417,8 +417,8 @@ impl Database {
         })
     }
 
-    /// The job's runs that are not part of a post-processing pass: its event
-    /// scripts, and the post-processing scripts nothing waited for.
+    // The job's runs that are not part of a post-processing pass: its event
+    // scripts, and the post-processing scripts nothing waited for.
     pub fn event_script_results(&self, job_id: u64) -> Result<Vec<ScriptResult>, StateError> {
         let datastore = self.datastore();
         let job_id = i64::try_from(job_id).map_err(error)?;
@@ -431,8 +431,8 @@ impl Database {
             .collect())
     }
 
-    /// Recorded runs, latest first. `before` continues a listing below the
-    /// `seq` of the last run already returned.
+    // Recorded runs, latest first. `before` continues a listing below the
+    // `seq` of the last run already returned.
     pub fn script_runs(
         &self,
         filter: ScriptRunFilter,
@@ -476,7 +476,7 @@ impl Database {
         })
     }
 
-    /// How many recorded runs the filter matches, across every page.
+    // How many recorded runs the filter matches, across every page.
     pub fn script_run_count(&self, filter: &ScriptRunFilter) -> Result<u64, StateError> {
         let datastore = self.datastore();
         let (conditions, args) = script_run_conditions(filter)?;
@@ -494,8 +494,8 @@ impl Database {
         u64::try_from(total).map_err(error)
     }
 
-    /// How many of the runs the filter matches ended each way. The filter's
-    /// own status is left out, so the answer covers every status at once.
+    // How many of the runs the filter matches ended each way. The filter's
+    // own status is left out, so the answer covers every status at once.
     pub fn script_run_status_counts(
         &self,
         filter: &ScriptRunFilter,
@@ -524,7 +524,7 @@ impl Database {
     }
 }
 
-/// The SQL conditions, over `script_outputs o`, that select the runs a filter matches.
+// The SQL conditions, over `script_outputs o`, that select the runs a filter matches.
 fn script_run_conditions(
     filter: &ScriptRunFilter,
 ) -> Result<(Vec<&'static str>, Vec<SqlArg>), StateError> {
@@ -554,7 +554,7 @@ fn script_run_conditions(
     Ok((conditions, args))
 }
 
-/// Archive moves active rows to history, so deletion is explicit rather than an FK cascade.
+// Archive moves active rows to history, so deletion is explicit rather than an FK cascade.
 pub(crate) async fn delete_script_state_tx(
     tx: &mut SqlTx<'_>,
     job_id: i64,
@@ -632,7 +632,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Record a run whose kept output is everything it wrote.
+    // Record a run whose kept output is everything it wrote.
     async fn retain_output(
         db: Database,
         job_id: Option<u64>,

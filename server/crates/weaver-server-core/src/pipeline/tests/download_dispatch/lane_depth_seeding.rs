@@ -1,4 +1,4 @@
-//! Every configured server has a depth explorer before the first lane runs.
+// Every configured server has a depth explorer before the first lane runs.
 
 use super::*;
 use crate::pipeline::download::transport::DownloadLaneMode;
@@ -31,12 +31,12 @@ fn server(
     }
 }
 
-/// The first lease a lane takes is dispatched pipelined.
-///
-/// Nothing had built an explorer for a server until its first BODY response
-/// came back, so the opening of every download — every lane, every job — was
-/// dispatched sequential and gave back a whole round trip per article before
-/// the ladder could even begin.
+// The first lease a lane takes is dispatched pipelined.
+//
+// Nothing had built an explorer for a server until its first BODY response
+// came back, so the opening of every download — every lane, every job — was
+// dispatched sequential and gave back a whole round trip per article before
+// the ladder could even begin.
 #[tokio::test]
 async fn the_first_lease_on_a_pipelining_server_is_already_pipelined() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -55,7 +55,7 @@ async fn the_first_lease_on_a_pipelining_server_is_already_pipelined() {
     );
 }
 
-/// The rung the last run proved is where this one starts.
+// The rung the last run proved is where this one starts.
 #[tokio::test]
 async fn a_proven_depth_seeds_the_first_lease() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -74,9 +74,9 @@ async fn a_proven_depth_seeds_the_first_lease() {
     );
 }
 
-/// A server that does not pipeline, or whose capability has never been
-/// established, is seeded too — and stays sequential. The entry exists so the
-/// per-server lookup finds a definite answer rather than a missing one.
+// A server that does not pipeline, or whose capability has never been
+// established, is seeded too — and stays sequential. The entry exists so the
+// per-server lookup finds a definite answer rather than a missing one.
 #[tokio::test]
 async fn a_server_without_a_known_capability_is_seeded_sequential() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -125,8 +125,8 @@ async fn a_server_without_a_known_capability_is_seeded_sequential() {
     );
 }
 
-/// Re-seeding against a new pool layout keeps what a surviving server had
-/// already measured, matched by stable id rather than by position.
+// Re-seeding against a new pool layout keeps what a surviving server had
+// already measured, matched by stable id rather than by position.
 #[tokio::test]
 async fn reseeding_carries_a_surviving_servers_measurements_across() {
     let temp_dir = tempfile::tempdir().unwrap();

@@ -1,12 +1,12 @@
-//! HTTP request counters and latency, keyed by **route template**.
-//!
-//! Raw request paths are never used as a label: `/api/jobs/{job_id}/nzb` would
-//! otherwise mint one time series per job and blow the exporter's cardinality
-//! open. Every request is classified into a small closed set of templates, and
-//! anything unrecognised lands in `other`.
-//!
-//! Storage is a fixed array of atomics indexed by that route enum, so the
-//! middleware never allocates, never locks and never hashes.
+// HTTP request counters and latency, keyed by **route template**.
+//
+// Raw request paths are never used as a label: `/api/jobs/{job_id}/nzb` would
+// otherwise mint one time series per job and blow the exporter's cardinality
+// open. Every request is classified into a small closed set of templates, and
+// anything unrecognised lands in `other`.
+//
+// Storage is a fixed array of atomics indexed by that route enum, so the
+// middleware never allocates, never locks and never hashes.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,7 +20,7 @@ use weaver_server_core::operations::instrumentation::{
     AtomicHistogram, HTTP_REQUEST_DURATION_BOUNDS, HttpMetricsSnapshot, HttpRequestCount,
 };
 
-/// Route templates the exporter reports. Closed set by design.
+// Route templates the exporter reports. Closed set by design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteLabel {
     Graphql,
@@ -91,11 +91,11 @@ impl RouteLabel {
         }
     }
 
-    /// Classify a request path into a template.
-    ///
-    /// `base_url` is stripped first so a deployment served under a prefix
-    /// produces the same labels as one served at the root. Job-scoped paths are
-    /// matched structurally so the job id never reaches a label.
+    // Classify a request path into a template.
+    //
+    // `base_url` is stripped first so a deployment served under a prefix
+    // produces the same labels as one served at the root. Job-scoped paths are
+    // matched structurally so the job id never reaches a label.
     pub(crate) fn classify(path: &str, base_url: &str) -> Self {
         let path = if !base_url.is_empty() {
             path.strip_prefix(base_url).unwrap_or(path)
@@ -139,15 +139,15 @@ impl RouteLabel {
     }
 }
 
-/// HTTP methods that get their own label. Anything else is folded into `other`
-/// so a scanner probing exotic verbs cannot mint series.
+// HTTP methods that get their own label. Anything else is folded into `other`
+// so a scanner probing exotic verbs cannot mint series.
 const METHODS: [&str; 6] = ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"];
-/// Status codes reported exactly. This is the closed set weaver's own handlers
-/// and middleware produce (plus the class boundaries); anything outside it
-/// collapses onto its class boundary (`200`, `300`, `400`, `500`) so a scanner
-/// cannot mint series, while the codes an operator actually alerts on — 401/403
-/// auth, 404, 413 body limit, 421 Host allowlist, 429, 503 RPC gate — stay
-/// distinguishable.
+// Status codes reported exactly. This is the closed set weaver's own handlers
+// and middleware produce (plus the class boundaries); anything outside it
+// collapses onto its class boundary (`200`, `300`, `400`, `500`) so a scanner
+// cannot mint series, while the codes an operator actually alerts on — 401/403
+// auth, 404, 413 body limit, 421 Host allowlist, 429, 503 RPC gate — stay
+// distinguishable.
 const STATUS_CODES: [u16; 23] = [
     101, 200, 201, 204, 206, 300, 301, 302, 304, 400, 401, 403, 404, 405, 408, 413, 415, 421, 429,
     500, 501, 502, 503,
@@ -165,9 +165,9 @@ fn method_label(index: usize) -> &'static str {
     METHODS.get(index).copied().unwrap_or("other")
 }
 
-/// Map a status code onto its slot: exact when it is in [`STATUS_CODES`],
-/// otherwise the class boundary (`101` stands in for every 1xx, since the
-/// GraphQL websocket upgrade is the only informational response weaver sends).
+// Map a status code onto its slot: exact when it is in [`STATUS_CODES`],
+// otherwise the class boundary (`101` stands in for every 1xx, since the
+// GraphQL websocket upgrade is the only informational response weaver sends).
 fn status_slot(status: u16) -> usize {
     if let Some(slot) = STATUS_CODES.iter().position(|code| *code == status) {
         return slot;
@@ -189,14 +189,14 @@ fn status_label(slot: usize) -> u16 {
     STATUS_CODES.get(slot).copied().unwrap_or(500)
 }
 
-/// Fixed-size HTTP counters. One instance lives for the process.
-///
-/// Not a per-segment path, but written on every request, so it is built to the
-/// same standard: array indexing plus `Relaxed` `fetch_add`s, no allocation and
-/// no lock on the request path.
+// Fixed-size HTTP counters. One instance lives for the process.
+//
+// Not a per-segment path, but written on every request, so it is built to the
+// same standard: array indexing plus `Relaxed` `fetch_add`s, no allocation and
+// no lock on the request path.
 #[derive(Debug)]
 pub(crate) struct HttpMetrics {
-    /// `[route][method][status_slot]`.
+    // `[route][method][status_slot]`.
     requests: Vec<AtomicU64>,
     duration: Vec<AtomicHistogram>,
 }
@@ -225,7 +225,7 @@ impl HttpMetrics {
         (route * Self::METHOD_SLOTS + method) * STATUS_SLOTS + status
     }
 
-    /// Record one completed request. Array indexing plus `Relaxed` adds.
+    // Record one completed request. Array indexing plus `Relaxed` adds.
     pub(crate) fn record(
         &self,
         route: RouteLabel,
@@ -238,9 +238,9 @@ impl HttpMetrics {
         self.duration[route.index()].observe(elapsed);
     }
 
-    /// Copy the counters out. Scrape-time only; allocates. Cells that have
-    /// never been hit are omitted, but every route keeps a duration series so
-    /// the histogram families pre-exist.
+    // Copy the counters out. Scrape-time only; allocates. Cells that have
+    // never been hit are omitted, but every route keeps a duration series so
+    // the histogram families pre-exist.
     pub(crate) fn snapshot(&self) -> HttpMetricsSnapshot {
         let mut requests = Vec::new();
         for route in RouteLabel::ALL {
@@ -270,7 +270,7 @@ impl HttpMetrics {
     }
 }
 
-/// Shared handle installed as an axum extension and read by the exporter.
+// Shared handle installed as an axum extension and read by the exporter.
 #[derive(Clone, Debug)]
 pub(crate) struct HttpMetricsHandle {
     metrics: Arc<HttpMetrics>,
@@ -290,10 +290,10 @@ impl HttpMetricsHandle {
     }
 }
 
-/// Axum middleware recording one observation per request.
-///
-/// `/metrics` is skipped: counting the scrape in the numbers the scrape returns
-/// makes every rate self-referential and tells an operator nothing.
+// Axum middleware recording one observation per request.
+//
+// `/metrics` is skipped: counting the scrape in the numbers the scrape returns
+// makes every rate self-referential and tells an operator nothing.
 pub(crate) async fn track_requests(
     handle: HttpMetricsHandle,
     request: Request,

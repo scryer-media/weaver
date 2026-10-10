@@ -2,8 +2,8 @@ mod common;
 
 use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 
-/// A filesystem path as a GraphQL string literal, so a Windows separator does
-/// not read as an escape.
+// A filesystem path as a GraphQL string literal, so a Windows separator does
+// not read as an escape.
 fn gql_string(path: &std::path::Path) -> String {
     serde_json::to_string(&*path.to_string_lossy()).unwrap()
 }

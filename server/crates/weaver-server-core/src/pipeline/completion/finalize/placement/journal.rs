@@ -73,7 +73,7 @@ pub(crate) struct Transaction {
 #[derive(Default)]
 pub(crate) struct RecoveryReport {
     pub transactions: Vec<Transaction>,
-    /// Includes rollback and completion cleanup, even without pending bindings.
+    // Includes rollback and completion cleanup, even without pending bindings.
     pub replayed: bool,
 }
 

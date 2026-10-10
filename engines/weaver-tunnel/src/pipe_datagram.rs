@@ -1,9 +1,9 @@
-//! A WireGuard session as the carrier of another WireGuard tunnel.
-//!
-//! The tunnel stacked on top sends its encrypted packets through a UDP socket
-//! inside the session beneath it. Each such socket holds the session's
-//! activity guard and budget permit for as long as it lives, so the session
-//! beneath is never retired as idle while a tunnel still rides on it.
+// A WireGuard session as the carrier of another WireGuard tunnel.
+//
+// The tunnel stacked on top sends its encrypted packets through a UDP socket
+// inside the session beneath it. Each such socket holds the session's
+// activity guard and budget permit for as long as it lives, so the session
+// beneath is never retired as idle while a tunnel still rides on it.
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -70,7 +70,7 @@ impl DatagramTransport for SessionDatagrams {
     }
 }
 
-/// A socket inside the session beneath, holding that session open.
+// A socket inside the session beneath, holding that session open.
 struct HeldSocket {
     socket: Arc<dyn DatagramSocket>,
     _activity: OwnedRwLockReadGuard<()>,

@@ -1,5 +1,5 @@
-//! Scripts: files in an operator-configured directory, wired up as saved
-//! instances that each run one script on one trigger.
+// Scripts: files in an operator-configured directory, wired up as saved
+// instances that each run one script on one trigger.
 
 pub mod callbacks;
 pub mod directives;

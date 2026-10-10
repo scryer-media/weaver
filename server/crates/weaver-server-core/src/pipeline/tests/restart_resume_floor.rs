@@ -1,22 +1,22 @@
-//! A job that resumes after a restart must keep advancing its durable floor.
-//!
-//! The restored prefix is committed straight into assembly and never enters the
-//! write reorder buffer, so the buffer's cursor has to be told where those bytes
-//! stop. If it is not, every arriving part sits above a cursor still at zero,
-//! the sequential drain never releases anything, and the file's contiguous
-//! floor — the only input to the job's durable floor — stays pinned at the value
-//! the restart credited it for the rest of the file's life.
+// A job that resumes after a restart must keep advancing its durable floor.
+//
+// The restored prefix is committed straight into assembly and never enters the
+// write reorder buffer, so the buffer's cursor has to be told where those bytes
+// stop. If it is not, every arriving part sits above a cursor still at zero,
+// the sequential drain never releases anything, and the file's contiguous
+// floor — the only input to the job's durable floor — stays pinned at the value
+// the restart credited it for the rest of the file's life.
 
 use super::*;
 
 use crate::jobs::handle::RestoreJobRequest;
 use crate::pipeline::tests::yenc_compatibility::deliver;
 
-/// Declared segment sizes are ENCODED, the payloads are DECODED, and the two
-/// deliberately disagree here: a prefix of 8 decoded bytes covers two parts on
-/// disk while a walk over declared sizes can only prove one. That gap is the
-/// whole reason the resumed cursor cannot be a byte count carried over from the
-/// restart, and a fixture where the two agree would never show it.
+// Declared segment sizes are ENCODED, the payloads are DECODED, and the two
+// deliberately disagree here: a prefix of 8 decoded bytes covers two parts on
+// disk while a walk over declared sizes can only prove one. That gap is the
+// whole reason the resumed cursor cannot be a byte count carried over from the
+// restart, and a fixture where the two agree would never show it.
 const DECLARED_SEGMENT_BYTES: u32 = 8;
 const DECODED_PAYLOADS: [&[u8]; 5] = [b"head", b"tail", b"more", b"tail", b"last"];
 
@@ -27,9 +27,9 @@ fn decoded_offset(ordinal: usize) -> u64 {
         .sum()
 }
 
-/// Bring up a job in exactly the state a restart leaves it in: a partial file on
-/// disk, a persisted contiguous floor over it, and the ordinals that floor
-/// covers committed without ever being fetched.
+// Bring up a job in exactly the state a restart leaves it in: a partial file on
+// disk, a persisted contiguous floor over it, and the ordinals that floor
+// covers committed without ever being fetched.
 async fn restore_resumed_job(
     temp: &TempDir,
     id: u64,
@@ -235,8 +235,8 @@ async fn resumed_file_advances_its_durable_floor_on_in_order_arrivals() {
     assert_eq!(std::fs::read(&path).unwrap(), b"headtailmoretaillast");
 }
 
-/// A file with no persisted floor is not resumed, and nothing about it may
-/// change: its cursor starts at zero because its first part really is coming.
+// A file with no persisted floor is not resumed, and nothing about it may
+// change: its cursor starts at zero because its first part really is coming.
 #[tokio::test]
 async fn a_file_without_a_restored_prefix_still_starts_at_zero() {
     let temp = tempfile::tempdir().unwrap();
@@ -280,11 +280,11 @@ async fn a_file_without_a_restored_prefix_still_starts_at_zero() {
     assert_eq!(std::fs::read(&path).unwrap(), b"headtail");
 }
 
-/// The restart guard's own units: it hands out one article at a time exactly
-/// while the bytes accepted above the durable floor exceed its lead limit, so a
-/// floor that cannot move is a job that never leaves that state. The limit is a
-/// process-wide constant, so the fixture is written relative to it rather than
-/// by lowering it.
+// The restart guard's own units: it hands out one article at a time exactly
+// while the bytes accepted above the durable floor exceed its lead limit, so a
+// floor that cannot move is a job that never leaves that state. The limit is a
+// process-wide constant, so the fixture is written relative to it rather than
+// by lowering it.
 #[tokio::test]
 async fn an_advancing_floor_brings_a_resumed_job_back_within_the_restart_lead() {
     // The admission verdict is compared through its metric label: the decision

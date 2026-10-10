@@ -304,10 +304,10 @@ impl RawMetricsHistoryPoint {
 }
 
 impl Database {
-    /// Write one sample and bring every rollup and retention window up to
-    /// date with it. The periodic sampler uses
-    /// [`Database::record_metrics_history_point`] instead, which writes only
-    /// what its cadence says is due.
+    // Write one sample and bring every rollup and retention window up to
+    // date with it. The periodic sampler uses
+    // [`Database::record_metrics_history_point`] instead, which writes only
+    // what its cadence says is due.
     pub fn record_metrics_history_sample(
         &self,
         recorded_at_epoch_sec: i64,
@@ -322,7 +322,7 @@ impl Database {
         )
     }
 
-    /// Write one raw sample plus whatever `plan` names.
+    // Write one raw sample plus whatever `plan` names.
     pub fn record_metrics_history_point(
         &self,
         recorded_at_epoch_sec: i64,
@@ -1025,7 +1025,7 @@ fn weighted_mean(values: impl Iterator<Item = (f64, f64)>) -> f64 {
     }
 }
 
-/// How many jobs are in each status, in `JOB_STATUS_KEYS` order.
+// How many jobs are in each status, in `JOB_STATUS_KEYS` order.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct JobStatusCounts([f64; NUM_JOB_STATUS_METRICS]);
 
@@ -1050,7 +1050,7 @@ impl JobStatusCounts {
         Self::from_statuses(jobs.iter().map(|job| &job.status))
     }
 
-    /// Jobs whose status is named `key` in `JOB_STATUS_KEYS`.
+    // Jobs whose status is named `key` in `JOB_STATUS_KEYS`.
     pub fn count(&self, key: &str) -> f64 {
         JOB_STATUS_KEYS
             .iter()
@@ -1059,16 +1059,16 @@ impl JobStatusCounts {
     }
 }
 
-/// Which parts of the metrics history a sample writes besides its raw point.
-///
-/// A rollup bucket is aggregated once, when the samples have moved past it,
-/// and each tier is pruned at most once per its own resolution, so a steady
-/// stream of raw samples costs one small write each.
+// Which parts of the metrics history a sample writes besides its raw point.
+//
+// A rollup bucket is aggregated once, when the samples have moved past it,
+// and each tier is pruned at most once per its own resolution, so a steady
+// stream of raw samples costs one small write each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MetricsHistoryWritePlan {
-    /// A timestamp inside the 5-minute bucket to aggregate, if one closed.
+    // A timestamp inside the 5-minute bucket to aggregate, if one closed.
     pub rollup_5m_bucket: Option<i64>,
-    /// A timestamp inside the 1-hour bucket to aggregate, if one closed.
+    // A timestamp inside the 1-hour bucket to aggregate, if one closed.
     pub rollup_1h_bucket: Option<i64>,
     pub prune_raw: bool,
     pub prune_5m: bool,
@@ -1076,8 +1076,8 @@ pub struct MetricsHistoryWritePlan {
 }
 
 impl MetricsHistoryWritePlan {
-    /// Refresh the buckets holding `recorded_at_epoch_sec` and prune every
-    /// tier: what a one-off sample with no history of its own needs.
+    // Refresh the buckets holding `recorded_at_epoch_sec` and prune every
+    // tier: what a one-off sample with no history of its own needs.
     pub fn eager(recorded_at_epoch_sec: i64) -> Self {
         let recorded_at_epoch_sec = quantize_raw_timestamp(recorded_at_epoch_sec);
         Self {
@@ -1094,20 +1094,20 @@ const RAW_PRUNE_EVERY_SECS: i64 = ROLLUP_5M_RESOLUTION_SECS;
 const ROLLUP_5M_PRUNE_EVERY_SECS: i64 = ROLLUP_1H_RESOLUTION_SECS;
 const ROLLUP_1H_PRUNE_EVERY_SECS: i64 = 24 * 60 * 60;
 
-/// The sampler's memory of what it has already written, so each sample only
-/// writes what is due.
+// The sampler's memory of what it has already written, so each sample only
+// writes what is due.
 #[derive(Debug, Clone, Default)]
 pub struct MetricsHistoryCadence {
     last_sample_epoch_sec: Option<i64>,
     last_prune_raw: Option<i64>,
     last_prune_5m: Option<i64>,
     last_prune_1h: Option<i64>,
-    /// The values of the last written sample, timestamp zeroed.
+    // The values of the last written sample, timestamp zeroed.
     last_written: Option<RawMetricsHistoryPoint>,
 }
 
 impl MetricsHistoryCadence {
-    /// A sample's values with the timestamp zeroed, for comparing samples.
+    // A sample's values with the timestamp zeroed, for comparing samples.
     pub fn sample_values(
         snapshot: &MetricsSnapshot,
         jobs: &JobStatusCounts,
@@ -1115,10 +1115,10 @@ impl MetricsHistoryCadence {
         RawMetricsHistoryPoint::from_snapshot(0, snapshot, jobs)
     }
 
-    /// Whether writing `values` under `plan` would only repeat the last
-    /// written sample: the values are unchanged and no roll-up closes and no
-    /// prune falls due with it. Every roll-up bucket still gets the sample
-    /// that opens it, so an idle daemon writes once per bucket, not per tick.
+    // Whether writing `values` under `plan` would only repeat the last
+    // written sample: the values are unchanged and no roll-up closes and no
+    // prune falls due with it. Every roll-up bucket still gets the sample
+    // that opens it, so an idle daemon writes once per bucket, not per tick.
     pub fn repeats_last_write(
         &self,
         plan: &MetricsHistoryWritePlan,
@@ -1132,8 +1132,8 @@ impl MetricsHistoryCadence {
             && self.last_written.as_ref() == Some(values)
     }
 
-    /// [`Self::commit`], remembering the written values for
-    /// [`Self::repeats_last_write`].
+    // [`Self::commit`], remembering the written values for
+    // [`Self::repeats_last_write`].
     pub fn commit_written(
         &mut self,
         recorded_at_epoch_sec: i64,
@@ -1144,10 +1144,10 @@ impl MetricsHistoryCadence {
         self.last_written = Some(values);
     }
 
-    /// What the sample taken at `recorded_at_epoch_sec` should write.
-    ///
-    /// The first sample closes the buckets just before its own, so a bucket
-    /// left open when the process last stopped is still aggregated.
+    // What the sample taken at `recorded_at_epoch_sec` should write.
+    //
+    // The first sample closes the buckets just before its own, so a bucket
+    // left open when the process last stopped is still aggregated.
     pub fn plan(&self, recorded_at_epoch_sec: i64) -> MetricsHistoryWritePlan {
         let now = quantize_raw_timestamp(recorded_at_epoch_sec);
         let closed = |resolution: i64| {
@@ -1170,8 +1170,8 @@ impl MetricsHistoryCadence {
         }
     }
 
-    /// Record that the sample planned at `recorded_at_epoch_sec` was written.
-    /// A failed write is not committed, so its work is planned again.
+    // Record that the sample planned at `recorded_at_epoch_sec` was written.
+    // A failed write is not committed, so its work is planned again.
     pub fn commit(&mut self, recorded_at_epoch_sec: i64, plan: &MetricsHistoryWritePlan) {
         let now = quantize_raw_timestamp(recorded_at_epoch_sec);
         self.last_sample_epoch_sec = Some(now);

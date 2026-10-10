@@ -349,8 +349,8 @@ fn logical_backup_before_egress_catalog_restores_system_defaults() {
     assert_eq!(target.list_proxy_profiles().unwrap().len(), 1);
 }
 
-/// Remove a row the way a restore of an older backup or a hand edit does:
-/// behind the store's reference checks.
+// Remove a row the way a restore of an older backup or a hand edit does:
+// behind the store's reference checks.
 fn delete_row_behind_the_store(db: &Database, sql: &'static str, id: u32) {
     let store = db.datastore();
     db.run_sql_blocking(async move {

@@ -86,10 +86,10 @@ async fn concurrent_metrics() {
     assert_eq!(snap.segments_downloaded, 10 * 1000);
 }
 
-/// The three published rate gauges were once lifetime averages since process
-/// start, so a box that downloaded hard for an hour and then stalled kept
-/// reporting a healthy rate forever. They are short-window rates now; these
-/// tests pin that they follow the window rather than the process lifetime.
+// The three published rate gauges were once lifetime averages since process
+// start, so a box that downloaded hard for an hour and then stalled kept
+// reporting a healthy rate forever. They are short-window rates now; these
+// tests pin that they follow the window rather than the process lifetime.
 #[test]
 fn rate_gauges_reflect_the_recent_window_not_the_process_lifetime() {
     let m = PipelineMetrics::new();
@@ -197,9 +197,9 @@ fn instrumentation_registries_are_reachable_from_the_shared_metrics_handle() {
     );
 }
 
-/// `ALL` is what the Prometheus exporter iterates to build its label sets, so
-/// a variant missing from `ALL` silently drops a series. Pin the lists against
-/// the dense code space every variant already round-trips through.
+// `ALL` is what the Prometheus exporter iterates to build its label sets, so
+// a variant missing from `ALL` silently drops a series. Pin the lists against
+// the dense code space every variant already round-trips through.
 #[test]
 fn variant_lists_cover_every_code() {
     for state in DownloadPressureState::ALL {

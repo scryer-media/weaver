@@ -1,9 +1,9 @@
-//! Durable state for post-processing: settings, the scripts root, and the
-//! per-job script results appended to the job's own rows.
-//!
-//! Settings live in the settings KV, and results live on `active_jobs` /
-//! `job_history` beside the summary the rest of the product already reads.
-//! What runs is kept as script instances, in tables of their own.
+// Durable state for post-processing: settings, the scripts root, and the
+// per-job script results appended to the job's own rows.
+//
+// Settings live in the settings KV, and results live on `active_jobs` /
+// `job_history` beside the summary the rest of the product already reads.
+// What runs is kept as script instances, in tables of their own.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,10 +30,10 @@ pub enum ScriptDirectoryError {
     Io(#[from] std::io::Error),
 }
 
-/// Create, canonicalize, and prove that a scripts root can be listed.
-///
-/// A read-only bind mount is valid when it already exists: only creating a
-/// previously absent directory requires write access to its parent.
+// Create, canonicalize, and prove that a scripts root can be listed.
+//
+// A read-only bind mount is valid when it already exists: only creating a
+// previously absent directory requires write access to its parent.
 pub fn normalize_script_directory(path: &Path) -> Result<PathBuf, ScriptDirectoryError> {
     if !path.is_absolute() {
         return Err(ScriptDirectoryError::RelativePath);
@@ -48,10 +48,10 @@ pub fn normalize_script_directory(path: &Path) -> Result<PathBuf, ScriptDirector
 }
 
 impl Database {
-    /// Return the persisted scripts root, seeding it exactly once when absent.
-    ///
-    /// Environment input is intentionally accepted only here; a stored value
-    /// is always authoritative after this first settlement.
+    // Return the persisted scripts root, seeding it exactly once when absent.
+    //
+    // Environment input is intentionally accepted only here; a stored value
+    // is always authoritative after this first settlement.
     pub fn initialize_post_processing_script_directory(
         &self,
         data_dir: &Path,
@@ -80,10 +80,10 @@ impl Database {
             })
     }
 
-    /// Persist a validated directory and, in the same transaction, turn off
-    /// every instance: each names a script, and a name in the new directory
-    /// is not the script the operator wired up. What was saved in them is
-    /// kept. Script files themselves are never touched.
+    // Persist a validated directory and, in the same transaction, turn off
+    // every instance: each names a script, and a name in the new directory
+    // is not the script the operator wired up. What was saved in them is
+    // kept. Script files themselves are never touched.
     pub fn replace_post_processing_script_directory(
         &self,
         directory: &Path,
@@ -139,7 +139,7 @@ impl Database {
             .map(Option::unwrap_or_default)
     }
 
-    /// Read the settings and the scripts root from one database snapshot.
+    // Read the settings and the scripts root from one database snapshot.
     pub(crate) fn post_processing_script_admission(
         &self,
     ) -> Result<(PostProcessingSettings, PathBuf), StateError> {
@@ -193,10 +193,10 @@ impl Database {
         Ok(())
     }
 
-    /// Save a full settings update while optionally retaining the extension
-    /// policy already stored in the settings document. The read, merge, and
-    /// write share one transaction so an omitted GraphQL field cannot erase a
-    /// concurrent extension-policy update.
+    // Save a full settings update while optionally retaining the extension
+    // policy already stored in the settings document. The read, merge, and
+    // write share one transaction so an omitted GraphQL field cannot erase a
+    // concurrent extension-policy update.
     pub fn save_post_processing_settings_preserving_extensions(
         &self,
         settings: PostProcessingSettings,
@@ -264,7 +264,7 @@ impl Database {
         Ok(settings)
     }
 
-    /// Stamp a job's script results and rollup summary onto whichever of its rows exist.
+    // Stamp a job's script results and rollup summary onto whichever of its rows exist.
     pub fn save_job_post_processing_results(
         &self,
         job_id: u64,
@@ -306,7 +306,7 @@ impl Database {
         })
     }
 
-    /// The job's script results, preferring the live row and falling back to history.
+    // The job's script results, preferring the live row and falling back to history.
     pub fn job_post_processing_results(
         &self,
         job_id: u64,
@@ -331,7 +331,7 @@ impl Database {
         })
     }
 
-    /// Record that a job's scripts have started, so a crash is recoverable.
+    // Record that a job's scripts have started, so a crash is recoverable.
     pub fn mark_job_post_processing_running(&self, job_id: u64) -> Result<(), StateError> {
         self.mark_job_post_processing_resumed(job_id, &PostProcessingResume::default())
     }
@@ -497,11 +497,11 @@ impl Database {
         })
     }
 
-    /// Mark every job that was mid-post-processing when weaver stopped.
-    ///
-    /// One statement replaces the old run/attempt sweep: a `running` summary is
-    /// only ever left behind by a process that died, because a completed pass
-    /// always overwrites it.
+    // Mark every job that was mid-post-processing when weaver stopped.
+    //
+    // One statement replaces the old run/attempt sweep: a `running` summary is
+    // only ever left behind by a process that died, because a completed pass
+    // always overwrites it.
     pub fn recover_interrupted_post_processing(&self) -> Result<u64, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -515,7 +515,7 @@ impl Database {
         })
     }
 
-    /// The summary currently recorded for a job, used by restart recovery.
+    // The summary currently recorded for a job, used by restart recovery.
     pub fn job_post_processing_summary(
         &self,
         job_id: u64,
@@ -538,8 +538,8 @@ impl Database {
     }
 }
 
-/// Whether `next` keeps fewer runs than `previous` did. Raising a limit
-/// deletes nothing, so it needs no trim.
+// Whether `next` keeps fewer runs than `previous` did. Raising a limit
+// deletes nothing, so it needs no trim.
 fn retention_lowered(previous: &PostProcessingSettings, next: &PostProcessingSettings) -> bool {
     let (previous, next) = (&previous.event_scripts, &next.event_scripts);
     next.script_output_runs_per_job < previous.script_output_runs_per_job

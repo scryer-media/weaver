@@ -12,15 +12,15 @@ use crate::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use crate::pipeline::Pipeline;
 use crate::servers::{ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod};
 
-/// Origin of a global download pause, so the download-block presentation can
-/// distinguish a schedule-driven pause from a manual one across every refresh.
+// Origin of a global download pause, so the download-block presentation can
+// distinguish a schedule-driven pause from a manual one across every refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GlobalPause {
-    /// Not globally paused; a download quota may still block.
+    // Not globally paused; a download quota may still block.
     Running,
-    /// Operator pressed pause.
+    // Operator pressed pause.
     Manual,
-    /// A bandwidth schedule paused downloads.
+    // A bandwidth schedule paused downloads.
     Scheduled,
 }
 
@@ -28,7 +28,7 @@ const BANDWIDTH_LEDGER_RETENTION_DAYS: i64 = 90;
 const BANDWIDTH_USAGE_FLUSH_BYTES: u64 = 1024 * 1024 * 1024;
 const BANDWIDTH_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
-/// One quota period, in local time.
+// One quota period, in local time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QuotaWindow {
     period: Range<DateTime<Local>>,
@@ -50,11 +50,11 @@ impl QuotaWindow {
     }
 }
 
-/// The per-minute download ledger behind the bandwidth graph.
-///
-/// It records every BODY byte once, tagged with whether quota metering was on
-/// when it arrived, and flushes in batches. Download quotas themselves live on
-/// each egress and server; nothing here refuses work.
+// The per-minute download ledger behind the bandwidth graph.
+//
+// It records every BODY byte once, tagged with whether quota metering was on
+// when it arrived, and flushes in batches. Download quotas themselves live on
+// each egress and server; nothing here refuses work.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BandwidthLedgerRuntime {
     metering_suspended: bool,
@@ -296,7 +296,7 @@ fn compute_monthly_window(now: DateTime<Local>, reset_day: u8, reset_minutes: u1
     QuotaWindow::new(start, end)
 }
 
-/// The quota period containing `now`, or `None` for a one-time quota.
+// The quota period containing `now`, or `None` for a one-time quota.
 pub(crate) fn compute_window(
     now: DateTime<Local>,
     quota: &ServerDownloadQuotaConfig,
@@ -318,8 +318,8 @@ pub(crate) fn compute_window(
 }
 
 impl Pipeline {
-    /// The current global-pause origin, so every download-block refresh reports
-    /// a consistent Scheduled vs ManualPause kind.
+    // The current global-pause origin, so every download-block refresh reports
+    // a consistent Scheduled vs ManualPause kind.
     pub(crate) fn global_pause(&self) -> GlobalPause {
         if !self.global_paused {
             GlobalPause::Running

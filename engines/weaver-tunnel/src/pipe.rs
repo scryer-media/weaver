@@ -1,4 +1,4 @@
-//! Composable outbound paths shared by NNTP, feeds and connectivity probes.
+// Composable outbound paths shared by NNTP, feeds and connectivity probes.
 #[path = "pipe_revocable.rs"]
 mod revocable;
 pub use revocable::Revocable;
@@ -44,15 +44,15 @@ pub struct Target {
     pub host: String,
     pub port: u16,
     pub purpose: Purpose,
-    /// The addresses `host` resolved to when the caller checked them, so a
-    /// dial connects exactly those instead of resolving `host` again; empty
-    /// when the dial, or the proxy it goes through, resolves for itself.
+    // The addresses `host` resolved to when the caller checked them, so a
+    // dial connects exactly those instead of resolving `host` again; empty
+    // when the dial, or the proxy it goes through, resolves for itself.
     pub addresses: Vec<IpAddr>,
 }
 impl Target {
-    /// The destinations a hop asks its proxy for, in order: each checked
-    /// address when the caller pinned them, so the proxy never resolves
-    /// `host` itself, else `host`.
+    // The destinations a hop asks its proxy for, in order: each checked
+    // address when the caller pinned them, so the proxy never resolves
+    // `host` itself, else `host`.
     fn hop_destinations(&self) -> Vec<String> {
         if self.addresses.is_empty() {
             vec![self.host.clone()]
@@ -141,7 +141,7 @@ impl AsyncWrite for DialedStream {
     }
 }
 
-/// One-shot greeting/authentication evidence. Dropping an unreported setup is cancellation.
+// One-shot greeting/authentication evidence. Dropping an unreported setup is cancellation.
 pub struct SetupHandle(Option<Box<dyn FnOnce(bool) + Send + Sync>>);
 impl SetupHandle {
     pub fn new(report: impl FnOnce(bool) + Send + Sync + 'static) -> Self {
@@ -163,7 +163,7 @@ pub struct Dialed {
     pub setup: Option<SetupHandle>,
 }
 impl Dialed {
-    /// Preserve outcome ownership when adapting a pipe to a tunnel consumer.
+    // Preserve outcome ownership when adapting a pipe to a tunnel consumer.
     pub fn into_observed_stream(self) -> Box<dyn TunnelStream> {
         Box::new(OutcomeStream::new(self.stream, self.outcome, None, None))
     }
@@ -199,7 +199,7 @@ impl DialError {
     pub fn is_evidence(&self) -> bool {
         !matches!(self, Self::Skipped(_) | Self::AtCapacity(_))
     }
-    /// Only positively attributed path failures can cool a leg or rung.
+    // Only positively attributed path failures can cool a leg or rung.
     pub fn is_path_evidence(&self) -> bool {
         matches!(
             self,
@@ -246,28 +246,28 @@ impl DialError {
     }
 }
 
-/// An SSH server refuses a forwarding request it will not serve with
-/// `administratively prohibited`; the destination was never tried.
+// An SSH server refuses a forwarding request it will not serve with
+// `administratively prohibited`; the destination was never tried.
 fn is_forwarding_refusal(detail: &str) -> bool {
     detail.contains("AdministrativelyProhibited")
 }
 
-/// A proxy hop known to be failing, and what its last attempt came to.
+// A proxy hop known to be failing, and what its last attempt came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailingHop {
     pub proxy: u32,
     pub reason: String,
 }
 
-/// What a proxy hop's own last attempt came to. The hop keeps it itself, so
-/// a path can name its first failing hop however the failure travelled up: a
-/// hop stacked on a broken one fails too, and its error names only itself.
+// What a proxy hop's own last attempt came to. The hop keeps it itself, so
+// a path can name its first failing hop however the failure travelled up: a
+// hop stacked on a broken one fails too, and its error names only itself.
 #[derive(Default)]
 pub struct HopFailure(Mutex<Option<String>>);
 impl HopFailure {
-    /// Records `error` when it is evidence against the hop. A destination
-    /// the hop answered for clears the record, and an attempt that was never
-    /// made, such as one skipped for capacity, says nothing either way.
+    // Records `error` when it is evidence against the hop. A destination
+    // the hop answered for clears the record, and an attempt that was never
+    // made, such as one skipped for capacity, says nothing either way.
     fn note(&self, error: &DialError) {
         match error {
             // The hop is named beside its reason, so the reason leaves it out.
@@ -277,13 +277,13 @@ impl HopFailure {
             _ => {}
         }
     }
-    /// The hop's own endpoint could not be reached from the stage beneath.
+    // The hop's own endpoint could not be reached from the stage beneath.
     fn unreachable(&self, source: &io::Error) {
         self.record(format!("endpoint unreachable: {source}"));
     }
-    /// Records what the hop's tunnel said. A stream proxy reports through
-    /// the engine variant, whose own wording is about an engine that could
-    /// not start, so what the proxy said stands alone.
+    // Records what the hop's tunnel said. A stream proxy reports through
+    // the engine variant, whose own wording is about an engine that could
+    // not start, so what the proxy said stands alone.
     fn blame(&self, source: &TunnelError) {
         self.record(match source {
             TunnelError::Engine(said) => said.clone(),
@@ -304,11 +304,11 @@ impl HopFailure {
 
 #[async_trait::async_trait]
 pub trait Dialer: Send + Sync {
-    /// Physical NNTP capacity by leg; independent of server health and work permits.
+    // Physical NNTP capacity by leg; independent of server health and work permits.
     fn leg_targets(&self) -> Option<tokio::sync::watch::Receiver<Vec<u16>>> {
         None
     }
-    /// Feedback from consumers whose request outlives connection setup.
+    // Feedback from consumers whose request outlives connection setup.
     fn report_request(&self, _error: Option<&DialError>) {}
     fn needs_probe(&self) -> bool {
         false
@@ -317,7 +317,7 @@ pub trait Dialer: Send + Sync {
         Ok(())
     }
     async fn retire(&self) {}
-    /// Returns false when a shared active session could not be retired.
+    // Returns false when a shared active session could not be retired.
     async fn retire_idle(&self) -> bool {
         self.retire().await;
         true
@@ -333,13 +333,13 @@ pub trait Dialer: Send + Sync {
     fn offers(&self) -> Transports {
         Transports::Tcp
     }
-    /// Datagrams through this stage, for a WireGuard tunnel stacked on it.
-    /// Only a WireGuard stage carries them.
+    // Datagrams through this stage, for a WireGuard tunnel stacked on it.
+    // Only a WireGuard stage carries them.
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         None
     }
-    /// The first proxy hop on this stage's path, counted from the egress,
-    /// whose own last attempt failed.
+    // The first proxy hop on this stage's path, counted from the egress,
+    // whose own last attempt failed.
     fn failing_hop(&self) -> Option<FailingHop> {
         None
     }
@@ -495,12 +495,12 @@ pub struct TransportHop {
 }
 
 impl TransportHop {
-    /// Asks the proxy for `destination` within `budget`.
-    ///
-    /// A proxy that was reached, and then reports that the next hop's
-    /// endpoint cannot be reached or never answers for it, has done its own
-    /// part. That failure is the next hop's, so the error names the next hop.
-    /// For any other destination it stays a failure of this hop's path.
+    // Asks the proxy for `destination` within `budget`.
+    //
+    // A proxy that was reached, and then reports that the next hop's
+    // endpoint cannot be reached or never answers for it, has done its own
+    // part. That failure is the next hop's, so the error names the next hop.
+    // For any other destination it stays a failure of this hop's path.
     async fn negotiate(
         &self,
         stream: &mut DialedStream,
@@ -623,7 +623,7 @@ impl Dialer for TransportHop {
 
 pub type ConnectedPath = (DialPath, Option<SocketAddr>, Option<SocketAddr>);
 
-/// Adapts an arbitrary inner stage to the shared SSH engine while retaining its metadata.
+// Adapts an arbitrary inner stage to the shared SSH engine while retaining its metadata.
 pub struct InnerTransport {
     pub inner: Arc<dyn Dialer>,
     pub proxy: u32,
@@ -667,9 +667,9 @@ impl EndpointTransport for InnerTransport {
 struct OutcomeStream {
     stream: std::mem::ManuallyDrop<DialedStream>,
     outcome: Arc<ConnectionOutcome>,
-    /// The runtime the stream was dialed on. A tunnel stream closes itself
-    /// from a task it spawns when dropped, so it is dropped inside that
-    /// runtime wherever the drop happens, a blocking lane thread included.
+    // The runtime the stream was dialed on. A tunnel stream closes itself
+    // from a task it spawns when dropped, so it is dropped inside that
+    // runtime wherever the drop happens, a blocking lane thread included.
     runtime: Option<tokio::runtime::Handle>,
     _session: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     _capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -763,7 +763,7 @@ impl SessionCapacity {
 
 pub struct SessionHop {
     pub capacity: SessionCapacity,
-    /// Shared by every use of this canonical session path.
+    // Shared by every use of this canonical session path.
     pub activity: Arc<tokio::sync::RwLock<()>>,
     pub id: u32,
     pub provider: Arc<dyn TunnelProvider>,
@@ -777,14 +777,14 @@ pub struct SessionHop {
 }
 
 impl SessionHop {
-    /// A WireGuard hop carried by the WireGuard session beneath it.
+    // A WireGuard hop carried by the WireGuard session beneath it.
     fn is_carried(&self) -> bool {
         self.resolver.is_some() && !self.path.proxies.is_empty()
     }
 
-    /// Bring the session beneath a carried hop up first. Its exhausted budget
-    /// or failed handshake then surfaces as its own error, attributed to it,
-    /// instead of as a failure of this hop's tunnel to come up.
+    // Bring the session beneath a carried hop up first. Its exhausted budget
+    // or failed handshake then surfaces as its own error, attributed to it,
+    // instead of as a failure of this hop's tunnel to come up.
     async fn prepare_carrier(&self) -> Result<(), DialError> {
         if !self.is_carried() {
             return Ok(());
@@ -942,9 +942,9 @@ impl Dialer for SessionHop {
     fn budget(&self) -> Duration {
         self.inner.budget().saturating_add(self.timeout)
     }
-    /// Stops this hop's own session only. The stage beneath may be another
-    /// session shared with other routes, or one a probe runtime borrowed;
-    /// whoever owns it shuts it down.
+    // Stops this hop's own session only. The stage beneath may be another
+    // session shared with other routes, or one a probe runtime borrowed;
+    // whoever owns it shuts it down.
     async fn shutdown(&self) {
         self.provider.shutdown().await;
         self.capacity.release();
@@ -962,9 +962,9 @@ struct RungState {
 pub struct Fallback {
     rungs: Vec<Arc<dyn Dialer>>,
     states: Arc<Mutex<Vec<RungState>>>,
-    /// How long a rung whose path failed is left alone before it is tried
-    /// again. Flat: a rung is a whole path, and the ladder below it carries
-    /// the work meanwhile.
+    // How long a rung whose path failed is left alone before it is tried
+    // again. Flat: a rung is a whole path, and the ladder below it carries
+    // the work meanwhile.
     rung_cooldown: Duration,
 }
 impl Fallback {
@@ -985,7 +985,7 @@ impl Fallback {
             })
             .collect()
     }
-    /// For each rung, the first proxy hop on it known to be failing.
+    // For each rung, the first proxy hop on it known to be failing.
     pub fn failing_hops(&self) -> Vec<Option<FailingHop>> {
         self.rungs.iter().map(|rung| rung.failing_hop()).collect()
     }
@@ -1018,11 +1018,11 @@ impl Fallback {
             state.until = None;
         }
     }
-    /// A ladder that leaves a failed rung alone for thirty seconds.
+    // A ladder that leaves a failed rung alone for thirty seconds.
     pub fn new(rungs: Vec<Arc<dyn Dialer>>) -> Self {
         Self::with_rung_cooldown(rungs, PATH_COOLDOWN)
     }
-    /// A ladder that leaves a failed rung alone for `rung_cooldown`.
+    // A ladder that leaves a failed rung alone for `rung_cooldown`.
     pub fn with_rung_cooldown(rungs: Vec<Arc<dyn Dialer>>, rung_cooldown: Duration) -> Self {
         let states = (0..rungs.len())
             .map(|_| RungState {
@@ -1114,8 +1114,8 @@ pub fn cooldown(failures: u32) -> Duration {
     cooldown_from(PATH_COOLDOWN, failures)
 }
 
-/// [`cooldown`] starting from `initial` instead of 30 seconds: doubling per
-/// failure, never longer than ten times `initial`.
+// [`cooldown`] starting from `initial` instead of 30 seconds: doubling per
+// failure, never longer than ten times `initial`.
 pub fn cooldown_from(initial: Duration, failures: u32) -> Duration {
     initial
         .saturating_mul(1 << failures.saturating_sub(1).min(4))

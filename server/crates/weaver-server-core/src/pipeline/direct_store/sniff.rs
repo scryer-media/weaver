@@ -1,74 +1,74 @@
-//! Byte-sniffing an unclassified file's first bytes for a RAR volume head or a
-//! 7z signature header.
-//!
-//! The identity seam's second rung. The first rung binds by PAR2 fingerprint
-//! and needs the recovery set's descriptions; a post with no PAR2 anywhere
-//! has only one remaining source of set structure, and it is the volumes'
-//! own headers: a RAR5 volume states in its main archive header whether it
-//! belongs to a volume set and — past the first volume — which position it
-//! holds. That header sits in the first few dozen bytes, so the same
-//! offset-zero prefix the fingerprint rung hashes carries everything this
-//! parser reads.
-//!
-//! Deliberately RAR5-only for set positions. RAR4 headers carry no volume
-//! number, and the interior volumes of a stored RAR4 set are identical in
-//! every header field that could place one — a measured property of the
-//! format, not a parsing gap — so a RAR4 answer here is "it is RAR4",
-//! which the caller declines to bind on and the conventional path owns.
-//!
-//! Everything here treats its input as hostile bytes an anonymous poster
-//! chose: every read is bounds-checked, varints are length-capped, and any
-//! malformation answers [`PrefixSniff::NotRar`] rather than guessing.
+// Byte-sniffing an unclassified file's first bytes for a RAR volume head or a
+// 7z signature header.
+//
+// The identity seam's second rung. The first rung binds by PAR2 fingerprint
+// and needs the recovery set's descriptions; a post with no PAR2 anywhere
+// has only one remaining source of set structure, and it is the volumes'
+// own headers: a RAR5 volume states in its main archive header whether it
+// belongs to a volume set and — past the first volume — which position it
+// holds. That header sits in the first few dozen bytes, so the same
+// offset-zero prefix the fingerprint rung hashes carries everything this
+// parser reads.
+//
+// Deliberately RAR5-only for set positions. RAR4 headers carry no volume
+// number, and the interior volumes of a stored RAR4 set are identical in
+// every header field that could place one — a measured property of the
+// format, not a parsing gap — so a RAR4 answer here is "it is RAR4",
+// which the caller declines to bind on and the conventional path owns.
+//
+// Everything here treats its input as hostile bytes an anonymous poster
+// chose: every read is bounds-checked, varints are length-capped, and any
+// malformation answers [`PrefixSniff::NotRar`] rather than guessing.
 
-/// RAR5 signature: `Rar!\x1a\x07\x01\x00`.
+// RAR5 signature: `Rar!\x1a\x07\x01\x00`.
 const RAR5_SIGNATURE: [u8; 8] = *b"Rar!\x1a\x07\x01\x00";
-/// RAR4 (1.5–4.x) signature: `Rar!\x1a\x07\x00`.
+// RAR4 (1.5–4.x) signature: `Rar!\x1a\x07\x00`.
 const RAR4_SIGNATURE: [u8; 7] = *b"Rar!\x1a\x07\x00";
 
-/// Archive-flags bit: this archive is part of a volume set.
+// Archive-flags bit: this archive is part of a volume set.
 const RAR5_ARCHIVE_FLAG_VOLUME: u64 = 0x0001;
-/// Archive-flags bit: a volume-number field follows (absent on the first
-/// volume, whose number is zero by definition).
+// Archive-flags bit: a volume-number field follows (absent on the first
+// volume, whose number is zero by definition).
 const RAR5_ARCHIVE_FLAG_VOLUME_NUMBER: u64 = 0x0002;
-/// Header-flags bit: an extra-area size field follows.
+// Header-flags bit: an extra-area size field follows.
 const RAR5_HEADER_FLAG_EXTRA: u64 = 0x0001;
-/// Header-flags bit: a data-area size field follows.
+// Header-flags bit: a data-area size field follows.
 const RAR5_HEADER_FLAG_DATA: u64 = 0x0002;
-/// Block type of the main archive header.
+// Block type of the main archive header.
 const RAR5_HEADER_TYPE_MAIN: u64 = 1;
-/// Block type of the archive-encryption header a `-hp` archive opens with.
+// Block type of the archive-encryption header a `-hp` archive opens with.
 const RAR5_HEADER_TYPE_CRYPT: u64 = 4;
 
-/// Ceiling on a declared volume number. Far above any real posting — the
-/// largest sets in the field run to a few thousand volumes — and low enough
-/// that a hostile header cannot make the caller book absurd positions.
+// Ceiling on a declared volume number. Far above any real posting — the
+// largest sets in the field run to a few thousand volumes — and low enough
+// that a hostile header cannot make the caller book absurd positions.
 const VOLUME_NUMBER_CEILING: u64 = 100_000;
 
-/// What one offset-zero prefix says the file is.
+// What one offset-zero prefix says the file is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrefixSniff {
-    /// A readable RAR5 archive head.
+    // A readable RAR5 archive head.
     Rar5 {
-        /// Declared volume position, zero for the first volume of a set and
-        /// for a standalone archive.
+        // Declared volume position, zero for the first volume of a set and
+        // for a standalone archive.
         volume_number: u32,
-        /// Whether the archive declares itself part of a volume set at all.
-        /// A standalone archive is a set of one; the caller decides whether
-        /// that is worth admitting.
+        // Whether the archive declares itself part of a volume set at all.
+        // A standalone archive is a set of one; the caller decides whether
+        // that is worth admitting.
         is_volume: bool,
     },
-    /// A RAR5 archive whose headers are encrypted (`-hp`): nothing about the
-    /// layout is readable without a key, volume position included.
+    // A RAR5 archive whose headers are encrypted (`-hp`): nothing about the
+    // layout is readable without a key, volume position included.
     Rar5EncryptedHeaders,
-    /// A RAR4-family archive. Recognized so the caller can say *why* it
-    /// declines — the format states no position to bind on.
+    // A RAR4-family archive. Recognized so the caller can say *why* it
+    // declines — the format states no position to bind on.
     Rar4,
-    /// Not a RAR head, or one too malformed to trust.
+    // Not a RAR head, or one too malformed to trust.
     NotRar,
 }
 
-/// Reads one RAR5 variable-length integer: 7 bits per byte, low byte first,
-/// high bit means another byte follows, at most ten bytes.
+// Reads one RAR5 variable-length integer: 7 bits per byte, low byte first,
+// high bit means another byte follows, at most ten bytes.
 fn read_vint(bytes: &[u8], position: &mut usize) -> Option<u64> {
     let mut value: u64 = 0;
     for count in 0..10 {
@@ -82,10 +82,10 @@ fn read_vint(bytes: &[u8], position: &mut usize) -> Option<u64> {
     None
 }
 
-/// Classifies an offset-zero prefix. `prefix` is however much of the file's
-/// first bytes the caller holds; a prefix long enough to carry the 16 KiB
-/// fingerprint window is orders of magnitude longer than the main header
-/// this walks.
+// Classifies an offset-zero prefix. `prefix` is however much of the file's
+// first bytes the caller holds; a prefix long enough to carry the 16 KiB
+// fingerprint window is orders of magnitude longer than the main header
+// this walks.
 pub(crate) fn sniff_rar_prefix(prefix: &[u8]) -> PrefixSniff {
     if prefix.starts_with(&RAR4_SIGNATURE) {
         return PrefixSniff::Rar4;
@@ -143,32 +143,32 @@ pub(crate) fn sniff_rar_prefix(prefix: &[u8]) -> PrefixSniff {
     }
 }
 
-/// The 7z signature: `7z\xBC\xAF\x27\x1C`.
+// The 7z signature: `7z\xBC\xAF\x27\x1C`.
 const SEVEN_Z_SIGNATURE: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
-/// The signature header's length: magic, version, start-header CRC32, and the
-/// end header's offset, length and CRC32.
+// The signature header's length: magic, version, start-header CRC32, and the
+// end header's offset, length and CRC32.
 const SEVEN_Z_SIGNATURE_HEADER_LEN: u64 = 32;
 
-/// What one offset-zero prefix says about a file that might be a 7z container.
+// What one offset-zero prefix says about a file that might be a 7z container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SevenZipSniff {
-    /// A whole container: its start header places the end header so that it
-    /// closes exactly at the file's declared length.
+    // A whole container: its start header places the end header so that it
+    // closes exactly at the file's declared length.
     Whole,
-    /// The opening part of a container split across files: the end header
-    /// lies past the file's declared length.
+    // The opening part of a container split across files: the end header
+    // lies past the file's declared length.
     FirstPart,
-    /// Not a 7z signature header, or one whose coordinates fit no reading.
+    // Not a 7z signature header, or one whose coordinates fit no reading.
     NotSevenZip,
 }
 
-/// Classifies an offset-zero prefix against the file's declared length.
-///
-/// A 7z container states its own length in its first 32 bytes — the end
-/// header is the last thing in it — so the signature header alone tells a
-/// whole container from the first part of a split one. Without a declared
-/// length the two cannot be told apart, and the answer is
-/// [`SevenZipSniff::NotSevenZip`]: nothing is admitted on a guess.
+// Classifies an offset-zero prefix against the file's declared length.
+//
+// A 7z container states its own length in its first 32 bytes — the end
+// header is the last thing in it — so the signature header alone tells a
+// whole container from the first part of a split one. Without a declared
+// length the two cannot be told apart, and the answer is
+// [`SevenZipSniff::NotSevenZip`]: nothing is admitted on a guess.
 pub(crate) fn sniff_sevenz_prefix(prefix: &[u8], declared_len: Option<u64>) -> SevenZipSniff {
     if prefix.len() < SEVEN_Z_SIGNATURE_HEADER_LEN as usize
         || prefix[..SEVEN_Z_SIGNATURE.len()] != SEVEN_Z_SIGNATURE

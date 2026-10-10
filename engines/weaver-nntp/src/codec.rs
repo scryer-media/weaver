@@ -3,56 +3,56 @@ use tokio_util::codec::{Decoder, Encoder};
 
 use crate::error::NntpError;
 
-/// Maximum size for a single response line (generous limit).
+// Maximum size for a single response line (generous limit).
 const MAX_LINE_LENGTH: usize = 16 * 1024;
 
-/// Maximum size for a multi-line response body (256 MB).
+// Maximum size for a multi-line response body (256 MB).
 const MAX_MULTILINE_LENGTH: usize = 256 * 1024 * 1024;
 
-/// A chunk from streaming multiline decode.
+// A chunk from streaming multiline decode.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StreamChunk {
-    /// A chunk of decoded data. More may follow.
+    // A chunk of decoded data. More may follow.
     Data(BytesMut),
-    /// The multiline block has ended (terminator found).
+    // The multiline block has ended (terminator found).
     End,
 }
 
-/// Frames produced by the NNTP codec.
+// Frames produced by the NNTP codec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NntpFrame {
-    /// A single response line (without the trailing CRLF).
+    // A single response line (without the trailing CRLF).
     Line(String),
-    /// A complete multi-line data block (dot-unstuffed, without terminating ".\r\n").
+    // A complete multi-line data block (dot-unstuffed, without terminating ".\r\n").
     MultiLineData(BytesMut),
 }
 
-/// NNTP codec that operates in two modes:
-///
-/// 1. **Line mode** (default): reads CRLF-terminated lines, yields `NntpFrame::Line`.
-/// 2. **Multi-line mode**: reads until the `.\r\n` terminator on its own line,
-///    performs dot-unstuffing, yields `NntpFrame::MultiLineData`.
-///
-/// The caller switches modes via `set_multiline(true)` after receiving a status
-/// code that indicates a multi-line response follows.
+// NNTP codec that operates in two modes:
+//
+// 1. **Line mode** (default): reads CRLF-terminated lines, yields `NntpFrame::Line`.
+// 2. **Multi-line mode**: reads until the `.\r\n` terminator on its own line,
+//    performs dot-unstuffing, yields `NntpFrame::MultiLineData`.
+//
+// The caller switches modes via `set_multiline(true)` after receiving a status
+// code that indicates a multi-line response follows.
 pub struct NntpCodec {
     multiline: bool,
     streaming_multiline: bool,
-    /// When true, multiline data is returned without dot-unstuffing.
-    /// The caller is responsible for handling dot-stuffed lines.
+    // When true, multiline data is returned without dot-unstuffing.
+    // The caller is responsible for handling dot-stuffed lines.
     raw_multiline: bool,
-    /// Scan progress for raw multiline bodies.
-    ///
-    /// BODY fetches append to the same buffer across many socket reads. In raw
-    /// mode we don't mutate the accumulated bytes until the terminator arrives,
-    /// so rescanning from byte 0 on every read turns terminator detection into
-    /// repeated full-buffer work. Remember the next line start instead.
+    // Scan progress for raw multiline bodies.
+    //
+    // BODY fetches append to the same buffer across many socket reads. In raw
+    // mode we don't mutate the accumulated bytes until the terminator arrives,
+    // so rescanning from byte 0 on every read turns terminator detection into
+    // repeated full-buffer work. Remember the next line start instead.
     raw_multiline_scan_offset: usize,
-    /// When a streaming decode sees data and the final terminator in the same
-    /// chunk, emit `Data` first and then a synthetic `End` on the next call.
+    // When a streaming decode sees data and the final terminator in the same
+    // chunk, emit `Data` first and then a synthetic `End` on the next call.
     streaming_end_pending: bool,
-    /// Raw NNTP multiline payload bytes consumed by the most recent decode,
-    /// before dot-unstuffing and excluding the terminator.
+    // Raw NNTP multiline payload bytes consumed by the most recent decode,
+    // before dot-unstuffing and excluding the terminator.
     last_multiline_payload_bytes: usize,
 }
 
@@ -64,7 +64,7 @@ struct MultilineScan {
 }
 
 impl NntpCodec {
-    /// Create a new codec in line mode.
+    // Create a new codec in line mode.
     pub fn new() -> Self {
         NntpCodec {
             multiline: false,
@@ -76,7 +76,7 @@ impl NntpCodec {
         }
     }
 
-    /// Switch to multi-line mode for reading the next data block.
+    // Switch to multi-line mode for reading the next data block.
     pub fn set_multiline(&mut self, multiline: bool) {
         self.multiline = multiline;
         if !multiline {
@@ -85,10 +85,10 @@ impl NntpCodec {
         }
     }
 
-    /// Enable raw multiline mode: data is returned without dot-unstuffing.
-    /// The dot-terminator is still detected and stripped, but dot-stuffed
-    /// lines retain their leading dot. This allows the caller to handle
-    /// dot-unstuffing inline (e.g., during yEnc decode).
+    // Enable raw multiline mode: data is returned without dot-unstuffing.
+    // The dot-terminator is still detected and stripped, but dot-stuffed
+    // lines retain their leading dot. This allows the caller to handle
+    // dot-unstuffing inline (e.g., during yEnc decode).
     pub fn set_raw_multiline(&mut self, raw: bool) {
         self.raw_multiline = raw;
         if !raw {
@@ -96,17 +96,17 @@ impl NntpCodec {
         }
     }
 
-    /// Whether the codec is currently in multi-line mode.
+    // Whether the codec is currently in multi-line mode.
     pub fn is_multiline(&self) -> bool {
         self.multiline
     }
 
-    /// Whether the codec is currently in streaming multiline mode.
+    // Whether the codec is currently in streaming multiline mode.
     pub fn is_streaming_multiline(&self) -> bool {
         self.streaming_multiline
     }
 
-    /// Whether the codec is currently expecting multiline data in either mode.
+    // Whether the codec is currently expecting multiline data in either mode.
     pub fn is_reading_multiline(&self) -> bool {
         self.multiline || self.streaming_multiline
     }
@@ -115,7 +115,7 @@ impl NntpCodec {
         self.last_multiline_payload_bytes
     }
 
-    /// Set the codec into streaming multiline mode.
+    // Set the codec into streaming multiline mode.
     pub fn set_streaming_multiline(&mut self, streaming: bool) {
         self.streaming_multiline = streaming;
         if !streaming {
@@ -123,10 +123,10 @@ impl NntpCodec {
         }
     }
 
-    /// Decode the next chunk in streaming multiline mode.
-    ///
-    /// Yields complete lines (dot-unstuffed) as `Data` chunks.
-    /// Yields `End` when the `.\r\n` terminator is found.
+    // Decode the next chunk in streaming multiline mode.
+    //
+    // Yields complete lines (dot-unstuffed) as `Data` chunks.
+    // Yields `End` when the `.\r\n` terminator is found.
     pub fn decode_streaming_chunk(
         &mut self,
         src: &mut BytesMut,
@@ -153,11 +153,11 @@ impl NntpCodec {
         Ok(Some(StreamChunk::Data(chunk.data)))
     }
 
-    /// Decode the next raw chunk in streaming multiline mode.
-    ///
-    /// Yields data ending on a complete line boundary without dot-unstuffing.
-    /// This is used by the download hot path so yEnc decoding can happen while
-    /// the BODY is still streaming in.
+    // Decode the next raw chunk in streaming multiline mode.
+    //
+    // Yields data ending on a complete line boundary without dot-unstuffing.
+    // This is used by the download hot path so yEnc decoding can happen while
+    // the BODY is still streaming in.
     pub fn decode_streaming_raw_chunk(
         &mut self,
         src: &mut BytesMut,
@@ -192,7 +192,7 @@ impl NntpCodec {
         Ok(Some(StreamChunk::Data(chunk.data)))
     }
 
-    /// Decode a single line terminated by `\r\n` or bare `\n`.
+    // Decode a single line terminated by `\r\n` or bare `\n`.
     fn decode_line(&self, src: &mut BytesMut) -> Result<Option<NntpFrame>, NntpError> {
         if let Some((pos, term_len)) = find_line_ending(src) {
             if pos > MAX_LINE_LENGTH {
@@ -221,7 +221,7 @@ impl NntpCodec {
         }
     }
 
-    /// Decode a multi-line data block terminated by `\r\n.\r\n` (or bare `\n` variants).
+    // Decode a multi-line data block terminated by `\r\n.\r\n` (or bare `\n` variants).
     fn decode_multiline(&mut self, src: &mut BytesMut) -> Result<Option<NntpFrame>, NntpError> {
         self.last_multiline_payload_bytes = 0;
         let scan_result = if self.raw_multiline {
@@ -287,11 +287,11 @@ impl Encoder<bytes::Bytes> for NntpCodec {
     }
 }
 
-/// Find the position of the first line terminator (`\r\n` or bare `\n`) in the buffer.
-///
-/// Returns `(position, terminator_length)` where `terminator_length` is 2 for `\r\n`
-/// and 1 for bare `\n`. Position points to the start of the line content (i.e., the
-/// byte offset of the `\r` in `\r\n` or the `\n` for bare `\n`).
+// Find the position of the first line terminator (`\r\n` or bare `\n`) in the buffer.
+//
+// Returns `(position, terminator_length)` where `terminator_length` is 2 for `\r\n`
+// and 1 for bare `\n`. Position points to the start of the line content (i.e., the
+// byte offset of the `\r` in `\r\n` or the `\n` for bare `\n`).
 fn find_line_ending(buf: &[u8]) -> Option<(usize, usize)> {
     // Search for any \n — it's either bare \n or the \n in \r\n.
     let nl_pos = memchr::memchr(b'\n', buf)?;
@@ -370,9 +370,9 @@ fn scan_multiline_chunk(buf: &[u8], allow_partial: bool) -> Option<MultilineScan
     None
 }
 
-/// Scan for the dot-terminator without dot-unstuffing.
-/// Returns the byte offset of the terminator line start and its length,
-/// or None if not found yet.
+// Scan for the dot-terminator without dot-unstuffing.
+// Returns the byte offset of the terminator line start and its length,
+// or None if not found yet.
 fn scan_multiline_raw(buf: &[u8], cursor: &mut usize) -> Option<MultilineScan> {
     if buf.is_empty() {
         *cursor = 0;
@@ -478,10 +478,10 @@ fn take_multiline_output(src: &mut BytesMut, scan: MultilineScan) -> TakenMultil
     }
 }
 
-/// Perform NNTP dot-unstuffing on raw multi-line data.
-///
-/// Per RFC 3977 Section 3.1.1: if a line begins with a dot, the first dot is
-/// removed (it was added by the server to avoid confusion with the terminator).
+// Perform NNTP dot-unstuffing on raw multi-line data.
+//
+// Per RFC 3977 Section 3.1.1: if a line begins with a dot, the first dot is
+// removed (it was added by the server to avoid confusion with the terminator).
 pub fn dot_unstuff(data: &[u8]) -> BytesMut {
     let mut i = 0usize;
     let mut line_start = true;

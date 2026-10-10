@@ -1,39 +1,39 @@
-//! What a tier-two job posts, article by article, as the wire carries it.
-//!
-//! Every article is rendered to the bytes a server would send and decoded by
-//! the production fused decoder, so a damaged article reaches the pipeline the
-//! way a real one does: through the decoder's own verdict, not a hand-built
-//! result.
+// What a tier-two job posts, article by article, as the wire carries it.
+//
+// Every article is rendered to the bytes a server would send and decoded by
+// the production fused decoder, so a damaged article reaches the pipeline the
+// way a real one does: through the decoder's own verdict, not a hand-built
+// result.
 use super::*;
 
-/// What one posted article carries instead of a clean copy of its bytes.
+// What one posted article carries instead of a clean copy of its bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) enum Wire {
-    /// The server has no copy.
+    // The server has no copy.
     Absent,
     Damaged(Damage),
 }
 
-/// The ways an article can arrive wrong.
+// The ways an article can arrive wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in super::super) enum Damage {
-    /// The part CRC disagrees; the body is intact.
+    // The part CRC disagrees; the body is intact.
     CrcWrong,
-    /// The body stops short of the declared range; the trailer still says
-    /// the full size.
+    // The body stops short of the declared range; the trailer still says
+    // the full size.
     Truncated,
-    /// The body runs past the declared range.
+    // The body runs past the declared range.
     Overlong,
-    /// Wrong payload bytes under a CRC recomputed to match: only a recovery
-    /// set's block hashes can see it.
+    // Wrong payload bytes under a CRC recomputed to match: only a recovery
+    // set's block hashes can see it.
     Recomputed,
-    /// The body of another article of the same file under this one's header.
+    // The body of another article of the same file under this one's header.
     Swapped,
-    /// Junk lines after `=yend`.
+    // Junk lines after `=yend`.
     TrailingJunk,
-    /// Two copies arrive and the first differs from the posted bytes.
+    // Two copies arrive and the first differs from the posted bytes.
     DifferingDuplicate,
-    /// `=yend` with no checksum at all over a wrong payload.
+    // `=yend` with no checksum at all over a wrong payload.
     NoChecksum,
 }
 
@@ -49,20 +49,20 @@ pub(in super::super) const DAMAGES: [Damage; 8] = [
 ];
 
 impl Damage {
-    /// Bytes this damage may leave wrong on disk, as a superset: the
-    /// article's own range, and for an over-long body the range after it.
+    // Bytes this damage may leave wrong on disk, as a superset: the
+    // article's own range, and for an over-long body the range after it.
     fn may_spill(self) -> bool {
         self == Self::Overlong
     }
 }
 
-/// How a file's articles are encoded.
+// How a file's articles are encoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) enum Encoding {
     Yenc {
         line: usize,
-        /// Multi-part headers. A single-article file may be posted without
-        /// `=ypart`, as a single-part article with a whole-file `crc32=`.
+        // Multi-part headers. A single-article file may be posted without
+        // `=ypart`, as a single-part article with a whole-file `crc32=`.
         ypart: bool,
     },
     Uu(UuStyle),
@@ -75,43 +75,43 @@ impl Encoding {
     };
 }
 
-/// One uuencode dialect, as the posting tools in the field write it.
+// One uuencode dialect, as the posting tools in the field write it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in super::super) struct UuStyle {
     pub header: UuHeader,
-    /// Free text ahead of the `begin` line.
+    // Free text ahead of the `begin` line.
     pub preamble: bool,
-    /// A zero sextet as a space instead of a backtick.
+    // A zero sextet as a space instead of a backtick.
     pub space_zero: bool,
-    /// The final group carries only the bytes it needs instead of a full
-    /// four characters.
+    // The final group carries only the bytes it needs instead of a full
+    // four characters.
     pub unpadded_tail: bool,
-    /// The last line's length character overstates its bytes by one.
+    // The last line's length character overstates its bytes by one.
     pub wrong_last_length: bool,
     pub end: UuEnd,
-    /// Bare LF line endings instead of CRLF.
+    // Bare LF line endings instead of CRLF.
     pub bare_lf: bool,
-    /// Bytes per encoded line: 45 is the standard, shorter lines are posted.
+    // Bytes per encoded line: 45 is the standard, shorter lines are posted.
     pub line_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in super::super) enum UuHeader {
-    /// `begin 644 name`.
+    // `begin 644 name`.
     Mode,
-    /// `begin name`, no mode.
+    // `begin name`, no mode.
     NoMode,
-    /// No `begin` line at all.
+    // No `begin` line at all.
     Missing,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in super::super) enum UuEnd {
-    /// An empty terminating line and `end`.
+    // An empty terminating line and `end`.
     Full,
-    /// `end` with no empty terminating line before it.
+    // `end` with no empty terminating line before it.
     NoTerminator,
-    /// No `end` line at all.
+    // No `end` line at all.
     Missing,
 }
 
@@ -128,24 +128,24 @@ impl UuStyle {
     };
 }
 
-/// What a posted file is to a schedule.
+// What a posted file is to a schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) enum Role {
-    /// Its articles are what a schedule's slots name.
+    // Its articles are what a schedule's slots name.
     Data,
-    /// A recovery index: arrives first or last, as the schedule says.
+    // A recovery index: arrives first or last, as the schedule says.
     Index,
-    /// Recovery volumes: arrive only when the job asks for them.
+    // Recovery volumes: arrive only when the job asks for them.
     Recovery,
 }
 
-/// One file of the post.
+// One file of the post.
 #[derive(Clone, Debug)]
 pub(in super::super) struct Posted {
-    /// The name the NZB and the article headers carry.
+    // The name the NZB and the article headers carry.
     pub name: String,
     pub bytes: Vec<u8>,
-    /// Decoded bytes per article; the last article carries the remainder.
+    // Decoded bytes per article; the last article carries the remainder.
     pub article: usize,
     pub role: Role,
     pub encoding: Encoding,
@@ -179,7 +179,7 @@ impl Posted {
         start..end
     }
 
-    /// Every article of the file absent.
+    // Every article of the file absent.
     pub(in super::super) fn absent(&mut self) {
         for article in 0..self.articles() {
             self.wire.insert(article, Wire::Absent);
@@ -190,9 +190,9 @@ impl Posted {
         self.wire.get(&article) == Some(&Wire::Absent)
     }
 
-    /// The bytes this article puts on disk when the pipeline takes it at its
-    /// word, for the lower bound of what it leaves wrong; `None` where the
-    /// outcome depends on what the pipeline keeps.
+    // The bytes this article puts on disk when the pipeline takes it at its
+    // word, for the lower bound of what it leaves wrong; `None` where the
+    // outcome depends on what the pipeline keeps.
     fn definite(&self, article: u32) -> Option<Vec<u8>> {
         let range = self.extent(article);
         match self.wire.get(&article) {
@@ -225,8 +225,8 @@ impl Posted {
         }
     }
 
-    /// Byte ranges of the file this post may leave wrong, as a superset
-    /// (`upper`) and as the ranges it certainly leaves wrong (`lower`).
+    // Byte ranges of the file this post may leave wrong, as a superset
+    // (`upper`) and as the ranges it certainly leaves wrong (`lower`).
     pub(in super::super) fn wrong_ranges(
         &self,
         lost: &BTreeSet<u32>,
@@ -281,7 +281,7 @@ impl Posted {
         (upper, lower)
     }
 
-    /// The wire copies a request for `article` is answered with, in order.
+    // The wire copies a request for `article` is answered with, in order.
     pub(in super::super) fn wire_copies(&self, article: u32) -> Vec<Vec<u8>> {
         let range = self.extent(article);
         let data = &self.bytes[range.clone()];
@@ -360,7 +360,7 @@ impl Posted {
     }
 }
 
-/// Every byte flipped: a wrong copy of the same length.
+// Every byte flipped: a wrong copy of the same length.
 fn altered(data: &[u8]) -> Vec<u8> {
     data.iter().map(|byte| byte ^ 0x5a).collect()
 }
@@ -383,14 +383,14 @@ struct YencArticle<'a> {
     yend_size: u64,
     pcrc: Option<u32>,
     crc32: Option<u32>,
-    /// The second half of the body's lines are lost in transit.
+    // The second half of the body's lines are lost in transit.
     cut: bool,
-    /// Lines of junk follow the trailer.
+    // Lines of junk follow the trailer.
     junk: bool,
 }
 
 impl YencArticle<'_> {
-    /// Checksums restated over the current body.
+    // Checksums restated over the current body.
     fn restate(&mut self) {
         let crc = checksum::crc32(&self.body);
         self.pcrc = self.pcrc.map(|_| crc);
@@ -446,7 +446,7 @@ impl YencArticle<'_> {
     }
 }
 
-/// The encoded data lines of `body`, without line endings.
+// The encoded data lines of `body`, without line endings.
 fn yenc_lines(body: &[u8], line: usize) -> Vec<Vec<u8>> {
     if body.is_empty() {
         return Vec::new();
@@ -465,7 +465,7 @@ fn uu_article(name: &str, bytes: &[u8], ordinal: u32, count: u32, style: UuStyle
     uu_render(name, bytes, ordinal, count, style, None)
 }
 
-/// A uuencode article with one of the damage kinds a uuencode post can carry.
+// A uuencode article with one of the damage kinds a uuencode post can carry.
 fn uu_damaged(
     name: &str,
     bytes: &[u8],
@@ -483,9 +483,9 @@ fn uu_damaged(
     }
 }
 
-/// The uuencode damage kinds, as [`Damage`] values: a line cut short, a
-/// length character that overstates, a byte outside the alphabet, and a
-/// differing duplicate. A missing part is [`Wire::Absent`].
+// The uuencode damage kinds, as [`Damage`] values: a line cut short, a
+// length character that overstates, a byte outside the alphabet, and a
+// differing duplicate. A missing part is [`Wire::Absent`].
 pub(in super::super) const UU_DAMAGES: [Damage; 4] = [
     Damage::Truncated,
     Damage::Overlong,
@@ -583,8 +583,8 @@ fn uu_render(
     out
 }
 
-/// The NNTP response a server sends for one article body: a status line,
-/// the body with dot-stuffing, and the terminating dot.
+// The NNTP response a server sends for one article body: a status line,
+// the body with dot-stuffing, and the terminating dot.
 pub(in super::super) fn on_the_wire(body: &[u8]) -> Vec<u8> {
     let mut wire = b"222 0 <tier2@example.invalid> body follows\r\n".to_vec();
     for line in body.split_inclusive(|&byte| byte == b'\n') {
@@ -600,16 +600,16 @@ pub(in super::super) fn on_the_wire(body: &[u8]) -> Vec<u8> {
     wire
 }
 
-/// A whole job as posted.
+// A whole job as posted.
 #[derive(Clone, Debug)]
 pub(in super::super) struct Post {
     pub files: Vec<Posted>,
     pub password: Option<String>,
-    /// What a complete job must publish, by path under its output
-    /// directory, byte for byte.
+    // What a complete job must publish, by path under its output
+    // directory, byte for byte.
     pub expected: Vec<(String, Vec<u8>)>,
-    /// Further files a complete job may publish besides `expected`, such as
-    /// furniture posted beside the archive.
+    // Further files a complete job may publish besides `expected`, such as
+    // furniture posted beside the archive.
     pub allowed: Vec<String>,
 }
 

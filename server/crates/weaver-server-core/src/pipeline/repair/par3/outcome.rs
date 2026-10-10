@@ -1,10 +1,10 @@
-//! Typed PAR3 outcomes.
-//!
-//! Every terminal verdict the PAR3 path can reach is one of these classes, so
-//! the failure message, the exported counter and the retained per-job record
-//! all come from one value instead of from an ad-hoc string at each call site.
-//! Engine I/O and internal-state errors are *not* outcomes and keep their own
-//! error text.
+// Typed PAR3 outcomes.
+//
+// Every terminal verdict the PAR3 path can reach is one of these classes, so
+// the failure message, the exported counter and the retained per-job record
+// all come from one value instead of from an ad-hoc string at each call site.
+// Engine I/O and internal-state errors are *not* outcomes and keep their own
+// error text.
 
 use super::*;
 use crate::operations::metrics::{Par3AdmissionReason, Par3OutcomeClass};
@@ -12,16 +12,16 @@ use par3_rs::runtime::{LimitCause, MemoryCategory};
 use par3_rs::session::RecoveryRequirement;
 use std::borrow::Cow;
 
-/// One cohort's shortfall, as the engine's assessment reports it.
+// One cohort's shortfall, as the engine's assessment reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::pipeline) struct CohortDeficit {
     pub matrix: par3_rs::Fingerprint,
     pub cohort: u64,
     pub cohorts: u64,
     pub lost: u64,
-    /// Distinct compatible recovery indices already held.
+    // Distinct compatible recovery indices already held.
     pub available: u64,
-    /// Minimum further recovery blocks this cohort needs.
+    // Minimum further recovery blocks this cohort needs.
     pub additional: u64,
 }
 
@@ -37,8 +37,8 @@ impl CohortDeficit {
         }
     }
 
-    /// First four fingerprint bytes, enough to tell two matrices apart in a
-    /// message without printing a full hash.
+    // First four fingerprint bytes, enough to tell two matrices apart in a
+    // message without printing a full hash.
     fn matrix_prefix(&self) -> String {
         self.matrix
             .iter()
@@ -63,19 +63,19 @@ impl std::fmt::Display for CohortDeficit {
     }
 }
 
-/// How far short of an executable plan the authenticated metadata is.
+// How far short of an executable plan the authenticated metadata is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(in crate::pipeline) struct MissingMetadata {
-    /// Sets whose Start/Root or referenced children have not all arrived.
+    // Sets whose Start/Root or referenced children have not all arrived.
     pub sets: u64,
-    /// Carriers still reporting a gap the scanner needs before it can resume.
+    // Carriers still reporting a gap the scanner needs before it can resume.
     pub carriers_awaiting_bytes: u64,
-    /// Referenced files with no authenticated layout entry yet.
+    // Referenced files with no authenticated layout entry yet.
     pub unresolved_files: u64,
-    /// A packet family no carrier produced a single authenticated copy of.
-    /// This is a different statement from `sets`: the set is not merely
-    /// incomplete, it is short one of the packets nothing can proceed without,
-    /// and no further carrier byte of the ones already scanned will supply it.
+    // A packet family no carrier produced a single authenticated copy of.
+    // This is a different statement from `sets`: the set is not merely
+    // incomplete, it is short one of the packets nothing can proceed without,
+    // and no further carrier byte of the ones already scanned will supply it.
     pub missing_vital: Option<super::carriers::Par3PacketKind>,
 }
 
@@ -93,46 +93,60 @@ impl std::fmt::Display for MissingMetadata {
     }
 }
 
-/// A terminal or near-terminal PAR3 verdict.
+// A terminal or near-terminal PAR3 verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::pipeline) enum Par3Outcome {
-    /// At least one cohort's deficit exceeds every admissible recovery index
-    /// that exists in the set, and donor search cannot close it.
-    Unrecoverable { cohorts: Vec<CohortDeficit> },
-    /// Not a failure: the acquisition plan for the cohorts still short.
+    // At least one cohort's deficit exceeds every admissible recovery index
+    // that exists in the set, and donor search cannot close it.
+    Unrecoverable {
+        cohorts: Vec<CohortDeficit>,
+    },
+    // Not a failure: the acquisition plan for the cohorts still short.
     NeedsRecovery {
         cohorts: Vec<CohortDeficit>,
         bytes: u64,
     },
-    /// Authenticated metadata is incomplete, as far as the assessment exposes.
-    MetadataIncomplete { missing: MissingMetadata },
-    /// A matrix kind or geometry the engine does not execute.
-    Unsupported { detail: &'static str },
-    /// Admissible, but the engine will not run it: a hard ceiling the set is
-    /// over, or a rule the engine refuses to break for it. The reason is
-    /// borrowed where it is a fixed label and owned where the engine names a
-    /// particular offender.
-    NotExecutable { limit: Cow<'static, str> },
-    /// Fits alone, but not beside the peer work unit currently holding
-    /// PAR3 memory.
-    WaitingForMemory { need: u64, have: u64 },
-    /// Cannot fit even alone under the configured budget.
-    DoesNotFit { need: u64, limit: u64 },
-    /// Informational: what the carrier scanner refused or could not read,
-    /// with the carriers it happened on.
+    // Authenticated metadata is incomplete, as far as the assessment exposes.
+    MetadataIncomplete {
+        missing: MissingMetadata,
+    },
+    // A matrix kind or geometry the engine does not execute.
+    Unsupported {
+        detail: &'static str,
+    },
+    // Admissible, but the engine will not run it: a hard ceiling the set is
+    // over, or a rule the engine refuses to break for it. The reason is
+    // borrowed where it is a fixed label and owned where the engine names a
+    // particular offender.
+    NotExecutable {
+        limit: Cow<'static, str>,
+    },
+    // Fits alone, but not beside the peer work unit currently holding
+    // PAR3 memory.
+    WaitingForMemory {
+        need: u64,
+        have: u64,
+    },
+    // Cannot fit even alone under the configured budget.
+    DoesNotFit {
+        need: u64,
+        limit: u64,
+    },
+    // Informational: what the carrier scanner refused or could not read,
+    // with the carriers it happened on.
     CarrierDamage {
         carriers: Vec<super::carriers::CarrierDamage>,
         rejected_packets: u64,
         unavailable_ranges: u64,
         damaged_bytes: u64,
     },
-    /// A set names a file weaver will not create under that name.
+    // A set names a file weaver will not create under that name.
     UnsafePath {
         path: String,
         reason: super::paths::UnsafePath,
     },
-    /// The working directory cannot hold the outputs the installation stages
-    /// beside their destinations.
+    // The working directory cannot hold the outputs the installation stages
+    // beside their destinations.
     NoOutputSpace {
         need: u64,
         available: u64,
@@ -156,10 +170,10 @@ impl Par3Outcome {
         }
     }
 
-    /// Whether this class ends the job. `NeedsRecovery` and `CarrierDamage`
-    /// describe a plan or a condition, and `WaitingForMemory` describes a
-    /// collision that the peer work unit's handback resolves; none of the
-    /// three fails a job on its own.
+    // Whether this class ends the job. `NeedsRecovery` and `CarrierDamage`
+    // describe a plan or a condition, and `WaitingForMemory` describes a
+    // collision that the peer work unit's handback resolves; none of the
+    // three fails a job on its own.
     pub fn is_terminal(&self) -> bool {
         !matches!(
             self,
@@ -167,9 +181,9 @@ impl Par3Outcome {
         )
     }
 
-    /// A bounded rendering of a damage summary, on the same rule as the
-    /// cohort list: a few entries and a count of the rest, never one line per
-    /// carrier in a set that has hundreds.
+    // A bounded rendering of a damage summary, on the same rule as the
+    // cohort list: a few entries and a count of the rest, never one line per
+    // carrier in a set that has hundreds.
     fn render_carriers(carriers: &[super::carriers::CarrierDamage]) -> String {
         const SHOWN: usize = 3;
         let mut rendered = carriers
@@ -184,8 +198,8 @@ impl Par3Outcome {
         rendered
     }
 
-    /// A refused path, shortened so a hostile name cannot flood a message or
-    /// a log line with its own length.
+    // A refused path, shortened so a hostile name cannot flood a message or
+    // a log line with its own length.
     fn render_path(path: &str) -> String {
         const SHOWN: usize = 120;
         if path.len() <= SHOWN {
@@ -289,21 +303,21 @@ impl std::fmt::Display for Par3Outcome {
     }
 }
 
-/// Decide whether a refused PAR3 reservation is a transient peer collision or
-/// a budget the set can never fit into.
-///
-/// The engine measures its own refusals now, so nothing here is inferred from
-/// the configured budget: `need`, `limit` and `available` are the numbers the
-/// refusal carried, and `cause()` is the engine's own reading of them.
-///
-/// One thing the engine deliberately does not decide is *whose* reservations
-/// crowded the request out. `LimitCause::PeerContention` means "the same
-/// request fits once the memory currently held is released", and the holder may
-/// be another work unit or this session's own earlier reservations — layout,
-/// evidence and assessment state are all still charged when codec scratch is
-/// asked for. Only weaver knows which, because only weaver knows whether a peer
-/// work unit is in flight; with no peer, waiting frees nothing and the refusal
-/// is terminal.
+// Decide whether a refused PAR3 reservation is a transient peer collision or
+// a budget the set can never fit into.
+//
+// The engine measures its own refusals now, so nothing here is inferred from
+// the configured budget: `need`, `limit` and `available` are the numbers the
+// refusal carried, and `cause()` is the engine's own reading of them.
+//
+// One thing the engine deliberately does not decide is *whose* reservations
+// crowded the request out. `LimitCause::PeerContention` means "the same
+// request fits once the memory currently held is released", and the holder may
+// be another work unit or this session's own earlier reservations — layout,
+// evidence and assessment state are all still charged when codec scratch is
+// asked for. Only weaver knows which, because only weaver knows whether a peer
+// work unit is in flight; with no peer, waiting frees nothing and the refusal
+// is terminal.
 pub(in crate::pipeline) fn classify_memory_refusal(
     limit: par3_rs::runtime::ResourceLimit,
     peer_in_flight: bool,
@@ -329,25 +343,25 @@ pub(in crate::pipeline) fn classify_memory_refusal(
     }
 }
 
-/// The ceiling an error names, when it names one.
-///
-/// Hostile or merely enormous metadata — thousands of File packets, a
-/// directory tree that nests without end, a chunk list longer than the data it
-/// describes — stops at a ceiling somebody set rather than at exhaustion.
-/// Naming that ceiling turns it into a typed verdict instead of an opaque
-/// engine string. Which side set it does not change the verdict: a plan that
-/// cannot be executed under a stated bound is unexecutable whether the bound
-/// was the engine's or weaver's, and the label says which one it was.
+// The ceiling an error names, when it names one.
+//
+// Hostile or merely enormous metadata — thousands of File packets, a
+// directory tree that nests without end, a chunk list longer than the data it
+// describes — stops at a ceiling somebody set rather than at exhaustion.
+// Naming that ceiling turns it into a typed verdict instead of an opaque
+// engine string. Which side set it does not change the verdict: a plan that
+// cannot be executed under a stated bound is unexecutable whether the bound
+// was the engine's or weaver's, and the label says which one it was.
 pub(in crate::pipeline) fn execution_limit(error: &EngineError) -> Option<&'static str> {
     super::budget::limit_label(error)
 }
 
-/// The path violation behind an engine error, however it was wrapped.
-///
-/// A refused name can be reached after earlier files of the same repair have
-/// staged, and the engine then hands the refusal back inside the interruption
-/// that carries those temporaries. The verdict is the same either way, so the
-/// cause is read through the wrapper exactly as a refused reservation is.
+// The path violation behind an engine error, however it was wrapped.
+//
+// A refused name can be reached after earlier files of the same repair have
+// staged, and the engine then hands the refusal back inside the interruption
+// that carries those temporaries. The verdict is the same either way, so the
+// cause is read through the wrapper exactly as a refused reservation is.
 pub(in crate::pipeline) fn unsafe_path(error: &EngineError) -> Option<&par3_rs::PathViolation> {
     match error {
         EngineError::UnsafePath(violation) => Some(violation),
@@ -360,14 +374,14 @@ pub(in crate::pipeline) fn unsafe_path(error: &EngineError) -> Option<&par3_rs::
     }
 }
 
-/// The verdict on a set that names a file the engine refuses to write.
-///
-/// Weaver checks the same names before it plans anything, so this is the
-/// engine's own refusal reaching the same class from the other end: the last
-/// line rather than the first. Nothing weaver can do changes the answer — no
-/// retry, no further recovery blocks and no larger budget makes the name
-/// admissible — so the verdict is terminal, and it keeps the engine's words
-/// for the rule when weaver's table states nothing equivalent.
+// The verdict on a set that names a file the engine refuses to write.
+//
+// Weaver checks the same names before it plans anything, so this is the
+// engine's own refusal reaching the same class from the other end: the last
+// line rather than the first. Nothing weaver can do changes the answer — no
+// retry, no further recovery blocks and no larger budget makes the name
+// admissible — so the verdict is terminal, and it keeps the engine's words
+// for the rule when weaver's table states nothing equivalent.
 pub(in crate::pipeline) fn refuse_unsafe_path(violation: &par3_rs::PathViolation) -> Par3Outcome {
     Par3Outcome::UnsafePath {
         path: violation.path.clone(),
@@ -375,8 +389,8 @@ pub(in crate::pipeline) fn refuse_unsafe_path(violation: &par3_rs::PathViolation
     }
 }
 
-/// Which admission budget a refusal names. The labels are the engine's own and
-/// the ones weaver's host-side budgets refuse under; `limit_label` reads both.
+// Which admission budget a refusal names. The labels are the engine's own and
+// the ones weaver's host-side budgets refuse under; `limit_label` reads both.
 pub(in crate::pipeline) fn admission_reason(error: &EngineError) -> Par3AdmissionReason {
     let Some(label) = super::budget::limit_label(error) else {
         return Par3AdmissionReason::Other;
@@ -406,10 +420,10 @@ pub(in crate::pipeline) fn admission_reason(error: &EngineError) -> Par3Admissio
 }
 
 impl Pipeline {
-    /// Count a typed verdict once, retain it on the job, and fail the job with
-    /// the outcome's own message when the class is terminal. Every PAR3 path
-    /// that reaches a verdict goes through here, so the exported counter and
-    /// the user-facing text can never disagree.
+    // Count a typed verdict once, retain it on the job, and fail the job with
+    // the outcome's own message when the class is terminal. Every PAR3 path
+    // that reaches a verdict goes through here, so the exported counter and
+    // the user-facing text can never disagree.
     pub(in crate::pipeline) fn settle_par3_outcome(&mut self, job_id: JobId, outcome: Par3Outcome) {
         let message = outcome.to_string();
         let terminal = outcome.is_terminal();
@@ -432,8 +446,8 @@ impl Pipeline {
         }
     }
 
-    /// The deficient cohorts of every retained assessment for this job, and
-    /// the bytes they are short by. Publishes the two acquisition gauges.
+    // The deficient cohorts of every retained assessment for this job, and
+    // the bytes they are short by. Publishes the two acquisition gauges.
     pub(in crate::pipeline) fn par3_cohort_plan(
         &self,
         job_id: JobId,
@@ -453,9 +467,9 @@ impl Pipeline {
         plan
     }
 
-    /// Classify a refused PAR3 memory reservation and act on the verdict: a
-    /// collision with the peer work unit parks the job until that unit hands
-    /// back, while a set that cannot fit alone fails now.
+    // Classify a refused PAR3 memory reservation and act on the verdict: a
+    // collision with the peer work unit parks the job until that unit hands
+    // back, while a set that cannot fit alone fails now.
     pub(in crate::pipeline) fn refuse_par3_memory(
         &mut self,
         job_id: JobId,
@@ -477,10 +491,10 @@ impl Pipeline {
         }
     }
 
-    /// A host-side ceiling refused the image, so there is no native
-    /// measurement to classify: weaver knows only what it asked for. A peer
-    /// work unit still holds the payload that ceiling is sized against, so the
-    /// park/wake path is the same one an engine refusal takes.
+    // A host-side ceiling refused the image, so there is no native
+    // measurement to classify: weaver knows only what it asked for. A peer
+    // work unit still holds the payload that ceiling is sized against, so the
+    // park/wake path is the same one an engine refusal takes.
     pub(in crate::pipeline) fn refuse_par3_host_memory(
         &mut self,
         job_id: JobId,
@@ -508,8 +522,8 @@ impl Pipeline {
         }
     }
 
-    /// What the authenticated metadata is still short of, as far as the
-    /// retained assessments and the carrier scanners expose it.
+    // What the authenticated metadata is still short of, as far as the
+    // retained assessments and the carrier scanners expose it.
     pub(in crate::pipeline) fn par3_missing_metadata(&self, job_id: JobId) -> MissingMetadata {
         let Some(runtime) = self.par3_runtime.as_ref() else {
             return MissingMetadata::default();

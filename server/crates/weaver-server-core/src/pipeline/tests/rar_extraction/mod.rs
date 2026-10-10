@@ -1,9 +1,9 @@
 use super::*;
 use crate::pipeline::completion::finalize::rar::{ArchiveSetRetirement, UnmaterializedArchiveSet};
 
-/// A four-volume set whose two file members sanitize to one destination
-/// on a case-folding filesystem: `CERTIFICATE/BACKUP/id.bdmv` and
-/// `CERTIFICATE/backup/id.bdmv`.
+// A four-volume set whose two file members sanitize to one destination
+// on a case-folding filesystem: `CERTIFICATE/BACKUP/id.bdmv` and
+// `CERTIFICATE/backup/id.bdmv`.
 fn build_case_colliding_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     let first = b"first-of-two-names-for-one-path";
     let second = b"second-of-two-names-for-one-path";
@@ -69,8 +69,8 @@ fn build_case_colliding_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     volumes
 }
 
-/// A job whose four-volume RAR set is fully downloaded, complete, and already
-/// carries a derived plan — the state every post-repair refresh finds.
+// A job whose four-volume RAR set is fully downloaded, complete, and already
+// carries a derived plan — the state every post-repair refresh finds.
 async fn complete_rar_set_with_plan(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -92,8 +92,8 @@ async fn complete_rar_set_with_plan(
     );
 }
 
-/// Every file `Complete` at its canonical name, which is what a repaired volume
-/// re-verifies as — never `Renamed`.
+// Every file `Complete` at its canonical name, which is what a repaired volume
+// re-verifies as — never `Renamed`.
 fn all_complete_verification(files: &[(String, Vec<u8>)]) -> par2_rs::VerificationResult {
     par2_rs::VerificationResult {
         files: files
@@ -113,12 +113,12 @@ fn all_complete_verification(files: &[(String, Vec<u8>)]) -> par2_rs::Verificati
     }
 }
 
-/// A job whose RAR volumes are complete in the ledger but were never written
-/// under the names its live identities classify them into.
-///
-/// Nothing is written to the working directory on purpose: this is the state a
-/// direct set leaves behind, where the bytes were routed straight to their
-/// members and no volume file ever existed to reopen.
+// A job whose RAR volumes are complete in the ledger but were never written
+// under the names its live identities classify them into.
+//
+// Nothing is written to the working directory on purpose: this is the state a
+// direct set leaves behind, where the bytes were routed straight to their
+// members and no volume file ever existed to reopen.
 async fn claimed_alias_set_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -164,8 +164,8 @@ async fn claimed_alias_set_job(
     }
 }
 
-/// Turns the completion loop the way the run loop does: pop everything the
-/// queue holds, check it, and let each check re-arm whatever it wants to.
+// Turns the completion loop the way the run loop does: pop everything the
+// queue holds, check it, and let each check re-arm whatever it wants to.
 async fn drain_completion_checks(pipeline: &mut Pipeline, rounds: usize) -> usize {
     let mut checks = 0;
     for _ in 0..rounds {
@@ -184,13 +184,13 @@ async fn drain_completion_checks(pipeline: &mut Pipeline, rounds: usize) -> usiz
     checks
 }
 
-/// A single stored member split across an **old-numbering** RAR4 set —
-/// `<base>.rar`, `<base>.r00`, `<base>.r01`, … — the one multi-volume RAR
-/// shape whose headers state no per-volume number anywhere: RAR4's main header
-/// has no number field (that is RAR5's), and these end records carry no
-/// `VOLUME_NUMBER` flag (a numbered `ENDARC` is what modern `.partNN` writers
-/// emit). Every volume of such a set parses as volume 0; only the filename
-/// says which volume a file is.
+// A single stored member split across an **old-numbering** RAR4 set —
+// `<base>.rar`, `<base>.r00`, `<base>.r01`, … — the one multi-volume RAR
+// shape whose headers state no per-volume number anywhere: RAR4's main header
+// has no number field (that is RAR5's), and these end records carry no
+// `VOLUME_NUMBER` flag (a numbered `ENDARC` is what modern `.partNN` writers
+// emit). Every volume of such a set parses as volume 0; only the filename
+// says which volume a file is.
 fn single_member_rar4_old_numbering_set(
     base: &str,
     member_name: &str,
@@ -240,10 +240,10 @@ fn single_member_rar4_old_numbering_set(
         .collect()
 }
 
-/// Fill in the CRC16 of every RAR4 block in `bytes`. The shared fixture
-/// builders leave it zero because weaver's own parser only warns on a
-/// mismatch; the recovery restorer's validity probe does not, and a set
-/// written to exercise it has to be one it would accept.
+// Fill in the CRC16 of every RAR4 block in `bytes`. The shared fixture
+// builders leave it zero because weaver's own parser only warns on a
+// mismatch; the recovery restorer's validity probe does not, and a set
+// written to exercise it has to be one it would accept.
 fn with_rar4_header_crcs(mut bytes: Vec<u8>) -> Vec<u8> {
     let mut offset = TEST_RAR4_SIG.len();
     while offset + 7 <= bytes.len() {
@@ -266,10 +266,10 @@ fn with_rar4_header_crcs(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
-/// A RAR3 standalone recovery volume for `volumes`: the set's RS parity over
-/// every data volume, padded to the longest, followed by the 7-byte footer
-/// (`data-1`, `rec-1`, `position-1`, CRC32) a new-style `.rev` carries and the
-/// restorer reads its geometry from.
+// A RAR3 standalone recovery volume for `volumes`: the set's RS parity over
+// every data volume, padded to the longest, followed by the 7-byte footer
+// (`data-1`, `rec-1`, `position-1`, CRC32) a new-style `.rev` carries and the
+// restorer reads its geometry from.
 fn single_recovery_volume_for_rar4_set(volumes: &[&[u8]]) -> Vec<u8> {
     let width = volumes.iter().map(|volume| volume.len()).max().unwrap_or(0);
     let coder = reedsolomon_rs::rar3::Rar3RsCoder::new(1).expect("one recovery volume");
@@ -291,10 +291,10 @@ fn single_recovery_volume_for_rar4_set(volumes: &[&[u8]]) -> Vec<u8> {
     rev
 }
 
-/// An old-numbering RAR4 set of four volumes whose volume 2 was never posted,
-/// plus one `.rev` that can rebuild it. The job's files are volumes 0, 1 and 3
-/// and the recovery volume, every one of them downloaded and complete, and
-/// the set is left waiting on the hole. Returns the member's payload.
+// An old-numbering RAR4 set of four volumes whose volume 2 was never posted,
+// plus one `.rev` that can rebuild it. The job's files are volumes 0, 1 and 3
+// and the recovery volume, every one of them downloaded and complete, and
+// the set is left waiting on the hole. Returns the member's payload.
 async fn stage_old_numbering_rar4_set_with_a_recovery_volume(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -342,13 +342,13 @@ async fn stage_old_numbering_rar4_set_with_a_recovery_volume(
     payload
 }
 
-/// Stands up the fixture both extraction-ordering tests share: a five-volume
-/// old-numbering RAR4 set in the NZB, with a recovery set installed over it
-/// **before** any volume completes — the order a real job has, where the small
-/// index lands long before the payload.
-///
-/// The volumes are returned rather than completed, because the ordering under
-/// test is exactly what a completing volume triggers.
+// Stands up the fixture both extraction-ordering tests share: a five-volume
+// old-numbering RAR4 set in the NZB, with a recovery set installed over it
+// **before** any volume completes — the order a real job has, where the small
+// index lands long before the payload.
+//
+// The volumes are returned rather than completed, because the ordering under
+// test is exactly what a completing volume triggers.
 async fn rar_set_with_recovery_awaiting_volumes(
     pipeline: &mut Pipeline,
     job_id: JobId,

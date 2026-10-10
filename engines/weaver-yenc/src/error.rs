@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Errors that can occur during yEnc decoding or encoding.
+// Errors that can occur during yEnc decoding or encoding.
 #[derive(Debug, Error)]
 pub enum YencError {
     #[error("missing =ybegin header")]

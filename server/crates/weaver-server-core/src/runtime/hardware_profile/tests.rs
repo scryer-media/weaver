@@ -2,8 +2,8 @@ use crate::runtime::system_profile::*;
 
 use super::*;
 
-/// A machine with `cores` physical cores and `memory_gib` of RAM. Disk plays no
-/// part in the profile decision, so it stays fixed.
+// A machine with `cores` physical cores and `memory_gib` of RAM. Disk plays no
+// part in the profile decision, so it stays fixed.
 fn machine(cores: usize, memory_gib: u64) -> SystemProfile {
     SystemProfile {
         cpu: CpuProfile {
@@ -94,8 +94,8 @@ fn a_container_is_held_to_its_quota_not_the_host() {
     );
 }
 
-/// A cpuset or affinity mask narrows the CPUs a process may use without any
-/// quota, while the physical count is still read host-wide.
+// A cpuset or affinity mask narrows the CPUs a process may use without any
+// quota, while the physical count is still read host-wide.
 #[test]
 fn a_process_pinned_to_two_cpus_is_held_to_them_without_a_quota() {
     let mut pinned = machine(16, 32);
@@ -145,8 +145,8 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(performance.max_concurrent_downloads_cap, None);
 }
 
-/// The extraction, PAR3 and holds limits shrink with the profile, and the
-/// widest profile leaves each exactly where the machine alone put it.
+// The extraction, PAR3 and holds limits shrink with the profile, and the
+// widest profile leaves each exactly where the machine alone put it.
 #[test]
 fn each_profile_sizes_extraction_par3_and_holds_limits() {
     for large in [machine(4, 8), machine(16, 64)] {

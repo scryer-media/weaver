@@ -11,7 +11,7 @@ pub struct Claims {
     pub exp: u64,
 }
 
-/// What a token handed to a running script says about that run.
+// What a token handed to a running script says about that run.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScriptRunClaims {
     pub run_id: String,
@@ -41,8 +41,8 @@ pub enum JwtSecretError {
     InvalidHex(#[from] hex::FromHexError),
 }
 
-/// Share a small CPU/memory budget across browser password operations.
-/// Move the permit into the blocking closure so cancellation cannot free it early.
+// Share a small CPU/memory budget across browser password operations.
+// Move the permit into the blocking closure so cancellation cannot free it early.
 pub fn password_work_permit() -> Result<tokio::sync::OwnedSemaphorePermit, &'static str> {
     static WORK: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
@@ -58,35 +58,35 @@ pub fn generate_api_key() -> String {
     format!("wvr_{}", hex::encode(bytes))
 }
 
-/// Generate an opaque browser credential. It deliberately has no API-key
-/// prefix, so browser cookies can never be mistaken for programmatic keys.
+// Generate an opaque browser credential. It deliberately has no API-key
+// prefix, so browser cookies can never be mistaken for programmatic keys.
 pub fn generate_browser_session_secret() -> String {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).expect("getrandom failed");
     hex::encode(bytes)
 }
 
-/// Characters a first-run setup code is drawn from: capitals and digits, less
-/// the ones that read alike (0/O, 1/I/L), so the code survives being copied
-/// by eye from a terminal.
+// Characters a first-run setup code is drawn from: capitals and digits, less
+// the ones that read alike (0/O, 1/I/L), so the code survives being copied
+// by eye from a terminal.
 pub const SETUP_CODE_ALPHABET: &[u8; 31] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
-/// Characters a first-run setup code carries, not counting its hyphen. Six
-/// characters is about 30 bits, and the setup endpoint allows five wrong
-/// guesses a minute for the life of one process, which puts a guessed code
-/// centuries away.
+// Characters a first-run setup code carries, not counting its hyphen. Six
+// characters is about 30 bits, and the setup endpoint allows five wrong
+// guesses a minute for the life of one process, which puts a guessed code
+// centuries away.
 pub const SETUP_CODE_LENGTH: usize = 6;
 
-/// The code is shown as two groups of three joined by a hyphen (`K7P-M2X`),
-/// so it is easy to read back and easy to spot in a log.
+// The code is shown as two groups of three joined by a hyphen (`K7P-M2X`),
+// so it is easy to read back and easy to spot in a log.
 const SETUP_CODE_GROUP: usize = SETUP_CODE_LENGTH / 2;
 
-/// The text that introduces a setup code wherever Weaver prints one. Launchers
-/// find the code by looking for it, so it must stay stable.
+// The text that introduces a setup code wherever Weaver prints one. Launchers
+// find the code by looking for it, so it must stay stable.
 pub const SETUP_CODE_MARKER: &str = "Weaver one-time setup code: ";
 
-/// A short first-run setup code, uniform over `SETUP_CODE_ALPHABET`, in its
-/// hyphenated display form.
+// A short first-run setup code, uniform over `SETUP_CODE_ALPHABET`, in its
+// hyphenated display form.
 pub fn generate_setup_code() -> String {
     // Rejection sampling: 248 is the largest multiple of 31 in a byte, so
     // every accepted byte maps to a character with equal probability.
@@ -111,7 +111,7 @@ pub fn generate_setup_code() -> String {
     code
 }
 
-/// Whether `code` has the hyphenated shape `generate_setup_code` produces.
+// Whether `code` has the hyphenated shape `generate_setup_code` produces.
 pub fn is_setup_code(code: &str) -> bool {
     let bytes = code.as_bytes();
     bytes.len() == SETUP_CODE_LENGTH + 1
@@ -124,8 +124,8 @@ pub fn is_setup_code(code: &str) -> bool {
         })
 }
 
-/// The form a setup code is compared in: capitals, with the hyphen and any
-/// spacing dropped, so `k7p-m2x`, `K7PM2X` and `K7P M2X` are the same code.
+// The form a setup code is compared in: capitals, with the hyphen and any
+// spacing dropped, so `k7p-m2x`, `K7PM2X` and `K7P M2X` are the same code.
 pub fn normalize_setup_code(input: &str) -> String {
     input
         .chars()
@@ -134,8 +134,8 @@ pub fn normalize_setup_code(input: &str) -> String {
         .collect()
 }
 
-/// The setup code a line announces, wherever in the line the announcement
-/// sits: a console banner row, or the message of a JSON record.
+// The setup code a line announces, wherever in the line the announcement
+// sits: a console banner row, or the message of a JSON record.
 pub fn find_setup_code(line: &str) -> Option<&str> {
     let (_, rest) = line.split_once(SETUP_CODE_MARKER)?;
     let code = rest.get(..SETUP_CODE_LENGTH + 1)?;
@@ -146,8 +146,8 @@ pub fn find_setup_code(line: &str) -> Option<&str> {
     (is_setup_code(code) && whole).then_some(code)
 }
 
-/// Stable per-session CSRF value. Only a verifier is persisted; this value is
-/// regenerated from the server secret after a browser reload or process restart.
+// Stable per-session CSRF value. Only a verifier is persisted; this value is
+// regenerated from the server secret after a browser reload or process restart.
 pub fn derive_browser_csrf_token(session_token: &str, server_secret: &[u8; 32]) -> String {
     hex::encode(sign_hs256(
         server_secret,
@@ -201,8 +201,8 @@ pub fn verify_jwt(token: &str, secret: &[u8]) -> Result<Claims, JwtError> {
     Ok(claims)
 }
 
-/// A token for one script run, signed with a domain-separated key so login
-/// tokens and run tokens cannot be substituted even if their claims overlap.
+// A token for one script run, signed with a domain-separated key so login
+// tokens and run tokens cannot be substituted even if their claims overlap.
 pub fn create_script_run_jwt(claims: &ScriptRunClaims, secret: &[u8]) -> String {
     sign_claims(claims, &sign_hs256(secret, b"weaver-script-run-v1"))
 }
@@ -214,8 +214,8 @@ pub fn verify_script_run_jwt(token: &str, secret: &[u8]) -> Result<ScriptRunClai
     Ok(claims)
 }
 
-/// Whether `token` has the shape of a token this server signs. Cheap enough
-/// to ask of every credential before anything is read to verify it.
+// Whether `token` has the shape of a token this server signs. Cheap enough
+// to ask of every credential before anything is read to verify it.
 pub fn is_signed_token_shape(token: &str) -> bool {
     let mut parts = token.split('.');
     parts.next() == Some(TOKEN_HEADER)
@@ -224,9 +224,9 @@ pub fn is_signed_token_shape(token: &str) -> bool {
         && parts.next().is_none()
 }
 
-/// Whether `token` could be a script run's token: signed as this server signs
-/// and with the claims of a run, read without checking the signature. A login
-/// token fails this, so nothing is read from the database to turn it away.
+// Whether `token` could be a script run's token: signed as this server signs
+// and with the claims of a run, read without checking the signature. A login
+// token fails this, so nothing is read from the database to turn it away.
 pub fn is_script_run_token_shape(token: &str) -> bool {
     if !is_signed_token_shape(token) {
         return false;
@@ -246,7 +246,7 @@ pub fn is_script_run_token_shape(token: &str) -> bool {
         && claims.contains_key("instance_id")
 }
 
-/// `{"alg":"HS256","typ":"JWT"}`, encoded.
+// `{"alg":"HS256","typ":"JWT"}`, encoded.
 const TOKEN_HEADER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
 
 fn sign_claims(claims: &impl Serialize, secret: &[u8]) -> String {
@@ -258,7 +258,7 @@ fn sign_claims(claims: &impl Serialize, secret: &[u8]) -> String {
     format!("{signing_input}.{sig_b64}")
 }
 
-/// The claims of `token`, once its signature has been checked.
+// The claims of `token`, once its signature has been checked.
 fn verified_claims<T: serde::de::DeserializeOwned>(
     token: &str,
     secret: &[u8],
@@ -321,8 +321,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         == 0
 }
 
-/// Compare a browser CSRF verifier using the existing MAC implementation's
-/// constant-time tag verification, without exposing a prefix comparison.
+// Compare a browser CSRF verifier using the existing MAC implementation's
+// constant-time tag verification, without exposing a prefix comparison.
 pub fn verify_browser_csrf_token(token: &str, verifier: &str) -> bool {
     let Ok(expected): Result<[u8; 32], _> = hex::decode(verifier).and_then(|bytes| {
         bytes

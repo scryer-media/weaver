@@ -1,8 +1,8 @@
-//! The wider shapes of real posts, one small family each: a PAR2 index that
-//! lies about its files, archives nested in archives, posts at the far ends
-//! of the size axes, passwords right, wrong and missing over every locked
-//! container, the yEnc wire's own variants, volume naming the field writes,
-//! and jobs of several sets with the furniture posted beside them.
+// The wider shapes of real posts, one small family each: a PAR2 index that
+// lies about its files, archives nested in archives, posts at the far ends
+// of the size axes, passwords right, wrong and missing over every locked
+// container, the yEnc wire's own variants, volume naming the field writes,
+// and jobs of several sets with the furniture posted beside them.
 use super::super::super::super::sevenz_store::{Entry, build_7z_shaped, split_volumes};
 use super::damage::with_recovery;
 use super::fixtures::{Container, MEMBER, PASSWORD as KEY, SEVENZ_MEMBER, payload};
@@ -18,7 +18,7 @@ const BLOCK: usize = 1024;
 const VOLUMES: usize = 4;
 const ARTICLES_PER_VOLUME: usize = 32;
 
-/// Each family's name and scenario count.
+// Each family's name and scenario count.
 pub(super) fn totals() -> Vec<(&'static str, usize)> {
     vec![
         ("index that lies", lies::family().total()),
@@ -39,7 +39,7 @@ pub(super) const TOTAL: usize = lies::TOTAL
     + naming::TOTAL
     + sets::TOTAL;
 
-/// What recovery a post carries beside its archive.
+// What recovery a post carries beside its archive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Recovery {
     Par2(Margin),
@@ -47,8 +47,8 @@ pub(super) enum Recovery {
     None,
 }
 
-/// A stored single-member set of `container` under `member`, `payload`
-/// across `count` volumes, named `silver.horizon`.
+// A stored single-member set of `container` under `member`, `payload`
+// across `count` volumes, named `silver.horizon`.
 fn stored(
     container: Container,
     member: &'static str,
@@ -106,8 +106,8 @@ fn source_blocks(post: &Post, block: usize) -> usize {
         .sum()
 }
 
-/// `post` with the recovery it carries authored to the margin, and the
-/// geometry the oracle counts in.
+// `post` with the recovery it carries authored to the margin, and the
+// geometry the oracle counts in.
 fn with(
     post: Post,
     recovery: Recovery,
@@ -164,7 +164,7 @@ fn with(
     }
 }
 
-/// [`with_recovery`] with the set posted in `article`-sized articles.
+// [`with_recovery`] with the set posted in `article`-sized articles.
 fn with_recovery_in(
     post: Post,
     lost: impl Fn(&Post) -> BTreeMap<usize, BTreeSet<u32>>,
@@ -214,28 +214,28 @@ macro_rules! breadth_family {
     };
 }
 
-/// A PAR2 index whose descriptions are wrong about the files they name.
+// A PAR2 index whose descriptions are wrong about the files they name.
 pub(super) mod lies {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub(in super::super) enum Lie {
         None,
-        /// The whole-file MD5 is wrong; every slice checks.
+        // The whole-file MD5 is wrong; every slice checks.
         FileHash,
-        /// The first-16k MD5 is wrong.
+        // The first-16k MD5 is wrong.
         Hash16k,
-        /// The file is described one article longer than it is.
+        // The file is described one article longer than it is.
         LengthLong,
-        /// The file is described one article shorter than it is.
+        // The file is described one article shorter than it is.
         LengthShort,
-        /// One slice's MD5 is wrong; the bytes are right.
+        // One slice's MD5 is wrong; the bytes are right.
         SliceHash,
-        /// The names are uppercased.
+        // The names are uppercased.
         NameCase,
-        /// The names are of other files.
+        // The names are of other files.
         NameOther,
-        /// The main packet's slice size is doubled.
+        // The main packet's slice size is doubled.
         SliceSize,
     }
 
@@ -287,7 +287,7 @@ pub(super) mod lies {
     // 162 cells under three profiles, 617 of the combined cases each.
     breadth_family!(LieCell, cells(), Pool::Combined, 617, 299_862, 162);
 
-    /// The set rewritten to tell the lie, in every file that describes.
+    // The set rewritten to tell the lie, in every file that describes.
     fn tell(lie: Lie, set: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
         if lie == Lie::None {
             return set;
@@ -426,7 +426,7 @@ pub(super) mod lies {
         }
     }
 
-    /// The campaign: 300 shards of about a thousand cases.
+    // The campaign: 300 shards of about a thousand cases.
     mod combined_lies {
         use super::*;
 
@@ -434,19 +434,19 @@ pub(super) mod lies {
     }
 }
 
-/// Archives inside archives.
+// Archives inside archives.
 pub(super) mod nesting {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub(in super::super) enum Depth {
-        /// A stored RAR holding a stored RAR holding the member.
+        // A stored RAR holding a stored RAR holding the member.
         Two,
-        /// Three stored RARs deep.
+        // Three stored RARs deep.
         Three,
-        /// A RAR holding a 7z holding the member.
+        // A RAR holding a 7z holding the member.
         SevenZipInside,
-        /// A 7z holding a RAR holding the member.
+        // A 7z holding a RAR holding the member.
         RarInside7z,
     }
 
@@ -460,13 +460,13 @@ pub(super) mod nesting {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub(in super::super) struct NestCell {
         pub depth: Depth,
-        /// Volumes of the outer archive.
+        // Volumes of the outer archive.
         pub volumes: usize,
         pub recovery: Recovery,
-        /// The innermost archive is encrypted under the job's password.
+        // The innermost archive is encrypted under the job's password.
         pub locked: bool,
         pub members: usize,
-        /// The outer container where the depth leaves a choice.
+        // The outer container where the depth leaves a choice.
         pub outer: Container,
     }
 
@@ -507,7 +507,7 @@ pub(super) mod nesting {
             members
         }
 
-        /// The innermost archive, one volume, over the members.
+        // The innermost archive, one volume, over the members.
         fn innermost(self, members: &[(String, Vec<u8>)]) -> Vec<u8> {
             if self.depth == Depth::SevenZipInside {
                 let entries: Vec<Entry> = members
@@ -607,15 +607,15 @@ pub(super) mod nesting {
         }
     }
 
-    /// A 7z whose member is a RAR publishes the RAR itself: nested extraction
-    /// is not entered from a 7z outer. Not PAR2, so not release-blocking.
+    // A 7z whose member is a RAR publishes the RAR itself: nested extraction
+    // is not entered from a 7z outer. Not PAR2, so not release-blocking.
     const RAR_INSIDE_7Z_PUBLISHED_AS_IS: &str =
         "a RAR inside a 7z is published as the archive, never extracted";
 
-    /// A four-volume RAR holding a two-member RAR beside a PAR2 set completes
-    /// every volume, fetches the PAR2 set and then fails "invalid authoritative
-    /// NZB segment layout: FileMissing" under DirectStore with nothing lost.
-    /// PAR2 with sufficient margin: release-blocking.
+    // A four-volume RAR holding a two-member RAR beside a PAR2 set completes
+    // every volume, fetches the PAR2 set and then fails "invalid authoritative
+    // NZB segment layout: FileMissing" under DirectStore with nothing lost.
+    // PAR2 with sufficient margin: release-blocking.
     const NESTED_TWO_MEMBERS_PAR2_FILE_MISSING: &str =
         "a nested two-member RAR beside a PAR2 set fails FileMissing after completing every volume";
 
@@ -675,7 +675,7 @@ pub(super) mod nesting {
         }
     }
 
-    /// The campaign: 300 shards of about a thousand cases.
+    // The campaign: 300 shards of about a thousand cases.
     mod combined_nesting {
         use super::*;
 
@@ -683,21 +683,21 @@ pub(super) mod nesting {
     }
 }
 
-/// The far ends of the size axes.
+// The far ends of the size axes.
 pub(super) mod scale {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub(in super::super) enum Shape {
-        /// Twenty-four volumes of eight articles.
+        // Twenty-four volumes of eight articles.
         ManyVolumes,
-        /// Two volumes of four hundred small articles.
+        // Two volumes of four hundred small articles.
         ManyArticles,
-        /// Four volumes of eight 12 KiB articles.
+        // Four volumes of eight 12 KiB articles.
         BigArticles,
-        /// Forty-eight volumes of two articles.
+        // Forty-eight volumes of two articles.
         ManyFiles,
-        /// One volume in one article.
+        // One volume in one article.
         Tiny,
     }
 
@@ -751,7 +751,7 @@ pub(super) mod scale {
     breadth_family!(ScaleCell, cells(), Pool::Combined, 1_000, 300_000, 100);
 
     impl ScaleCell {
-        /// Volumes, articles per volume, article size.
+        // Volumes, articles per volume, article size.
         fn geometry(self) -> (usize, usize, usize) {
             match self.shape {
                 Shape::ManyVolumes => (24, 8, ARTICLE),
@@ -848,7 +848,7 @@ pub(super) mod scale {
         }
     }
 
-    /// The campaign: 300 shards of about a thousand cases.
+    // The campaign: 300 shards of about a thousand cases.
     mod combined_scale {
         use super::*;
 
@@ -856,7 +856,7 @@ pub(super) mod scale {
     }
 }
 
-/// Passwords right, wrong and missing over every locked container.
+// Passwords right, wrong and missing over every locked container.
 pub(super) mod password {
     use super::*;
 
@@ -869,7 +869,7 @@ pub(super) mod password {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub(in super::super) enum Locked {
-        /// Not encrypted at all: a password is ignored.
+        // Not encrypted at all: a password is ignored.
         Rar5Plain,
         Rar5Data,
         Rar5Headers,
@@ -1045,7 +1045,7 @@ pub(super) mod password {
         }
     }
 
-    /// The campaign: 200 shards of about a thousand cases.
+    // The campaign: 200 shards of about a thousand cases.
     mod combined_password {
         use super::*;
 
@@ -1053,7 +1053,7 @@ pub(super) mod password {
     }
 }
 
-/// The yEnc wire's own variants.
+// The yEnc wire's own variants.
 pub(super) mod wire {
     use super::*;
 
@@ -1061,9 +1061,9 @@ pub(super) mod wire {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub(in super::super) enum Articles {
-        /// The standard article.
+        // The standard article.
         Many,
-        /// Each volume in one single-part article, with no `=ypart`.
+        // Each volume in one single-part article, with no `=ypart`.
         One,
     }
 
@@ -1196,7 +1196,7 @@ pub(super) mod wire {
         }
     }
 
-    /// The campaign: 200 shards of about a thousand cases.
+    // The campaign: 200 shards of about a thousand cases.
     mod combined_wire {
         use super::*;
 
@@ -1204,22 +1204,22 @@ pub(super) mod wire {
     }
 }
 
-/// Volume naming as the field writes it.
+// Volume naming as the field writes it.
 pub(super) mod naming {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub(in super::super) enum Naming {
         Standard,
-        /// `.RAR`, `.PAR2`, `.7Z.001`.
+        // `.RAR`, `.PAR2`, `.7Z.001`.
         UpperExtension,
-        /// `Silver.Horizon.Part01.RAR`.
+        // `Silver.Horizon.Part01.RAR`.
         MixedCase,
-        /// `part001`.
+        // `part001`.
         WidePadding,
-        /// `part1`.
+        // `part1`.
         NarrowPadding,
-        /// The third volume is posted under its name and never arrives.
+        // The third volume is posted under its name and never arrives.
         Gap,
     }
 
@@ -1248,7 +1248,7 @@ pub(super) mod naming {
         pub volumes: usize,
     }
 
-    /// A 7z set's three-digit numbering is the format's own.
+    // A 7z set's three-digit numbering is the format's own.
     fn possible(cell: NameCell) -> bool {
         !(cell.container == Container::SevenZip
             && matches!(cell.naming, Naming::WidePadding | Naming::NarrowPadding))
@@ -1408,7 +1408,7 @@ pub(super) mod naming {
         }
     }
 
-    /// The campaign: 200 shards of about a thousand cases.
+    // The campaign: 200 shards of about a thousand cases.
     mod combined_naming {
         use super::*;
 
@@ -1416,21 +1416,21 @@ pub(super) mod naming {
     }
 }
 
-/// Jobs of several sets and the furniture posted beside them.
+// Jobs of several sets and the furniture posted beside them.
 pub(super) mod sets {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     pub(in super::super) enum Layout {
-        /// One set with an nfo, sfv, jpg, srr and txt beside it.
+        // One set with an nfo, sfv, jpg, srr and txt beside it.
         Furniture,
-        /// Two sets, nothing else.
+        // Two sets, nothing else.
         TwoSets,
-        /// Two sets and the furniture.
+        // Two sets and the furniture.
         TwoSetsFurniture,
-        /// One set and a bare media file posted beside it.
+        // One set and a bare media file posted beside it.
         LooseMedia,
-        /// One set and a small sample set.
+        // One set and a small sample set.
         Sample,
     }
 
@@ -1449,7 +1449,7 @@ pub(super) mod sets {
         pub layout: Layout,
         pub container: Container,
         pub recovery: Recovery,
-        /// The sfv lists a wrong checksum.
+        // The sfv lists a wrong checksum.
         pub stale_sfv: bool,
         pub volumes: usize,
     }
@@ -1648,7 +1648,7 @@ pub(super) mod sets {
         }
     }
 
-    /// The campaign: 200 shards of about a thousand cases.
+    // The campaign: 200 shards of about a thousand cases.
     mod combined_sets {
         use super::*;
 

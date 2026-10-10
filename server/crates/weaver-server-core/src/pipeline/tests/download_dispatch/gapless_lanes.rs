@@ -1,16 +1,16 @@
-//! Lanes must not idle while a job still has work they could serve.
-//!
-//! An established connection asking for its next articles is the cheapest
-//! fetch a link has. Nothing about the articles a lane was carrying before may
-//! refuse it work the scheduler still holds for its server: not a priority
-//! boundary, not another server's failures, not the class the lane happens to
-//! be booked under.
+// Lanes must not idle while a job still has work they could serve.
+//
+// An established connection asking for its next articles is the cheapest
+// fetch a link has. Nothing about the articles a lane was carrying before may
+// refuse it work the scheduler still holds for its server: not a priority
+// boundary, not another server's failures, not the class the lane happens to
+// be booked under.
 
 use super::*;
 
-/// Retag the queue so every remaining item sits at `head_priority`, and drop
-/// one item at `lane_priority` — the shape a direct-store volume boundary
-/// leaves behind when a lane's batch ends one volume short of the head.
+// Retag the queue so every remaining item sits at `head_priority`, and drop
+// one item at `lane_priority` — the shape a direct-store volume boundary
+// leaves behind when a lane's batch ends one volume short of the head.
 fn split_queue_priorities(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -54,8 +54,8 @@ fn refill_request_on(
     }
 }
 
-/// A lane booked as `job_id`'s, holding a connection, so the refill has an
-/// owner entry to re-book and the connection gauges have something to move.
+// A lane booked as `job_id`'s, holding a connection, so the refill has an
+// owner entry to re-book and the connection gauges have something to move.
 fn book_connected_lane(pipeline: &mut Pipeline, job_id: JobId, completion_critical: bool) -> u64 {
     let lane_id = Pipeline::next_download_lane_id();
     pipeline.download_lane_owners.insert(
@@ -80,9 +80,9 @@ fn book_connected_lane(pipeline: &mut Pipeline, job_id: JobId, completion_critic
     lane_id
 }
 
-/// The park this whole change exists to remove: the queue head is one volume
-/// on from the lane's batch, so the old equality rule refused the refill and
-/// the connection went idle with the rest of the job still queued.
+// The park this whole change exists to remove: the queue head is one volume
+// on from the lane's batch, so the old equality rule refused the refill and
+// the connection went idle with the rest of the job still queued.
 #[tokio::test]
 async fn lane_refill_crosses_a_priority_boundary_instead_of_parking() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -128,10 +128,10 @@ async fn lane_refill_crosses_a_priority_boundary_instead_of_parking() {
     assert!(pipeline.jobs.get(&job_id).unwrap().download_queue.len() < queued_before);
 }
 
-/// Work another server failed is still this lane's to fetch, and the lease it
-/// comes back in says so in two separate places: the failure ledger sees only
-/// the job's retention exclusions, while the lane's dial is pinned to the one
-/// server the handout was cut for.
+// Work another server failed is still this lane's to fetch, and the lease it
+// comes back in says so in two separate places: the failure ledger sees only
+// the job's retention exclusions, while the lane's dial is pinned to the one
+// server the handout was cut for.
 #[tokio::test]
 async fn lane_refill_takes_head_work_its_own_server_can_serve() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -204,9 +204,9 @@ async fn lane_refill_takes_head_work_its_own_server_can_serve() {
     assert_eq!(lease.server_modes, vec![(0, DownloadLaneMode::Sequential)]);
 }
 
-/// A park frees a connection immediately. Dispatch has to see that in the same
-/// turn, not whenever the run loop next comes round: the measured restart gap
-/// was 340 ms at the median and 2.3 s at the tail.
+// A park frees a connection immediately. Dispatch has to see that in the same
+// turn, not whenever the run loop next comes round: the measured restart gap
+// was 340 ms at the median and 2.3 s at the tail.
 #[tokio::test]
 async fn a_parked_lane_wakes_dispatch_without_a_loop_turn() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -261,7 +261,7 @@ async fn a_parked_lane_wakes_dispatch_without_a_loop_turn() {
     assert!(!pipeline.take_download_dispatch_wake());
 }
 
-/// The dispatch pass answers the wake it was asked for, so it must clear it.
+// The dispatch pass answers the wake it was asked for, so it must clear it.
 #[tokio::test]
 async fn dispatch_clears_the_park_wake_it_serves() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -280,8 +280,8 @@ async fn dispatch_clears_the_park_wake_it_serves() {
     assert!(!pipeline.take_download_dispatch_wake());
 }
 
-/// The gauge is a diagnostic, and a lane that reports a mode it was never
-/// booked under must not be able to turn it into `usize::MAX`.
+// The gauge is a diagnostic, and a lane that reports a mode it was never
+// booked under must not be able to turn it into `usize::MAX`.
 #[tokio::test]
 async fn lane_depth_gauges_never_wrap_below_zero() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -321,8 +321,8 @@ async fn lane_depth_gauges_never_wrap_below_zero() {
     );
 }
 
-/// Splits the queue so the completion-critical heap holds `critical` items and
-/// the ordinary heap the rest.
+// Splits the queue so the completion-critical heap holds `critical` items and
+// the ordinary heap the rest.
 fn split_queue_classes(pipeline: &mut Pipeline, job_id: JobId, critical: usize) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let mut works = state.download_queue.drain_all();
@@ -338,12 +338,12 @@ fn split_queue_classes(pipeline: &mut Pipeline, job_id: JobId, critical: usize) 
     }
 }
 
-/// An established connection changes class rather than parking.
-///
-/// Completion-critical work leads its job's queue because something downstream
-/// is waiting on it, and a lane that already holds an authenticated connection
-/// is the cheapest way to fetch it — cheaper than the park, the dropped socket
-/// and the fresh handshake the class split used to force.
+// An established connection changes class rather than parking.
+//
+// Completion-critical work leads its job's queue because something downstream
+// is waiting on it, and a lane that already holds an authenticated connection
+// is the cheapest way to fetch it — cheaper than the park, the dropped socket
+// and the fresh handshake the class split used to force.
 #[tokio::test]
 async fn lane_refill_changes_class_to_take_completion_critical_work() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -405,8 +405,8 @@ async fn lane_refill_changes_class_to_take_completion_critical_work() {
     );
 }
 
-/// A lane that changes back releases the class it was counted under, so the
-/// two ends of the booking agree and the park cannot underflow it.
+// A lane that changes back releases the class it was counted under, so the
+// two ends of the booking agree and the park cannot underflow it.
 #[tokio::test]
 async fn a_lane_that_changes_class_back_releases_the_critical_booking() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -441,10 +441,10 @@ async fn a_lane_that_changes_class_back_releases_the_critical_booking() {
     );
 }
 
-/// A lane belongs to a server, not to the job it last carried. When the job it
-/// was leased for is behind another in dispatch order, its next articles come
-/// from the hot job: the alternative is an authenticated connection sitting
-/// idle beside a queue it is allowed to fetch from.
+// A lane belongs to a server, not to the job it last carried. When the job it
+// was leased for is behind another in dispatch order, its next articles come
+// from the hot job: the alternative is an authenticated connection sitting
+// idle beside a queue it is allowed to fetch from.
 #[tokio::test]
 async fn a_refill_on_a_lane_of_a_job_that_is_not_hot_is_answered_from_the_hot_job() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -531,9 +531,9 @@ async fn a_lane_between_leases_outlives_the_job_it_last_served() {
     assert_eq!(pipeline.active_download_connections, 1);
 }
 
-/// A lane at its share of the hot job is neither refused nor sent on to the
-/// next job: its ask waits, and is answered as soon as its holdings fall
-/// below the share. Rule 7 of the scheduler, seen from the lane's side.
+// A lane at its share of the hot job is neither refused nor sent on to the
+// next job: its ask waits, and is answered as soon as its holdings fall
+// below the share. Rule 7 of the scheduler, seen from the lane's side.
 #[tokio::test]
 async fn a_saturated_refill_waits_for_the_lane_to_drain_below_its_share() {
     let temp_dir = tempfile::tempdir().unwrap();

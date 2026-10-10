@@ -73,8 +73,8 @@ async fn a_direct_dial_uses_the_pinned_addresses_instead_of_resolving() {
     assert!(egress.dial(&unpinned).await.is_err());
 }
 
-/// A stream that, like an SSH channel, closes itself from a task it spawns
-/// when dropped.
+// A stream that, like an SSH channel, closes itself from a task it spawns
+// when dropped.
 struct ClosesFromATask(tokio::io::DuplexStream);
 impl Drop for ClosesFromATask {
     fn drop(&mut self) {
@@ -207,7 +207,7 @@ async fn chained_connect_hops_preserve_source_path_and_destination_name() {
     second_task.await.unwrap();
 }
 
-/// A stage whose streams reach a proxy that has already sent `reply`.
+// A stage whose streams reach a proxy that has already sent `reply`.
 struct Answered {
     reply: Mutex<&'static [u8]>,
     far: Mutex<Vec<tokio::io::DuplexStream>>,
@@ -237,8 +237,8 @@ impl Dialer for Answered {
     }
 }
 
-/// Each hop keeps its own last failure, so a ladder names the first hop
-/// failing on a rung even though the hop stacked on it failed as well.
+// Each hop keeps its own last failure, so a ladder names the first hop
+// failing on a rung even though the hop stacked on it failed as well.
 #[tokio::test]
 async fn a_chain_names_its_first_failing_hop() {
     let endpoint: SocketAddr = "192.0.2.1:8080".parse().unwrap();
@@ -265,8 +265,8 @@ async fn a_chain_names_its_first_failing_hop() {
     assert_eq!(failing[1], None);
 }
 
-/// A proxy that refuses to forward is failing itself, not the stage beneath
-/// it, and stops failing as soon as it carries a dial.
+// A proxy that refuses to forward is failing itself, not the stage beneath
+// it, and stops failing as soon as it carries a dial.
 #[tokio::test]
 async fn a_hop_is_failing_until_it_carries_a_dial() {
     let stage = Arc::new(Answered {
@@ -292,9 +292,9 @@ async fn a_hop_is_failing_until_it_carries_a_dial() {
     assert_eq!(proxy.failing_hop(), None);
 }
 
-/// A proxy that reports it cannot reach the next hop's endpoint is working;
-/// the hop it could not reach is the one failing. The same report for a final
-/// destination stays on the proxy's own path.
+// A proxy that reports it cannot reach the next hop's endpoint is working;
+// the hop it could not reach is the one failing. The same report for a final
+// destination stays on the proxy's own path.
 #[tokio::test]
 async fn a_chain_blames_the_hop_its_proxy_could_not_reach() {
     let stage = Arc::new(Answered {
@@ -348,8 +348,8 @@ async fn a_chain_blames_the_hop_its_proxy_could_not_reach() {
     assert_eq!(chain.failing_hop(), None);
 }
 
-/// A SOCKS proxy says what became of its own connection attempt, so a reply
-/// that the next hop's endpoint refused names that hop.
+// A SOCKS proxy says what became of its own connection attempt, so a reply
+// that the next hop's endpoint refused names that hop.
 #[tokio::test]
 async fn a_socks_reply_names_the_hop_that_refused() {
     // The method is accepted, then the request comes back "connection refused".
@@ -396,9 +396,9 @@ async fn a_socks_reply_names_the_hop_that_refused() {
     );
 }
 
-/// A proxy that takes the request for the next hop's endpoint and never
-/// answers was itself reached, so the wait is charged to the next hop. The
-/// same silence for a final destination times out this hop's own path.
+// A proxy that takes the request for the next hop's endpoint and never
+// answers was itself reached, so the wait is charged to the next hop. The
+// same silence for a final destination times out this hop's own path.
 #[tokio::test(start_paused = true)]
 async fn a_silent_proxy_is_charged_to_the_hop_it_was_asked_for() {
     let stage = Arc::new(Answered {
@@ -427,9 +427,9 @@ async fn a_silent_proxy_is_charged_to_the_hop_it_was_asked_for() {
     assert_eq!(first.failing_hop().map(|hop| hop.proxy), Some(7));
 }
 
-/// A session hop is failing after a path failure of its own. A destination
-/// it reached for and could not connect to is not its failure, and carrying
-/// a dial clears one.
+// A session hop is failing after a path failure of its own. A destination
+// it reached for and could not connect to is not its failure, and carrying
+// a dial clears one.
 #[tokio::test]
 async fn a_session_hop_is_failing_only_while_its_own_path_fails() {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -856,9 +856,9 @@ fn cooldown_from_scales_the_whole_ladder() {
     }
 }
 
-/// One WireGuard session carrying another: the carried session reaches the
-/// peer behind the first, the session beneath stays up while anything rides
-/// on it, and each session holds its own budget permit.
+// One WireGuard session carrying another: the carried session reaches the
+// peer behind the first, the session beneath stays up while anything rides
+// on it, and each session holds its own budget permit.
 #[tokio::test]
 async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
     use crate::test_support::{
@@ -1000,8 +1000,8 @@ async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
     lower.shutdown().await;
 }
 
-/// A WireGuard session over `inner`, as the runtime builds one, with its
-/// own budget.
+// A WireGuard session over `inner`, as the runtime builds one, with its
+// own budget.
 fn wireguard_session(
     id: u32,
     provider: Arc<dyn TunnelProvider>,
@@ -1029,7 +1029,7 @@ fn wireguard_session(
     })
 }
 
-/// A WireGuard hop stacked on `lower`, aimed at an address inside it.
+// A WireGuard hop stacked on `lower`, aimed at an address inside it.
 fn carried_by(lower: &Arc<SessionHop>, spec: crate::WireGuardSpec) -> Arc<SessionHop> {
     let carrier = lower
         .clone()
@@ -1051,8 +1051,8 @@ fn probe_target() -> Target {
     }
 }
 
-/// The session beneath has no budget left: the stacked hop is skipped, as
-/// the session beneath would be, and nothing counts against the hop above.
+// The session beneath has no budget left: the stacked hop is skipped, as
+// the session beneath would be, and nothing counts against the hop above.
 #[tokio::test]
 async fn an_exhausted_budget_beneath_a_carried_hop_is_a_skip_not_its_failure() {
     let near = crate::test_support::WireGuardTestPeer::start().await;
@@ -1087,8 +1087,8 @@ async fn an_exhausted_budget_beneath_a_carried_hop_is_a_skip_not_its_failure() {
     );
 }
 
-/// The session beneath fails its handshake: the failure is that hop's, and
-/// the hop stacked on it is not blamed.
+// The session beneath fails its handshake: the failure is that hop's, and
+// the hop stacked on it is not blamed.
 #[tokio::test]
 async fn a_failed_handshake_beneath_a_carried_hop_is_attributed_to_the_hop_beneath() {
     struct Unreachable;

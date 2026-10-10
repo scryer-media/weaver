@@ -1,17 +1,17 @@
-//! The one-time notice for an install still on the access settings from
-//! before 0.12.0.
-//!
-//! Upgrading never changes who gets in, so such an install carries on exactly
-//! as before and nothing in the interface says a simpler model exists, or that
-//! moving to it is a restart with one environment variable. The notice says so
-//! once. Whether it has been seen is kept here rather than in the browser, so
-//! a second browser is not told again; moving the install to the new model
-//! ends it too, because the notice has nothing left to say.
-//!
-//! An install created since then can be on the older settings too, when its
-//! deployment asked for them (`WEAVER_TRUSTED_CIDRS` without
-//! `WEAVER_ACCESS_MODE`). It chose them knowingly and never had anything to
-//! upgrade from, so it is not told.
+// The one-time notice for an install still on the access settings from
+// before 0.12.0.
+//
+// Upgrading never changes who gets in, so such an install carries on exactly
+// as before and nothing in the interface says a simpler model exists, or that
+// moving to it is a restart with one environment variable. The notice says so
+// once. Whether it has been seen is kept here rather than in the browser, so
+// a second browser is not told again; moving the install to the new model
+// ends it too, because the notice has nothing left to say.
+//
+// An install created since then can be on the older settings too, when its
+// deployment asked for them (`WEAVER_TRUSTED_CIDRS` without
+// `WEAVER_ACCESS_MODE`). It chose them knowingly and never had anything to
+// upgrade from, so it is not told.
 
 use async_graphql::SimpleObject;
 use weaver_server_core::Database;

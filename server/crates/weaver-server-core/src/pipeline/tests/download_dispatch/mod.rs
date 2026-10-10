@@ -1,6 +1,6 @@
 use super::*;
 
-/// Seconds since the epoch, as the NZB's `date` attribute carries it.
+// Seconds since the epoch, as the NZB's `date` attribute carries it.
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -8,7 +8,7 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// A one-file job whose files carry `posted_at` (or no date at all).
+// A one-file job whose files carry `posted_at` (or no date at all).
 fn posted_job_spec(name: &str, posted_at: Option<u64>) -> JobSpec {
     let mut spec = standalone_job_spec(name, &[("queued.bin".to_string(), 512u32)]);
     for file in &mut spec.files {

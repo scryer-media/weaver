@@ -1,7 +1,7 @@
-//! PAR3 across its surface: a sidecar set, a set inserted inside a 7z after
-//! its end header, and both at once; Cauchy and FFT codes; recovery with
-//! margin, exact and one block short; three block sizes; one member and two;
-//! one archive set in the job and two; the index present, absent and damaged.
+// PAR3 across its surface: a sidecar set, a set inserted inside a 7z after
+// its end header, and both at once; Cauchy and FFT codes; recovery with
+// margin, exact and one block short; three block sizes; one member and two;
+// one archive set in the job and two; the index present, absent and damaged.
 use super::super::super::super::sevenz_store::embedded_par3::with_embedded_par3;
 use super::super::super::super::sevenz_store::{Entry, build_7z_shaped, split_volumes};
 use super::fixtures::{Container, MEMBER, SEVENZ_MEMBER, payload};
@@ -15,11 +15,11 @@ const ARTICLES_PER_VOLUME: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Placement {
-    /// A PAR3 set posted beside the archive.
+    // A PAR3 set posted beside the archive.
     Sidecar,
-    /// A PAR3 recovery tail inside the 7z, after its end header.
+    // A PAR3 recovery tail inside the 7z, after its end header.
     Embedded,
-    /// Both: the sidecar protects the container, tail and all.
+    // Both: the sidecar protects the container, tail and all.
     Both,
 }
 
@@ -36,7 +36,7 @@ pub(super) enum Entries {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Sets {
     One,
-    /// Two archive sets in one job, each with its own recovery.
+    // Two archive sets in one job, each with its own recovery.
     Two,
 }
 
@@ -44,7 +44,7 @@ pub(super) enum Sets {
 pub(super) enum Index {
     Present,
     Absent,
-    /// Every index article arrives CRC-damaged.
+    // Every index article arrives CRC-damaged.
     Damaged,
 }
 
@@ -64,8 +64,8 @@ pub(super) struct Par3Cell {
     pub container: Container,
 }
 
-/// Whether the cell can be posted: a tail is inserted into a 7z only, and a
-/// post with no sidecar has no index to lose.
+// Whether the cell can be posted: a tail is inserted into a 7z only, and a
+// post with no sidecar has no index to lose.
 fn possible(cell: Par3Cell) -> bool {
     if cell.placement != Placement::Sidecar && cell.container != Container::SevenZip {
         return false;
@@ -107,11 +107,11 @@ pub(super) fn cells() -> Vec<Par3Cell> {
     cells
 }
 
-/// Schedules each (cell, profile) unit samples from the matrix's smoke
-/// schedules.
+// Schedules each (cell, profile) unit samples from the matrix's smoke
+// schedules.
 pub(super) const PER_UNIT: usize = 231;
 
-/// 720 possible cells under three profiles, 231 schedules each.
+// 720 possible cells under three profiles, 231 schedules each.
 pub(super) const TOTAL: usize = 498_960;
 
 pub(super) fn family() -> Family<Par3Cell> {
@@ -130,7 +130,7 @@ pub(super) fn family() -> Family<Par3Cell> {
     }
 }
 
-/// One archive set of the post: its prefix, its members and their bytes.
+// One archive set of the post: its prefix, its members and their bytes.
 struct ArchiveSet {
     prefix: &'static str,
     members: Vec<(String, Vec<u8>)>,
@@ -172,8 +172,8 @@ impl Par3Cell {
         base
     }
 
-    /// The posted volumes of one archive set, with the tail inserted where
-    /// the placement says.
+    // The posted volumes of one archive set, with the tail inserted where
+    // the placement says.
     fn volumes(self, set: &ArchiveSet, tail_blocks: usize) -> Vec<(String, Vec<u8>)> {
         let mut volumes = match self.container {
             Container::SevenZip => {
@@ -221,9 +221,9 @@ impl Par3Cell {
         }
     }
 
-    /// The post with its sidecar sets authored to the margin over the data as
-    /// posted (tail included), and the tail sized to the margin over the
-    /// container's own bytes.
+    // The post with its sidecar sets authored to the margin over the data as
+    // posted (tail included), and the tail sized to the margin over the
+    // container's own bytes.
     fn build(self, interruption: Interruption) -> (Post, Option<Geometry>, Option<Verdict>) {
         let sets = self.archive_sets();
         let geometry = Geometry {
@@ -353,7 +353,7 @@ impl Par3Cell {
         (post, Some(geometry), Some(verdict))
     }
 
-    /// The data files of each archive set, by set.
+    // The data files of each archive set, by set.
     fn data_files(self, post: &Post) -> Vec<Vec<usize>> {
         let count = if self.sets == Sets::Two { 2 } else { 1 };
         (0..count)
@@ -384,7 +384,7 @@ impl Par3Cell {
     }
 }
 
-/// The worse of two verdicts for a job that must publish every set.
+// The worse of two verdicts for a job that must publish every set.
 fn combine(a: Verdict, b: Verdict) -> Verdict {
     match (a, b) {
         (Verdict::Fails, _) | (_, Verdict::Fails) => Verdict::Fails,
@@ -393,8 +393,8 @@ fn combine(a: Verdict, b: Verdict) -> Verdict {
     }
 }
 
-/// Entry names must outlive the builder; a handful of leaked strings per
-/// fixture is the price of the 7z writer's `&'static str` entries.
+// Entry names must outlive the builder; a handful of leaked strings per
+// fixture is the price of the 7z writer's `&'static str` entries.
 fn leak(name: &str) -> &'static str {
     Box::leak(name.to_string().into_boxed_str())
 }
@@ -412,7 +412,7 @@ fn blocks_touched(ranges: &[Range<usize>], block: usize) -> usize {
     touched.len()
 }
 
-/// Source blocks a sidecar over `files` may and must mend.
+// Source blocks a sidecar over `files` may and must mend.
 fn needed_over(
     post: &Post,
     files: &[usize],
@@ -430,7 +430,7 @@ fn needed_over(
     (upper, lower)
 }
 
-/// Recovery packets of the sidecar set named `prefix` that survive.
+// Recovery packets of the sidecar set named `prefix` that survive.
 fn recovery_surviving(
     post: &Post,
     prefix: &str,
@@ -457,8 +457,8 @@ fn recovery_surviving(
     (least, most)
 }
 
-/// The container bytes of a set with a tail, as one span across its volumes,
-/// and the posted offset of each file in that span.
+// The container bytes of a set with a tail, as one span across its volumes,
+// and the posted offset of each file in that span.
 fn container_span(post: &Post, files: &[usize]) -> (usize, Vec<usize>) {
     let mut offsets = Vec::new();
     let mut at = 0;
@@ -476,8 +476,8 @@ fn container_span(post: &Post, files: &[usize]) -> (usize, Vec<usize>) {
     (tail, offsets)
 }
 
-/// Container blocks a tail may and must mend: the wrong ranges that fall
-/// before the tail, in the container's own block grid.
+// Container blocks a tail may and must mend: the wrong ranges that fall
+// before the tail, in the container's own block grid.
 fn tail_needed(
     post: &Post,
     files: &[usize],
@@ -502,7 +502,7 @@ fn tail_needed(
     )
 }
 
-/// Recovery packets of a tail that survive what the post loses.
+// Recovery packets of a tail that survive what the post loses.
 fn tail_surviving(
     post: &Post,
     files: &[usize],
@@ -545,10 +545,10 @@ fn tail_surviving(
     )
 }
 
-/// What a 7z with a tail must end in under the loss: the tail mends the
-/// container when enough of it survives; a lost start header leaves no map,
-/// so the set demotes and the conventional path repairs from the tail, which
-/// is still a completion.
+// What a 7z with a tail must end in under the loss: the tail mends the
+// container when enough of it survives; a lost start header leaves no map,
+// so the set demotes and the conventional path repairs from the tail, which
+// is still a completion.
 fn tail_verdict(
     post: &Post,
     files: &[usize],
@@ -588,18 +588,18 @@ impl Cell for Par3Cell {
     }
 }
 
-/// The defects each cell and profile is held open for.
+// The defects each cell and profile is held open for.
 fn open_defect(cell: Par3Cell, profile: ExtractionProfile) -> Option<Defect> {
     let _ = profile;
     (cell.placement == Placement::Embedded)
         .then_some(Defect::Diverges(EMBEDDED_PAR3_SPLIT_NOT_REPAIRED))
 }
 
-/// A split 7z whose only recovery is the PAR3 embedded in its tail is demoted
-/// for volume size when an article is lost, and the conventional path then
-/// fails "no PAR2 metadata is available for repair" without reading the tail.
-/// The product repairs lost articles from an embedded tail only in a
-/// single-volume archive. Not PAR2, so not release-blocking.
+// A split 7z whose only recovery is the PAR3 embedded in its tail is demoted
+// for volume size when an article is lost, and the conventional path then
+// fails "no PAR2 metadata is available for repair" without reading the tail.
+// The product repairs lost articles from an embedded tail only in a
+// single-volume archive. Not PAR2, so not release-blocking.
 const EMBEDDED_PAR3_SPLIT_NOT_REPAIRED: &str =
     "embedded PAR3 in a split 7z is never used to repair a lost article; the set demotes and fails";
 
@@ -672,7 +672,7 @@ mod par3_breadth_loss_smoke {
     }
 }
 
-/// The campaign: 500 shards of about a thousand cases.
+// The campaign: 500 shards of about a thousand cases.
 mod combined_par3_breadth {
     use super::*;
 

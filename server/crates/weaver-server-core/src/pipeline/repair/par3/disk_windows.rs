@@ -1,5 +1,5 @@
-//! Mutable Windows files use identity and change-time fences between reads.
-//! No retained sharing lock may prevent the next decoded article from writing.
+// Mutable Windows files use identity and change-time fences between reads.
+// No retained sharing lock may prevent the next decoded article from writing.
 
 use super::*;
 use std::fs::File;

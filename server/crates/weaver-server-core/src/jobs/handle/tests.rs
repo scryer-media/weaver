@@ -215,7 +215,7 @@ fn raw_metrics_snapshot_reads_do_not_cool_shared_speed_tracker() {
     assert!(refreshed.current_download_speed < initial.current_download_speed);
 }
 
-/// Create a test scheduler handle with a minimal background loop.
+// Create a test scheduler handle with a minimal background loop.
 fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
     let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
     let (event_tx, _) = broadcast::channel(256);

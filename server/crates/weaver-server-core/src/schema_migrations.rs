@@ -320,19 +320,19 @@ async fn load_applied_migrations(pool: &SqlitePool) -> Result<Vec<MigrationLedge
         .collect()
 }
 
-/// Highest migration version recorded in the ledger, or `None` when no ledger
-/// exists yet.
-///
-/// Read *before* a migration run, this answers "which release last wrote to
-/// this database": no ledger means nothing has ever migrated it (a database
-/// this process is about to create), while a recorded maximum names the newest
-/// migration the previous binary shipped. That is the only reliable way to tell
-/// a fresh install from an upgrade of a specific older line, because the data a
-/// database holds says nothing about which version wrote it.
-///
-/// Deliberately not filtered by `success`: a recorded-but-failed row still
-/// proves the binary that wrote it reached that version, and counting it can
-/// only make a database look newer than it is, never older.
+// Highest migration version recorded in the ledger, or `None` when no ledger
+// exists yet.
+//
+// Read *before* a migration run, this answers "which release last wrote to
+// this database": no ledger means nothing has ever migrated it (a database
+// this process is about to create), while a recorded maximum names the newest
+// migration the previous binary shipped. That is the only reliable way to tell
+// a fresh install from an upgrade of a specific older line, because the data a
+// database holds says nothing about which version wrote it.
+//
+// Deliberately not filtered by `success`: a recorded-but-failed row still
+// proves the binary that wrote it reached that version, and counting it can
+// only make a database look newer than it is, never older.
 pub async fn max_recorded_migration_version(pool: &SqlitePool) -> Result<Option<i64>, StateError> {
     if !migration_ledger_exists(pool).await? {
         return Ok(None);
@@ -365,10 +365,10 @@ fn list_pending_migrations_from_applied(
     )
 }
 
-/// Checks the ledger against the embedded catalog and returns the versions
-/// whose recorded checksum is a legacy line-ending variant of the embedded one.
-/// Those rows are valid but stale: callers that may write should heal them with
-/// [`heal_line_ending_checksums`] so the next startup takes the plain path.
+// Checks the ledger against the embedded catalog and returns the versions
+// whose recorded checksum is a legacy line-ending variant of the embedded one.
+// Those rows are valid but stale: callers that may write should heal them with
+// [`heal_line_ending_checksums`] so the next startup takes the plain path.
 fn validate_known_migrations(
     applied: &[MigrationLedgerRow],
     catalog: &CompiledMigrationCatalog,
@@ -419,12 +419,12 @@ fn validate_known_migrations(
     Ok(stale_line_endings)
 }
 
-/// Rewrites the ledger checksum of `versions` to the embedded canonical value.
-///
-/// These rows were written by a build whose checkout carried the other line
-/// ending (GitHub's Windows runner checks out with `core.autocrlf=true`), so
-/// they hash the same SQL in a different form. Healing them keeps a database
-/// from bouncing between the released binary and a from-source build.
+// Rewrites the ledger checksum of `versions` to the embedded canonical value.
+//
+// These rows were written by a build whose checkout carried the other line
+// ending (GitHub's Windows runner checks out with `core.autocrlf=true`), so
+// they hash the same SQL in a different form. Healing them keeps a database
+// from bouncing between the released binary and a from-source build.
 async fn heal_line_ending_checksums(
     pool: &SqlitePool,
     catalog: &CompiledMigrationCatalog,
@@ -1389,8 +1389,8 @@ mod tests {
         assert_eq!(usage_cascade, 1);
     }
 
-    /// Status exists from the first script-output schema and never needs to
-    /// parse a result blob during upgrade.
+    // Status exists from the first script-output schema and never needs to
+    // parse a result blob during upgrade.
     #[tokio::test]
     async fn sqlite_script_output_status_is_present_from_creation() {
         let pool = SqlitePoolOptions::new()
@@ -1437,8 +1437,8 @@ mod tests {
         );
     }
 
-    /// The proven BODY pipelining depth is optional: a server that has never
-    /// been measured must read back as NULL, not as a depth nobody proved.
+    // The proven BODY pipelining depth is optional: a server that has never
+    // been measured must read back as NULL, not as a depth nobody proved.
     #[tokio::test]
     async fn sqlite_v45_upgrade_adds_a_nullable_server_pipelining_depth() {
         let pool = SqlitePoolOptions::new()
@@ -2208,10 +2208,10 @@ mod tests {
         ));
     }
 
-    /// A database written by a build whose checkout carried CRLF SQL (the
-    /// released Windows binary) must open under a build from an LF checkout,
-    /// and must come out of that startup holding the canonical checksum so the
-    /// next open takes the plain equality path.
+    // A database written by a build whose checkout carried CRLF SQL (the
+    // released Windows binary) must open under a build from an LF checkout,
+    // and must come out of that startup holding the canonical checksum so the
+    // next open takes the plain equality path.
     #[tokio::test]
     async fn legacy_line_ending_ledger_checksum_opens_and_is_healed() {
         let pool = SqlitePoolOptions::new()

@@ -391,7 +391,7 @@ fn metered_egress(limit_bytes: u64) -> EgressInterface {
     }
 }
 
-/// Spend `bytes` of an egress's allowance the way a finished BODY does.
+// Spend `bytes` of an egress's allowance the way a finished BODY does.
 fn spend(runtime: &NetworkRuntime, egress_id: u32, bytes: usize) {
     let mut permit = runtime
         .egress_controls
@@ -558,9 +558,9 @@ async fn egress_quota_usage_survives_a_network_recompile_and_a_rebuilt_runtime()
     runtime.shutdown().await;
 }
 
-/// A ladder whose chain stacks one WireGuard proxy on another, against two
-/// real peers: the second is reachable only inside the first, by a name only
-/// the first resolves.
+// A ladder whose chain stacks one WireGuard proxy on another, against two
+// real peers: the second is reachable only inside the first, by a name only
+// the first resolves.
 #[tokio::test]
 async fn a_wireguard_chain_rides_one_tunnel_inside_another() {
     use weaver_tunnel::test_support::{
@@ -673,7 +673,7 @@ fn proxy_with_id(id: u32) -> ProxyProfile {
     ProxyProfile { id, ..proxy() }
 }
 
-/// A WireGuard profile for `peer`, reached at `host:port`.
+// A WireGuard profile for `peer`, reached at `host:port`.
 fn wireguard_profile(
     id: u32,
     peer: &weaver_tunnel::test_support::WireGuardTestPeer,
@@ -706,11 +706,11 @@ fn wireguard_profile(
     }
 }
 
-/// The port the near peer relays to the far one, inside its tunnel.
+// The port the near peer relays to the far one, inside its tunnel.
 const FAR_PORT: u16 = 51820;
 
-/// Two peers, the far one reachable only through the near one, which also
-/// resolves `far.vpn.test` to it.
+// Two peers, the far one reachable only through the near one, which also
+// resolves `far.vpn.test` to it.
 async fn stacked_peers() -> (
     weaver_tunnel::test_support::WireGuardTestPeer,
     weaver_tunnel::test_support::WireGuardTestPeer,
@@ -748,7 +748,7 @@ fn wireguard_ladder(rung: Rung) -> RoutingPolicy {
     }
 }
 
-/// The body the test peer's HTTP service at the far end of `stage` answers.
+// The body the test peer's HTTP service at the far end of `stage` answers.
 async fn fetch_through(stage: &Arc<dyn Dialer>) -> Result<String, DialError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut dialed = stage
@@ -769,8 +769,8 @@ async fn fetch_through(stage: &Arc<dyn Dialer>) -> Result<String, DialError> {
     Ok(String::from_utf8_lossy(&answer).into_owned())
 }
 
-/// Testing a draft that stacks WireGuard on a live WireGuard session borrows
-/// that session; ending the draft must leave it running for the live route.
+// Testing a draft that stacks WireGuard on a live WireGuard session borrows
+// that session; ending the draft must leave it running for the live route.
 #[tokio::test]
 async fn ending_a_draft_that_stacked_on_a_live_session_leaves_that_session_running() {
     let (near, far) = stacked_peers().await;
@@ -821,8 +821,8 @@ async fn ending_a_draft_that_stacked_on_a_live_session_leaves_that_session_runni
     runtime.shutdown().await;
 }
 
-/// Bulk replies must fit a 1280-byte carrier, including when four download
-/// streams are active and the carried endpoint is resolved inside it.
+// Bulk replies must fit a 1280-byte carrier, including when four download
+// streams are active and the carried endpoint is resolved inside it.
 #[tokio::test]
 async fn a_wireguard_chain_downloads_four_concurrent_bulk_streams() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1015,8 +1015,8 @@ async fn a_three_hop_wireguard_chain_sizes_each_tunnel_from_its_carrier() {
     runtime.shutdown().await;
 }
 
-/// The MTU of the WireGuard tunnel `session` runs, as seen by a socket bound
-/// inside it.
+// The MTU of the WireGuard tunnel `session` runs, as seen by a socket bound
+// inside it.
 async fn tunnel_mtu(session: Arc<dyn Dialer>) -> Option<u16> {
     session
         .datagrams()
@@ -1027,8 +1027,8 @@ async fn tunnel_mtu(session: Arc<dyn Dialer>) -> Option<u16> {
         .link_mtu()
 }
 
-/// Saving and removing a stacked route preserves its live carrier. The
-/// carried tunnel fits the carrier after resolving its endpoint.
+// Saving and removing a stacked route preserves its live carrier. The
+// carried tunnel fits the carrier after resolving its endpoint.
 #[tokio::test]
 async fn stacking_on_a_wireguard_session_preserves_its_capacity_and_identity() {
     use weaver_tunnel::test_support::TEST_PEER_ADDRESS;

@@ -1,7 +1,7 @@
-//! Runs schedule jobs at the times saved on each job.
-//!
-//! The evaluator ticks once a minute from memory. It reads the jobs from the
-//! database only after one of them changed, never to decide what is due.
+// Runs schedule jobs at the times saved on each job.
+//
+// The evaluator ticks once a minute from memory. It reads the jobs from the
+// database only after one of them changed, never to decide what is due.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ use crate::bandwidth::Weekday;
 use crate::settings::SharedConfig;
 use crate::{Database, StateError};
 
-/// Which occurrences have fired, so each fires once however the ticks fall.
+// Which occurrences have fired, so each fires once however the ticks fall.
 #[derive(Default)]
 pub struct Occurrences {
     last: Option<NaiveDateTime>,
@@ -25,9 +25,9 @@ pub struct Occurrences {
 }
 
 impl Occurrences {
-    /// The jobs due between the last tick and `now`. The first tick starts
-    /// only startup jobs. After a forward clock jump, each job catches up its
-    /// latest missed occurrence once, without replaying the entire backlog.
+    // The jobs due between the last tick and `now`. The first tick starts
+    // only startup jobs. After a forward clock jump, each job catches up its
+    // latest missed occurrence once, without replaying the entire backlog.
     pub fn advance(&mut self, jobs: &[ScriptInstance], now: NaiveDateTime) -> Vec<String> {
         let previous = self.last.replace(now);
         self.fired
@@ -97,8 +97,8 @@ impl Occurrences {
 }
 
 impl Database {
-    /// Every script job, as the evaluator last read it. A write to any job
-    /// clears this, and the next tick reads them again.
+    // Every script job, as the evaluator last read it. A write to any job
+    // clears this, and the next tick reads them again.
     fn schedule_jobs(&self) -> Result<Arc<Vec<ScriptInstance>>, StateError> {
         let revision = {
             let cache = self
@@ -181,11 +181,11 @@ pub fn spawn_script_evaluator(db: Database, config: SharedConfig) {
     });
 }
 
-/// What came of a job's occurrence.
+// What came of a job's occurrence.
 #[derive(Debug, Eq, PartialEq)]
 enum Scheduled {
     Ran,
-    /// Deleted, turned off or moved to another trigger since it was due.
+    // Deleted, turned off or moved to another trigger since it was due.
     Gone,
 }
 

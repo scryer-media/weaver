@@ -71,15 +71,15 @@ async fn grid_verified_direct_job(
     file_id
 }
 
-/// A two-payload job whose first file is damaged and whose second is intact,
-/// wired the same way as the single-payload repair test above.
-///
-/// The damaged payload carries a `Zip` archive topology so the job's clean-PAR2
-/// integrity gate reads `StrongDecode`. That is what routes it through the
-/// verify-then-repair branch — the one whose post-repair pass this exercises —
-/// rather than the repairer-analysis branch a bare payload takes.
-///
-/// Returns the working directory plus the two payloads' original bytes.
+// A two-payload job whose first file is damaged and whose second is intact,
+// wired the same way as the single-payload repair test above.
+//
+// The damaged payload carries a `Zip` archive topology so the job's clean-PAR2
+// integrity gate reads `StrongDecode`. That is what routes it through the
+// verify-then-repair branch — the one whose post-repair pass this exercises —
+// rather than the repairer-analysis branch a bare payload takes.
+//
+// Returns the working directory plus the two payloads' original bytes.
 async fn two_payload_repair_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -225,10 +225,10 @@ async fn two_payload_repair_job(
     (working_dir, damaged_original, intact_original)
 }
 
-/// A real NZB's `<segment bytes=…>` is the *yEnc-encoded* article size, about
-/// 3% larger than the decoded payload PAR2 describes. Every live-PAR2 fixture
-/// declares inflated sizes so the declared total never equals the decoded
-/// length — the shape production always has.
+// A real NZB's `<segment bytes=…>` is the *yEnc-encoded* article size, about
+// 3% larger than the decoded payload PAR2 describes. Every live-PAR2 fixture
+// declares inflated sizes so the declared total never equals the decoded
+// length — the shape production always has.
 fn yenc_declared_bytes(decoded_len: u32) -> u32 {
     decoded_len + decoded_len.div_ceil(32) + 2
 }
@@ -364,9 +364,9 @@ async fn drain_job_to_completion(pipeline: &mut Pipeline, job_id: JobId) {
     settle_direct_post_repair_work(pipeline).await;
 }
 
-/// Build a single-payload job whose article bitmap is one segment short, with a
-/// PAR2 set describing the payload. Returns the working dir and the payload's
-/// file id.
+// Build a single-payload job whose article bitmap is one segment short, with a
+// PAR2 set describing the payload. Returns the working dir and the payload's
+// file id.
 async fn incomplete_protected_payload_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -463,19 +463,19 @@ async fn install_par2_rename_candidate(
     working_dir
 }
 
-/// A complete, PAR2-protected payload whose bytes are not where their names say.
-///
-/// `described` gives the recovery set (and the NZB) its file names and the
-/// content each name is supposed to hold; `on_disk[i]` is what is actually
-/// written at `described[i]`'s name, so a caller expresses a swap by handing the
-/// two entries each other's bytes and damage by handing one entry holed bytes.
-/// Every article has arrived either way — this is a posting fault, not a
-/// download one.
-///
-/// No archive topology is installed, so the completion gate's integrity gate
-/// reads `None` and the job takes the repairer-analysis arm. That is the arm the
-/// field job took, and the one that has to tell "nothing to repair, only to
-/// place" from "damaged".
+// A complete, PAR2-protected payload whose bytes are not where their names say.
+//
+// `described` gives the recovery set (and the NZB) its file names and the
+// content each name is supposed to hold; `on_disk[i]` is what is actually
+// written at `described[i]`'s name, so a caller expresses a swap by handing the
+// two entries each other's bytes and damage by handing one entry holed bytes.
+// Every article has arrived either way — this is a posting fault, not a
+// download one.
+//
+// No archive topology is installed, so the completion gate's integrity gate
+// reads `None` and the job takes the repairer-analysis arm. That is the arm the
+// field job took, and the one that has to tell "nothing to repair, only to
+// place" from "damaged".
 async fn misplaced_payload_par2_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -599,20 +599,20 @@ fn misplacement_payload(seed: u32) -> Vec<u8> {
         .collect()
 }
 
-/// Stage the identity-rebound misplaced-payload shape as a conventional
-/// (non-direct) job and hand back the two pieces a direct quick-verify call
-/// needs: the working directory and the served recovery set.
-///
-/// `described[i]` is the name the recovery set gives file `i` and the content it
-/// says that name should hold; `on_disk[i]` is what is actually written at that
-/// name — `None` leaves the file absent (never completed). A caller expresses a
-/// swap by handing two present entries each other's bytes, damage by handing one
-/// holed bytes, and a missing partner by handing `None`. Every present file is
-/// completed and its identity rebound to its canonical name with a PAR2 source,
-/// which is the post-rebind state the completion gate meets in the field. No
-/// article is fed to the dual-CRC grid and no whole-file digest is recorded, so
-/// this is the metadata-early shape that streams no MD5 at all — callers that
-/// want content evidence add it explicitly.
+// Stage the identity-rebound misplaced-payload shape as a conventional
+// (non-direct) job and hand back the two pieces a direct quick-verify call
+// needs: the working directory and the served recovery set.
+//
+// `described[i]` is the name the recovery set gives file `i` and the content it
+// says that name should hold; `on_disk[i]` is what is actually written at that
+// name — `None` leaves the file absent (never completed). A caller expresses a
+// swap by handing two present entries each other's bytes, damage by handing one
+// holed bytes, and a missing partner by handing `None`. Every present file is
+// completed and its identity rebound to its canonical name with a PAR2 source,
+// which is the post-rebind state the completion gate meets in the field. No
+// article is fed to the dual-CRC grid and no whole-file digest is recorded, so
+// this is the metadata-early shape that streams no MD5 at all — callers that
+// want content evidence add it explicitly.
 async fn stage_misplaced_payload_shape(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -666,8 +666,8 @@ async fn stage_misplaced_payload_shape(
     (working_dir, par2_set)
 }
 
-/// Record a trusted whole-file MD5 for a completed file, the current-generation
-/// evidence a metadata-early download deliberately never streams.
+// Record a trusted whole-file MD5 for a completed file, the current-generation
+// evidence a metadata-early download deliberately never streams.
 fn set_measured_md5(pipeline: &mut Pipeline, job_id: JobId, file_index: u32, content: &[u8]) {
     pipeline
         .ensure_par2_runtime(job_id)
@@ -682,13 +682,13 @@ fn set_measured_md5(pipeline: &mut Pipeline, job_id: JobId, file_index: u32, con
         );
 }
 
-/// Describe a file the set lists but does not protect.
-///
-/// A PAR2 set's non-recovery files carry a name and the two digests every
-/// description carries, and nothing else: no slice checksums, no recovery data.
-/// `verify_all` reads only the protected files, while the deobfuscator reads
-/// every description — which is what lets a file arrive under a posted name and
-/// be given the one the set says it should have.
+// Describe a file the set lists but does not protect.
+//
+// A PAR2 set's non-recovery files carry a name and the two digests every
+// description carries, and nothing else: no slice checksums, no recovery data.
+// `verify_all` reads only the protected files, while the deobfuscator reads
+// every description — which is what lets a file arrive under a posted name and
+// be given the one the set says it should have.
 fn describe_non_recovery_file(
     par2_set: &mut Par2FileSet,
     filename: &str,
@@ -719,24 +719,24 @@ fn describe_non_recovery_file(
 
 const FURNITURE_SLICE_SIZE: u64 = 64;
 
-/// A recovery set describing a payload plus one piece of metadata "furniture"
-/// (an `.nfo`, an `.sfv`), with the PAR2 index — and, when the set carries
-/// recovery slices, one recovery volume — already downloaded.
+// A recovery set describing a payload plus one piece of metadata "furniture"
+// (an `.nfo`, an `.sfv`), with the PAR2 index — and, when the set carries
+// recovery slices, one recovery volume — already downloaded.
 struct FurnitureJob<'a> {
     name: &'a str,
     payload_filename: &'a str,
-    /// The bytes the recovery set describes.
+    // The bytes the recovery set describes.
     payload: &'a [u8],
-    /// What is on disk under that name, if anything.
+    // What is on disk under that name, if anything.
     payload_on_disk: Option<&'a [u8]>,
     furniture_filename: &'a str,
     furniture: &'a [u8],
     furniture_on_disk: Option<&'a [u8]>,
-    /// Whether the furniture's articles all arrived.
+    // Whether the furniture's articles all arrived.
     furniture_articles_complete: bool,
-    /// Recovery slices the set carries; also the block count the NZB
-    /// advertises for the one recovery volume, which is what the fail-fast
-    /// arithmetic reads.
+    // Recovery slices the set carries; also the block count the NZB
+    // advertises for the one recovery volume, which is what the fail-fast
+    // arithmetic reads.
     recovery_blocks: u32,
 }
 
@@ -880,8 +880,8 @@ async fn install_furniture_par2_job(
     working_dir
 }
 
-/// Drive the completion gate until the job settles, the way a live pipeline
-/// would through its own re-arms.
+// Drive the completion gate until the job settles, the way a live pipeline
+// would through its own re-arms.
 async fn settle_job_completion(pipeline: &mut Pipeline, job_id: JobId) {
     for _ in 0..12 {
         if matches!(
@@ -908,15 +908,15 @@ fn second_half_zeroed(bytes: &[u8]) -> Vec<u8> {
 
 const PARTIAL_VOLUME_SLICE_SIZE: u64 = 64;
 
-/// Payload slices, and therefore the width of the recovery set's solve.
+// Payload slices, and therefore the width of the recovery set's solve.
 const PARTIAL_VOLUME_PAYLOAD_SLICES: usize = 8;
 
 struct PartialVolumeJob<'a> {
     name: &'a str,
-    /// Leading payload slices zeroed on disk — the damage the repair must cover.
+    // Leading payload slices zeroed on disk — the damage the repair must cover.
     damaged_slices: usize,
-    /// Recovery packets of the short volume whose payload bytes are a hole on
-    /// disk. Their headers survive, so only the packet's own MD5 can tell.
+    // Recovery packets of the short volume whose payload bytes are a hole on
+    // disk. Their headers survive, so only the packet's own MD5 can tell.
     holed_packets: &'a [usize],
 }
 
@@ -927,14 +927,14 @@ struct PartialVolumeFixture {
     working_dir: PathBuf,
 }
 
-/// A job whose damage needs more recovery blocks than the one *complete* volume
-/// carries, with the balance sitting in a second volume that lost an article.
-///
-/// The short volume is on disk with its surviving packets intact and the lost
-/// article's bytes zeroed, its assembly entry is one segment short forever, and
-/// the recovery set is installed carrying only the complete volume's blocks —
-/// so every block the short volume still holds has to be recovered from the
-/// bytes themselves or it is not counted at all.
+// A job whose damage needs more recovery blocks than the one *complete* volume
+// carries, with the balance sitting in a second volume that lost an article.
+//
+// The short volume is on disk with its surviving packets intact and the lost
+// article's bytes zeroed, its assembly entry is one segment short forever, and
+// the recovery set is installed carrying only the complete volume's blocks —
+// so every block the short volume still holds has to be recovered from the
+// bytes themselves or it is not counted at all.
 async fn install_partial_volume_par2_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -1132,16 +1132,16 @@ async fn install_partial_volume_par2_job(
     }
 }
 
-/// Recovery packets of a short volume posted one article per packet.
-///
-/// The two-article fixture above cannot express a volume that takes *more* bytes
-/// and is still short: its only outstanding article is the one that would
-/// complete it. This one loses its middle article and keeps its last, so the
-/// volume grows on disk twice while never completing.
+// Recovery packets of a short volume posted one article per packet.
+//
+// The two-article fixture above cannot express a volume that takes *more* bytes
+// and is still short: its only outstanding article is the one that would
+// complete it. This one loses its middle article and keeps its last, so the
+// volume grows on disk twice while never completing.
 struct GrowingVolumeFixture {
     working_dir: PathBuf,
     volume_filename: String,
-    /// The volume's packets in posting order, one per article.
+    // The volume's packets in posting order, one per article.
     packets: Vec<Vec<u8>>,
 }
 
@@ -1150,8 +1150,8 @@ impl GrowingVolumeFixture {
         self.packets[0].len()
     }
 
-    /// The volume as it looks on disk once `arrived` articles have landed: the
-    /// packets that came, and holes where the rest will go.
+    // The volume as it looks on disk once `arrived` articles have landed: the
+    // packets that came, and holes where the rest will go.
     fn on_disk(&self, arrived: &[usize]) -> Vec<u8> {
         let mut bytes = vec![0u8; self.packets.len() * self.packet_len()];
         for index in arrived {
@@ -1362,13 +1362,13 @@ const SMALLER_INDEX: &str = "amber.trail.par2";
 
 const SMALLER_VOLUME: &str = "amber.trail.vol00+04.par2";
 
-/// One posting carrying two independent recovery sets.
-///
-/// The sets describe different files and share no bytes, and one protects four
-/// times the payload of the other — so which of them is served has to be a
-/// decision rather than an accident of arrival order. File indices are fixed
-/// so a test can name them: 0/1/2 are the larger set's payload, index and
-/// volume, 3/4/5 the smaller set's.
+// One posting carrying two independent recovery sets.
+//
+// The sets describe different files and share no bytes, and one protects four
+// times the payload of the other — so which of them is served has to be a
+// decision rather than an accident of arrival order. File indices are fixed
+// so a test can name them: 0/1/2 are the larger set's payload, index and
+// volume, 3/4/5 the smaller set's.
 struct TwoSetPosting {
     larger_payload: Vec<u8>,
     larger_index: Vec<u8>,
@@ -1521,9 +1521,9 @@ impl TwoSetPosting {
         }
     }
 
-    /// Seed the job and land both index files, exactly as the download path
-    /// does — an index is parsed because it finished arriving — without
-    /// parsing either yet.
+    // Seed the job and land both index files, exactly as the download path
+    // does — an index is parsed because it finished arriving — without
+    // parsing either yet.
     async fn install(&self, pipeline: &mut Pipeline, job_id: JobId) -> PathBuf {
         let working_dir = insert_active_job(pipeline, job_id, self.spec()).await;
         write_and_complete_file(pipeline, job_id, 1, LARGER_INDEX, &self.larger_index).await;
@@ -1628,12 +1628,12 @@ fn volume_only_par2_bootstrap_fixture() -> (JobSpec, Vec<u8>, par2_rs::RecoveryS
     (spec, volume, recovery_set_id)
 }
 
-/// The name the recovery set speaks for. Nothing in the posting is called this:
-/// the parts join into it.
+// The name the recovery set speaks for. Nothing in the posting is called this:
+// the parts join into it.
 const SPLIT_JOIN_JOINED_FILENAME: &str = "Ivory.Meadow.mkv";
 
-/// A recovery volume in the posting, so the fail arithmetic has capacity to
-/// spend before the repairer is ever asked for a verdict.
+// A recovery volume in the posting, so the fail arithmetic has capacity to
+// spend before the repairer is ever asked for a verdict.
 const SPLIT_JOIN_RECOVERY_FILENAME: &str = "Ivory.Meadow.mkv.vol00+02.par2";
 
 const SPLIT_JOIN_RECOVERY_BLOCKS: u32 = 2;
@@ -1642,19 +1642,19 @@ fn split_join_payload(len: usize) -> Vec<u8> {
     (0..len).map(|value| (value % 251) as u8).collect()
 }
 
-/// One posted part of a plain split set.
+// One posted part of a plain split set.
 struct SplitJoinPart {
     filename: String,
-    /// Article sizes in posting order. More than one entry is what lets a part
-    /// land short of its articles.
+    // Article sizes in posting order. More than one entry is what lets a part
+    // land short of its articles.
     segments: Vec<u32>,
-    /// How many of those articles arrived.
+    // How many of those articles arrived.
     arrived_segments: usize,
-    /// What the arrival actually left on disk.
+    // What the arrival actually left on disk.
     on_disk: Vec<u8>,
 }
 
-/// A part every article of which landed intact.
+// A part every article of which landed intact.
 fn whole_split_join_part(filename: &str, bytes: &[u8]) -> SplitJoinPart {
     SplitJoinPart {
         filename: filename.to_string(),
@@ -1664,19 +1664,19 @@ fn whole_split_join_part(filename: &str, bytes: &[u8]) -> SplitJoinPart {
     }
 }
 
-/// A posting of plain split parts whose recovery set is computed over the file
-/// the parts join into.
+// A posting of plain split parts whose recovery set is computed over the file
+// the parts join into.
 struct SplitJoinPosting {
     job_name: &'static str,
     joined: Vec<u8>,
     slice_size: u64,
     parts: Vec<SplitJoinPart>,
-    /// Parts whose first 16 KiB the decode path captured. A part that begins
-    /// where the joined file begins reproduces the joined description's 16 KiB
-    /// hash exactly, which is how content binding finds it.
+    // Parts whose first 16 KiB the decode path captured. A part that begins
+    // where the joined file begins reproduces the joined description's 16 KiB
+    // hash exactly, which is how content binding finds it.
     prefix_captured: Vec<usize>,
-    /// When set, the recovery set describes these files instead of the joined
-    /// one — the ordinary shape, where the parts protect themselves.
+    // When set, the recovery set describes these files instead of the joined
+    // one — the ordinary shape, where the parts protect themselves.
     describes_parts: bool,
 }
 
@@ -1816,8 +1816,8 @@ impl SplitJoinPosting {
     }
 }
 
-/// Drive the completion gate the way a live pipeline would, resolving the
-/// extraction tasks it spawns instead of racing them.
+// Drive the completion gate the way a live pipeline would, resolving the
+// extraction tasks it spawns instead of racing them.
 async fn settle_split_join_completion(pipeline: &mut Pipeline, job_id: JobId) {
     for _ in 0..12 {
         if matches!(
@@ -1865,17 +1865,17 @@ fn split_join_failure_error(pipeline: &Pipeline, job_id: JobId) -> String {
     }
 }
 
-/// The shape that outgrows the transient decode-matrix budget.
-///
-/// The workspace a repair plan needs is set by the damage, not by streaming
-/// buffer tuning: it grows with `missing²` plus `missing × total`, and the
-/// budget it is measured against has a floor of its own well above weaver's
-/// configured limit. Working the arithmetic backwards, nothing under
-/// ~16,384 total slices can reach that floor at any damage level, and at the
-/// format's 32,768-slice ceiling it takes more than ~11,994 missing slices —
-/// upwards of a third of the set gone, with recovery blocks for every one of
-/// them. No real posting is shaped like this; the point of pinning it is that
-/// the refusal is a *budget* decision and says so.
+// The shape that outgrows the transient decode-matrix budget.
+//
+// The workspace a repair plan needs is set by the damage, not by streaming
+// buffer tuning: it grows with `missing²` plus `missing × total`, and the
+// budget it is measured against has a floor of its own well above weaver's
+// configured limit. Working the arithmetic backwards, nothing under
+// ~16,384 total slices can reach that floor at any damage level, and at the
+// format's 32,768-slice ceiling it takes more than ~11,994 missing slices —
+// upwards of a third of the set gone, with recovery blocks for every one of
+// them. No real posting is shaped like this; the point of pinning it is that
+// the refusal is a *budget* decision and says so.
 const MATRIX_BUDGET_FILENAME: &str = "silver.horizon.bin";
 
 const MATRIX_BUDGET_SLICE_SIZE: u64 = 16;
@@ -1884,9 +1884,9 @@ const MATRIX_BUDGET_TOTAL_SLICES: usize = 32_768;
 
 const MATRIX_BUDGET_MISSING_SLICES: usize = 13_000;
 
-/// Payload bytes with no repeating structure, so no damaged window can be
-/// mistaken for an intact slice and the missing count is exactly what the
-/// fixture punched out.
+// Payload bytes with no repeating structure, so no damaged window can be
+// mistaken for an intact slice and the missing count is exactly what the
+// fixture punched out.
 fn matrix_budget_payload() -> Vec<u8> {
     let mut data = vec![0u8; MATRIX_BUDGET_TOTAL_SLICES * MATRIX_BUDGET_SLICE_SIZE as usize];
     let mut state = 0x2545_f491_4f6c_dd1du64;
@@ -1900,18 +1900,18 @@ fn matrix_budget_payload() -> Vec<u8> {
     data
 }
 
-/// The same payload with its first `MATRIX_BUDGET_MISSING_SLICES` slices
-/// zeroed — aligned, so every surviving slice is still found where the set
-/// describes it.
+// The same payload with its first `MATRIX_BUDGET_MISSING_SLICES` slices
+// zeroed — aligned, so every surviving slice is still found where the set
+// describes it.
 fn matrix_budget_damaged_payload(payload: &[u8]) -> Vec<u8> {
     let mut damaged = payload.to_vec();
     damaged[..MATRIX_BUDGET_MISSING_SLICES * MATRIX_BUDGET_SLICE_SIZE as usize].fill(0);
     damaged
 }
 
-/// Analysis only — never a repair. The budget decision is reached before any
-/// planning, so this returns the verdict without spending a solve that, at this
-/// shape, would be a 13,000-row field inversion.
+// Analysis only — never a repair. The budget decision is reached before any
+// planning, so this returns the verdict without spending a solve that, at this
+// shape, would be a 13,000-row field inversion.
 fn analyze_with_memory_limit(
     working_dir: &std::path::Path,
     par2_set: &Par2FileSet,
@@ -1926,8 +1926,8 @@ fn analyze_with_memory_limit(
         .unwrap()
 }
 
-/// A job with no parsed recovery set and two PAR2 files it could promote for
-/// metadata: an index and a second index, neither yet tried.
+// A job with no parsed recovery set and two PAR2 files it could promote for
+// metadata: an index and a second index, neither yet tried.
 async fn metadata_promotion_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -2020,9 +2020,9 @@ fn drain_promoted_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<Segmen
         .collect()
 }
 
-/// [`placement_par2_file_set`] with the per-slice IFSC CRC32s the whole-file-CRC
-/// arm folds. The base helper ships none, which is the shape that proves the arm
-/// refuses rather than guesses when the table is absent.
+// [`placement_par2_file_set`] with the per-slice IFSC CRC32s the whole-file-CRC
+// arm folds. The base helper ships none, which is the shape that proves the arm
+// refuses rather than guesses when the table is absent.
 fn placement_par2_file_set_with_slice_checksums(files: &[(String, Vec<u8>)]) -> Par2FileSet {
     let mut set = placement_par2_file_set(files);
     let slice_size = set.slice_size;
@@ -2045,9 +2045,9 @@ fn placement_par2_file_set_with_slice_checksums(files: &[(String, Vec<u8>)]) -> 
     set
 }
 
-/// The streamed state a metadata-early download leaves behind: the folded
-/// whole-file CRC32, whether every article's declared yEnc part CRC verified,
-/// and whatever digest that generation carries — usually none at all.
+// The streamed state a metadata-early download leaves behind: the folded
+// whole-file CRC32, whether every article's declared yEnc part CRC verified,
+// and whatever digest that generation carries — usually none at all.
 fn set_streamed_file_crc(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -2069,8 +2069,8 @@ fn set_streamed_file_crc(
         );
 }
 
-/// Stage a job whose files sit at their described names, served by a set that
-/// carries slice checksums.
+// Stage a job whose files sit at their described names, served by a set that
+// carries slice checksums.
 async fn stage_file_crc_shape(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -2111,14 +2111,14 @@ const SEEDED_INTACT: &str = "silver.horizon.e01.mkv";
 
 const SEEDED_DAMAGED: &str = "silver.horizon.e02.mkv";
 
-/// A two-payload job whose second file is damaged on disk, with a real PAR2
-/// index beside them.
-///
-/// The first file is intact and — when `cover_intact_with_grid` — carries an
-/// in-stream verdict for every one of its slices, which is the evidence the
-/// authoritative pass is supposed to be able to act on. Neither file carries a
-/// completed-file checksum, so no *committed* evidence can be built for either:
-/// whatever the analysis manages to skip, it skipped on slice evidence alone.
+// A two-payload job whose second file is damaged on disk, with a real PAR2
+// index beside them.
+//
+// The first file is intact and — when `cover_intact_with_grid` — carries an
+// in-stream verdict for every one of its slices, which is the evidence the
+// authoritative pass is supposed to be able to act on. Neither file carries a
+// completed-file checksum, so no *committed* evidence can be built for either:
+// whatever the analysis manages to skip, it skipped on slice evidence alone.
 async fn install_seeded_evidence_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -2198,8 +2198,8 @@ async fn install_seeded_evidence_job(
     (working_dir, intact, other)
 }
 
-/// Bytes the whole set would cost to read, so a bound can be stated in terms of
-/// the fixture rather than a magic number.
+// Bytes the whole set would cost to read, so a bound can be stated in terms of
+// the fixture rather than a magic number.
 fn seeded_evidence_total_payload_bytes(intact: &[u8], other: &[u8]) -> u64 {
     (intact.len() + other.len()) as u64
 }
@@ -2212,12 +2212,12 @@ const PARKED_RECOVERY_INDEX: &str = "silver.horizon.par2";
 
 const PARKED_RECOVERY_VOLUME: &str = "silver.horizon.vol00+01.par2";
 
-/// A damaged job whose only recovery volume is still parked.
-///
-/// The payload's second slice is zeroed on disk and the set as installed
-/// carries no recovery at all, so the first authoritative pass has to promote
-/// the volume and wait — which is the state this section is about. The volume's
-/// bytes are handed back so the test can land it afterwards.
+// A damaged job whose only recovery volume is still parked.
+//
+// The payload's second slice is zeroed on disk and the set as installed
+// carries no recovery at all, so the first authoritative pass has to promote
+// the volume and wait — which is the state this section is about. The volume's
+// bytes are handed back so the test can land it afterwards.
 struct ParkedRecoveryFixture {
     payload_path: PathBuf,
     original_payload: Vec<u8>,
@@ -2372,8 +2372,8 @@ async fn install_parked_recovery_par2_job(
     }
 }
 
-/// Land the promoted volume the way the wire does: its work leaves the queue,
-/// its bytes reach the disk, and its packets merge into the set.
+// Land the promoted volume the way the wire does: its work leaves the queue,
+// its bytes reach the disk, and its packets merge into the set.
 async fn land_parked_recovery_volume(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -2396,10 +2396,10 @@ async fn land_parked_recovery_volume(
         .await;
 }
 
-/// A damaged, fully-drained job whose next completion check submits a
-/// damaged-path analysis ticket: the payload is on disk with its second block
-/// corrupted, the index and one recovery volume are complete, and no wire work
-/// remains to hold the gate shut.
+// A damaged, fully-drained job whose next completion check submits a
+// damaged-path analysis ticket: the payload is on disk with its second block
+// corrupted, the index and one recovery volume are complete, and no wire work
+// remains to hold the gate shut.
 async fn insert_damaged_job_ready_for_analysis(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -2506,9 +2506,9 @@ async fn insert_damaged_job_ready_for_analysis(
     working_dir
 }
 
-/// Waits for the detached analysis worker to hand its verdict back, without
-/// letting the pipeline see it. Tests that want the verdict *dropped* need the
-/// message in hand to prove the fence rejects it.
+// Waits for the detached analysis worker to hand its verdict back, without
+// letting the pipeline see it. Tests that want the verdict *dropped* need the
+// message in hand to prove the fence rejects it.
 async fn next_par2_analysis_done(pipeline: &mut Pipeline) -> crate::pipeline::Par2AnalysisWorkDone {
     let done = pipeline
         .repair_work_done_rx

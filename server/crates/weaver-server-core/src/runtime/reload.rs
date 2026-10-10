@@ -15,10 +15,10 @@ pub async fn load_global_pause_from_db(db: &Database) -> Result<bool, String> {
         .unwrap_or(false))
 }
 
-/// Pool settings for every active server, in dial order. Startup and every
-/// rebuild take their NNTP client from here, so a server's route, adopted
-/// certificate and proven pipelining depth apply from the first connection
-/// after a restart exactly as they do after a change.
+// Pool settings for every active server, in dial order. Startup and every
+// rebuild take their NNTP client from here, so a server's route, adopted
+// certificate and proven pipelining depth apply from the first connection
+// after a restart exactly as they do after a change.
 pub fn nntp_server_pool_configs(
     configured_servers: &[crate::servers::ServerConfig],
     proxy_runtime: Option<&crate::proxies::ProxyRuntime>,
@@ -73,7 +73,7 @@ pub fn nntp_server_pool_configs(
         .collect()
 }
 
-/// The NNTP client for one generation of pool settings.
+// The NNTP client for one generation of pool settings.
 pub fn nntp_client(
     servers: Vec<weaver_nntp::pool::ServerPoolConfig>,
 ) -> weaver_nntp::client::NntpClient {

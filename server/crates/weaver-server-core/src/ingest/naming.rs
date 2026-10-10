@@ -19,12 +19,12 @@ pub fn derive_release_name(primary: Option<&str>, secondary: Option<&str>) -> St
     "Untitled".to_string()
 }
 
-/// The name of a job's completed folder: the release title as posted, kept
-/// whole the way SABnzbd and NZBGet keep it, because download managers check
-/// the files they import against this folder's name and the shortened display
-/// name drops the season or the later episodes they look for. Only what a
-/// filesystem cannot hold is taken out. A job with no original title keeps its
-/// display name.
+// The name of a job's completed folder: the release title as posted, kept
+// whole the way SABnzbd and NZBGet keep it, because download managers check
+// the files they import against this folder's name and the shortened display
+// name drops the season or the later episodes they look for. Only what a
+// filesystem cannot hold is taken out. A job with no original title keeps its
+// display name.
 pub fn completed_folder_name(display_name: &str, metadata: &[(String, String)]) -> String {
     metadata
         .iter()
@@ -33,7 +33,7 @@ pub fn completed_folder_name(display_name: &str, metadata: &[(String, String)]) 
         .unwrap_or_else(|| weaver_model::files::sanitize_path_component(display_name))
 }
 
-/// `None` when nothing a folder could be named after is left.
+// `None` when nothing a folder could be named after is left.
 fn release_folder_name(title: &str) -> Option<String> {
     let title: String = title.chars().filter(|ch| !ch.is_control()).collect();
     let title = strip_nzb_source_suffix(title.trim()).unwrap_or(title.trim());
@@ -41,7 +41,7 @@ fn release_folder_name(title: &str) -> Option<String> {
     (!title.is_empty()).then(|| weaver_model::files::sanitize_path_component(title))
 }
 
-/// Removes the source-container suffix from an uploaded NZB filename.
+// Removes the source-container suffix from an uploaded NZB filename.
 pub fn strip_nzb_source_suffix(value: &str) -> Option<&str> {
     for suffix in [".nzb.xz", ".nzb"] {
         let suffix_start = value.len().saturating_sub(suffix.len());
