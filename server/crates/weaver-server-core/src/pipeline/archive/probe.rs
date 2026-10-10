@@ -8,7 +8,7 @@ use crate::pipeline::Pipeline;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::PathBuf;
-use weaver_model::files::FileRole;
+use weaver_model::files::{FileRole, sanitize_download_filename};
 
 const SEVEN_Z_SIGNATURE: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 
@@ -1314,6 +1314,7 @@ impl Pipeline {
     // outputs. A repaired part on disk can fill a hole the NZB never listed.
     pub(crate) fn missing_numbered_archive_part(&self, job_id: JobId) -> Option<String> {
         let state = self.jobs.get(&job_id)?;
+        let par2_set = self.par2_set(job_id);
         let mut groups: BTreeMap<String, BTreeMap<u32, (String, usize, usize)>> = BTreeMap::new();
         for file in state.assembly.files() {
             if self.direct_set_already_installed(job_id, file)
@@ -1325,9 +1326,21 @@ impl Pipeline {
             {
                 continue;
             }
-            let name = self
-                .effective_file_identity(job_id, file.file_id())
-                .and_then(|identity| identity.canonical_filename)
+            // A part PAR2 has matched by its bytes is the part PAR2 describes,
+            // whatever it is called on disk. Parts posted under each other's
+            // names sit on duplicate names until the cycle is settled, and
+            // reading those names would turn the cycle into a hole.
+            let described = par2_set.and_then(|set| {
+                let description = self.content_bound_par2_file_id(file.file_id(), set)?;
+                set.files
+                    .get(&description)
+                    .map(|desc| sanitize_download_filename(&desc.filename))
+            });
+            let name = described
+                .or_else(|| {
+                    self.effective_file_identity(job_id, file.file_id())
+                        .and_then(|identity| identity.canonical_filename)
+                })
                 .unwrap_or_else(|| self.current_filename_for_file(job_id, file));
             let lower = name.to_ascii_lowercase();
             let end = if lower.ends_with(".rar") && lower.contains(".part") {

@@ -3967,3 +3967,78 @@ async fn input_identity_settle_lands_every_part_on_its_described_name() {
             .is_empty()
     );
 }
+
+// Parts posted under one another's names wait on duplicate names until
+// cleanup settles the cycle. Until then the numbered-gap check must read the
+// part PAR2 matched each file's bytes to, not its name on disk: the bytes of
+// parts 2 and 3 are present, so nothing is missing.
+#[tokio::test]
+async fn numbered_gap_check_reads_parts_on_duplicate_names_by_their_par2_match() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30182);
+    let described: Vec<(String, Vec<u8>)> = (1..=4u32)
+        .map(|part| {
+            let bytes = (0..4096u32)
+                .map(|index| ((index * 11 + part * 37) % 251) as u8)
+                .collect();
+            (format!("archive.part{part}.rar"), bytes)
+        })
+        .collect();
+    let posted: Vec<(String, Vec<u8>)> = described
+        .iter()
+        .enumerate()
+        .map(|(index, (name, bytes))| {
+            let on_disk = if index == 1 || index == 2 {
+                name.replace(".rar", ".duplicate1.rar")
+            } else {
+                name.clone()
+            };
+            (on_disk, bytes.clone())
+        })
+        .collect();
+
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("Duplicate Names", &posted),
+    )
+    .await;
+    for (index, (filename, bytes)) in posted.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job_id, index as u32, filename, bytes).await;
+    }
+    for (index, (filename, bytes)) in posted.iter().enumerate() {
+        let file_id = NzbFileId {
+            job_id,
+            file_index: index as u32,
+        };
+        pipeline
+            .file_prefix_16k
+            .insert(file_id, bytes[..bytes.len().min(16 * 1024)].to_vec());
+        let mut identity = pipeline.effective_file_identity(job_id, file_id).unwrap();
+        identity.current_filename = filename.clone();
+        identity.canonical_filename = Some(filename.clone());
+        identity.classification = Some(crate::jobs::assembly::DetectedArchiveIdentity {
+            kind: crate::jobs::assembly::DetectedArchiveKind::Rar,
+            set_name: "archive".to_string(),
+            volume_index: Some(index as u32),
+        });
+        identity.classification_source = crate::jobs::record::FileIdentitySource::Par2;
+        pipeline.set_file_identity(job_id, identity).unwrap();
+    }
+
+    // Read by their names alone, parts 2 and 3 look like a hole.
+    assert_eq!(
+        pipeline.missing_numbered_archive_part(job_id).as_deref(),
+        Some("missing archive part 'archive.part2.rar'")
+    );
+
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        placement_par2_file_set(&described),
+        &[],
+    );
+
+    assert_eq!(pipeline.missing_numbered_archive_part(job_id), None);
+}

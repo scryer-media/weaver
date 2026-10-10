@@ -1780,7 +1780,7 @@ impl Pipeline {
     // on that fingerprint and its proven length, under the same uniqueness
     // rule. A prefix captured again later is what the bytes are matched on,
     // but the length stays the proven one.
-    fn content_bound_par2_file_id(
+    pub(in crate::pipeline) fn content_bound_par2_file_id(
         &self,
         file_id: NzbFileId,
         set: &Par2FileSet,
