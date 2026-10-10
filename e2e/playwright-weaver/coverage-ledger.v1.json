@@ -758,6 +758,36 @@
       "oracle": "api-metrics"
     },
     {
+      "name": "schedule-action-contract-and-refusals",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-hold-matrix-every-action",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-track-independence-and-overlap",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-operator-overrides",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-one-shot-occurrences",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "schedule-catch-up-across-restart",
+      "owner": "scheduling-tracks",
+      "oracle": "api-metrics"
+    },
+    {
       "name": "automatic-and-upgrade-backups",
       "owner": "scheduling",
       "oracle": "api-metrics"

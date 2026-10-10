@@ -69,6 +69,10 @@ type weaverReleaseFlowSpec struct {
 	// ExtendedOnly keeps a flow out of "all" and "datastore-matrix"; it runs
 	// only when named.
 	ExtendedOnly bool
+	// ClockWhileStopped stops Weaver between stages instead of restarting it,
+	// and puts the instant a stage left in the clock's while-stopped file on
+	// the e2e clock before Weaver starts again.
+	ClockWhileStopped bool
 }
 
 var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
@@ -152,6 +156,7 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 	eventScriptsReleaseFlow(),
 	schedulingReleaseFlow(),
 	schedulingDSTReleaseFlow(),
+	schedulingTracksReleaseFlow(),
 }
 
 func browserReleaseFlow(name string, timeout time.Duration) weaverReleaseFlowSpec {

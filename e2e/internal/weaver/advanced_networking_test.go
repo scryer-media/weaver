@@ -232,6 +232,34 @@ func TestReleaseFlowPlaywrightScriptsExist(t *testing.T) {
 	}
 }
 
+// The spec leaves the instant beside the clock file; the harness must read
+// the same path, and only flows with more than one stage can use it.
+func TestClockWhileStoppedMatchesTheSpecHelper(t *testing.T) {
+	support, err := os.ReadFile(filepath.Join(weaverE2ETestRoot(t), "playwright-weaver", "tests", "support", "schedules.ts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(support), "`${file}.while-stopped`") {
+		t.Fatal("schedules.ts no longer writes <clock file>.while-stopped")
+	}
+	if !strings.Contains(weaverClockWhileStoppedScript, "pending=/e2e-clock/now.while-stopped") {
+		t.Fatalf("the harness reads a different file: %q", weaverClockWhileStoppedScript)
+	}
+	users := 0
+	for _, spec := range weaverReleaseFlowSpecs {
+		if !spec.ClockWhileStopped {
+			continue
+		}
+		users++
+		if len(spec.Stages) < 2 {
+			t.Fatalf("%s moves the clock while Weaver is stopped but never restarts it", spec.Name)
+		}
+	}
+	if users == 0 {
+		t.Fatal("no flow moves the clock while Weaver is stopped")
+	}
+}
+
 func TestTwoNICConfigRequiresConfirmationAndEnvironment(t *testing.T) {
 	values := map[string]string{
 		"E2E_TWO_NIC_REMOTE":         "user@192.0.2.10",

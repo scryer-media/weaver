@@ -1,15 +1,20 @@
 import fs from "node:fs";
-import path from "node:path";
 import type { APIRequestContext } from "@playwright/test";
 import {
   configuredServer, expect, graphql, nntpBodyMetrics, nntpConnectionMetrics, postProbeArticle,
   resetNntpMetrics, submitProbeNzb, test,
 } from "./helpers";
-import { literal, setting, waitRows } from "./support/datastore";
+import { setting, waitRows } from "./support/datastore";
 import { jobState, startDownload, waitTerminal } from "./support/downloads";
 import { readClock, setClock } from "./support/e2e-clock";
 import { graphqlErrors, setSystemEgressQuota, stage, systemEgressQuotaUsage } from "./support/network-flow";
-import { loadStageState, nzbDocument, nzbgetRpc, saveStageState, withControlKey } from "./support/script-settings";
+import { loadStageState, nzbgetRpc, saveStageState, withControlKey } from "./support/script-settings";
+import {
+  Rules, SCHEDULE_FIELDS, type QueueItem, type ScheduleRow, armWatchFolder, at, bodyCount, cancelledJob, completedJob,
+  disarmWatchFolder, dropValidNzb, failedJob, freshDay, generalSettings, historyItem, hhmm, localOutput, note,
+  profileState, queueItem, queueState, resumeAll, schedules, serverActive, token, updateSettings, waitPaused,
+  waitProfile, waitQueue, watchDir, watchFolderPaused, withRules, witnessTick,
+} from "./support/schedules";
 
 /**
  * Schedule rules (T01-T16). Weaver reads the e2e clock
@@ -26,307 +31,11 @@ import { loadStageState, nzbDocument, nzbgetRpc, saveStageState, withControlKey 
  * created first: the later rule of a pair wins on the previous day too.
  *
  * T13 spans the Weaver restart. Every other test runs in the initial stage.
+ * Occurrence rules (times, hourly, weekdays, one-shot catch-up) and the
+ * per-action hold matrix live in schedule-tracks.spec.ts.
  */
-
-const RSS_FIXTURE = "http://rss-fixture:8089";
-const WATCH_ROOT = "/watch-folder";
-const DAY_MS = 24 * 60 * 60_000;
-const WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"] as const;
-const token = Date.now().toString(36);
-
-function note(type: string, description: string): void {
-  test.info().annotations.push({ type, description });
-}
 
 const initialOnly = () => test.skip(stage() !== "initial", "runs in the initial stage");
-
-// ---------------------------------------------------------------------------
-// Clock
-
-/** Midnight UTC at least two days past the clock, optionally on a weekday. */
-function freshDay(weekday?: (typeof WEEKDAYS)[number]): Date {
-  const now = readClock();
-  let day = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 2);
-  while (weekday !== undefined && WEEKDAYS[new Date(day).getUTCDay()] !== weekday) day += DAY_MS;
-  return new Date(day);
-}
-
-const at = (day: Date, hours: number, minutes: number) => new Date(day.getTime() + (hours * 60 + minutes) * 60_000);
-const hhmm = (instant: Date) => instant.toISOString().slice(11, 16);
-
-// ---------------------------------------------------------------------------
-// Rules
-
-type ScheduleRow = {
-  id: string; label: string; enabled: boolean; days: string[]; time: string; times: string[];
-  everyHourAtMinute: number | null; actionType: string; track: string;
-  serverId: number | null; serverActive: boolean | null; speedLimitBytes: number | null; hardwareProfile: string | null;
-  speedLimits: Array<{ kind: "GLOBAL" | "EGRESS" | "SERVER"; id: number | null; bytesPerSec: number }>;
-};
-type RuleInput = Record<string, unknown> & { actionType: string; time: string };
-
-const SCHEDULE_FIELDS = "id label enabled days time times everyHourAtMinute actionType track serverId serverActive speedLimitBytes hardwareProfile speedLimits { kind id bytesPerSec }";
-
-async function schedules(request: APIRequestContext): Promise<ScheduleRow[]> {
-  return (await graphql<{ schedules: ScheduleRow[] }>(request, `query { schedules { ${SCHEDULE_FIELDS} } }`)).schedules;
-}
-
-/** Rules a test creates, all removed again when it ends. */
-class Rules {
-  private readonly ids = new Set<string>();
-  private serial = 0;
-
-  constructor(private readonly request: APIRequestContext, private readonly tag: string) {}
-
-  label(): string {
-    this.serial += 1;
-    return `${this.tag}-${this.serial}-${token}`;
-  }
-
-  async create(input: RuleInput): Promise<ScheduleRow> {
-    const label = (input.label as string | undefined) ?? this.label();
-    const rows = (await graphql<{ createSchedule: ScheduleRow[] }>(this.request,
-      `mutation($input: ScheduleInput!) { createSchedule(input: $input) { ${SCHEDULE_FIELDS} } }`,
-      { input: { enabled: true, days: [], ...input, label } })).createSchedule;
-    const created = rows.filter(row => row.label === label);
-    expect(created, `created rule ${label}`).toHaveLength(1);
-    this.ids.add(created[0]!.id);
-    return created[0]!;
-  }
-
-  async update(id: string, input: RuleInput): Promise<ScheduleRow[]> {
-    return (await graphql<{ updateSchedule: ScheduleRow[] }>(this.request,
-      `mutation($id: String!, $input: ScheduleInput!) { updateSchedule(id: $id, input: $input) { ${SCHEDULE_FIELDS} } }`,
-      { id, input: { enabled: true, days: [], ...input } })).updateSchedule;
-  }
-
-  async toggle(id: string, enabled: boolean): Promise<ScheduleRow[]> {
-    return (await graphql<{ toggleSchedule: ScheduleRow[] }>(this.request,
-      `mutation($id: String!, $enabled: Boolean!) { toggleSchedule(id: $id, enabled: $enabled) { ${SCHEDULE_FIELDS} } }`,
-      { id, enabled })).toggleSchedule;
-  }
-
-  async delete(id: string): Promise<ScheduleRow[]> {
-    const rows = (await graphql<{ deleteSchedule: ScheduleRow[] }>(this.request,
-      `mutation($id: String!) { deleteSchedule(id: $id) { ${SCHEDULE_FIELDS} } }`, { id })).deleteSchedule;
-    this.ids.delete(id);
-    return rows;
-  }
-
-  async clear(): Promise<void> {
-    for (const id of [...this.ids]) await this.delete(id);
-  }
-}
-
-/** Run `body` with a rule tracker whose rules are removed afterwards. */
-async function withRules(request: APIRequestContext, tag: string, body: (rules: Rules) => Promise<void>): Promise<void> {
-  const rules = new Rules(request, tag);
-  try {
-    await body(rules);
-  } finally {
-    await rules.clear();
-  }
-}
-
-let witnessSerial = 0;
-
-/**
- * Prove a whole evaluator tick ran after this call began. A speed rule with a
- * value nothing else uses must come into force, then the same rule edited to
- * the configured limit must too. The second change needs a later tick than
- * the first, and that tick read the rules (so the clock) after the clock was
- * last moved; every track, the Speed track included, has been processed by
- * the tick that published the first value.
- *
- * Not for tests that schedule speed rules of their own.
- */
-async function witnessTick(request: APIRequestContext): Promise<void> {
-  witnessSerial += 1;
-  const marker = 2_000_000_000 + witnessSerial * 1_024 + (Date.now() % 1_000);
-  const rules = new Rules(request, "witness");
-  try {
-    const rule = await rules.create({ actionType: "speed_limit", time: hhmm(readClock()), speedLimitBytes: marker });
-    await expect.poll(async () => (await queueState(request)).downloadBlock.scheduledSpeedLimit,
-      { message: `witness ${marker} in force`, timeout: 0 }).toBe(marker);
-    // A global limit of 0 takes the scheduled limit away again.
-    await rules.update(rule.id, { actionType: "speed_limit", time: rule.time, label: rule.label, speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: 0 }] });
-    await expect.poll(async () => (await queueState(request)).downloadBlock.scheduledSpeedLimit,
-      { message: `witness ${marker} lifted`, timeout: 0 }).toBe(0);
-  } finally {
-    await rules.clear();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Queue, settings and jobs
-
-type QueueState = {
-  isPaused: boolean;
-  speedLimitBytesPerSec: number;
-  downloadBlock: { kind: string; usedBytes: number; scheduledSpeedLimit: number; scheduleHoldReason: string | null };
-};
-
-async function queueState(request: APIRequestContext): Promise<QueueState> {
-  return (await graphql<{ globalQueueState: QueueState }>(request,
-    "query { globalQueueState { isPaused speedLimitBytesPerSec downloadBlock { kind usedBytes scheduledSpeedLimit scheduleHoldReason } } }")).globalQueueState;
-}
-
-async function waitQueue(request: APIRequestContext, predicate: (state: QueueState) => boolean, message: string): Promise<QueueState> {
-  let state: QueueState | undefined;
-  await expect.poll(async () => predicate(state = await queueState(request)), { message, timeout: 0 }).toBe(true);
-  return state!;
-}
-
-const waitPaused = (request: APIRequestContext, paused: boolean, message: string) =>
-  waitQueue(request, state => state.isPaused === paused, message);
-
-async function resumeAll(request: APIRequestContext): Promise<void> {
-  await graphql(request, "mutation { resumeAll }");
-}
-
-type WatchFolder = {
-  mode: string; path: string | null; pollIntervalSecs: number; stabilitySecs: number;
-  categoryFromSubfolders: boolean; scanningPaused: boolean;
-};
-
-async function generalSettings(request: APIRequestContext): Promise<{ maxDownloadSpeed: number; watchFolder: WatchFolder }> {
-  return (await graphql<{ settings: { maxDownloadSpeed: number; watchFolder: WatchFolder } }>(request,
-    "query { settings { maxDownloadSpeed watchFolder { mode path pollIntervalSecs stabilitySecs categoryFromSubfolders scanningPaused } } }")).settings;
-}
-
-async function updateSettings(request: APIRequestContext, input: Record<string, unknown>): Promise<void> {
-  await graphql(request, "mutation($input: GeneralSettingsInput!) { updateSettings(input: $input) { maxDownloadSpeed } }", { input });
-}
-
-async function watchFolderPaused(request: APIRequestContext): Promise<boolean> {
-  return (await generalSettings(request)).watchFolder.scanningPaused;
-}
-
-/** A watch directory only this test uses, writable by Weaver. */
-function watchDir(name: string): string {
-  const directory = path.join(WATCH_ROOT, `scheduling-${name}-${token}`);
-  fs.mkdirSync(directory, { recursive: true, mode: 0o777 });
-  fs.chmodSync(directory, 0o777);
-  return directory;
-}
-
-function dropFile(directory: string, name: string, contents: string): string {
-  const target = path.join(directory, name);
-  fs.writeFileSync(`${target}.part`, contents, { mode: 0o666 });
-  fs.renameSync(`${target}.part`, target);
-  return target;
-}
-
-/**
- * Poll `directory` once an hour, so only a scheduled scan or a resume can
- * consume what a test drops later, and wait for the first pass: it marks an
- * invalid sentinel file `.error`.
- */
-async function armWatchFolder(request: APIRequestContext, directory: string): Promise<void> {
-  const sentinel = dropFile(directory, "sentinel.nzb", "not an nzb\n");
-  await updateSettings(request, { watchFolder: {
-    mode: "polling", path: directory, pollIntervalSecs: 3600, stabilitySecs: 0,
-    categoryFromSubfolders: false, scanningPaused: false,
-  } });
-  await expect.poll(() => fs.existsSync(`${sentinel}.error`), { message: `first watch pass over ${directory}`, timeout: 0 }).toBe(true);
-}
-
-async function disarmWatchFolder(request: APIRequestContext): Promise<void> {
-  await updateSettings(request, { watchFolder: { mode: "off", scanningPaused: false } });
-}
-
-/** Post one article and drop an NZB for it, returning the NZB's path. */
-async function dropValidNzb(directory: string, name: string): Promise<string> {
-  const article = { messageId: `${name}-${token}@e2e.invalid`, bytes: 16 * 1024 };
-  await postProbeArticle(article.messageId, article.bytes);
-  return dropFile(directory, `${name}.nzb`, nzbDocument(name, [article]));
-}
-
-async function addCountedFeed(request: APIRequestContext, key: string): Promise<number> {
-  // Disabled, so only a scheduled fetch_rss reads it: the background poller
-  // runs on wall-clock time and skips disabled feeds.
-  return (await graphql<{ addRssFeed: { id: number } }>(request,
-    "mutation($input: RssFeedInput!) { addRssFeed(input: $input) { id } }",
-    { input: { name: `counted ${key}`, url: `${RSS_FIXTURE}/counted/${key}.xml`, enabled: false } })).addRssFeed.id;
-}
-
-async function deleteFeed(request: APIRequestContext, id: number): Promise<void> {
-  await graphql(request, "mutation($id: Int!) { deleteRssFeed(id: $id) }", { id });
-}
-
-async function feedCount(key: string): Promise<number> {
-  const response = await fetch(`${RSS_FIXTURE}/count/${key}`);
-  expect(response.ok, `count for ${key}`).toBe(true);
-  return ((await response.json()) as { count: number }).count;
-}
-
-async function waitCounts(keys: Record<string, string>, expected: Record<string, number>, message: string): Promise<void> {
-  let counts: Record<string, number> = {};
-  await expect.poll(async () => {
-    counts = {};
-    for (const [name, key] of Object.entries(keys)) counts[name] = await feedCount(key);
-    return Object.entries(expected).every(([name, count]) => counts[name]! >= count);
-  }, { message, timeout: 0 }).toBe(true);
-}
-
-async function counts(keys: Record<string, string>): Promise<Record<string, number>> {
-  const result: Record<string, number> = {};
-  for (const [name, key] of Object.entries(keys)) result[name] = await feedCount(key);
-  return result;
-}
-
-type QueueItem = { id: number; state: string; remainingFileCount: number; downloadedBytes: number };
-
-async function queueItem(request: APIRequestContext, id: number): Promise<QueueItem | null> {
-  return (await graphql<{ queueItem: QueueItem | null }>(request,
-    "query($id: Int!) { queueItem(id: $id) { id state remainingFileCount downloadedBytes } }", { id })).queueItem;
-}
-
-async function historyItem(request: APIRequestContext, id: number): Promise<{ state: string; outputDir: string | null } | null> {
-  return (await graphql<{ historyItem: { state: string; outputDir: string | null } | null }>(request,
-    "query($id: Int!) { historyItem(id: $id) { state outputDir } }", { id })).historyItem;
-}
-
-/** BODY requests the provider served for articles whose id contains `prefix`. */
-async function bodyCount(prefix: string, host = "nntp"): Promise<number> {
-  const metrics = await nntpBodyMetrics(prefix, host);
-  return Object.entries(metrics.body_counts ?? {})
-    .filter(([messageId]) => messageId.includes(prefix))
-    .reduce((sum, [, count]) => sum + count, 0);
-}
-
-async function completedJob(request: APIRequestContext, name: string, options: { nntpHost?: string } = {}): Promise<number> {
-  const id = await startDownload(request, `${name}-${token}`, { count: 4, partBytes: 32 * 1024, ...options });
-  expect(await waitTerminal(request, id), `${name} completes`).toBe("COMPLETED");
-  return id;
-}
-
-/** A job none of whose articles exist on any provider. */
-async function failedJob(request: APIRequestContext, name: string): Promise<number> {
-  const articles = [{ messageId: `${name}-${token}-absent@e2e.invalid`, bytes: 16 * 1024 }];
-  const result = await submitProbeNzb(request, `${name}-${token}`, articles);
-  expect(result, `submit ${name}`).toMatchObject({ accepted: true });
-  expect(await waitTerminal(request, result.jobId!), `${name} fails`).toBe("FAILED");
-  return result.jobId!;
-}
-
-async function cancelledJob(request: APIRequestContext, name: string): Promise<number> {
-  await graphql(request, "mutation { pauseAll }");
-  try {
-    const articles = [{ messageId: `${name}-${token}-held@e2e.invalid`, bytes: 16 * 1024 }];
-    await postProbeArticle(articles[0]!.messageId, articles[0]!.bytes);
-    const result = await submitProbeNzb(request, `${name}-${token}`, articles);
-    expect(result, `submit ${name}`).toMatchObject({ accepted: true });
-    await graphql(request, "mutation($id: Int!) { cancelJob(id: $id) }", { id: result.jobId });
-    await waitRows(`SELECT status FROM job_history WHERE job_id = ${literal(result.jobId!)}`,
-      rows => rows[0]?.status === "cancelled", `${name} recorded as cancelled`);
-    return result.jobId!;
-  } finally {
-    await resumeAll(request);
-  }
-}
-
-const localOutput = (outputDir: string) => outputDir.replace(/^\/data\/complete/, "/weaver-downloads");
 
 // ---------------------------------------------------------------------------
 // Tests, in the order the evaluator state needs (T13 last).
@@ -504,19 +213,6 @@ test("T06 a scheduled speed limit binds for its window, then the configured limi
   });
 });
 
-type ProfileState = { active: string; scheduled: string | null; available: string[] };
-
-async function profileState(request: APIRequestContext): Promise<ProfileState> {
-  return (await graphql<{ hardwareProfile: ProfileState }>(request, "query { hardwareProfile { active scheduled available } }")).hardwareProfile;
-}
-
-async function waitProfile(request: APIRequestContext, scheduled: string, message: string): Promise<ProfileState> {
-  let state: ProfileState | undefined;
-  await expect.poll(async () => (state = await profileState(request)).scheduled === scheduled, { message, timeout: 0 }).toBe(true);
-  expect(state!.active).toBe(scheduled);
-  return state!;
-}
-
 test("T07 a scheduled hardware profile follows its rules across midnight", async ({ request }) => {
   initialOnly();
   note("observed", "A scheduled profile stays in force after its rules are deleted, until Weaver restarts; the test ends on the profile that was already active.");
@@ -546,11 +242,6 @@ test("T07 a scheduled hardware profile follows its rules across midnight", async
     await waitProfile(request, home, "T07 next day 10:00");
   });
 });
-
-async function serverActive(request: APIRequestContext, id: number): Promise<boolean | undefined> {
-  return (await graphql<{ servers: Array<{ id: number; active: boolean }> }>(request, "query { servers { id active } }"))
-    .servers.find(server => server.id === id)?.active;
-}
 
 test("T08 a server is out of rotation for its scheduled window", async ({ request }) => {
   initialOnly();
@@ -668,75 +359,6 @@ test("T10 one-shot rules prune history", async ({ request }) => {
       await waitRows(`SELECT COUNT(*) AS n FROM async_operation_targets WHERE state IN ('queued', 'running')`,
         rows => rows[0]?.n === "0", "T10 round 2 delete operation finished");
       expect(fs.existsSync(localOutput(complete2Dir)), "round 2 keeps completed files").toBe(true);
-    }
-  });
-});
-
-test("T11 every due one-shot runs even past the running cap", async ({ request }) => {
-  test.fixme(true, "counted scheduled RSS fetches, which no rule makes any more; needs an occurrence probe of its own");
-  initialOnly();
-  note("gap", "At most 32 one-shots run at once and the rest wait; scheduled RSS fetches also serialise on the RSS lock, so how many ran concurrently is not observable. All 33 must still run exactly once.");
-  const keys: Record<string, string> = {};
-  const feeds: number[] = [];
-  const day = freshDay();
-  setClock(at(day, 9, 58));
-  await withRules(request, "t11", async rules => {
-    try {
-      for (let index = 0; index < 33; index += 1) {
-        const key = `t11-${index}-${token}`;
-        keys[`f${index}`] = key;
-        const feedId = await addCountedFeed(request, key);
-        feeds.push(feedId);
-        await rules.create({ actionType: "fetch_rss", time: "10:00", feedId });
-      }
-      await witnessTick(request);
-      setClock(at(day, 10, 1));
-      await waitCounts(keys, Object.fromEntries(Object.keys(keys).map(name => [name, 1])), "T11 all 33 fetched");
-      await witnessTick(request);
-      expect(Object.values(await counts(keys)).every(count => count === 1)).toBe(true);
-    } finally {
-      for (const id of feeds) await deleteFeed(request, id);
-    }
-  });
-});
-
-test("T12 time, times, hourly and weekday rules fire on their occurrences", async ({ request }) => {
-  test.fixme(true, "counted scheduled RSS fetches, which no rule makes any more; needs an occurrence probe of its own");
-  initialOnly();
-  const keys = { A: `t12-a-${token}`, B: `t12-b-${token}`, C: `t12-c-${token}`, D: `t12-d-${token}` };
-  const feeds: Record<string, number> = {};
-  const monday = freshDay("mon");
-  const tuesday = new Date(monday.getTime() + DAY_MS);
-  setClock(at(monday, 9, 58));
-  await withRules(request, "t12", async rules => {
-    try {
-      for (const [name, key] of Object.entries(keys)) feeds[name] = await addCountedFeed(request, key);
-      await rules.create({ actionType: "fetch_rss", time: "10:00", feedId: feeds.A });
-      await rules.create({ actionType: "fetch_rss", time: "10:00", times: ["10:00", "10:05"], feedId: feeds.B });
-      const hourly = await rules.create({ actionType: "fetch_rss", time: "00:07", everyHourAtMinute: 7, feedId: feeds.C });
-      expect(hourly.everyHourAtMinute).toBe(7);
-      const weekly = await rules.create({ actionType: "fetch_rss", time: "10:00", days: ["mon"], feedId: feeds.D });
-      expect(weekly.days).toEqual(["mon"]);
-      await witnessTick(request);
-
-      const step = async (instant: Date, expected: Record<string, number>, message: string) => {
-        setClock(instant);
-        await waitCounts(keys, expected, message);
-        await witnessTick(request);
-        expect(await counts(keys), message).toEqual(expected);
-      };
-      await step(at(monday, 10, 1), { A: 1, B: 1, C: 0, D: 1 }, "Monday 10:01");
-      await step(at(monday, 10, 6), { A: 1, B: 2, C: 0, D: 1 }, "Monday 10:06");
-      await step(at(monday, 10, 8), { A: 1, B: 2, C: 1, D: 1 }, "Monday 10:08");
-      await step(at(monday, 11, 8), { A: 1, B: 2, C: 2, D: 1 }, "Monday 11:08");
-
-      // More than 90 minutes forward only sets a new baseline.
-      setClock(at(tuesday, 9, 58));
-      await witnessTick(request);
-      expect(await counts(keys), "a long jump fires nothing").toEqual({ A: 1, B: 2, C: 2, D: 1 });
-      await step(at(tuesday, 10, 1), { A: 2, B: 3, C: 2, D: 1 }, "Tuesday 10:01");
-    } finally {
-      for (const id of Object.values(feeds)) await deleteFeed(request, id);
     }
   });
 });
