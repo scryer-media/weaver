@@ -149,7 +149,7 @@ jobs:
           go-version-file: e2e/go.mod
           cache-dependency-path: e2e/go.sum
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Build the oracle images the artifact cache needs
         timeout-minutes: 60
@@ -177,7 +177,7 @@ jobs:
           tar -cf "$RUNNER_TEMP/corpus-shared-clips.tar" -T "$RUNNER_TEMP/group-paths.txt"
           tar -cf "$RUNNER_TEMP/artifact-cache.tar" target/fixturegen/artifacts
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: corpus-group-shared-clips
           path: ${{ runner.temp }}/corpus-shared-clips.tar
@@ -187,7 +187,7 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: corpus-artifact-cache
           path: ${{ runner.temp }}/artifact-cache.tar
@@ -225,10 +225,10 @@ jobs:
           go-version-file: e2e/go.mod
           cache-dependency-path: e2e/go.sum
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Download the shared artifact cache
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: corpus-artifact-cache
           path: ${{ runner.temp }}/cache
@@ -266,7 +266,7 @@ jobs:
             --out "$RUNNER_TEMP/group-paths.txt"
           tar -cf "$RUNNER_TEMP/corpus-$FAMILY.tar" -T "$RUNNER_TEMP/group-paths.txt"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: corpus-group-${{ matrix.family }}
           path: ${{ runner.temp }}/corpus-${{ matrix.family }}.tar
@@ -296,7 +296,7 @@ jobs:
           cache-dependency-path: e2e/go.sum
 
       - name: Download every generation artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: corpus-group-*
           path: ${{ runner.temp }}/groups
@@ -334,7 +334,7 @@ jobs:
           tar -cf "$RUNNER_TEMP/corpus-tree.tar" -T "$RUNNER_TEMP/all-paths.txt"
 
       # The one tree the publish job uploads. Nothing regenerates it.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: corpus-tree
           path: ${{ runner.temp }}/corpus-tree.tar
@@ -344,7 +344,7 @@ jobs:
 
       # The manifest, its provenance, and the refreshed ledger the tree was
       # held to. The publish job uploads these exact bytes.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: corpus-build
           path: |
@@ -428,13 +428,13 @@ jobs:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
       - name: Download the assembled corpus
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: corpus-tree
           path: ${{ runner.temp }}/tree
 
       - name: Download the manifest, provenance and refreshed ledger
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: corpus-build
           path: ${{ runner.temp }}/build
@@ -513,7 +513,7 @@ jobs:
 
       - name: Keep the build directory and the refreshed ledger as run artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-test-corpus-${{ github.run_id }}
           path: |
