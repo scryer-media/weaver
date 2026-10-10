@@ -929,12 +929,12 @@ impl Pipeline {
         Ok(())
     }
 
-    /// The pool replaced by generation `generation` has drained its sockets,
-    /// so the new pool may dial without competing for the provider allowance.
-    ///
-    /// A drain that finishes after a further rebuild is stale: only the newest
-    /// generation's own drain re-opens dispatch, which keeps the overlap rule
-    /// intact across back-to-back settings saves.
+    // The pool replaced by generation `generation` has drained its sockets,
+    // so the new pool may dial without competing for the provider allowance.
+    //
+    // A drain that finishes after a further rebuild is stale: only the newest
+    // generation's own drain re-opens dispatch, which keeps the overlap rule
+    // intact across back-to-back settings saves.
     pub(crate) fn handle_nntp_handoff_drained(&mut self, generation: u64) {
         if generation != self.pool_generation {
             debug!(

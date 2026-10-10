@@ -123,8 +123,8 @@ impl TunnelProvider for NntpFixture {
         "NNTP review fixture".into()
     }
 }
-/// Route and NNTP timeouts that a test does not exercise, set out of reach of a
-/// slow runner so only the behavior under test can decide the outcome.
+// Route and NNTP timeouts that a test does not exercise, set out of reach of a
+// slow runner so only the behavior under test can decide the outcome.
 const NOT_UNDER_TEST: Duration = Duration::from_secs(3600);
 
 fn route(modes: &[Mode], timeout: Duration) -> Arc<ConsumerRoute> {

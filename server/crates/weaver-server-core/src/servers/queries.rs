@@ -106,9 +106,9 @@ impl Database {
         })
     }
 
-    /// Read just the proven BODY pipelining depth. The download runtime writes
-    /// this column behind the in-memory config, so an editor that wants to keep
-    /// it has to ask the database rather than the config it already holds.
+    // Read just the proven BODY pipelining depth. The download runtime writes
+    // this column behind the in-memory config, so an editor that wants to keep
+    // it has to ask the database rather than the config it already holds.
     pub fn server_pipelining_depth(&self, id: u32) -> Result<Option<u8>, StateError> {
         let datastore = self.datastore();
         let args = vec![SqlArg::I64(i64::from(id))];

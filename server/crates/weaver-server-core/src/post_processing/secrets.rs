@@ -1,9 +1,9 @@
-//! Named secrets: a value the operator types once, stored encrypted, and
-//! linked by reference from any number of instance inputs.
-//!
-//! A secret's value never leaves this module except to a run that resolves a
-//! linked input. Listings carry names and where each secret is used, never
-//! values.
+// Named secrets: a value the operator types once, stored encrypted, and
+// linked by reference from any number of instance inputs.
+//
+// A secret's value never leaves this module except to a run that resolves a
+// linked input. Listings carry names and where each secret is used, never
+// values.
 
 use std::collections::BTreeMap;
 
@@ -18,7 +18,7 @@ use crate::persistence::{Database, StateError};
 const MAX_SECRET_NAME_BYTES: usize = 128;
 const MAX_SECRET_VALUE_BYTES: usize = 64 * 1024;
 
-/// A link from an input to a secret, as an input shows it.
+// A link from an input to a secret, as an input shows it.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretRef {
@@ -26,21 +26,21 @@ pub struct SecretRef {
     pub name: String,
 }
 
-/// An instance that links a secret.
+// An instance that links a secret.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct SecretUsage {
     pub instance_id: String,
     pub instance_name: String,
 }
 
-/// A secret as it is listed: everything but its value.
+// A secret as it is listed: everything but its value.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Secret {
     pub id: String,
     pub name: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    /// The instances linking it, by instance name.
+    // The instances linking it, by instance name.
     pub used_by: Vec<SecretUsage>,
 }
 
@@ -69,8 +69,8 @@ fn in_use_names(usages: &[SecretUsage]) -> String {
         .join(", ")
 }
 
-/// The form a name is compared in: names that differ only by case are one
-/// name.
+// The form a name is compared in: names that differ only by case are one
+// name.
 pub(crate) fn secret_name_key(name: &str) -> String {
     name.to_lowercase()
 }
@@ -92,7 +92,7 @@ fn valid_value(value: &str) -> Result<(), SecretError> {
     Ok(())
 }
 
-/// How a change inside a transaction came out.
+// How a change inside a transaction came out.
 enum Outcome {
     Done,
     NotFound,
@@ -109,8 +109,8 @@ impl Database {
         encrypt_value(key, value).map_err(|error| SecretError::Storage(StateError::Database(error)))
     }
 
-    /// Every secret, by name, with the instances that link it. Values are
-    /// never read.
+    // Every secret, by name, with the instances that link it. Values are
+    // never read.
     pub fn secrets(&self) -> Result<Vec<Secret>, StateError> {
         let mut usages = self.secret_usages()?;
         let datastore = self.datastore();
@@ -141,7 +141,7 @@ impl Database {
         Ok(self.secrets()?.into_iter().find(|secret| secret.id == id))
     }
 
-    /// For each linked secret, the instances that link it, by instance name.
+    // For each linked secret, the instances that link it, by instance name.
     pub fn secret_usages(&self) -> Result<BTreeMap<String, Vec<SecretUsage>>, StateError> {
         let datastore = self.datastore();
         let rows = self.run_sql_blocking_read(async move {
@@ -213,8 +213,8 @@ impl Database {
         self.finish(name_race_outcome(outcome)?, &created)
     }
 
-    /// Rename a secret, give it a new value, or both. A run started after
-    /// this resolves the new value.
+    // Rename a secret, give it a new value, or both. A run started after
+    // this resolves the new value.
     pub fn update_secret(
         &self,
         id: &str,
@@ -271,7 +271,7 @@ impl Database {
         self.finish(name_race_outcome(outcome)?, id)
     }
 
-    /// Remove a secret. Refused while any instance links it.
+    // Remove a secret. Refused while any instance links it.
     pub fn delete_secret(&self, id: &str) -> Result<(), SecretError> {
         let datastore = self.datastore();
         let target = id.to_string();
@@ -345,8 +345,8 @@ impl Database {
     }
 }
 
-/// A name write that lost a race to another with the same name hits the
-/// unique index on `name_key`: that is the name being taken, not a failure.
+// A name write that lost a race to another with the same name hits the
+// unique index on `name_key`: that is the name being taken, not a failure.
 fn name_race_outcome(result: Result<Outcome, StateError>) -> Result<Outcome, SecretError> {
     match result {
         Ok(outcome) => Ok(outcome),
@@ -355,7 +355,7 @@ fn name_race_outcome(result: Result<Outcome, StateError>) -> Result<Outcome, Sec
     }
 }
 
-/// Whether every id names a stored secret, read inside `tx`.
+// Whether every id names a stored secret, read inside `tx`.
 pub(crate) async fn secrets_exist_tx(
     tx: &mut SqlTx<'_>,
     ids: &[String],

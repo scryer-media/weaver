@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use crate::operations::instrumentation::DiskSpaceSnapshot;
 
-/// Capacity for the filesystem backing a path.
+// Capacity for the filesystem backing a path.
 #[derive(Debug, Clone, Copy)]
 pub struct DiskSpace {
     pub total_bytes: u64,
@@ -21,23 +21,23 @@ impl DiskSpace {
     }
 }
 
-/// Why a capacity probe produced no reading.
+// Why a capacity probe produced no reading.
 #[derive(Debug)]
 pub enum DiskProbeError {
-    /// The operating system rejected the query (missing path, permission,
-    /// unmounted or unreachable filesystem, ...).
+    // The operating system rejected the query (missing path, permission,
+    // unmounted or unreachable filesystem, ...).
     Io(io::Error),
-    /// The path cannot be handed to the operating system (interior NUL).
+    // The path cannot be handed to the operating system (interior NUL).
     InvalidPath,
-    /// The filesystem answered with fields no reading can be built from.
+    // The filesystem answered with fields no reading can be built from.
     InvalidReading,
-    /// This platform has no capacity query.
+    // This platform has no capacity query.
     Unsupported,
 }
 
 impl DiskProbeError {
-    /// True when the failure means the path does not exist (yet), which is the
-    /// only failure a probe may recover from by asking an ancestor instead.
+    // True when the failure means the path does not exist (yet), which is the
+    // only failure a probe may recover from by asking an ancestor instead.
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::Io(error) if error.kind() == io::ErrorKind::NotFound)
     }
@@ -56,18 +56,18 @@ impl fmt::Display for DiskProbeError {
 
 impl std::error::Error for DiskProbeError {}
 
-/// Query total/available capacity for the filesystem backing `path`
-/// (`statfs` on Apple platforms, `statvfs` on other unix,
-/// `GetDiskFreeSpaceExW` on Windows).
-///
-/// Apple's `statvfs` keeps block counts in 32 bits, so a volume with more
-/// than 2^32 blocks — a 22 TB share counted in 1 KiB blocks — reads as a
-/// small disk with more free space than total. Its `statfs` counts in 64 bits.
-///
-/// Fails when the path cannot be stat'd (e.g. it does not exist yet), when the
-/// filesystem returns an unusable reading, or on unsupported platforms. The
-/// error carries the operating-system reason so callers can log it and decide
-/// between failing open, holding a stale reading, and refusing.
+// Query total/available capacity for the filesystem backing `path`
+// (`statfs` on Apple platforms, `statvfs` on other unix,
+// `GetDiskFreeSpaceExW` on Windows).
+//
+// Apple's `statvfs` keeps block counts in 32 bits, so a volume with more
+// than 2^32 blocks — a 22 TB share counted in 1 KiB blocks — reads as a
+// small disk with more free space than total. Its `statfs` counts in 64 bits.
+//
+// Fails when the path cannot be stat'd (e.g. it does not exist yet), when the
+// filesystem returns an unusable reading, or on unsupported platforms. The
+// error carries the operating-system reason so callers can log it and decide
+// between failing open, holding a stale reading, and refusing.
 pub fn probe_disk_space(path: &Path) -> Result<DiskSpace, DiskProbeError> {
     #[cfg(target_vendor = "apple")]
     {
@@ -155,11 +155,11 @@ pub fn probe_disk_space(path: &Path) -> Result<DiskSpace, DiskProbeError> {
     }
 }
 
-/// Build a reading from `statvfs` block counts.
-///
-/// `f_frsize` is the unit the block counts are expressed in; a few
-/// filesystems and emulation layers leave it zero and only fill `f_bsize`, so
-/// that is used as the fallback unit. Both zero means no reading can be built.
+// Build a reading from `statvfs` block counts.
+//
+// `f_frsize` is the unit the block counts are expressed in; a few
+// filesystems and emulation layers leave it zero and only fill `f_bsize`, so
+// that is used as the fallback unit. Both zero means no reading can be built.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn reading_from_blocks(
     blocks: u64,
@@ -180,14 +180,14 @@ fn reading_from_blocks(
     })
 }
 
-/// Shape an absolute UTF-16 path for `GetDiskFreeSpaceExW`.
-///
-/// The API wants directories to end in a separator (a UNC root without one is
-/// rejected) and only accepts paths beyond the classic length limit through
-/// the verbatim `\\?\` prefix. UNC paths take `\\?\UNC\server\share` rather
-/// than a bare prefix. Already-verbatim and device paths pass through
-/// untouched; short drive paths stay short so the usual normalization rules
-/// keep applying to them.
+// Shape an absolute UTF-16 path for `GetDiskFreeSpaceExW`.
+//
+// The API wants directories to end in a separator (a UNC root without one is
+// rejected) and only accepts paths beyond the classic length limit through
+// the verbatim `\\?\` prefix. UNC paths take `\\?\UNC\server\share` rather
+// than a bare prefix. Already-verbatim and device paths pass through
+// untouched; short drive paths stay short so the usual normalization rules
+// keep applying to them.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn windows_probe_path(absolute: &[u16]) -> Vec<u16> {
     const MAX_CLASSIC_PATH: usize = 260;
@@ -220,11 +220,11 @@ fn windows_probe_path(absolute: &[u16]) -> Vec<u16> {
     shaped
 }
 
-/// Probe `path`, falling back to its nearest existing ancestor when the path
-/// itself has not been created yet. Only use this for advisory startup
-/// estimates: a missing path may also mean a disconnected storage root, and
-/// its parent's capacity does not establish that the target is available.
-/// Permission and I/O errors are returned unchanged.
+// Probe `path`, falling back to its nearest existing ancestor when the path
+// itself has not been created yet. Only use this for advisory startup
+// estimates: a missing path may also mean a disconnected storage root, and
+// its parent's capacity does not establish that the target is available.
+// Permission and I/O errors are returned unchanged.
 pub fn probe_nearest_disk_space(path: &Path) -> Result<DiskSpace, DiskProbeError> {
     let mut candidate = path;
     loop {
@@ -238,19 +238,19 @@ pub fn probe_nearest_disk_space(path: &Path) -> Result<DiskSpace, DiskProbeError
     }
 }
 
-/// Query total/available capacity, discarding the failure reason.
-///
-/// Callers that only want a best-effort number (metrics, informational
-/// warnings) use this; anything that gates work on the answer should go
-/// through [`probe_disk_space`] or a [`CapacitySampler`] so the failure is at
-/// least logged.
+// Query total/available capacity, discarding the failure reason.
+//
+// Callers that only want a best-effort number (metrics, informational
+// warnings) use this; anything that gates work on the answer should go
+// through [`probe_disk_space`] or a [`CapacitySampler`] so the failure is at
+// least logged.
 pub fn disk_space(path: &Path) -> Option<DiskSpace> {
     probe_disk_space(path).ok()
 }
 
-/// True when an I/O error means the filesystem (or the caller's quota on it)
-/// ran out of room, as opposed to a corrupt path, permission problem, or
-/// hardware fault.
+// True when an I/O error means the filesystem (or the caller's quota on it)
+// ran out of room, as opposed to a corrupt path, permission problem, or
+// hardware fault.
 pub fn is_out_of_space(error: &io::Error) -> bool {
     if matches!(
         error.kind(),
@@ -282,24 +282,24 @@ pub fn is_out_of_space(error: &io::Error) -> bool {
     }
 }
 
-/// One capacity reading as seen by a [`CapacitySampler`].
+// One capacity reading as seen by a [`CapacitySampler`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapacityReading {
     pub available_bytes: u64,
     pub total_bytes: u64,
-    /// When the underlying probe succeeded. Debits since then are already
-    /// applied to `available_bytes`.
+    // When the underlying probe succeeded. Debits since then are already
+    // applied to `available_bytes`.
     pub sampled_at: Instant,
-    /// The most recent probe failed and this is the last good reading, kept
-    /// so callers can keep accounting against something rather than nothing.
+    // The most recent probe failed and this is the last good reading, kept
+    // so callers can keep accounting against something rather than nothing.
     pub stale: bool,
 }
 
-/// What a [`CapacitySampler`] currently knows about its filesystem.
+// What a [`CapacitySampler`] currently knows about its filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capacity {
     Known(CapacityReading),
-    /// No probe has ever succeeded for this path.
+    // No probe has ever succeeded for this path.
     Unknown,
 }
 
@@ -311,14 +311,14 @@ impl Capacity {
         }
     }
 
-    /// Available bytes from a fresh reading only.
+    // Available bytes from a fresh reading only.
     pub fn fresh_available_bytes(self) -> Option<u64> {
         self.reading()
             .filter(|reading| !reading.stale)
             .map(|reading| reading.available_bytes)
     }
 
-    /// Available bytes from the best reading held, fresh or stale.
+    // Available bytes from the best reading held, fresh or stale.
     pub fn best_available_bytes(self) -> Option<u64> {
         self.reading().map(|reading| reading.available_bytes)
     }
@@ -326,15 +326,15 @@ impl Capacity {
 
 type ProbeFn = dyn Fn(&Path) -> Result<DiskSpace, DiskProbeError> + Send + Sync;
 
-/// Per-path capacity sampler shared by every admission check that gates work
-/// on free space.
-///
-/// It bounds the probe rate with a TTL, keeps the last good reading (flagged
-/// stale) across probe failures so a transient stat error does not turn into
-/// a phantom "disk full", tracks bytes admitted against the cached reading
-/// between probes, and logs each failure and recovery transition exactly once
-/// with the operating-system reason. Callers keep it under their own lock;
-/// nothing here blocks beyond the syscall.
+// Per-path capacity sampler shared by every admission check that gates work
+// on free space.
+//
+// It bounds the probe rate with a TTL, keeps the last good reading (flagged
+// stale) across probe failures so a transient stat error does not turn into
+// a phantom "disk full", tracks bytes admitted against the cached reading
+// between probes, and logs each failure and recovery transition exactly once
+// with the operating-system reason. Callers keep it under their own lock;
+// nothing here blocks beyond the syscall.
 pub struct CapacitySampler {
     path: PathBuf,
     ttl: Duration,
@@ -357,15 +357,15 @@ impl fmt::Debug for CapacitySampler {
 }
 
 impl CapacitySampler {
-    /// Sample the exact storage path at most once per `ttl`. A missing root
-    /// stays unavailable rather than borrowing its parent's capacity.
-    /// No probe runs until the first `sample`.
+    // Sample the exact storage path at most once per `ttl`. A missing root
+    // stays unavailable rather than borrowing its parent's capacity.
+    // No probe runs until the first `sample`.
     pub fn new(path: PathBuf, ttl: Duration) -> Self {
         Self::with_probe(path, ttl, Box::new(probe_disk_space))
     }
 
-    /// Like [`Self::new`] with a caller-supplied probe (tests, injected
-    /// accounting).
+    // Like [`Self::new`] with a caller-supplied probe (tests, injected
+    // accounting).
     pub fn with_probe(path: PathBuf, ttl: Duration, probe: Box<ProbeFn>) -> Self {
         Self {
             path,
@@ -381,7 +381,7 @@ impl CapacitySampler {
         &self.path
     }
 
-    /// Current knowledge without touching the filesystem.
+    // Current knowledge without touching the filesystem.
     pub fn current(&self) -> Capacity {
         match self.last_good {
             Some(reading) => Capacity::Known(CapacityReading {
@@ -392,18 +392,18 @@ impl CapacitySampler {
         }
     }
 
-    /// True when the most recent probe failed.
+    // True when the most recent probe failed.
     pub fn is_failing(&self) -> bool {
         self.failing_since.is_some()
     }
 
-    /// Return the current reading, probing first when the last attempt is
-    /// older than the TTL.
+    // Return the current reading, probing first when the last attempt is
+    // older than the TTL.
     pub fn sample(&mut self) -> Capacity {
         self.sample_at(Instant::now())
     }
 
-    /// Probe now regardless of the TTL.
+    // Probe now regardless of the TTL.
     pub fn refresh(&mut self) -> Capacity {
         self.refresh_at(Instant::now())
     }
@@ -457,15 +457,15 @@ impl CapacitySampler {
         self.current()
     }
 
-    /// Account bytes admitted against the cached reading so a burst of
-    /// admissions between probes cannot each see the same headroom.
+    // Account bytes admitted against the cached reading so a burst of
+    // admissions between probes cannot each see the same headroom.
     pub fn debit(&mut self, bytes: u64) {
         if let Some(reading) = self.last_good.as_mut() {
             reading.available_bytes = reading.available_bytes.saturating_sub(bytes);
         }
     }
 
-    /// Undo a `debit` whose admission was rolled back.
+    // Undo a `debit` whose admission was rolled back.
     pub fn credit(&mut self, bytes: u64) {
         if let Some(reading) = self.last_good.as_mut() {
             reading.available_bytes = reading.available_bytes.saturating_add(bytes);
@@ -473,16 +473,16 @@ impl CapacitySampler {
     }
 }
 
-/// How often each storage root's sampler re-reads its filesystem.
-///
-/// A capacity probe is a filesystem round trip that a slow or overloaded
-/// mount can hold for as long as its request queue is deep, so it never runs
-/// where a caller is waiting on it. Every consumer — admission checks,
-/// metrics, the NZBGet status — reads the last completed reading instead,
-/// which is at most this old plus however long the probe itself took.
+// How often each storage root's sampler re-reads its filesystem.
+//
+// A capacity probe is a filesystem round trip that a slow or overloaded
+// mount can hold for as long as its request queue is deep, so it never runs
+// where a caller is waiting on it. Every consumer — admission checks,
+// metrics, the NZBGet status — reads the last completed reading instead,
+// which is at most this old plus however long the probe itself took.
 pub const STORAGE_CAPACITY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The configured storage roots whose free space the runtime tracks.
+// The configured storage roots whose free space the runtime tracks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StorageRoot {
     Data,
@@ -493,7 +493,7 @@ pub enum StorageRoot {
 impl StorageRoot {
     pub const ALL: [Self; 3] = [Self::Data, Self::Intermediate, Self::Complete];
 
-    /// Stable label for metrics and logs.
+    // Stable label for metrics and logs.
     pub fn label(self) -> &'static str {
         match self {
             Self::Data => "data",
@@ -511,11 +511,11 @@ impl StorageRoot {
     }
 }
 
-/// A non-blocking view of one filesystem's latest capacity reading.
-///
-/// Reading it never touches the filesystem unless it was built with
-/// [`Self::probing`]. Consumers that spend against the reading between
-/// refreshes keep their own [`CapacityDebits`].
+// A non-blocking view of one filesystem's latest capacity reading.
+//
+// Reading it never touches the filesystem unless it was built with
+// [`Self::probing`]. Consumers that spend against the reading between
+// refreshes keep their own [`CapacityDebits`].
 #[derive(Clone)]
 pub struct CapacityReader(Arc<dyn Fn() -> Capacity + Send + Sync>);
 
@@ -528,20 +528,20 @@ impl fmt::Debug for CapacityReader {
 }
 
 impl CapacityReader {
-    /// A reader backed by `read`. Tests inject readings through it.
+    // A reader backed by `read`. Tests inject readings through it.
     pub fn from_fn(read: impl Fn() -> Capacity + Send + Sync + 'static) -> Self {
         Self(Arc::new(read))
     }
 
-    /// A reader with no reading, which every consumer treats as a failed
-    /// probe: nothing to enforce against.
+    // A reader with no reading, which every consumer treats as a failed
+    // probe: nothing to enforce against.
     pub fn unknown() -> Self {
         Self::from_fn(|| Capacity::Unknown)
     }
 
-    /// A reader that probes `path` itself, at most once per `ttl`, on the
-    /// calling thread. Only for callers already off the pipeline with no
-    /// runtime-owned sampler to read (a standalone extraction).
+    // A reader that probes `path` itself, at most once per `ttl`, on the
+    // calling thread. Only for callers already off the pipeline with no
+    // runtime-owned sampler to read (a standalone extraction).
     pub fn probing(path: PathBuf, ttl: Duration) -> Self {
         let sampler = Mutex::new(CapacitySampler::new(path, ttl));
         Self::from_fn(move || {
@@ -557,14 +557,14 @@ impl CapacityReader {
     }
 }
 
-/// Bytes one consumer has admitted against a shared reading since that
-/// reading was taken, so a burst of admissions between refreshes cannot each
-/// see the same headroom.
-///
-/// The debits belong to the reading they were made against: a newer reading
-/// already reflects the bytes written since, so it starts the count again. A
-/// stale reading keeps its timestamp, so debits keep accumulating across a
-/// probe outage.
+// Bytes one consumer has admitted against a shared reading since that
+// reading was taken, so a burst of admissions between refreshes cannot each
+// see the same headroom.
+//
+// The debits belong to the reading they were made against: a newer reading
+// already reflects the bytes written since, so it starts the count again. A
+// stale reading keeps its timestamp, so debits keep accumulating across a
+// probe outage.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CapacityDebits {
     basis: Option<Instant>,
@@ -572,7 +572,7 @@ pub struct CapacityDebits {
 }
 
 impl CapacityDebits {
-    /// `capacity` less everything debited against the same reading.
+    // `capacity` less everything debited against the same reading.
     pub fn apply(&mut self, capacity: Capacity) -> Capacity {
         let Capacity::Known(reading) = capacity else {
             return Capacity::Unknown;
@@ -591,7 +591,7 @@ impl CapacityDebits {
         self.debited = self.debited.saturating_add(bytes);
     }
 
-    /// Undo a `debit` whose admission was rolled back.
+    // Undo a `debit` whose admission was rolled back.
     pub fn credit(&mut self, bytes: u64) {
         self.debited = self.debited.saturating_sub(bytes);
     }
@@ -623,16 +623,16 @@ impl RootSlot {
     }
 }
 
-/// One background capacity sampler per configured storage root.
-///
-/// Each root has its own thread that probes, publishes, and then waits a full
-/// interval after the probe finished, so probes of one root never overlap and
-/// a stalled mount delays only its own next reading. A failed probe keeps the
-/// last good reading, flagged stale ([`CapacitySampler`]). Until a root's
-/// first probe completes its readers see [`Capacity::Unknown`].
-///
-/// Dropping it stops the threads; one stuck in a probe exits when the probe
-/// returns.
+// One background capacity sampler per configured storage root.
+//
+// Each root has its own thread that probes, publishes, and then waits a full
+// interval after the probe finished, so probes of one root never overlap and
+// a stalled mount delays only its own next reading. A failed probe keeps the
+// last good reading, flagged stale ([`CapacitySampler`]). Until a root's
+// first probe completes its readers see [`Capacity::Unknown`].
+//
+// Dropping it stops the threads; one stuck in a probe exits when the probe
+// returns.
 pub struct StorageCapacity {
     slots: [Arc<RootSlot>; 3],
 }
@@ -649,7 +649,7 @@ impl fmt::Debug for StorageCapacity {
 }
 
 impl StorageCapacity {
-    /// Start sampling the real filesystems behind the three roots.
+    // Start sampling the real filesystems behind the three roots.
     pub fn start(data: PathBuf, intermediate: PathBuf, complete: PathBuf) -> Self {
         Self::with_probe(
             [data, intermediate, complete],
@@ -658,8 +658,8 @@ impl StorageCapacity {
         )
     }
 
-    /// Like [`Self::start`] with a caller-supplied probe and interval. `roots`
-    /// is in [`StorageRoot::ALL`] order.
+    // Like [`Self::start`] with a caller-supplied probe and interval. `roots`
+    // is in [`StorageRoot::ALL`] order.
     pub fn with_probe(roots: [PathBuf; 3], interval: Duration, probe: SharedProbeFn) -> Self {
         let slots = StorageRoot::ALL.map(|root| {
             Arc::new(RootSlot {
@@ -695,19 +695,19 @@ impl StorageCapacity {
         &self.slots[root.index()]
     }
 
-    /// The latest reading for `root`, without touching the filesystem.
+    // The latest reading for `root`, without touching the filesystem.
     pub fn current(&self, root: StorageRoot) -> Capacity {
         self.slot(root).lock().capacity
     }
 
-    /// A cloneable reader of `root`'s latest reading.
+    // A cloneable reader of `root`'s latest reading.
     pub fn reader(&self, root: StorageRoot) -> CapacityReader {
         let slot = Arc::clone(self.slot(root));
         CapacityReader::from_fn(move || slot.lock().capacity)
     }
 
-    /// Point `root` at a new directory. The old directory's reading is
-    /// dropped and the new one is probed as soon as the thread is free.
+    // Point `root` at a new directory. The old directory's reading is
+    // dropped and the new one is probed as soon as the thread is free.
     pub fn retarget(&self, root: StorageRoot, path: PathBuf) {
         let slot = self.slot(root);
         let mut state = slot.lock();
@@ -720,17 +720,17 @@ impl StorageCapacity {
         slot.wake.notify_all();
     }
 
-    /// Ask `root`'s thread to probe again without waiting out its interval.
-    /// A request made while a probe is running is served after it finishes.
+    // Ask `root`'s thread to probe again without waiting out its interval.
+    // A request made while a probe is running is served after it finishes.
     pub fn request_refresh(&self, root: StorageRoot) {
         let slot = self.slot(root);
         slot.lock().refresh_requested = true;
         slot.wake.notify_all();
     }
 
-    /// One row per root with a reading, fresh or held from the last good
-    /// probe. A root that has never produced a reading is omitted rather than
-    /// reported as zero capacity.
+    // One row per root with a reading, fresh or held from the last good
+    // probe. A root that has never produced a reading is omitted rather than
+    // reported as zero capacity.
     pub fn snapshots(&self) -> Vec<DiskSpaceSnapshot> {
         self.slots
             .iter()
@@ -746,7 +746,7 @@ impl StorageCapacity {
             .collect()
     }
 
-    /// Block until `root` has completed at least `probes` probes.
+    // Block until `root` has completed at least `probes` probes.
     #[cfg(test)]
     pub(crate) fn wait_for_probes(&self, root: StorageRoot, probes: u64) {
         let slot = self.slot(root);
@@ -1090,8 +1090,8 @@ mod tests {
         assert!(!reading.stale);
     }
 
-    /// A year: long enough that no test ever sees an interval refresh, so
-    /// every probe a test counts is one it asked for.
+    // A year: long enough that no test ever sees an interval refresh, so
+    // every probe a test counts is one it asked for.
     const NEVER: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
     fn counting_probe(calls: Arc<Mutex<Vec<PathBuf>>>) -> SharedProbeFn {

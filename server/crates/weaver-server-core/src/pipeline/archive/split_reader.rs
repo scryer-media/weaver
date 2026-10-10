@@ -3,12 +3,12 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::range::Range;
 
-/// Presents multiple files as a single contiguous `Read + Seek` stream.
-///
-/// Used for split archives (e.g., `.7z.001`, `.7z.002`) where the archive
-/// parser expects a single seekable source.
+// Presents multiple files as a single contiguous `Read + Seek` stream.
+//
+// Used for split archives (e.g., `.7z.001`, `.7z.002`) where the archive
+// parser expects a single seekable source.
 pub struct SplitFileReader {
-    /// Ordered file parts and their byte spans in the virtual stream.
+    // Ordered file parts and their byte spans in the virtual stream.
     parts: Vec<Part>,
     total_size: u64,
     position: u64,
@@ -16,15 +16,15 @@ pub struct SplitFileReader {
 
 struct Part {
     file: File,
-    /// Half-open byte span owned by this part in the virtual stream.
+    // Half-open byte span owned by this part in the virtual stream.
     span: Range<u64>,
 }
 
 impl SplitFileReader {
-    /// Create a `SplitFileReader` from an ordered list of file paths.
-    ///
-    /// The files are concatenated in the order provided. All files are opened
-    /// immediately so that errors surface early.
+    // Create a `SplitFileReader` from an ordered list of file paths.
+    //
+    // The files are concatenated in the order provided. All files are opened
+    // immediately so that errors surface early.
     pub fn open(paths: &[impl AsRef<Path>]) -> io::Result<Self> {
         if paths.is_empty() {
             return Err(io::Error::new(
@@ -56,7 +56,7 @@ impl SplitFileReader {
         })
     }
 
-    /// Find the part index and local offset for the current position.
+    // Find the part index and local offset for the current position.
     fn find_part(&self) -> Option<(usize, u64)> {
         if self.position >= self.total_size {
             return None;

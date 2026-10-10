@@ -1,14 +1,16 @@
-//! Uuencode as the field still posts it: the dialects of the old posting
-//! tools, over a lone volume, a whole set, a set beside a yEnc PAR2 set, a set
-//! whose volumes alternate between the two encodings, and a PAR2 set that is
-//! itself uuencoded; each clean and under each damage a uuencode article can
-//! carry.
-//!
-//! Every uuencode part is placed by the decoded length of the parts before it,
-//! so a schedule that delivers groups out of order parks parts and a damaged
-//! part shifts everything behind it: that is the surface this family covers.
+// Uuencode as the field still posts it: the dialects of the old posting
+// tools, over a lone volume, a whole set, a set beside a yEnc PAR2 set, a set
+// whose volumes alternate between the two encodings, and a PAR2 set that is
+// itself uuencoded; each clean and under each damage a uuencode article can
+// carry.
+//
+// Every uuencode part is placed by the decoded length of the parts before it,
+// so a schedule that delivers groups out of order parks parts and a damaged
+// part shifts everything behind it: that is the surface this family covers.
 use super::fixtures::{Container, payload};
-use super::post::{Damage, Encoding, Post, Posted, Role, UU_DAMAGES, UuEnd, UuHeader, UuStyle, Wire};
+use super::post::{
+    Damage, Encoding, Post, Posted, Role, UU_DAMAGES, UuEnd, UuHeader, UuStyle, Wire,
+};
 use super::recovery::{self, Geometry, Margin, Par2Volumes};
 use super::*;
 
@@ -17,7 +19,7 @@ const SLICE: usize = 1048;
 const VOLUMES: usize = 4;
 const ARTICLES_PER_VOLUME: usize = 32;
 
-/// The dialects, by index into [`STYLES`].
+// The dialects, by index into [`STYLES`].
 const STYLES: [UuStyle; 12] = [
     UuStyle::STANDARD,
     UuStyle {
@@ -70,18 +72,18 @@ const STYLES: [UuStyle; 12] = [
     },
 ];
 
-/// What is uuencoded and what is posted beside it.
+// What is uuencoded and what is posted beside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Shape {
-    /// One volume, uuencoded.
+    // One volume, uuencoded.
     SingleVolume,
-    /// Four volumes, all uuencoded.
+    // Four volumes, all uuencoded.
     Set,
-    /// Four uuencoded volumes and a yEnc PAR2 set with margin.
+    // Four uuencoded volumes and a yEnc PAR2 set with margin.
     SetWithPar2,
-    /// Volumes alternating uuencode and yEnc, and a yEnc PAR2 set.
+    // Volumes alternating uuencode and yEnc, and a yEnc PAR2 set.
     Mixed,
-    /// Four yEnc volumes and a PAR2 set that is itself uuencoded.
+    // Four yEnc volumes and a PAR2 set that is itself uuencoded.
     Par2AsUu,
 }
 
@@ -104,7 +106,7 @@ const CONTAINERS: [Container; 4] = [
 pub(super) struct UuCell {
     pub style: usize,
     pub shape: Shape,
-    /// Damage on the middle article of the second data file, if any.
+    // Damage on the middle article of the second data file, if any.
     pub damage: Option<Damage>,
     pub container: Container,
 }
@@ -128,11 +130,11 @@ pub(super) fn cells() -> Vec<UuCell> {
     cells
 }
 
-/// Schedules each (cell, profile) unit samples from the matrix's smoke
-/// schedules.
+// Schedules each (cell, profile) unit samples from the matrix's smoke
+// schedules.
 pub(super) const PER_UNIT: usize = 139;
 
-/// 1,200 cells under three profiles, 139 schedules each.
+// 1,200 cells under three profiles, 139 schedules each.
 pub(super) const TOTAL: usize = 500_400;
 
 pub(super) fn family() -> Family<UuCell> {
@@ -157,10 +159,13 @@ impl UuCell {
     }
 
     fn has_par2(self) -> bool {
-        matches!(self.shape, Shape::SetWithPar2 | Shape::Mixed | Shape::Par2AsUu)
+        matches!(
+            self.shape,
+            Shape::SetWithPar2 | Shape::Mixed | Shape::Par2AsUu
+        )
     }
 
-    /// Whether data file `index` is uuencoded.
+    // Whether data file `index` is uuencoded.
     fn data_is_uu(self, index: usize) -> bool {
         match self.shape {
             Shape::SingleVolume | Shape::Set | Shape::SetWithPar2 => true,
@@ -171,7 +176,11 @@ impl UuCell {
 
     fn data(self) -> Post {
         let payload = payload(37, VOLUMES * ARTICLES_PER_VOLUME * ARTICLE - 512);
-        let volumes = if self.shape == Shape::SingleVolume { 1 } else { VOLUMES };
+        let volumes = if self.shape == Shape::SingleVolume {
+            1
+        } else {
+            VOLUMES
+        };
         let volumes = self.container.volumes(&payload, volumes);
         let style = self.style();
         let mut post = Post {
@@ -194,12 +203,14 @@ impl UuCell {
             let data = post.index_of(Role::Data);
             let target = data[1.min(data.len() - 1)];
             let article = post.files[target].articles() / 2;
-            post.files[target].wire.insert(article, Wire::Damaged(damage));
+            post.files[target]
+                .wire
+                .insert(article, Wire::Damaged(damage));
         }
         post
     }
 
-    /// Uuencodes the recovery files where the shape posts them so.
+    // Uuencodes the recovery files where the shape posts them so.
     fn encode_recovery(self, post: &mut Post) {
         if self.shape != Shape::Par2AsUu {
             return;
@@ -258,19 +269,19 @@ impl Cell for UuCell {
     }
 }
 
-/// The defects each cell and profile is held open for.
+// The defects each cell and profile is held open for.
 fn open_defect(cell: UuCell, profile: ExtractionProfile) -> Option<Defect> {
     let _ = profile;
-    cell.has_par2().then_some(Defect::Diverges(UU_PAR2_COUNTS_ONE_VOLUME))
+    cell.has_par2()
+        .then_some(Defect::Diverges(UU_PAR2_COUNTS_ONE_VOLUME))
 }
 
-/// A uuencoded part carries no offset, so a part lost or cut short strands
-/// every part behind it in its volume; the repair then needs blocks from more
-/// than one PAR2 volume. The product fetches every volume but advertises only
-/// the first volume's blocks and fails "not repairable" with the index intact,
-/// under every profile. Release-blocking: PAR2 with sufficient margin.
-const UU_PAR2_COUNTS_ONE_VOLUME: &str =
-    "PAR2 over a uuencoded set advertises one volume's recovery blocks and fails a repair the posted margin covers";
+// A uuencoded part carries no offset, so a part lost or cut short strands
+// every part behind it in its volume; the repair then needs blocks from more
+// than one PAR2 volume. The product fetches every volume but advertises only
+// the first volume's blocks and fails "not repairable" with the index intact,
+// under every profile. Release-blocking: PAR2 with sufficient margin.
+const UU_PAR2_COUNTS_ONE_VOLUME: &str = "PAR2 over a uuencoded set advertises one volume's recovery blocks and fails a repair the posted margin covers";
 
 macro_rules! uu_smokes {
     ($($name:ident $style:literal $shape:ident $damage:expr, $container:ident;)+) => {
@@ -333,7 +344,7 @@ mod uu_loss_smoke {
     }
 }
 
-/// The campaign: 500 shards of about a thousand cases.
+// The campaign: 500 shards of about a thousand cases.
 mod combined_uu {
     use super::*;
 

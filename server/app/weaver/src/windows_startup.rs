@@ -1,8 +1,8 @@
-//! Per-user Windows startup registration shared by the tray and the upgrade helper.
-//!
-//! The tray owns the "start Weaver when I sign in" preference, and the temporary
-//! upgrade helper has to observe and restore it around an MSI major upgrade.
-//! Both binaries include this module, so each uses only part of it.
+// Per-user Windows startup registration shared by the tray and the upgrade helper.
+//
+// The tray owns the "start Weaver when I sign in" preference, and the temporary
+// upgrade helper has to observe and restore it around an MSI major upgrade.
+// Both binaries include this module, so each uses only part of it.
 #![allow(dead_code)]
 
 use std::path::Path;
@@ -16,7 +16,7 @@ use windows_sys::Win32::System::Registry::{
 pub(crate) const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 pub(crate) const RUN_VALUE: &str = "ScryerMedia.Weaver";
 
-/// Point the per-user Run value at `executable`, launching it in login mode.
+// Point the per-user Run value at `executable`, launching it in login mode.
 pub(crate) fn register_startup(executable: &Path) -> Result<(), String> {
     let mut key: HKEY = ptr::null_mut();
     let key_path = wide(RUN_KEY);
@@ -61,7 +61,7 @@ pub(crate) fn register_startup(executable: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove the per-user Run value, tolerating a key or value that is already gone.
+// Remove the per-user Run value, tolerating a key or value that is already gone.
 pub(crate) fn unregister_startup() -> Result<(), String> {
     let mut key: HKEY = ptr::null_mut();
     let key_path = wide(RUN_KEY);
@@ -89,7 +89,7 @@ pub(crate) fn unregister_startup() -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the per-user Run value currently exists.
+// Whether the per-user Run value currently exists.
 pub(crate) fn startup_enabled() -> Result<bool, String> {
     let mut key: HKEY = ptr::null_mut();
     let key_path = wide(RUN_KEY);

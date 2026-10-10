@@ -1,10 +1,10 @@
-//! A lane that cannot be acquired must be visible, and must be retried.
-//!
-//! The acquire-failure handler keeps the download running either way — the
-//! work is requeued, or the leased articles take the failure and are retried
-//! through the ordinary result path — so the failure itself has to announce
-//! that it happened. Nothing above debug did, which made a job running on a
-//! fraction of its lanes look exactly like a slow server.
+// A lane that cannot be acquired must be visible, and must be retried.
+//
+// The acquire-failure handler keeps the download running either way — the
+// work is requeued, or the leased articles take the failure and are retried
+// through the ordinary result path — so the failure itself has to announce
+// that it happened. Nothing above debug did, which made a job running on a
+// fraction of its lanes look exactly like a slow server.
 
 use super::*;
 
@@ -30,10 +30,10 @@ fn lease_for(pipeline: &mut Pipeline, job_id: JobId) -> DownloadBatchLease {
     }
 }
 
-/// Selection contention hands the work straight back and asks for another
-/// dispatch pass. Without that wake the freed connection would sit idle until
-/// the run loop next came round on its own — with the work that needs it
-/// already queued.
+// Selection contention hands the work straight back and asks for another
+// dispatch pass. Without that wake the freed connection would sit idle until
+// the run loop next came round on its own — with the work that needs it
+// already queued.
 #[tokio::test]
 async fn a_contended_acquire_requeues_its_work_and_asks_for_another_pass() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -89,8 +89,8 @@ async fn a_contended_acquire_requeues_its_work_and_asks_for_another_pass() {
     );
 }
 
-/// The warning is rate limited: a server that refuses one acquire refuses the
-/// next dispatch pass's too, and one line a minute is the budget.
+// The warning is rate limited: a server that refuses one acquire refuses the
+// next dispatch pass's too, and one line a minute is the budget.
 #[tokio::test]
 async fn repeated_acquire_failures_report_at_most_once_a_window() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -134,8 +134,8 @@ async fn repeated_acquire_failures_report_at_most_once_a_window() {
     );
 }
 
-/// Lanes below their cap are only reported once they have stayed there, and
-/// only while there is work they could be carrying.
+// Lanes below their cap are only reported once they have stayed there, and
+// only while there is work they could be carrying.
 #[tokio::test]
 async fn lanes_under_their_cap_are_reported_only_when_it_persists() {
     let temp_dir = tempfile::tempdir().unwrap();

@@ -1,21 +1,21 @@
-//! The 7z loss schedules answered by a PAR3 set instead of PAR2, over every
-//! shape, and a one-volume set under both.
-//!
-//! The recovery set is posted beside the volumes. A loss inside a direct set
-//! is rebuilt into it through readback; a loss that takes the start or end
-//! header leaves the set nothing to route by, so it demotes and the ordinary
-//! path repairs the volumes on disk. Shapes direct store refuses repair the
-//! same way they always extract: from the volumes.
+// The 7z loss schedules answered by a PAR3 set instead of PAR2, over every
+// shape, and a one-volume set under both.
+//
+// The recovery set is posted beside the volumes. A loss inside a direct set
+// is rebuilt into it through readback; a loss that takes the start or end
+// header leaves the set nothing to route by, so it demotes and the ordinary
+// path repairs the volumes on disk. Shapes direct store refuses repair the
+// same way they always extract: from the volumes.
 use super::super::super::super::archive_schedules::{
     RecoveryFormat, combined_schedule_cases, schedules,
 };
 use super::*;
 
-/// Combined cases that carry a loss, and so a recovery set.
+// Combined cases that carry a loss, and so a recovery set.
 const LOSS_CASES: usize = 6777;
 
-/// Shards each PAR3 campaign is cut into, so none runs more than a few
-/// hundred cases.
+// Shards each PAR3 campaign is cut into, so none runs more than a few
+// hundred cases.
 const PAR3_SHARDS: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
@@ -24,9 +24,9 @@ enum Slice {
     Shard(usize),
 }
 
-/// The loss cases of the matrix, by the replay index of the matrix they are
-/// drawn from: `WEAVER_ARCHIVE_SCHEDULE_CASE` replays a smoke case and
-/// `WEAVER_ARCHIVE_COMBINED_CASE` a combined one.
+// The loss cases of the matrix, by the replay index of the matrix they are
+// drawn from: `WEAVER_ARCHIVE_SCHEDULE_CASE` replays a smoke case and
+// `WEAVER_ARCHIVE_COMBINED_CASE` a combined one.
 fn loss_cases(slice: Slice) -> Vec<(usize, Schedule)> {
     let carries_loss = |interruption: &Interruption| {
         matches!(

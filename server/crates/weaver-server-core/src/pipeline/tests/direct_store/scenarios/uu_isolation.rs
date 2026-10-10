@@ -1,10 +1,10 @@
-//! Encoding-specific admission must not strand unrelated downloads.
+// Encoding-specific admission must not strand unrelated downloads.
 
 use super::*;
 use crate::pipeline::tests::decode_and_files::submit_uu_segment_named;
 
-/// A UU part with 45 decoded bytes per line, a begin line only in the
-/// opening article and an end marker only in the closing article.
+// A UU part with 45 decoded bytes per line, a begin line only in the
+// opening article and an end marker only in the closing article.
 fn uu_article(filename: &str, bytes: &[u8], ordinal: u32, count: usize) -> Vec<u8> {
     fn sextet(value: u8) -> u8 {
         if value & 63 == 0 {
@@ -38,8 +38,8 @@ fn uu_article(filename: &str, bytes: &[u8], ordinal: u32, count: usize) -> Vec<u
     out
 }
 
-/// A real local provider: the test exercises leases, workers, wire decoding,
-/// assembly, archive extraction and final publication, then checks the bytes.
+// A real local provider: the test exercises leases, workers, wire decoding,
+// assembly, archive extraction and final publication, then checks the bytes.
 async fn download_archives(uu: bool, mixed: bool, low_space: bool) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 

@@ -15,7 +15,7 @@ fn gap_position(segment_id: SegmentId) -> GapPosition {
 }
 
 impl Pipeline {
-    /// A set's demotion, recorded with the job's status at the time.
+    // A set's demotion, recorded with the job's status at the time.
     pub(super) fn note_demotion_support_fact(&mut self, job_id: JobId, reason: &'static str) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -27,7 +27,7 @@ impl Pipeline {
         }
     }
 
-    /// A segment's pending-to-terminal edge.
+    // A segment's pending-to-terminal edge.
     pub(super) fn note_gap_support_fact(
         &mut self,
         segment_id: SegmentId,
@@ -41,8 +41,8 @@ impl Pipeline {
         }
     }
 
-    /// The servers that refused a gap just booked, by pool index. An index the
-    /// pool cannot name durably is left out rather than guessed.
+    // The servers that refused a gap just booked, by pool index. An index the
+    // pool cannot name durably is left out rather than guessed.
     pub(super) fn note_gap_servers_support_fact(
         &mut self,
         job_id: JobId,
@@ -66,7 +66,7 @@ impl Pipeline {
         }
     }
 
-    /// A gap a verified late replacement filled.
+    // A gap a verified late replacement filled.
     pub(super) fn forget_gap_support_fact(
         &mut self,
         segment_id: SegmentId,
@@ -80,7 +80,7 @@ impl Pipeline {
         }
     }
 
-    /// The job's terminal segment states were dropped; its gaps go with them.
+    // The job's terminal segment states were dropped; its gaps go with them.
     pub(super) fn clear_gap_support_facts(&mut self, job_id: JobId) {
         if let Some(job) = self.jobs.get_mut(&job_id)
             && !job.support_facts.gaps.is_empty()
@@ -90,9 +90,9 @@ impl Pipeline {
         }
     }
 
-    /// Checkpoint changed support facts onto the active rows, on the same
-    /// cadence and writer lane as the server attribution: checkpoints keep
-    /// their order, and a job's archive waits for the ones queued before it.
+    // Checkpoint changed support facts onto the active rows, on the same
+    // cadence and writer lane as the server attribution: checkpoints keep
+    // their order, and a job's archive waits for the ones queued before it.
     pub(crate) fn flush_support_facts(&mut self) {
         if self.dirty_support_facts.is_empty() {
             return;
@@ -115,9 +115,9 @@ impl Pipeline {
         }
     }
 
-    /// Write one finishing job's facts ahead of its history archive, which
-    /// copies them from the active row. Queued as one of the job's own writes,
-    /// so it lands before the archive queued after it.
+    // Write one finishing job's facts ahead of its history archive, which
+    // copies them from the active row. Queued as one of the job's own writes,
+    // so it lands before the archive queued after it.
     pub(super) fn persist_support_facts_before_archive(&mut self, job_id: JobId) {
         self.dirty_support_facts.remove(&job_id);
         let Some(json) = self

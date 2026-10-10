@@ -1,4 +1,4 @@
-//! `download_dispatch` tests, part of a mechanical split of the original file.
+// `download_dispatch` tests, part of a mechanical split of the original file.
 
 use super::*;
 
@@ -1504,9 +1504,9 @@ async fn dispatch_downloads_hot_job_takes_full_capacity_over_same_priority_peers
     assert_eq!(peer_lane_total, 0);
 }
 
-/// Completion-critical work orders a job internally, never globally: a later,
-/// lower-priority job whose whole queue is completion-critical recovery still
-/// waits behind the hot job's ordinary bytes.
+// Completion-critical work orders a job internally, never globally: a later,
+// lower-priority job whose whole queue is completion-critical recovery still
+// waits behind the hot job's ordinary bytes.
 #[tokio::test]
 async fn a_lower_priority_critical_recovery_waits_behind_the_hot_jobs_regular_bytes() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1785,9 +1785,9 @@ async fn dispatch_downloads_under_soft_pressure_opens_one_lane_for_the_hot_job()
     );
 }
 
-/// Completion-critical work is a within-job ordering, so two later jobs made
-/// entirely of it still wait while the hot job has regular bytes this server
-/// can fetch.
+// Completion-critical work is a within-job ordering, so two later jobs made
+// entirely of it still wait while the hot job has regular bytes this server
+// can fetch.
 #[tokio::test]
 async fn critical_work_of_later_jobs_waits_behind_the_hot_jobs_regular_bytes() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1871,9 +1871,9 @@ async fn critical_work_of_later_jobs_waits_behind_the_hot_jobs_regular_bytes() {
     }
 }
 
-/// New-contract test: with no connection ramp, the very first dispatch pass
-/// reaches full configured capacity when there is enough queued work — no
-/// gradual climb, no warmup.
+// New-contract test: with no connection ramp, the very first dispatch pass
+// reaches full configured capacity when there is enough queued work — no
+// gradual climb, no warmup.
 #[tokio::test]
 async fn first_dispatch_pass_reaches_full_capacity_with_no_ramp() {
     let temp_dir = tempfile::tempdir().unwrap();

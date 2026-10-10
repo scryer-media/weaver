@@ -1,24 +1,24 @@
-//! The tier-two runner: one post, one profile, one schedule.
-//!
-//! A schedule names four slots. Tier two posts more articles than that, so
-//! the data articles, in file order, are cut into four contiguous groups and
-//! slot `file * 2 + article` names group `file * 2 + article`: an arrival
-//! delivers the whole group in article order, a duplicate delivers it again,
-//! and boundaries fall between groups. A lost slot loses the middle article
-//! of its group rather than the whole group, so a loss stays inside what a
-//! recovery set sized for the cell can mend; a starved schedule withholds the
-//! recovery volumes instead.
-//!
-//! Every article reaches the pipeline as wire bytes through the production
-//! fused decoder, from a provider of one server: an article that fails to
-//! decode has nowhere else to come from and is given up for repair at once.
+// The tier-two runner: one post, one profile, one schedule.
+//
+// A schedule names four slots. Tier two posts more articles than that, so
+// the data articles, in file order, are cut into four contiguous groups and
+// slot `file * 2 + article` names group `file * 2 + article`: an arrival
+// delivers the whole group in article order, a duplicate delivers it again,
+// and boundaries fall between groups. A lost slot loses the middle article
+// of its group rather than the whole group, so a loss stays inside what a
+// recovery set sized for the cell can mend; a starved schedule withholds the
+// recovery volumes instead.
+//
+// Every article reaches the pipeline as wire bytes through the production
+// fused decoder, from a provider of one server: an article that fails to
+// decode has nowhere else to come from and is given up for repair at once.
 use super::post::{Post, Role};
 use super::*;
 
-/// What one run left behind.
+// What one run left behind.
 pub(in super::super) struct Ran {
     pub status: Option<JobStatus>,
-    /// Each expected path, as the output directory holds it.
+    // Each expected path, as the output directory holds it.
     pub files: BTreeMap<String, Option<Vec<u8>>>,
     pub published: BTreeSet<String>,
     pub leftovers: BTreeSet<String>,
@@ -28,9 +28,9 @@ pub(in super::super) struct Ran {
     pub trace: Vec<String>,
 }
 
-/// A provider of one server, so a decode failure books the article as
-/// exhausted instead of scheduling a timed retry. The pipeline is given no
-/// connections, so nothing ever dials it.
+// A provider of one server, so a decode failure books the article as
+// exhausted instead of scheduling a timed retry. The pipeline is given no
+// connections, so nothing ever dials it.
 fn one_server(pipeline: &mut Pipeline) {
     pipeline.nntp = Arc::new(NntpClient::new(NntpClientConfig {
         servers: vec![weaver_nntp::pool::ServerPoolConfig {
@@ -50,9 +50,9 @@ fn one_server(pipeline: &mut Pipeline) {
     pin_disk_reserve(pipeline);
 }
 
-/// The disk reserve is otherwise a share of the host's filesystem, so a
-/// nearly full disk would refuse a fixture's few kilobytes and the outcome
-/// would depend on the machine. Fixtures are tiny: reserve nothing.
+// The disk reserve is otherwise a share of the host's filesystem, so a
+// nearly full disk would refuse a fixture's few kilobytes and the outcome
+// would depend on the machine. Fixtures are tiny: reserve nothing.
 fn pin_disk_reserve(pipeline: &mut Pipeline) {
     use crate::pipeline::direct_store::{DirectStoreSettings, wiring::DirectStoreRuntime};
     pipeline.direct_store = DirectStoreRuntime::with_settings(DirectStoreSettings {
@@ -61,12 +61,14 @@ fn pin_disk_reserve(pipeline: &mut Pipeline) {
     });
 }
 
-/// The data articles cut into the four groups a schedule's slots name.
+// The data articles cut into the four groups a schedule's slots name.
 pub(in super::super) fn groups(post: &Post) -> Vec<Vec<(u32, u32)>> {
     let articles: Vec<(u32, u32)> = post
         .index_of(Role::Data)
         .into_iter()
-        .flat_map(|file| (0..post.files[file].articles()).map(move |article| (file as u32, article)))
+        .flat_map(|file| {
+            (0..post.files[file].articles()).map(move |article| (file as u32, article))
+        })
         .collect();
     let per = articles.len().div_ceil(4).max(1);
     let mut groups: Vec<Vec<(u32, u32)>> = articles.chunks(per).map(<[_]>::to_vec).collect();
@@ -74,9 +76,12 @@ pub(in super::super) fn groups(post: &Post) -> Vec<Vec<(u32, u32)>> {
     groups
 }
 
-/// The articles a schedule's loss mask takes: the middle article of each
-/// lost group, by file.
-pub(in super::super) fn lost_articles(post: &Post, interruption: Interruption) -> BTreeMap<usize, BTreeSet<u32>> {
+// The articles a schedule's loss mask takes: the middle article of each
+// lost group, by file.
+pub(in super::super) fn lost_articles(
+    post: &Post,
+    interruption: Interruption,
+) -> BTreeMap<usize, BTreeSet<u32>> {
     let mut lost: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
     let Some((mask, _)) = interruption.loss() else {
         return lost;
@@ -91,8 +96,8 @@ pub(in super::super) fn lost_articles(post: &Post, interruption: Interruption) -
     lost
 }
 
-/// Whether the downloader would start a fetch for the job: the statuses its
-/// dispatch admits.
+// Whether the downloader would start a fetch for the job: the statuses its
+// dispatch admits.
 fn dispatchable(pipeline: &Pipeline, job: JobId) -> bool {
     pipeline.jobs.get(&job).is_some_and(|state| {
         matches!(
@@ -116,7 +121,7 @@ fn terminal(pipeline: &Pipeline, job: JobId) -> bool {
     )
 }
 
-/// Answers one request for an article with what the post has for it.
+// Answers one request for an article with what the post has for it.
 async fn deliver(pipeline: &mut Pipeline, job: JobId, post: &Post, file: u32, article: u32) {
     use weaver_nntp::client::{DecodedBody, DecodedBodyTrace};
     retire_schedule_article(pipeline, job, file, article);
@@ -175,7 +180,7 @@ async fn deliver(pipeline: &mut Pipeline, job: JobId, post: &Post, file: u32, ar
     }
 }
 
-/// Every article the job has queued, from both queues, left queued.
+// Every article the job has queued, from both queues, left queued.
 fn queued(pipeline: &mut Pipeline, job: JobId) -> Vec<(u32, u32)> {
     let Some(state) = pipeline.jobs.get_mut(&job) else {
         return Vec::new();
@@ -196,8 +201,8 @@ fn queued(pipeline: &mut Pipeline, job: JobId) -> Vec<(u32, u32)> {
     out
 }
 
-/// Books a queued article the one server does not have, as the downloader
-/// does once every server has answered 430.
+// Books a queued article the one server does not have, as the downloader
+// does once every server has answered 430.
 fn unavailable(pipeline: &mut Pipeline, job: JobId, file: u32, article: u32) {
     retire_schedule_article(pipeline, job, file, article);
     pipeline.book_failed_segment(SegmentId {
@@ -210,7 +215,7 @@ fn unavailable(pipeline: &mut Pipeline, job: JobId, file: u32, article: u32) {
     pipeline.maybe_finish_download_pass(job);
 }
 
-/// Runs `post` under one schedule.
+// Runs `post` under one schedule.
 pub(in super::super) async fn run(
     post: &Post,
     profile: ExtractionProfile,
@@ -223,7 +228,8 @@ pub(in super::super) async fn run(
     let lost = lost_articles(post, interruption);
     let starved = interruption.fails();
     let is_lost = |file: u32, article: u32| {
-        lost.get(&(file as usize)).is_some_and(|set| set.contains(&article))
+        lost.get(&(file as usize))
+            .is_some_and(|set| set.contains(&article))
     };
     // Whether a request for this article can be answered at all.
     let available = |file: u32, article: u32| {
@@ -354,7 +360,10 @@ pub(in super::super) async fn run(
                 deliver(&mut pipeline, job, post, file, article).await;
             }
         }
-        trace.push(format!("arrive slot {slot}: {:?}", pipeline.direct_store.sets_for(job)));
+        trace.push(format!(
+            "arrive slot {slot}: {:?}",
+            pipeline.direct_store.sets_for(job)
+        ));
     }
     if !index_first && retired.is_none() {
         deliver_index(&mut pipeline).await;
@@ -480,7 +489,9 @@ pub(in super::super) async fn run(
         .map(|name| {
             (
                 name.clone(),
-                std::fs::metadata(output.join(name)).ok().map(|meta| meta.len()),
+                std::fs::metadata(output.join(name))
+                    .ok()
+                    .map(|meta| meta.len()),
                 post.files
                     .iter()
                     .find(|posted| posted.name == *name)
@@ -503,26 +514,36 @@ pub(in super::super) async fn run(
     }
 }
 
-/// What a run must end in.
+// What a run must end in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) enum Verdict {
-    /// Every expected file published, byte for byte.
+    // Every expected file published, byte for byte.
     Completes,
-    /// A named failure that publishes none of the expected files.
+    // A named failure that publishes none of the expected files.
     Fails,
-    /// Either of the above; the oracle cannot tell which the bytes allow.
+    // Either of the above; the oracle cannot tell which the bytes allow.
     Either,
 }
 
 impl Ran {
-    /// Holds the run to its verdict and to the invariants every run keeps:
-    /// it settles, a complete job published exactly the source bytes and
-    /// nothing unexpected, a failed job is named and published none of them.
-    pub(in super::super) fn assert(&self, post: &Post, profile: ExtractionProfile, verdict: Verdict, context: &str) {
+    // Holds the run to its verdict and to the invariants every run keeps:
+    // it settles, a complete job published exactly the source bytes and
+    // nothing unexpected, a failed job is named and published none of them.
+    pub(in super::super) fn assert(
+        &self,
+        post: &Post,
+        profile: ExtractionProfile,
+        verdict: Verdict,
+        context: &str,
+    ) {
         let trace = &self.trace;
         match &self.status {
             Some(JobStatus::Complete) => {
-                assert_ne!(verdict, Verdict::Fails, "{context}: completed where it must fail: {trace:?}");
+                assert_ne!(
+                    verdict,
+                    Verdict::Fails,
+                    "{context}: completed where it must fail: {trace:?}"
+                );
                 for (name, bytes) in &post.expected {
                     assert!(
                         self.files[name].as_deref() == Some(bytes.as_slice()),
@@ -554,8 +575,14 @@ impl Ran {
                     Verdict::Completes,
                     "{context}: failed where it must complete: {error}: {trace:?}"
                 );
-                assert!(!error.trim().is_empty(), "{context}: an unnamed failure: {trace:?}");
-                assert_eq!(self.finalized, 0, "{context}: a failed job finalized a set: {trace:?}");
+                assert!(
+                    !error.trim().is_empty(),
+                    "{context}: an unnamed failure: {trace:?}"
+                );
+                assert_eq!(
+                    self.finalized, 0,
+                    "{context}: a failed job finalized a set: {trace:?}"
+                );
                 let leaked: Vec<_> = post
                     .expected
                     .iter()
@@ -573,7 +600,11 @@ impl Ran {
             assert_eq!(self.finalized, 0, "{context}: {trace:?}");
         }
         if profile == ExtractionProfile::Conventional {
-            assert_eq!(self.chase_armed + self.chase_consumed, 0, "{context}: {trace:?}");
+            assert_eq!(
+                self.chase_armed + self.chase_consumed,
+                0,
+                "{context}: {trace:?}"
+            );
         }
     }
 }

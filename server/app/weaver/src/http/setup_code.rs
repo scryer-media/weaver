@@ -9,15 +9,15 @@ use weaver_server_core::auth::{generate_setup_code, hash_api_key, normalize_setu
 const MAX_FAILURES: usize = 5;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
-/// Asks for a setup code even on loopback, to try the flow a container gets.
+// Asks for a setup code even on loopback, to try the flow a container gets.
 const ENV_REQUIRE_SETUP_CODE: &str = "WEAVER_REQUIRE_SETUP_CODE";
 
-/// Whether first-time setup has to be proven with the code from the console.
-///
-/// A Weaver listening on loopback alone can only be opened from this machine,
-/// so reaching the wizard is proof enough. Anything wider needs the code: a
-/// container's `0.0.0.0`, a LAN address, or a reverse proxy relaying browsers
-/// from elsewhere to a loopback listener.
+// Whether first-time setup has to be proven with the code from the console.
+//
+// A Weaver listening on loopback alone can only be opened from this machine,
+// so reaching the wizard is proof enough. Anything wider needs the code: a
+// container's `0.0.0.0`, a LAN address, or a reverse proxy relaying browsers
+// from elsewhere to a loopback listener.
 pub(super) fn setup_code_required(bind_address: IpAddr, behind_trusted_proxy: bool) -> bool {
     let forced = std::env::var(ENV_REQUIRE_SETUP_CODE)
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
@@ -28,8 +28,8 @@ pub(super) fn setup_code_required(bind_address: IpAddr, behind_trusted_proxy: bo
 pub(super) struct SetupChallenge(Arc<Mutex<State>>);
 
 struct State {
-    /// `None` for a Weaver only this machine can reach, whose setup needs no
-    /// code: being able to open it at all already proves the operator is here.
+    // `None` for a Weaver only this machine can reach, whose setup needs no
+    // code: being able to open it at all already proves the operator is here.
     verifier: Option<String>,
     failures: VecDeque<Instant>,
     consumed: bool,
@@ -44,8 +44,8 @@ pub(super) enum SetupCodeError {
 }
 
 impl SetupChallenge {
-    /// Generates a short setup code and returns it once. Only its verifier
-    /// remains in the cloneable challenge state.
+    // Generates a short setup code and returns it once. Only its verifier
+    // remains in the cloneable challenge state.
     pub(super) fn generate() -> (Self, String) {
         let code = generate_setup_code();
         let verifier = hex_hash(hash_api_key(&normalize_setup_code(&code)));
@@ -59,7 +59,7 @@ impl SetupChallenge {
         )
     }
 
-    /// Setup without a code, for a Weaver that listens on loopback only.
+    // Setup without a code, for a Weaver that listens on loopback only.
     pub(super) fn open() -> Self {
         Self(Arc::new(Mutex::new(State {
             verifier: None,
@@ -122,8 +122,8 @@ impl SetupChallenge {
         Ok(())
     }
 
-    /// Call only after the setup database transaction commits. Failed writes
-    /// intentionally leave the challenge retryable.
+    // Call only after the setup database transaction commits. Failed writes
+    // intentionally leave the challenge retryable.
     pub(super) fn consume(&self) {
         self.0
             .lock()

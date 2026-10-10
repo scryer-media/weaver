@@ -1,4 +1,4 @@
-//! Bounded recovery windows. Download estimates control scheduling, never proof.
+// Bounded recovery windows. Download estimates control scheduling, never proof.
 use super::*;
 use crate::jobs::ids::SegmentId;
 use crate::pipeline::{JobStatus, SegmentTerminalState};
@@ -157,8 +157,8 @@ impl Pipeline {
         }
     }
 
-    /// Tally a drained acquisition window: each article it admitted either
-    /// reached the assembly or did not. Counted once per window.
+    // Tally a drained acquisition window: each article it admitted either
+    // reached the assembly or did not. Counted once per window.
     #[cfg(test)]
     pub(in crate::pipeline) fn settle_par3_recovery_batch_for_test(&mut self, job_id: JobId) {
         self.settle_par3_recovery_batch(job_id);
@@ -203,12 +203,12 @@ impl Pipeline {
         }
     }
 
-    /// Whether recovery acquisition for this job is still moving: a window's
-    /// articles are in the download pipeline, or the engine holds work for
-    /// the job — including the reassessment a drained window queues when it
-    /// retracts its in-flight declaration. While either is true, a window
-    /// that could not be admitted says nothing about whether recovery
-    /// remains; the retained view predates the retraction.
+    // Whether recovery acquisition for this job is still moving: a window's
+    // articles are in the download pipeline, or the engine holds work for
+    // the job — including the reassessment a drained window queues when it
+    // retracts its in-flight declaration. While either is true, a window
+    // that could not be admitted says nothing about whether recovery
+    // remains; the retained view predates the retraction.
     pub(in crate::pipeline) fn par3_recovery_in_progress(&self, job_id: JobId) -> bool {
         self.par3_runtime
             .as_ref()

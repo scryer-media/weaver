@@ -1,8 +1,8 @@
-//! Integration tests for deobfuscation heuristics and subject line parsing.
-//!
-//! Test cases sourced from NZBGet (tests/queue/Deobfuscation.cpp) and
-//! SABnzbd (tests/test_deobfuscate_filenames.py) to ensure parity with
-//! both established Usenet downloaders.
+// Integration tests for deobfuscation heuristics and subject line parsing.
+//
+// Test cases sourced from NZBGet (tests/queue/Deobfuscation.cpp) and
+// SABnzbd (tests/test_deobfuscate_filenames.py) to ensure parity with
+// both established Usenet downloaders.
 
 use std::path::Path;
 use weaver_nzb::{extract_filename, is_obfuscated, is_protected_media_structure};

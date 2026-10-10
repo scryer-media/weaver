@@ -105,12 +105,12 @@ impl LoginRateLimiter {
     }
 }
 
-/// The address login attempts are metered against.
-///
-/// Resolved the same way trust is, so a deployment behind a configured proxy
-/// meters each browser separately instead of pooling every attempt under the
-/// proxy's own address. Headers are believed only from a configured proxy; a
-/// direct peer is metered on its socket address exactly as before.
+// The address login attempts are metered against.
+//
+// Resolved the same way trust is, so a deployment behind a configured proxy
+// meters each browser separately instead of pooling every attempt under the
+// proxy's own address. Headers are believed only from a configured proxy; a
+// direct peer is metered on its socket address exactly as before.
 fn login_client_id(
     security: &RuntimeSecurityConfig,
     headers: &HeaderMap,
@@ -166,8 +166,8 @@ fn canonical_browser_origin(headers: &HeaderMap) -> Result<String, StatusCode> {
     Ok(url.origin().ascii_serialization())
 }
 
-/// Same-origin GETs normally omit Origin. Use their Referer to keep session
-/// discovery consistent with the mandatory Origin check on browser writes.
+// Same-origin GETs normally omit Origin. Use their Referer to keep session
+// discovery consistent with the mandatory Origin check on browser writes.
 fn browser_session_origin_matches(headers: &HeaderMap, session_origin: &str) -> bool {
     if headers.contains_key(header::ORIGIN) {
         return canonical_browser_origin(headers).ok().as_deref() == Some(session_origin);
@@ -193,10 +193,10 @@ fn browser_session_origin_matches(headers: &HeaderMap, session_origin: &str) -> 
         && url.origin().ascii_serialization() == session_origin
 }
 
-/// Whether a canonical browser origin names the same host and port as the
-/// request's authority. Either side may leave out the scheme's default port,
-/// so both are compared as the port the origin's scheme would actually use:
-/// another page on the same host is a different origin.
+// Whether a canonical browser origin names the same host and port as the
+// request's authority. Either side may leave out the scheme's default port,
+// so both are compared as the port the origin's scheme would actually use:
+// another page on the same host is a different origin.
 fn origin_host_matches(origin: &str, host: &weaver_server_core::security::HttpAuthority) -> bool {
     let Ok(url) = reqwest::Url::parse(origin) else {
         return false;
@@ -232,7 +232,7 @@ fn hash_to_hex(hash: [u8; 32]) -> String {
     encoded
 }
 
-/// Extract the `weaver_jwt` cookie value from request headers.
+// Extract the `weaver_jwt` cookie value from request headers.
 pub(super) fn extract_jwt_cookie(headers: &HeaderMap) -> Option<String> {
     extract_cookie(headers, JWT_COOKIE_NAME)
 }
@@ -319,9 +319,9 @@ pub(super) async fn lookup_api_key_auth(
     Ok(Some(cached))
 }
 
-/// Debounce interval for `api_keys.last_used_at` writes. *arr pollers hit the
-/// API every few seconds; persisting a timestamp that granular is pointless and
-/// on Postgres it is a write round-trip + WAL flush per request.
+// Debounce interval for `api_keys.last_used_at` writes. *arr pollers hit the
+// API every few seconds; persisting a timestamp that granular is pointless and
+// on Postgres it is a write round-trip + WAL flush per request.
 const API_KEY_TOUCH_MIN_INTERVAL_MS: i64 = 60_000;
 const API_KEY_TOUCH_MAX_KEYS: usize = 4096;
 
@@ -365,16 +365,16 @@ pub(super) struct ResolvedCaller {
     pub(super) identity: CallerIdentity,
 }
 
-/// Browser session cookies are accepted only on browser-facing routes whose
-/// immediate socket peer has been explicitly trusted by the operator.
+// Browser session cookies are accepted only on browser-facing routes whose
+// immediate socket peer has been explicitly trusted by the operator.
 #[derive(Clone, Copy)]
 pub(super) enum BrowserSessionPolicy {
     TrustedPeer(Option<SocketAddr>),
     Denied,
 }
 
-/// Resolve the caller scope and stable request identity from persistent API
-/// key headers, a login JWT cookie, or a trusted-peer browser session cookie.
+// Resolve the caller scope and stable request identity from persistent API
+// key headers, a login JWT cookie, or a trusted-peer browser session cookie.
 pub(super) async fn resolve_caller(
     db: &Database,
     auth_cache: &LoginAuthCache,
@@ -465,12 +465,12 @@ pub(super) async fn resolve_caller(
     Err(StatusCode::UNAUTHORIZED)
 }
 
-/// A running script calling back with the token its run was handed. `None`
-/// when the request carries no such token or the run it names has ended, in
-/// which case the request is whatever its other credentials make it.
-///
-/// Only the GraphQL endpoint asks this: the token is no credential anywhere
-/// else, and it is never kept past the request it came with.
+// A running script calling back with the token its run was handed. `None`
+// when the request carries no such token or the run it names has ended, in
+// which case the request is whatever its other credentials make it.
+//
+// Only the GraphQL endpoint asks this: the token is no credential anywhere
+// else, and it is never kept past the request it came with.
 pub(super) async fn resolve_script_run(
     db: &Database,
     headers: &HeaderMap,
@@ -493,7 +493,7 @@ pub(super) async fn resolve_script_run(
     })
 }
 
-/// Resolve the caller scope with an explicit browser-session policy.
+// Resolve the caller scope with an explicit browser-session policy.
 pub(super) async fn resolve_scope(
     db: &Database,
     auth_cache: &LoginAuthCache,
@@ -538,8 +538,8 @@ pub(super) async fn enforce_browser_csrf(
     next.run(request).await
 }
 
-/// Validate the browser binding for a state-changing cookie request. API-key
-/// callers do not carry the browser session cookie and bypass this adapter.
+// Validate the browser binding for a state-changing cookie request. API-key
+// callers do not carry the browser session cookie and bypass this adapter.
 pub(super) async fn validate_browser_csrf(
     db: &Database,
     security: &RuntimeSecurityConfig,
@@ -720,15 +720,15 @@ pub(super) struct SetupRequest {
     trusted_networks: Option<Vec<String>>,
 }
 
-/// Complete first-run setup from the browser: pick an access mode, optionally
-/// create the login, optionally widen the binding.
-///
-/// This is the wizard's endpoint, and its whole reason to exist is that every
-/// peer product does setup in the browser while Weaver used to demand
-/// environment variables. It is callable exactly once — while no credentials
-/// are stored — and only from loopback or an already-trusted peer, which is
-/// the same trust argument the loopback bind default rests on: the first
-/// browser to reach a fresh instance from the machine itself is the operator.
+// Complete first-run setup from the browser: pick an access mode, optionally
+// create the login, optionally widen the binding.
+//
+// This is the wizard's endpoint, and its whole reason to exist is that every
+// peer product does setup in the browser while Weaver used to demand
+// environment variables. It is callable exactly once — while no credentials
+// are stored — and only from loopback or an already-trusted peer, which is
+// the same trust argument the loopback bind default rests on: the first
+// browser to reach a fresh instance from the machine itself is the operator.
 #[expect(
     clippy::too_many_arguments,
     reason = "Axum extracts independent request and application state"
@@ -1380,9 +1380,9 @@ pub(super) async fn logout_handler(
 
 const FRESH_ADMIN_TTL_SECS: i64 = 15 * 60;
 
-/// Resolves the current caller and requires a recent password check for a
-/// durable browser session. Persistent administrator API keys deliberately
-/// retain their documented machine-to-machine capability.
+// Resolves the current caller and requires a recent password check for a
+// durable browser session. Persistent administrator API keys deliberately
+// retain their documented machine-to-machine capability.
 pub(super) async fn require_fresh_admin(
     request_auth: &super::RequestAuthContext,
     peer: Option<SocketAddr>,
@@ -2126,9 +2126,9 @@ mod tests {
         assert_eq!(login_client_id(&security, &headers, None), "198.51.100.10");
     }
 
-    /// Metering follows the same resolution trust does: a browser behind a
-    /// configured proxy is rate-limited on its own address, so one attacker
-    /// cannot lock out every other browser sharing that proxy.
+    // Metering follows the same resolution trust does: a browser behind a
+    // configured proxy is rate-limited on its own address, so one attacker
+    // cannot lock out every other browser sharing that proxy.
     #[test]
     fn login_client_id_meters_the_client_behind_a_configured_proxy() {
         let mut security = RuntimeSecurityConfig::default();

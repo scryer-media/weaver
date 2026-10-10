@@ -8,9 +8,9 @@ fn carrier(root: &std::path::Path) -> PathBuf {
     path
 }
 
-/// Whether a coordinator call was refused by a budget — weaver's own or the
-/// engine's. The two no longer share one error variant, so asking "did a
-/// ceiling refuse this?" is a question for the label, not for the shape.
+// Whether a coordinator call was refused by a budget — weaver's own or the
+// engine's. The two no longer share one error variant, so asking "did a
+// ceiling refuse this?" is a question for the label, not for the shape.
 fn refused<T>(result: EngineResult<T>) -> bool {
     result.as_ref().err().is_some_and(budget::is_limit)
 }
@@ -19,8 +19,8 @@ async fn next(coordinator: &mut Coordinator) -> WorkDone {
     coordinator.recv().await.unwrap()
 }
 
-/// Repair keeps every core but one when no profile caps it, a profile's cap
-/// only ever lowers that, and neither ever reaches zero.
+// Repair keeps every core but one when no profile caps it, a profile's cap
+// only ever lowers that, and neither ever reaches zero.
 #[test]
 fn a_profile_cap_only_lowers_the_par3_cpu_limit() {
     // (parallelism, uncapped, capped at 2, capped at 8)

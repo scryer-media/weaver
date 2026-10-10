@@ -2,13 +2,13 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 use lzma_turbo::xz::{XzOptions, XzParallelReader, XzReader};
 
-/// Maximum memory the xz decoder may use while decoding an XZ input.
-///
-/// This covers the attacker-controlled LZMA2 dictionary as well as decoder
-/// bookkeeping.  128 MiB accepts standard `xz -9` archives (64 MiB
-/// dictionary) without allowing a tiny archive to request multi-gigabyte
-/// allocations.  The parallel decoder degrades its thread count to fit under
-/// this figure rather than refusing the file.
+// Maximum memory the xz decoder may use while decoding an XZ input.
+//
+// This covers the attacker-controlled LZMA2 dictionary as well as decoder
+// bookkeeping.  128 MiB accepts standard `xz -9` archives (64 MiB
+// dictionary) without allowing a tiny archive to request multi-gigabyte
+// allocations.  The parallel decoder degrades its thread count to fit under
+// this figure rather than refusing the file.
 pub const XZ_DECODER_MEMORY_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,11 +17,11 @@ pub(crate) enum XzFilesystemDecoderKind {
     Parallel,
 }
 
-/// Opens an integrity-checking, concatenated-stream XZ decoder with a hard
-/// decoder-memory limit.
-///
-/// Single-threaded by construction: the input only has to be readable, so this
-/// is the decoder for uploads, watch-folder intake and anything still arriving.
+// Opens an integrity-checking, concatenated-stream XZ decoder with a hard
+// decoder-memory limit.
+//
+// Single-threaded by construction: the input only has to be readable, so this
+// is the decoder for uploads, watch-folder intake and anything still arriving.
 pub fn xz_multistream_decoder<R: Read>(
     reader: R,
     memory_limit_bytes: u64,
@@ -32,16 +32,16 @@ pub fn xz_multistream_decoder<R: Read>(
     Ok(XzReader::with_options(reader, options))
 }
 
-/// Opens a bounded block-parallel decoder for one XZ stream already on disk.
-///
-/// The file's index is read first, so every block's offsets and sizes are
-/// known before a byte is decoded; the thread count is reduced until the
-/// workers' buffers fit under `memory_limit_bytes`, and
-/// [`XzParallelReader::memory_estimate`] then reports what the decode will
-/// actually cost so the caller can reserve exactly that.
-///
-/// Callers must first use [`xz_filesystem_decoder_kind`] to keep concatenated
-/// streams on the sequential multistream decoder.
+// Opens a bounded block-parallel decoder for one XZ stream already on disk.
+//
+// The file's index is read first, so every block's offsets and sizes are
+// known before a byte is decoded; the thread count is reduced until the
+// workers' buffers fit under `memory_limit_bytes`, and
+// [`XzParallelReader::memory_estimate`] then reports what the decode will
+// actually cost so the caller can reserve exactly that.
+//
+// Callers must first use [`xz_filesystem_decoder_kind`] to keep concatenated
+// streams on the sequential multistream decoder.
 pub(crate) fn xz_parallel_decoder<R: Read + Seek>(
     reader: R,
     memory_limit_bytes: u64,
@@ -54,12 +54,12 @@ pub(crate) fn xz_parallel_decoder<R: Read + Seek>(
     XzParallelReader::with_options(reader, options).map_err(io::Error::from)
 }
 
-/// Selects the decoder for a completed XZ file without decompressing it.
-///
-/// The multithreaded decoder is used only for a structurally single stream
-/// containing more than one block. Any malformed or ambiguous structure falls
-/// back to the bounded sequential decoder, which remains responsible for full
-/// format and integrity validation.
+// Selects the decoder for a completed XZ file without decompressing it.
+//
+// The multithreaded decoder is used only for a structurally single stream
+// containing more than one block. Any malformed or ambiguous structure falls
+// back to the bounded sequential decoder, which remains responsible for full
+// format and integrity validation.
 pub(crate) fn xz_filesystem_decoder_kind<R: Read + Seek>(
     reader: &mut R,
 ) -> XzFilesystemDecoderKind {

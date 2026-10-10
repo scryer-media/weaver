@@ -1,31 +1,31 @@
-//! Periodic liveness and process-memory reporting.
-//!
-//! A process that vanishes without writing a line leaves nothing to correlate
-//! against: the log simply stops. A steady pulse turns that into evidence —
-//! the gap between the last beat and the next startup bounds when the process
-//! died, the beat counter distinguishes "stopped logging" from "stopped
-//! running", and the resident-set numbers beside it show whether memory was
-//! climbing towards the end.
+// Periodic liveness and process-memory reporting.
+//
+// A process that vanishes without writing a line leaves nothing to correlate
+// against: the log simply stops. A steady pulse turns that into evidence —
+// the gap between the last beat and the next startup bounds when the process
+// died, the beat counter distinguishes "stopped logging" from "stopped
+// running", and the resident-set numbers beside it show whether memory was
+// climbing towards the end.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
 
-/// How often the heartbeat line is written. Long enough to be free at rest,
-/// short enough that the death window it brackets is useful.
+// How often the heartbeat line is written. Long enough to be free at rest,
+// short enough that the death window it brackets is useful.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Every beat is written at DEBUG; every this-many-th one, and the first, at
-/// INFO, so the default log keeps a coarse pulse without a line a minute.
+// Every beat is written at DEBUG; every this-many-th one, and the first, at
+// INFO, so the default log keeps a coarse pulse without a line a minute.
 const HEARTBEAT_INFO_EVERY: u64 = 10;
 
-/// A beat whose resident set moved by more than this fraction since the last
-/// INFO beat is written at INFO too: memory climbing is exactly what the
-/// pulse is there to show.
+// A beat whose resident set moved by more than this fraction since the last
+// INFO beat is written at INFO too: memory climbing is exactly what the
+// pulse is there to show.
 const HEARTBEAT_RSS_CHANGE_FOR_INFO: f64 = 0.25;
 
-/// Whether this beat is written at INFO rather than DEBUG.
+// Whether this beat is written at INFO rather than DEBUG.
 fn beat_is_info(beat: u64, rss: Option<u64>, last_info_rss: Option<u64>) -> bool {
     if beat == 1 || beat.is_multiple_of(HEARTBEAT_INFO_EVERY) {
         return true;
@@ -38,13 +38,13 @@ fn beat_is_info(beat: u64, rss: Option<u64>, last_info_rss: Option<u64>) -> bool
     }
 }
 
-/// Highest resident set size any sample has seen, in bytes; zero until the
-/// first successful sample. A process-wide atomic rather than task state so
-/// shutdown can report the same high-water mark without reaching into the
-/// running task.
+// Highest resident set size any sample has seen, in bytes; zero until the
+// first successful sample. A process-wide atomic rather than task state so
+// shutdown can report the same high-water mark without reaching into the
+// running task.
 static PEAK_RSS_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Spawns the heartbeat task. It runs until aborted.
+// Spawns the heartbeat task. It runs until aborted.
 pub(crate) fn spawn_heartbeat_task() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let started = Instant::now();
@@ -88,11 +88,11 @@ pub(crate) fn spawn_heartbeat_task() -> tokio::task::JoinHandle<()> {
     })
 }
 
-/// Logs the high-water resident set size for this run, once.
-///
-/// The last heartbeat can be up to a full interval old by the time a shutdown
-/// completes, so this takes one more sample first: a spike in the final
-/// minute would otherwise never be recorded anywhere.
+// Logs the high-water resident set size for this run, once.
+//
+// The last heartbeat can be up to a full interval old by the time a shutdown
+// completes, so this takes one more sample first: a spike in the final
+// minute would otherwise never be recorded anywhere.
 pub(crate) fn log_peak_rss() {
     let _ = sample_and_record_rss();
     let peak = peak_rss_bytes();
@@ -101,22 +101,22 @@ pub(crate) fn log_peak_rss() {
     }
 }
 
-/// The highest resident set size recorded so far, in bytes. Zero means no
-/// sample has ever succeeded on this platform.
+// The highest resident set size recorded so far, in bytes. Zero means no
+// sample has ever succeeded on this platform.
 fn peak_rss_bytes() -> u64 {
     PEAK_RSS_BYTES.load(Ordering::Relaxed)
 }
 
-/// Samples the resident set size and folds it into the high-water mark.
+// Samples the resident set size and folds it into the high-water mark.
 fn sample_and_record_rss() -> Option<u64> {
     let rss = resident_set_bytes()?;
     PEAK_RSS_BYTES.fetch_max(rss, Ordering::Relaxed);
     Some(rss)
 }
 
-/// Resident set size of this process in bytes, or `None` when the platform
-/// declines to report it. Never fails loudly: this is diagnostics, and a
-/// refused sample must not disturb the run it is describing.
+// Resident set size of this process in bytes, or `None` when the platform
+// declines to report it. Never fails loudly: this is diagnostics, and a
+// refused sample must not disturb the run it is describing.
 #[cfg(target_os = "linux")]
 fn resident_set_bytes() -> Option<u64> {
     // `/proc/self/statm` is a single line of page counts; the second field is

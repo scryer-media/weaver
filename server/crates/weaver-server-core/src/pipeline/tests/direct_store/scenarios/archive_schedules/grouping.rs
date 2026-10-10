@@ -1,33 +1,33 @@
-//! The grouping-information axis of the archive matrix.
-//!
-//! A cell is a container, the names its volumes are posted under, and what
-//! else the post carries that could group or order them. [`rule`] states, for
-//! every cell, whether a single job can present it at all and, if it can,
-//! what each extraction profile must make of it: the volume set direct store
-//! admits by name alone, and whether the job extracts direct, streams through
-//! chase, extracts after download, demotes for a named reason, or fails.
-//!
-//! The ruling is an exhaustive match over the axes with no fallback arm, so a
-//! value added to any axis does not compile until every cell it opens has an
-//! expectation. The hand-named [`Format`](super::Format) layouts are aliases
-//! of cells, and take their direct-store route from here.
-//!
-//! The cells reuse the matrix's synthetic stored-volume builders and the 7z
-//! writer; nothing here is a captured post.
+// The grouping-information axis of the archive matrix.
+//
+// A cell is a container, the names its volumes are posted under, and what
+// else the post carries that could group or order them. [`rule`] states, for
+// every cell, whether a single job can present it at all and, if it can,
+// what each extraction profile must make of it: the volume set direct store
+// admits by name alone, and whether the job extracts direct, streams through
+// chase, extracts after download, demotes for a named reason, or fails.
+//
+// The ruling is an exhaustive match over the axes with no fallback arm, so a
+// value added to any axis does not compile until every cell it opens has an
+// expectation. The hand-named [`Format`](super::Format) layouts are aliases
+// of cells, and take their direct-store route from here.
+//
+// The cells reuse the matrix's synthetic stored-volume builders and the 7z
+// writer; nothing here is a captured post.
 use super::super::sevenz_store::schedules::{LOSES, map_slots, unrepeated_payload};
 use super::super::sevenz_store::{Entry, build_7z_shaped, sevenz_job_spec, split_volumes};
 use super::*;
 use crate::pipeline::direct_store::plan::{AdmissionRefusal, DirectSetPlan};
 
-/// What the volumes are.
+// What the volumes are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Container {
     Rar4,
     Rar5,
-    /// Encrypted data under plain headers: the headers still chain the set.
+    // Encrypted data under plain headers: the headers still chain the set.
     Rar5Encrypted,
-    /// Encrypted headers: nothing in a volume is readable before the set is
-    /// known, so only a name or a timely index can group it.
+    // Encrypted headers: nothing in a volume is readable before the set is
+    // known, so only a name or a timely index can group it.
     Rar5EncryptedHeaders,
     SevenZip,
     SevenZipSolid,
@@ -41,62 +41,62 @@ pub(super) enum Container {
     Blake2,
 }
 
-/// The names the volumes are posted under.
+// The names the volumes are posted under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Naming {
-    /// `silver.horizon.partNN.rar`, `silver.horizon.7z.NNN`.
+    // `silver.horizon.partNN.rar`, `silver.horizon.7z.NNN`.
     Conventional,
-    /// [`Naming::Conventional`] over four volumes, so two are middle volumes.
+    // [`Naming::Conventional`] over four volumes, so two are middle volumes.
     ConventionalFour,
-    /// One volume, `silver.horizon.rar` or `silver.horizon.7z`.
+    // One volume, `silver.horizon.rar` or `silver.horizon.7z`.
     Single,
-    /// The first volume's stem in a different case from the second's.
+    // The first volume's stem in a different case from the second's.
     MixedCase,
-    /// `.rar` then `.s00`: the second old-style series, which an archiver
-    /// starts after `.r99`.
+    // `.rar` then `.s00`: the second old-style series, which an archiver
+    // starts after `.r99`.
     OldStyleS,
-    /// 32-hex extensionless names with no shared stem.
+    // 32-hex extensionless names with no shared stem.
     HexBare,
-    /// One volume under a bare 32-hex name.
+    // One volume under a bare 32-hex name.
     HexSingle,
-    /// A hex stem whose numeric suffixes misstate the order: `.002`, `.001`.
+    // A hex stem whose numeric suffixes misstate the order: `.002`, `.001`.
     HexMisnumbered,
-    /// A hex stem whose `.rar` and `.r00` are swapped.
+    // A hex stem whose `.rar` and `.r00` are swapped.
     HexSwappedRar,
-    /// Four unrelated hex names that do not sort into volume order.
+    // Four unrelated hex names that do not sort into volume order.
     HexScattered,
-    /// Parts one and three of a three-part set under a hex stem, `.001` and
-    /// `.003`: part two was never posted.
+    // Parts one and three of a three-part set under a hex stem, `.001` and
+    // `.003`: part two was never posted.
     HexNumberedGap,
-    /// The first volume under a bare hex name, the second conventionally.
+    // The first volume under a bare hex name, the second conventionally.
     FirstVolumeHex,
-    /// Every volume posted twice under two names that number it alike.
+    // Every volume posted twice under two names that number it alike.
     Reposted,
-    /// Every volume posted twice, each copy under a hex name of its own.
+    // Every volume posted twice, each copy under a hex name of its own.
     HexReposted,
-    /// The first part as a whole `silver.horizon.7z`, the second as `.7z.002`.
+    // The first part as a whole `silver.horizon.7z`, the second as `.7z.002`.
     BareFirstPart,
 }
 
-/// What, besides the volumes, could group or order them.
+// What, besides the volumes, could group or order them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Binding {
-    /// A PAR2 index carrying the real names arrives before any volume.
+    // A PAR2 index carrying the real names arrives before any volume.
     Par2RealFirst,
-    /// A PAR2 index carrying the real names arrives after every volume.
+    // A PAR2 index carrying the real names arrives after every volume.
     Par2RealLast,
-    /// A PAR2 index describes the volumes under the names they are posted
-    /// under, arriving where the matrix's index does.
+    // A PAR2 index describes the volumes under the names they are posted
+    // under, arriving where the matrix's index does.
     Par2Posted,
-    /// An `.sfv` lists the real names; no PAR2 is posted.
+    // An `.sfv` lists the real names; no PAR2 is posted.
     Sfv,
-    /// Nothing besides the volumes.
+    // Nothing besides the volumes.
     Nothing,
-    /// The matrix's own: a PAR2 index under the posted names, posted only
-    /// when the schedule loses something. The hand-named formats' binding.
+    // The matrix's own: a PAR2 index under the posted names, posted only
+    // when the schedule loses something. The hand-named formats' binding.
     LegacyOnLoss,
-    /// The matrix's own obfuscated binding: a PAR2 index with the real names,
-    /// ahead of the volumes unless the schedule's loss puts it last.
+    // The matrix's own obfuscated binding: a PAR2 index with the real names,
+    // ahead of the volumes unless the schedule's loss puts it last.
     LegacyReal,
 }
 
@@ -107,33 +107,33 @@ pub(super) struct Cell {
     pub binding: Binding,
 }
 
-/// What direct store's name-only discovery makes of the posted names.
+// What direct store's name-only discovery makes of the posted names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Admission {
-    /// One set, admitted by name.
+    // One set, admitted by name.
     Named,
-    /// No set admitted; this refusal named.
+    // No set admitted; this refusal named.
     Refused(AdmissionRefusal),
-    /// One set admitted by name, and another under a name that differs
-    /// only in case refused for this.
+    // One set admitted by name, and another under a name that differs
+    // only in case refused for this.
     Split(AdmissionRefusal),
-    /// Nothing the names say forms a set.
+    // Nothing the names say forms a set.
     Unnamed,
 }
 
-/// What one extraction profile must make of a cell.
+// What one extraction profile must make of a cell.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Expect {
-    /// Direct store finalizes the set from its own partials.
+    // Direct store finalizes the set from its own partials.
     Direct,
-    /// No direct set; chase streams the extraction while it downloads.
+    // No direct set; chase streams the extraction while it downloads.
     Streams,
-    /// Direct store demotes the set for a reason this accepts; the job then
-    /// extracts by the fallback route.
+    // Direct store demotes the set for a reason this accepts; the job then
+    // extracts by the fallback route.
     Demotes(fn(DemotionReason) -> bool),
-    /// Extracted after download, with neither direct store nor chase.
+    // Extracted after download, with neither direct store nor chase.
     Downloads,
-    /// The job fails with an error naming this, and publishes nothing.
+    // The job fails with an error naming this, and publishes nothing.
     Fails(&'static str),
 }
 
@@ -147,7 +147,7 @@ pub(super) struct Expectation {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Ruling {
-    /// No single job can present this cell, for the stated reason.
+    // No single job can present this cell, for the stated reason.
     Impossible(&'static str),
     Possible(Expectation),
 }
@@ -206,7 +206,7 @@ fn sevenz_coder(reason: DemotionReason) -> bool {
     matches!(reason, DemotionReason::SevenZip(SevenZipRefusal::Coder))
 }
 
-/// The same expectation under every profile but direct store.
+// The same expectation under every profile but direct store.
 const fn fallback(admission: Admission, direct_store: Expect) -> Expectation {
     Expectation {
         admission,
@@ -221,13 +221,13 @@ impl Container {
         matches!(self, Self::SevenZip | Self::SevenZipSolid)
     }
 
-    /// Whether the volumes' own readable headers chain the set, so a set no
-    /// name or index places is still admitted by content.
+    // Whether the volumes' own readable headers chain the set, so a set no
+    // name or index places is still admitted by content.
     fn headers_chain(self) -> bool {
         matches!(self, Self::Rar5 | Self::Rar5Encrypted)
     }
 
-    /// What direct store does with a set it has admitted.
+    // What direct store does with a set it has admitted.
     fn admitted(self) -> Expect {
         match self {
             Self::SevenZipSolid => Expect::Demotes(sevenz_coder),
@@ -248,7 +248,7 @@ impl Container {
     }
 }
 
-/// Every cell's ruling. See the module documentation.
+// Every cell's ruling. See the module documentation.
 pub(super) fn rule(cell: Cell) -> Ruling {
     let Cell {
         container,
@@ -455,10 +455,10 @@ fn crossed(cell: Cell) -> Ruling {
     }
 }
 
-/// What a job missing a volume says about it.
+// What a job missing a volume says about it.
 const MISSING_PART: &str = "missing";
 
-/// What a job whose 7z continuation volumes nothing orders says.
+// What a job whose 7z continuation volumes nothing orders says.
 const UNORDERED_7Z: &str = "failed to read 7z archive";
 
 impl Expectation {
@@ -472,8 +472,8 @@ impl Expectation {
 }
 
 impl Naming {
-    /// Volumes the archive is written as, and the indices of those posted,
-    /// in posted order.
+    // Volumes the archive is written as, and the indices of those posted,
+    // in posted order.
     fn layout(self) -> (usize, &'static [usize]) {
         match self {
             Self::Single | Self::HexSingle => (1, &[0]),
@@ -491,8 +491,8 @@ impl Naming {
         }
     }
 
-    /// Whether the posted names place the set, so a lost offset-zero article
-    /// leaves no volume without a set.
+    // Whether the posted names place the set, so a lost offset-zero article
+    // leaves no volume without a set.
     fn names_place(self) -> bool {
         matches!(
             self,
@@ -505,7 +505,7 @@ impl Naming {
         )
     }
 
-    /// The names each posted volume goes under, given each one's real name.
+    // The names each posted volume goes under, given each one's real name.
     fn posted(self, real: &[String]) -> Vec<String> {
         const STEM: &str = "5f0c9e2ab1d74c6e8a3f1b0d9c2e7a41";
         let hex = |index: usize| format!("{:032x}", 0xd1c7_0000_u128 + index as u128);
@@ -549,14 +549,14 @@ impl Naming {
 
 const PASSWORD: &str = "moonlit-harbour";
 
-/// One cell's posted job.
+// One cell's posted job.
 struct Fixture {
     volumes: Vec<(String, Vec<u8>)>,
-    /// What each posted volume is really called, in posted order.
+    // What each posted volume is really called, in posted order.
     real: Vec<String>,
     spec: JobSpec,
     expected: Vec<(&'static str, Vec<u8>)>,
-    /// Loss masks that leave a 7z set without its map.
+    // Loss masks that leave a 7z set without its map.
     unmapped: fn(u8) -> bool,
 }
 
@@ -675,7 +675,7 @@ impl Fixture {
 }
 
 impl Binding {
-    /// How the schedule is driven, and the names any listing carries.
+    // How the schedule is driven, and the names any listing carries.
     fn drive(self, fixture: &Fixture) -> (ScheduleOptions, Option<Vec<String>>) {
         let matrix = ScheduleOptions::MATRIX;
         let real = Some(fixture.real.clone());
@@ -725,8 +725,8 @@ impl Binding {
     }
 }
 
-/// The direct-store route a cell's expectation allows, with `unmapped` the
-/// loss masks that leave its map unreadable.
+// The direct-store route a cell's expectation allows, with `unmapped` the
+// loss masks that leave its map unreadable.
 fn route(cell: Cell, expect: Expect, unmapped: fn(u8) -> bool) -> Route {
     let shape = match expect {
         Expect::Direct => {
@@ -762,7 +762,7 @@ fn route(cell: Cell, expect: Expect, unmapped: fn(u8) -> bool) -> Route {
     }
 }
 
-/// The direct-store route of a hand-named format's cell.
+// The direct-store route of a hand-named format's cell.
 pub(super) fn alias_route(cell: Cell) -> Route {
     match rule(cell) {
         Ruling::Possible(expectation) => route(cell, expectation.direct_store, |_| false),
@@ -771,7 +771,7 @@ pub(super) fn alias_route(cell: Cell) -> Route {
 }
 
 impl Expect {
-    /// Holds a clean schedule's outcome to the expectation.
+    // Holds a clean schedule's outcome to the expectation.
     fn assert_clean(self, outcome: &Outcome, unique: bool, context: &str) {
         let trace = &outcome.trace;
         match self {
@@ -801,7 +801,7 @@ impl Expect {
     }
 }
 
-/// Runs `cases` over `cell` under `profile` and holds each to the ruling.
+// Runs `cases` over `cell` under `profile` and holds each to the ruling.
 async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Schedule)>) {
     let expectation = match rule(cell) {
         Ruling::Possible(expectation) => expectation,
@@ -880,7 +880,7 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
     }
 }
 
-/// A cell's campaign: every profile over the matrix's smoke schedules.
+// A cell's campaign: every profile over the matrix's smoke schedules.
 pub(super) async fn cell_campaign(cell: Cell) {
     for profile in PROFILES {
         let cases = schedules().into_iter().enumerate().collect();
@@ -888,7 +888,7 @@ pub(super) async fn cell_campaign(cell: Cell) {
     }
 }
 
-/// A cell's default-suite smoke: in order and reversed, under every profile.
+// A cell's default-suite smoke: in order and reversed, under every profile.
 pub(super) async fn cell_smoke(cell: Cell) {
     let forward = slot_arrivals(4);
     let mut backward = forward.clone();
@@ -935,8 +935,8 @@ pub(super) const NAMINGS: [Naming; 15] = [
     Naming::BareFirstPart,
 ];
 
-/// The bindings the grouping cross varies. The two legacy bindings belong to
-/// the hand-named formats, whose own campaigns run them.
+// The bindings the grouping cross varies. The two legacy bindings belong to
+// the hand-named formats, whose own campaigns run them.
 pub(super) const BINDINGS: [Binding; 5] = [
     Binding::Par2RealFirst,
     Binding::Par2RealLast,
@@ -945,7 +945,7 @@ pub(super) const BINDINGS: [Binding; 5] = [
     Binding::Nothing,
 ];
 
-/// Every possible cell of the cross, in axis order.
+// Every possible cell of the cross, in axis order.
 pub(super) fn possible_cells() -> Vec<Cell> {
     let mut cells = Vec::new();
     for container in CONTAINERS {
@@ -965,15 +965,15 @@ pub(super) fn possible_cells() -> Vec<Cell> {
     cells
 }
 
-/// Emits one ignored campaign test per listed cell under
-/// `archive_schedules::combined_grouping`, inside the archive matrix's
-/// filter, and one default-suite smoke per listed cell of a `smoke` container
-/// under `archive_schedules::grouping_smoke`, outside it.
+// Emits one ignored campaign test per listed cell under
+// `archive_schedules::combined_grouping`, inside the archive matrix's
+// filter, and one default-suite smoke per listed cell of a `smoke` container
+// under `archive_schedules::grouping_smoke`, outside it.
 macro_rules! grouping_cells {
     ($($tag:ident $c:ident $C:ident {
         $($n:ident $N:ident [$($b:ident $B:ident)*])*
     })*) => {
-        /// Every cell the generator emits a campaign for.
+        // Every cell the generator emits a campaign for.
         const GENERATED_CELLS: &[grouping::Cell] = &[$($($(grouping::Cell {
             container: grouping::Container::$C,
             naming: grouping::Naming::$N,
@@ -1027,7 +1027,7 @@ macro_rules! grouping_cells {
 }
 pub(super) use grouping_cells;
 
-/// Prints the generator's list for the possible cells, in the macro's form.
+// Prints the generator's list for the possible cells, in the macro's form.
 fn generator_listing() -> String {
     fn snake(name: String) -> String {
         let mut out = String::new();
@@ -1077,7 +1077,7 @@ fn generator_listing() -> String {
     listing
 }
 
-/// The generator emits a campaign for exactly the possible cells.
+// The generator emits a campaign for exactly the possible cells.
 pub(super) fn assert_generated(generated: &[Cell]) {
     assert!(
         generated == possible_cells().as_slice(),

@@ -2,54 +2,54 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::jobs::ids::{MessageId, NzbFileId, SegmentId};
 
-/// A work item representing a segment to download.
+// A work item representing a segment to download.
 #[derive(Clone)]
 pub struct DownloadWork {
     pub segment_id: SegmentId,
     pub message_id: MessageId,
-    /// The file's newsgroups, shared by every segment of the file rather than
-    /// cloned per segment: a job's queue used to carry one `Vec<String>` per
-    /// article, and every lease and refill cloned it again.
+    // The file's newsgroups, shared by every segment of the file rather than
+    // cloned per segment: a job's queue used to carry one `Vec<String>` per
+    // article, and every lease and refill cloned it again.
     pub groups: std::sync::Arc<[String]>,
     pub priority: u32,
     pub byte_estimate: u32,
     pub retry_count: u32,
-    /// Whether this segment belongs to a recovery file (PAR2 repair blocks).
+    // Whether this segment belongs to a recovery file (PAR2 repair blocks).
     pub is_recovery: bool,
-    /// Whether pipeline progress is explicitly waiting for this segment.
-    ///
-    /// This is deliberately orthogonal to `is_recovery`: PAR2 completion work
-    /// and the bounded direct-store identity probe wave both need to lead the
-    /// ordinary queue. The flag changes dispatch eligibility only.
+    // Whether pipeline progress is explicitly waiting for this segment.
+    //
+    // This is deliberately orthogonal to `is_recovery`: PAR2 completion work
+    // and the bounded direct-store identity probe wave both need to lead the
+    // ordinary queue. The flag changes dispatch eligibility only.
     pub completion_critical: bool,
-    /// Servers to skip for this download (e.g. after decode failure from that server).
+    // Servers to skip for this download (e.g. after decode failure from that server).
     pub exclude_servers: Vec<usize>,
-    /// Transport-rotation hint: the server whose established connection just
-    /// failed for this segment. Selection avoids it on the next attempt so the
-    /// retry lands elsewhere when an alternative exists. Unlike `exclude_servers`, it
-    /// never counts toward article-not-found exhaustion, so one transient
-    /// timeout can never help declare an article missing. Replaced (not
-    /// accumulated) on each transport failure; advisory only, so an index left
-    /// stale by a pool rebuild merely skips one server for one attempt.
+    // Transport-rotation hint: the server whose established connection just
+    // failed for this segment. Selection avoids it on the next attempt so the
+    // retry lands elsewhere when an alternative exists. Unlike `exclude_servers`, it
+    // never counts toward article-not-found exhaustion, so one transient
+    // timeout can never help declare an article missing. Replaced (not
+    // accumulated) on each transport failure; advisory only, so an index left
+    // stale by a pool rebuild merely skips one server for one attempt.
     pub avoid_server: Option<usize>,
 }
 
-/// Dispatch classes, in the order the queue serves them:
-///
-/// 0. completion-critical work that is not recovery — PAR2 index bootstrap,
-///    metadata discovery, the direct-store identity probe wave;
-/// 1. promoted PAR2 recovery blocks, which share the payload's connections and
-///    lead it, because a repair cannot start until they land;
-/// 2. first articles — one article per file, marked by the owner of the queue.
-///    They lead the payload so that the first round trips of a job sample
-///    every file in it rather than the first file in it, which is what makes
-///    "this post is not there any more" answerable in seconds instead of
-///    after a whole file's worth of articles;
-/// 3. ordinary payload.
-///
-/// Classes 0 and 1 live in the completion-critical map and 2 and 3 in the
-/// ordinary one, so the split is what `pop` reads; the rank orders the classes
-/// inside each map ahead of the per-file priority.
+// Dispatch classes, in the order the queue serves them:
+//
+// 0. completion-critical work that is not recovery — PAR2 index bootstrap,
+//    metadata discovery, the direct-store identity probe wave;
+// 1. promoted PAR2 recovery blocks, which share the payload's connections and
+//    lead it, because a repair cannot start until they land;
+// 2. first articles — one article per file, marked by the owner of the queue.
+//    They lead the payload so that the first round trips of a job sample
+//    every file in it rather than the first file in it, which is what makes
+//    "this post is not there any more" answerable in seconds instead of
+//    after a whole file's worth of articles;
+// 3. ordinary payload.
+//
+// Classes 0 and 1 live in the completion-critical map and 2 and 3 in the
+// ordinary one, so the split is what `pop` reads; the rank orders the classes
+// inside each map ahead of the per-file priority.
 const COMPLETION_RANK_CRITICAL: u8 = 0;
 const COMPLETION_RANK_PROMOTED_RECOVERY: u8 = 1;
 const COMPLETION_RANK_FIRST_ARTICLE: u8 = 2;
@@ -69,17 +69,17 @@ fn completion_rank_for(work: &DownloadWork, first_article: bool) -> u8 {
     }
 }
 
-/// The dispatch key of one queued item: the queue serves keys in ascending
-/// order. Lower priority number = higher scheduling priority (downloaded
-/// first). The sequence is unique within a queue, so no two items share a key.
+// The dispatch key of one queued item: the queue serves keys in ascending
+// order. Lower priority number = higher scheduling priority (downloaded
+// first). The sequence is unique within a queue, so no two items share a key.
 #[derive(Clone, Copy)]
 struct QueueKey {
-    /// Dispatch class: see [`completion_rank_for`].
+    // Dispatch class: see [`completion_rank_for`].
     completion_rank: u8,
     priority: u32,
-    /// Optional intra-priority rank for deterministic dynamic ordering.
+    // Optional intra-priority rank for deterministic dynamic ordering.
     rank: Option<u32>,
-    /// Tie-breaker: insertion order (lower = earlier).
+    // Tie-breaker: insertion order (lower = earlier).
     sequence: u64,
 }
 
@@ -109,54 +109,54 @@ impl Ord for QueueKey {
     }
 }
 
-/// One dispatch class, served in ascending key order.
-///
-/// An ordered map rather than a heap so that a matching read can walk the
-/// class in dispatch order and stop at the first hit, and a removal takes out
-/// only the matched entry: skipping an ineligible head costs a read, not a
-/// pop and re-push of everything ahead of the match.
+// One dispatch class, served in ascending key order.
+//
+// An ordered map rather than a heap so that a matching read can walk the
+// class in dispatch order and stop at the first hit, and a removal takes out
+// only the matched entry: skipping an ineligible head costs a read, not a
+// pop and re-push of everything ahead of the match.
 type ClassMap = BTreeMap<QueueKey, DownloadWork>;
 
-/// Priority queue for download work items.
+// Priority queue for download work items.
 pub struct DownloadQueue {
     completion_critical_work: ClassMap,
     ordinary_work: ClassMap,
     next_sequence: u64,
-    /// Queued items carrying failure exclusions — escalated work that may
-    /// need a backfill lane. Maintained on push/pop; recounted on the rare
-    /// bulk-removal paths.
+    // Queued items carrying failure exclusions — escalated work that may
+    // need a backfill lane. Maintained on push/pop; recounted on the rare
+    // bulk-removal paths.
     excluded_work: usize,
-    /// Queued recovery items. Kept explicitly so scheduler admission checks
-    /// stay O(1) even for jobs with very large article queues.
+    // Queued recovery items. Kept explicitly so scheduler admission checks
+    // stay O(1) even for jobs with very large article queues.
     recovery_work: usize,
-    /// Queued items per file, maintained on every push and removal. The RAR
-    /// unlock planner asks "does this file still have queued work" once per
-    /// volume; answering that by scanning the queue made every replan cost
-    /// files times queued segments.
+    // Queued items per file, maintained on every push and removal. The RAR
+    // unlock planner asks "does this file still have queued work" once per
+    // volume; answering that by scanning the queue made every replan cost
+    // files times queued segments.
     queued_by_file: HashMap<NzbFileId, u32>,
-    /// Queued byte estimates per file, as estimate -> how many queued items
-    /// carry it, maintained beside `queued_by_file`. Lets a caller ask for a
-    /// file's smallest queued article without reading the file's articles.
+    // Queued byte estimates per file, as estimate -> how many queued items
+    // carry it, maintained beside `queued_by_file`. Lets a caller ask for a
+    // file's smallest queued article without reading the file's articles.
     queued_estimates_by_file: HashMap<NzbFileId, BTreeMap<u32, u32>>,
-    /// The file priority plan currently in force: `(priority, rank)` per
-    /// file, applied to every push of an unprotected item and re-applied to
-    /// the queue only when the plan itself changes.
-    ///
-    /// A requeued retry used to lose its rank (a fresh push carries none) and
-    /// force a full rebuild to get it back. With the plan held here a
-    /// push lands at the right key immediately, so a retry never triggers a
-    /// rebuild and an unchanged plan is a no-op.
+    // The file priority plan currently in force: `(priority, rank)` per
+    // file, applied to every push of an unprotected item and re-applied to
+    // the queue only when the plan itself changes.
+    //
+    // A requeued retry used to lose its rank (a fresh push carries none) and
+    // force a full rebuild to get it back. With the plan held here a
+    // push lands at the right key immediately, so a retry never triggers a
+    // rebuild and an unchanged plan is a no-op.
     file_priority_plan: HashMap<NzbFileId, (u32, Option<u32>)>,
-    /// Items at or below this priority are never touched by the file plan.
+    // Items at or below this priority are never touched by the file plan.
     file_priority_plan_protected: u32,
-    /// Set whenever queued keys are rewritten outside the plan (direct-store
-    /// volume binding, chase gating), so that re-installing an unchanged plan
-    /// still re-asserts it over those keys, as a rebuild always did.
+    // Set whenever queued keys are rewritten outside the plan (direct-store
+    // volume binding, chase gating), so that re-installing an unchanged plan
+    // still re-asserts it over those keys, as a rebuild always did.
     file_priority_plan_stale: bool,
-    /// One article per file — the lowest ordinal each file has. Held here
-    /// rather than on the work item so that every path that puts an article
-    /// back, including a requeue after a lane gave one up, lands it in the
-    /// leading class again without having to know it was a first article.
+    // One article per file — the lowest ordinal each file has. Held here
+    // rather than on the work item so that every path that puts an article
+    // back, including a requeue after a lane gave one up, lands it in the
+    // leading class again without having to know it was a first article.
     first_articles: std::collections::HashSet<SegmentId>,
 }
 
@@ -177,8 +177,8 @@ impl DownloadQueue {
         }
     }
 
-    /// Marks an article as its file's first, which is the class it is served
-    /// in from now on, however often it is requeued.
+    // Marks an article as its file's first, which is the class it is served
+    // in from now on, however often it is requeued.
     pub fn note_first_article(&mut self, segment_id: SegmentId) {
         self.first_articles.insert(segment_id);
     }
@@ -187,8 +187,8 @@ impl DownloadQueue {
         self.first_articles.contains(&segment_id)
     }
 
-    /// Every article this queue holds as a first article, whether or not it is
-    /// still queued.
+    // Every article this queue holds as a first article, whether or not it is
+    // still queued.
     pub fn first_articles(&self) -> impl Iterator<Item = SegmentId> + '_ {
         self.first_articles.iter().copied()
     }
@@ -254,14 +254,14 @@ impl DownloadQueue {
         work
     }
 
-    /// Number of queued items with failure exclusions.
+    // Number of queued items with failure exclusions.
     pub fn excluded_work_count(&self) -> usize {
         self.excluded_work
     }
 
-    /// Drop failure exclusions from all queued work. Used when the server
-    /// config is rebuilt: exclusion indices refer to the old pool layout and
-    /// would mis-target (or spuriously exhaust) servers in the new one.
+    // Drop failure exclusions from all queued work. Used when the server
+    // config is rebuilt: exclusion indices refer to the old pool layout and
+    // would mis-target (or spuriously exhaust) servers in the new one.
     pub fn clear_exclude_servers(&mut self) {
         if self.excluded_work == 0 {
             return;
@@ -298,13 +298,13 @@ impl DownloadQueue {
         self.queued_estimates_by_file = queued_estimates_by_file;
     }
 
-    /// Queued items for one file, in O(1).
+    // Queued items for one file, in O(1).
     pub fn queued_count_for_file(&self, file_id: NzbFileId) -> u32 {
         self.queued_by_file.get(&file_id).copied().unwrap_or(0)
     }
 
-    /// The smallest `byte_estimate` among one file's queued items, in
-    /// O(log n); `None` when the file has nothing queued.
+    // The smallest `byte_estimate` among one file's queued items, in
+    // O(log n); `None` when the file has nothing queued.
     pub fn min_queued_byte_estimate_for_file(&self, file_id: NzbFileId) -> Option<u32> {
         self.queued_estimates_by_file
             .get(&file_id)
@@ -312,8 +312,8 @@ impl DownloadQueue {
             .map(|(estimate, _)| *estimate)
     }
 
-    /// Every queued item, completion-critical class first, each class in
-    /// dispatch order.
+    // Every queued item, completion-critical class first, each class in
+    // dispatch order.
     fn iter(&self) -> impl Iterator<Item = &DownloadWork> {
         self.completion_critical_work
             .values()
@@ -342,14 +342,14 @@ impl DownloadQueue {
             .then(|| self.pop_from_class(completion_critical))?
     }
 
-    /// Removes the highest-priority item matching `matches`, even when another
-    /// work class currently owns the head. The classes are walked in dispatch
-    /// order until the first match, so the cost is O(log n) plus one predicate
-    /// call per item skipped ahead of the match; the skipped items are only
-    /// read, never moved. With an eligible head it is the same O(log n) as
-    /// [`Self::pop`].
-    /// Every dispatch takes this path; the head-only paths above are not
-    /// used by dispatch.
+    // Removes the highest-priority item matching `matches`, even when another
+    // work class currently owns the head. The classes are walked in dispatch
+    // order until the first match, so the cost is O(log n) plus one predicate
+    // call per item skipped ahead of the match; the skipped items are only
+    // read, never moved. With an eligible head it is the same O(log n) as
+    // [`Self::pop`].
+    // Every dispatch takes this path; the head-only paths above are not
+    // used by dispatch.
     pub fn pop_first_matching(
         &mut self,
         mut matches: impl FnMut(&DownloadWork) -> bool,
@@ -444,9 +444,9 @@ impl DownloadQueue {
             .and_then(|(_, work)| matches(work).then_some(work))
     }
 
-    /// Read the same candidate as `pop_first_matching`, including work hidden
-    /// behind an ineligible head: the classes are walked in dispatch order and
-    /// the walk stops at the first match, so an eligible head is O(log n).
+    // Read the same candidate as `pop_first_matching`, including work hidden
+    // behind an ineligible head: the classes are walked in dispatch order and
+    // the walk stops at the first match, so an eligible head is O(log n).
     pub fn peek_first_matching(
         &self,
         mut matches: impl FnMut(&DownloadWork) -> bool,
@@ -454,21 +454,21 @@ impl DownloadQueue {
         self.iter().find(|work| matches(work))
     }
 
-    /// The **highest-numbered** queued segment of the matching work, ignoring
-    /// dispatch priority.
-    ///
-    /// The one caller is the direct-store header probe over a 7z set, whose map
-    /// lives in the last bytes of the last volume. It cannot ask for "the
-    /// article covering offset X": a yEnc article's byte range is only known
-    /// once it has been decoded, and the NZB's own `bytes=` is an *encoded*
-    /// size. Segment order is the only ordering that exists before a byte
-    /// lands, and because a landed article leaves the queue, asking for the
-    /// highest one still queued walks backwards from the tail on its own.
-    ///
-    /// Segment order is not dispatch order — a requeued retry or a file's
-    /// first article sits elsewhere in the key order than its segment number
-    /// says — so this is a scan of every queued item, not a walk from the end
-    /// of the dispatch order.
+    // The **highest-numbered** queued segment of the matching work, ignoring
+    // dispatch priority.
+    //
+    // The one caller is the direct-store header probe over a 7z set, whose map
+    // lives in the last bytes of the last volume. It cannot ask for "the
+    // article covering offset X": a yEnc article's byte range is only known
+    // once it has been decoded, and the NZB's own `bytes=` is an *encoded*
+    // size. Segment order is the only ordering that exists before a byte
+    // lands, and because a landed article leaves the queue, asking for the
+    // highest one still queued walks backwards from the tail on its own.
+    //
+    // Segment order is not dispatch order — a requeued retry or a file's
+    // first article sits elsewhere in the key order than its segment number
+    // says — so this is a scan of every queued item, not a walk from the end
+    // of the dispatch order.
     pub fn peek_last_matching(
         &self,
         mut matches: impl FnMut(&DownloadWork) -> bool,
@@ -478,13 +478,13 @@ impl DownloadQueue {
             .max_by_key(|work| work.segment_id.segment_number)
     }
 
-    /// The **lowest-numbered** queued segment of the matching work, ignoring
-    /// dispatch priority: [`Self::peek_last_matching`] from the other end.
-    ///
-    /// For the direct-store set that must reach the article it routes next.
-    /// A requeued retry sits behind the articles queued before it in dispatch
-    /// order, so the first match in that order can be one the set would only
-    /// hold; the lowest one still queued is the earliest it has not received.
+    // The **lowest-numbered** queued segment of the matching work, ignoring
+    // dispatch priority: [`Self::peek_last_matching`] from the other end.
+    //
+    // For the direct-store set that must reach the article it routes next.
+    // A requeued retry sits behind the articles queued before it in dispatch
+    // order, so the first match in that order can be one the set would only
+    // hold; the lowest one still queued is the earliest it has not received.
     pub fn peek_lowest_matching(
         &self,
         mut matches: impl FnMut(&DownloadWork) -> bool,
@@ -494,11 +494,11 @@ impl DownloadQueue {
             .min_by_key(|work| work.segment_id.segment_number)
     }
 
-    /// The head of one dispatch class without removing it, in O(log n).
-    ///
-    /// For decisions that are about the *shape* of the work rather than the
-    /// work itself — which newsgroups a connection for this job would have to
-    /// be opened for, ahead of any lease being cut.
+    // The head of one dispatch class without removing it, in O(log n).
+    //
+    // For decisions that are about the *shape* of the work rather than the
+    // work itself — which newsgroups a connection for this job would have to
+    // be opened for, ahead of any lease being cut.
     pub fn peek_in_class(&self, completion_critical: bool) -> Option<&DownloadWork> {
         self.class(completion_critical)
             .first_key_value()
@@ -513,11 +513,11 @@ impl DownloadQueue {
         self.completion_critical_work.is_empty() && self.ordinary_work.is_empty()
     }
 
-    /// Queued items in one dispatch class, in O(1).
-    ///
-    /// Lease sizing divides the remaining work of the class it is about to
-    /// lease from, so it must never pay for a queue scan: this is a map
-    /// length, read once per lease.
+    // Queued items in one dispatch class, in O(1).
+    //
+    // Lease sizing divides the remaining work of the class it is about to
+    // lease from, so it must never pay for a queue scan: this is a map
+    // length, read once per lease.
     pub fn len_in_class(&self, completion_critical: bool) -> usize {
         self.class(completion_critical).len()
     }
@@ -530,8 +530,8 @@ impl DownloadQueue {
         self.iter().filter(|work| predicate(work)).count()
     }
 
-    /// Removes and returns every queued item matching the predicate, leaving
-    /// the rest queued in place.
+    // Removes and returns every queued item matching the predicate, leaving
+    // the rest queued in place.
     pub fn extract_matching(
         &mut self,
         mut predicate: impl FnMut(&DownloadWork) -> bool,
@@ -550,11 +550,11 @@ impl DownloadQueue {
         extracted
     }
 
-    /// Adds every queued segment id to `out`.
-    ///
-    /// For callers that build work items from a spec rather than from the
-    /// queue and so must not re-queue an article the queue already owns —
-    /// pushing a second copy would download it twice.
+    // Adds every queued segment id to `out`.
+    //
+    // For callers that build work items from a spec rather than from the
+    // queue and so must not re-queue an article the queue already owns —
+    // pushing a second copy would download it twice.
     pub fn extend_segment_ids(&self, out: &mut std::collections::HashSet<SegmentId>) {
         out.extend(self.iter().map(|work| work.segment_id));
     }
@@ -567,7 +567,7 @@ impl DownloadQueue {
         !self.ordinary_work.is_empty()
     }
 
-    /// Remove and return all queued segments.
+    // Remove and return all queued segments.
     pub fn drain_all(&mut self) -> Vec<DownloadWork> {
         self.excluded_work = 0;
         self.recovery_work = 0;
@@ -579,16 +579,16 @@ impl DownloadQueue {
             .collect()
     }
 
-    /// Installs a per-file `(priority, rank)` plan and applies it to the queued
-    /// work, leaving items at or below `protected` untouched. Returns how many
-    /// queued items changed key.
-    ///
-    /// The plan persists: every later push of an unprotected item for a planned
-    /// file lands at the planned key, so a requeued retry keeps its rank without
-    /// a rebuild. Re-installing an identical plan is a no-op — queued keys are
-    /// only re-keyed when the plan differs from the one in force,
-    /// which is what keeps a burst of retry requeues from costing a re-key pass
-    /// each.
+    // Installs a per-file `(priority, rank)` plan and applies it to the queued
+    // work, leaving items at or below `protected` untouched. Returns how many
+    // queued items changed key.
+    //
+    // The plan persists: every later push of an unprotected item for a planned
+    // file lands at the planned key, so a requeued retry keeps its rank without
+    // a rebuild. Re-installing an identical plan is a no-op — queued keys are
+    // only re-keyed when the plan differs from the one in force,
+    // which is what keeps a burst of retry requeues from costing a re-key pass
+    // each.
     pub fn install_file_priority_plan(
         &mut self,
         plan: HashMap<NzbFileId, (u32, Option<u32>)>,
@@ -620,8 +620,8 @@ impl DownloadQueue {
         changed
     }
 
-    /// Recompute priorities for selected queued work while preserving insertion
-    /// order for work that ends up with the same priority.
+    // Recompute priorities for selected queued work while preserving insertion
+    // order for work that ends up with the same priority.
     pub fn reprioritize_matching(
         &mut self,
         mut priority_for: impl FnMut(&DownloadWork) -> Option<u32>,
@@ -631,8 +631,8 @@ impl DownloadQueue {
         })
     }
 
-    /// Recompute priorities and optional intra-priority ranks for selected queued
-    /// work. Unranked equal-priority work remains ordered by original insertion.
+    // Recompute priorities and optional intra-priority ranks for selected queued
+    // work. Unranked equal-priority work remains ordered by original insertion.
     pub fn reprioritize_matching_with_rank(
         &mut self,
         mut priority_for: impl FnMut(&DownloadWork) -> Option<(u32, Option<u32>)>,
@@ -667,8 +667,8 @@ impl DownloadQueue {
         changed
     }
 
-    /// Moves selected work into the completion-critical class while applying
-    /// its priority and optional intra-priority rank.
+    // Moves selected work into the completion-critical class while applying
+    // its priority and optional intra-priority rank.
     pub fn promote_matching_to_completion_critical_with_rank(
         &mut self,
         mut priority_for: impl FnMut(&DownloadWork) -> Option<(u32, Option<u32>)>,

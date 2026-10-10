@@ -11,15 +11,15 @@ use super::stored::{
 };
 use crate::persistence::database_target::DatabaseTarget;
 
-/// Settings key holding the version that last started against this database.
-/// It is written as soon as the database opens, before first-run configuration
-/// is imported, so it does not make the database hold settings of its own.
+// Settings key holding the version that last started against this database.
+// It is written as soon as the database opens, before first-run configuration
+// is imported, so it does not make the database hold settings of its own.
 pub(crate) const LAST_VERSION: &str = "last_started_version";
 const PENDING_VERSION: &str = "pending_auto_backup_version";
 
-/// Record the version after the database has opened and restore recovery has completed.
-/// A failed pre-upgrade backup remains pending, but a later retry must describe the
-/// migrated database rather than claiming to be the original rollback copy.
+// Record the version after the database has opened and restore recovery has completed.
+// A failed pre-upgrade backup remains pending, but a later retry must describe the
+// migrated database rather than claiming to be the original rollback copy.
 pub fn record_started_version(db: &crate::Database) -> Result<(), BackupServiceError> {
     record_started_version_for(db, env!("CARGO_PKG_VERSION"))
 }
@@ -31,8 +31,8 @@ fn record_started_version_for(
     db.set_setting(LAST_VERSION, version).map_err(io_err)
 }
 
-/// Explicit operator recovery from an unavailable pre-upgrade backup target.
-/// This deliberately forfeits rollback protection for this version transition.
+// Explicit operator recovery from an unavailable pre-upgrade backup target.
+// This deliberately forfeits rollback protection for this version transition.
 pub async fn skip_upgrade_backup(config_path: &Path) -> Result<(), BackupServiceError> {
     let restore_locator = crate::persistence::setup::default_data_dir_for_config_path(config_path);
     if super::pending::pending_restore_status(&restore_locator).is_some() {
@@ -56,7 +56,7 @@ async fn skip_upgrade_backup_for_target(
     Ok(())
 }
 
-/// Explicitly discard only automatic-backup configuration for operator recovery.
+// Explicitly discard only automatic-backup configuration for operator recovery.
 pub async fn reset_automatic_backup_settings(config_path: &Path) -> Result<(), BackupServiceError> {
     let restore_locator = crate::persistence::setup::default_data_dir_for_config_path(config_path);
     if super::pending::pending_restore_status(&restore_locator).is_some() {
@@ -157,8 +157,8 @@ async fn write_marker(
     Ok(())
 }
 
-/// Called only at server startup, before the normal database opener can migrate it.
-/// The caller chooses whether a failure blocks migration; failures retain the retry marker.
+// Called only at server startup, before the normal database opener can migrate it.
+// The caller chooses whether a failure blocks migration; failures retain the retry marker.
 pub async fn prepare_upgrade_backup(config_path: &Path) -> Result<(), BackupServiceError> {
     let target = DatabaseTarget::resolve(config_path).map_err(io_err)?;
     prepare_upgrade_backup_for_target(

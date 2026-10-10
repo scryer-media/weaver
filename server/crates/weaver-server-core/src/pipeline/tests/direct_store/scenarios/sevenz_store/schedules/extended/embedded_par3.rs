@@ -1,19 +1,19 @@
-//! A one-volume stored 7z that carries its own PAR3 recovery set after the
-//! end header, under every arrival order, duplicate, loss, and boundary
-//! action of the combined matrix's shape.
-//!
-//! The volume is four articles. The container fills the first two and part
-//! of the third, which also holds the end header and the recovery set's
-//! leading packets; the fourth is recovery packets only. The set carries
-//! recovery for one article's worth of the container and not two, so which
-//! losses the job survives follows from those four facts alone:
-//!
-//! - slot 1 (member bytes only) is repaired from the tail in place;
-//! - slot 3 (recovery packets only) costs nothing the container needed;
-//! - slot 0 (the start header) leaves no map, so the set demotes and the
-//!   conventional path repairs the file from its own tail;
-//! - slot 2, or any two container slots, or a container slot with the
-//!   recovery-only slot, is beyond what the set can mend.
+// A one-volume stored 7z that carries its own PAR3 recovery set after the
+// end header, under every arrival order, duplicate, loss, and boundary
+// action of the combined matrix's shape.
+//
+// The volume is four articles. The container fills the first two and part
+// of the third, which also holds the end header and the recovery set's
+// leading packets; the fourth is recovery packets only. The set carries
+// recovery for one article's worth of the container and not two, so which
+// losses the job survives follows from those four facts alone:
+//
+// - slot 1 (member bytes only) is repaired from the tail in place;
+// - slot 3 (recovery packets only) costs nothing the container needed;
+// - slot 0 (the start header) leaves no map, so the set demotes and the
+//   conventional path repairs the file from its own tail;
+// - slot 2, or any two container slots, or a container slot with the
+//   recovery-only slot, is beyond what the set can mend.
 use super::super::super::super::archive_schedules::{
     BoundaryAction, DemotionChoice, Interruption, RecoveryFormat, SHARDS, ScheduleOptions,
     arrival_orders, run_schedule_with,
@@ -53,13 +53,13 @@ fn fixture() -> Fixture {
     }
 }
 
-/// Loss masks the set survives; see the module documentation.
+// Loss masks the set survives; see the module documentation.
 fn survivable(mask: u8) -> bool {
     matches!(mask, 0 | 0b0001 | 0b0010 | 0b1000)
 }
 
-/// Every order the combined matrix uses: each arrival order, and each with
-/// an earlier article repeated at every nonterminal point.
+// Every order the combined matrix uses: each arrival order, and each with
+// an earlier article repeated at every nonterminal point.
 fn orders() -> BTreeSet<Vec<(u32, u32)>> {
     let mut orders = BTreeSet::new();
     for order in arrival_orders() {
@@ -77,8 +77,8 @@ fn orders() -> BTreeSet<Vec<(u32, u32)>> {
 
 type Case = (Vec<(u32, u32)>, Interruption);
 
-/// Every case, by replay index. A loss that drops an arrival changes only
-/// what is received, so identical received sequences are one case.
+// Every case, by replay index. A loss that drops an arrival changes only
+// what is received, so identical received sequences are one case.
 fn cases() -> Vec<(usize, Case)> {
     let mut cases = BTreeSet::new();
     for order in orders() {
@@ -135,8 +135,8 @@ fn cases() -> Vec<(usize, Case)> {
         .collect()
 }
 
-/// The default suite's sample: in order, every survivable loss under every
-/// boundary action at the middle boundary, and one loss the set cannot mend.
+// The default suite's sample: in order, every survivable loss under every
+// boundary action at the middle boundary, and one loss the set cannot mend.
 fn smoke() -> Vec<(usize, Case)> {
     let order: Vec<(u32, u32)> = vec![(0, 0), (0, 1), (1, 0), (1, 1)];
     let mut cases = vec![(order.clone(), Interruption::None)];

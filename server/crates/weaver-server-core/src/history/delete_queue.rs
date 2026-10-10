@@ -2,7 +2,7 @@ use crate::bandwidth::PruneFiles;
 use crate::{Database, HistoryDeleteOperationInsertError, HistoryFilter};
 
 impl Database {
-    /// Manual and scheduled deletion use the same durable worker queue.
+    // Manual and scheduled deletion use the same durable worker queue.
     pub fn history_delete_notification(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.history_delete_wake.clone()
     }

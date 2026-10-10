@@ -1,11 +1,11 @@
-//! SIMD and lookup-table accelerated yEnc decoding.
-//!
-//! The decoder keeps the public streaming state in `decode.rs`, but normalizes it
-//! here so the same fast path can serve full-body and chunked decode.
-//!
-//! Line-aware SIMD yEnc decode, validated tier-by-tier against a scalar reference
-//! (Public Domain/CC0), especially `decoder.cc`, `decoder_common.h`,
-//! `decoder_avx2_base.h`, and `decoder_neon64.cc`.
+// SIMD and lookup-table accelerated yEnc decoding.
+//
+// The decoder keeps the public streaming state in `decode.rs`, but normalizes it
+// here so the same fast path can serve full-body and chunked decode.
+//
+// Line-aware SIMD yEnc decode, validated tier-by-tier against a scalar reference
+// (Public Domain/CC0), especially `decoder.cc`, `decoder_common.h`,
+// `decoder_avx2_base.h`, and `decoder_neon64.cc`.
 
 use crate::decode::{DecodeState, RapidyencDecodeEnd, RapidyencDecodeState};
 use crate::error::YencError;
@@ -161,7 +161,7 @@ fn sanitize_line_length(line_length: Option<u32>) -> Option<usize> {
         .filter(|&value| value > 0)
 }
 
-/// Decode a complete body buffer with the SIMD-capable internal kernel.
+// Decode a complete body buffer with the SIMD-capable internal kernel.
 #[cfg(test)]
 pub(crate) fn decode_body_into(
     input: &[u8],
@@ -181,25 +181,25 @@ pub(crate) fn decode_body_into_with_line_length(
     Ok(decode_kernel(input, output, &mut state, dot_unstuffing, false, false)?.written)
 }
 
-/// Input bytes decoded between CRC folds by [`decode_raw_body_until_end_crc`].
-///
-/// A stretch's input and output together stay inside one core's share of a
-/// shared L2 (512 KiB where four cores share 2 MiB), and a typical article
-/// takes about three stretches, so the extra kernel and fold calls cost the
-/// cores whose private L2 already holds the output almost nothing.
+// Input bytes decoded between CRC folds by [`decode_raw_body_until_end_crc`].
+//
+// A stretch's input and output together stay inside one core's share of a
+// shared L2 (512 KiB where four cores share 2 MiB), and a typical article
+// takes about three stretches, so the extra kernel and fold calls cost the
+// cores whose private L2 already holds the output almost nothing.
 const CRC_FOLD_STRETCH: usize = 256 * 1024;
 
-/// Decode a whole raw (dot-stuffed) body, stopping where the kernel's end
-/// detection stops (the first `=y` at a line start, or the NNTP terminator),
-/// with the CRC of the decoded bytes folded into `crc`.
-///
-/// Where the bounded raw kernel exists the body is decoded in stretches of
-/// about [`CRC_FOLD_STRETCH`] input bytes and each stretch's output is folded
-/// while it is still in L2. Folding the whole output after one decode call
-/// reads it back from L3 or memory once an article outgrows L2, which costs
-/// most where L2 is shared and small.
-/// The stretches end on 64-byte boundaries with the kernel's lookahead still
-/// in view, so the result is byte-for-byte that of one whole-body call.
+// Decode a whole raw (dot-stuffed) body, stopping where the kernel's end
+// detection stops (the first `=y` at a line start, or the NNTP terminator),
+// with the CRC of the decoded bytes folded into `crc`.
+//
+// Where the bounded raw kernel exists the body is decoded in stretches of
+// about [`CRC_FOLD_STRETCH`] input bytes and each stretch's output is folded
+// while it is still in L2. Folding the whole output after one decode call
+// reads it back from L3 or memory once an article outgrows L2, which costs
+// most where L2 is shared and small.
+// The stretches end on 64-byte boundaries with the kernel's lookahead still
+// in view, so the result is byte-for-byte that of one whole-body call.
 pub(crate) fn decode_raw_body_until_end_crc(
     input: &[u8],
     output: &mut [u8],
@@ -245,8 +245,8 @@ fn decode_raw_body_until_end_crc_in(
     })
 }
 
-/// The bounded stretches of [`decode_raw_body_until_end_crc`], each folded
-/// into `crc`; returns the (consumed, written) cursors the tail resumes from.
+// The bounded stretches of [`decode_raw_body_until_end_crc`], each folded
+// into `crc`; returns the (consumed, written) cursors the tail resumes from.
 #[cfg(target_arch = "x86_64")]
 fn decode_raw_stretches(
     input: &[u8],
@@ -298,7 +298,7 @@ fn decode_raw_stretches(
     Ok((0, 0))
 }
 
-/// Rebase a sliced kernel's `MalformedEscape` offset onto the whole input.
+// Rebase a sliced kernel's `MalformedEscape` offset onto the whole input.
 fn shift_escape_error(err: YencError, by: usize) -> YencError {
     match err {
         YencError::MalformedEscape(at) => YencError::MalformedEscape(at + by),
@@ -306,7 +306,7 @@ fn shift_escape_error(err: YencError, by: usize) -> YencError {
     }
 }
 
-/// Decode one streaming body chunk with carry state preserved across calls.
+// Decode one streaming body chunk with carry state preserved across calls.
 pub(crate) fn decode_chunk_into(
     input: &[u8],
     output: &mut [u8],
@@ -339,7 +339,7 @@ pub(crate) fn decode_chunk_until_end_into(
     Ok(outcome)
 }
 
-/// Decode a chunk carrying an explicit decoder state; `is_raw` toggles dot-unstuffing.
+// Decode a chunk carrying an explicit decoder state; `is_raw` toggles dot-unstuffing.
 pub(crate) fn decode_rapidyenc_into(
     input: &[u8],
     output: &mut [u8],
@@ -387,7 +387,7 @@ pub(crate) fn decode_rapidyenc_into(
     Ok(written)
 }
 
-/// Incremental decode that stops and reports at a yEnc/NNTP end marker.
+// Incremental decode that stops and reports at a yEnc/NNTP end marker.
 pub(crate) fn decode_rapidyenc_incremental_into(
     input: &[u8],
     output: &mut [u8],
@@ -472,8 +472,8 @@ fn decode_kernel(
     }
 }
 
-/// The SIMD decode tier the production dispatcher selected on this host, as
-/// reported by [`selected_decoder_tier`].
+// The SIMD decode tier the production dispatcher selected on this host, as
+// reported by [`selected_decoder_tier`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SelectedDecoderTier {
     Avx512Vbmi2,
@@ -501,11 +501,11 @@ impl SelectedDecoderTier {
     }
 }
 
-/// The x86 decode tier this CPU dispatches to.
-///
-/// Split out of [`dispatch_x86_decode_kernel`] so the tier decision has one
-/// home: the dispatcher and the [`selected_decoder_tier`] reporting surface
-/// read the same answer and cannot drift.
+// The x86 decode tier this CPU dispatches to.
+//
+// Split out of [`dispatch_x86_decode_kernel`] so the tier decision has one
+// home: the dispatcher and the [`selected_decoder_tier`] reporting surface
+// read the same answer and cannot drift.
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum X86Tier {
@@ -556,7 +556,7 @@ fn x86_tier() -> X86Tier {
     }
 }
 
-/// Return the exact SIMD tier selected by the production decoder dispatcher.
+// Return the exact SIMD tier selected by the production decoder dispatcher.
 pub fn selected_decoder_tier() -> SelectedDecoderTier {
     #[cfg(target_arch = "x86_64")]
     {
@@ -604,18 +604,18 @@ mod selected_decoder_tier_tests {
     }
 }
 
-/// Resolve the x86 decode tier once per process, not once per call.
-///
-/// The `is_x86_feature_detected!` chain is cheap but not free (an atomic load
-/// plus mask tests per feature), and the two guardrail helpers each issue a raw
-/// `CPUID` — a serializing instruction, and on some hypervisors a VM exit. That
-/// whole chain used to run on EVERY `decode_kernel` call, i.e. once per decoded
-/// chunk. Memoized behind a `OnceLock` (same shape as
-/// [`dispatch_x86_decode_normal_run`]), it runs once and the steady state is a
-/// single acquire load plus an indirect call.
-///
-/// Argument-dependent routing (the compact-output scalar fallback) stays at the
-/// call site — only the CPU-feature decision is cached here.
+// Resolve the x86 decode tier once per process, not once per call.
+//
+// The `is_x86_feature_detected!` chain is cheap but not free (an atomic load
+// plus mask tests per feature), and the two guardrail helpers each issue a raw
+// `CPUID` — a serializing instruction, and on some hypervisors a VM exit. That
+// whole chain used to run on EVERY `decode_kernel` call, i.e. once per decoded
+// chunk. Memoized behind a `OnceLock` (same shape as
+// [`dispatch_x86_decode_normal_run`]), it runs once and the steady state is a
+// single acquire load plus an indirect call.
+//
+// Argument-dependent routing (the compact-output scalar fallback) stays at the
+// call site — only the CPU-feature decision is cached here.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn dispatch_x86_decode_kernel() -> DecodeKernelFn {
@@ -633,20 +633,20 @@ fn dispatch_x86_decode_kernel() -> DecodeKernelFn {
     })
 }
 
-/// The complete feature set the AVX-512 VBMI2 decode tier requires.
-///
-/// This is the single source of truth for "the VBMI2 tier is usable here": the
-/// dispatcher above gates on it, and the per-tier differential tests gate their
-/// VBMI2 legs on the same predicate, so a tier that CI thinks it exercised can
-/// never be one the dispatcher would have declined (or vice versa).
-///
-/// It is wider than the AVX-512 subsets the kernels name in `#[target_feature]`
-/// because those kernels also compile their scalar mask math with the
-/// BMI/POPCNT/LZCNT sets. Every VBMI2-capable CPU has them, but the portable
-/// build otherwise leaves ~20% on the table versus the same build with the
-/// features enabled globally (measured 45.6 -> 36.6 us realshape on Zen 4).
-/// Detecting them keeps the unsafe contract honest rather than
-/// architecture-implied.
+// The complete feature set the AVX-512 VBMI2 decode tier requires.
+//
+// This is the single source of truth for "the VBMI2 tier is usable here": the
+// dispatcher above gates on it, and the per-tier differential tests gate their
+// VBMI2 legs on the same predicate, so a tier that CI thinks it exercised can
+// never be one the dispatcher would have declined (or vice versa).
+//
+// It is wider than the AVX-512 subsets the kernels name in `#[target_feature]`
+// because those kernels also compile their scalar mask math with the
+// BMI/POPCNT/LZCNT sets. Every VBMI2-capable CPU has them, but the portable
+// build otherwise leaves ~20% on the table versus the same build with the
+// features enabled globally (measured 45.6 -> 36.6 us realshape on Zen 4).
+// Detecting them keeps the unsafe contract honest rather than
+// architecture-implied.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn vbmi2_tier_available() -> bool {
     is_x86_feature_detected!("avx512vbmi2")
@@ -738,12 +738,12 @@ fn write_decoded(output: &mut [u8], dst: &mut usize, byte: u8) -> Result<(), Yen
     Ok(())
 }
 
-/// Decode a run of "normal" yEnc bytes (no special characters) by subtracting 42.
-///
-/// Scans `input` from position `start`, decoding bytes into `output` at position
-/// `dst_start`. Stops at the first special character (`=`, `\r`, `\n`) or end of input.
-///
-/// Returns `(bytes_consumed_from_input, bytes_written_to_output)`.
+// Decode a run of "normal" yEnc bytes (no special characters) by subtracting 42.
+//
+// Scans `input` from position `start`, decoding bytes into `output` at position
+// `dst_start`. Stops at the first special character (`=`, `\r`, `\n`) or end of input.
+//
+// Returns `(bytes_consumed_from_input, bytes_written_to_output)`.
 #[inline]
 pub fn decode_normal_run(
     input: &[u8],

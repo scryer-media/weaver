@@ -6,7 +6,7 @@ use weaver_tunnel::{
     pipe::{Purpose, Resolution},
 };
 
-/// A feed attempt owns one concrete path for both DNS validation and HTTP.
+// A feed attempt owns one concrete path for both DNS validation and HTTP.
 pub struct FeedAttempt {
     route: Arc<LiveNetworkRoute>,
     guard: Arc<Revocable>,
@@ -22,15 +22,15 @@ pub struct FeedAttempt {
     transport_error: Mutex<Option<Arc<DialError>>>,
     setups: Mutex<Vec<weaver_tunnel::pipe::SetupHandle>>,
     last_member: bool,
-    /// The leg's final attempt this sync: no later rung, and no direct
-    /// fallback, remains after it.
+    // The leg's final attempt this sync: no later rung, and no direct
+    // fallback, remains after it.
     last_attempt: bool,
-    /// The addresses the fetch checked for its host, so a direct dial uses
-    /// exactly those instead of resolving again.
+    // The addresses the fetch checked for its host, so a direct dial uses
+    // exactly those instead of resolving again.
     addresses: Mutex<Option<(String, Vec<IpAddr>)>>,
 }
 impl FeedAttempt {
-    /// Pins the checked addresses a direct dial of `host` uses.
+    // Pins the checked addresses a direct dial of `host` uses.
     pub fn pin_addresses(&self, host: &str, addresses: Vec<IpAddr>) {
         *self.addresses.lock().expect("feed addresses") = Some((host.to_owned(), addresses));
     }

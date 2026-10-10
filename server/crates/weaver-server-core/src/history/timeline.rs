@@ -6,7 +6,7 @@ use crate::persistence::sql_runtime::{
 use crate::persistence::{Database, DatabaseWriterExecutor};
 use sqlx::{Postgres, QueryBuilder, Sqlite};
 
-/// A persisted job event.
+// A persisted job event.
 #[derive(Debug, Clone)]
 pub struct JobEvent {
     pub job_id: u64,
@@ -16,7 +16,7 @@ pub struct JobEvent {
     pub file_id: Option<String>,
 }
 
-/// A job event read from durable storage together with its stable row id.
+// A job event read from durable storage together with its stable row id.
 #[derive(Debug, Clone)]
 pub struct JobEventRecord {
     pub id: u64,
@@ -33,7 +33,7 @@ impl std::ops::Deref for JobEventRecord {
 
 pub const JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER: &str = "__timeline:finalizing-download";
 
-/// Per-job (kind, first_ts, last_ts) event bounds keyed by job id.
+// Per-job (kind, first_ts, last_ts) event bounds keyed by job id.
 pub type JobEventStageBounds = std::collections::HashMap<u64, Vec<(String, i64, i64)>>;
 
 async fn bulk_insert_job_events_tx(
@@ -149,7 +149,7 @@ async fn insert_job_events_sql(
 }
 
 impl Database {
-    /// Insert a single job event.
+    // Insert a single job event.
     pub fn insert_job_event(
         &self,
         job_id: u64,
@@ -180,7 +180,7 @@ impl Database {
         })
     }
 
-    /// Batch-insert job events in a single transaction.
+    // Batch-insert job events in a single transaction.
     pub fn insert_job_events(&self, events: &[JobEvent]) -> Result<(), StateError> {
         if events.is_empty() {
             return Ok(());
@@ -191,7 +191,7 @@ impl Database {
         self.run_sql_blocking(insert_job_events_sql(datastore, events))
     }
 
-    /// Load all events for a specific job, ordered by insertion order.
+    // Load all events for a specific job, ordered by insertion order.
     pub fn get_job_events(&self, job_id: u64) -> Result<Vec<JobEvent>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -218,17 +218,17 @@ impl Database {
         })
     }
 
-    /// Load the most recent events for a job, ordered oldest-first, capped at
-    /// `cap` rows.
-    ///
-    /// Unlike [`Database::get_job_events`], which scans a job's entire event log,
-    /// this reads only the newest `cap` rows (`ORDER BY id DESC LIMIT cap`) and
-    /// reverses them in Rust so the returned slice is still oldest-first. It is
-    /// intended for read-only views that re-poll frequently and only render the
-    /// tail of a potentially huge log (large RAR jobs write several rows per
-    /// extracted member). Callers that need the full log — such as the pipeline
-    /// restore path that scans for a finalization marker — must keep using
-    /// [`Database::get_job_events`].
+    // Load the most recent events for a job, ordered oldest-first, capped at
+    // `cap` rows.
+    //
+    // Unlike [`Database::get_job_events`], which scans a job's entire event log,
+    // this reads only the newest `cap` rows (`ORDER BY id DESC LIMIT cap`) and
+    // reverses them in Rust so the returned slice is still oldest-first. It is
+    // intended for read-only views that re-poll frequently and only render the
+    // tail of a potentially huge log (large RAR jobs write several rows per
+    // extracted member). Callers that need the full log — such as the pipeline
+    // restore path that scans for a finalization marker — must keep using
+    // [`Database::get_job_events`].
     pub fn get_job_events_latest(
         &self,
         job_id: u64,
@@ -262,8 +262,8 @@ impl Database {
         })
     }
 
-    /// Load the most recent events for a job with their stable database ids.
-    /// Results are returned oldest-first after the capped newest-row query.
+    // Load the most recent events for a job with their stable database ids.
+    // Results are returned oldest-first after the capped newest-row query.
     pub fn get_job_event_records_latest(
         &self,
         job_id: u64,
@@ -299,9 +299,9 @@ impl Database {
         })
     }
 
-    /// Batched min/max event timestamps per (job, kind) for stage-duration
-    /// reporting. One query regardless of how many jobs are listed; only the
-    /// stage-boundary kinds in `kinds` are scanned.
+    // Batched min/max event timestamps per (job, kind) for stage-duration
+    // reporting. One query regardless of how many jobs are listed; only the
+    // stage-boundary kinds in `kinds` are scanned.
     pub fn get_job_event_stage_bounds(
         &self,
         job_ids: &[u64],
@@ -344,12 +344,12 @@ impl Database {
         })
     }
 
-    /// Batched newest-first event read across multiple jobs in a single
-    /// query. Floored at the stable database row `min_id` and capped at
-    /// `limit` rows total (not per job).
-    ///
-    /// Unlike [`Database::get_job_events_latest`], the result is returned in
-    /// the raw `ORDER BY id DESC` order (newest first) and is not reversed.
+    // Batched newest-first event read across multiple jobs in a single
+    // query. Floored at the stable database row `min_id` and capped at
+    // `limit` rows total (not per job).
+    //
+    // Unlike [`Database::get_job_events_latest`], the result is returned in
+    // the raw `ORDER BY id DESC` order (newest first) and is not reversed.
     pub fn get_recent_job_events_multi(
         &self,
         job_ids: &[u64],
@@ -394,7 +394,7 @@ impl Database {
         })
     }
 
-    /// Delete all events for a job.
+    // Delete all events for a job.
     pub fn delete_job_events(&self, job_id: u64) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -408,7 +408,7 @@ impl Database {
         })
     }
 
-    /// Delete all job events across all jobs.
+    // Delete all job events across all jobs.
     pub fn delete_all_job_events(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {

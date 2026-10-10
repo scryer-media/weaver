@@ -1,11 +1,11 @@
-//! Standalone weaver-yenc decode timing harness (no rapidyenc dependency).
-//!
-//! Times `decode_rapidyenc` on the same five fixtures as the parity bench so a
-//! before/after can be taken on a box where the rapidyenc shared library is not
-//! available. Prints min + median microseconds per fixture over a fixed iter
-//! count; compare min against the recorded rapidyenc baseline for the box.
-//!
-//!   cargo run --release --example decode_timing
+// Standalone weaver-yenc decode timing harness (no rapidyenc dependency).
+//
+// Times `decode_rapidyenc` on the same five fixtures as the parity bench so a
+// before/after can be taken on a box where the rapidyenc shared library is not
+// available. Prints min + median microseconds per fixture over a fixed iter
+// count; compare min against the recorded rapidyenc baseline for the box.
+//
+//   cargo run --release --example decode_timing
 
 use std::time::Instant;
 

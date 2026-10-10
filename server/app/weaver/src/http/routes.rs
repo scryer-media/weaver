@@ -18,8 +18,8 @@ pub(super) enum HostRejection {
     BadRequest,
 }
 
-/// The single authority the `Host` header names, if it carries one. More than
-/// one header, or one that is not an authority, is a malformed request.
+// The single authority the `Host` header names, if it carries one. More than
+// one header, or one that is not an authority, is a malformed request.
 pub(super) fn host_header_authority(
     headers: &axum::http::HeaderMap,
 ) -> Result<Option<HttpAuthority>, HostRejection> {
@@ -277,9 +277,9 @@ pub(super) fn with_http_host_validation(router: Router, security: RuntimeSecurit
     }))
 }
 
-/// Browser protections every response carries, including refusals: the UI is
-/// never framed, content types are never sniffed, and paths under a base URL
-/// never leak to other sites through `Referer`.
+// Browser protections every response carries, including refusals: the UI is
+// never framed, content types are never sniffed, and paths under a base URL
+// never leak to other sites through `Referer`.
 pub(super) fn with_response_hardening(router: Router) -> Router {
     router.layer(middleware::from_fn(|req: Request, next: Next| async move {
         let mut response = next.run(req).await;

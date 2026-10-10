@@ -1,21 +1,21 @@
-//! Recording test doubles. One struct implements all three barrier traits, so
-//! Range set
-//! Codec
-//! Barrier triggers
-//! Refused writes
-//! Barrier ordering and failure handling
-//! Failure backoff
-//! The stamped plan digest tracks the set's facts
-//! Retiring one destination (task_9ee23560)
-//! One row per set, independent of volume count
-//! Restart
-//! Floor to segment derivation
-//! The real database seam
-//! Gate
-//! Router internals: the pieces every routed byte passes through
-//! The hybrid virtual-volume provider
-//! The re-encrypting overlay
-//! The reconstruction sweep, and the verification that gates it
+// Recording test doubles. One struct implements all three barrier traits, so
+// Range set
+// Codec
+// Barrier triggers
+// Refused writes
+// Barrier ordering and failure handling
+// Failure backoff
+// The stamped plan digest tracks the set's facts
+// Retiring one destination (task_9ee23560)
+// One row per set, independent of volume count
+// Restart
+// Floor to segment derivation
+// The real database seam
+// Gate
+// Router internals: the pieces every routed byte passes through
+// The hybrid virtual-volume provider
+// The re-encrypting overlay
+// The reconstruction sweep, and the verification that gates it
 
 use super::*;
 
@@ -210,8 +210,8 @@ fn two_thousand_volume_snapshot_round_trips_in_a_sane_blob() {
     assert_eq!(decode(&blob).unwrap(), snapshot);
 }
 
-/// The body a v6 writer produced: the v7 fields but the identity binding, in
-/// the same positional order.
+// The body a v6 writer produced: the v7 fields but the identity binding, in
+// the same positional order.
 fn encode_v6(snapshot: &CoverageSnapshot) -> Vec<u8> {
     let body = rmp_serde::to_vec(&(
         snapshot.generation,
@@ -797,10 +797,10 @@ fn a_persist_failure_leaves_the_previous_checkpoint_authoritative() {
     );
 }
 
-/// Step 4 can only fail by dying: publish is pure in-memory bookkeeping, and
-/// `DIRECT_STORE_BARRIER_PUBLISH` aborts the process. What a restart then sees
-/// is the row step 3 committed, which is exactly the interval's floors — and
-/// nothing that happened after it.
+// Step 4 can only fail by dying: publish is pure in-memory bookkeeping, and
+// `DIRECT_STORE_BARRIER_PUBLISH` aborts the process. What a restart then sees
+// is the row step 3 committed, which is exactly the interval's floors — and
+// nothing that happened after it.
 #[test]
 fn a_crash_between_persist_and_publish_leaves_the_committed_checkpoint_authoritative() {
     let mut barrier = sample_barrier();
@@ -1418,10 +1418,10 @@ async fn restart_refuses_a_plan_digest_mismatch() {
     );
 }
 
-/// The digest still discriminates. Re-stamping it as a set's members are
-/// discovered makes the *label* track the plan; it must not make the label stop
-/// meaning anything, or a row written against genuinely different member facts
-/// would be trusted for coverage it cannot describe.
+// The digest still discriminates. Re-stamping it as a set's members are
+// discovered makes the *label* track the plan; it must not make the label stop
+// meaning anything, or a row written against genuinely different member facts
+// would be trusted for coverage it cannot describe.
 #[tokio::test]
 async fn restart_refuses_a_row_written_under_different_member_facts() {
     let plan = envelope_plan();
@@ -1766,10 +1766,10 @@ fn refetch_floors_take_the_lowest_floor_for_a_repeated_file_index() {
 // The real database seam
 // ---------------------------------------------------------------------------
 
-/// The barrier's persist step against a real database rather than a test
-/// double. The codec's blob-size test proves something about memory; this
-/// proves the same blob survives the round trip it will actually make —
-/// encode, one replaced row, read back, decode, every floor intact.
+// The barrier's persist step against a real database rather than a test
+// double. The codec's blob-size test proves something about memory; this
+// proves the same blob survives the round trip it will actually make —
+// encode, one replaced row, read back, decode, every floor intact.
 #[test]
 fn a_two_thousand_floor_checkpoint_round_trips_through_the_database() {
     let database = crate::Database::open_in_memory().unwrap();
@@ -1951,8 +1951,8 @@ fn settings_resolve_env_over_config_over_default() {
     );
 }
 
-/// The process-wide limits follow the host when nothing configures them, and
-/// config and the environment override them like every other field.
+// The process-wide limits follow the host when nothing configures them, and
+// config and the environment override them like every other field.
 #[test]
 fn settings_derive_the_shared_limits_from_the_host() {
     use super::super::router::HOLDS_SCRATCH_CEILING_BYTES;
@@ -2059,9 +2059,9 @@ fn settings_derive_the_shared_limits_from_the_host() {
     );
 }
 
-/// A hardware profile caps only the resident limit Weaver derives: the widest
-/// profiles leave it where the host puts it, the efficient one holds it to
-/// 256 MiB, and a configured or environment limit is never capped.
+// A hardware profile caps only the resident limit Weaver derives: the widest
+// profiles leave it where the host puts it, the efficient one holds it to
+// 256 MiB, and a configured or environment limit is never capped.
 #[test]
 fn settings_cap_the_derived_resident_limit_by_hardware_profile() {
     use super::super::{DirectStoreEnv, DirectStoreSettings, HostFacts};
@@ -2396,13 +2396,13 @@ fn a_sparse_image_reads_across_run_boundaries_and_stops_at_every_hole() {
     assert_eq!(refused.kind(), std::io::ErrorKind::Unsupported);
 }
 
-/// The split this plan exists to state: **payload** goes to the staging root on
-/// the complete volume, **working data** stays in the intermediate directory.
-///
-/// Both halves are asserted, because only asserting the first would pass for a
-/// change that moved the whole set — and moving the holds scratch onto the
-/// complete volume would put a write-once append log, read back one paged region
-/// at a time, on a network filesystem for no benefit at all.
+// The split this plan exists to state: **payload** goes to the staging root on
+// the complete volume, **working data** stays in the intermediate directory.
+//
+// Both halves are asserted, because only asserting the first would pass for a
+// change that moved the whole set — and moving the holds scratch onto the
+// complete volume would put a write-once append log, read back one paged region
+// at a time, on a network filesystem for no benefit at all.
 #[test]
 fn member_payload_resolves_under_the_staging_root_and_scratch_under_the_working_dir() {
     let plan = envelope_plan();
@@ -2451,14 +2451,14 @@ fn member_payload_resolves_under_the_staging_root_and_scratch_under_the_working_
     }
 }
 
-/// The tripwire for the rule a cross-device rename would break.
-///
-/// Direct-store performs exactly one rename — `finalize_direct_set` turning a
-/// member's `.direct.partial` into the member — and its two sides must resolve
-/// under the *same* root. A temp-then-rename whose temp is created in the
-/// working directory returns `EXDEV` the moment intermediate and complete are
-/// different filesystems, which is precisely the copy this split removes; a unit
-/// test cannot make two filesystems, but it can hold the derivation to the rule.
+// The tripwire for the rule a cross-device rename would break.
+//
+// Direct-store performs exactly one rename — `finalize_direct_set` turning a
+// member's `.direct.partial` into the member — and its two sides must resolve
+// under the *same* root. A temp-then-rename whose temp is created in the
+// working directory returns `EXDEV` the moment intermediate and complete are
+// different filesystems, which is precisely the copy this split removes; a unit
+// test cannot make two filesystems, but it can hold the derivation to the rule.
 #[test]
 fn the_commit_rename_never_crosses_a_root() {
     let plan = envelope_plan();
@@ -2473,8 +2473,8 @@ fn the_commit_rename_never_crosses_a_root() {
     }
 }
 
-/// A destination key decides the root, and it is the key rather than the path
-/// text that decides it.
+// A destination key decides the root, and it is the key rather than the path
+// text that decides it.
 #[test]
 fn a_barrier_destination_resolves_against_the_root_its_key_names() {
     let plan = envelope_plan();
@@ -2501,13 +2501,13 @@ fn a_barrier_destination_resolves_against_the_root_its_key_names() {
     }
 }
 
-/// Every derived namespace carries the set discriminator, because every one of
-/// them can be reached by two sets of one job:
-/// member names are shared freely between archives, and `sanitize_dirname` is
-/// many-to-one, so `A/B` and `A_B` are one stem. The discriminator — the set's
-/// lowest NZB file index, unique per job by construction — is what keeps them
-/// two files. The holds scratch had this from the start; the other three
-/// namespaces found out the slow way.
+// Every derived namespace carries the set discriminator, because every one of
+// them can be reached by two sets of one job:
+// member names are shared freely between archives, and `sanitize_dirname` is
+// many-to-one, so `A/B` and `A_B` are one stem. The discriminator — the set's
+// lowest NZB file index, unique per job by construction — is what keeps them
+// two files. The holds scratch had this from the start; the other three
+// namespaces found out the slow way.
 #[test]
 fn two_sets_of_one_job_never_share_a_derived_path() {
     let first = envelope_plan();
@@ -2562,11 +2562,11 @@ fn two_sets_of_one_job_never_share_a_derived_path() {
     );
 }
 
-/// Envelope v2 replaces the first shape's
-/// `envelope_offsets_split_each_volume_slot…` test, which asserted a 64 KiB
-/// half-slot layout that no longer exists: there is no slot arithmetic to
-/// overflow, because a byte's envelope offset *is* its physical offset in the
-/// volume.
+// Envelope v2 replaces the first shape's
+// `envelope_offsets_split_each_volume_slot…` test, which asserted a 64 KiB
+// half-slot layout that no longer exists: there is no slot arithmetic to
+// overflow, because a byte's envelope offset *is* its physical offset in the
+// volume.
 #[test]
 fn each_volume_owns_a_separate_sparse_envelope_file() {
     let plan = envelope_plan();
@@ -2878,11 +2878,11 @@ fn a_finalized_set_refuses_to_be_demoted() {
 // The hybrid virtual-volume provider
 // ---------------------------------------------------------------------------
 
-/// A hold is a posted byte too. The bytes a router could not route yet — an
-/// encrypted member's edge block waiting for the article on the other side of a
-/// hole — sit in staging, and the virtual volume serves them from there: read
-/// as posted, claimed as coverage, and composed against the article CRC like
-/// every placed byte around them.
+// A hold is a posted byte too. The bytes a router could not route yet — an
+// encrypted member's edge block waiting for the article on the other side of a
+// hole — sit in staging, and the virtual volume serves them from there: read
+// as posted, claimed as coverage, and composed against the article CRC like
+// every placed byte around them.
 #[test]
 fn a_virtual_volume_serves_its_holds_as_posted_bytes() {
     use std::io::Read;
@@ -2936,9 +2936,9 @@ fn a_virtual_volume_serves_its_holds_as_posted_bytes() {
     assert_eq!(std::fs::read(&path).unwrap(), fixture.conventional);
 }
 
-/// A hold the budget paged out is served from the scratch image, positionally,
-/// when a read lands on it. The provider owns no copy: what the budget paged
-/// out stays out, whatever the size of the holds.
+// A hold the budget paged out is served from the scratch image, positionally,
+// when a read lands on it. The provider owns no copy: what the budget paged
+// out stays out, whatever the size of the holds.
 #[test]
 fn a_virtual_volume_reads_a_paged_hold_from_the_scratch_on_demand() {
     use std::io::{Read, Seek, SeekFrom};
@@ -3577,13 +3577,13 @@ fn a_covered_run_with_no_composed_reference_refuses_only_the_articles_it_covers(
     );
 }
 
-/// The repair scratch carries a run that stops inside an article through: the
-/// composition vouches for it up to the last article boundary, and the placed
-/// prefix of the article it stops inside is written after that with no
-/// reference. An encrypted member's frontier before a hole is always this shape
-/// — its final cipher block waits for the block after it — and PAR2 needs the
-/// slices it judged valid there as repair input, so refusing the run demoted
-/// every encrypted set the moment it needed a repair.
+// The repair scratch carries a run that stops inside an article through: the
+// composition vouches for it up to the last article boundary, and the placed
+// prefix of the article it stops inside is written after that with no
+// reference. An encrypted member's frontier before a hole is always this shape
+// — its final cipher block waits for the block after it — and PAR2 needs the
+// slices it judged valid there as repair input, so refusing the run demoted
+// every encrypted set the moment it needed a repair.
 #[test]
 fn a_repair_scratch_carries_a_run_that_stops_inside_an_article() {
     let fixture = provider_fixture(whole_volume_covered());
@@ -3620,9 +3620,9 @@ fn a_repair_scratch_carries_a_run_that_stops_inside_an_article() {
     );
 }
 
-/// The carried remainder is exactly one article's placed prefix: a run that
-/// starts off a boundary, or reaches past the article the composition knows,
-/// is bytes no article record accounts for and is refused as before.
+// The carried remainder is exactly one article's placed prefix: a run that
+// starts off a boundary, or reaches past the article the composition knows,
+// is bytes no article record accounts for and is refused as before.
 #[test]
 fn a_carried_remainder_must_be_the_prefix_of_one_known_article() {
     let fixture = provider_fixture(whole_volume_covered());
@@ -3684,8 +3684,8 @@ fn a_carried_remainder_must_be_the_prefix_of_one_known_article() {
     );
 }
 
-/// Carrying the remainder does not loosen the check on what comes before it:
-/// the whole articles of the run are still verified against the composition.
+// Carrying the remainder does not loosen the check on what comes before it:
+// the whole articles of the run are still verified against the composition.
 #[test]
 fn a_carried_remainder_still_verifies_the_articles_before_it() {
     let fixture = provider_fixture(whole_volume_covered());
@@ -3718,8 +3718,8 @@ fn a_carried_remainder_still_verifies_the_articles_before_it() {
     assert!(path.exists());
 }
 
-/// Article records for `articles`, each `(start, len)` taken off `bytes`: the
-/// composition a process that placed only those articles would hold.
+// Article records for `articles`, each `(start, len)` taken off `bytes`: the
+// composition a process that placed only those articles would hold.
 fn article_crcs_for(bytes: &[u8], articles: &[(usize, usize)]) -> CrcRuns {
     let mut runs = CrcRuns::default();
     for &(start, len) in articles {
@@ -3732,11 +3732,11 @@ fn article_crcs_for(bytes: &[u8], articles: &[(usize, usize)]) -> CrcRuns {
     runs
 }
 
-/// After a restart the composition holds nothing for the bytes a checkpoint
-/// restored, so a volume that needs repair would refuse every byte placed
-/// before the restart and demote. The repair scratch carries a restored
-/// stretch with no record through, and still verifies every article this
-/// process recorded after it.
+// After a restart the composition holds nothing for the bytes a checkpoint
+// restored, so a volume that needs repair would refuse every byte placed
+// before the restart and demote. The repair scratch carries a restored
+// stretch with no record through, and still verifies every article this
+// process recorded after it.
 #[test]
 fn a_repair_scratch_carries_restored_bytes_with_no_record() {
     let fixture = provider_fixture(whole_volume_covered());
@@ -3771,9 +3771,9 @@ fn a_repair_scratch_carries_restored_bytes_with_no_record() {
     assert_eq!(&written[..400], &fixture.conventional[..400]);
 }
 
-/// The carry stops where the restored bytes do. A covered stretch past them
-/// that no record accounts for is bytes this process placed and cannot vouch
-/// for, and is refused exactly as it would be without a restart.
+// The carry stops where the restored bytes do. A covered stretch past them
+// that no record accounts for is bytes this process placed and cannot vouch
+// for, and is refused exactly as it would be without a restart.
 #[test]
 fn a_restored_carry_never_reaches_past_the_restored_bytes() {
     let fixture = provider_fixture(whole_volume_covered());
@@ -3809,9 +3809,9 @@ fn a_restored_carry_never_reaches_past_the_restored_bytes() {
     );
 }
 
-/// A record this process holds inside the restored bytes — an article fetched
-/// again after the restart — is checked like any other, so a restored byte
-/// that disagrees with it is still caught.
+// A record this process holds inside the restored bytes — an article fetched
+// again after the restart — is checked like any other, so a restored byte
+// that disagrees with it is still caught.
 #[test]
 fn a_record_inside_restored_bytes_is_still_verified() {
     let fixture = provider_fixture(whole_volume_covered());
@@ -3842,8 +3842,8 @@ fn a_record_inside_restored_bytes_is_still_verified() {
     );
 }
 
-/// The demotion sweep publishes a floor over what it writes, so restored bytes
-/// with no record are refused there whatever the repair scratch does.
+// The demotion sweep publishes a floor over what it writes, so restored bytes
+// with no record are refused there whatever the repair scratch does.
 #[test]
 fn a_demotion_sweep_does_not_carry_restored_bytes() {
     let fixture = provider_fixture(whole_volume_covered());

@@ -25,7 +25,7 @@ pub enum InitialSetupOutcome {
     AlreadyCompleted,
 }
 
-/// Stored login credentials (single user).
+// Stored login credentials (single user).
 #[derive(Debug, Clone)]
 pub struct AuthCredentials {
     pub username: String,
@@ -34,8 +34,8 @@ pub struct AuthCredentials {
     pub updated_at: i64,
 }
 
-/// Server-side record for one browser credential. Raw credentials and CSRF
-/// values never enter this type: callers pass their one-way verifiers only.
+// Server-side record for one browser credential. Raw credentials and CSRF
+// values never enter this type: callers pass their one-way verifiers only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserSession {
     pub token_hash: String,
@@ -49,9 +49,9 @@ pub struct BrowserSession {
 }
 
 impl Database {
-    /// Persist the explicit pending state before exposing first-run setup.
-    /// Callers must independently establish a new datastore, an explicitly
-    /// requested credentialless legacy migration, or operator-authorized recovery.
+    // Persist the explicit pending state before exposing first-run setup.
+    // Callers must independently establish a new datastore, an explicitly
+    // requested credentialless legacy migration, or operator-authorized recovery.
     pub fn mark_initial_setup_pending(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -72,10 +72,10 @@ impl Database {
         })
     }
 
-    /// Atomically establishes a first-run authenticated installation. The
-    /// completion marker is the transaction claim: a concurrent setup loses
-    /// without changing credentials or browser sessions, and any later error
-    /// rolls that claim back with the rest of the transaction.
+    // Atomically establishes a first-run authenticated installation. The
+    // completion marker is the transaction claim: a concurrent setup loses
+    // without changing credentials or browser sessions, and any later error
+    // rolls that claim back with the rest of the transaction.
     pub fn complete_initial_authenticated_setup(
         &self,
         setup: &InitialAuthenticatedSetup,
@@ -155,7 +155,7 @@ impl Database {
             }).await
         })
     }
-    /// Load the persistent JWT signing secret, creating one on first use.
+    // Load the persistent JWT signing secret, creating one on first use.
     pub fn get_or_create_jwt_signing_secret(&self) -> Result<[u8; 32], StateError> {
         let datastore = self.datastore();
         let encryption_key = self.encryption_key().cloned();
@@ -170,7 +170,7 @@ impl Database {
         })
     }
 
-    /// Replace the persistent JWT signing secret and return the new value.
+    // Replace the persistent JWT signing secret and return the new value.
     pub fn rotate_jwt_signing_secret(&self) -> Result<[u8; 32], StateError> {
         let datastore = self.datastore();
         let encryption_key = self.encryption_key().cloned();
@@ -196,7 +196,7 @@ impl Database {
         })
     }
 
-    /// Get the stored login credentials, if any.
+    // Get the stored login credentials, if any.
     pub fn get_auth_credentials(&self) -> Result<Option<AuthCredentials>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -218,7 +218,7 @@ impl Database {
         })
     }
 
-    /// Set (insert or replace) login credentials.
+    // Set (insert or replace) login credentials.
     pub fn set_auth_credentials(
         &self,
         username: &str,
@@ -249,8 +249,8 @@ impl Database {
         })
     }
 
-    /// Atomically changes the only administrator password and invalidates all
-    /// durable browser sessions that could have been established with it.
+    // Atomically changes the only administrator password and invalidates all
+    // durable browser sessions that could have been established with it.
     pub fn change_auth_credentials_and_revoke_sessions(
         &self,
         username: &str,
@@ -279,7 +279,7 @@ impl Database {
         })
     }
 
-    /// Clear login credentials (disable login).
+    // Clear login credentials (disable login).
     pub fn clear_auth_credentials(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -389,8 +389,8 @@ impl Database {
         })
     }
 
-    /// Moves a session's expiry, so a test can expire a live session outright
-    /// instead of waiting for the wall clock to pass it.
+    // Moves a session's expiry, so a test can expire a live session outright
+    // instead of waiting for the wall clock to pass it.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_browser_session_expiry(
         &self,
@@ -423,9 +423,9 @@ impl Database {
         })
     }
 
-    /// Record a successful password check for one active browser session.
-    /// The session token hash is already a durable verifier, so this table
-    /// stores no additional credential material.
+    // Record a successful password check for one active browser session.
+    // The session token hash is already a durable verifier, so this table
+    // stores no additional credential material.
     pub fn verify_browser_session_password(
         &self,
         token_hash: &str,

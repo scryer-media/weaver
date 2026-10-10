@@ -1,8 +1,8 @@
-//! Script instances: a script wired to one trigger, with the inputs,
-//! categories and run policy the operator saved for it.
-//!
-//! What is stored here is what runs. A script's own header can fill a form, but
-//! nothing is ever read back out of it into a saved instance.
+// Script instances: a script wired to one trigger, with the inputs,
+// categories and run policy the operator saved for it.
+//
+// What is stored here is what runs. A script's own header can fill a form, but
+// nothing is ever read back out of it into a saved instance.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -31,7 +31,7 @@ pub(super) struct DispatchJobs {
     mode: GlobalScriptsRun,
 }
 
-/// The one thing that starts an instance.
+// The one thing that starts an instance.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub enum InstanceTrigger {
     PostProcessing,
@@ -52,7 +52,7 @@ impl InstanceTrigger {
         }
     }
 
-    /// Whether `event` is one this trigger starts on.
+    // Whether `event` is one this trigger starts on.
     pub fn starts_on(self, event: &ScriptEventLabel) -> bool {
         match (self, event) {
             (Self::PostProcessing, ScriptEventLabel::PostProcessing)
@@ -64,8 +64,8 @@ impl InstanceTrigger {
         }
     }
 
-    /// Only a download has a category, so only the triggers a download raises
-    /// can be narrowed to one.
+    // Only a download has a category, so only the triggers a download raises
+    // can be narrowed to one.
     pub fn category_scoped(self) -> bool {
         matches!(self, Self::PostProcessing | Self::Queue(_))
     }
@@ -128,37 +128,37 @@ impl<'de> Deserialize<'de> for InstanceTrigger {
     }
 }
 
-/// One saved input: a plain value, a link to a named secret, or a secret of
-/// the instance's own. A secret's value is never read back out for display.
+// One saved input: a plain value, a link to a named secret, or a secret of
+// the instance's own. A secret's value is never read back out for display.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceInput {
     pub name: OptionName,
-    /// Empty for a secret of either kind.
+    // Empty for a secret of either kind.
     pub value: String,
     pub secret: Option<SecretRef>,
-    /// The input is a secret of the instance's own: its value is kept sealed
-    /// in the instance's own row, and no named secret stands behind it.
+    // The input is a secret of the instance's own: its value is kept sealed
+    // in the instance's own row, and no named secret stands behind it.
     #[serde(default)]
     pub sealed: bool,
 }
 
 impl InstanceInput {
-    /// Whether the input is a secret, linked or the instance's own.
+    // Whether the input is a secret, linked or the instance's own.
     pub fn is_secret(&self) -> bool {
         self.secret.is_some() || self.sealed
     }
 }
 
-/// When a schedule job runs. Every other trigger leaves it empty.
+// When a schedule job runs. Every other trigger leaves it empty.
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceSchedule {
-    /// Empty runs on every day.
+    // Empty runs on every day.
     pub days: Vec<Weekday>,
-    /// Each one `HH:MM`, or `*:MM` for that minute of every hour, in order.
+    // Each one `HH:MM`, or `*:MM` for that minute of every hour, in order.
     pub times: Vec<String>,
-    /// Also run once when Weaver starts.
+    // Also run once when Weaver starts.
     pub run_at_startup: bool,
 }
 
@@ -169,8 +169,8 @@ impl InstanceSchedule {
         self.days.is_empty() && self.times.is_empty() && !self.run_at_startup
     }
 
-    /// The run times a script header declares: `*` is run at startup, and
-    /// every other declaration is a time.
+    // The run times a script header declares: `*` is run at startup, and
+    // every other declaration is a time.
     pub fn from_task_times(declared: &[ScriptTaskTime]) -> Self {
         let mut schedule = Self::default();
         for time in declared {
@@ -184,7 +184,7 @@ impl InstanceSchedule {
         schedule
     }
 
-    /// Its times, as parsed declarations.
+    // Its times, as parsed declarations.
     pub fn task_times(&self) -> impl Iterator<Item = ScriptTaskTime> + '_ {
         self.times
             .iter()
@@ -244,7 +244,7 @@ impl InstanceSchedule {
     }
 }
 
-/// A script wired to one trigger.
+// A script wired to one trigger.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScriptInstance {
@@ -253,24 +253,24 @@ pub struct ScriptInstance {
     pub script: ScriptName,
     pub trigger: InstanceTrigger,
     pub inputs: Vec<InstanceInput>,
-    /// Empty runs for every category.
+    // Empty runs for every category.
     pub categories: Vec<String>,
     pub enabled: bool,
-    /// A blocking instance is run in line: the next one waits for it, and so
-    /// does whatever its trigger holds. One that is not is started and left to
-    /// finish on its own, and its result changes nothing.
+    // A blocking instance is run in line: the next one waits for it, and so
+    // does whatever its trigger holds. One that is not is started and left to
+    // finish on its own, and its result changes nothing.
     pub blocking: bool,
-    /// `None` runs under the default timeout of its trigger.
+    // `None` runs under the default timeout of its trigger.
     pub timeout_seconds: Option<u64>,
     pub run_order: i64,
-    /// When a schedule job runs.
+    // When a schedule job runs.
     #[serde(default)]
     pub schedule: InstanceSchedule,
 }
 
 impl ScriptInstance {
-    /// How long a run of this instance may last: its own limit, or else the
-    /// default of its trigger. A test run is held to the same.
+    // How long a run of this instance may last: its own limit, or else the
+    // default of its trigger. A test run is held to the same.
     pub fn time_limit(&self, settings: &PostProcessingSettings) -> std::time::Duration {
         match (self.timeout_seconds, self.trigger) {
             (Some(seconds), _) => std::time::Duration::from_secs(seconds),
@@ -307,12 +307,12 @@ enum Scope {
     None,
 }
 
-/// The instances `event` starts for a download in `category`, in run order.
-///
-/// Instances for every category run first, then the ones narrowed to this
-/// category. When the setting says so, a category with instances of its own
-/// leaves the unscoped ones out. Category names are matched without regard to
-/// case, because download clients echo their own casing back.
+// The instances `event` starts for a download in `category`, in run order.
+//
+// Instances for every category run first, then the ones narrowed to this
+// category. When the setting says so, a category with instances of its own
+// leaves the unscoped ones out. Category names are matched without regard to
+// case, because download clients echo their own casing back.
 pub fn resolve_instances(
     all: &[ScriptInstance],
     event: &ScriptEventLabel,
@@ -347,8 +347,8 @@ pub fn resolve_instances(
 pub enum ScriptInstanceError {
     #[error("{0}")]
     Invalid(&'static str),
-    /// An input was sent as a secret of the instance's own with no value, and
-    /// the instance holds none under that name to keep.
+    // An input was sent as a secret of the instance's own with no value, and
+    // the instance holds none under that name to keep.
     #[error("input \"{0}\" is marked secret but was given no value, and none is saved for it")]
     NoOwnSecret(String),
     #[error("script job does not exist")]
@@ -357,12 +357,12 @@ pub enum ScriptInstanceError {
     Storage(#[from] StateError),
 }
 
-/// One input as the operator sent it: a plain value, the id of a secret to
-/// link, or a secret of the instance's own.
-///
-/// A secret of the instance's own is `sealed` with a value to seal, or, on an
-/// update, `sealed` with nothing else to keep the one the instance already
-/// holds under that name.
+// One input as the operator sent it: a plain value, the id of a secret to
+// link, or a secret of the instance's own.
+//
+// A secret of the instance's own is `sealed` with a value to seal, or, on an
+// update, `sealed` with nothing else to keep the one the instance already
+// holds under that name.
 #[derive(Clone, Eq, PartialEq)]
 pub struct InstanceInputDraft {
     pub name: String,
@@ -371,7 +371,7 @@ pub struct InstanceInputDraft {
     pub sealed: bool,
 }
 
-/// A value on its way to being sealed is not printed.
+// A value on its way to being sealed is not printed.
 impl fmt::Debug for InstanceInputDraft {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match &self.value {
@@ -407,7 +407,7 @@ impl InstanceInputDraft {
         }
     }
 
-    /// A secret of the instance's own, to be sealed from `value`.
+    // A secret of the instance's own, to be sealed from `value`.
     pub fn sealed(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -417,8 +417,8 @@ impl InstanceInputDraft {
         }
     }
 
-    /// The secret of its own the instance already holds under `name`, kept
-    /// as it is.
+    // The secret of its own the instance already holds under `name`, kept
+    // as it is.
     pub fn kept_sealed(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -429,11 +429,11 @@ impl InstanceInputDraft {
     }
 }
 
-/// An instance as the operator sent it, before it has an id or a place in the
-/// order.
+// An instance as the operator sent it, before it has an id or a place in the
+// order.
 #[derive(Debug, Clone)]
 pub struct ScriptInstanceDraft {
-    /// Empty takes the script's name.
+    // Empty takes the script's name.
     pub name: String,
     pub script: ScriptName,
     pub trigger: InstanceTrigger,
@@ -442,7 +442,7 @@ pub struct ScriptInstanceDraft {
     pub enabled: bool,
     pub blocking: bool,
     pub timeout_seconds: Option<u64>,
-    /// Kept only for a schedule job; any other trigger saves it empty.
+    // Kept only for a schedule job; any other trigger saves it empty.
     pub schedule: InstanceSchedule,
 }
 
@@ -461,7 +461,7 @@ impl ScriptInstanceDraft {
         }
     }
 
-    /// Run on `days` (empty for every day) at each of `times`.
+    // Run on `days` (empty for every day) at each of `times`.
     pub fn runs_at(mut self, days: &[Weekday], times: &[&str]) -> Self {
         self.schedule.days = days.to_vec();
         self.schedule.times = times.iter().map(|time| time.to_string()).collect();
@@ -483,14 +483,14 @@ impl ScriptInstanceDraft {
         self
     }
 
-    /// An input linked to the secret `secret_id`.
+    // An input linked to the secret `secret_id`.
     pub fn secret_input(mut self, name: impl Into<String>, secret_id: impl Into<String>) -> Self {
         self.inputs
             .push(InstanceInputDraft::secret(name, secret_id));
         self
     }
 
-    /// An input that is a secret of the instance's own, sealed from `value`.
+    // An input that is a secret of the instance's own, sealed from `value`.
     pub fn sealed_input(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.inputs.push(InstanceInputDraft::sealed(name, value));
         self
@@ -516,8 +516,8 @@ impl ScriptInstanceDraft {
         self
     }
 
-    /// `instance` as a draft that saves it back unchanged. A secret of its
-    /// own is carried as one to keep, so its value is never needed.
+    // `instance` as a draft that saves it back unchanged. A secret of its
+    // own is carried as one to keep, so its value is never needed.
     pub fn from_instance(instance: &ScriptInstance) -> Self {
         Self {
             name: instance.name.clone(),
@@ -541,20 +541,20 @@ impl ScriptInstanceDraft {
     }
 }
 
-/// How an update of an instance came out.
+// How an update of an instance came out.
 enum Updated {
     Done,
     NotFound,
     MissingSecret,
-    /// The named input was to keep a secret of its own that is not there.
+    // The named input was to keep a secret of its own that is not there.
     NoOwnSecret(String),
 }
 
 const MISSING_SECRET: ScriptInstanceError =
     ScriptInstanceError::Invalid("a linked secret does not exist");
 
-/// A write that lost a race to a secret being deleted hits the foreign key
-/// on the input row: that is a missing secret, not a storage failure.
+// A write that lost a race to a secret being deleted hits the foreign key
+// on the input row: that is a missing secret, not a storage failure.
 fn missing_secret_race<T>(result: Result<T, StateError>) -> Result<T, ScriptInstanceError> {
     result.map_err(|error| {
         if is_foreign_key_violation(&error) {
@@ -565,19 +565,19 @@ fn missing_secret_race<T>(result: Result<T, StateError>) -> Result<T, ScriptInst
     })
 }
 
-/// What an input row is to hold.
+// What an input row is to hold.
 #[derive(Debug, Clone)]
 enum StoredValue {
     Plain(String),
-    /// The id of the named secret it links.
+    // The id of the named secret it links.
     Secret(String),
-    /// A secret of the instance's own, already sealed.
+    // A secret of the instance's own, already sealed.
     Sealed(String),
-    /// The secret of its own the instance already holds under this name.
+    // The secret of its own the instance already holds under this name.
     KeepSealed,
 }
 
-/// One input row as it is written.
+// One input row as it is written.
 #[derive(Debug, Clone)]
 struct InputRow {
     name: String,
@@ -586,8 +586,8 @@ struct InputRow {
     sealed_value: Option<String>,
 }
 
-/// The form an input's name is compared in: names that differ only by ASCII
-/// case are one input.
+// The form an input's name is compared in: names that differ only by ASCII
+// case are one input.
 fn input_name_key(name: &str) -> String {
     name.to_ascii_uppercase()
 }
@@ -606,7 +606,7 @@ struct ValidatedInstance {
 }
 
 impl ValidatedInstance {
-    /// The ids of the secrets its inputs link.
+    // The ids of the secrets its inputs link.
     fn linked_secrets(&self) -> Vec<String> {
         self.inputs
             .iter()
@@ -617,16 +617,16 @@ impl ValidatedInstance {
             .collect()
     }
 
-    /// Whether any input keeps a secret the instance already holds.
+    // Whether any input keeps a secret the instance already holds.
     fn keeps_sealed(&self) -> bool {
         self.inputs
             .iter()
             .any(|(_, stored)| matches!(stored, StoredValue::KeepSealed))
     }
 
-    /// The input rows to write. `kept` is the sealed value the instance
-    /// already holds under each input name, by compared name. The error is
-    /// the name of an input that was to keep one that is not there.
+    // The input rows to write. `kept` is the sealed value the instance
+    // already holds under each input name, by compared name. The error is
+    // the name of an input that was to keep one that is not there.
     fn input_rows(&self, kept: &BTreeMap<String, String>) -> Result<Vec<InputRow>, String> {
         self.inputs
             .iter()
@@ -654,8 +654,8 @@ impl ValidatedInstance {
 }
 
 impl Database {
-    /// Seal the value of a secret of an instance's own. Refused without an
-    /// encryption key, as storing a named secret is.
+    // Seal the value of a secret of an instance's own. Refused without an
+    // encryption key, as storing a named secret is.
     fn seal_input(&self, value: &str) -> Result<String, ScriptInstanceError> {
         let key = self.encryption_key().ok_or(ScriptInstanceError::Invalid(
             "an encryption key is required to store a secret",
@@ -764,13 +764,13 @@ impl Database {
         })
     }
 
-    /// Every instance, in run order.
+    // Every instance, in run order.
     pub fn script_instances(&self) -> Result<Vec<ScriptInstance>, StateError> {
         self.load_script_instances(None)
     }
 
-    /// Every instance, or only the one with id `only`. A secret input carries
-    /// the secret's name and id, never its value.
+    // Every instance, or only the one with id `only`. A secret input carries
+    // the secret's name and id, never its value.
     fn load_script_instances(
         &self,
         only: Option<String>,
@@ -905,7 +905,7 @@ impl Database {
             .next())
     }
 
-    /// The instances `event` starts for a download in `category`, in run order.
+    // The instances `event` starts for a download in `category`, in run order.
     pub fn script_instances_for(
         &self,
         event: &ScriptEventLabel,
@@ -920,7 +920,7 @@ impl Database {
         ))
     }
 
-    /// An actor-safe lookup: a cold cache is reported without touching SQL.
+    // An actor-safe lookup: a cold cache is reported without touching SQL.
     pub(crate) fn cached_script_instances_for(
         &self,
         event: &ScriptEventLabel,
@@ -1100,8 +1100,8 @@ impl Database {
             .ok_or(ScriptInstanceError::NotFound)
     }
 
-    /// Remove an instance and everything that hangs off it. Returns whether
-    /// there was one.
+    // Remove an instance and everything that hangs off it. Returns whether
+    // there was one.
     pub fn delete_script_instance(&self, id: &str) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let target = id.to_string();
@@ -1140,8 +1140,8 @@ impl Database {
         result
     }
 
-    /// Put `ids` in this order. Instances that are not named keep their place
-    /// after the ones that are.
+    // Put `ids` in this order. Instances that are not named keep their place
+    // after the ones that are.
     pub fn reorder_script_instances(&self, ids: &[String]) -> Result<(), StateError> {
         let datastore = self.datastore();
         let ids = ids.to_vec();
@@ -1179,7 +1179,7 @@ impl Database {
         result
     }
 
-    /// Stop every instance from running without losing what was saved in it.
+    // Stop every instance from running without losing what was saved in it.
     pub fn disable_script_instances(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         let result = self.run_sql_blocking(async move {
@@ -1195,9 +1195,9 @@ impl Database {
         result
     }
 
-    /// An instance's inputs as a run receives them, secrets included: a
-    /// secret of its own is handed over exactly as a linked one is. `None`
-    /// when the instance is gone.
+    // An instance's inputs as a run receives them, secrets included: a
+    // secret of its own is handed over exactly as a linked one is. `None`
+    // when the instance is gone.
     pub(crate) fn script_instance_run_inputs(
         &self,
         id: &str,
@@ -1267,7 +1267,7 @@ impl Database {
         Ok(Some(inputs))
     }
 
-    /// The instances attached to a feed, in the order they run.
+    // The instances attached to a feed, in the order they run.
     pub fn feed_script_instance_ids(&self, feed_id: u32) -> Result<Vec<String>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -1284,7 +1284,7 @@ impl Database {
         })
     }
 
-    /// Every feed's attached instances, in the order they run.
+    // Every feed's attached instances, in the order they run.
     pub fn feed_script_instance_ids_by_feed(
         &self,
     ) -> Result<BTreeMap<u32, Vec<String>>, StateError> {
@@ -1310,7 +1310,7 @@ impl Database {
         })
     }
 
-    /// Replace the instances attached to a feed. Each must be a feed instance.
+    // Replace the instances attached to a feed. Each must be a feed instance.
     pub fn set_feed_script_instances(
         &self,
         feed_id: u32,
@@ -1346,7 +1346,7 @@ impl Database {
         Ok(())
     }
 
-    /// Forget a deleted feed's attachments.
+    // Forget a deleted feed's attachments.
     pub fn delete_feed_script_instances(&self, feed_id: u32) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -1405,8 +1405,8 @@ pub(crate) async fn set_feed_scripts_tx(
     Ok(())
 }
 
-/// The sealed value of each secret of its own an instance holds, by compared
-/// input name.
+// The sealed value of each secret of its own an instance holds, by compared
+// input name.
 async fn sealed_inputs_tx(
     tx: &mut SqlTx<'_>,
     id: &str,

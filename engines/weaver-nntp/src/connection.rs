@@ -31,7 +31,7 @@ pub struct BodyStreamStats {
     pub throttle_wait: Duration,
 }
 
-/// The budget check against a clock reading the read turn already took.
+// The budget check against a clock reading the read turn already took.
 fn ensure_active_transfer_budget_at(
     budget: Option<&ActiveTransferBudget>,
     now: Instant,
@@ -152,13 +152,13 @@ where
     (output, cpu)
 }
 
-/// Hand every decoded batch the fused decoder has produced to `on_chunk`, in
-/// order, before appending it to the article's own chunk list.
-///
-/// This is what makes the streaming design observable to a caller: batches are
-/// delivered as they are decoded, not once at article finish. Both the async
-/// and the blocking article readers route through here so neither can quietly
-/// stop firing the callback.
+// Hand every decoded batch the fused decoder has produced to `on_chunk`, in
+// order, before appending it to the article's own chunk list.
+//
+// This is what makes the streaming design observable to a caller: batches are
+// delivered as they are decoded, not once at article finish. Both the async
+// and the blocking article readers route through here so neither can quietly
+// stop firing the callback.
 pub(crate) fn deliver_fused_output_chunks<F>(
     chunks: Vec<Box<[u8]>>,
     article_chunks: &mut Vec<Box<[u8]>>,
@@ -185,25 +185,25 @@ where
     Ok(())
 }
 
-/// State of a single NNTP connection.
+// State of a single NNTP connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
-    /// Not connected.
+    // Not connected.
     Disconnected,
-    /// Waiting for the server greeting.
+    // Waiting for the server greeting.
     Greeting,
-    /// Authenticated and ready for commands.
+    // Authenticated and ready for commands.
     Ready,
-    /// A command is in progress.
+    // A command is in progress.
     InUse,
-    /// QUIT sent, connection closing.
+    // QUIT sent, connection closing.
     Closing,
 }
 
-/// Minimum allowed timeout value (1 second).
+// Minimum allowed timeout value (1 second).
 const MIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Internal NNTP buffer sizing profile.
+// Internal NNTP buffer sizing profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NntpBufferProfile {
     pub read_buf_capacity: usize,
@@ -233,57 +233,57 @@ impl Default for NntpBufferProfile {
     }
 }
 
-/// How an NNTP connection determines PIPELINING support.
-///
-/// Application runtime connections use the persisted server setting. Explicit
-/// server validation opts into [`Self::Probe`] and performs one post-auth
-/// CAPABILITIES exchange instead.
+// How an NNTP connection determines PIPELINING support.
+//
+// Application runtime connections use the persisted server setting. Explicit
+// server validation opts into [`Self::Probe`] and performs one post-auth
+// CAPABILITIES exchange instead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PipeliningCapability {
-    /// Discover the capability from the server.
+    // Discover the capability from the server.
     #[default]
     Probe,
-    /// Use the persisted server setting and skip CAPABILITIES.
+    // Use the persisted server setting and skip CAPABILITIES.
     Known(bool),
 }
 
-/// Configuration for connecting to a single NNTP server.
+// Configuration for connecting to a single NNTP server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub dialer: Option<Arc<crate::route_dialer::RouteDialer>>,
-    /// Hostname or IP address.
+    // Hostname or IP address.
     pub host: String,
-    /// Port number.
+    // Port number.
     pub port: u16,
-    /// Use implicit TLS (true for port 563).
+    // Use implicit TLS (true for port 563).
     pub tls: bool,
-    /// Use STARTTLS after plain TCP connect.
+    // Use STARTTLS after plain TCP connect.
     pub starttls: bool,
-    /// Username for AUTHINFO USER.
+    // Username for AUTHINFO USER.
     pub username: Option<String>,
-    /// Password for AUTHINFO PASS.
+    // Password for AUTHINFO PASS.
     pub password: Option<String>,
-    /// Timeout for the entire connection setup (connect + TLS + auth).
-    /// Clamped to a minimum of 1 second.
+    // Timeout for the entire connection setup (connect + TLS + auth).
+    // Clamped to a minimum of 1 second.
     pub connect_timeout: Duration,
-    /// Timeout for individual command responses.
-    /// Clamped to a minimum of 1 second.
+    // Timeout for individual command responses.
+    // Clamped to a minimum of 1 second.
     pub command_timeout: Duration,
-    /// Internal read-buffer sizing profile.
+    // Internal read-buffer sizing profile.
     pub buffer_profile: NntpBufferProfile,
-    /// Optional path to a PEM-encoded CA certificate to trust in addition
-    /// to the system/Mozilla roots (e.g. self-signed or internal CAs).
+    // Optional path to a PEM-encoded CA certificate to trust in addition
+    // to the system/Mozilla roots (e.g. self-signed or internal CAs).
     pub tls_ca_cert: Option<std::path::PathBuf>,
-    /// One explicitly adopted leaf certificate allowed only when normal TLS
-    /// verification fails because this server's hostname does not match.
+    // One explicitly adopted leaf certificate allowed only when normal TLS
+    // verification fails because this server's hostname does not match.
     pub tls_name_mismatch_certificate_der: Option<Vec<u8>>,
-    /// Source of the PIPELINING capability for this connection.
+    // Source of the PIPELINING capability for this connection.
     pub pipelining: PipeliningCapability,
-    /// BODY pipelining depth a previous run proved for this server, if any.
-    /// Inert for the connection itself; the download lanes read it to start
-    /// where the last run left off instead of rediscovering the depth.
+    // BODY pipelining depth a previous run proved for this server, if any.
+    // Inert for the connection itself; the download lanes read it to start
+    // where the last run left off instead of rediscovering the depth.
     pub pipelining_depth: Option<u8>,
-    /// Which AEAD family the TLS ClientHello offers first.
+    // Which AEAD family the TLS ClientHello offers first.
     pub tls_cipher_preference: crate::tls::TlsCipherPreference,
 }
 
@@ -309,16 +309,16 @@ impl Default for ServerConfig {
     }
 }
 
-/// A single NNTP connection to a server.
-///
-/// Manages the transport, codec, and read buffer manually (not using `Framed`)
-/// to avoid borrow-checker issues when we need simultaneous access to the codec,
-/// buffer, and transport.
+// A single NNTP connection to a server.
+//
+// Manages the transport, codec, and read buffer manually (not using `Framed`)
+// to avoid borrow-checker issues when we need simultaneous access to the codec,
+// buffer, and transport.
 pub struct NntpConnection {
     pub route_path: Option<weaver_tunnel::pipe::DialPath>,
     egress_control: Option<Arc<ServerTransferControl>>,
     pub(crate) route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
-    /// Wrapped in Option to allow taking ownership during STARTTLS upgrade.
+    // Wrapped in Option to allow taking ownership during STARTTLS upgrade.
     transport: Option<NntpTransport>,
     codec: NntpCodec,
     read_buf: BytesMut,
@@ -326,77 +326,77 @@ pub struct NntpConnection {
     state: ConnectionState,
     capabilities: Capabilities,
     host: String,
-    /// Kept alongside `host` so a requirement learned on this connection is
-    /// recorded against the endpoint, not the resolved address.
+    // Kept alongside `host` so a requirement learned on this connection is
+    // recorded against the endpoint, not the resolved address.
     port: u16,
     remote_addr: Option<SocketAddr>,
     created_at: Instant,
     last_used: Instant,
     command_timeout: Duration,
-    /// Set to true when an I/O error has occurred, preventing pool reuse.
+    // Set to true when an I/O error has occurred, preventing pool reuse.
     poisoned: bool,
-    /// The currently selected newsgroup on this connection, if any.
+    // The currently selected newsgroup on this connection, if any.
     current_group: Option<String>,
-    /// Stored credentials for transparent mid-session re-authentication.
+    // Stored credentials for transparent mid-session re-authentication.
     credentials: Option<(String, String)>,
-    /// Optional custom CA certificate path, kept for STARTTLS upgrades.
+    // Optional custom CA certificate path, kept for STARTTLS upgrades.
     tls_ca_cert: Option<std::path::PathBuf>,
-    /// Optional adopted leaf certificate, kept for STARTTLS upgrades.
+    // Optional adopted leaf certificate, kept for STARTTLS upgrades.
     tls_name_mismatch_certificate_der: Option<Vec<u8>>,
-    /// Cipher family order, kept for STARTTLS upgrades.
+    // Cipher family order, kept for STARTTLS upgrades.
     tls_cipher_preference: crate::tls::TlsCipherPreference,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
-    /// The egress's accounting for each outstanding BODY, in step with
-    /// `body_accounting`. Empty when the connection has no egress control.
+    // The egress's accounting for each outstanding BODY, in step with
+    // `body_accounting`. Empty when the connection has no egress control.
     egress_accounting: VecDeque<BodyTransferAccounting>,
     // Declared after the transport: a physical slot is refunded only after close.
     pub(crate) socket_slot: Option<crate::socket_budget::SocketSlot>,
     pub(crate) health_lease: Option<Arc<crate::recovery::ConnectionHealthLease>>,
-    /// Immutable geometry the next decoded article's CRC pass checkpoints at.
-    ///
-    /// Set per fetch by the lane rather than at connect time: connections are
-    /// pooled across jobs, and checkpoint geometry belongs to a job snapshot,
-    /// not to a socket. `None` is deliberately applied per response.
+    // Immutable geometry the next decoded article's CRC pass checkpoints at.
+    //
+    // Set per fetch by the lane rather than at connect time: connections are
+    // pooled across jobs, and checkpoint geometry belongs to a job snapshot,
+    // not to a socket. `None` is deliberately applied per response.
     checkpoint_plan: CheckpointPlan,
-    /// How long the last decoded article waited for its status line. The lane
-    /// takes this to separate distance from transfer cost.
+    // How long the last decoded article waited for its status line. The lane
+    // takes this to separate distance from transfer cost.
     last_response_line_wait: Duration,
-    /// How long the CAPABILITIES command waited for its status line, when
-    /// setup sent one. The command is already part of setup, so timing it
-    /// costs nothing and gives a distance figure without a dedicated ping.
+    // How long the CAPABILITIES command waited for its status line, when
+    // setup sent one. The command is already part of setup, so timing it
+    // costs nothing and gives a distance figure without a dedicated ping.
     capabilities_round_trip: Option<Duration>,
-    /// Armed when session setup declined to select a group this caller
-    /// offered, because the server has never been shown to need one. The first
-    /// response afterwards either clears it or teaches the process that this
-    /// server does insist. See [`crate::server_caps`].
+    // Armed when session setup declined to select a group this caller
+    // offered, because the server has never been shown to need one. The first
+    // response afterwards either clears it or teaches the process that this
+    // server does insist. See [`crate::server_caps`].
     group_probe_armed: bool,
 }
 
 impl NntpConnection {
-    /// Declare the checkpoint geometry for articles decoded on this connection
-    /// from now on. See [`Self::checkpoint_plan`].
+    // Declare the checkpoint geometry for articles decoded on this connection
+    // from now on. See [`Self::checkpoint_plan`].
     pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
         self.checkpoint_plan = checkpoint_plan;
     }
 
-    /// Consume the last article's status-line wait, so a lane cannot credit
-    /// one response's latency to the next.
+    // Consume the last article's status-line wait, so a lane cannot credit
+    // one response's latency to the next.
     pub(crate) fn take_response_line_wait(&mut self) -> Duration {
         std::mem::replace(&mut self.last_response_line_wait, Duration::ZERO)
     }
 
-    /// Connect to an NNTP server, perform TLS negotiation and authentication.
+    // Connect to an NNTP server, perform TLS negotiation and authentication.
     pub async fn connect(config: &ServerConfig) -> Result<Self> {
         Self::connect_for_group(config, None, None).await
     }
 
-    /// Connect and, on servers known to pipeline, select `initial_group` in
-    /// the same write as the session setup so a BODY lane starts with no
-    /// extra round trip. An unselectable group is not an error here: the
-    /// lane walks its candidate list afterwards. A direct connection dials
-    /// the address `route`'s plan picks, or the first resolved address that
-    /// answers when there is no route.
+    // Connect and, on servers known to pipeline, select `initial_group` in
+    // the same write as the session setup so a BODY lane starts with no
+    // extra round trip. An unselectable group is not an error here: the
+    // lane walks its candidate list afterwards. A direct connection dials
+    // the address `route`'s plan picks, or the first resolved address that
+    // answers when there is no route.
     pub(crate) async fn connect_for_group(
         config: &ServerConfig,
         route: Option<&AddressRoute>,
@@ -603,7 +603,7 @@ impl NntpConnection {
         Ok(conn)
     }
 
-    /// Perform STARTTLS upgrade.
+    // Perform STARTTLS upgrade.
     async fn do_starttls(&mut self) -> Result<()> {
         debug!("initiating STARTTLS");
         let resp = self.send_command(&Command::StartTls).await?;
@@ -638,7 +638,7 @@ impl NntpConnection {
         }
     }
 
-    /// Fetch and parse server capabilities.
+    // Fetch and parse server capabilities.
     async fn fetch_capabilities(&mut self) -> Result<()> {
         let started = Instant::now();
         let resp = self.send_command(&Command::Capabilities).await?;
@@ -653,13 +653,13 @@ impl NntpConnection {
         Ok(())
     }
 
-    /// Session setup for a server known to pipeline. AUTHINFO goes first and
-    /// on its own: RFC 4643 forbids pipelining it, and a provider that
-    /// enforces that answers the whole batch with 480s or drops the
-    /// connection. A GROUP this server has proven it needs then leaves in one
-    /// flush and is answered in order (RFC 4644) — usually there is nothing at
-    /// all to send, which is the point: the lane reaches its first BODY in
-    /// four round trips.
+    // Session setup for a server known to pipeline. AUTHINFO goes first and
+    // on its own: RFC 4643 forbids pipelining it, and a provider that
+    // enforces that answers the whole batch with 480s or drops the
+    // connection. A GROUP this server has proven it needs then leaves in one
+    // flush and is answered in order (RFC 4644) — usually there is nothing at
+    // all to send, which is the point: the lane reaches its first BODY in
+    // four round trips.
     async fn pipelined_session_setup(
         &mut self,
         config: &ServerConfig,
@@ -691,7 +691,7 @@ impl NntpConnection {
         Ok(())
     }
 
-    /// Authenticate using AUTHINFO USER/PASS (RFC 4643).
+    // Authenticate using AUTHINFO USER/PASS (RFC 4643).
     pub async fn authenticate(&mut self, username: &str, password: &str) -> Result<()> {
         debug!("authenticating");
 
@@ -727,7 +727,7 @@ impl NntpConnection {
         }
     }
 
-    /// Send a command and read the single-line response.
+    // Send a command and read the single-line response.
     async fn write_command_frame(&mut self, cmd: &Command) -> Result<()> {
         self.last_used = Instant::now();
 
@@ -797,13 +797,13 @@ impl NntpConnection {
         self.transfer_control = transfer_control;
     }
 
-    /// The egress control this connection's route leaves through, if any.
+    // The egress control this connection's route leaves through, if any.
     pub(crate) fn egress_transfer_control(&self) -> Option<Arc<ServerTransferControl>> {
         self.egress_control.clone()
     }
 
-    /// Admit one BODY against the server, then against the egress. A refusal
-    /// from either leaves nothing reserved and names who refused.
+    // Admit one BODY against the server, then against the egress. A refusal
+    // from either leaves nothing reserved and names who refused.
     fn reserve_body(
         &mut self,
         estimated_body_bytes: u64,
@@ -826,7 +826,7 @@ impl NntpConnection {
         Ok(())
     }
 
-    /// Undo the last `reserve_body`, for a BODY that was never sent.
+    // Undo the last `reserve_body`, for a BODY that was never sent.
     fn unreserve_last_body(&mut self) {
         if self.transfer_control.is_some() {
             self.body_accounting.pop_back();
@@ -975,7 +975,7 @@ impl NntpConnection {
         }
     }
 
-    /// Read a single response line from the server.
+    // Read a single response line from the server.
     async fn read_response(&mut self) -> Result<Response> {
         let frame = self.read_frame().await?;
         self.trim_read_buffer();
@@ -991,16 +991,16 @@ impl NntpConnection {
         }
     }
 
-    /// Learn, from the first response after session setup, whether this server
-    /// insists on a selected group the connection did not select.
-    ///
-    /// 412 is the only code that can mean this, and only on a connection that
-    /// was offered a group and declined to spend the round trip on it. The
-    /// connection is poisoned rather than repaired in place: the caller's
-    /// command has already been refused, and a pipelined batch may have more
-    /// refusals behind it. Discarding the socket lets the ordinary retry open
-    /// a fresh one, which now selects the group — so only the first connection
-    /// to such a server pays for the discovery.
+    // Learn, from the first response after session setup, whether this server
+    // insists on a selected group the connection did not select.
+    //
+    // 412 is the only code that can mean this, and only on a connection that
+    // was offered a group and declined to spend the round trip on it. The
+    // connection is poisoned rather than repaired in place: the caller's
+    // command has already been refused, and a pipelined batch may have more
+    // refusals behind it. Discarding the socket lets the ordinary retry open
+    // a fresh one, which now selects the group — so only the first connection
+    // to such a server pays for the discovery.
     fn observe_group_requirement(&mut self, response: &Response) {
         if !std::mem::take(&mut self.group_probe_armed) {
             return;
@@ -1019,8 +1019,8 @@ impl NntpConnection {
         self.poisoned = true;
     }
 
-    /// Whether this server has proven it refuses message-id fetches without a
-    /// selected group. Lanes skip the GROUP round trip unless it has.
+    // Whether this server has proven it refuses message-id fetches without a
+    // selected group. Lanes skip the GROUP round trip unless it has.
     pub fn needs_group_prologue(&self) -> bool {
         crate::server_caps::requires_group_selection(&self.host, self.port)
     }
@@ -1049,7 +1049,7 @@ impl NntpConnection {
         }
     }
 
-    /// Read a raw frame from the codec, with timeout.
+    // Read a raw frame from the codec, with timeout.
     async fn read_frame(&mut self) -> Result<NntpFrame> {
         let timeout = self.command_timeout;
 
@@ -1079,18 +1079,18 @@ impl NntpConnection {
         }
     }
 
-    /// Read a multi-line data block from the server.
-    ///
-    /// Call after receiving a status code that indicates multi-line data follows.
+    // Read a multi-line data block from the server.
+    //
+    // Call after receiving a status code that indicates multi-line data follows.
     pub async fn read_multiline_data(&mut self) -> Result<Bytes> {
         self.read_multiline_data_inner(false).await
     }
 
-    /// Read a multi-line data block without dot-unstuffing.
-    ///
-    /// The returned data retains NNTP dot-stuffing (lines starting with `..`
-    /// keep both dots). The caller is responsible for inline unstuffing during
-    /// content decoding. This avoids a separate scan+copy pass.
+    // Read a multi-line data block without dot-unstuffing.
+    //
+    // The returned data retains NNTP dot-stuffing (lines starting with `..`
+    // keep both dots). The caller is responsible for inline unstuffing during
+    // content decoding. This avoids a separate scan+copy pass.
     pub async fn read_multiline_data_raw(&mut self) -> Result<Bytes> {
         self.read_multiline_data_inner(true).await
     }
@@ -1127,16 +1127,16 @@ impl NntpConnection {
         }
     }
 
-    /// Send a command and read the complete multi-line response.
-    ///
-    /// Used for commands like BODY, HEAD, ARTICLE that return multi-line data.
-    /// If the server responds with 480 (authentication required) and we have
-    /// stored credentials, transparently re-authenticates and retries once.
+    // Send a command and read the complete multi-line response.
+    //
+    // Used for commands like BODY, HEAD, ARTICLE that return multi-line data.
+    // If the server responds with 480 (authentication required) and we have
+    // stored credentials, transparently re-authenticates and retries once.
     pub async fn send_multiline_command(&mut self, cmd: &Command) -> Result<MultiLineResponse> {
         self.send_multiline_command_inner(cmd, false).await
     }
 
-    /// Like `send_multiline_command` but returns raw data without dot-unstuffing.
+    // Like `send_multiline_command` but returns raw data without dot-unstuffing.
     pub async fn send_multiline_command_raw(&mut self, cmd: &Command) -> Result<MultiLineResponse> {
         self.send_multiline_command_inner(cmd, true).await
     }
@@ -1188,11 +1188,11 @@ impl NntpConnection {
         Ok(MultiLineResponse { initial, data })
     }
 
-    /// Ensure the given group is selected on this connection.
-    ///
-    /// Sends the GROUP command only if the current group differs from the
-    /// requested one, avoiding unnecessary round-trips. Handles mid-session
-    /// re-authentication (480) transparently.
+    // Ensure the given group is selected on this connection.
+    //
+    // Sends the GROUP command only if the current group differs from the
+    // requested one, avoiding unnecessary round-trips. Handles mid-session
+    // re-authentication (480) transparently.
     pub async fn select_group(&mut self, group: &str) -> Result<()> {
         if self.current_group.as_deref() == Some(group) {
             return Ok(());
@@ -1226,12 +1226,12 @@ impl NntpConnection {
         Ok(())
     }
 
-    /// The currently selected newsgroup on this connection, if any.
+    // The currently selected newsgroup on this connection, if any.
     pub fn current_group(&self) -> Option<&str> {
         self.current_group.as_deref()
     }
 
-    /// Retrieve the body of an article by message-id.
+    // Retrieve the body of an article by message-id.
     pub async fn body_by_id(&mut self, message_id: &str) -> Result<MultiLineResponse> {
         self.body_by_id_with_estimate(message_id, 0).await
     }
@@ -1245,13 +1245,13 @@ impl NntpConnection {
             .await
     }
 
-    /// Retrieve the body of an article without dot-unstuffing.
-    ///
-    /// The returned data retains NNTP dot-stuffing. Use with `weaver_yenc::decode_nntp`
-    /// which handles unstuffing inline during decode, avoiding a separate pass.
-    /// Size its destination from `weaver_yenc::max_decoded_len` of the returned
-    /// data, never from the article's declared `=ybegin size=` — a poster is
-    /// free to omit that field, and an undersized destination is a typed error.
+    // Retrieve the body of an article without dot-unstuffing.
+    //
+    // The returned data retains NNTP dot-stuffing. Use with `weaver_yenc::decode_nntp`
+    // which handles unstuffing inline during decode, avoiding a separate pass.
+    // Size its destination from `weaver_yenc::max_decoded_len` of the returned
+    // data, never from the article's declared `=ybegin size=` — a poster is
+    // free to omit that field, and an undersized destination is a typed error.
     pub async fn body_by_id_raw(&mut self, message_id: &str) -> Result<MultiLineResponse> {
         self.body_by_id_raw_with_estimate(message_id, 0).await
     }
@@ -1299,11 +1299,11 @@ impl NntpConnection {
         })
     }
 
-    /// Retrieve the headers of an article by message-id.
-    ///
-    /// A 500/501 here is the server saying it does not implement `HEAD` at
-    /// all. That is an answer, not a fault: it is recorded against the server
-    /// so later callers stop asking, and the connection stays healthy.
+    // Retrieve the headers of an article by message-id.
+    //
+    // A 500/501 here is the server saying it does not implement `HEAD` at
+    // all. That is an answer, not a fault: it is recorded against the server
+    // so later callers stop asking, and the connection stays healthy.
     pub async fn head_by_id(&mut self, message_id: &str) -> Result<MultiLineResponse> {
         let cmd = Command::Head(ArticleId::MessageId(message_id.to_string()));
         let result = self.send_multiline_command(&cmd).await;
@@ -1318,27 +1318,27 @@ impl NntpConnection {
         result
     }
 
-    /// Retrieve a complete article (headers + body) by message-id.
+    // Retrieve a complete article (headers + body) by message-id.
     pub async fn article_by_id(&mut self, message_id: &str) -> Result<MultiLineResponse> {
         let cmd = Command::Article(ArticleId::MessageId(message_id.to_string()));
         self.send_multiline_command(&cmd).await
     }
 
-    /// Check whether an article exists on the server without downloading it.
-    ///
-    /// Returns `Ok(true)` if the article exists (223), `Ok(false)` if not found (430).
+    // Check whether an article exists on the server without downloading it.
+    //
+    // Returns `Ok(true)` if the article exists (223), `Ok(false)` if not found (430).
     pub async fn stat_by_id(&mut self, message_id: &str) -> Result<bool> {
         let cmd = Command::Stat(ArticleId::MessageId(message_id.to_string()));
         let resp = self.send_command(&cmd).await?;
         self.classify_stat_response(&resp)
     }
 
-    /// Turn one STAT status line into an existence verdict.
-    ///
-    /// A 500/501 is the server saying it does not implement STAT. That is an
-    /// answer about the command, not a fault on the socket: it is recorded so
-    /// the existence probe switches to HEAD, and the connection stays healthy
-    /// and pooled.
+    // Turn one STAT status line into an existence verdict.
+    //
+    // A 500/501 is the server saying it does not implement STAT. That is an
+    // answer about the command, not a fault on the socket: it is recorded so
+    // the existence probe switches to HEAD, and the connection stays healthy
+    // and pooled.
     fn classify_stat_response(&mut self, resp: &Response) -> Result<bool> {
         match resp.code.raw() {
             223 => Ok(true),
@@ -1353,13 +1353,13 @@ impl NntpConnection {
         }
     }
 
-    /// Check multiple articles for existence using NNTP pipelining.
-    ///
-    /// Sends all STAT commands in a single write, then reads all responses.
-    /// This amortizes network round-trip time across the batch — N articles
-    /// checked in 1 RTT instead of N RTTs.
-    ///
-    /// Returns a `Vec<bool>` aligned with the input: true = exists, false = 430.
+    // Check multiple articles for existence using NNTP pipelining.
+    //
+    // Sends all STAT commands in a single write, then reads all responses.
+    // This amortizes network round-trip time across the batch — N articles
+    // checked in 1 RTT instead of N RTTs.
+    //
+    // Returns a `Vec<bool>` aligned with the input: true = exists, false = 430.
     pub async fn stat_pipeline(&mut self, message_ids: &[&str]) -> Result<Vec<bool>> {
         if message_ids.is_empty() {
             return Ok(Vec::new());
@@ -1410,19 +1410,19 @@ impl NntpConnection {
         }
     }
 
-    /// Check multiple articles for existence using pipelined `HEAD`.
-    ///
-    /// The shape of [`Self::stat_pipeline`], for a server that has refused
-    /// STAT and for re-checking what STAT reported missing: every HEAD goes
-    /// out in one write and the responses are read back in order, so a batch
-    /// costs one round trip rather than one per article. A 221 carries the
-    /// headers, which have to be drained before the next status line can be
-    /// read; only their arrival matters here, so they are read and dropped.
-    ///
-    /// Returns a `Vec<bool>` aligned with the input: true = 221, false = 430.
-    /// A server that does not implement HEAD at all is recorded as such and
-    /// the batch fails with `CommandNotRecognized` — after the pipe has been
-    /// drained, so the connection is left clean.
+    // Check multiple articles for existence using pipelined `HEAD`.
+    //
+    // The shape of [`Self::stat_pipeline`], for a server that has refused
+    // STAT and for re-checking what STAT reported missing: every HEAD goes
+    // out in one write and the responses are read back in order, so a batch
+    // costs one round trip rather than one per article. A 221 carries the
+    // headers, which have to be drained before the next status line can be
+    // read; only their arrival matters here, so they are read and dropped.
+    //
+    // Returns a `Vec<bool>` aligned with the input: true = 221, false = 430.
+    // A server that does not implement HEAD at all is recorded as such and
+    // the batch fails with `CommandNotRecognized` — after the pipe has been
+    // drained, so the connection is left clean.
     pub async fn head_pipeline(&mut self, message_ids: &[&str]) -> Result<Vec<bool>> {
         if message_ids.is_empty() {
             return Ok(Vec::new());
@@ -1479,10 +1479,10 @@ impl NntpConnection {
         }
     }
 
-    /// Stream the body of an article directly to a writer.
-    ///
-    /// Reads the multi-line data and writes it to the provided writer.
-    /// Returns the total number of bytes written.
+    // Stream the body of an article directly to a writer.
+    //
+    // Reads the multi-line data and writes it to the provided writer.
+    // Returns the total number of bytes written.
     pub async fn stream_body<W: tokio::io::AsyncWrite + Unpin>(
         &mut self,
         message_id: &str,
@@ -1496,11 +1496,11 @@ impl NntpConnection {
         Ok(len)
     }
 
-    /// Send a lightweight `DATE` command to verify the connection is still alive.
-    ///
-    /// If the server responds successfully, the connection is still good.
-    /// If the response is an error or the connection times out, it is marked
-    /// as poisoned and an error is returned.
+    // Send a lightweight `DATE` command to verify the connection is still alive.
+    //
+    // If the server responds successfully, the connection is still good.
+    // If the response is an error or the connection times out, it is marked
+    // as poisoned and an error is returned.
     pub async fn ping(&mut self) -> Result<()> {
         let resp = self.send_command(&Command::Date).await.inspect_err(|_e| {
             self.poisoned = true;
@@ -1516,11 +1516,11 @@ impl NntpConnection {
         Ok(())
     }
 
-    /// Stream the body of an article, calling the callback for each chunk.
-    ///
-    /// Returns the total number of bytes streamed (after dot-unstuffing).
-    /// The callback receives each chunk of decoded data as it arrives,
-    /// avoiding buffering the entire article in memory.
+    // Stream the body of an article, calling the callback for each chunk.
+    //
+    // Returns the total number of bytes streamed (after dot-unstuffing).
+    // The callback receives each chunk of decoded data as it arrives,
+    // avoiding buffering the entire article in memory.
     pub async fn stream_body_chunked<F>(&mut self, message_id: &str, on_chunk: F) -> Result<u64>
     where
         F: FnMut(&[u8]) -> Result<()>,
@@ -1546,11 +1546,11 @@ impl NntpConnection {
             .map(|stats| stats.bytes)
     }
 
-    /// Stream the raw body of an article, yielding chunks on line boundaries.
-    ///
-    /// Chunks retain NNTP dot-stuffing and exclude the final multiline
-    /// terminator. This is the download hot path used by the streaming yEnc
-    /// decoder.
+    // Stream the raw body of an article, yielding chunks on line boundaries.
+    //
+    // Chunks retain NNTP dot-stuffing and exclude the final multiline
+    // terminator. This is the download hot path used by the streaming yEnc
+    // decoder.
     async fn stream_body_response<F>(
         &mut self,
         initial: Response,
@@ -2096,7 +2096,7 @@ impl NntpConnection {
         Ok((read.bytes, read.stats))
     }
 
-    /// Send QUIT and close the connection gracefully.
+    // Send QUIT and close the connection gracefully.
     pub async fn quit(&mut self) -> Result<()> {
         self.state = ConnectionState::Closing;
         self.route_outcome = None;
@@ -2104,27 +2104,27 @@ impl NntpConnection {
         Ok(())
     }
 
-    /// Check whether this connection is still healthy and usable.
+    // Check whether this connection is still healthy and usable.
     pub fn is_healthy(&self) -> bool {
         !self.poisoned && self.state == ConnectionState::Ready
     }
 
-    /// Whether the connection has been poisoned by an I/O error.
+    // Whether the connection has been poisoned by an I/O error.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
 
-    /// The current connection state.
+    // The current connection state.
     pub fn state(&self) -> ConnectionState {
         self.state
     }
 
-    /// When this connection was created.
+    // When this connection was created.
     pub fn created_at(&self) -> Instant {
         self.created_at
     }
 
-    /// When this connection was last used for a command.
+    // When this connection was last used for a command.
     pub fn last_used(&self) -> Instant {
         self.last_used
     }
@@ -2147,18 +2147,18 @@ impl NntpConnection {
                 .is_none_or(|slot| slot.claim_reuse())
     }
 
-    /// The server's advertised capabilities.
+    // The server's advertised capabilities.
     pub fn capabilities(&self) -> &Capabilities {
         &self.capabilities
     }
 
-    /// How long setup's CAPABILITIES command waited for its status line, or
-    /// `None` when setup did not ask (the capability was already known).
+    // How long setup's CAPABILITIES command waited for its status line, or
+    // `None` when setup did not ask (the capability was already known).
     pub fn capabilities_round_trip(&self) -> Option<Duration> {
         self.capabilities_round_trip
     }
 
-    /// IANA name of the negotiated TLS cipher suite, if the transport is TLS.
+    // IANA name of the negotiated TLS cipher suite, if the transport is TLS.
     pub fn negotiated_cipher_suite(&self) -> Option<String> {
         self.transport
             .as_ref()
@@ -2174,11 +2174,11 @@ impl NntpConnection {
     }
 }
 
-/// Whether an error is the server refusing the command itself (500/501)
-/// rather than answering it.
-///
-/// 500 is mapped to its own variant; 501 arrives as an unexpected response,
-/// so both shapes have to be recognised here.
+// Whether an error is the server refusing the command itself (500/501)
+// rather than answering it.
+//
+// 500 is mapped to its own variant; 501 arrives as an unexpected response,
+// so both shapes have to be recognised here.
 pub(crate) fn reports_unsupported_command(error: &NntpError) -> bool {
     match error {
         NntpError::CommandNotRecognized => true,

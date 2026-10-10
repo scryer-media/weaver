@@ -3,10 +3,10 @@ use bytes::Bytes;
 use crate::error::NntpError;
 use crate::types::{MultiLineResponse, Response, StatusCode};
 
-/// Parse a single-line NNTP response string into a `Response`.
-///
-/// Expected format: `xyz message text` where `xyz` is a 3-digit status code
-/// followed by a space (or end of line) and optional message text.
+// Parse a single-line NNTP response string into a `Response`.
+//
+// Expected format: `xyz message text` where `xyz` is a 3-digit status code
+// followed by a space (or end of line) and optional message text.
 pub fn parse_response(line: &str) -> Result<Response, NntpError> {
     let bytes = line.as_bytes();
     if bytes.len() < 3 {
@@ -46,16 +46,16 @@ pub fn parse_response(line: &str) -> Result<Response, NntpError> {
     })
 }
 
-/// Build a `MultiLineResponse` from a parsed initial `Response` and the raw
-/// multi-line data body (already dot-unstuffed by the codec).
+// Build a `MultiLineResponse` from a parsed initial `Response` and the raw
+// multi-line data body (already dot-unstuffed by the codec).
 pub fn build_multiline_response(initial: Response, data: Bytes) -> MultiLineResponse {
     MultiLineResponse { initial, data }
 }
 
-/// Check a response and return an appropriate error if it indicates failure.
-///
-/// Returns `Ok(response)` if the status code is not an error code. Otherwise
-/// maps known error codes to specific `NntpError` variants.
+// Check a response and return an appropriate error if it indicates failure.
+//
+// Returns `Ok(response)` if the status code is not an error code. Otherwise
+// maps known error codes to specific `NntpError` variants.
 pub fn check_response(response: Response) -> Result<Response, NntpError> {
     if !response.code.is_error() {
         return Ok(response);
@@ -63,9 +63,9 @@ pub fn check_response(response: Response) -> Result<Response, NntpError> {
     Err(NntpError::from_status(response.code, &response.message))
 }
 
-/// Returns `true` if the given status code indicates a multi-line data block follows.
-///
-/// Based on RFC 3977 and common extensions.
+// Returns `true` if the given status code indicates a multi-line data block follows.
+//
+// Based on RFC 3977 and common extensions.
 pub fn is_multiline_status(code: u16) -> bool {
     matches!(
         code,

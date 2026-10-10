@@ -461,10 +461,10 @@ async fn final_move_refuses_symlink_entries_and_releases_its_empty_destination_c
     assert!(!dest.exists());
 }
 
-/// The seam the rename pass runs at has to see both delivery routes as one set.
-/// Extraction writes members into the working root and direct-store commits
-/// them into staging; only after this move do they share a directory, and the
-/// dominance test that picks the payload is meaningless before then.
+// The seam the rename pass runs at has to see both delivery routes as one set.
+// Extraction writes members into the working root and direct-store commits
+// them into staging; only after this move do they share a directory, and the
+// dominance test that picks the payload is meaningless before then.
 #[tokio::test]
 async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
     let temp = tempfile::tempdir().unwrap();
@@ -503,8 +503,8 @@ async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
     assert!(!dest.join("Yb5drZSkNi20UCMkb.mkv").exists());
 }
 
-/// The pass is a policy, not a stage: with it off the move places exactly what
-/// it was given.
+// The pass is a policy, not a stage: with it off the move places exactly what
+// it was given.
 #[tokio::test]
 async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
     let temp = tempfile::tempdir().unwrap();
@@ -554,10 +554,10 @@ fn prepublication_scan_checks_both_delivery_roots() {
     assert!(staging.join("extras/Payload.EXE").exists());
 }
 
-/// The Windows arm of the guard reads a raw attribute bit rather than asking
-/// `FileType`, so an inverted or mistyped mask would reject every ordinary
-/// delivery instead of just the redirecting ones. The Unix symlink tests
-/// cannot see that: this one runs on every platform.
+// The Windows arm of the guard reads a raw attribute bit rather than asking
+// `FileType`, so an inverted or mistyped mask would reject every ordinary
+// delivery instead of just the redirecting ones. The Unix symlink tests
+// cannot see that: this one runs on every platform.
 #[test]
 fn ordinary_files_and_directories_are_not_treated_as_links() {
     let temp = tempfile::tempdir().unwrap();

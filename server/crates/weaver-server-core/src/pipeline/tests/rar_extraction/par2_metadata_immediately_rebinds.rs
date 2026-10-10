@@ -1,4 +1,4 @@
-//! `rar_extraction` tests, part of a mechanical split of the original file.
+// `rar_extraction` tests, part of a mechanical split of the original file.
 
 use super::*;
 
@@ -2938,17 +2938,17 @@ async fn generic_par2_repair_requeues_extraction_for_7z_and_gzip_payloads() {
     }
 }
 
-/// A split 7z set short one part the NZB never carried is repaired from its
-/// recovery blocks and then extracted — for an interior part and for the last
-/// part alike.
-///
-/// Before this, neither shape ever reached PAR2. The interior hole left the
-/// topology short of ready forever, with no predicate naming the absence the
-/// way the RAR scheduler's `WaitingForVolumes` does; the missing last part was
-/// not even known to be missing, so the strong-decode fast path settled the set
-/// as clean and extraction opened a truncated set. And had a repair somehow
-/// run, the rebuilt part sat on disk under a name the assembly had never heard
-/// of, outside the topology and outside `archive_set_part_paths`.
+// A split 7z set short one part the NZB never carried is repaired from its
+// recovery blocks and then extracted — for an interior part and for the last
+// part alike.
+//
+// Before this, neither shape ever reached PAR2. The interior hole left the
+// topology short of ready forever, with no predicate naming the absence the
+// way the RAR scheduler's `WaitingForVolumes` does; the missing last part was
+// not even known to be missing, so the strong-decode fast path settled the set
+// as clean and extraction opened a truncated set. And had a repair somehow
+// run, the rebuilt part sat on disk under a name the assembly had never heard
+// of, outside the topology and outside `archive_set_part_paths`.
 #[tokio::test]
 async fn par2_rebuilds_a_split_7z_part_the_nzb_never_carried_and_extraction_follows() {
     for (job_id, withheld) in [(JobId(30084), 2usize), (JobId(30085), 6usize)] {
@@ -3099,12 +3099,12 @@ async fn par2_rebuilds_a_split_7z_part_the_nzb_never_carried_and_extraction_foll
     }
 }
 
-/// The live ordering of a small posting: every data part and the index land
-/// while the recovery file is still parked, so the completion pass runs with
-/// the download pipeline not yet quiet. The absent part is structural — the
-/// NZB never carried it — so the pass must not settle the set as clean and
-/// hand a truncated archive to the extractor; it has to reach for the
-/// recovery blocks. Then, once the recovery file lands, the part is rebuilt.
+// The live ordering of a small posting: every data part and the index land
+// while the recovery file is still parked, so the completion pass runs with
+// the download pipeline not yet quiet. The absent part is structural — the
+// NZB never carried it — so the pass must not settle the set as clean and
+// hand a truncated archive to the extractor; it has to reach for the
+// recovery blocks. Then, once the recovery file lands, the part is rebuilt.
 #[tokio::test]
 async fn a_split_7z_short_of_a_part_the_nzb_never_carried_is_not_settled_clean_before_its_recovery_lands()
  {
@@ -3265,7 +3265,7 @@ async fn a_split_7z_short_of_a_part_the_nzb_never_carried_is_not_settled_clean_b
     }
 }
 
-/// What a 7z extraction reports for a block whose packed bytes did not decode.
+// What a 7z extraction reports for a block whose packed bytes did not decode.
 fn sevenz_corrupted_block_error() -> String {
     format!(
         "{}BlockDecode {{ block_index: 0, packed_offset: 32, kind: Corrupted, message: \"data error\" }}",
@@ -3273,12 +3273,12 @@ fn sevenz_corrupted_block_error() -> String {
     )
 }
 
-/// A split 7z job with every part posted and its recovery set loaded, walked
-/// through its completion checks until its conventional extraction is in
-/// flight. The checks settle the set clean on the strong-decode claim without
-/// an authoritative pass, which is the state a job's extraction starts from.
-/// `damaged` names a part whose posted bytes differ from what the recovery set
-/// describes.
+// A split 7z job with every part posted and its recovery set loaded, walked
+// through its completion checks until its conventional extraction is in
+// flight. The checks settle the set clean on the strong-decode claim without
+// an authoritative pass, which is the state a job's extraction starts from.
+// `damaged` names a part whose posted bytes differ from what the recovery set
+// describes.
 async fn strong_decode_verified_split_7z(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -3376,9 +3376,9 @@ async fn strong_decode_verified_split_7z(
     (working_dir, parts)
 }
 
-/// Runs what the job queues until it has an extraction result to hand back,
-/// or has nothing left queued. No deadline: a step that never comes is the
-/// test runner's to bound.
+// Runs what the job queues until it has an extraction result to hand back,
+// or has nothing left queued. No deadline: a step that never comes is the
+// test runner's to bound.
 async fn next_7z_extraction_or_rest(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -3403,11 +3403,11 @@ async fn next_7z_extraction_or_rest(
     }
 }
 
-/// A clean strong-decode verdict is a claim that extraction would prove the
-/// bytes. When the conventional extraction then fails on a damaged block with
-/// every part present, the claim is contradicted: the verdict reopens, the
-/// authoritative pass finds the damage, one repair rebuilds the part, and the
-/// set extracts from the repaired bytes.
+// A clean strong-decode verdict is a claim that extraction would prove the
+// bytes. When the conventional extraction then fails on a damaged block with
+// every part present, the claim is contradicted: the verdict reopens, the
+// authoritative pass finds the damage, one repair rebuilds the part, and the
+// set extracts from the repaired bytes.
 #[tokio::test]
 async fn a_strong_decode_verified_7z_whose_extraction_hits_a_damaged_block_is_repaired_once() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3472,9 +3472,9 @@ async fn a_strong_decode_verified_7z_whose_extraction_hits_a_damaged_block_is_re
     assert_eq!(pipeline.par2_repairer_execute_calls, 1, "and only one");
 }
 
-/// The reopen is bounded. A set the authoritative pass finds clean while its
-/// extraction keeps failing on a data error gets one retry, and then the job
-/// fails naming that, rather than reopening the verdict again and again.
+// The reopen is bounded. A set the authoritative pass finds clean while its
+// extraction keeps failing on a data error gets one retry, and then the job
+// fails naming that, rather than reopening the verdict again and again.
 #[tokio::test]
 async fn a_7z_data_error_the_recovery_data_finds_clean_fails_after_one_retry() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3523,10 +3523,10 @@ async fn a_7z_data_error_the_recovery_data_finds_clean_fails_after_one_retry() {
     }
 }
 
-/// A gzip job with its recovery set loaded, walked through its completion
-/// checks until its conventional extraction is in flight, settled clean on the
-/// strong-decode claim with no verification pass. `damaged` flips one byte in
-/// the middle of the posted archive, which the recovery set describes intact.
+// A gzip job with its recovery set loaded, walked through its completion
+// checks until its conventional extraction is in flight, settled clean on the
+// strong-decode claim with no verification pass. `damaged` flips one byte in
+// the middle of the posted archive, which the recovery set describes intact.
 async fn strong_decode_verified_gzip(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -3633,10 +3633,10 @@ async fn strong_decode_verified_gzip(
     (working_dir, archive_filename, gzip_bytes)
 }
 
-/// The strong-decode claim is not the 7z's alone. A gzip set settled on it
-/// whose extraction then fails has its claim reopened the same way: the
-/// authoritative pass finds the damage, one repair rebuilds the archive, and
-/// the set extracts from the repaired bytes rather than failing the job.
+// The strong-decode claim is not the 7z's alone. A gzip set settled on it
+// whose extraction then fails has its claim reopened the same way: the
+// authoritative pass finds the damage, one repair rebuilds the archive, and
+// the set extracts from the repaired bytes rather than failing the job.
 #[tokio::test]
 async fn a_strong_decode_verified_gzip_whose_extraction_fails_is_repaired_once() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3692,9 +3692,9 @@ async fn a_strong_decode_verified_gzip_whose_extraction_fails_is_repaired_once()
     assert_eq!(pipeline.par2_repairer_execute_calls, 1, "and only one");
 }
 
-/// The gzip reopen is bounded too. Once the authoritative pass has ruled, an
-/// extraction that keeps failing finds no claim left to reopen, and the job
-/// fails on the extraction's own error after exactly one fallback.
+// The gzip reopen is bounded too. Once the authoritative pass has ruled, an
+// extraction that keeps failing finds no claim left to reopen, and the job
+// fails on the extraction's own error after exactly one fallback.
 #[tokio::test]
 async fn a_gzip_failure_the_recovery_data_finds_clean_is_final_after_one_fallback() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3742,8 +3742,8 @@ async fn a_gzip_failure_the_recovery_data_finds_clean_is_final_after_one_fallbac
     }
 }
 
-/// A 7z data error is one a repair can change; a method this build cannot
-/// decode and a missing or wrong password are not, and still end the job.
+// A 7z data error is one a repair can change; a method this build cannot
+// decode and a missing or wrong password are not, and still end the job.
 #[test]
 fn only_7z_data_errors_are_recoverable_full_set_failures() {
     let prefix = crate::pipeline::completion::finalize::extract::SEVENZ_BLOCK_DATA_ERROR_PREFIX;
@@ -3766,17 +3766,17 @@ fn only_7z_data_errors_are_recoverable_full_set_failures() {
     }
 }
 
-/// Two file members that sanitize to one destination are refused at open, and
-/// that refusal has to end the job — not send it round again.
-///
-/// The refusal is raised by `ensure_unique_sanitized_rar_member_paths` before
-/// any member is extracted, so the batch worker's error is the archive's
-/// structure, not a member's bytes. Nothing about a retry can change it: no
-/// re-download, no PAR2 verdict, no header refresh. Left classified as an
-/// ordinary member failure, a job with no PAR2 set re-scheduled the same
-/// members straight back into the same open — `set_failed_extraction_member`
-/// only latches a member out while PAR2 still owes a verdict — and spun
-/// extract/refuse/re-schedule as fast as the worker pool allowed.
+// Two file members that sanitize to one destination are refused at open, and
+// that refusal has to end the job — not send it round again.
+//
+// The refusal is raised by `ensure_unique_sanitized_rar_member_paths` before
+// any member is extracted, so the batch worker's error is the archive's
+// structure, not a member's bytes. Nothing about a retry can change it: no
+// re-download, no PAR2 verdict, no header refresh. Left classified as an
+// ordinary member failure, a job with no PAR2 set re-scheduled the same
+// members straight back into the same open — `set_failed_extraction_member`
+// only latches a member out while PAR2 still owes a verdict — and spun
+// extract/refuse/re-schedule as fast as the worker pool allowed.
 #[tokio::test]
 async fn colliding_member_paths_fail_the_job_instead_of_respinning_extraction() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3821,10 +3821,10 @@ async fn colliding_member_paths_fail_the_job_instead_of_respinning_extraction() 
     );
 }
 
-/// The terminal classification is keyed on the exact prefixes the open-time
-/// checks produce. Anything a retry or a repair could still turn around —
-/// a member CRC, a stale topology, FD pressure, a member whose *name* merely
-/// contains one of the phrases — stays on its existing path.
+// The terminal classification is keyed on the exact prefixes the open-time
+// checks produce. Anything a retry or a repair could still turn around —
+// a member CRC, a stale topology, FD pressure, a member whose *name* merely
+// contains one of the phrases — stays on its existing path.
 #[test]
 fn terminal_archive_structure_classification_matches_only_open_time_refusals() {
     assert!(Pipeline::is_terminal_archive_structure_error(

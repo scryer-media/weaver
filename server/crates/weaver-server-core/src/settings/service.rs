@@ -9,17 +9,17 @@ use crate::settings::{
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
-/// The key the chosen hardware profile is stored under. Absent until an
-/// operator picks one.
+// The key the chosen hardware profile is stored under. Absent until an
+// operator picks one.
 pub const HARDWARE_PROFILE_SETTING: &str = "hardware_profile";
 
-/// Keys earlier releases stored that nothing reads any more. Loading the
-/// config removes them, so an old database or a restored backup does not
-/// carry a setting the product no longer has.
+// Keys earlier releases stored that nothing reads any more. Loading the
+// config removes them, so an old database or a restored backup does not
+// carry a setting the product no longer has.
 pub(crate) const RETIRED_SETTING_KEYS: &[&str] = &["ip_replacement_trial_extra_connections"];
 
 impl Database {
-    /// Load a full `Config` from the settings and servers tables.
+    // Load a full `Config` from the settings and servers tables.
     pub fn load_config(&self) -> Result<Config, StateError> {
         let settings: std::collections::HashMap<String, String> = self
             .list_setting_records()?
@@ -238,7 +238,7 @@ impl Database {
         })
     }
 
-    /// Save a full `Config` to the settings and servers tables.
+    // Save a full `Config` to the settings and servers tables.
     pub fn save_config(&self, config: &Config) -> Result<(), StateError> {
         self.set_setting("data_dir", &config.data_dir)?;
         if let Some(ref intermediate_dir) = config.intermediate_dir {

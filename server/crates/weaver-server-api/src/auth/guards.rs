@@ -4,8 +4,8 @@ use async_graphql::{Context, Error, ErrorExtensions, Guard, Result};
 use crate::auth::CallerIdentity;
 use weaver_server_core::auth::CallerScope;
 
-/// The only general queries exposed to run credentials. The unguarded
-/// `scriptRun` field separately checks the live run and scopes its callbacks.
+// The only general queries exposed to run credentials. The unguarded
+// `scriptRun` field separately checks the live run and scopes its callbacks.
 fn script_run_verdict(ctx: &Context<'_>) -> Result<()> {
     if ctx.query_env.operation.node.ty != OperationType::Query
         || !matches!(ctx.field().name(), "queueItems" | "historyItems")

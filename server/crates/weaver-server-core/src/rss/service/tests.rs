@@ -36,8 +36,8 @@ struct TestHttpState {
     conditional_hits: Arc<AtomicUsize>,
 }
 
-/// Parks the feed response until the test releases it, so a test can act while
-/// a sync is known to be mid-request.
+// Parks the feed response until the test releases it, so a test can act while
+// a sync is known to be mid-request.
 #[derive(Default)]
 struct FeedHold {
     arrived: tokio::sync::Notify,

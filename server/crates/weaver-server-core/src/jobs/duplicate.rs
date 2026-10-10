@@ -1,8 +1,8 @@
-//! Stable duplicate-detection identities and admission policy.
-//!
-//! These values deliberately describe a validated [`JobSpec`] instead of the
-//! submitted XML bytes.  The raw NZB hash remains an archival integrity value;
-//! it is not reused as a duplicate identity.
+// Stable duplicate-detection identities and admission policy.
+//
+// These values deliberately describe a validated [`JobSpec`] instead of the
+// submitted XML bytes.  The raw NZB hash remains an archival integrity value;
+// it is not reused as a duplicate identity.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{LazyLock, Mutex};
@@ -26,9 +26,9 @@ pub struct DuplicateAdmissionMetric {
     pub count: u64,
 }
 
-/// Fixed semantic-arbitration lifecycle events. These are intentionally a
-/// closed allowlist so Prometheus never receives a release name, key, digest,
-/// job identifier, or caller identity as a label.
+// Fixed semantic-arbitration lifecycle events. These are intentionally a
+// closed allowlist so Prometheus never receives a release name, key, digest,
+// job identifier, or caller identity as a label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticDuplicateLifecycleEvent {
     Park,
@@ -96,7 +96,7 @@ pub fn semantic_duplicate_lifecycle_metrics_snapshot() -> Vec<SemanticDuplicateL
         .collect()
 }
 
-/// The independently versioned shapes used to compare two validated NZBs.
+// The independently versioned shapes used to compare two validated NZBs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FingerprintKind {
     StrictArticleLayout,
@@ -315,13 +315,13 @@ impl DuplicateAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DuplicateMode {
-    /// Apply only the independent article-fingerprint policy.
+    // Apply only the independent article-fingerprint policy.
     Enforce,
-    /// Arbitrate candidates sharing an explicit source-supplied semantic key.
+    // Arbitrate candidates sharing an explicit source-supplied semantic key.
     Score,
-    /// Do not group candidates, while retaining article-fingerprint policy.
+    // Do not group candidates, while retaining article-fingerprint policy.
     All,
-    /// Bypass semantic and fingerprint policy, never caller idempotency.
+    // Bypass semantic and fingerprint policy, never caller idempotency.
     Force,
 }
 
@@ -350,9 +350,9 @@ impl DuplicateMode {
     }
 }
 
-/// A source-supplied grouping key and score. The key is deliberately separate
-/// from caller-scoped idempotency: multiple independently submitted releases
-/// can legitimately compete for one semantic group.
+// A source-supplied grouping key and score. The key is deliberately separate
+// from caller-scoped idempotency: multiple independently submitted releases
+// can legitimately compete for one semantic group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticDuplicate {
     pub normalized_key: String,
@@ -368,8 +368,8 @@ impl SemanticDuplicate {
     }
 }
 
-/// Normalizes a semantic source key using Unicode NFKC followed by Unicode
-/// lowercase folding. Empty keys have no semantic authority.
+// Normalizes a semantic source key using Unicode NFKC followed by Unicode
+// lowercase folding. Empty keys have no semantic authority.
 pub fn normalize_semantic_duplicate_key(value: &str) -> Option<String> {
     let normalized = value.trim().nfkc().collect::<String>();
     let normalized = unicase::UniCase::new(normalized).to_folded_case();
@@ -377,9 +377,9 @@ pub fn normalize_semantic_duplicate_key(value: &str) -> Option<String> {
     (!normalized.is_empty()).then(|| normalized.to_string())
 }
 
-/// Durable classification for a terminal SCORE candidate. The raw pipeline
-/// error remains in history; this small taxonomy is the only policy input for
-/// automatic candidate promotion.
+// Durable classification for a terminal SCORE candidate. The raw pipeline
+// error remains in history; this small taxonomy is the only policy input for
+// automatic candidate promotion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SemanticTerminalCause {
@@ -442,8 +442,8 @@ impl SemanticTerminalCause {
     }
 }
 
-/// Classifies the terminal pipeline result once at the history boundary. This
-/// intentionally does not become a caller-controlled string protocol.
+// Classifies the terminal pipeline result once at the history boundary. This
+// intentionally does not become a caller-controlled string protocol.
 pub fn classify_semantic_terminal_cause(
     status: &str,
     raw_error: Option<&str>,
@@ -583,7 +583,7 @@ impl DuplicateDecision {
     }
 }
 
-/// Default policy accepted for the first duplicate-detection rollout.
+// Default policy accepted for the first duplicate-detection rollout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DuplicatePolicy {
     #[serde(default = "default_strict_active_or_success_action")]
@@ -678,8 +678,8 @@ const fn default_warn_action() -> DuplicateAction {
     DuplicateAction::Warn
 }
 
-/// Classifies the submitting boundary without making external transport text an
-/// untyped policy input.
+// Classifies the submitting boundary without making external transport text an
+// untyped policy input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmissionOrigin {
     Api,
@@ -709,7 +709,7 @@ impl SubmissionOrigin {
     }
 }
 
-/// An idempotency key only has meaning within the submitting caller's scope.
+// An idempotency key only has meaning within the submitting caller's scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallerScopedIdempotency {
     pub caller: String,

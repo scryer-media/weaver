@@ -1,8 +1,8 @@
-//! A routed article's destination writes run off the pipeline task. These pin
-//! what that must not change: the pipeline keeps serving while a write is
-//! held open, a demotion that overtakes a write hands its article back, and
-//! neither a shutdown checkpoint nor a PAR3 publication runs ahead of a write
-//! that is still out.
+// A routed article's destination writes run off the pipeline task. These pin
+// what that must not change: the pipeline keeps serving while a write is
+// held open, a demotion that overtakes a write hands its article back, and
+// neither a shutdown checkpoint nor a PAR3 publication runs ahead of a write
+// that is still out.
 
 use super::*;
 
@@ -13,9 +13,9 @@ const ARTICLES: usize = 2;
 
 mod schedules;
 
-/// A placement routed into a set retires the set's PAR3 sources before its
-/// writes leave. A refresh while those writes are held must not publish one
-/// over a destination about to change.
+// A placement routed into a set retires the set's PAR3 sources before its
+// writes leave. A refresh while those writes are held must not publish one
+// over a destination about to change.
 #[tokio::test]
 async fn par3_publication_waits_for_direct_placement() {
     use crate::pipeline::repair::par3::work::Coordinator;
@@ -56,9 +56,9 @@ async fn par3_publication_waits_for_direct_placement() {
     );
 }
 
-/// Every volume of a split member reads the same destination, so a placement
-/// into one volume writes under the PAR3 images of the others. A refresh
-/// while it is out must not take a sibling's snapshot over that destination.
+// Every volume of a split member reads the same destination, so a placement
+// into one volume writes under the PAR3 images of the others. A refresh
+// while it is out must not take a sibling's snapshot over that destination.
 #[tokio::test]
 async fn par3_sibling_snapshot_stays_fresh_after_placement() {
     use crate::pipeline::repair::par3::work::Coordinator;
@@ -127,11 +127,11 @@ async fn par3_keyed_checksum_encrypted_source_gains_committed_ranges() {
     par3_partial_publication(Some(true)).await;
 }
 
-/// A volume's second article lands — its writes returned, its commit not yet
-/// applied — across a PAR3 refresh. The image published after the commit
-/// must read what the set has committed, not the coverage of before it.
-/// `encrypted` is `None` for a plain set, or whether an encrypted set keys
-/// its final part's checksum.
+// A volume's second article lands — its writes returned, its commit not yet
+// applied — across a PAR3 refresh. The image published after the commit
+// must read what the set has committed, not the coverage of before it.
+// `encrypted` is `None` for a plain set, or whether an encrypted set keys
+// its final part's checksum.
 async fn par3_partial_publication(encrypted: Option<bool>) {
     use crate::pipeline::repair::par3::work::Coordinator;
     use par3_rs::source::SourceId;
@@ -210,12 +210,12 @@ async fn par3_partial_publication(encrypted: Option<bool>) {
     );
 }
 
-/// A demotion that overtakes a run of placements hands every one of those
-/// articles to the conventional path, where they wait in the volume's write
-/// buffer until the sweep's handback drains it. The volume completes when the
-/// last of them is written, and is read back for its checksum exactly once
-/// then — not once more for every handed-back article written after an
-/// earlier one already made the file look complete.
+// A demotion that overtakes a run of placements hands every one of those
+// articles to the conventional path, where they wait in the volume's write
+// buffer until the sweep's handback drains it. The volume completes when the
+// last of them is written, and is read back for its checksum exactly once
+// then — not once more for every handed-back article written after an
+// earlier one already made the file look complete.
 #[tokio::test]
 async fn a_demotion_handback_hashes_its_volume_once() {
     let root = TempDir::new().unwrap();
@@ -270,8 +270,8 @@ fn committed(pipeline: &Pipeline, segment_id: SegmentId) -> bool {
         .is_some_and(|file| file.has_segment(segment_id.segment_number))
 }
 
-/// A pipeline with one direct set admitted and every placement task held at
-/// its first step until the returned semaphore gets a permit.
+// A pipeline with one direct set admitted and every placement task held at
+// its first step until the returned semaphore gets a permit.
 async fn held_pipeline(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -286,9 +286,9 @@ async fn held_pipeline(
     (pipeline, working_dir, hold)
 }
 
-/// Delivers one decoded article the way the decode stage does, and returns
-/// as soon as the pipeline does — without waiting for the placement it
-/// starts, which is what every other submit helper settles.
+// Delivers one decoded article the way the decode stage does, and returns
+// as soon as the pipeline does — without waiting for the placement it
+// starts, which is what every other submit helper settles.
 async fn route_article(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -516,14 +516,14 @@ async fn a_placement_task_that_panics_fails_its_placement_and_hands_the_article_
     assert_eq!(pipeline.write_buffered_bytes, 0);
 }
 
-/// Swaps the hold new placement tasks wait at, and returns it closed.
+// Swaps the hold new placement tasks wait at, and returns it closed.
 fn hold_next_flights(pipeline: &mut Pipeline) -> Arc<Semaphore> {
     let hold = Arc::new(Semaphore::new(0));
     pipeline.direct_placement_hold = Some(Arc::clone(&hold));
     hold
 }
 
-/// Handles the next placement done message, as the select loop would.
+// Handles the next placement done message, as the select loop would.
 async fn land_next_flight(pipeline: &mut Pipeline) {
     let done = pipeline
         .direct_placement_done_rx
@@ -613,9 +613,9 @@ async fn a_completed_volumes_trailing_region_lands_through_the_lane_while_the_pi
     assert_eq!(pipeline.write_buffered_bytes, 0);
 }
 
-/// A pipeline with one direct set admitted, also returning the directory a
-/// finished member is published into. Placement tasks run free until a test
-/// swaps a closed hold in with [`hold_next_flights`].
+// A pipeline with one direct set admitted, also returning the directory a
+// finished member is published into. Placement tasks run free until a test
+// swaps a closed hold in with [`hold_next_flights`].
 async fn publishing_pipeline(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -628,9 +628,9 @@ async fn publishing_pipeline(
     (pipeline, working_dir, complete_dir)
 }
 
-/// What the download stage does once a job's last article is in, and the
-/// completion checks that queues, run as the select loop's tick runs them.
-/// The placement lanes are left alone.
+// What the download stage does once a job's last article is in, and the
+// completion checks that queues, run as the select loop's tick runs them.
+// The placement lanes are left alone.
 async fn finish_download_pass_and_check(pipeline: &mut Pipeline, job_id: JobId) {
     pipeline.maybe_finish_download_pass(job_id);
     while let Some(queued) = pipeline.pending_completion_checks.pop_front() {
@@ -638,8 +638,8 @@ async fn finish_download_pass_and_check(pipeline: &mut Pipeline, job_id: JobId) 
     }
 }
 
-/// Nothing judged the job: it is still downloading, with no extraction
-/// started over a set that has no volume on disk.
+// Nothing judged the job: it is still downloading, with no extraction
+// started over a set that has no volume on disk.
 fn assert_still_active(pipeline: &Pipeline, job_id: JobId) {
     assert_eq!(
         job_status_for_assert(pipeline, job_id),
@@ -656,10 +656,10 @@ fn assert_still_active(pipeline: &Pipeline, job_id: JobId) {
     );
 }
 
-/// The completion check that deferred to the placements has run again: the
-/// landing either ran it inline, after the set finalized, and the job is
-/// moving its output, or queued it for the next tick. Neither leaves a check
-/// parked on placements that are gone.
+// The completion check that deferred to the placements has run again: the
+// landing either ran it inline, after the set finalized, and the job is
+// moving its output, or queued it for the next tick. Neither leaves a check
+// parked on placements that are gone.
 fn assert_carried_forward(pipeline: &Pipeline, job_id: JobId) {
     let status = job_status_for_assert(pipeline, job_id);
     assert!(
@@ -673,8 +673,8 @@ fn assert_carried_forward(pipeline: &Pipeline, job_id: JobId) {
     );
 }
 
-/// Lands every placement, checks that the landing itself carried the job on,
-/// and drives it to its end.
+// Lands every placement, checks that the landing itself carried the job on,
+// and drives it to its end.
 async fn land_and_finish(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -872,9 +872,9 @@ async fn placements_a_barrier_settles_still_carry_a_deferred_completion_on() {
     assert!(no_volume_file(&working_dir, &volumes));
 }
 
-/// A refresh held back while a placement was out is owed once it lands, and
-/// no completion check is bound to follow the landing while the job still
-/// downloads: the landing itself publishes what the refresh did not.
+// A refresh held back while a placement was out is owed once it lands, and
+// no completion check is bound to follow the landing while the job still
+// downloads: the landing itself publishes what the refresh did not.
 #[tokio::test]
 async fn a_placement_landing_publishes_the_par3_sources_it_held_back() {
     use crate::pipeline::repair::par3::work::Coordinator;
@@ -946,16 +946,16 @@ async fn a_placement_landing_publishes_the_par3_sources_it_held_back() {
     );
 }
 
-/// A direct set protected by PAR3, with one article of its middle volume
-/// held at its placement while everything else of the set has landed, and
-/// the middle volume's last article lost for good.
-///
-/// A completion check's PAR3 refresh runs while the held article is out —
-/// before its write lands when `landed_first` is false, after the write
-/// returned but before its done message is applied when it is true — and
-/// the next one after the landing. The verdict the runtime then holds must
-/// be the one a fresh publication of everything committed gives: the lost
-/// article and nothing more.
+// A direct set protected by PAR3, with one article of its middle volume
+// held at its placement while everything else of the set has landed, and
+// the middle volume's last article lost for good.
+//
+// A completion check's PAR3 refresh runs while the held article is out —
+// before its write lands when `landed_first` is false, after the write
+// returned but before its done message is applied when it is true — and
+// the next one after the landing. The verdict the runtime then holds must
+// be the one a fresh publication of everything committed gives: the lost
+// article and nothing more.
 async fn par3_refresh_across_a_held_placement(job_id: JobId, landed_first: bool) {
     const ARTICLES_EACH: usize = 8;
     let payload: Vec<u8> = (0..48_000u32).map(|index| (index * 13 + 5) as u8).collect();

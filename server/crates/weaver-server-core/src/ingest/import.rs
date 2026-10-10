@@ -11,10 +11,10 @@ use crate::jobs::{
 use weaver_model::files::{FileRole, unique_download_filenames};
 use weaver_nzb::{Nzb, parse_nzb};
 
-/// Global counter for generating unique job IDs.
+// Global counter for generating unique job IDs.
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Import an NZB file and return a JobId + JobSpec ready for the scheduler.
+// Import an NZB file and return a JobId + JobSpec ready for the scheduler.
 pub fn import_nzb(nzb_bytes: &[u8], nzb_path: &Path) -> Result<(JobId, JobSpec), ImportError> {
     let nzb = parse_nzb(nzb_bytes).map_err(ImportError::Parse)?;
 
@@ -37,8 +37,8 @@ pub fn import_nzb(nzb_bytes: &[u8], nzb_path: &Path) -> Result<(JobId, JobSpec),
     Ok((job_id, spec))
 }
 
-/// Convert a parsed NZB into a JobSpec. Reused by both fresh imports and
-/// recovery (re-parsing an NZB to rebuild the spec for a recovered job).
+// Convert a parsed NZB into a JobSpec. Reused by both fresh imports and
+// recovery (re-parsing an NZB to rebuild the spec for a recovered job).
 pub fn nzb_to_spec(
     nzb: &Nzb,
     nzb_path: &Path,

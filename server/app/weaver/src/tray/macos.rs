@@ -1,15 +1,15 @@
-//! The macOS desktop wrapper: a menu-bar status item and a `WKWebView` window.
-//!
-//! This mirrors the Windows tray one behaviour at a time — the same menu, the
-//! same supervised server, the same rule about which links leave the window —
-//! with two deliberate differences that come from the platform:
-//!
-//! * There is no restart IPC. On Unix the server restarts by replacing its own
-//!   process image, so its PID never changes and this wrapper never sees an
-//!   exit to react to. A message channel would have nothing to carry.
-//! * There is no "start at sign-in" item. macOS login items are registered
-//!   through a service that has its own approval UI, and a checkbox that
-//!   silently did nothing would be worse than no checkbox.
+// The macOS desktop wrapper: a menu-bar status item and a `WKWebView` window.
+//
+// This mirrors the Windows tray one behaviour at a time — the same menu, the
+// same supervised server, the same rule about which links leave the window —
+// with two deliberate differences that come from the platform:
+//
+// * There is no restart IPC. On Unix the server restarts by replacing its own
+//   process image, so its PID never changes and this wrapper never sees an
+//   exit to react to. A message channel would have nothing to carry.
+// * There is no "start at sign-in" item. macOS login items are registered
+//   through a service that has its own approval UI, and a checkbox that
+//   silently did nothing would be worse than no checkbox.
 
 use std::cell::{Cell, RefCell};
 use std::fs::File;
@@ -52,23 +52,23 @@ use super::shared::{
     SMOKE_TIMEOUT, ServerSupervisor, SupervisedServer,
 };
 
-/// The notification a second invocation posts so the running instance shows
-/// its window. Launch Services already routes a second `.app` launch to the
-/// running process; this covers the case where the binary inside the bundle is
-/// run directly.
+// The notification a second invocation posts so the running instance shows
+// its window. Launch Services already routes a second `.app` launch to the
+// running process; this covers the case where the binary inside the bundle is
+// run directly.
 const OPEN_NOTIFICATION: &str = "media.weaver.app.open";
 
-/// The lock the primary instance holds for as long as it runs.
+// The lock the primary instance holds for as long as it runs.
 const INSTANCE_LOCK_FILE: &str = "weaver-tray.lock";
 
-/// How often the wrapper checks whether the server has come up.
+// How often the wrapper checks whether the server has come up.
 const READY_POLL_INTERVAL: f64 = 0.25;
 
-/// How often the wrapper checks on the server it started.
-///
-/// This only has to notice a bundle upgrade's relaunch request promptly enough
-/// that the user does not sit looking at a stopped app; a second is well inside
-/// that and costs a `waitpid` poll.
+// How often the wrapper checks on the server it started.
+//
+// This only has to notice a bundle upgrade's relaunch request promptly enough
+// that the user does not sit looking at a stopped app; a second is well inside
+// that and costs a `waitpid` poll.
 const SUPERVISION_POLL_INTERVAL: f64 = 1.0;
 
 fn copy_setup_code_to_clipboard(code: &str) -> std::io::Result<()> {
@@ -84,52 +84,52 @@ fn copy_setup_code_to_clipboard(code: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The app window's default size. Weaver's UI is a dense table layout, so the
-/// first-run window is sized for it rather than for the smallest usable frame.
+// The app window's default size. Weaver's UI is a dense table layout, so the
+// first-run window is sized for it rather than for the smallest usable frame.
 const WINDOW_WIDTH: f64 = 1280.0;
 const WINDOW_HEIGHT: f64 = 800.0;
 const WINDOW_MIN_WIDTH: f64 = 720.0;
 const WINDOW_MIN_HEIGHT: f64 = 480.0;
 
-/// Result of the background readiness probe, read by the main-thread timer.
+// Result of the background readiness probe, read by the main-thread timer.
 const PROBE_PENDING: u8 = 0;
 const PROBE_READY: u8 = 1;
 const PROBE_TIMED_OUT: u8 = 2;
 
-/// The menu-bar glyph: one drawing per menu-bar appearance, at both
-/// backing-store scales. The files are named for the appearance they serve —
-/// the dark-named drawing is the light-coloured one. These carry interior
-/// detail a one-colour template mask cannot, so the wrapper selects between
-/// them itself instead of letting AppKit tint a template.
+// The menu-bar glyph: one drawing per menu-bar appearance, at both
+// backing-store scales. The files are named for the appearance they serve —
+// the dark-named drawing is the light-coloured one. These carry interior
+// detail a one-colour template mask cannot, so the wrapper selects between
+// them itself instead of letting AppKit tint a template.
 const MENU_BAR_ICON_LIGHT: &[u8] = include_bytes!("../../resources/macos/menubar-light.png");
 const MENU_BAR_ICON_LIGHT_2X: &[u8] = include_bytes!("../../resources/macos/menubar-light@2x.png");
 const MENU_BAR_ICON_DARK: &[u8] = include_bytes!("../../resources/macos/menubar-dark.png");
 const MENU_BAR_ICON_DARK_2X: &[u8] = include_bytes!("../../resources/macos/menubar-dark@2x.png");
 
-/// The glyph's size in points. Both representations are declared at this size;
-/// the 2x one simply has twice the pixels.
+// The glyph's size in points. Both representations are declared at this size;
+// the 2x one simply has twice the pixels.
 const MENU_BAR_ICON_POINTS: f64 = 18.0;
 
-/// How far the popover's content sits from its edges, and the width its rows
-/// are laid out at.
+// How far the popover's content sits from its edges, and the width its rows
+// are laid out at.
 const POPOVER_INSET: f64 = 14.0;
 const POPOVER_CONTENT_WIDTH: f64 = POPOVER_WIDTH - 2.0 * POPOVER_INSET;
 
-/// How often the popover's timer looks for a finished fetch. This is the
-/// latency of a result appearing, not how often the server is asked.
+// How often the popover's timer looks for a finished fetch. This is the
+// latency of a result appearing, not how often the server is asked.
 const POPOVER_POLL_INTERVAL: f64 = 0.2;
 
-/// How often the popover asks the server again while it stays open. Nothing is
-/// fetched at all while it is closed.
+// How often the popover asks the server again while it stays open. Nothing is
+// fetched at all while it is closed.
 const POPOVER_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
-/// How long the popover survives the pointer leaving it. The gap between the
-/// status item and the popover's own view is crossed with the pointer inside
-/// neither, so closing immediately would make the popover unreachable.
+// How long the popover survives the pointer leaving it. The gap between the
+// status item and the popover's own view is crossed with the pointer inside
+// neither, so closing immediately would make the popover unreachable.
 const POPOVER_CLOSE_GRACE: f64 = 0.25;
 
-/// AppKit's `NSModalResponseOK`. It is a header macro, so the bindings carry
-/// only its siblings; the value is contractual.
+// AppKit's `NSModalResponseOK`. It is a header macro, so the bindings carry
+// only its siblings; the value is contractual.
 const MODAL_RESPONSE_OK: NSModalResponse = 1;
 
 enum LaunchMode {
@@ -202,11 +202,11 @@ fn run_interactive() -> Result<(), String> {
     Ok(())
 }
 
-/// Take the single-instance lock, or report that another instance holds it.
-///
-/// `flock` is used rather than a pid file because the kernel releases it on
-/// every exit path, including a crash — a stale pid file would leave the user
-/// with a wrapper that refuses to start and no way to tell why.
+// Take the single-instance lock, or report that another instance holds it.
+//
+// `flock` is used rather than a pid file because the kernel releases it on
+// every exit path, including a crash — a stale pid file would leave the user
+// with a wrapper that refuses to start and no way to tell why.
 fn acquire_instance_lock(profile_dir: &Path) -> Result<Option<File>, String> {
     let path = profile_dir.join(INSTANCE_LOCK_FILE);
     let file = File::options()
@@ -244,9 +244,9 @@ fn post_open_notification() {
     unsafe { center.postNotificationName_object(&name, None) };
 }
 
-/// The views the popover updates in place. Rebuilding them per refresh would
-/// throw away the layout and flicker; rows the queue does not fill are hidden,
-/// which is what takes them out of the stack's layout too.
+// The views the popover updates in place. Rebuilding them per refresh would
+// throw away the layout and flicker; rows the queue does not fill are hidden,
+// which is what takes them out of the stack's layout too.
 struct PopoverRowViews {
     row: Retained<NSStackView>,
     name: Retained<NSTextField>,
@@ -261,7 +261,7 @@ struct PopoverViews {
     rows: Vec<PopoverRowViews>,
 }
 
-/// State the delegate owns for the whole run.
+// State the delegate owns for the whole run.
 struct DelegateState {
     supervisor: RefCell<ServerSupervisor>,
     window: RefCell<Option<Retained<NSWindow>>>,
@@ -269,27 +269,27 @@ struct DelegateState {
     status_item: RefCell<Option<Retained<NSStatusItem>>>,
     ready_timer: RefCell<Option<Retained<NSTimer>>>,
     ready_probe: RefCell<Option<Arc<AtomicU8>>>,
-    /// Watches the supervised server for the bundle-upgrade relaunch request.
+    // Watches the supervised server for the bundle-upgrade relaunch request.
     supervision_timer: RefCell<Option<Retained<NSTimer>>>,
     popover: RefCell<Option<Retained<NSPopover>>>,
     popover_views: RefCell<Option<PopoverViews>>,
     popover_timer: RefCell<Option<Retained<NSTimer>>>,
     popover_close_timer: RefCell<Option<Retained<NSTimer>>>,
-    /// Where a finished fetch leaves its result for the main thread to draw.
+    // Where a finished fetch leaves its result for the main thread to draw.
     queue_result: Arc<Mutex<Option<PopoverContent>>>,
-    /// The browser session the wrapper reuses across fetches. Only the fetch
-    /// thread touches it, and only one fetch runs at a time.
+    // The browser session the wrapper reuses across fetches. Only the fetch
+    // thread touches it, and only one fetch runs at a time.
     queue_cookie: Arc<Mutex<Option<String>>>,
     queue_fetching: Arc<AtomicBool>,
     queue_fetched_at: Cell<Option<Instant>>,
-    /// Set once a fetch has answered, so a reopened popover shows the last
-    /// queue rather than the placeholder again.
+    // Set once a fetch has answered, so a reopened popover shows the last
+    // queue rather than the placeholder again.
     queue_answered: Cell<bool>,
-    /// Set by the status-item's own Quit before it asks the app to terminate.
-    /// Every other quit path — Cmd+Q, the Dock — prompts first.
+    // Set by the status-item's own Quit before it asks the app to terminate.
+    // Every other quit path — Cmd+Q, the Dock — prompts first.
     quit_confirmed: Cell<bool>,
-    /// Set once the app URL has been loaded, so a later show does not throw
-    /// the user back to the splash.
+    // Set once the app URL has been loaded, so a later show does not throw
+    // the user back to the splash.
     showing_app: Cell<bool>,
     origin: String,
     url: String,
@@ -356,13 +356,13 @@ define_class!(
             NSApplication::sharedApplication(self.mtm()).terminate(None);
         }
 
-        /// The distributed notification a second invocation posts.
+        // The distributed notification a second invocation posts.
         #[unsafe(method(showWindowFromNotification:))]
         fn show_window_from_notification(&self, _notification: &NSNotification) {
             self.report(self.open_weaver());
         }
 
-        /// Timer callback: has the server come up yet?
+        // Timer callback: has the server come up yet?
         #[unsafe(method(pollServerReady:))]
         fn poll_server_ready(&self, _timer: &NSTimer) {
             let state = self
@@ -384,9 +384,9 @@ define_class!(
             }
         }
 
-        /// The pointer reached the status item, or the popover itself. Both
-        /// mean the same thing — stay open — and reshowing an open popover is
-        /// a no-op, so neither area needs to be told apart from the other.
+        // The pointer reached the status item, or the popover itself. Both
+        // mean the same thing — stay open — and reshowing an open popover is
+        // a no-op, so neither area needs to be told apart from the other.
         #[unsafe(method(mouseEntered:))]
         fn mouse_entered(&self, _event: &NSEvent) {
             self.cancel_popover_close();
@@ -403,12 +403,12 @@ define_class!(
             self.hide_popover();
         }
 
-        /// Timer callback: has the server asked for the app to be relaunched?
-        ///
-        /// A bundle upgrade replaces this wrapper's own binary, so the running
-        /// wrapper cannot become the new build. When its server reports the
-        /// swap succeeded, the wrapper hands off to a fresh instance launched
-        /// from the replaced bundle and quits.
+        // Timer callback: has the server asked for the app to be relaunched?
+        //
+        // A bundle upgrade replaces this wrapper's own binary, so the running
+        // wrapper cannot become the new build. When its server reports the
+        // swap succeeded, the wrapper hands off to a fresh instance launched
+        // from the replaced bundle and quits.
         #[unsafe(method(pollSupervisedServer:))]
         fn poll_supervised_server(&self, _timer: &NSTimer) {
             let observed = self.ivars().supervisor.borrow_mut().poll_supervised_server();
@@ -419,8 +419,8 @@ define_class!(
             }
         }
 
-        /// Timer callback: draw whatever the fetch thread has left, and start
-        /// the next fetch once the current answer is stale.
+        // Timer callback: draw whatever the fetch thread has left, and start
+        // the next fetch once the current answer is stale.
         #[unsafe(method(refreshPopover:))]
         fn refresh_popover(&self, _timer: &NSTimer) {
             let finished = self
@@ -447,8 +447,8 @@ define_class!(
     unsafe impl NSObjectProtocol for WeaverDelegate {}
 
     unsafe impl NSMenuDelegate for WeaverDelegate {
-        /// A click on the status item opens the menu. The popover the same
-        /// pointer just opened would sit under it, so it goes first.
+        // A click on the status item opens the menu. The popover the same
+        // pointer just opened would sit under it, so it goes first.
         #[unsafe(method(menuWillOpen:))]
         fn menu_will_open(&self, _menu: &NSMenu) {
             self.hide_popover();
@@ -465,10 +465,10 @@ define_class!(
             self.report(self.open_weaver());
         }
 
-        /// The wrapper is a menu-bar app first: quitting is what the status
-        /// item's Quit does. Every other trigger — Cmd+Q, the Dock — asks,
-        /// because macOS muscle memory fires it at apps that are really
-        /// windows, and this window is not the tool.
+        // The wrapper is a menu-bar app first: quitting is what the status
+        // item's Quit does. Every other trigger — Cmd+Q, the Dock — asks,
+        // because macOS muscle memory fires it at apps that are really
+        // windows, and this window is not the tool.
         #[unsafe(method(applicationShouldTerminate:))]
         fn application_should_terminate(
             &self,
@@ -499,8 +499,8 @@ define_class!(
             NSApplicationTerminateReply::TerminateCancel
         }
 
-        /// The wrapper lives in the menu bar, so closing the window is not
-        /// quitting.
+        // The wrapper lives in the menu bar, so closing the window is not
+        // quitting.
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
         fn application_should_terminate_after_last_window_closed(
             &self,
@@ -509,7 +509,7 @@ define_class!(
             false
         }
 
-        /// Clicking the Dock icon brings the window back.
+        // Clicking the Dock icon brings the window back.
         #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
         fn application_should_handle_reopen(
             &self,
@@ -520,9 +520,9 @@ define_class!(
             true
         }
 
-        /// Every quit path ends here, so this is where the server the wrapper
-        /// started is stopped — a wrapper that exited leaving its own child
-        /// serving the port would look exactly like a failure to quit.
+        // Every quit path ends here, so this is where the server the wrapper
+        // started is stopped — a wrapper that exited leaving its own child
+        // serving the port would look exactly like a failure to quit.
         #[unsafe(method(applicationWillTerminate:))]
         fn application_will_terminate(&self, _notification: &NSNotification) {
             self.stop_ready_polling();
@@ -564,8 +564,8 @@ define_class!(
     }
 
     unsafe impl WKUIDelegate for WeaverDelegate {
-        /// `target="_blank"` and `window.open`. Returning nil tells WebKit no
-        /// view was created; the link has already been handed to the browser.
+        // `target="_blank"` and `window.open`. Returning nil tells WebKit no
+        // view was created; the link has already been handed to the browser.
         #[unsafe(method_id(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
         fn create_web_view(
             &self,
@@ -581,8 +581,8 @@ define_class!(
             None
         }
 
-        /// `<input type="file">`. WebKit draws no chooser of its own — without
-        /// this method the page's upload buttons are silent no-ops.
+        // `<input type="file">`. WebKit draws no chooser of its own — without
+        // this method the page's upload buttons are silent no-ops.
         #[unsafe(method(webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:))]
         fn run_open_panel(
             &self,
@@ -724,11 +724,11 @@ impl WeaverDelegate {
         }
     }
 
-    /// Show the app window, starting the server if it is not up yet.
-    ///
-    /// The window is shown before the server answers, on purpose: the user
-    /// asked for a window and the wait is the interesting part, so the splash
-    /// is what they see while the server comes up.
+    // Show the app window, starting the server if it is not up yet.
+    //
+    // The window is shown before the server answers, on purpose: the user
+    // asked for a window and the wait is the interesting part, so the splash
+    // is what they see while the server comes up.
     fn open_weaver(&self) -> Result<(), String> {
         self.ivars().supervisor.borrow_mut().start()?;
         self.show_window();
@@ -746,7 +746,7 @@ impl WeaverDelegate {
         Ok(())
     }
 
-    /// Used by the menu items that only need a server, not a window.
+    // Used by the menu items that only need a server, not a window.
     fn ensure_server_ready(&self) -> Result<(), String> {
         {
             let mut supervisor = self.ivars().supervisor.borrow_mut();
@@ -779,7 +779,7 @@ impl WeaverDelegate {
         NSApplication::sharedApplication(self.mtm()).activate();
     }
 
-    /// The app window, created on first use.
+    // The app window, created on first use.
     fn window(&self) -> Retained<NSWindow> {
         if let Some(window) = self.ivars().window.borrow().as_ref() {
             return window.clone();
@@ -841,11 +841,11 @@ impl WeaverDelegate {
         window
     }
 
-    /// Start watching for the server, showing the splash until it answers.
-    ///
-    /// The probe itself runs off the main thread: it opens a socket and reads
-    /// a response, and doing that on the main thread would freeze the window
-    /// it is supposed to be filling.
+    // Start watching for the server, showing the splash until it answers.
+    //
+    // The probe itself runs off the main thread: it opens a socket and reads
+    // a response, and doing that on the main thread would freeze the window
+    // it is supposed to be filling.
     fn begin_ready_polling(&self) {
         if self.ivars().ready_timer.borrow().is_some() {
             return;
@@ -884,11 +884,11 @@ impl WeaverDelegate {
         *self.ivars().ready_probe.borrow_mut() = None;
     }
 
-    /// Watch the supervised server for the whole run.
-    ///
-    /// Unlike the readiness poll this never stops on its own: the request it
-    /// waits for can arrive at any point in a session, hours after the window
-    /// came up.
+    // Watch the supervised server for the whole run.
+    //
+    // Unlike the readiness poll this never stops on its own: the request it
+    // waits for can arrive at any point in a session, hours after the window
+    // came up.
     fn begin_supervision_polling(&self) {
         if self.ivars().supervision_timer.borrow().is_some() {
             return;
@@ -913,12 +913,12 @@ impl WeaverDelegate {
         }
     }
 
-    /// Hand off to a fresh instance of the replaced bundle, and quit.
-    ///
-    /// The server has already exited by the time this runs — that exit *is* the
-    /// request — so `stop` here only reaps the bookkeeping. The bundle path
-    /// comes from this process's own location, never from the server, so the
-    /// relaunch can only target the application the user started.
+    // Hand off to a fresh instance of the replaced bundle, and quit.
+    //
+    // The server has already exited by the time this runs — that exit *is* the
+    // request — so `stop` here only reaps the bookkeeping. The bundle path
+    // comes from this process's own location, never from the server, so the
+    // relaunch can only target the application the user started.
     fn relaunch_after_bundle_upgrade(&self) {
         self.stop_supervision_polling();
         self.stop_ready_polling();
@@ -947,11 +947,11 @@ impl WeaverDelegate {
 
     // -- the hover popover ---------------------------------------------------
 
-    /// Watch the status item for the pointer.
-    ///
-    /// `InVisibleRect` rather than a rectangle of this wrapper's own: the
-    /// status item moves and resizes whenever the menu bar does, and an area
-    /// pinned to a stale rectangle would silently stop firing.
+    // Watch the status item for the pointer.
+    //
+    // `InVisibleRect` rather than a rectangle of this wrapper's own: the
+    // status item moves and resizes whenever the menu bar does, and an area
+    // pinned to a stale rectangle would silently stop firing.
     fn install_hover_tracking(&self, view: &NSView) {
         // SAFETY: The owner is this delegate, which outlives the view it is
         // attached to, and no user info is passed for the class to decode.
@@ -1028,7 +1028,7 @@ impl WeaverDelegate {
         }
     }
 
-    /// The popover, created on first hover.
+    // The popover, created on first hover.
     fn popover(&self, mtm: MainThreadMarker) -> Retained<NSPopover> {
         if let Some(popover) = self.ivars().popover.borrow().as_ref() {
             return popover.clone();
@@ -1095,8 +1095,8 @@ impl WeaverDelegate {
         }
     }
 
-    /// Draw one fetch result. Rows past the end of the queue are hidden rather
-    /// than emptied, so they take no space in the stack.
+    // Draw one fetch result. Rows past the end of the queue are hidden rather
+    // than emptied, so they take no space in the stack.
     fn render_popover(&self, content: &PopoverContent) {
         let views = self.ivars().popover_views.borrow();
         let Some(views) = views.as_ref() else {
@@ -1138,8 +1138,8 @@ impl WeaverDelegate {
         }
     }
 
-    /// Start asking the server for the queue. Nothing polls while the popover
-    /// is closed, so an idle menu bar makes no requests at all.
+    // Start asking the server for the queue. Nothing polls while the popover
+    // is closed, so an idle menu bar makes no requests at all.
     fn begin_queue_polling(&self) {
         if self.ivars().popover_timer.borrow().is_some() {
             return;
@@ -1167,8 +1167,8 @@ impl WeaverDelegate {
         }
     }
 
-    /// Fetch off the main thread. A menu bar that stalls while a socket times
-    /// out is worse than a popover that fills in a moment late.
+    // Fetch off the main thread. A menu bar that stalls while a socket times
+    // out is worse than a popover that fills in a moment late.
     fn spawn_queue_fetch(&self) {
         let port = self.ivars().supervisor.borrow().port();
         let result = Arc::clone(&self.ivars().queue_result);
@@ -1216,11 +1216,11 @@ impl WeaverDelegate {
         }
     }
 
-    /// Whether a navigation should be handed to the user's browser.
-    ///
-    /// Only main-frame navigations are considered: an iframe or a subresource
-    /// pointing somewhere else is the page doing its job, not the user
-    /// following a link out of the app.
+    // Whether a navigation should be handed to the user's browser.
+    //
+    // Only main-frame navigations are considered: an iframe or a subresource
+    // pointing somewhere else is the page doing its job, not the user
+    // following a link out of the app.
     fn leaves_the_app(&self, navigation_action: &WKNavigationAction) -> bool {
         // SAFETY: These are the action's own properties, read on the thread
         // WebKit called us on.
@@ -1255,11 +1255,11 @@ impl WeaverDelegate {
     }
 }
 
-/// Build the menu-bar glyph.
-///
-/// A drawing handler rather than a static image: AppKit runs it with the menu
-/// bar's own appearance current, and re-runs it when that appearance changes,
-/// so the glyph follows the menu bar without any observation of our own.
+// Build the menu-bar glyph.
+//
+// A drawing handler rather than a static image: AppKit runs it with the menu
+// bar's own appearance current, and re-runs it when that appearance changes,
+// so the glyph follows the menu bar without any observation of our own.
 fn menu_bar_icon() -> Option<Retained<NSImage>> {
     let size = NSSize::new(MENU_BAR_ICON_POINTS, MENU_BAR_ICON_POINTS);
     let for_light_bar = variant_image(size, MENU_BAR_ICON_LIGHT, MENU_BAR_ICON_LIGHT_2X)?;
@@ -1278,11 +1278,11 @@ fn menu_bar_icon() -> Option<Retained<NSImage>> {
     ))
 }
 
-/// One appearance's drawing, from both shipped scales.
-///
-/// Each representation is declared at the same point size, which is what tells
-/// AppKit the 36-pixel asset is the 18-point glyph on a Retina display rather
-/// than a 36-point glyph.
+// One appearance's drawing, from both shipped scales.
+//
+// Each representation is declared at the same point size, which is what tells
+// AppKit the 36-pixel asset is the 18-point glyph on a Retina display rather
+// than a 36-point glyph.
 fn variant_image(size: NSSize, base: &[u8], retina: &[u8]) -> Option<Retained<NSImage>> {
     let image = NSImage::initWithSize(NSImage::alloc(), size);
     for bytes in [base, retina] {
@@ -1294,8 +1294,8 @@ fn variant_image(size: NSSize, base: &[u8], retina: &[u8]) -> Option<Retained<NS
     Some(image)
 }
 
-/// A non-editable, non-drawn text field: the popover shows text, it does not
-/// collect any.
+// A non-editable, non-drawn text field: the popover shows text, it does not
+// collect any.
 fn popover_label(
     mtm: MainThreadMarker,
     font: Retained<NSFont>,
@@ -1349,18 +1349,18 @@ fn build_popover_row(mtm: MainThreadMarker) -> PopoverRowViews {
     }
 }
 
-/// Every row spans the popover, so each one is pinned rather than left to an
-/// intrinsic width the queue's own titles would otherwise decide.
+// Every row spans the popover, so each one is pinned rather than left to an
+// intrinsic width the queue's own titles would otherwise decide.
 fn pin_width(view: &NSView, width: f64) {
     view.widthAnchor()
         .constraintEqualToConstant(width)
         .setActive(true);
 }
 
-/// The window background for the current system appearance: #050914 in dark
-/// mode, #f8f9fc in light. These predate the web UI's current palette
-/// (apps/weaver-web/src/next/theme.css), whose ground is #1a1b1e in both
-/// appearances.
+// The window background for the current system appearance: #050914 in dark
+// mode, #f8f9fc in light. These predate the web UI's current palette
+// (apps/weaver-web/src/next/theme.css), whose ground is #1a1b1e in both
+// appearances.
 fn theme_background_color(mtm: MainThreadMarker) -> Retained<NSColor> {
     let app = NSApplication::sharedApplication(mtm);
     let dark = appearance_is_dark(&app.effectiveAppearance());
@@ -1377,11 +1377,11 @@ fn theme_background_color(mtm: MainThreadMarker) -> Retained<NSColor> {
     )
 }
 
-/// The main menu exists for its key equivalents: without one, Cmd+Q, Cmd+W
-/// and the standard editing shortcuts reach nothing. Every item routes
-/// through the responder chain (no target), so the webview keeps its own
-/// editing behaviour and `terminate:` still funnels through the delegate's
-/// quit prompt.
+// The main menu exists for its key equivalents: without one, Cmd+Q, Cmd+W
+// and the standard editing shortcuts reach nothing. Every item routes
+// through the responder chain (no target), so the webview keeps its own
+// editing behaviour and `terminate:` still funnels through the delegate's
+// quit prompt.
 fn install_main_menu(mtm: MainThreadMarker) {
     let main_menu = NSMenu::new(mtm);
 
@@ -1407,7 +1407,7 @@ fn install_main_menu(mtm: MainThreadMarker) {
     NSApplication::sharedApplication(mtm).setMainMenu(Some(&main_menu));
 }
 
-/// A first-responder-targeted menu item with a Cmd key equivalent.
+// A first-responder-targeted menu item with a Cmd key equivalent.
 fn key_item(mtm: MainThreadMarker, title: &str, action: Sel, key: &str) -> Retained<NSMenuItem> {
     let title = NSString::from_str(title);
     let key = NSString::from_str(key);
@@ -1423,7 +1423,7 @@ fn key_item(mtm: MainThreadMarker, title: &str, action: Sel, key: &str) -> Retai
     }
 }
 
-/// A titled item carrying a submenu; the title is what the menu bar shows.
+// A titled item carrying a submenu; the title is what the menu bar shows.
 fn submenu_item(mtm: MainThreadMarker, title: &str, submenu: &NSMenu) -> Retained<NSMenuItem> {
     let title = NSString::from_str(title);
     let key = NSString::from_str("");
@@ -1436,7 +1436,7 @@ fn submenu_item(mtm: MainThreadMarker, title: &str, submenu: &NSMenu) -> Retaine
     item
 }
 
-/// Whether an appearance resolves to the dark family.
+// Whether an appearance resolves to the dark family.
 fn appearance_is_dark(appearance: &NSAppearance) -> bool {
     // SAFETY: The appearance statics are plain constants, and matching names
     // has no precondition; every caller is on the main thread.
@@ -1457,8 +1457,8 @@ fn build_webview(mtm: MainThreadMarker, frame: NSRect) -> Retained<WKWebView> {
     }
 }
 
-/// Shown while the server starts. Inline and asset-free on purpose: it has to
-/// render before anything is listening on the port.
+// Shown while the server starts. Inline and asset-free on purpose: it has to
+// render before anything is listening on the port.
 fn splash_html() -> String {
     document_html(
         "Starting Weaver…",
@@ -1520,12 +1520,12 @@ fn show_error_on_main_thread(mtm: MainThreadMarker, title: &str, message: &str) 
 // `--webview-smoke`
 // ---------------------------------------------------------------------------
 
-/// Prove that this binary can create a WebKit view and load a real network
-/// document, without needing Weaver — or any Weaver data — to exist.
-///
-/// This is the check that would have caught a missing framework, a webview
-/// that silently fails to start its content process, or a sandbox that
-/// refuses the loopback connection.
+// Prove that this binary can create a WebKit view and load a real network
+// document, without needing Weaver — or any Weaver data — to exist.
+//
+// This is the check that would have caught a missing framework, a webview
+// that silently fails to start its content process, or a sandbox that
+// refuses the loopback connection.
 fn run_webview_smoke() -> Result<(), String> {
     let port = shared::start_smoke_server()?;
     let url = shared::app_url(port);
@@ -1693,7 +1693,7 @@ impl SmokeDelegate {
     }
 }
 
-/// How often the smoke watchdog checks the clock.
+// How often the smoke watchdog checks the clock.
 const WATCHDOG_INTERVAL: f64 = 1.0;
 
 #[cfg(test)]

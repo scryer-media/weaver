@@ -1,126 +1,126 @@
-//! uuencode article decoding.
-//!
-//! Usenet binaries are overwhelmingly yEnc, but a long tail of posts — and some
-//! encoders that never moved on — still use classic uuencode. This module is the
-//! decoder for that tail. It is deliberately kept off the yEnc hot path: the
-//! fused article decoder only reaches for it on the `=ybegin`-miss branch, so a
-//! yEnc article never pays for uuencode support.
-//!
-//! # Structural facts that shape the design
-//!
-//! uuencode carries far less information than yEnc:
-//!
-//! - no per-part byte offsets — a part says nothing about where it belongs,
-//! - no per-part checksum — nothing local can be verified,
-//! - no declared file size — the total is only known once the last part lands,
-//! - no header on continuation parts — they open with bare data lines.
-//!
-//! Everything downstream follows from that: parts can only be assembled in
-//! sequence, and correctness is ultimately PAR2's job rather than the decoder's.
-//! This module therefore never rejects an article outright for damaged content.
-//! A line it cannot decode sets [`UuDecoder::damaged`] and decoding continues,
-//! keeping whatever bytes were recovered so the repair layer has the most
-//! material to work with.
-//!
-//! # Attribution
-//!
-//! The per-line decode follows the classic UUDECODE formulation (Clem Dye's
-//! `UUDECODE.c`, 1998, released under the GPL) by way of the two reference
-//! decoders this crate is checked against: NZBGet's `Decoder::DecodeUx` and
-//! sabctools' uuencode branch. The detection heuristics — the `M`-line shape,
-//! the octal-validated `begin` line, and the short-final-part admission — follow
-//! sabctools. Damage handling is stricter here than in either reference: see
-//! [`UuDecoder::push_body_line`].
+// uuencode article decoding.
+//
+// Usenet binaries are overwhelmingly yEnc, but a long tail of posts — and some
+// encoders that never moved on — still use classic uuencode. This module is the
+// decoder for that tail. It is deliberately kept off the yEnc hot path: the
+// fused article decoder only reaches for it on the `=ybegin`-miss branch, so a
+// yEnc article never pays for uuencode support.
+//
+// # Structural facts that shape the design
+//
+// uuencode carries far less information than yEnc:
+//
+// - no per-part byte offsets — a part says nothing about where it belongs,
+// - no per-part checksum — nothing local can be verified,
+// - no declared file size — the total is only known once the last part lands,
+// - no header on continuation parts — they open with bare data lines.
+//
+// Everything downstream follows from that: parts can only be assembled in
+// sequence, and correctness is ultimately PAR2's job rather than the decoder's.
+// This module therefore never rejects an article outright for damaged content.
+// A line it cannot decode sets [`UuDecoder::damaged`] and decoding continues,
+// keeping whatever bytes were recovered so the repair layer has the most
+// material to work with.
+//
+// # Attribution
+//
+// The per-line decode follows the classic UUDECODE formulation (Clem Dye's
+// `UUDECODE.c`, 1998, released under the GPL) by way of the two reference
+// decoders this crate is checked against: NZBGet's `Decoder::DecodeUx` and
+// sabctools' uuencode branch. The detection heuristics — the `M`-line shape,
+// the octal-validated `begin` line, and the short-final-part admission — follow
+// sabctools. Damage handling is stricter here than in either reference: see
+// [`UuDecoder::push_body_line`].
 
-/// Lowest byte value a uuencode payload character may take (`' '`).
+// Lowest byte value a uuencode payload character may take (`' '`).
 const UU_CHAR_MIN: u8 = 32;
-/// Highest byte value a uuencode payload character may take (`` '`' ``).
+// Highest byte value a uuencode payload character may take (`` '`' ``).
 const UU_CHAR_MAX: u8 = 96;
 
-/// Bytes encoded by a full uuencode line. 45 bytes is 15 groups of 3, encoded
-/// as 60 characters after the leading length character.
+// Bytes encoded by a full uuencode line. 45 bytes is 15 groups of 3, encoded
+// as 60 characters after the leading length character.
 const UU_MAX_LINE_BYTES: usize = 45;
 
-/// Characters a full uuencode line carries after its length character.
+// Characters a full uuencode line carries after its length character.
 const UU_MAX_LINE_CHARS: usize = 60;
 
-/// Width of the padded scratch buffer the vector kernels consume. The 60
-/// payload characters of a full line are padded up to this with `' '`, which
-/// decodes to zero and lands only in bytes the caller discards.
+// Width of the padded scratch buffer the vector kernels consume. The 60
+// payload characters of a full line are padded up to this with `' '`, which
+// decodes to zero and lands only in bytes the caller discards.
 const UU_KERNEL_CHARS: usize = 64;
 
-/// How many characters a line may be short of the bits it declares before the
-/// shortfall is treated as damage rather than as stripped trailing whitespace.
-///
-/// # Why any shortfall is tolerated
-///
-/// A space is the sextet zero, so an encoder writing a run of zero bits emits a
-/// run of trailing spaces — and mail-to-news gateways, quoted-printable hops
-/// and well-meaning agents have been stripping trailing whitespace off text
-/// lines for as long as uuencode has existed. The characters that go missing
-/// are exactly the ones that decode to nothing, so restoring them as *virtual*
-/// spaces reconstructs the original bytes exactly. CPython's `binascii.a2b_uu`
-/// does precisely this, and says so in a comment older than most of Usenet:
-/// it substitutes zero for the characters that ran out and calls it
-/// "some spaces got eaten at end-of-line".
-///
-/// # Why the tolerance is bounded at three
-///
-/// Four characters is a whole group. Padding four would fabricate three bytes
-/// out of no observed characters at all, which is not reconstruction but
-/// invention. Bounding at three keeps at least one real character in every
-/// group the decode emits, so every byte produced still rests on something the
-/// wire actually carried. Beyond that the line is short for some other reason
-/// and takes the salvage-and-flag path, which is what it did before.
-///
-/// The reference decoders split here, and neither takes the third option of
-/// refusing the line: one silently emits a short line (its group loop simply
-/// stops once fewer than four characters remain, with no flag), and the other
-/// reads past the end of the line. Reconstructing the whitespace is strictly
-/// better than both.
+// How many characters a line may be short of the bits it declares before the
+// shortfall is treated as damage rather than as stripped trailing whitespace.
+//
+// # Why any shortfall is tolerated
+//
+// A space is the sextet zero, so an encoder writing a run of zero bits emits a
+// run of trailing spaces — and mail-to-news gateways, quoted-printable hops
+// and well-meaning agents have been stripping trailing whitespace off text
+// lines for as long as uuencode has existed. The characters that go missing
+// are exactly the ones that decode to nothing, so restoring them as *virtual*
+// spaces reconstructs the original bytes exactly. CPython's `binascii.a2b_uu`
+// does precisely this, and says so in a comment older than most of Usenet:
+// it substitutes zero for the characters that ran out and calls it
+// "some spaces got eaten at end-of-line".
+//
+// # Why the tolerance is bounded at three
+//
+// Four characters is a whole group. Padding four would fabricate three bytes
+// out of no observed characters at all, which is not reconstruction but
+// invention. Bounding at three keeps at least one real character in every
+// group the decode emits, so every byte produced still rests on something the
+// wire actually carried. Beyond that the line is short for some other reason
+// and takes the salvage-and-flag path, which is what it did before.
+//
+// The reference decoders split here, and neither takes the third option of
+// refusing the line: one silently emits a short line (its group loop simply
+// stops once fewer than four characters remain, with no flag), and the other
+// reads past the end of the line. Reconstructing the whitespace is strictly
+// better than both.
 const UU_MAX_VIRTUAL_PAD_CHARS: usize = 3;
 
-/// Width of the kernel output buffer. Only the first 48 bytes are meaningful
-/// (64 characters decode to 48 bytes); the tail is slack so the x86 kernel's
-/// final 16-byte store stays in bounds.
+// Width of the kernel output buffer. Only the first 48 bytes are meaningful
+// (64 characters decode to 48 bytes); the tail is slack so the x86 kernel's
+// final 16-byte store stays in bounds.
 const UU_KERNEL_BYTES: usize = 64;
 
-/// Decode one uuencode character to its 6-bit value.
-///
-/// Backtick needs no special case: `` '`' `` is 0x60, so `0x60 - 0x20 = 0x40`
-/// and the mask takes it to 0 — the same answer the reference decoders reach
-/// with an explicit branch. Keeping it branchless is what lets the whole
-/// transform become a single vector expression.
+// Decode one uuencode character to its 6-bit value.
+//
+// Backtick needs no special case: `` '`' `` is 0x60, so `0x60 - 0x20 = 0x40`
+// and the mask takes it to 0 — the same answer the reference decoders reach
+// with an explicit branch. Keeping it branchless is what lets the whole
+// transform become a single vector expression.
 #[inline]
 const fn uu_sextet(c: u8) -> u8 {
     c.wrapping_sub(b' ') & 0x3F
 }
 
-/// Characters a canonical encoder emits for `bytes` bytes of payload: whole
-/// four-character groups, the last one zero-padded out.
+// Characters a canonical encoder emits for `bytes` bytes of payload: whole
+// four-character groups, the last one zero-padded out.
 #[inline]
 const fn padded_payload_chars(bytes: usize) -> usize {
     bytes.div_ceil(3) * 4
 }
 
-/// The fewest characters that can carry `bytes` bytes.
-///
-/// Each character carries six bits, so a one-byte tail needs two characters and
-/// a two-byte tail needs three — `(bytes * 8).div_ceil(6)`, spelled here as
-/// whole groups plus the tail so the group structure stays visible.
-///
-/// Canonical encoders pad the final group out to four characters, but a family
-/// of broken encoders stops as soon as the bits run out. Accepting an unpadded
-/// final group preserves the tail of older posts, which typically have no
-/// PAR2 to repair dropped bytes.
-///
-/// This range — `[min_payload_chars, padded_payload_chars]` — also subsumes the
-/// broken-encoder length reading attributed to Fredrik Lundh. That reading,
-/// `(v * 4 + 5) / 3`, is a *character* count, and it lands inside this envelope
-/// wherever the two differ (3 characters for a one-byte tail against a
-/// two-character minimum and a four-character padded form; 7 against 6 and 8 for
-/// a four-byte payload). Deriving the envelope from the arithmetic covers those
-/// shapes without a second speculative reading of the length character.
+// The fewest characters that can carry `bytes` bytes.
+//
+// Each character carries six bits, so a one-byte tail needs two characters and
+// a two-byte tail needs three — `(bytes * 8).div_ceil(6)`, spelled here as
+// whole groups plus the tail so the group structure stays visible.
+//
+// Canonical encoders pad the final group out to four characters, but a family
+// of broken encoders stops as soon as the bits run out. Accepting an unpadded
+// final group preserves the tail of older posts, which typically have no
+// PAR2 to repair dropped bytes.
+//
+// This range — `[min_payload_chars, padded_payload_chars]` — also subsumes the
+// broken-encoder length reading attributed to Fredrik Lundh. That reading,
+// `(v * 4 + 5) / 3`, is a *character* count, and it lands inside this envelope
+// wherever the two differ (3 characters for a one-byte tail against a
+// two-character minimum and a four-character padded form; 7 against 6 and 8 for
+// a four-byte payload). Deriving the envelope from the arithmetic covers those
+// shapes without a second speculative reading of the length character.
 #[inline]
 const fn min_payload_chars(bytes: usize) -> usize {
     (bytes / 3) * 4
@@ -131,7 +131,7 @@ const fn min_payload_chars(bytes: usize) -> usize {
         }
 }
 
-/// Strip a trailing `\r\n` or `\n` from a raw line.
+// Strip a trailing `\r\n` or `\n` from a raw line.
 fn trim_line_ending(line: &[u8]) -> &[u8] {
     let mut end = line.len();
     if end > 0 && line[end - 1] == b'\n' {
@@ -143,7 +143,7 @@ fn trim_line_ending(line: &[u8]) -> &[u8] {
     &line[..end]
 }
 
-/// Undo NNTP dot-stuffing on a body line.
+// Undo NNTP dot-stuffing on a body line.
 fn strip_dot_stuffing(line: &[u8]) -> &[u8] {
     if line.starts_with(b"..") {
         &line[1..]
@@ -152,10 +152,10 @@ fn strip_dot_stuffing(line: &[u8]) -> &[u8] {
     }
 }
 
-/// Convert bytes to a string, trying UTF-8 first and falling back to Latin-1.
-///
-/// Same rule the yEnc header parser applies to `name=`, so a uuencode `begin`
-/// name and a yEnc `name=` reach file identity spelled the same way.
+// Convert bytes to a string, trying UTF-8 first and falling back to Latin-1.
+//
+// Same rule the yEnc header parser applies to `name=`, so a uuencode `begin`
+// name and a yEnc `name=` reach file identity spelled the same way.
 fn bytes_to_string(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
@@ -164,35 +164,35 @@ fn bytes_to_string(bytes: &[u8]) -> String {
     }
 }
 
-/// Parse a uuencode `begin <mode> <name>` header line.
-///
-/// Returns the filename bytes when the line is a well-formed header. The name
-/// may be empty (a `begin` line with a mode and nothing after it), which is
-/// still a valid signal that the body starts on the next line.
-///
-/// The mode token is validated as octal digits, which is what keeps ordinary
-/// English prose starting with "begin " from being mistaken for a header. This
-/// is the **detection** reading, used by [`looks_like_uu`]; once an article has
-/// already been claimed as uuencode the mode is read by
-/// [`parse_begin_line_engaged`] instead, which does not care.
+// Parse a uuencode `begin <mode> <name>` header line.
+//
+// Returns the filename bytes when the line is a well-formed header. The name
+// may be empty (a `begin` line with a mode and nothing after it), which is
+// still a valid signal that the body starts on the next line.
+//
+// The mode token is validated as octal digits, which is what keeps ordinary
+// English prose starting with "begin " from being mistaken for a header. This
+// is the **detection** reading, used by [`looks_like_uu`]; once an article has
+// already been claimed as uuencode the mode is read by
+// [`parse_begin_line_engaged`] instead, which does not care.
 fn parse_begin_line(line: &[u8]) -> Option<&[u8]> {
     parse_begin_line_with(line, |mode| mode.iter().all(|b| (b'0'..=b'7').contains(b)))
 }
 
-/// Parse a `begin` line inside an article that is already known to be uuencode,
-/// accepting any digit run as the mode.
-///
-/// Both reference decoders split the mode reading exactly this way: their
-/// *detectors* demand octal before claiming an article, and their *decode*
-/// stages then skip the mode token without validating it at all. The strictness
-/// is a confidence gate on "is this uuencode?", and once that question is
-/// settled it has no further job — a poster who wrote `begin 999` or a decimal
-/// mode should not cost the file its name.
-///
-/// Safe to consult on a body line, which is what weaver does: uuencode payload
-/// characters live in `[' ', '`']`, so the lowercase letters in `begin` cannot
-/// appear in a valid data line. A body line starting with `begin ` is therefore
-/// never a data line that this could steal.
+// Parse a `begin` line inside an article that is already known to be uuencode,
+// accepting any digit run as the mode.
+//
+// Both reference decoders split the mode reading exactly this way: their
+// *detectors* demand octal before claiming an article, and their *decode*
+// stages then skip the mode token without validating it at all. The strictness
+// is a confidence gate on "is this uuencode?", and once that question is
+// settled it has no further job — a poster who wrote `begin 999` or a decimal
+// mode should not cost the file its name.
+//
+// Safe to consult on a body line, which is what weaver does: uuencode payload
+// characters live in `[' ', '`']`, so the lowercase letters in `begin` cannot
+// appear in a valid data line. A body line starting with `begin ` is therefore
+// never a data line that this could steal.
 fn parse_begin_line_engaged(line: &[u8]) -> Option<&[u8]> {
     parse_begin_line_with(line, |mode| mode.iter().all(u8::is_ascii_digit))
 }
@@ -223,26 +223,26 @@ fn parse_begin_line_with(line: &[u8], mode_is_valid: impl Fn(&[u8]) -> bool) -> 
     Some(after_mode[name_start..].trim_ascii_end())
 }
 
-/// Does this line have the shape of a full uuencode data line?
-///
-/// A full line is `'M'` (45 bytes) plus 60 payload characters, so 61 characters
-/// once the line ending is stripped. Lines down to 58 are admitted as well,
-/// because a trailing run of spaces — the sextet zero, which is what a run of
-/// zero bits encodes to — is exactly what whitespace-stripping agents eat off
-/// the end of a text line. Three is the same bound the decoder reconstructs
-/// under, for the same reason: see [`UU_MAX_VIRTUAL_PAD_CHARS`].
-///
-/// This is where the stripped-whitespace tolerance belongs rather than in
-/// [`plausible_uu_data_line`], because here the evidence can carry it. Even at
-/// 58 characters the charset check below is examining 57 of them, so what is
-/// being admitted is a line that looks overwhelmingly like uuencode and is a
-/// few pad characters short — not a two-character line with nothing to check.
-///
-/// The payload charset check is stricter than the reference detector, which
-/// tests only the length and the leading `'M'`. Prose lines of exactly the
-/// right length that happen to start with `M` almost always contain lowercase
-/// letters, which are outside the uuencode charset, so the check costs nothing
-/// and turns a plausible false positive into a miss.
+// Does this line have the shape of a full uuencode data line?
+//
+// A full line is `'M'` (45 bytes) plus 60 payload characters, so 61 characters
+// once the line ending is stripped. Lines down to 58 are admitted as well,
+// because a trailing run of spaces — the sextet zero, which is what a run of
+// zero bits encodes to — is exactly what whitespace-stripping agents eat off
+// the end of a text line. Three is the same bound the decoder reconstructs
+// under, for the same reason: see [`UU_MAX_VIRTUAL_PAD_CHARS`].
+//
+// This is where the stripped-whitespace tolerance belongs rather than in
+// [`plausible_uu_data_line`], because here the evidence can carry it. Even at
+// 58 characters the charset check below is examining 57 of them, so what is
+// being admitted is a line that looks overwhelmingly like uuencode and is a
+// few pad characters short — not a two-character line with nothing to check.
+//
+// The payload charset check is stricter than the reference detector, which
+// tests only the length and the leading `'M'`. Prose lines of exactly the
+// right length that happen to start with `M` almost always contain lowercase
+// letters, which are outside the uuencode charset, so the check costs nothing
+// and turns a plausible false positive into a miss.
 fn full_uu_data_line(line: &[u8]) -> bool {
     const SHORTEST_STRIPPED_FULL_LINE: usize = UU_MAX_LINE_CHARS - UU_MAX_VIRTUAL_PAD_CHARS + 1;
 
@@ -253,20 +253,20 @@ fn full_uu_data_line(line: &[u8]) -> bool {
             .all(|c| (UU_CHAR_MIN..=UU_CHAR_MAX).contains(c))
 }
 
-/// Does this line plausibly encode a uuencode part?
-///
-/// The final part of a multi-part post is short, so it never matches the
-/// full-line shape and has to be admitted on its own terms. The line is checked
-/// against its own length character: the declared byte count implies a range of
-/// acceptable payload lengths — from [`min_payload_chars`] up to
-/// [`padded_payload_chars`] — and the line has to carry a payload inside that
-/// envelope, made only of uuencode characters, with nothing but padding after
-/// it.
-///
-/// Validating against the widest end of the envelope is enough on its own:
-/// padding characters are themselves inside the uuencode charset, so a payload
-/// that stops early and pads out still passes the charset check across the whole
-/// window.
+// Does this line plausibly encode a uuencode part?
+//
+// The final part of a multi-part post is short, so it never matches the
+// full-line shape and has to be admitted on its own terms. The line is checked
+// against its own length character: the declared byte count implies a range of
+// acceptable payload lengths — from [`min_payload_chars`] up to
+// [`padded_payload_chars`] — and the line has to carry a payload inside that
+// envelope, made only of uuencode characters, with nothing but padding after
+// it.
+//
+// Validating against the widest end of the envelope is enough on its own:
+// padding characters are themselves inside the uuencode charset, so a payload
+// that stops early and pads out still passes the charset check across the whole
+// window.
 fn plausible_uu_data_line(line: &[u8]) -> bool {
     let line = strip_dot_stuffing(line);
     if line.len() <= 1 {
@@ -301,16 +301,16 @@ fn plausible_uu_data_line(line: &[u8]) -> bool {
         && line[payload_end..].iter().all(|c| *c == b' ' || *c == b'`')
 }
 
-/// Would this line start a uuencode article?
-///
-/// This is the detection entry point. The caller must have already ruled out
-/// yEnc: `=ybegin` always wins, and this is only consulted for lines that are
-/// not one.
-///
-/// It answers yes for all three ways a uuencode article can open — an explicit
-/// `begin` header, a full data line, or a short data line — because a
-/// continuation part of a multi-part post carries no header at all and opens
-/// directly with data.
+// Would this line start a uuencode article?
+//
+// This is the detection entry point. The caller must have already ruled out
+// yEnc: `=ybegin` always wins, and this is only consulted for lines that are
+// not one.
+//
+// It answers yes for all three ways a uuencode article can open — an explicit
+// `begin` header, a full data line, or a short data line — because a
+// continuation part of a multi-part post carries no header at all and opens
+// directly with data.
 pub fn looks_like_uu(line: &[u8]) -> bool {
     let line = trim_line_ending(line);
     if line.is_empty() {
@@ -319,82 +319,82 @@ pub fn looks_like_uu(line: &[u8]) -> bool {
     parse_begin_line(line).is_some() || full_uu_data_line(line) || plausible_uu_data_line(line)
 }
 
-/// Is this the line that ends a uuencode body?
-///
-/// Canonical uuencode closes with a zero-length data line (a single backtick)
-/// followed by `end`. Either is taken as the end, matching both reference
-/// decoders.
+// Is this the line that ends a uuencode body?
+//
+// Canonical uuencode closes with a zero-length data line (a single backtick)
+// followed by `end`. Either is taken as the end, matching both reference
+// decoders.
 fn end_of_body_line(line: &[u8]) -> bool {
     line == b"`" || line == b"end" || line.starts_with(b"end ")
 }
 
-/// Body lines that carry no data and must not be treated as damage.
+// Body lines that carry no data and must not be treated as damage.
 fn ignorable_body_line(line: &[u8]) -> bool {
     line.is_empty() || line == b"-- " || line.starts_with(b"Posted via ")
 }
 
-/// What a uuencode article decoded to.
-///
-/// Deliberately thin. uuencode declares no offsets, no per-part checksum and no
-/// file size, so this is the complete set of facts an article yields: how many
-/// bytes came out, what the `begin` line called the file if it had one, and
-/// whether anything failed to decode along the way.
+// What a uuencode article decoded to.
+//
+// Deliberately thin. uuencode declares no offsets, no per-part checksum and no
+// file size, so this is the complete set of facts an article yields: how many
+// bytes came out, what the `begin` line called the file if it had one, and
+// whether anything failed to decode along the way.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UuOutcome {
-    /// Bytes this article decoded to.
+    // Bytes this article decoded to.
     pub decoded_len: u64,
-    /// Filename from the `begin` header. `None` on a continuation part, which
-    /// legitimately carries no header at all.
+    // Filename from the `begin` header. `None` on a continuation part, which
+    // legitimately carries no header at all.
     pub filename: Option<String>,
-    /// At least one line failed to decode. The bytes are still here — see the
-    /// module docs for why that is the useful behaviour.
+    // At least one line failed to decode. The bytes are still here — see the
+    // module docs for why that is the useful behaviour.
     pub damaged: bool,
-    /// A body was entered, i.e. the article really did carry uuencode data.
+    // A body was entered, i.e. the article really did carry uuencode data.
     pub saw_body: bool,
-    /// The body's terminator was seen, so this article ended a file.
+    // The body's terminator was seen, so this article ended a file.
     pub ended: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UuState {
-    /// Before the body: skipping whatever the poster put above it.
+    // Before the body: skipping whatever the poster put above it.
     Preamble,
-    /// Inside the body, decoding data lines.
+    // Inside the body, decoding data lines.
     Body,
-    /// Past the terminator; anything further is a trailer and is ignored.
-    ///
-    /// # Concatenated multi-file articles
-    ///
-    /// This is where weaver deliberately diverges from one of the reference
-    /// decoders. uuencode has no framing above the file, so a single article
-    /// can carry `begin … end` twice and hold two files. That decoder's `end`
-    /// handling only clears its in-body flag, leaving a later `begin` free to
-    /// re-enter the body and append the second file's bytes to the same output
-    /// — the two files come back concatenated, with only the first one's name.
-    ///
-    /// Weaver stays ended. Its file model is one NZB file per assembly, and a
-    /// second file's bytes have no assembly to go to: appending them would
-    /// silently corrupt the first file's tail with content that belongs
-    /// somewhere else, and there is nowhere else to put it. Multi-file
-    /// uuencode articles are a vintage shape outside the scope this decoder
-    /// exists for, so the honest answer is to decode the first file correctly
-    /// and ignore the rest rather than to produce a file that is neither.
-    ///
-    /// The trailer is ignored without damage: signatures, server banners and a
-    /// second `begin` all routinely follow `end`, and none of them says
-    /// anything is wrong with the bytes already decoded.
+    // Past the terminator; anything further is a trailer and is ignored.
+    //
+    // # Concatenated multi-file articles
+    //
+    // This is where weaver deliberately diverges from one of the reference
+    // decoders. uuencode has no framing above the file, so a single article
+    // can carry `begin … end` twice and hold two files. That decoder's `end`
+    // handling only clears its in-body flag, leaving a later `begin` free to
+    // re-enter the body and append the second file's bytes to the same output
+    // — the two files come back concatenated, with only the first one's name.
+    //
+    // Weaver stays ended. Its file model is one NZB file per assembly, and a
+    // second file's bytes have no assembly to go to: appending them would
+    // silently corrupt the first file's tail with content that belongs
+    // somewhere else, and there is nowhere else to put it. Multi-file
+    // uuencode articles are a vintage shape outside the scope this decoder
+    // exists for, so the honest answer is to decode the first file correctly
+    // and ignore the rest rather than to produce a file that is neither.
+    //
+    // The trailer is ignored without damage: signatures, server banners and a
+    // second `begin` all routinely follow `end`, and none of them says
+    // anything is wrong with the bytes already decoded.
     Ended,
 }
 
-/// A line-fed uuencode decoder.
-///
-/// Feed it whole lines with [`push_line`](Self::push_line), in article order.
-/// It skips the preamble, decodes the body, and ignores the trailer. Decoded
-/// bytes accumulate in an internal buffer that the caller can drain as it goes.
-///
-/// The decoder never fails. Lines it cannot make sense of set
-/// [`damaged`](Self::damaged) and decoding continues; whether a damaged article
-/// is worth keeping is the caller's decision, not the decoder's.
+// A line-fed uuencode decoder.
+//
+// Feed it whole lines with [`push_line`](Self::push_line), in article order.
+// It skips the preamble, decodes the body, and ignores the trailer. Decoded
+// bytes accumulate in an internal buffer that the caller can drain as it goes.
+//
+// The decoder never fails. Lines it cannot make sense of set
+// [`damaged`](Self::damaged) and decoding continues; whether a damaged article
+// is worth keeping is the caller's decision, not the decoder's.
 #[derive(Debug)]
 pub struct UuDecoder {
     state: UuState,
@@ -423,7 +423,7 @@ impl UuDecoder {
         }
     }
 
-    /// Feed one line. The line may carry its trailing `\r\n`.
+    // Feed one line. The line may carry its trailing `\r\n`.
     pub fn push_line(&mut self, raw: &[u8]) {
         let line = trim_line_ending(raw);
         match self.state {
@@ -434,49 +434,49 @@ impl UuDecoder {
         }
     }
 
-    /// Has the body's terminator been seen?
+    // Has the body's terminator been seen?
     pub fn is_ended(&self) -> bool {
         self.state == UuState::Ended
     }
 
-    /// Has a body been entered — that is, did this article carry binary data?
+    // Has a body been entered — that is, did this article carry binary data?
     pub fn saw_body(&self) -> bool {
         self.state != UuState::Preamble
     }
 
-    /// Was an explicit `begin` header seen? False for continuation parts, which
-    /// legitimately have none.
+    // Was an explicit `begin` header seen? False for continuation parts, which
+    // legitimately have none.
     pub fn saw_begin(&self) -> bool {
         self.saw_begin
     }
 
-    /// Did any line fail to decode cleanly?
+    // Did any line fail to decode cleanly?
     pub fn damaged(&self) -> bool {
         self.damaged
     }
 
-    /// Total bytes decoded so far, including bytes already drained.
+    // Total bytes decoded so far, including bytes already drained.
     pub fn decoded_len(&self) -> u64 {
         self.decoded_len
     }
 
-    /// The filename from the `begin` header, if this article carried one.
+    // The filename from the `begin` header, if this article carried one.
     pub fn filename(&self) -> Option<&str> {
         self.filename.as_deref()
     }
 
-    /// Decoded bytes not yet drained.
+    // Decoded bytes not yet drained.
     pub fn output(&self) -> &[u8] {
         &self.output
     }
 
-    /// Take the decoded bytes accumulated so far, leaving the decoder able to
-    /// continue into the same article.
+    // Take the decoded bytes accumulated so far, leaving the decoder able to
+    // continue into the same article.
     pub fn take_output(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.output)
     }
 
-    /// Everything this article established, as the product the pipeline routes.
+    // Everything this article established, as the product the pipeline routes.
     pub fn outcome(&self) -> UuOutcome {
         UuOutcome {
             decoded_len: self.decoded_len,
@@ -571,8 +571,8 @@ impl UuDecoder {
         self.decode_salvage(declared, payload);
     }
 
-    /// Decode a line whose payload carries every bit it declares, or is short of
-    /// them by less than one group's worth of stripped trailing whitespace.
+    // Decode a line whose payload carries every bit it declares, or is short of
+    // them by less than one group's worth of stripped trailing whitespace.
     fn decode_full_line(&mut self, declared: usize, payload: &[u8]) {
         debug_assert!(
             payload.len() + UU_MAX_VIRTUAL_PAD_CHARS >= min_payload_chars(declared)
@@ -604,10 +604,10 @@ impl UuDecoder {
         self.decoded_len += declared as u64;
     }
 
-    /// Scalar group-at-a-time decode, used for truncated and over-long lines.
-    ///
-    /// Consumes two characters for a one-byte tail and three for a two-byte
-    /// tail. A group with fewer characters than that minimum is truncated.
+    // Scalar group-at-a-time decode, used for truncated and over-long lines.
+    //
+    // Consumes two characters for a one-byte tail and three for a two-byte
+    // tail. A group with fewer characters than that minimum is truncated.
     fn decode_salvage(&mut self, declared: usize, payload: &[u8]) {
         let mut remaining = declared;
         let mut chars = payload;
@@ -647,12 +647,12 @@ impl UuDecoder {
     }
 }
 
-/// Decode 64 uuencode characters into 48 bytes.
-///
-/// The transform is a single branchless expression per character followed by a
-/// 4-to-3 repack, which is exactly the shape base64 decoders vectorise. Only
-/// the first 48 bytes of `output` are meaningful; the rest is slack for the x86
-/// kernel's final store.
+// Decode 64 uuencode characters into 48 bytes.
+//
+// The transform is a single branchless expression per character followed by a
+// 4-to-3 repack, which is exactly the shape base64 decoders vectorise. Only
+// the first 48 bytes of `output` are meaningful; the rest is slack for the x86
+// kernel's final store.
 #[inline]
 fn decode_kernel(input: &[u8; UU_KERNEL_CHARS], output: &mut [u8; UU_KERNEL_BYTES]) {
     // Exactly one of the three blocks below survives `cfg` on any given target.
@@ -678,12 +678,12 @@ fn decode_kernel(input: &[u8; UU_KERNEL_CHARS], output: &mut [u8; UU_KERNEL_BYTE
     }
 }
 
-/// Scalar reference implementation, and the fallback where no vector tier is
-/// available. The vector kernels are checked against this directly.
-///
-/// NEON is architecturally guaranteed on aarch64, so there the twin is reached
-/// only by the differential test; it stays compiled so that test has something
-/// to compare against.
+// Scalar reference implementation, and the fallback where no vector tier is
+// available. The vector kernels are checked against this directly.
+//
+// NEON is architecturally guaranteed on aarch64, so there the twin is reached
+// only by the differential test; it stays compiled so that test has something
+// to compare against.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn decode_kernel_scalar(input: &[u8; UU_KERNEL_CHARS], output: &mut [u8; UU_KERNEL_BYTES]) {
     for group in 0..UU_KERNEL_CHARS / 4 {
@@ -698,8 +698,8 @@ fn decode_kernel_scalar(input: &[u8; UU_KERNEL_CHARS], output: &mut [u8; UU_KERN
     }
 }
 
-/// Resolve the x86 tier once per process rather than once per line, the same
-/// shape the yEnc dispatcher uses.
+// Resolve the x86 tier once per process rather than once per line, the same
+// shape the yEnc dispatcher uses.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn dispatch_x86_ssse3() -> bool {
@@ -709,12 +709,12 @@ fn dispatch_x86_ssse3() -> bool {
     *DISPATCH.get_or_init(|| std::arch::is_x86_feature_detected!("ssse3"))
 }
 
-/// SSSE3 kernel: four 16-character steps, each producing 12 bytes.
-///
-/// The repack is the textbook base64 sequence — `maddubs` folds character pairs
-/// into 12-bit halves, `madd` folds those into a 24-bit group, and one shuffle
-/// pulls the three bytes out of each 32-bit lane in big-endian order. uuencode
-/// needs no lookup table in front of it because its alphabet is contiguous.
+// SSSE3 kernel: four 16-character steps, each producing 12 bytes.
+//
+// The repack is the textbook base64 sequence — `maddubs` folds character pairs
+// into 12-bit halves, `madd` folds those into a 24-bit group, and one shuffle
+// pulls the three bytes out of each 32-bit lane in big-endian order. uuencode
+// needs no lookup table in front of it because its alphabet is contiguous.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
 unsafe fn decode_kernel_ssse3(input: &[u8; UU_KERNEL_CHARS], output: &mut [u8; UU_KERNEL_BYTES]) {
@@ -747,12 +747,12 @@ unsafe fn decode_kernel_ssse3(input: &[u8; UU_KERNEL_CHARS], output: &mut [u8; U
     }
 }
 
-/// NEON kernel: one pass over all 64 characters.
-///
-/// `vld4q_u8` deinterleaves the line into the four character positions of every
-/// group, which is precisely the operand layout the repack wants, and
-/// `vst3q_u8` interleaves the three output bytes back into order. The whole
-/// kernel is therefore load, mask, three shift-or pairs, store.
+// NEON kernel: one pass over all 64 characters.
+//
+// `vld4q_u8` deinterleaves the line into the four character positions of every
+// group, which is precisely the operand layout the repack wants, and
+// `vst3q_u8` interleaves the three output bytes back into order. The whole
+// kernel is therefore load, mask, three shift-or pairs, store.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn decode_kernel_neon(input: &[u8; UU_KERNEL_CHARS], output: &mut [u8; UU_KERNEL_BYTES]) {
@@ -781,11 +781,11 @@ unsafe fn decode_kernel_neon(input: &[u8; UU_KERNEL_CHARS], output: &mut [u8; UU
 mod tests {
     use super::*;
 
-    /// Encode one uuencode line the way a canonical encoder would.
-    ///
-    /// Anchored against a hand-computed vector by
-    /// [`encoder_matches_hand_computed_vector`], so the golden round-trips below
-    /// are checked against arithmetic rather than against this decoder.
+    // Encode one uuencode line the way a canonical encoder would.
+    //
+    // Anchored against a hand-computed vector by
+    // [`encoder_matches_hand_computed_vector`], so the golden round-trips below
+    // are checked against arithmetic rather than against this decoder.
     fn uu_line(data: &[u8], pad: u8) -> Vec<u8> {
         assert!(data.len() <= UU_MAX_LINE_BYTES);
         let mut line = vec![encode_char(data.len() as u8, pad)];
@@ -801,8 +801,8 @@ mod tests {
         line
     }
 
-    /// `pad` picks how a zero sextet is spelled: canonical encoders use a
-    /// space, others use a backtick. Both must decode identically.
+    // `pad` picks how a zero sextet is spelled: canonical encoders use a
+    // space, others use a backtick. Both must decode identically.
     fn encode_char(sextet: u8, pad: u8) -> u8 {
         if sextet == 0 { pad } else { sextet + b' ' }
     }
@@ -1490,18 +1490,18 @@ mod tests {
         }
     }
 
-    /// A kernel under differential test, paired with the label used in failures.
+    // A kernel under differential test, paired with the label used in failures.
     type LabelledKernel = (
         &'static str,
         fn(&[u8; UU_KERNEL_CHARS], &mut [u8; UU_KERNEL_BYTES]),
     );
 
-    /// Every kernel that is usable on this host, paired with a label.
-    ///
-    /// The vector kernel is listed on its own rather than only through
-    /// [`decode_kernel`], so a host that has the tier always compares it — a
-    /// dispatcher that quietly declined a tier can never masquerade as a tested
-    /// one.
+    // Every kernel that is usable on this host, paired with a label.
+    //
+    // The vector kernel is listed on its own rather than only through
+    // [`decode_kernel`], so a host that has the tier always compares it — a
+    // dispatcher that quietly declined a tier can never masquerade as a tested
+    // one.
     fn kernels_under_test() -> Vec<LabelledKernel> {
         let mut kernels: Vec<LabelledKernel> = vec![("dispatched", decode_kernel)];
 

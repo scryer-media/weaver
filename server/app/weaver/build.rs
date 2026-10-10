@@ -7,11 +7,11 @@ fn main() {
     compile_windows_resources();
 }
 
-/// Stamp the short commit into the binary for `weaver_build_info{commit=...}`.
-///
-/// Release tarballs and container builds are routinely produced from an
-/// exported source tree with no `.git` at all, so every failure mode here has
-/// to degrade to `unknown` rather than fail the build.
+// Stamp the short commit into the binary for `weaver_build_info{commit=...}`.
+//
+// Release tarballs and container builds are routinely produced from an
+// exported source tree with no `.git` at all, so every failure mode here has
+// to degrade to `unknown` rather than fail the build.
 fn emit_git_commit() {
     let commit = git_commit().unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=WEAVER_GIT_COMMIT={commit}");
@@ -37,10 +37,10 @@ fn git_commit() -> Option<String> {
     Some(commit)
 }
 
-/// Find the repository's git directory, walking up from the crate.
-///
-/// Worktrees store a `.git` *file* pointing at the real directory, so the
-/// presence check must accept both.
+// Find the repository's git directory, walking up from the crate.
+//
+// Worktrees store a `.git` *file* pointing at the real directory, so the
+// presence check must accept both.
 fn locate_git_dir() -> Option<PathBuf> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").ok()?);
     let mut current: Option<&Path> = Some(manifest_dir.as_path());

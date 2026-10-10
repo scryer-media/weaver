@@ -63,8 +63,8 @@ pub(crate) fn is_due(feed: &RssFeedRow, now: i64) -> bool {
     .is_due(now)
 }
 
-/// The columns that decide when a feed is next polled, read without the
-/// rest of the feed so the poller can find the due feeds cheaply.
+// The columns that decide when a feed is next polled, read without the
+// rest of the feed so the poller can find the due feeds cheaply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RssFeedSchedule {
     pub(crate) id: u32,
@@ -74,7 +74,7 @@ pub(crate) struct RssFeedSchedule {
 }
 
 impl RssFeedSchedule {
-    /// The unix second at which the feed is next due.
+    // The unix second at which the feed is next due.
     pub(crate) fn next_due_at(&self) -> i64 {
         let interval = if self.poll_interval_secs == 0 {
             DEFAULT_POLL_INTERVAL_SECS

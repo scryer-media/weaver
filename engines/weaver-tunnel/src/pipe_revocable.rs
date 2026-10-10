@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use super::{ConnectionOutcome, DialError, Dialed, DialedStream, Dialer, Resolution, Target};
 
-/// One leg's sockets and streams. Revocation also cancels in-flight opens.
+// One leg's sockets and streams. Revocation also cancels in-flight opens.
 pub struct Revocable {
     inner: Arc<dyn Dialer>,
     sockets: crate::revocation::SocketRegistry,

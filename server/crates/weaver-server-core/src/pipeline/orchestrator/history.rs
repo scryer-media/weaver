@@ -2,13 +2,13 @@ use std::collections::HashSet;
 
 use super::*;
 
-/// The finished jobs the pipeline keeps in memory, newest first, with the
-/// shared copy the job snapshot publishes.
-///
-/// History is most of a long-running snapshot and changes only when a job
-/// finishes or a row is deleted, so the published copy is built once per
-/// change and shared by every snapshot until the next one. Any mutable access
-/// drops it, so it can never be stale.
+// The finished jobs the pipeline keeps in memory, newest first, with the
+// shared copy the job snapshot publishes.
+//
+// History is most of a long-running snapshot and changes only when a job
+// finishes or a row is deleted, so the published copy is built once per
+// change and shared by every snapshot until the next one. Any mutable access
+// drops it, so it can never be stale.
 #[derive(Debug, Default)]
 pub(crate) struct FinishedJobs {
     jobs: Vec<JobInfo>,
@@ -16,8 +16,8 @@ pub(crate) struct FinishedJobs {
 }
 
 impl FinishedJobs {
-    /// The rows as an immutable shared slice, built on first use after a
-    /// change.
+    // The rows as an immutable shared slice, built on first use after a
+    // change.
     pub(crate) fn shared(&mut self) -> Arc<[JobInfo]> {
         let jobs = &self.jobs;
         Arc::clone(
@@ -63,8 +63,8 @@ impl<'a> IntoIterator for &'a FinishedJobs {
     }
 }
 
-/// The working directories a history delete will remove, and the ones it will
-/// leave on disk because their ownership marker no longer matches them.
+// The working directories a history delete will remove, and the ones it will
+// leave on disk because their ownership marker no longer matches them.
 #[derive(Debug, Default)]
 pub(crate) struct HistoryCleanupDirs {
     pub(crate) job_ids: BTreeSet<JobId>,
@@ -286,9 +286,9 @@ impl Pipeline {
         Ok(dirs)
     }
 
-    /// Removes every owned directory in `dirs`, and returns every directory
-    /// left on disk — the ones `dirs` already set aside plus any whose marker
-    /// stopped matching between the two looks.
+    // Removes every owned directory in `dirs`, and returns every directory
+    // left on disk — the ones `dirs` already set aside plus any whose marker
+    // stopped matching between the two looks.
     async fn cleanup_history_intermediate_dirs_at(
         intermediate_dir: &std::path::Path,
         dirs: &HistoryCleanupDirs,
@@ -472,10 +472,10 @@ impl Pipeline {
             .truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
     }
 
-    /// Archive the job's history row and publish `terminal_event` once that
-    /// archive has committed. Terminal events are routed through here so every
-    /// caller keeps the same guarantee: a subscriber that observes the event can
-    /// immediately read the row back from the history facade.
+    // Archive the job's history row and publish `terminal_event` once that
+    // archive has committed. Terminal events are routed through here so every
+    // caller keeps the same guarantee: a subscriber that observes the event can
+    // immediately read the row back from the history facade.
     pub(crate) fn record_job_history(
         &mut self,
         job_id: JobId,
@@ -653,10 +653,10 @@ impl Pipeline {
         }
     }
 
-    /// Hold the terminal event until the history archive has committed, so the
-    /// row is queryable the moment the event is observed. A dropped signal (the
-    /// writer queue closed at shutdown) still publishes: losing a terminal event
-    /// is worse than publishing one ahead of its row.
+    // Hold the terminal event until the history archive has committed, so the
+    // row is queryable the moment the event is observed. A dropped signal (the
+    // writer queue closed at shutdown) still publishes: losing a terminal event
+    // is worse than publishing one ahead of its row.
     fn publish_terminal_event_after_archive(
         &self,
         archived: oneshot::Receiver<()>,

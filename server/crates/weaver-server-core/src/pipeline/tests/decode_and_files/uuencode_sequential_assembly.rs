@@ -1,14 +1,14 @@
-//! uuencode sequential assembly
-//! PAR2 binding by content (obfuscation)
+// uuencode sequential assembly
+// PAR2 binding by content (obfuscation)
 
 use super::*;
 
-/// Give the UU spool a known free-space reading so a spill is judged on it.
-///
-/// The pipeline reads spool headroom from the background storage sampler, and
-/// until that sampler's first probe lands the reading is unknown. A spill with
-/// no reading is refused and the part requeued, so a test that expects a part
-/// to spill must not race the sampler: it seeds the reading it wants instead.
+// Give the UU spool a known free-space reading so a spill is judged on it.
+//
+// The pipeline reads spool headroom from the background storage sampler, and
+// until that sampler's first probe lands the reading is unknown. A spill with
+// no reading is refused and the part requeued, so a test that expects a part
+// to spill must not race the sampler: it seeds the reading it wants instead.
 fn seed_uu_spool_headroom(pipeline: &mut Pipeline) {
     pipeline.uu_spool_available_bytes_for_test =
         Some(Some(pipeline.uu_spool_min_free_bytes + 64 * 1024 * 1024));

@@ -76,12 +76,12 @@ impl Pipeline {
         drop(self.db.admit_queue_script_event(context, false));
     }
 
-    /// Raise the event for a job's arrival, and keep the job from downloading
-    /// while a script job that blocks on it runs.
-    ///
-    /// The category lookup uses the dispatch cache. Only a blocking script
-    /// holds the job; a cold cache is resolved off the actor before releasing
-    /// a provisional hold. A script that could not run decides nothing.
+    // Raise the event for a job's arrival, and keep the job from downloading
+    // while a script job that blocks on it runs.
+    //
+    // The category lookup uses the dispatch cache. Only a blocking script
+    // holds the job; a cold cache is resolved off the actor before releasing
+    // a provisional hold. A script that could not run decides nothing.
     pub(crate) fn raise_added_script_event(&mut self, job_id: JobId) {
         if !self.jobs.contains_key(&job_id) || !self.db.queue_scripts_possible() {
             return;
@@ -133,8 +133,8 @@ impl Pipeline {
         });
     }
 
-    /// Whether a job is being kept from downloading by the scripts that run on
-    /// its arrival.
+    // Whether a job is being kept from downloading by the scripts that run on
+    // its arrival.
     pub(crate) fn held_for_added_scripts(&self, job_id: JobId) -> bool {
         self.added_script_holds.contains(&job_id)
     }
@@ -156,15 +156,15 @@ impl Pipeline {
         self.publish_snapshot();
     }
 
-    /// Returns true while the completion pass must yield to its queue scripts.
-    ///
-    /// The barrier is raised once nothing more is coming off the wire, or once
-    /// every data file is complete. The second clause matters: the streamed
-    /// decode of a job's last article runs the completion pass from inside the
-    /// booking of that article's own download result, so the result still
-    /// counts as pending download work while the pass, with every file
-    /// complete, goes on to finalize the job. Deferring on pending work there
-    /// would let the final move run with the barrier never raised.
+    // Returns true while the completion pass must yield to its queue scripts.
+    //
+    // The barrier is raised once nothing more is coming off the wire, or once
+    // every data file is complete. The second clause matters: the streamed
+    // decode of a job's last article runs the completion pass from inside the
+    // booking of that article's own download result, so the result still
+    // counts as pending download work while the pass, with every file
+    // complete, goes on to finalize the job. Deferring on pending work there
+    // would let the final move run with the barrier never raised.
     pub(crate) fn queue_script_completion_gate(
         &mut self,
         job_id: JobId,
@@ -210,9 +210,9 @@ impl Pipeline {
         true
     }
 
-    /// A job whose download is complete and that holds the queue-script
-    /// barrier. Until the scripts finish it is not downloading: it cannot be
-    /// paused, a semantic cancel is not safe, and it reports as waiting.
+    // A job whose download is complete and that holds the queue-script
+    // barrier. Until the scripts finish it is not downloading: it cannot be
+    // paused, a semantic cancel is not safe, and it reports as waiting.
     pub(crate) fn awaiting_queue_script_barrier(&self, job_id: JobId) -> bool {
         self.queue_script_waiters.contains(&job_id)
     }
@@ -307,8 +307,8 @@ impl Pipeline {
     }
 }
 
-/// The statuses a job holding the queue-script barrier can be in. Anything
-/// else means the job moved on, and a late event must not act on it.
+// The statuses a job holding the queue-script barrier can be in. Anything
+// else means the job moved on, and a late event must not act on it.
 fn queue_barrier_status(status: &JobStatus) -> bool {
     matches!(
         status,

@@ -37,9 +37,9 @@ pub(super) fn wireguard_session_budget() -> std::sync::Arc<tokio::sync::Semaphor
         .clone()
 }
 
-/// Every WireGuard session `routes` need, named by its egress and the hops
-/// up to and including it. A WireGuard hop stacked on another is its own
-/// session, apart from the same proxy directly on the egress.
+// Every WireGuard session `routes` need, named by its egress and the hops
+// up to and including it. A WireGuard hop stacked on another is its own
+// session, apart from the same proxy directly on the egress.
 pub fn wireguard_sessions(
     routes: &[Route],
     profiles: &HashMap<u32, ProxyProfile>,
@@ -95,10 +95,10 @@ pub fn validate_instance_budget(
     Ok(())
 }
 
-/// A WireGuard server keeps one endpoint per peer key, so one profile may
-/// run only one session per egress: used directly and also stacked on
-/// another WireGuard proxy, or stacked on two different ones, its two
-/// sessions would keep taking the endpoint from each other.
+// A WireGuard server keeps one endpoint per peer key, so one profile may
+// run only one session per egress: used directly and also stacked on
+// another WireGuard proxy, or stacked on two different ones, its two
+// sessions would keep taking the endpoint from each other.
 pub fn validate_wireguard_paths(
     routes: &[Route],
     profiles: &HashMap<u32, ProxyProfile>,
@@ -149,8 +149,8 @@ pub struct EgressInterface {
     pub binding: EgressBinding,
     pub enabled: bool,
     pub max_download_speed: u64,
-    /// Raw BODY bytes this egress may carry, counted across every server
-    /// routed over it.
+    // Raw BODY bytes this egress may carry, counted across every server
+    // routed over it.
     #[serde(default)]
     pub download_quota: crate::servers::ServerDownloadQuotaConfig,
 }
@@ -269,7 +269,7 @@ impl ProxyPool {
 }
 
 impl Route {
-    /// Old rows, including v1 restores, keep their exact direct-fallback policy.
+    // Old rows, including v1 restores, keep their exact direct-fallback policy.
     pub fn from_legacy(policy: &RoutingPolicy) -> Self {
         let path = if policy.proxy_ids.is_empty() && policy.allow_direct {
             LegPath::Direct
@@ -293,7 +293,7 @@ impl Route {
         }
     }
 
-    /// Legacy writes may only round-trip routes without dropping path information.
+    // Legacy writes may only round-trip routes without dropping path information.
     pub fn legacy_policy(&self) -> Option<RoutingPolicy> {
         let [leg] = self.legs.as_slice() else {
             return None;
@@ -423,8 +423,8 @@ impl Route {
         self.validate_shape()
     }
 
-    /// Integer largest-remainder allocation; position breaks all ties.
-    /// HOLD parks a down leg's original allocation, including its rounding share.
+    // Integer largest-remainder allocation; position breaks all ties.
+    // HOLD parks a down leg's original allocation, including its rounding share.
     pub fn targets(&self, cap: u16, healthy: &[bool]) -> Result<Vec<u16>, String> {
         self.validate_allocation()?;
         if healthy.len() != self.legs.len() {

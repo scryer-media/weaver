@@ -104,7 +104,7 @@ pub struct InterfaceSnapshot {
 }
 
 impl InterfaceSnapshot {
-    /// Family filtering is consumer-specific; `None` reports overall egress health.
+    // Family filtering is consumer-specific; `None` reports overall egress health.
     pub fn health(&self, egress: &EgressInterface, ipv6: Option<bool>) -> EgressHealth {
         if matches!(egress.binding, EgressBinding::System) {
             return EgressHealth::Up;
@@ -145,7 +145,7 @@ impl InterfaceSnapshot {
     }
 }
 
-/// Owns its polling task; dropping the monitor stops all further enumeration.
+// Owns its polling task; dropping the monitor stops all further enumeration.
 pub struct InterfaceMonitor {
     snapshot: Arc<RwLock<InterfaceSnapshot>>,
     task: tokio::task::JoinHandle<()>,

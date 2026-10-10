@@ -1,13 +1,13 @@
-//! A header-encrypted (`-hp`) set across a restart.
-//!
-//! Restoring a set rebuilds its layout from cached volume facts, and that
-//! rebuild re-runs the header parse — which, for `-hp`, is where admission
-//! happens and where the archive key is proved. The password itself is never
-//! persisted, so the restore seam has to hand the set's header gate the same
-//! candidates the live seam would have: the job spec's password and the job's
-//! harvest (NZB meta, file-name convention). A gate with an empty candidate
-//! ring refuses under a sticky `NoPassword`, and the set throws its checkpoint
-//! away and downloads every volume again.
+// A header-encrypted (`-hp`) set across a restart.
+//
+// Restoring a set rebuilds its layout from cached volume facts, and that
+// rebuild re-runs the header parse — which, for `-hp`, is where admission
+// happens and where the archive key is proved. The password itself is never
+// persisted, so the restore seam has to hand the set's header gate the same
+// candidates the live seam would have: the job spec's password and the job's
+// harvest (NZB meta, file-name convention). A gate with an empty candidate
+// ring refuses under a sticky `NoPassword`, and the set throws its checkpoint
+// away and downloads every volume again.
 
 use super::*;
 
@@ -15,8 +15,8 @@ const HP_RESTART_PASSWORD: &str = "cobalt-lighthouse";
 
 const HP_RESTART_ARTICLES: usize = 2;
 
-/// The "before" half with the job's persisted NZB chosen, so the harvest the
-/// restore reads back out of the database carries whatever the NZB carries.
+// The "before" half with the job's persisted NZB chosen, so the harvest the
+// restore reads back out of the database carries whatever the NZB carries.
 async fn hp_before_restart(
     temp_dir: &tempfile::TempDir,
     job_id: JobId,
@@ -51,9 +51,9 @@ async fn hp_before_restart(
     working_dir
 }
 
-/// Restarts a `-hp` job with volume 0 complete and asserts the checkpoint
-/// survived: the set is live, seeded from its coverage, and nothing of volume
-/// 0 is fetched again.
+// Restarts a `-hp` job with volume 0 complete and asserts the checkpoint
+// survived: the set is live, seeded from its coverage, and nothing of volume
+// 0 is fetched again.
 async fn assert_hp_set_survives_restart(
     job_id: JobId,
     member_name: &str,

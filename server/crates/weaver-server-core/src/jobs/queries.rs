@@ -103,14 +103,14 @@ fn extraction_chunk_from_row(row: SqlRow) -> Result<ExtractionChunk, StateError>
 }
 
 impl Database {
-    /// Completed-file digests that are safe to treat as *calculated from the
-    /// downloaded bytes*: rows whose `md5_provenance` records how the value
-    /// was obtained ('streamed' or 'verified'). Legacy rows — written before
-    /// provenance existed — are excluded here, because they may hold a PAR2
-    /// description's EXPECTED hash copied verbatim, and quick verification
-    /// must never treat an expectation as an observation. Use
-    /// [`Self::load_complete_file_hashes_any`] where a hash is only an
-    /// identity hint.
+    // Completed-file digests that are safe to treat as *calculated from the
+    // downloaded bytes*: rows whose `md5_provenance` records how the value
+    // was obtained ('streamed' or 'verified'). Legacy rows — written before
+    // provenance existed — are excluded here, because they may hold a PAR2
+    // description's EXPECTED hash copied verbatim, and quick verification
+    // must never treat an expectation as an observation. Use
+    // [`Self::load_complete_file_hashes_any`] where a hash is only an
+    // identity hint.
     pub fn load_complete_file_hashes(
         &self,
         job_id: JobId,
@@ -118,9 +118,9 @@ impl Database {
         self.load_complete_file_hashes_inner(job_id, true)
     }
 
-    /// Every persisted completed-file digest regardless of provenance,
-    /// including legacy rows of unknown origin. Identity hints only — never
-    /// verification evidence.
+    // Every persisted completed-file digest regardless of provenance,
+    // including legacy rows of unknown origin. Identity hints only — never
+    // verification evidence.
     pub fn load_complete_file_hashes_any(
         &self,
         job_id: JobId,
@@ -442,10 +442,10 @@ impl Database {
         })
     }
 
-    /// Load the per-file runtime view for one active job: contiguous bytes
-    /// written per incomplete file plus the set of fully completed file
-    /// indices. Used by integration facades that expose per-file listings
-    /// without loading the full recovery snapshot.
+    // Load the per-file runtime view for one active job: contiguous bytes
+    // written per incomplete file plus the set of fully completed file
+    // indices. Used by integration facades that expose per-file listings
+    // without loading the full recovery snapshot.
     pub fn load_active_file_runtime(
         &self,
         job_id: JobId,
@@ -626,9 +626,9 @@ impl Database {
         })
     }
 
-    /// Reads every direct-store coverage checkpoint for a job, keyed by archive
-    /// set name. One statement, one row per set — restart never
-    /// pays a per-volume round trip.
+    // Reads every direct-store coverage checkpoint for a job, keyed by archive
+    // set name. One statement, one row per set — restart never
+    // pays a per-volume round trip.
     pub fn load_direct_coverage(
         &self,
         job_id: JobId,

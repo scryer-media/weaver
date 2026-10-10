@@ -1,10 +1,10 @@
-//! A one-volume stored 7z that carries its own PAR3 recovery after the end
-//! header: `[7z][PAR3 packets]`, the shape an inside-insertion writes.
-//!
-//! The container states its own length in its start header, so the bytes past
-//! it are the recovery tail. The set is routed direct like any one-volume 7z;
-//! the tail is envelope, and the recovery it carries repairs the members in
-//! place when an article never arrives.
+// A one-volume stored 7z that carries its own PAR3 recovery after the end
+// header: `[7z][PAR3 packets]`, the shape an inside-insertion writes.
+//
+// The container states its own length in its start header, so the bytes past
+// it are the recovery tail. The set is routed direct like any one-volume 7z;
+// the tail is envelope, and the recovery it carries repairs the members in
+// place when an article never arrives.
 
 use super::*;
 use par3_rs::creation::CreationOptions;
@@ -13,9 +13,13 @@ use par3_rs::source::{MemorySourceAccess, SourceId};
 
 const ARTICLES: usize = 8;
 
-/// `archive` with a PAR3 recovery tail inserted after its end header, the way
-/// a poster's inside-insertion writes it.
-pub(in super::super) fn with_embedded_par3(archive: &[u8], block_size: u64, recovery_count: u64) -> Vec<u8> {
+// `archive` with a PAR3 recovery tail inserted after its end header, the way
+// a poster's inside-insertion writes it.
+pub(in super::super) fn with_embedded_par3(
+    archive: &[u8],
+    block_size: u64,
+    recovery_count: u64,
+) -> Vec<u8> {
     let scratch = tempfile::tempdir().unwrap();
     let source = SourceId(0);
     let mut access = MemorySourceAccess::default();
@@ -67,7 +71,7 @@ fn embedded_fixture(seed: u8, member_len: usize) -> Embedded {
     }
 }
 
-/// The article that holds byte `offset` of the one volume.
+// The article that holds byte `offset` of the one volume.
 fn article_holding(volume_len: usize, offset: usize) -> u32 {
     (0..ARTICLES as u32)
         .find(|&article| {
@@ -77,9 +81,9 @@ fn article_holding(volume_len: usize, offset: usize) -> u32 {
         .expect("the offset is inside the volume")
 }
 
-/// Drives the one-volume set through `arrivals`, never delivering `lost`, to
-/// whatever the job reaches. Articles the pipeline asks for again are
-/// answered unless they are lost, the way a server that never had them would.
+// Drives the one-volume set through `arrivals`, never delivering `lost`, to
+// whatever the job reaches. Articles the pipeline asks for again are
+// answered unless they are lost, the way a server that never had them would.
 async fn run_embedded(
     job_id: JobId,
     volumes: &[(String, Vec<u8>)],
@@ -171,7 +175,7 @@ fn in_order() -> Vec<u32> {
     (0..ARTICLES as u32).collect()
 }
 
-/// The set stayed direct, published only its member, and finished.
+// The set stayed direct, published only its member, and finished.
 fn assert_stayed_direct(label: &str, outcome: &Par3RepairOutcome, fixture: &Embedded) {
     assert!(
         matches!(outcome.status, Some(JobStatus::Complete)),
@@ -256,9 +260,9 @@ async fn sevenz_store_embedded_par3_repairs_a_lost_member_article() {
     }
 }
 
-/// The recovery packets are the only thing lost. The container is whole and
-/// every member passed its own checksum, so the set finalizes direct; the
-/// tail it never needed is envelope and is not delivered.
+// The recovery packets are the only thing lost. The container is whole and
+// every member passed its own checksum, so the set finalizes direct; the
+// tail it never needed is envelope and is not delivered.
 #[tokio::test]
 async fn sevenz_store_embedded_par3_finalizes_direct_without_its_tail() {
     let fixture = embedded_fixture(47, 40_000);
@@ -274,10 +278,10 @@ async fn sevenz_store_embedded_par3_finalizes_direct_without_its_tail() {
     }
 }
 
-/// The start header states where everything else is, the tail included. A
-/// set that never receives it has no destination for any byte, so it
-/// demotes for an unreadable map; the conventional path then finds the
-/// recovery set in the volume's own tail and repairs the archive in place.
+// The start header states where everything else is, the tail included. A
+// set that never receives it has no destination for any byte, so it
+// demotes for an unreadable map; the conventional path then finds the
+// recovery set in the volume's own tail and repairs the archive in place.
 #[tokio::test]
 async fn sevenz_store_embedded_par3_without_its_start_header_repairs_conventionally() {
     let fixture = embedded_fixture(53, 40_000);
@@ -302,11 +306,11 @@ async fn sevenz_store_embedded_par3_without_its_start_header_repairs_conventiona
     );
 }
 
-/// The end header shares its article with the recovery set's leading
-/// packets. Losing it costs the map and the set's own description at once:
-/// the set demotes for an unreadable map, and with no start packet left
-/// the recovery set cannot describe what it protects, so the job fails
-/// rather than delivering anything.
+// The end header shares its article with the recovery set's leading
+// packets. Losing it costs the map and the set's own description at once:
+// the set demotes for an unreadable map, and with no start packet left
+// the recovery set cannot describe what it protects, so the job fails
+// rather than delivering anything.
 #[tokio::test]
 async fn sevenz_store_embedded_par3_fails_when_the_end_header_takes_the_recovery_metadata() {
     let fixture = embedded_fixture(59, 40_000);
@@ -328,7 +332,7 @@ async fn sevenz_store_embedded_par3_fails_when_the_end_header_takes_the_recovery
     assert_eq!(outcome.member(MEMBER), None);
 }
 
-/// More member bytes lost than the tail carries recovery for.
+// More member bytes lost than the tail carries recovery for.
 #[tokio::test]
 async fn sevenz_store_embedded_par3_starved_loss_fails() {
     let fixture = embedded_fixture(61, 40_000);
@@ -348,9 +352,9 @@ async fn sevenz_store_embedded_par3_starved_loss_fails() {
     assert_eq!(outcome.member(MEMBER), None);
 }
 
-/// Bytes after a one-volume container that are not a recovery set are the
-/// posting disagreeing with the archive about where the file ends. The tail
-/// is admitted on its signature alone, so anything else is still refused.
+// Bytes after a one-volume container that are not a recovery set are the
+// posting disagreeing with the archive about where the file ends. The tail
+// is admitted on its signature alone, so anything else is still refused.
 #[tokio::test]
 async fn sevenz_store_one_volume_with_a_foreign_tail_is_refused() {
     let member = payload(67, 20_000);

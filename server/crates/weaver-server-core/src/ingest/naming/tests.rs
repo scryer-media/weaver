@@ -1,7 +1,7 @@
 use super::{completed_folder_name, derive_release_name, strip_nzb_source_suffix};
 use crate::ingest::append_original_title_metadata;
 
-/// The display name and completed folder a submission under `filename` gets.
+// The display name and completed folder a submission under `filename` gets.
 fn display_and_folder(filename: Option<&str>, meta_title: Option<&str>) -> (String, String) {
     let title = filename.map(|value| strip_nzb_source_suffix(value).unwrap_or(value));
     let metadata = append_original_title_metadata(Vec::new(), title, meta_title);

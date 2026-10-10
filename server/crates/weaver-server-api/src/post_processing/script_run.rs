@@ -1,13 +1,13 @@
-//! The API as a running script sees its own run.
-//!
-//! A script calling with its run token may read the queue, history and its
-//! own run. It may only change its run through `Mutation.scriptRun`.
-//! Other guarded queries and every other mutation are refused with
-//! `NOT_ALLOWED_FOR_SCRIPT_RUN`. What is here is the part that is about that
-//! run: the download it is for, and the things it may ask weaver to do with
-//! it. Those are the commands a script may also print after `[NZB]`, under the
-//! same rules for which trigger may issue which, and they are applied by the
-//! same code.
+// The API as a running script sees its own run.
+//
+// A script calling with its run token may read the queue, history and its
+// own run. It may only change its run through `Mutation.scriptRun`.
+// Other guarded queries and every other mutation are refused with
+// `NOT_ALLOWED_FOR_SCRIPT_RUN`. What is here is the part that is about that
+// run: the download it is for, and the things it may ask weaver to do with
+// it. Those are the commands a script may also print after `[NZB]`, under the
+// same rules for which trigger may issue which, and they are applied by the
+// same code.
 
 use async_graphql::{Context, Enum, Object, Result};
 use weaver_server_core::post_processing::callbacks::{LiveScriptRun, RunAction, RunActionError};
@@ -18,7 +18,7 @@ use super::types::ScriptKindGql;
 use crate::auth::{CallerIdentity, graphql_error};
 use crate::jobs::types::Job;
 
-/// The run the caller is, or why the caller is none.
+// The run the caller is, or why the caller is none.
 pub(crate) fn calling_run(ctx: &Context<'_>) -> Result<LiveScriptRun> {
     let Some(CallerIdentity::ScriptRun(run_id)) = ctx.data_opt::<CallerIdentity>() else {
         return Err(graphql_error(
@@ -84,7 +84,7 @@ impl From<ScriptDuplicateModeGql> for DupeMode {
     }
 }
 
-/// The run a script is calling from.
+// The run a script is calling from.
 pub struct LiveScriptRunGql(pub(crate) LiveScriptRun);
 
 #[Object(name = "LiveScriptRun")]
@@ -140,8 +140,8 @@ impl LiveScriptRunGql {
     }
 }
 
-/// What a running script may ask weaver to do for its own run. Each answers
-/// true once it has been done, and is an error when it was not.
+// What a running script may ask weaver to do for its own run. Each answers
+// true once it has been done, and is an error when it was not.
 pub struct ScriptRunActionsGql(pub(crate) LiveScriptRun);
 
 impl ScriptRunActionsGql {

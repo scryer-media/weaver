@@ -205,8 +205,8 @@ fn bind_budget_for_tx(tx: &SqlTx<'_>) -> usize {
     }
 }
 
-/// Maximum number of id binds per `IN (…)` chunk, leaving room for `fixed_binds`
-/// non-id parameters that every chunk carries (e.g. a `target_kind`).
+// Maximum number of id binds per `IN (…)` chunk, leaving room for `fixed_binds`
+// non-id parameters that every chunk carries (e.g. a `target_kind`).
 fn id_chunk_size(bind_budget: usize, fixed_binds: usize) -> usize {
     bind_budget.saturating_sub(fixed_binds).max(1)
 }
@@ -324,14 +324,14 @@ async fn insert_history_delete_operation_tx(
     Ok(operation_id)
 }
 
-/// Insert one `async_operation_targets` row per id using multi-row `VALUES`
-/// chunks (instead of one `INSERT` statement per id).
-///
-/// `sort_order` is the id's index in `ids`, preserving the exact ordering
-/// semantics of the previous per-statement loop. `error_message` is always
-/// `NULL` for a freshly queued target. Rows bind 6 parameters each
-/// (operation_id, target_kind, target_id, state, error_message, sort_order), so
-/// chunks stay under the dialect bind budget.
+// Insert one `async_operation_targets` row per id using multi-row `VALUES`
+// chunks (instead of one `INSERT` statement per id).
+//
+// `sort_order` is the id's index in `ids`, preserving the exact ordering
+// semantics of the previous per-statement loop. `error_message` is always
+// `NULL` for a freshly queued target. Rows bind 6 parameters each
+// (operation_id, target_kind, target_id, state, error_message, sort_order), so
+// chunks stay under the dialect bind budget.
 async fn bulk_insert_history_delete_targets_tx(
     tx: &mut SqlTx<'_>,
     operation_id: u64,

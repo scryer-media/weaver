@@ -3,8 +3,8 @@ use super::pressure::{CheckpointAdmission, CheckpointLease};
 use super::*;
 use crate::operations::metrics::SchedulerBlockClause;
 
-/// The clauses that refused a job's articles during one scan, so the
-/// scheduler can say what kept a blocked job from the asking server.
+// The clauses that refused a job's articles during one scan, so the
+// scheduler can say what kept a blocked job from the asking server.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(in crate::pipeline::download) struct BlockedBy(u16);
 
@@ -26,18 +26,18 @@ impl BlockedBy {
     }
 }
 
-/// One sampled answer to "may this server fetch this article of this job?",
-/// reusable across a whole queue scan and across every article of one
-/// handout. Built by [`Pipeline::servable_work_filter`], which is the only
-/// place the clauses are written down; [`ServableWorkFilter::note_taken`]
-/// charges each article the handout takes to the byte-budget clauses.
+// One sampled answer to "may this server fetch this article of this job?",
+// reusable across a whole queue scan and across every article of one
+// handout. Built by [`Pipeline::servable_work_filter`], which is the only
+// place the clauses are written down; [`ServableWorkFilter::note_taken`]
+// charges each article the handout takes to the byte-budget clauses.
 pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     server_idx: usize,
-    /// Set when `server_idx` is a backfill server: the fill servers that are
-    /// available right now. A backfill server only takes an article every one
-    /// of those cannot fetch — by the job's retention, the article's own
-    /// exclusions, or its rotation hint — which is what keeps backfill traffic
-    /// to what the fill tier has already given up on.
+    // Set when `server_idx` is a backfill server: the fill servers that are
+    // available right now. A backfill server only takes an article every one
+    // of those cannot fetch — by the job's retention, the article's own
+    // exclusions, or its rotation hint — which is what keeps backfill traffic
+    // to what the fill tier has already given up on.
     fill_servers: Option<Vec<usize>>,
     retention_excludes: Arc<Vec<usize>>,
     bootstrap_files: Option<&'a [u32]>,
@@ -45,28 +45,28 @@ pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     direct_admission: Vec<DirectStoreAdmission>,
     sweep_held: Option<Vec<u32>>,
     checkpoint: CheckpointAdmission,
-    /// What the handout being built has taken, as the checkpoint weighs it.
+    // What the handout being built has taken, as the checkpoint weighs it.
     leased: CheckpointLease,
-    /// Set when at least one article was refused *only* by the restart
-    /// checkpoint, so a caller that came away empty can tell "held for the
-    /// checkpoint" from "nothing here for this server" and schedule the
-    /// recheck the checkpoint needs.
+    // Set when at least one article was refused *only* by the restart
+    // checkpoint, so a caller that came away empty can tell "held for the
+    // checkpoint" from "nothing here for this server" and schedule the
+    // recheck the checkpoint needs.
     checkpoint_blocked: std::cell::Cell<bool>,
-    /// Articles refused so far, and the clauses that refused them; counters
-    /// only, never consulted by the answer.
+    // Articles refused so far, and the clauses that refused them; counters
+    // only, never consulted by the answer.
     skipped: std::cell::Cell<u64>,
     refused_by: std::cell::Cell<BlockedBy>,
 }
 
-/// What [`Pipeline::servable_work_filter`] found for one job and one server.
+// What [`Pipeline::servable_work_filter`] found for one job and one server.
 pub(in crate::pipeline::download) enum ServableWork<'a> {
-    /// Retention rules this server out for the whole job.
+    // Retention rules this server out for the whole job.
     RetentionExcluded,
-    /// Every queued file is refused by a clause decided per file, so no
-    /// article can pass and there is nothing to scan. Carries the clauses
-    /// that refused them.
+    // Every queued file is refused by a clause decided per file, so no
+    // article can pass and there is nothing to scan. Carries the clauses
+    // that refused them.
     NoQueuedFilePasses(BlockedBy),
-    /// Some article may pass; scan the queue with this filter.
+    // Some article may pass; scan the queue with this filter.
     Scan(ServableWorkFilter<'a>),
 }
 
@@ -80,9 +80,9 @@ impl ServableWorkFilter<'_> {
         false
     }
 
-    /// The first clause that refuses `work`, in a fixed order; the restart
-    /// checkpoint is asked last and only of an article every other clause
-    /// admits.
+    // The first clause that refuses `work`, in a fixed order; the restart
+    // checkpoint is asked last and only of an article every other clause
+    // admits.
     fn refusal(&self, work: &DownloadWork) -> Option<SchedulerBlockClause> {
         let file_index = work.segment_id.file_id.file_index;
         if !self.direct_admission.iter().all(|set| set.allows(work)) {
@@ -136,20 +136,20 @@ impl ServableWorkFilter<'_> {
         self.checkpoint_blocked.get()
     }
 
-    /// Articles this filter has refused, over every scan it drove.
+    // Articles this filter has refused, over every scan it drove.
     pub(in crate::pipeline::download) fn skipped(&self) -> u64 {
         self.skipped.get()
     }
 
-    /// The clauses that refused them.
+    // The clauses that refused them.
     pub(in crate::pipeline::download) fn refused_by(&self) -> BlockedBy {
         self.refused_by.get()
     }
 
-    /// Charge an article the handout has just taken, so every later article
-    /// of the same handout is admitted against the lease as it now stands:
-    /// the per-set disk budgets and header probes, and the restart
-    /// checkpoint's projected lead.
+    // Charge an article the handout has just taken, so every later article
+    // of the same handout is admitted against the lease as it now stands:
+    // the per-set disk budgets and header probes, and the restart
+    // checkpoint's projected lead.
     pub(in crate::pipeline::download) fn note_taken(&mut self, work: &DownloadWork) {
         for set in &mut self.direct_admission {
             set.note_leased(work);
@@ -181,12 +181,12 @@ impl Pipeline {
         Ok(Some(work))
     }
 
-    /// Hold payload work only while declared PAR2 indexes are unresolved.
-    ///
-    /// Checkpoint cuts are fixed when a batch is leased, so an index already
-    /// present in the primary queue must publish its grid first. Indexless
-    /// recovery discovery stays completion-bounded instead of turning every
-    /// optional volume into a pre-download barrier.
+    // Hold payload work only while declared PAR2 indexes are unresolved.
+    //
+    // Checkpoint cuts are fixed when a batch is leased, so an index already
+    // present in the primary queue must publish its grid first. Indexless
+    // recovery discovery stays completion-bounded instead of turning every
+    // optional volume into a pre-download barrier.
     pub(in crate::pipeline::download) fn par2_metadata_bootstrap_files(
         &mut self,
         job_id: JobId,
@@ -226,7 +226,7 @@ impl Pipeline {
         }
     }
 
-    /// While bootstrap is active, lease only tracked explicit-index work.
+    // While bootstrap is active, lease only tracked explicit-index work.
     pub(in crate::pipeline::download) fn par2_metadata_bootstrap_claims_work(
         &mut self,
         job_id: JobId,
@@ -263,32 +263,32 @@ impl Pipeline {
         };
     }
 
-    /// The single definition of "this server may fetch this queued article
-    /// right now", for one job.
-    ///
-    /// Both selection paths ask the same question, and they must not be able
-    /// to answer it differently: one of them pops work onto a live connection
-    /// and the other decides whether a connection should be given work at
-    /// all, so a drift between them shows up as either an idle link or an
-    /// article handed to a server that cannot serve it. Everything the answer
-    /// depends on — retention, per-set disk admission, a demotion sweep's
-    /// held files, the restart checkpoint, the PAR2 index bootstrap, the UU
-    /// spool cursor, the work's own exclusions and rotation hint — is sampled
-    /// once here, so a whole handout costs one sample rather than one per
-    /// article.
-    ///
-    /// Before the queue is scanned, the clauses that can refuse a whole file
-    /// are put to every queued file at once (see
-    /// [`Self::queued_file_may_pass`]); when none passes, the answer is
-    /// [`ServableWork::NoQueuedFilePasses`] and no scan is owed. Only the
-    /// per-set header-probe peeks run ahead of that answer, because a file
-    /// holding a probe is never refused by its set's budget.
-    ///
-    /// The filter starts from an empty lease. A caller cutting a batch passes
-    /// each article it takes to [`ServableWorkFilter::note_taken`], so the
-    /// byte-budget clauses (per-set disk admission and the restart
-    /// checkpoint's undurable lead) see the batch's own projection rather
-    /// than only what the actor has already committed.
+    // The single definition of "this server may fetch this queued article
+    // right now", for one job.
+    //
+    // Both selection paths ask the same question, and they must not be able
+    // to answer it differently: one of them pops work onto a live connection
+    // and the other decides whether a connection should be given work at
+    // all, so a drift between them shows up as either an idle link or an
+    // article handed to a server that cannot serve it. Everything the answer
+    // depends on — retention, per-set disk admission, a demotion sweep's
+    // held files, the restart checkpoint, the PAR2 index bootstrap, the UU
+    // spool cursor, the work's own exclusions and rotation hint — is sampled
+    // once here, so a whole handout costs one sample rather than one per
+    // article.
+    //
+    // Before the queue is scanned, the clauses that can refuse a whole file
+    // are put to every queued file at once (see
+    // [`Self::queued_file_may_pass`]); when none passes, the answer is
+    // [`ServableWork::NoQueuedFilePasses`] and no scan is owed. Only the
+    // per-set header-probe peeks run ahead of that answer, because a file
+    // holding a probe is never refused by its set's budget.
+    //
+    // The filter starts from an empty lease. A caller cutting a batch passes
+    // each article it takes to [`ServableWorkFilter::note_taken`], so the
+    // byte-budget clauses (per-set disk admission and the restart
+    // checkpoint's undurable lead) see the batch's own projection rather
+    // than only what the actor has already committed.
     pub(in crate::pipeline::download) fn servable_work_filter<'a>(
         &mut self,
         job_id: JobId,
@@ -326,23 +326,23 @@ impl Pipeline {
         })
     }
 
-    /// Whether any queued file of the job could get an article past the
-    /// clauses that refuse whole files — a direct-store set's disk budget, a
-    /// demotion sweep's holds and the PAR2 index bootstrap — answered from
-    /// the queue's per-file counts and smallest queued estimates in
-    /// O(files · sets), without looking at an article.
-    ///
-    /// Only an `Err` is acted on, so this may answer `Ok` freely and must
-    /// never answer `Err` while some article would pass. The `Err` names the
-    /// clauses that refused the queued files. A set's budget refuses a file
-    /// only when even the file's smallest queued article does not fit and no
-    /// probe of the set lies in that file
-    /// (see [`DirectStoreAdmission::may_admit_from_file`]). The other clauses
-    /// cannot refuse a whole file this way: the UU cursor admits the article
-    /// at its ordinal; exclusions, rotation hints and the backfill gate are
-    /// per article; and the checkpoint's refusals must be observed article by
-    /// article for the recheck it owes. Retention is decided for the whole
-    /// job before this is asked.
+    // Whether any queued file of the job could get an article past the
+    // clauses that refuse whole files — a direct-store set's disk budget, a
+    // demotion sweep's holds and the PAR2 index bootstrap — answered from
+    // the queue's per-file counts and smallest queued estimates in
+    // O(files · sets), without looking at an article.
+    //
+    // Only an `Err` is acted on, so this may answer `Ok` freely and must
+    // never answer `Err` while some article would pass. The `Err` names the
+    // clauses that refused the queued files. A set's budget refuses a file
+    // only when even the file's smallest queued article does not fit and no
+    // probe of the set lies in that file
+    // (see [`DirectStoreAdmission::may_admit_from_file`]). The other clauses
+    // cannot refuse a whole file this way: the UU cursor admits the article
+    // at its ordinal; exclusions, rotation hints and the backfill gate are
+    // per article; and the checkpoint's refusals must be observed article by
+    // article for the recheck it owes. Retention is decided for the whole
+    // job before this is asked.
     fn queued_file_may_pass(
         &self,
         job_id: JobId,
@@ -390,9 +390,9 @@ impl Pipeline {
         Err(blocked)
     }
 
-    /// The fill servers a backfill server must see exhausted before it takes
-    /// an article; `None` for a fill server, and for a backfill server once
-    /// the pool has already unlocked the backfill tier for everyone.
+    // The fill servers a backfill server must see exhausted before it takes
+    // an article; `None` for a fill server, and for a backfill server once
+    // the pool has already unlocked the backfill tier for everyone.
     fn backfill_fill_gate(&self, server_idx: usize) -> Option<Vec<usize>> {
         let flags = self.nntp.pool().server_backfill_flags();
         if !flags.get(server_idx).copied().unwrap_or(false) {
@@ -413,10 +413,10 @@ impl Pipeline {
         }
     }
 
-    /// The UU spool cursors a selection pass must respect, sampled once.
-    ///
-    /// Only a capped spool constrains selection; below the cap every encoding
-    /// dispatches freely and the map is not worth building.
+    // The UU spool cursors a selection pass must respect, sampled once.
+    //
+    // Only a capped spool constrains selection; below the cap every encoding
+    // dispatches freely and the map is not worth building.
     pub(in crate::pipeline::download) fn selection_uu_cursor_ordinals(
         &self,
         pressure: DownloadPressure,

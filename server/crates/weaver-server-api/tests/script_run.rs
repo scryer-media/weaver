@@ -9,8 +9,8 @@ use weaver_server_core::post_processing::directives::{Directive, DupeMode, Scrip
 use weaver_server_core::post_processing::model::{QueueEvent, ScriptEventLabel};
 use weaver_server_core::post_processing::runner::RunIdentity;
 
-/// A run as the server opens one, with the test standing where the script's
-/// output is read: whatever the script asks for arrives at what this returns.
+// A run as the server opens one, with the test standing where the script's
+// output is read: whatever the script asks for arrives at what this returns.
 fn open(
     harness: &TestHarness,
     run_id: &str,
@@ -38,7 +38,7 @@ fn open_run(
         .open_script_run(&mut identity, job_id, &event, None, test)
 }
 
-/// Ask as the script of run `run_id` would, with the token it was handed.
+// Ask as the script of run `run_id` would, with the token it was handed.
 async fn as_run(harness: &TestHarness, run_id: &str, query: &str) -> Response {
     harness
         .schema
@@ -50,7 +50,7 @@ async fn as_run(harness: &TestHarness, run_id: &str, query: &str) -> Response {
         .await
 }
 
-/// Take the next `count` things the script asks for and agree to each.
+// Take the next `count` things the script asks for and agree to each.
 async fn agree(requests: &mut RunRequests, count: usize) -> Vec<RunAction> {
     let mut taken = Vec::new();
     for _ in 0..count {
@@ -61,7 +61,7 @@ async fn agree(requests: &mut RunRequests, count: usize) -> Vec<RunAction> {
     taken
 }
 
-/// The one error a refused request came back with, as its code and message.
+// The one error a refused request came back with, as its code and message.
 fn refused(response: &Response) -> (String, String) {
     assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
     let error = serde_json::to_value(&response.errors[0]).unwrap();

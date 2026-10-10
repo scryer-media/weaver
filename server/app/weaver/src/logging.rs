@@ -1,8 +1,8 @@
-//! Log format, colour, timestamp and default-level resolution for the service
-//! subscriber.
-//!
-//! The resolution rules live here, apart from subscriber construction, so they
-//! can be unit-tested without installing a global subscriber.
+// Log format, colour, timestamp and default-level resolution for the service
+// subscriber.
+//
+// The resolution rules live here, apart from subscriber construction, so they
+// can be unit-tested without installing a global subscriber.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -13,12 +13,12 @@ use chrono::{DateTime, Local, SecondsFormat, TimeZone};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 
-/// Renders a log timestamp as RFC 3339 in the zone of `now`.
-///
-/// Weaver emits log timestamps in the host's local zone so that operators who
-/// set `TZ` (for example through Docker) see wall-clock times that match their
-/// other services. The offset is always written explicitly (`Z` for UTC,
-/// otherwise `+HH:MM`/`-HH:MM`) so the string stays machine-parseable.
+// Renders a log timestamp as RFC 3339 in the zone of `now`.
+//
+// Weaver emits log timestamps in the host's local zone so that operators who
+// set `TZ` (for example through Docker) see wall-clock times that match their
+// other services. The offset is always written explicitly (`Z` for UTC,
+// otherwise `+HH:MM`/`-HH:MM`) so the string stays machine-parseable.
 fn render_timestamp<Tz>(now: DateTime<Tz>, precision: SecondsFormat) -> String
 where
     Tz: TimeZone,
@@ -27,8 +27,8 @@ where
     now.to_rfc3339_opts(precision, true)
 }
 
-/// Timer for `tracing_subscriber` layers that prints the host's local
-/// wall-clock time (honouring `TZ`) instead of the UTC default.
+// Timer for `tracing_subscriber` layers that prints the host's local
+// wall-clock time (honouring `TZ`) instead of the UTC default.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LocalTimer;
 
@@ -38,16 +38,16 @@ impl FormatTime for LocalTimer {
     }
 }
 
-/// Environment variable selecting the stdout/log-file record format.
+// Environment variable selecting the stdout/log-file record format.
 pub(crate) const LOG_FORMAT_ENV: &str = "WEAVER_LOG_FORMAT";
-/// Environment variable selecting stdout colouring.
+// Environment variable selecting stdout colouring.
 pub(crate) const LOG_COLOR_ENV: &str = "WEAVER_LOG_COLOR";
 
-/// Record format for the stdout and log-file layers.
-///
-/// The in-memory ring buffer that backs the web log viewer is deliberately not
-/// covered: the viewer parses the human-readable `tracing` line format, so that
-/// layer keeps its format regardless of what stdout is doing.
+// Record format for the stdout and log-file layers.
+//
+// The in-memory ring buffer that backs the web log viewer is deliberately not
+// covered: the viewer parses the human-readable `tracing` line format, so that
+// layer keeps its format regardless of what stdout is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum LogFormat {
     #[default]
@@ -64,9 +64,9 @@ impl LogFormat {
         }
     }
 
-    /// Resolve the format from the CLI flag, then the environment, then the
-    /// default. An unrecognised value falls back to text rather than aborting
-    /// startup: a mistyped log format must never keep the service down.
+    // Resolve the format from the CLI flag, then the environment, then the
+    // default. An unrecognised value falls back to text rather than aborting
+    // startup: a mistyped log format must never keep the service down.
     pub(crate) fn resolve(cli: Option<&str>, env: Option<&OsString>) -> Self {
         if let Some(value) = cli
             && let Some(format) = Self::parse(value)
@@ -81,19 +81,19 @@ impl LogFormat {
 
 static CONSOLE_FORMAT: OnceLock<LogFormat> = OnceLock::new();
 
-/// Records the format the console layers were built with, so output written
-/// outside tracing can match it.
+// Records the format the console layers were built with, so output written
+// outside tracing can match it.
 pub(crate) fn set_console_format(format: LogFormat) {
     let _ = CONSOLE_FORMAT.set(format);
 }
 
-/// What to tell the operator next to a setup code.
+// What to tell the operator next to a setup code.
 const SETUP_CODE_INSTRUCTIONS: &str = "Open Weaver in your browser and enter this code to create the administrator account. It works until setup finishes or Weaver restarts.";
 
-/// Prints the first-run setup code to stderr, in the console's log format.
-///
-/// The code goes around tracing on purpose: tracing also feeds the in-app log
-/// viewer and the log file, and neither should hold a live credential.
+// Prints the first-run setup code to stderr, in the console's log format.
+//
+// The code goes around tracing on purpose: tracing also feeds the in-app log
+// viewer and the log file, and neither should hold a live credential.
 pub(crate) fn announce_setup_code(code: &str) {
     let format = CONSOLE_FORMAT.get().copied().unwrap_or_default();
     let timestamp = render_timestamp(Local::now(), SecondsFormat::Micros);
@@ -103,9 +103,9 @@ pub(crate) fn announce_setup_code(code: &str) {
     let _ = stderr.flush();
 }
 
-/// The setup code announcement: a banner a person can't scroll past in text
-/// mode, one record shaped like the rest of the log in JSON mode. Both carry
-/// `SETUP_CODE_MARKER` directly before the code, which launchers look for.
+// The setup code announcement: a banner a person can't scroll past in text
+// mode, one record shaped like the rest of the log in JSON mode. Both carry
+// `SETUP_CODE_MARKER` directly before the code, which launchers look for.
 fn setup_code_announcement(code: &str, format: LogFormat, timestamp: &str) -> String {
     use weaver_server_core::auth::SETUP_CODE_MARKER;
 
@@ -164,7 +164,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Colour policy for the stdout layer.
+// Colour policy for the stdout layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum LogColor {
     #[default]
@@ -189,13 +189,13 @@ impl LogColor {
             .unwrap_or_default()
     }
 
-    /// Whether stdout should be coloured.
-    ///
-    /// `NO_COLOR` (any value, per the informal convention) forces colour off
-    /// unless the operator asked for `always` explicitly. `auto` colours only
-    /// when stdout is a terminal, so piping to a file or a log collector no
-    /// longer embeds escape sequences — which is what it did unconditionally
-    /// before.
+    // Whether stdout should be coloured.
+    //
+    // `NO_COLOR` (any value, per the informal convention) forces colour off
+    // unless the operator asked for `always` explicitly. `auto` colours only
+    // when stdout is a terminal, so piping to a file or a log collector no
+    // longer embeds escape sequences — which is what it did unconditionally
+    // before.
     pub(crate) fn should_colour(self, stdout_is_terminal: bool, no_color_set: bool) -> bool {
         match self {
             Self::Always => true,
@@ -339,10 +339,10 @@ mod tests {
         );
     }
 
-    /// Locks the contract between the ring-buffer line format and the web log
-    /// viewer's parser: the viewer splits a leading RFC 3339 timestamp off each
-    /// line, so an emitted line must still start with one once the timer moved
-    /// off UTC.
+    // Locks the contract between the ring-buffer line format and the web log
+    // viewer's parser: the viewer splits a leading RFC 3339 timestamp off each
+    // line, so an emitted line must still start with one once the timer moved
+    // off UTC.
     #[test]
     fn emitted_lines_start_with_a_parseable_timestamp_then_the_level() {
         use std::io::Write;

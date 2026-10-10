@@ -685,11 +685,11 @@ async fn new_backup_requires_a_nonblank_password() {
     ));
 }
 
-/// The SQLite export reads through one read-only snapshot transaction on the
-/// live WAL database instead of a `VACUUM INTO` copy. This pins the property
-/// that decision relies on: rows committed while the export is running must
-/// not appear partially, so every exported `job_events` row still references
-/// an exported `job_history` job.
+// The SQLite export reads through one read-only snapshot transaction on the
+// live WAL database instead of a `VACUUM INTO` copy. This pins the property
+// that decision relies on: rows committed while the export is running must
+// not appear partially, so every exported `job_events` row still references
+// an exported `job_history` job.
 #[tokio::test]
 async fn sqlite_export_snapshot_stays_closed_while_history_grows_concurrently() {
     use std::sync::atomic::{AtomicBool, Ordering};

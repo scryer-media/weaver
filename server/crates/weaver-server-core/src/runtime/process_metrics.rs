@@ -1,21 +1,21 @@
-//! Process-level resource sampling for the metrics endpoint.
-//!
-//! [`sample`] is called at scrape time only — never from a pipeline path — and
-//! is written to stay in the "cheap syscall / small `/proc` read" budget: no
-//! process spawning, no directory walks beyond counting `/proc/self/fd`, no
-//! external crates. Every field is optional: a platform that cannot answer a
-//! question cheaply reports `None` rather than a misleading zero.
+// Process-level resource sampling for the metrics endpoint.
+//
+// [`sample`] is called at scrape time only — never from a pipeline path — and
+// is written to stay in the "cheap syscall / small `/proc` read" budget: no
+// process spawning, no directory walks beyond counting `/proc/self/fd`, no
+// external crates. Every field is optional: a platform that cannot answer a
+// question cheaply reports `None` rather than a misleading zero.
 
 use crate::operations::instrumentation::ProcessMetricsSnapshot;
 
-/// Sample the current process's CPU, memory, descriptor and thread usage.
-///
-/// * Linux reads `/proc/self/{stat,statm,status,fd,limits}`.
-/// * macOS reads the task's own accounting through `proc_pidinfo`.
-/// * Other Unix platforms answer CPU through `getrusage` and leave the rest
-///   `None` (there is no portable cheap equivalent).
-/// * Windows answers CPU through `GetProcessTimes` and the working set through
-///   `GetProcessMemoryInfo`.
+// Sample the current process's CPU, memory, descriptor and thread usage.
+//
+// * Linux reads `/proc/self/{stat,statm,status,fd,limits}`.
+// * macOS reads the task's own accounting through `proc_pidinfo`.
+// * Other Unix platforms answer CPU through `getrusage` and leave the rest
+//   `None` (there is no portable cheap equivalent).
+// * Windows answers CPU through `GetProcessTimes` and the working set through
+//   `GetProcessMemoryInfo`.
 pub fn sample() -> ProcessMetricsSnapshot {
     #[allow(unused_mut)]
     let mut snapshot = ProcessMetricsSnapshot {
@@ -36,10 +36,10 @@ pub fn sample() -> ProcessMetricsSnapshot {
     snapshot
 }
 
-/// The resident set alone, for callers that only need the one number.
-///
-/// Separate from [`sample`] so a caller does not pay for the descriptor count
-/// and the `/proc` reads it is not going to look at.
+// The resident set alone, for callers that only need the one number.
+//
+// Separate from [`sample`] so a caller does not pay for the descriptor count
+// and the `/proc` reads it is not going to look at.
 pub fn resident_memory_bytes() -> Option<u64> {
     sample().resident_memory_bytes
 }
@@ -48,10 +48,10 @@ pub fn resident_memory_bytes() -> Option<u64> {
 mod macos {
     use super::ProcessMetricsSnapshot;
 
-    /// Resident and virtual size, plus the thread count, from one syscall.
-    ///
-    /// The fields are the kernel's own task accounting, which is what
-    /// Activity Monitor's "memory" column reports for the process.
+    // Resident and virtual size, plus the thread count, from one syscall.
+    //
+    // The fields are the kernel's own task accounting, which is what
+    // Activity Monitor's "memory" column reports for the process.
     pub(super) fn fill(snapshot: &mut ProcessMetricsSnapshot) {
         let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
@@ -86,8 +86,8 @@ mod windows {
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    /// The working set, which is what Task Manager and the support bundles
-    /// call this process's memory, plus the commit charge as the virtual size.
+    // The working set, which is what Task Manager and the support bundles
+    // call this process's memory, plus the commit charge as the virtual size.
     pub(super) fn fill(snapshot: &mut ProcessMetricsSnapshot) {
         let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
@@ -204,8 +204,8 @@ mod tests {
         assert!(snapshot.threads.unwrap_or(0) > 0);
     }
 
-    /// The memory question is the one the support bundles and the working-set
-    /// dashboards ask, so every platform weaver ships for must answer it.
+    // The memory question is the one the support bundles and the working-set
+    // dashboards ask, so every platform weaver ships for must answer it.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn resident_memory_is_readable_on_every_shipped_platform() {

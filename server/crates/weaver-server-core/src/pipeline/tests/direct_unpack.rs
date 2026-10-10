@@ -1,10 +1,10 @@
-//! Controller tests: what gets admitted, what gets refused, what a chase
-//! produces, and what ends one.
-//!
-//! These drive the real controller — the same `try_arm_direct_unpack_for_file`
-//! the download path calls when a part completes, and the same
-//! `direct_unpack_note_commit` the decode worker calls when bytes land — rather
-//! than reaching into its state.
+// Controller tests: what gets admitted, what gets refused, what a chase
+// produces, and what ends one.
+//
+// These drive the real controller — the same `try_arm_direct_unpack_for_file`
+// the download path calls when a part completes, and the same
+// `direct_unpack_note_commit` the decode worker calls when bytes land — rather
+// than reaching into its state.
 
 use std::path::PathBuf;
 
@@ -16,21 +16,21 @@ use crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime;
 mod repair_guards;
 mod staging;
 
-/// Turn the feature on for one pipeline, the way config would.
+// Turn the feature on for one pipeline, the way config would.
 fn enable_direct_unpack(pipeline: &mut Pipeline) {
     pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
         gate: DirectUnpackGate::Enabled,
     });
 }
 
-/// Turn the feature off for one pipeline, the way an operator opt-out would.
+// Turn the feature off for one pipeline, the way an operator opt-out would.
 fn disable_direct_unpack(pipeline: &mut Pipeline) {
     pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
         gate: DirectUnpackGate::Disabled,
     });
 }
 
-/// A well-formed 32-byte signature header declaring the given end header.
+// A well-formed 32-byte signature header declaring the given end header.
 fn signature_header(next_header_offset: u64, next_header_size: u64) -> [u8; 32] {
     let mut header = [0u8; 32];
     header[..6].copy_from_slice(&MAGIC);
@@ -42,9 +42,9 @@ fn signature_header(next_header_offset: u64, next_header_size: u64) -> [u8; 32] 
     header
 }
 
-/// Land a whole split set and run its chase to completion.
-///
-/// Returns the fixture files so a caller can corrupt or inspect them.
+// Land a whole split set and run its chase to completion.
+//
+// Returns the fixture files so a caller can corrupt or inspect them.
 async fn chase_a_complete_split_set(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -60,11 +60,11 @@ async fn chase_a_complete_split_set(
     files
 }
 
-/// Replace every part on disk with garbage.
-///
-/// The sentinel for "did conventional extraction run?": with the sources
-/// destroyed, only an installed chase can produce members, so a successful
-/// extraction proves the chase was consumed rather than the archive re-decoded.
+// Replace every part on disk with garbage.
+//
+// The sentinel for "did conventional extraction run?": with the sources
+// destroyed, only an installed chase can produce members, so a successful
+// extraction proves the chase was consumed rather than the archive re-decoded.
 fn destroy_parts(pipeline: &Pipeline, job_id: JobId, files: &[(String, Vec<u8>)]) {
     let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
     for (filename, bytes) in files {
@@ -72,13 +72,13 @@ fn destroy_parts(pipeline: &Pipeline, job_id: JobId, files: &[(String, Vec<u8>)]
     }
 }
 
-/// Mark a file complete without touching its bytes on disk.
-///
-/// [`write_and_complete_file`] rewrites the whole file, which truncates it
-/// first — harmless when nothing is reading, but a chase running against a
-/// drip-fed part would briefly see the file shrink out from under it. Real
-/// downloads only ever append, which is the invariant the gated reader is built
-/// on, so the drip test appends and then settles the bookkeeping here.
+// Mark a file complete without touching its bytes on disk.
+//
+// [`write_and_complete_file`] rewrites the whole file, which truncates it
+// first — harmless when nothing is reading, but a chase running against a
+// drip-fed part would briefly see the file shrink out from under it. Real
+// downloads only ever append, which is the invariant the gated reader is built
+// on, so the drip test appends and then settles the bookkeeping here.
 async fn complete_already_written_file(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -97,7 +97,7 @@ async fn complete_already_written_file(
         .await;
 }
 
-/// A single-file 7z job whose archive is `bytes`.
+// A single-file 7z job whose archive is `bytes`.
 async fn insert_single_7z_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -109,13 +109,13 @@ async fn insert_single_7z_job(
     files
 }
 
-/// Run the controller's reaper until `job_id`/`set` has an outcome.
-///
-/// The budget is deliberately generous. The chase is a real decode on a
-/// blocking thread, and this suite runs alongside the rest of the pipeline
-/// tests on a shared pool, so a tight deadline measures machine load rather
-/// than the controller. Panics with what the controller actually thinks rather
-/// than returning a bare bool, so a timeout says why.
+// Run the controller's reaper until `job_id`/`set` has an outcome.
+//
+// The budget is deliberately generous. The chase is a real decode on a
+// blocking thread, and this suite runs alongside the rest of the pipeline
+// tests on a shared pool, so a tight deadline measures machine load rather
+// than the controller. Panics with what the controller actually thinks rather
+// than returning a bare bool, so a timeout says why.
 async fn reap_until_outcome(pipeline: &mut Pipeline, job_id: JobId, set_name: &str) {
     for _ in 0..3_000 {
         pipeline.reap_direct_unpack().await;
@@ -385,11 +385,11 @@ async fn a_drip_fed_split_set_is_chased_to_byte_identical_members() {
     );
 }
 
-/// Under write-backlog pressure the decode path evicts parked segments to their
-/// true offsets, which leaves a sparse hole below the furthest byte written. A
-/// watermark seeded from the file's *length* would present that hole as
-/// committed and feed the decoder zeros; the seed must come from the contiguous
-/// progress floor instead.
+// Under write-backlog pressure the decode path evicts parked segments to their
+// true offsets, which leaves a sparse hole below the furthest byte written. A
+// watermark seeded from the file's *length* would present that hole as
+// committed and feed the decoder zeros; the seed must come from the contiguous
+// progress floor instead.
 #[tokio::test]
 async fn an_out_of_order_tail_does_not_inflate_the_seeded_watermark() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -526,12 +526,12 @@ async fn a_renamed_part_demotes_the_chase() {
     );
 }
 
-/// The genuine end of the road: parts that never arrived and never will.
-///
-/// It takes both passes. The lenient one deliberately holds its fire — at that
-/// moment it cannot tell a part whose commit is still in flight from one that
-/// has none — and the strict one, which runs from the completion check after
-/// decode has drained, is what ends the chase.
+// The genuine end of the road: parts that never arrived and never will.
+//
+// It takes both passes. The lenient one deliberately holds its fire — at that
+// moment it cannot tell a part whose commit is still in flight from one that
+// has none — and the strict one, which runs from the completion check after
+// decode has drained, is what ends the chase.
 #[tokio::test]
 async fn a_download_that_ends_with_a_part_missing_aborts_the_chase_at_the_strict_pass() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -855,10 +855,10 @@ async fn a_repair_rewrite_mid_chase_taints_the_running_chase() {
 // Tail prefetch
 // ---------------------------------------------------------------------------
 
-/// The chase cannot list an archive until the end header — the last bytes of
-/// the last part — is on disk, so those segments join the head wave at queue
-/// birth. Planned at birth rather than reprioritized later because a
-/// reprioritization only reaches work still queued.
+// The chase cannot list an archive until the end header — the last bytes of
+// the last part — is on disk, so those segments join the head wave at queue
+// birth. Planned at birth rather than reprioritized later because a
+// reprioritization only reaches work still queued.
 #[tokio::test]
 async fn a_7z_split_set_boosts_both_ends_of_every_part_at_queue_birth() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -928,10 +928,10 @@ async fn a_7z_split_set_boosts_both_ends_of_every_part_at_queue_birth() {
     }
 }
 
-/// Extraction can reach a set whose chase has not been reaped yet. Every part
-/// is complete by then, so the chase is finishing at disk speed and awaiting it
-/// is cheaper than decoding the archive again — but it must be awaited inside
-/// the extraction task, never on the orchestrator loop.
+// Extraction can reach a set whose chase has not been reaped yet. Every part
+// is complete by then, so the chase is finishing at disk speed and awaiting it
+// is cheaper than decoding the archive again — but it must be awaited inside
+// the extraction task, never on the orchestrator loop.
 #[tokio::test]
 async fn a_chase_still_running_at_extraction_is_awaited_and_installed() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -980,12 +980,12 @@ async fn a_chase_still_running_at_extraction_is_awaited_and_installed() {
     );
 }
 
-/// Stage 2 of the tail prefetch: at arming, the segments covering the end of
-/// the archive are pulled forward even when they are not a part's *last*
-/// segment, which is all the birth-time boost can reach.
-///
-/// The distinguishing assertion is the second-to-last segment of the last part:
-/// birth-time never touches it, and the tail window does.
+// Stage 2 of the tail prefetch: at arming, the segments covering the end of
+// the archive are pulled forward even when they are not a part's *last*
+// segment, which is all the birth-time boost can reach.
+//
+// The distinguishing assertion is the second-to-last segment of the last part:
+// birth-time never touches it, and the tail window does.
 #[tokio::test]
 async fn arming_pulls_the_tail_window_forward_in_a_deep_queue() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1110,9 +1110,9 @@ async fn arming_pulls_the_tail_window_forward_in_a_deep_queue() {
 // Single-file .7z early arming
 // ---------------------------------------------------------------------------
 
-/// A bare `.7z` is a one-part set, so it has no order to discover and no reason
-/// to wait for a topology. It arms as soon as its signature header is on disk —
-/// 32 bytes — which is the whole overlap an unsplit archive can win.
+// A bare `.7z` is a one-part set, so it has no order to discover and no reason
+// to wait for a topology. It arms as soon as its signature header is on disk —
+// 32 bytes — which is the whole overlap an unsplit archive can win.
 #[tokio::test]
 async fn a_single_7z_arms_from_its_first_32_bytes() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1168,9 +1168,9 @@ async fn a_single_7z_arms_from_its_first_32_bytes() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// The header's declared total is taken on trust while the file is still
-/// arriving. Completion is when it gets checked, and a file that settles at a
-/// different length is not the archive the header described.
+// The header's declared total is taken on trust while the file is still
+// arriving. Completion is when it gets checked, and a file that settles at a
+// different length is not the archive the header described.
 #[tokio::test]
 async fn a_single_7z_whose_length_contradicts_its_header_aborts() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1216,9 +1216,9 @@ async fn a_single_7z_whose_length_contradicts_its_header_aborts() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// The commit hook is on the download's hot path, so a job that carries no
-/// unsplit 7z must leave it costing one `is_empty` and nothing else — no
-/// registration, no lookup, no arming attempt.
+// The commit hook is on the download's hot path, so a job that carries no
+// unsplit 7z must leave it costing one `is_empty` and nothing else — no
+// registration, no lookup, no arming attempt.
 #[tokio::test]
 async fn a_job_without_a_single_7z_registers_no_arming_candidates() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1248,14 +1248,14 @@ async fn a_job_without_a_single_7z_registers_no_arming_candidates() {
     );
 }
 
-/// The repair-time decision is allowed to spare a chase only when the recovery
-/// set positively vouches for every byte it consumed. With no binding and no
-/// grid verdicts — which is the state of any set the recovery data does not
-/// describe — nothing is vouched, and the behaviour must be exactly the taint
-/// it was before repair-resume existed.
-///
-/// This is the guard on the fallback. Everything above it is an optimisation;
-/// this is the thing that must not regress.
+// The repair-time decision is allowed to spare a chase only when the recovery
+// set positively vouches for every byte it consumed. With no binding and no
+// grid verdicts — which is the state of any set the recovery data does not
+// describe — nothing is vouched, and the behaviour must be exactly the taint
+// it was before repair-resume existed.
+//
+// This is the guard on the fallback. Everything above it is an optimisation;
+// this is the thing that must not regress.
 #[tokio::test]
 async fn a_repair_over_an_unvouched_chase_taints_exactly_as_before() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1315,8 +1315,8 @@ async fn a_repair_over_an_unvouched_chase_taints_exactly_as_before() {
     }
 }
 
-/// A repair that fails leaves nothing to lift the damage caps, so the sets it
-/// was allowed to run underneath have to be ended rather than left parked.
+// A repair that fails leaves nothing to lift the damage caps, so the sets it
+// was allowed to run underneath have to be ended rather than left parked.
 #[tokio::test]
 async fn a_failed_repair_releases_the_chases_it_was_parked_over() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1372,9 +1372,9 @@ async fn a_failed_repair_releases_the_chases_it_was_parked_over() {
     }
 }
 
-/// The seam every exit from the repairer funnels through. A parked chase is
-/// waiting on a frontier only this call advances, so both directions matter —
-/// and so does the analysis case, which parks nothing and must release nothing.
+// The seam every exit from the repairer funnels through. A parked chase is
+// waiting on a frontier only this call advances, so both directions matter —
+// and so does the analysis case, which parks nothing and must release nothing.
 #[tokio::test]
 async fn the_repair_settle_seam_releases_on_success_and_ends_on_failure() {
     async fn armed_and_parked(
@@ -1437,20 +1437,20 @@ async fn the_repair_settle_seam_releases_on_success_and_ends_on_failure() {
     }
 }
 
-/// What the `direct-unpack-repair` e2e failure actually measured.
-///
-/// The chase does not read a byte at a time: it reads through a 128 KiB
-/// `BufReader`, and the 7z decoder's first move is a probe at the *end* of the
-/// archive for the header. So within microseconds of arming, the consumed
-/// high-water is 128 KiB into the first part and the whole of the last one —
-/// long before any part has completed and therefore long before any damage cap
-/// exists to hold it back.
-///
-/// That is not a bug in the accounting: consumed-includes-readahead only ever
-/// over-demands vouching, which is the safe direction. It does mean a chase can
-/// consume bytes that a later verdict calls damaged, and such a chase can never
-/// vouch itself. This test pins the measurement rather than a wish, so the
-/// number is on the record when the semantics are revisited.
+// What the `direct-unpack-repair` e2e failure actually measured.
+//
+// The chase does not read a byte at a time: it reads through a 128 KiB
+// `BufReader`, and the 7z decoder's first move is a probe at the *end* of the
+// archive for the header. So within microseconds of arming, the consumed
+// high-water is 128 KiB into the first part and the whole of the last one —
+// long before any part has completed and therefore long before any damage cap
+// exists to hold it back.
+//
+// That is not a bug in the accounting: consumed-includes-readahead only ever
+// over-demands vouching, which is the safe direction. It does mean a chase can
+// consume bytes that a later verdict calls damaged, and such a chase can never
+// vouch itself. This test pins the measurement rather than a wish, so the
+// number is on the record when the semantics are revisited.
 #[tokio::test]
 async fn a_chase_consumes_readahead_and_the_archive_tail_within_microseconds() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1504,13 +1504,13 @@ async fn a_chase_consumes_readahead_and_the_archive_tail_within_microseconds() {
     );
 }
 
-/// Reproduces the e2e `direct-unpack-solid-split` failure: the set armed 22
-/// microseconds before the download-end settle ran, and the settle decided its
-/// parts were incomplete and killed it.
-///
-/// Deterministic by construction rather than by timing: every part is landed
-/// first, so arming happens with the whole set already on disk — exactly the
-/// state the racing arm found itself in — and then the settle runs.
+// Reproduces the e2e `direct-unpack-solid-split` failure: the set armed 22
+// microseconds before the download-end settle ran, and the settle decided its
+// parts were incomplete and killed it.
+//
+// Deterministic by construction rather than by timing: every part is landed
+// first, so arming happens with the whole set already on disk — exactly the
+// state the racing arm found itself in — and then the settle runs.
 #[tokio::test]
 async fn a_set_armed_after_its_download_ended_is_not_killed_by_the_settle() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1548,13 +1548,13 @@ async fn a_set_armed_after_its_download_ended_is_not_killed_by_the_settle() {
     );
 }
 
-/// A set that learned another part after it armed.
-///
-/// The coverage is sized at arming. When the set's parts later resolve to a
-/// different count — an obfuscated volume bound to the set after the chase
-/// started — the settle used to walk the new part list against the old
-/// coverage and address a part it never had. The chase has to stop instead,
-/// retryably, and leave the set to extraction.
+// A set that learned another part after it armed.
+//
+// The coverage is sized at arming. When the set's parts later resolve to a
+// different count — an obfuscated volume bound to the set after the chase
+// started — the settle used to walk the new part list against the old
+// coverage and address a part it never had. The chase has to stop instead,
+// retryably, and leave the set to extraction.
 #[tokio::test]
 async fn a_set_whose_parts_changed_after_arming_is_aborted_by_the_settle() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1599,17 +1599,17 @@ async fn a_set_whose_parts_changed_after_arming_is_aborted_by_the_settle() {
     assert_eq!(demoted, 1);
 }
 
-/// The panic, at the seam that caused it.
-///
-/// The download drains while a part's writes are still flushing, so the file on
-/// disk measures far short of what the part will actually be. The settle used to
-/// read that length and declare it — and the real completion commit, arriving
-/// moments later with the true and larger length, then had no truthful move
-/// left: it advanced a watermark past a declared length and tripped an assert
-/// that killed the whole pipeline task.
-///
-/// The settle must not look at the file at all. It leaves the part alone, the
-/// commit lands, and the part settles at its real length.
+// The panic, at the seam that caused it.
+//
+// The download drains while a part's writes are still flushing, so the file on
+// disk measures far short of what the part will actually be. The settle used to
+// read that length and declare it — and the real completion commit, arriving
+// moments later with the true and larger length, then had no truthful move
+// left: it advanced a watermark past a declared length and tripped an assert
+// that killed the whole pipeline task.
+//
+// The settle must not look at the file at all. It leaves the part alone, the
+// commit lands, and the part settles at its real length.
 #[tokio::test]
 async fn a_settle_that_races_a_flush_leaves_the_part_for_its_commit() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1675,9 +1675,9 @@ async fn a_settle_that_races_a_flush_leaves_the_part_for_its_commit() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// The `direct-unpack-solid-split` abort: the settle ran 1ms after arming, while
-/// a part's writes were still buffered and its file did not exist on disk at
-/// all. Nothing about that says the part is not coming.
+// The `direct-unpack-solid-split` abort: the settle ran 1ms after arming, while
+// a part's writes were still buffered and its file did not exist on disk at
+// all. Nothing about that says the part is not coming.
 #[tokio::test]
 async fn a_settle_before_a_parts_file_exists_does_not_end_the_chase() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1733,7 +1733,7 @@ async fn a_settle_before_a_parts_file_exists_does_not_end_the_chase() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// A successful repair outcome, for driving the settle seam directly.
+// A successful repair outcome, for driving the settle seam directly.
 fn repaired_outcome() -> par2_rs::Par2RepairOutcome {
     par2_rs::Par2RepairOutcome {
         status: par2_rs::Par2RepairStatus::Repaired,
@@ -1759,11 +1759,11 @@ fn repaired_outcome() -> par2_rs::Par2RepairOutcome {
     }
 }
 
-/// The starvation escape. A gated set whose claims never arrive — the
-/// straddled-slice geometry, where no block is ever independently claimed — is
-/// parked on evidence that does not exist. Once the repair has concluded there
-/// is nothing left in the system that could unpark it, so it must demote by
-/// name rather than hold a blocking thread for ever.
+// The starvation escape. A gated set whose claims never arrive — the
+// straddled-slice geometry, where no block is ever independently claimed — is
+// parked on evidence that does not exist. Once the repair has concluded there
+// is nothing left in the system that could unpark it, so it must demote by
+// name rather than hold a blocking thread for ever.
 #[tokio::test]
 async fn a_gated_chase_with_no_vouching_evidence_demotes_after_the_repair() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1827,15 +1827,15 @@ async fn a_gated_chase_with_no_vouching_evidence_demotes_after_the_repair() {
 // evidence the arithmetic runs on exists at all.
 // ---------------------------------------------------------------------------
 
-/// The block size the recovery sets in this section describe their files on.
+// The block size the recovery sets in this section describe their files on.
 const VOUCH_SLICE: u64 = 65_536;
 
-/// Offer one article per recovery-set block, through the same entry point the
-/// decode worker uses.
-///
-/// `plan` is the checkpoint geometry the decoder actually applied, which is the
-/// whole point: an article decoded before the PAR2 packets were parsed was cut
-/// on no grid at all, and no later knowledge can retroactively cut it.
+// Offer one article per recovery-set block, through the same entry point the
+// decode worker uses.
+//
+// `plan` is the checkpoint geometry the decoder actually applied, which is the
+// whole point: an article decoded before the PAR2 packets were parsed was cut
+// on no grid at all, and no later knowledge can retroactively cut it.
 fn feed_block_aligned_articles(
     pipeline: &mut Pipeline,
     file_id: NzbFileId,
@@ -1871,11 +1871,11 @@ fn feed_block_aligned_articles(
         .note_file_len(file_id, bytes.len() as u64);
 }
 
-/// Stand up a job whose 7z parts are described by a real recovery set, with the
-/// chase armed on part 0.
-///
-/// `plan_for_articles` decides whether the article evidence lands on the
-/// recovery set's grid or on no grid at all.
+// Stand up a job whose 7z parts are described by a real recovery set, with the
+// chase armed on part 0.
+//
+// `plan_for_articles` decides whether the article evidence lands on the
+// recovery set's grid or on no grid at all.
 async fn armed_chase_with_real_par2(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -1914,11 +1914,11 @@ async fn armed_chase_with_real_par2(
     files
 }
 
-/// The control: articles cut on the recovery set's own grid produce verdicts,
-/// the verdicts produce a vouched prefix, and a chase inside it survives repair.
-///
-/// This is the shape the vouching rule was designed against, and it has to hold
-/// before the failure below means anything.
+// The control: articles cut on the recovery set's own grid produce verdicts,
+// the verdicts produce a vouched prefix, and a chase inside it survives repair.
+//
+// This is the shape the vouching rule was designed against, and it has to hold
+// before the failure below means anything.
 #[tokio::test]
 async fn a_chase_inside_a_populated_grids_intact_prefix_is_vouched() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1969,19 +1969,19 @@ async fn a_chase_inside_a_populated_grids_intact_prefix_is_vouched() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// The round-8 failure, reproduced.
-///
-/// The recovery set binds the part and describes every one of its blocks. What
-/// is missing is the *grid*: these articles were decoded before the PAR2
-/// packets were parsed, so the decoder cut them on no checkpoint geometry, and
-/// `note_article_on_grids` will not retroactively claim them — doing so would
-/// imply cuts the decoder never made. `verdicts_against` therefore returns an
-/// empty map, the intact prefix walks to zero, and every byte the chase read is
-/// past it.
-///
-/// Locally the tiny `.par2` articles race the data volumes, so whichever data
-/// articles decode inside that window are grid-less for good — which is why the
-/// e2e failure was intermittent rather than reproducible.
+// The round-8 failure, reproduced.
+//
+// The recovery set binds the part and describes every one of its blocks. What
+// is missing is the *grid*: these articles were decoded before the PAR2
+// packets were parsed, so the decoder cut them on no checkpoint geometry, and
+// `note_article_on_grids` will not retroactively claim them — doing so would
+// imply cuts the decoder never made. `verdicts_against` therefore returns an
+// empty map, the intact prefix walks to zero, and every byte the chase read is
+// past it.
+//
+// Locally the tiny `.par2` articles race the data volumes, so whichever data
+// articles decode inside that window are grid-less for good — which is why the
+// e2e failure was intermittent rather than reproducible.
 #[tokio::test]
 async fn a_chase_over_a_part_whose_grid_never_formed_cannot_be_vouched() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2039,7 +2039,7 @@ async fn a_chase_over_a_part_whose_grid_never_formed_cannot_be_vouched() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// One analysis verdict per part, as the analysis pass would report it.
+// One analysis verdict per part, as the analysis pass would report it.
 fn analysis_verification(
     par2_set: &par2_rs::Par2FileSet,
     statuses: &[(&str, par2_rs::verify::FileStatus)],
@@ -2069,13 +2069,13 @@ fn analysis_verification(
     }
 }
 
-/// The fix for the failure above: a part with no grid claim falls back to the
-/// analysis pass's own file-level verdict.
-///
-/// `Complete` there is a full-MD5 match read from disk — strictly stronger than
-/// any run of CRC32 block claims — and a file the analysis found complete is not
-/// one the repair is going to write to. Same setup as the failing test, same
-/// missing grid; the only addition is the evidence the analysis already had.
+// The fix for the failure above: a part with no grid claim falls back to the
+// analysis pass's own file-level verdict.
+//
+// `Complete` there is a full-MD5 match read from disk — strictly stronger than
+// any run of CRC32 block claims — and a file the analysis found complete is not
+// one the repair is going to write to. Same setup as the failing test, same
+// missing grid; the only addition is the evidence the analysis already had.
 #[tokio::test]
 async fn a_part_with_no_grid_is_vouched_by_the_analysis_file_verdict() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2130,12 +2130,12 @@ async fn a_part_with_no_grid_is_vouched_by_the_analysis_file_verdict() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// The fallback must never vouch a file the repair intends to rewrite.
-///
-/// This is the whole safety condition. A damaged part with no grid claim looks
-/// exactly like a clean one to the in-stream evidence — both vouch for nothing —
-/// so if the fallback were keyed on anything looser than `Complete` it would
-/// hand a chase a file that is about to change underneath it.
+// The fallback must never vouch a file the repair intends to rewrite.
+//
+// This is the whole safety condition. A damaged part with no grid claim looks
+// exactly like a clean one to the in-stream evidence — both vouch for nothing —
+// so if the fallback were keyed on anything looser than `Complete` it would
+// hand a chase a file that is about to change underneath it.
 #[tokio::test]
 async fn the_analysis_fallback_refuses_a_part_the_repair_will_rewrite() {
     for damaged_status in [
@@ -2190,8 +2190,8 @@ async fn the_analysis_fallback_refuses_a_part_the_repair_will_rewrite() {
     }
 }
 
-/// A part the analysis never classified stays unvouched, and so does one whose
-/// analysis result is absent entirely.
+// A part the analysis never classified stays unvouched, and so does one whose
+// analysis result is absent entirely.
 #[tokio::test]
 async fn an_unclassified_part_is_not_vouched_by_the_fallback() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2245,8 +2245,8 @@ async fn an_unclassified_part_is_not_vouched_by_the_fallback() {
 // last topology-building event came before the last PAR2 registration.
 // ---------------------------------------------------------------------------
 
-/// A 7z split set whose parts are described by a real recovery set, with the
-/// topology built and the PAR2 runtime installed.
+// A 7z split set whose parts are described by a real recovery set, with the
+// topology built and the PAR2 runtime installed.
 async fn sevenz_job_with_par2_and_topology(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -2277,13 +2277,13 @@ fn has_topology(pipeline: &Pipeline, job_id: JobId, set_name: &str) -> bool {
         .is_some()
 }
 
-/// Applying PAR2 identity must not delete a 7z topology — not on the first
-/// application, and not on a second one that rebinds nothing at all.
-///
-/// The second call is the one that mattered in production: the stale-set
-/// bookkeeping ran above the "nothing changed, skip this file" check, so every
-/// registration swept sets no rebind had touched, with the rebind counter at
-/// zero and nothing logged.
+// Applying PAR2 identity must not delete a 7z topology — not on the first
+// application, and not on a second one that rebinds nothing at all.
+//
+// The second call is the one that mattered in production: the stale-set
+// bookkeeping ran above the "nothing changed, skip this file" check, so every
+// registration swept sets no rebind had touched, with the rebind counter at
+// zero and nothing logged.
 #[tokio::test]
 async fn applying_par2_identity_does_not_erase_a_7z_topology() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2317,14 +2317,14 @@ async fn applying_par2_identity_does_not_erase_a_7z_topology() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// The deterministic kill sequence, end to end.
-///
-/// Every data file completes — which is the last thing that would have rebuilt
-/// the topology — and only then does more recovery metadata register. In the
-/// gate run that ordering came from targeted recovery downloads arriving after
-/// the last data volume, and it killed both repair scenarios every time: the
-/// chase could no longer resolve its own part paths, so the repair decision
-/// refused with "no topology for set", 7 ms after the merge.
+// The deterministic kill sequence, end to end.
+//
+// Every data file completes — which is the last thing that would have rebuilt
+// the topology — and only then does more recovery metadata register. In the
+// gate run that ordering came from targeted recovery downloads arriving after
+// the last data volume, and it killed both repair scenarios every time: the
+// chase could no longer resolve its own part paths, so the repair decision
+// refused with "no topology for set", 7 ms after the merge.
 #[tokio::test]
 async fn a_late_par2_registration_leaves_the_chase_able_to_resolve_its_parts() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2370,7 +2370,7 @@ async fn a_late_par2_registration_leaves_the_chase_able_to_resolve_its_parts() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// Queue one piece of ordinary download work, so the job reads as still fetching.
+// Queue one piece of ordinary download work, so the job reads as still fetching.
 fn queue_download_work(pipeline: &mut Pipeline, job_id: JobId, message_id: &str) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     state.download_queue.push(DownloadWork {
@@ -2393,13 +2393,13 @@ fn queue_download_work(pipeline: &mut Pipeline, job_id: JobId, message_id: &str)
     });
 }
 
-/// A drained download *pass* is not a drained download.
-///
-/// `maybe_finish_download_pass` fires at every pass boundary, and a job with
-/// tens of megabytes still queued crosses several. Stamping "settled" there and
-/// then letting the next completion check act on the stamp is how two chases
-/// were ended 5 ms and 14 ms after arming, mid-download, with all their volumes
-/// still to come.
+// A drained download *pass* is not a drained download.
+//
+// `maybe_finish_download_pass` fires at every pass boundary, and a job with
+// tens of megabytes still queued crosses several. Stamping "settled" there and
+// then letting the next completion check act on the stamp is how two chases
+// were ended 5 ms and 14 ms after arming, mid-download, with all their volumes
+// still to come.
 #[tokio::test]
 async fn the_strict_settle_ignores_a_stamp_left_by_an_earlier_pass_boundary() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2434,8 +2434,8 @@ async fn the_strict_settle_ignores_a_stamp_left_by_an_earlier_pass_boundary() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// The 10127 shape: the set arms after an earlier pass boundary, and the rest of
-/// its parts arrive normally. Nothing here is an error, so nothing must die.
+// The 10127 shape: the set arms after an earlier pass boundary, and the rest of
+// its parts arrive normally. Nothing here is an error, so nothing must die.
 #[tokio::test]
 async fn a_set_armed_after_an_early_pass_boundary_survives_and_settles() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2487,17 +2487,17 @@ async fn a_set_armed_after_an_early_pass_boundary_survives_and_settles() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// A single-file 7z chase, driven all the way to an outcome.
-///
-/// This shape was untested: `a_single_7z_arms_from_its_first_32_bytes` proves
-/// the arming and stops there, and every other end-to-end chase test uses a
-/// split set. In the round-9 gate run every single-file 7z scenario timed out,
-/// and no chase of any shape ever logged a completion — so "does a single-file
-/// chase finish at all" had no answer in-process either way.
-///
-/// It drips the archive the way the download does — append, then publish the
-/// new watermark — and then completes the file, which is the only thing that
-/// tells the coverage the part is finished.
+// A single-file 7z chase, driven all the way to an outcome.
+//
+// This shape was untested: `a_single_7z_arms_from_its_first_32_bytes` proves
+// the arming and stops there, and every other end-to-end chase test uses a
+// split set. In the round-9 gate run every single-file 7z scenario timed out,
+// and no chase of any shape ever logged a completion — so "does a single-file
+// chase finish at all" had no answer in-process either way.
+//
+// It drips the archive the way the download does — append, then publish the
+// new watermark — and then completes the file, which is the only thing that
+// tells the coverage the part is finished.
 #[tokio::test]
 async fn a_single_7z_chase_runs_to_an_outcome() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2554,24 +2554,24 @@ async fn a_single_7z_chase_runs_to_an_outcome() {
     );
 }
 
-/// The round-9 wedge: a parked chase must not stop other jobs' extraction.
-///
-/// Both the chase and conventional 7z extraction reserve
-/// `budget.max_memory_bytes()`, and that is also the limit of the
-/// `ProcessMemoryBudget` they draw from — so one permit is the whole pool. The
-/// chase takes it before it opens the archive and holds it until it returns,
-/// across every park the gated reader does while waiting on the download.
-///
-/// While chases drew from the *shared* pool, a chase whose download never
-/// finished never released it and no other 7z work in the process could start.
-/// In the gate run 39 chases armed and not one ever logged a completion; every
-/// 7z scenario after the first wedge timed out in batch-sized groups, and
-/// completions burst the moment the harness cancelled the jobs holding the pool.
-///
-/// Chases now have their own pool, so this is bounded: a parked chase can starve
-/// other *chases*, which are speculative, but never the extractions on a job's
-/// critical path. This test drives exactly that — an independent, fully
-/// downloaded job finishing while another job's chase sits parked forever.
+// The round-9 wedge: a parked chase must not stop other jobs' extraction.
+//
+// Both the chase and conventional 7z extraction reserve
+// `budget.max_memory_bytes()`, and that is also the limit of the
+// `ProcessMemoryBudget` they draw from — so one permit is the whole pool. The
+// chase takes it before it opens the archive and holds it until it returns,
+// across every park the gated reader does while waiting on the download.
+//
+// While chases drew from the *shared* pool, a chase whose download never
+// finished never released it and no other 7z work in the process could start.
+// In the gate run 39 chases armed and not one ever logged a completion; every
+// 7z scenario after the first wedge timed out in batch-sized groups, and
+// completions burst the moment the harness cancelled the jobs holding the pool.
+//
+// Chases now have their own pool, so this is bounded: a parked chase can starve
+// other *chases*, which are speculative, but never the extractions on a job's
+// critical path. This test drives exactly that — an independent, fully
+// downloaded job finishing while another job's chase sits parked forever.
 #[tokio::test]
 async fn a_parked_chase_does_not_block_another_jobs_extraction() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2669,28 +2669,28 @@ async fn a_parked_chase_does_not_block_another_jobs_extraction() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// Take a job out of the dispatch ranking.
-///
-/// Arming belongs to the job the scheduler is actually feeding, so a fixture
-/// that needs several sets chasing at once must not leave its jobs competing
-/// for the hot slot. The tests that use this are about chase-pool capacity and
-/// the shared decoder memory pool, not about dispatch order, so emptying the
-/// remaining queues is the whole of what they need.
+// Take a job out of the dispatch ranking.
+//
+// Arming belongs to the job the scheduler is actually feeding, so a fixture
+// that needs several sets chasing at once must not leave its jobs competing
+// for the hot slot. The tests that use this are about chase-pool capacity and
+// the shared decoder memory pool, not about dispatch order, so emptying the
+// remaining queues is the whole of what they need.
 fn stop_competing_for_dispatch(pipeline: &mut Pipeline, job_id: JobId) {
     if let Some(state) = pipeline.jobs.get_mut(&job_id) {
         state.download_queue.drain_all();
     }
 }
 
-/// Admission is capped at the number of chase workers.
-///
-/// A chase occupies one `chase_pool` worker for its entire life, parks included.
-/// Arming more chases than there are workers produces chases that are armed but
-/// never start — and extraction awaits a still-running chase with no deadline,
-/// so those become wedges rather than merely slow overlaps.
-///
-/// The refusal is counted but not latched: having no free worker right now says
-/// nothing about the archive, so the set must be free to arm later.
+// Admission is capped at the number of chase workers.
+//
+// A chase occupies one `chase_pool` worker for its entire life, parks included.
+// Arming more chases than there are workers produces chases that are armed but
+// never start — and extraction awaits a still-running chase with no deadline,
+// so those become wedges rather than merely slow overlaps.
+//
+// The refusal is counted but not latched: having no free worker right now says
+// nothing about the archive, so the set must be free to arm later.
 #[tokio::test]
 async fn arming_stops_at_the_number_of_chase_workers() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2812,19 +2812,19 @@ async fn arming_stops_at_the_number_of_chase_workers() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// Consumption must not wait forever on a chase that never finishes.
-///
-/// A chase can be handed to extraction still running — normally it is finishing
-/// at disk speed, because every part is complete by then. But "normally" is not
-/// a guarantee: a worker still queued behind occupied chase workers cannot even
-/// see its own set's abort, because the abort only pokes a coverage that
-/// closure has not touched yet. The await used to have no deadline, so such a
-/// chase left extraction never returning, the job in Extracting forever, and a
-/// global extraction slot held until the job was cancelled.
-///
-/// Here the chase is parked on a coverage nothing will ever advance. The
-/// deadline must fire, abort the coverage, and let conventional extraction
-/// produce the members.
+// Consumption must not wait forever on a chase that never finishes.
+//
+// A chase can be handed to extraction still running — normally it is finishing
+// at disk speed, because every part is complete by then. But "normally" is not
+// a guarantee: a worker still queued behind occupied chase workers cannot even
+// see its own set's abort, because the abort only pokes a coverage that
+// closure has not touched yet. The await used to have no deadline, so such a
+// chase left extraction never returning, the job in Extracting forever, and a
+// global extraction slot held until the job was cancelled.
+//
+// Here the chase is parked on a coverage nothing will ever advance. The
+// deadline must fire, abort the coverage, and let conventional extraction
+// produce the members.
 #[tokio::test]
 async fn consumption_gives_up_on_a_chase_that_never_finishes() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2901,8 +2901,8 @@ async fn consumption_gives_up_on_a_chase_that_never_finishes() {
 // Decoder memory: a chase reserves what its archive needs, when it needs it
 // ---------------------------------------------------------------------------
 
-/// An in-process LZMA2 archive with a known dictionary, so the reservation a
-/// chase takes for it can be computed and compared exactly.
+// An in-process LZMA2 archive with a known dictionary, so the reservation a
+// chase takes for it can be computed and compared exactly.
 fn sized_lzma2_archive(dictionary: u32, members: &[(String, Vec<u8>)]) -> Vec<u8> {
     use sevenz_turbo::encoder_options::Lzma2Options;
     use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration};
@@ -2922,8 +2922,8 @@ fn sized_lzma2_archive(dictionary: u32, members: &[(String, Vec<u8>)]) -> Vec<u8
     writer.finish().expect("finish").into_inner()
 }
 
-/// Deterministic member bytes that compress a little, so the packed stream is
-/// neither trivially small nor a copy of the input.
+// Deterministic member bytes that compress a little, so the packed stream is
+// neither trivially small nor a copy of the input.
 fn sized_member(len: usize, seed: u64) -> Vec<u8> {
     let mut state = seed | 1;
     (0..len)
@@ -2940,7 +2940,7 @@ fn sized_member(len: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-/// Cut `archive` into parts on disk at `bounds`, returning the part paths.
+// Cut `archive` into parts on disk at `bounds`, returning the part paths.
 fn write_parts(dir: &std::path::Path, archive: &[u8], bounds: &[usize]) -> Vec<PathBuf> {
     bounds
         .windows(2)
@@ -2953,8 +2953,8 @@ fn write_parts(dir: &std::path::Path, archive: &[u8], bounds: &[usize]) -> Vec<P
         .collect()
 }
 
-/// A budget over `pool` with limits that do not depend on the machine the
-/// test runs on.
+// A budget over `pool` with limits that do not depend on the machine the
+// test runs on.
 fn chase_budget_over(
     pool: &std::sync::Arc<crate::pipeline::extraction::ProcessMemoryBudget>,
     staging: &std::path::Path,
@@ -2982,7 +2982,7 @@ fn chase_budget_over(
     .expect("budget")
 }
 
-/// Run the shared 7z extraction body the way a chase does, on its own thread.
+// Run the shared 7z extraction body the way a chase does, on its own thread.
 fn spawn_chase_extraction(
     context: crate::pipeline::completion::finalize::extract::SevenZipExtractionContext,
     paths: Vec<PathBuf>,
@@ -3026,21 +3026,21 @@ fn chase_context(
     }
 }
 
-/// Polls until `condition` holds; `what` names it for a reader. There is no
-/// deadline: the test runner bounds a condition that never arrives.
+// Polls until `condition` holds; `what` names it for a reader. There is no
+// deadline: the test runner bounds a condition that never arrives.
 async fn wait_until(mut condition: impl FnMut() -> bool, _what: &str) {
     while !condition() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
-/// A chase's decode pass holds its archive's decoders, not the ceiling.
-///
-/// Two chases over the same archive park mid-block with their permits held,
-/// and what the pool shows reserved is exactly two dictionaries plus the
-/// fixed allowances — a number small enough that both fit side by side in a
-/// pool that could not have held even one whole-ceiling reservation. When
-/// the parts they wait on land, both finish and every member matches.
+// A chase's decode pass holds its archive's decoders, not the ceiling.
+//
+// Two chases over the same archive park mid-block with their permits held,
+// and what the pool shows reserved is exactly two dictionaries plus the
+// fixed allowances — a number small enough that both fit side by side in a
+// pool that could not have held even one whole-ceiling reservation. When
+// the parts they wait on land, both finish and every member matches.
 #[tokio::test]
 async fn a_chase_reserves_its_decoders_not_the_ceiling() {
     use crate::pipeline::completion::finalize::extract::CHASE_DECODE_ALLOWANCE_BYTES;
@@ -3165,9 +3165,9 @@ async fn a_chase_reserves_its_decoders_not_the_ceiling() {
     assert_eq!(pool.reserved_bytes(), 0, "every permit is returned");
 }
 
-/// While a chase lists the archive it holds a header-sized permit and nothing
-/// else — and that is the pass that parks for the tail, sometimes for most of
-/// a download.
+// While a chase lists the archive it holds a header-sized permit and nothing
+// else — and that is the pass that parks for the tail, sometimes for most of
+// a download.
 #[tokio::test]
 async fn a_chase_listing_the_archive_holds_a_header_sized_permit() {
     use crate::pipeline::completion::finalize::extract::CHASE_HEADER_PASS_ALLOWANCE_BYTES;
@@ -3217,9 +3217,9 @@ async fn a_chase_listing_the_archive_holds_a_header_sized_permit() {
     assert_eq!(pool.reserved_bytes(), 0);
 }
 
-/// The round-10 wedge, at the controller: chases no longer single-file through
-/// the pool. Two jobs' chases park side by side in a pool that could not have
-/// held one whole-ceiling reservation, both still armed, neither failed.
+// The round-10 wedge, at the controller: chases no longer single-file through
+// the pool. Two jobs' chases park side by side in a pool that could not have
+// held one whole-ceiling reservation, both still armed, neither failed.
 #[tokio::test]
 async fn parked_chases_share_the_decoder_memory_pool() {
     const MIB: u64 = 1024 * 1024;
@@ -3295,8 +3295,8 @@ async fn parked_chases_share_the_decoder_memory_pool() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// Finalize can see a chase that is gated on recovery-reported damage — and
-/// only while it is armed.
+// Finalize can see a chase that is gated on recovery-reported damage — and
+// only while it is armed.
 #[tokio::test]
 async fn a_gated_chase_is_reported_to_finalize() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3349,13 +3349,13 @@ async fn a_gated_chase_is_reported_to_finalize() {
     }
 }
 
-/// A split 7z job with a loaded, intact PAR2 set, its chase armed on part one
-/// and every other part landed afterwards. `gate` decides whether the chase is
-/// held on a damage cap before those parts arrive.
-///
-/// Returns the pipeline and the set name. The job's archive topology is a
-/// multi-volume 7z, so the clean-PAR2 integrity gate reads `StrongDecode` —
-/// the claim the gated chase has to be able to override.
+// A split 7z job with a loaded, intact PAR2 set, its chase armed on part one
+// and every other part landed afterwards. `gate` decides whether the chase is
+// held on a damage cap before those parts arrive.
+//
+// Returns the pipeline and the set name. The job's archive topology is a
+// multi-volume 7z, so the clean-PAR2 integrity gate reads `StrongDecode` —
+// the claim the gated chase has to be able to override.
 async fn split_7z_job_with_par2(
     temp_dir: &tempfile::TempDir,
     job_id: JobId,
@@ -3364,8 +3364,8 @@ async fn split_7z_job_with_par2(
     split_7z_job_with_par2_as_posted(temp_dir, job_id, gate, false).await
 }
 
-/// The same job, with the first part's payload arriving damaged when
-/// `damage_first_part` is set. The PAR2 set still describes the clean parts.
+// The same job, with the first part's payload arriving damaged when
+// `damage_first_part` is set. The PAR2 set still describes the clean parts.
 async fn split_7z_job_with_par2_as_posted(
     temp_dir: &tempfile::TempDir,
     job_id: JobId,
@@ -3451,14 +3451,14 @@ async fn split_7z_job_with_par2_as_posted(
     (pipeline, set_name)
 }
 
-/// A chase that finishes before the damage report for its last bytes arrives
-/// still forces the authoritative PAR2 pass, and its members are not installed.
-///
-/// A short set decodes in the gap between its final commit and the recovery
-/// verdict for it. The report then lands on a worker that has already returned,
-/// and reaping it used to drop the report with it: finalize saw no gated set,
-/// let the strong-decode claim stand, and installed members decoded from the
-/// damaged range.
+// A chase that finishes before the damage report for its last bytes arrives
+// still forces the authoritative PAR2 pass, and its members are not installed.
+//
+// A short set decodes in the gap between its final commit and the recovery
+// verdict for it. The report then lands on a worker that has already returned,
+// and reaping it used to drop the report with it: finalize saw no gated set,
+// let the strong-decode claim stand, and installed members decoded from the
+// damaged range.
 #[tokio::test]
 async fn a_chase_that_finished_under_a_damage_report_still_forces_the_par2_pass() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3514,14 +3514,14 @@ async fn a_chase_that_finished_under_a_damage_report_still_forces_the_par2_pass(
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// A chase that fails on damaged bytes before the damage report for them
-/// arrives still forces the authoritative PAR2 pass.
-///
-/// The decoder reaches the damage in the gap between a commit and the recovery
-/// verdict for it, and fails. The report then lands on a worker that has
-/// already returned, and reaping the failure used to drop the report with it:
-/// finalize saw no gated set, let the strong-decode claim stand, and the
-/// conventional extraction read the same damage unrepaired.
+// A chase that fails on damaged bytes before the damage report for them
+// arrives still forces the authoritative PAR2 pass.
+//
+// The decoder reaches the damage in the gap between a commit and the recovery
+// verdict for it, and fails. The report then lands on a worker that has
+// already returned, and reaping the failure used to drop the report with it:
+// finalize saw no gated set, let the strong-decode claim stand, and the
+// conventional extraction read the same damage unrepaired.
 #[tokio::test]
 async fn a_chase_that_failed_under_a_damage_report_still_forces_the_par2_pass() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3566,8 +3566,8 @@ async fn a_chase_that_failed_under_a_damage_report_still_forces_the_par2_pass() 
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// A damage report that arrives after its chase was reaped still stands
-/// against the outcome.
+// A damage report that arrives after its chase was reaped still stands
+// against the outcome.
 #[tokio::test]
 async fn a_damage_report_after_the_chase_was_reaped_still_counts() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3600,10 +3600,10 @@ async fn a_damage_report_after_the_chase_was_reaped_still_counts() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// Put a Damaged grid verdict on the first recovery block of one part of the
-/// split 7z fixture, the way the article path would after a decoded range's
-/// CRC disagreed with what the recovery set describes. The rest of the part
-/// verifies.
+// Put a Damaged grid verdict on the first recovery block of one part of the
+// split 7z fixture, the way the article path would after a decoded range's
+// CRC disagreed with what the recovery set describes. The rest of the part
+// verifies.
 fn note_grid_damage_on_split_7z_part(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -3651,13 +3651,13 @@ fn note_grid_damage_on_split_7z_part(
     file_id
 }
 
-/// Damage the recovery data reported against a chased part still forces the
-/// authoritative PAR2 pass after the chase that was gated on it is demoted.
-///
-/// The gate lives on the worker, and a demoted worker takes it with it. The
-/// bytes it was gated on are just as wrong for the conventional extraction that
-/// follows, so the damage has to be on record against the set itself or the
-/// strong-decode claim settles it as clean.
+// Damage the recovery data reported against a chased part still forces the
+// authoritative PAR2 pass after the chase that was gated on it is demoted.
+//
+// The gate lives on the worker, and a demoted worker takes it with it. The
+// bytes it was gated on are just as wrong for the conventional extraction that
+// follows, so the damage has to be on record against the set itself or the
+// strong-decode claim settles it as clean.
 #[tokio::test]
 async fn damage_reported_against_a_chased_part_outlives_the_demoted_chase() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3690,8 +3690,8 @@ async fn damage_reported_against_a_chased_part_outlives_the_demoted_chase() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// A chased part whose damage is reported after its chase was reaped, with no
-/// other chase armed anywhere, still has the report put on the reaped outcome.
+// A chased part whose damage is reported after its chase was reaped, with no
+// other chase armed anywhere, still has the report put on the reaped outcome.
 #[tokio::test]
 async fn a_damaged_part_reaches_a_reaped_chase_with_nothing_else_armed() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3735,13 +3735,13 @@ async fn a_damaged_part_reaches_a_reaped_chase_with_nothing_else_armed() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// A damaged-path PAR2 analysis that found damage is read even when the gate
-/// that asked for it is gone by the time it lands.
-///
-/// The gated chase forces the analysis; the chase is demoted while the
-/// analysis runs, taking its gate with it. The completion check the verdict
-/// re-arms must not settle the set on the strong-decode claim over a verdict
-/// already in hand that calls it damaged.
+// A damaged-path PAR2 analysis that found damage is read even when the gate
+// that asked for it is gone by the time it lands.
+//
+// The gated chase forces the analysis; the chase is demoted while the
+// analysis runs, taking its gate with it. The completion check the verdict
+// re-arms must not settle the set on the strong-decode claim over a verdict
+// already in hand that calls it damaged.
 #[tokio::test]
 async fn a_parked_damaged_verdict_outlives_the_gate_that_asked_for_it() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3788,13 +3788,13 @@ async fn a_parked_damaged_verdict_outlives_the_gate_that_asked_for_it() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// A chase gated on recovery-reported damage forces the authoritative PAR2
-/// pass, over the strong-decode claim that would otherwise skip it.
-///
-/// This is the seam that left a gated chase waiting out its whole deadline:
-/// finalize settled the set as clean on the strength of the archive type, no
-/// repair was ever summoned, and the chase sat on vouches that were never
-/// coming.
+// A chase gated on recovery-reported damage forces the authoritative PAR2
+// pass, over the strong-decode claim that would otherwise skip it.
+//
+// This is the seam that left a gated chase waiting out its whole deadline:
+// finalize settled the set as clean on the strength of the archive type, no
+// repair was ever summoned, and the chase sat on vouches that were never
+// coming.
 #[tokio::test]
 async fn a_gated_chase_forces_the_authoritative_par2_pass() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3836,8 +3836,8 @@ async fn a_gated_chase_forces_the_authoritative_par2_pass() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// A clean verdict lifts only the gates it speaks for. A recovery set that
-/// does not describe the chased parts has nothing to say about them.
+// A clean verdict lifts only the gates it speaks for. A recovery set that
+// does not describe the chased parts has nothing to say about them.
 #[tokio::test]
 async fn a_clean_verdict_for_another_set_leaves_the_gate_up() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3922,8 +3922,8 @@ async fn a_clean_verdict_for_another_set_leaves_the_gate_up() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// The control: with nothing gated, the strong-decode skip stands exactly as
-/// it did — the new term is evidence-only, never a blanket veto for 7z jobs.
+// The control: with nothing gated, the strong-decode skip stands exactly as
+// it did — the new term is evidence-only, never a blanket veto for 7z jobs.
 #[tokio::test]
 async fn an_ungated_chase_leaves_the_strong_decode_skip_alone() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3944,17 +3944,17 @@ async fn an_ungated_chase_leaves_the_strong_decode_skip_alone() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// A job the scheduler is not feeding yet does not get a chase.
-///
-/// Articles are handed out from the hot job, so a job further down the order
-/// only ever sees the scraps the hot job leaves — enough of its opening bytes
-/// to look armable, and nowhere near enough for the chase to make progress.
-/// Arming it anyway spent a chase worker, a staging tree, a coverage map and an
-/// extraction budget per queued job, which is what made a batch of NZBs
-/// expensive the moment it was submitted rather than while it was downloading.
-///
-/// The refusal must not latch: the same set arms as soon as the job reaches the
-/// front of the order.
+// A job the scheduler is not feeding yet does not get a chase.
+//
+// Articles are handed out from the hot job, so a job further down the order
+// only ever sees the scraps the hot job leaves — enough of its opening bytes
+// to look armable, and nowhere near enough for the chase to make progress.
+// Arming it anyway spent a chase worker, a staging tree, a coverage map and an
+// extraction budget per queued job, which is what made a batch of NZBs
+// expensive the moment it was submitted rather than while it was downloading.
+//
+// The refusal must not latch: the same set arms as soon as the job reaches the
+// front of the order.
 #[tokio::test]
 async fn a_queued_job_arms_no_chase_until_it_is_the_one_being_downloaded() {
     let temp_dir = tempfile::tempdir().unwrap();

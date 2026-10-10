@@ -491,10 +491,10 @@ fn load_dotenv_path(path: &Path) -> Result<bool, dotenvy::Error> {
     }
 }
 
-/// In e2e mode only, divides the connection plans' timers by
-/// `WEAVER_E2E_NETWORK_TIME_SCALE` so a harness need not wait them out in real
-/// time. Without e2e mode, or without a scale above 1, nothing is installed and
-/// the process runs on production timing.
+// In e2e mode only, divides the connection plans' timers by
+// `WEAVER_E2E_NETWORK_TIME_SCALE` so a harness need not wait them out in real
+// time. Without e2e mode, or without a scale above 1, nothing is installed and
+// the process runs on production timing.
 fn install_e2e_network_time_scale() {
     if !weaver_server_core::e2e_clock::e2e_mode_enabled() {
         return;
@@ -597,7 +597,7 @@ fn default_windows_log_file_path() -> Option<PathBuf> {
     }
 }
 
-/// Adapter that lets `tracing_subscriber` write to a [`LogRingBuffer`].
+// Adapter that lets `tracing_subscriber` write to a [`LogRingBuffer`].
 #[derive(Clone)]
 struct LogBufferWriter(weaver_server_core::runtime::log_buffer::LogRingBuffer);
 

@@ -32,7 +32,7 @@ impl ScriptKind {
     }
 }
 
-/// Declaration order is NZBGet's event priority, from lowest to highest.
+// Declaration order is NZBGet's event priority, from lowest to highest.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueueEvent {

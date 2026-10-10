@@ -318,8 +318,8 @@ async fn route_save_rejects_missing_consumers_without_persisting() {
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
-/// A server or a feed made behind a kill switch is kept switched off behind a
-/// route nothing can take, and a route saved for it under Networking opens it.
+// A server or a feed made behind a kill switch is kept switched off behind a
+// route nothing can take, and a route saved for it under Networking opens it.
 #[tokio::test]
 async fn kill_switch_keeps_a_new_consumer_blocked_until_it_is_given_a_route() {
     let h = harness().await;

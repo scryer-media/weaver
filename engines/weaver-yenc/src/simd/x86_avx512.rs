@@ -78,16 +78,16 @@ pub(super) unsafe fn decode_kernel_avx512_vbmi2(
     x86_fold_head(outcome, head_src, head_dst)
 }
 
-/// Faithful 512-bit port of rapidyenc `do_decode_avx2` instantiated at
-/// `ISA_LEVEL_VBMI2` (`decoder_vbmi2.cc` → `decoder_avx2_base.h`), the
-/// `isRaw=true, searchEnd=false` path. This is the AVX2 flat-loop port
-/// [`decode_kernel_avx2_raw`](super::x86_avx2) widened to a single 512-bit
-/// window: the two 256-bit lanes collapse to one `__m512i`, `movemask`+combine
-/// collapses to a `_mm512_cmpeq_epi8_mask` k-register `u64`, the 2-lane LUT
-/// compaction becomes one `_mm512_maskz_compress_epi8`, and escape unescape is
-/// a single `_mm512_mask_add_epi8`. The scalar `u64` bit-math (`fix_eq_mask`,
-/// `escaped`, `esc_first`, `skip`, entry/exit state) is byte-identical to the
-/// AVX2 port, so both tiers share the same correctness envelope.
+// Faithful 512-bit port of rapidyenc `do_decode_avx2` instantiated at
+// `ISA_LEVEL_VBMI2` (`decoder_vbmi2.cc` → `decoder_avx2_base.h`), the
+// `isRaw=true, searchEnd=false` path. This is the AVX2 flat-loop port
+// [`decode_kernel_avx2_raw`](super::x86_avx2) widened to a single 512-bit
+// window: the two 256-bit lanes collapse to one `__m512i`, `movemask`+combine
+// collapses to a `_mm512_cmpeq_epi8_mask` k-register `u64`, the 2-lane LUT
+// compaction becomes one `_mm512_maskz_compress_epi8`, and escape unescape is
+// a single `_mm512_mask_add_epi8`. The scalar `u64` bit-math (`fix_eq_mask`,
+// `escaped`, `esc_first`, `skip`, entry/exit state) is byte-identical to the
+// AVX2 port, so both tiers share the same correctness envelope.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -510,11 +510,11 @@ pub(super) unsafe fn try_decode_avx512_vbmi2_block(
     Ok(Some(64))
 }
 
-/// Line-aware 64-byte-block driver for the AVX-512/VBMI2 tier: consult the
-/// caller's line-length hint, try the whole-line fast path first, and fall
-/// back to the generic 64-byte block decode. Mirrors the SSSE3 line-aware
-/// kernel structure (`decode_kernel_simd64_ssse3_line_aware`) at 512-bit
-/// width.
+// Line-aware 64-byte-block driver for the AVX-512/VBMI2 tier: consult the
+// caller's line-length hint, try the whole-line fast path first, and fall
+// back to the generic 64-byte block decode. Mirrors the SSSE3 line-aware
+// kernel structure (`decode_kernel_simd64_ssse3_line_aware`) at 512-bit
+// width.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 pub(super) unsafe fn decode_kernel_simd64_vbmi2_line_aware(
@@ -595,12 +595,12 @@ pub(super) unsafe fn decode_kernel_simd64_vbmi2_line_aware(
     })
 }
 
-/// Whole-line fast path for the AVX-512/VBMI2 tier: decode one complete yEnc
-/// line (hint-length plus CRLF) in a single pass when the window holds it,
-/// bailing to the block path on escapes at boundaries, stuffed dots, or short
-/// input. Same guards and bail conditions as `try_decode_ssse3_line`, with
-/// one 512-bit vector per 64-byte chunk, k-register masks, and full-width
-/// vpcompressb compaction.
+// Whole-line fast path for the AVX-512/VBMI2 tier: decode one complete yEnc
+// line (hint-length plus CRLF) in a single pass when the window holds it,
+// bailing to the block path on escapes at boundaries, stuffed dots, or short
+// input. Same guards and bail conditions as `try_decode_ssse3_line`, with
+// one 512-bit vector per 64-byte chunk, k-register masks, and full-width
+// vpcompressb compaction.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512vl,avx512vbmi2,avx512bw,avx512f,avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[allow(clippy::too_many_arguments)]

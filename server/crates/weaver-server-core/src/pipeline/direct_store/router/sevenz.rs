@@ -1,40 +1,40 @@
-//! The 7z half of the layout seam: reading one container's map out of its end
-//! header, and answering physical ranges from it.
-//!
-//! # Why this is a layout and not a second router
-//!
-//! Everything the router does once a member's coordinates are known — span
-//! routing, split parts across volumes, holds, the coverage barrier, the
-//! virtual-volume provider, reconstruction on a demotion, finalization by
-//! rename — reads the layout through two accessors and never asks which format
-//! produced it. A Copy-coded 7z member is, in those coordinates, exactly what a
-//! stored RAR member is: one contiguous run of container bytes whose values are
-//! the output file's values. So the 7z side builds [`unrar_rs::StoredMember`]s
-//! and hands them to the same machinery rather than growing a parallel copy of
-//! it.
-//!
-//! # What a 7z container looks like from here
-//!
-//! A `.7z` is a 32-byte signature header, then the packed streams, then an end
-//! header at the tail that names every entry and every block. A `-v` split is a
-//! pure byte split of that one container at a fixed volume size — no per-volume
-//! headers, no per-volume signature — so the volumes concatenate and every
-//! offset in this module is an offset into that concatenation.
-//!
-//! Two consequences shape the whole module:
-//!
-//! - **The map arrives at the end, and arrives whole.** There is no incremental
-//!   front-to-back walk to run per volume: either the end header has been read
-//!   and the container's every member is known, or nothing is. That is what
-//!   makes the layout here a one-shot build with `chain_complete` already true,
-//!   where the RAR builder grows volume by volume.
-//! - **The geometry is two facts, and everything else is arithmetic.** The
-//!   part size is volume zero's own length; the total is where the start
-//!   header's coordinates put the end of the end header. Every volume boundary
-//!   follows from those two, so no other volume has to be heard from before a
-//!   container offset becomes a (volume, offset) pair. What the volumes go on
-//!   to state about themselves is checked against that, never waited on: a
-//!   disagreement demotes the set, it does not fail the job.
+// The 7z half of the layout seam: reading one container's map out of its end
+// header, and answering physical ranges from it.
+//
+// # Why this is a layout and not a second router
+//
+// Everything the router does once a member's coordinates are known — span
+// routing, split parts across volumes, holds, the coverage barrier, the
+// virtual-volume provider, reconstruction on a demotion, finalization by
+// rename — reads the layout through two accessors and never asks which format
+// produced it. A Copy-coded 7z member is, in those coordinates, exactly what a
+// stored RAR member is: one contiguous run of container bytes whose values are
+// the output file's values. So the 7z side builds [`unrar_rs::StoredMember`]s
+// and hands them to the same machinery rather than growing a parallel copy of
+// it.
+//
+// # What a 7z container looks like from here
+//
+// A `.7z` is a 32-byte signature header, then the packed streams, then an end
+// header at the tail that names every entry and every block. A `-v` split is a
+// pure byte split of that one container at a fixed volume size — no per-volume
+// headers, no per-volume signature — so the volumes concatenate and every
+// offset in this module is an offset into that concatenation.
+//
+// Two consequences shape the whole module:
+//
+// - **The map arrives at the end, and arrives whole.** There is no incremental
+//   front-to-back walk to run per volume: either the end header has been read
+//   and the container's every member is known, or nothing is. That is what
+//   makes the layout here a one-shot build with `chain_complete` already true,
+//   where the RAR builder grows volume by volume.
+// - **The geometry is two facts, and everything else is arithmetic.** The
+//   part size is volume zero's own length; the total is where the start
+//   header's coordinates put the end of the end header. Every volume boundary
+//   follows from those two, so no other volume has to be heard from before a
+//   container offset becomes a (volume, offset) pair. What the volumes go on
+//   to state about themselves is checked against that, never waited on: a
+//   disagreement demotes the set, it does not fail the job.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -44,124 +44,124 @@ use unrar_rs::{MappedSlice, MemberEligibility, StoredMember, StoredMemberPart};
 
 use super::{SparseImage, StagedChunk};
 
-/// The signature header: magic, version, start-header CRC32, and the three
-/// fields naming the end header.
+// The signature header: magic, version, start-header CRC32, and the three
+// fields naming the end header.
 pub(super) const SIGNATURE_HEADER_LEN: u64 = 32;
 
 const SEVEN_Z_MAGIC: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
 
-/// The `Copy` coder's method id: the identity transform, which is the one
-/// coder whose packed bytes *are* the member's bytes.
+// The `Copy` coder's method id: the identity transform, which is the one
+// coder whose packed bytes *are* the member's bytes.
 const COPY_METHOD_ID: &[u8] = &[0x00];
 
-/// Why a 7z container could not be direct-routed.
-///
-/// Every variant is a property of the container itself rather than of how much
-/// of it has arrived, so each one is a verdict the moment the end header parses
-/// and none of them is worth waiting on another article for.
+// Why a 7z container could not be direct-routed.
+//
+// Every variant is a property of the container itself rather than of how much
+// of it has arrived, so each one is a verdict the moment the end header parses
+// and none of them is worth waiting on another article for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SevenZipRefusal {
-    /// A block is not a single `Copy` coder over a single pack stream whose
-    /// packed length equals its unpacked length. Anything else — LZMA, LZMA2,
-    /// BCJ, a filter chain — means the packed bytes are not the output bytes.
+    // A block is not a single `Copy` coder over a single pack stream whose
+    // packed length equals its unpacked length. Anything else — LZMA, LZMA2,
+    // BCJ, a filter chain — means the packed bytes are not the output bytes.
     Coder,
-    /// A block's coder chain includes AES.
-    ///
-    /// An encrypted `Copy` member is routable in principle: the cipher is CBC
-    /// over the whole stream, so cipher offset and member offset coincide
-    /// exactly as they do for an encrypted stored RAR member. It is reported
-    /// rather than routed because the decrypting half of that — the key ring,
-    /// the block-boundary holds, the re-encrypting overlay the provider needs
-    /// so PAR2 still sees the posted bytes — is the encrypted-member path, and
-    /// pointing the 7z layout at it is a separate piece of work.
+    // A block's coder chain includes AES.
+    //
+    // An encrypted `Copy` member is routable in principle: the cipher is CBC
+    // over the whole stream, so cipher offset and member offset coincide
+    // exactly as they do for an encrypted stored RAR member. It is reported
+    // rather than routed because the decrypting half of that — the key ring,
+    // the block-boundary holds, the re-encrypting overlay the provider needs
+    // so PAR2 still sees the posted bytes — is the encrypted-member path, and
+    // pointing the 7z layout at it is a separate piece of work.
     EncryptedContent,
-    /// The end header is itself encrypted, so nothing names the members.
+    // The end header is itself encrypted, so nothing names the members.
     EncryptedHeader,
-    /// An anti-item: a deletion marker carried by an incremental archive, which
-    /// names a file the archive does not contain.
+    // An anti-item: a deletion marker carried by an incremental archive, which
+    // names a file the archive does not contain.
     AntiItem,
-    /// An entry the header marks as a symlink or other redirection. Its
-    /// "content" is a link target, not a file body.
+    // An entry the header marks as a symlink or other redirection. Its
+    // "content" is a link target, not a file body.
     Redirection,
-    /// Every entry is a directory or an empty file, so the container stores
-    /// no byte of any file.
-    ///
-    /// There is nothing to route and nothing to verify: the whole container is
-    /// headers, and a set is only ever finalized on members it verified. The
-    /// conventional extractor creates the entries from a container this small
-    /// at no cost worth routing around.
+    // Every entry is a directory or an empty file, so the container stores
+    // no byte of any file.
+    //
+    // There is nothing to route and nothing to verify: the whole container is
+    // headers, and a set is only ever finalized on members it verified. The
+    // conventional extractor creates the entries from a container this small
+    // at no cost worth routing around.
     NothingToRoute,
-    /// An entry name the reader's own path check refuses: absolute, escaping,
-    /// or otherwise not a name that may become a destination.
-    ///
-    /// Distinct from [`super::DemotionReason::UnsafeDestination`], which says the same
-    /// thing about a RAR member and answers [`super::VolumeDemand::Virtual`] for it:
-    /// that set has a layout, so the conventional extractor can read its
-    /// volumes off the overlay and refuse the path itself. A container refused
-    /// while its map is being read has no layout and no overlay, so its
-    /// volumes have to be real.
+    // An entry name the reader's own path check refuses: absolute, escaping,
+    // or otherwise not a name that may become a destination.
+    //
+    // Distinct from [`super::DemotionReason::UnsafeDestination`], which says the same
+    // thing about a RAR member and answers [`super::VolumeDemand::Virtual`] for it:
+    // that set has a layout, so the conventional extractor can read its
+    // volumes off the overlay and refuse the path itself. A container refused
+    // while its map is being read has no layout and no overlay, so its
+    // volumes have to be real.
     UnsafeDestination,
-    /// Volume zero states no length this router can place a map against: none
-    /// at all, or zero.
-    ///
-    /// A split container is a byte split at a fixed part size, and volume
-    /// zero's length is the only statement of what that size is. Without it
-    /// every container offset is unplaceable, so the set is not routable
-    /// direct and says so before it holds anything beyond its probe articles.
-    ///
-    /// Not a judgement on the posting. A yEnc `size=` is advisory — weaver does
-    /// not validate it, and a volume with none is still perfectly downloadable
-    /// — so this refuses *this route* and hands the set to the conventional
-    /// path, which needs no such hint.
+    // Volume zero states no length this router can place a map against: none
+    // at all, or zero.
+    //
+    // A split container is a byte split at a fixed part size, and volume
+    // zero's length is the only statement of what that size is. Without it
+    // every container offset is unplaceable, so the set is not routable
+    // direct and says so before it holds anything beyond its probe articles.
+    //
+    // Not a judgement on the posting. A yEnc `size=` is advisory — weaver does
+    // not validate it, and a volume with none is still perfectly downloadable
+    // — so this refuses *this route* and hands the set to the conventional
+    // path, which needs no such hint.
     VolumeHintUnusable,
-    /// The map is still unread and nothing is left that could change that: no
-    /// article of the set is queued, retrying, downloading, decoding, reserved
-    /// or pending decode, and no released lane result is outstanding.
-    ///
-    /// Covers a missing volume zero, a missing volume anywhere in the middle
-    /// and a missing tail alike, because all three come to the same thing —
-    /// a parse that is not settled and no article left that could settle it.
-    /// Nothing else ends that wait: the budget ceilings only fire on a set big
-    /// enough to reach them, and a small set would sit unresolved forever.
-    ///
-    /// The RAR analogue is [`super::DemotionReason::UnparsableVolume`], which
-    /// says the same thing one volume at a time — a header walk shown its
-    /// ceiling and still holding no member is never going to hold one. This is
-    /// that verdict for a format whose layout is one fact about the whole
-    /// concatenation, and it is reached by the set running out of articles
-    /// rather than by it spending a ceiling.
+    // The map is still unread and nothing is left that could change that: no
+    // article of the set is queued, retrying, downloading, decoding, reserved
+    // or pending decode, and no released lane result is outstanding.
+    //
+    // Covers a missing volume zero, a missing volume anywhere in the middle
+    // and a missing tail alike, because all three come to the same thing —
+    // a parse that is not settled and no article left that could settle it.
+    // Nothing else ends that wait: the budget ceilings only fire on a set big
+    // enough to reach them, and a small set would sit unresolved forever.
+    //
+    // The RAR analogue is [`super::DemotionReason::UnparsableVolume`], which
+    // says the same thing one volume at a time — a header walk shown its
+    // ceiling and still holding no member is never going to hold one. This is
+    // that verdict for a format whose layout is one fact about the whole
+    // concatenation, and it is reached by the set running out of articles
+    // rather than by it spending a ceiling.
     UnreadableMap,
-    /// The article that closes the container was ruled missing on every
-    /// server, or ran out of retries or decodes, before the map was read.
-    ///
-    /// A container ends with its end header, so that article carries the
-    /// header's last bytes and the map is gone with it. Judged on that one
-    /// terminal verdict rather than once every other article has landed, so
-    /// the set hands over before it holds the rest of the container. A late
-    /// article is not a verdict: only a terminal one reaches this.
+    // The article that closes the container was ruled missing on every
+    // server, or ran out of retries or decodes, before the map was read.
+    //
+    // A container ends with its end header, so that article carries the
+    // header's last bytes and the map is gone with it. Judged on that one
+    // terminal verdict rather than once every other article has landed, so
+    // the set hands over before it holds the rest of the container. A late
+    // article is not a verdict: only a terminal one reaches this.
     EndHeaderLost,
-    /// A volume whose length is not the one the container's own coordinates
-    /// require of it.
-    ///
-    /// The container's geometry is two facts: the part size volume zero states,
-    /// and the total the start header's own coordinates give. Together they say
-    /// exactly how long every volume must be. This is raised when something
-    /// disagrees with that — a volume's declared length when it arrives, a
-    /// volume's **decoded** length when it completes, a part count that does
-    /// not match the set's, or a total the hint cannot divide into a sane
-    /// number of parts.
-    ///
-    /// The decoded check is the authoritative one and it is deliberately not
-    /// conditional on having routed nothing yet: a set that routed against a
-    /// wrong part size wrote its members' bytes at offsets no reader will look
-    /// for them at, and the demotion is what stops those bytes from shipping.
-    /// The declared check is only an earlier chance at the same verdict — a
-    /// yEnc `size=` is advisory, so its agreement proves nothing and its
-    /// disagreement is merely the first evidence to arrive.
+    // A volume whose length is not the one the container's own coordinates
+    // require of it.
+    //
+    // The container's geometry is two facts: the part size volume zero states,
+    // and the total the start header's own coordinates give. Together they say
+    // exactly how long every volume must be. This is raised when something
+    // disagrees with that — a volume's declared length when it arrives, a
+    // volume's **decoded** length when it completes, a part count that does
+    // not match the set's, or a total the hint cannot divide into a sane
+    // number of parts.
+    //
+    // The decoded check is the authoritative one and it is deliberately not
+    // conditional on having routed nothing yet: a set that routed against a
+    // wrong part size wrote its members' bytes at offsets no reader will look
+    // for them at, and the demotion is what stops those bytes from shipping.
+    // The declared check is only an earlier chance at the same verdict — a
+    // yEnc `size=` is advisory, so its agreement proves nothing and its
+    // disagreement is merely the first evidence to arrive.
     VolumeSize,
-    /// The header's coordinates do not describe one archive: members that
-    /// overlap, run backwards, reach past the container, leave a block's packed
-    /// bytes unclaimed, or repeat a name.
+    // The header's coordinates do not describe one archive: members that
+    // overlap, run backwards, reach past the container, leave a block's packed
+    // bytes unclaimed, or repeat a name.
     Geometry,
 }
 
@@ -184,7 +184,7 @@ impl SevenZipRefusal {
     }
 }
 
-/// The three fields of the signature header that place the end header.
+// The three fields of the signature header that place the end header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct StartHeader {
     pub(super) next_header_offset: u64,
@@ -192,12 +192,12 @@ pub(super) struct StartHeader {
 }
 
 impl StartHeader {
-    /// Reads the signature header out of the container's first 32 bytes.
-    ///
-    /// `None` for a prefix that is not a 7z signature at all, which the caller
-    /// reports as an unsupported format rather than as a shortage of bytes: the
-    /// magic is in the first six bytes of the first volume, so a set that has
-    /// those and does not match is not a container this layout can read.
+    // Reads the signature header out of the container's first 32 bytes.
+    //
+    // `None` for a prefix that is not a 7z signature at all, which the caller
+    // reports as an unsupported format rather than as a shortage of bytes: the
+    // magic is in the first six bytes of the first volume, so a set that has
+    // those and does not match is not a container this layout can read.
     pub(super) fn parse(prefix: &[u8; SIGNATURE_HEADER_LEN as usize]) -> Option<Self> {
         if prefix[..6] != SEVEN_Z_MAGIC {
             return None;
@@ -224,68 +224,68 @@ impl StartHeader {
         })
     }
 
-    /// Where the end header begins, as a container offset.
+    // Where the end header begins, as a container offset.
     pub(super) fn end_header_start(&self) -> Option<u64> {
         SIGNATURE_HEADER_LEN.checked_add(self.next_header_offset)
     }
 
-    /// Where the end header ends. For a well-formed container this is the
-    /// container's own length — the end header is the last thing in the file.
+    // Where the end header ends. For a well-formed container this is the
+    // container's own length — the end header is the last thing in the file.
     pub(super) fn end_header_end(&self) -> Option<u64> {
         self.end_header_start()?.checked_add(self.next_header_size)
     }
 }
 
-/// The most parts a container may be split into before its own start header is
-/// believed.
-///
-/// A start header is read before a single byte of it has been checked against
-/// anything, so `total / part_size` is arithmetic over two numbers a bad
-/// posting is free to have made up. Without a ceiling a header declaring a
-/// total near `u64::MAX` asks this router to plan for more volumes than the
-/// job has articles. Well clear of any real posting: the largest split sets
-/// seen in the wild are a few thousand parts.
+// The most parts a container may be split into before its own start header is
+// believed.
+//
+// A start header is read before a single byte of it has been checked against
+// anything, so `total / part_size` is arithmetic over two numbers a bad
+// posting is free to have made up. Without a ceiling a header declaring a
+// total near `u64::MAX` asks this router to plan for more volumes than the
+// job has articles. Well clear of any real posting: the largest split sets
+// seen in the wild are a few thousand parts.
 pub(super) const MAX_CONTAINER_PARTS: u64 = 100_000;
 
-/// What a split container's geometry is, derived from the two facts that state
-/// it.
-///
-/// A split 7z is a pure byte split at a fixed size, so the whole concatenation
-/// is described by the part size and the total — and every volume's length
-/// follows. That is what lets a set place its map without having heard from
-/// every volume: it needs volume zero and the tail, not the whole set.
-///
-/// `part_size` is a **hint**. It comes from volume zero's yEnc `size=`, which
-/// weaver does not validate anywhere else and which a posting is free to state
-/// wrongly or not at all. Everything here is therefore provisional until the
-/// volumes decode: see [`SevenZipRefusal::VolumeSize`] for what happens when
-/// the bytes disagree with the plan derived from the hint.
+// What a split container's geometry is, derived from the two facts that state
+// it.
+//
+// A split 7z is a pure byte split at a fixed size, so the whole concatenation
+// is described by the part size and the total — and every volume's length
+// follows. That is what lets a set place its map without having heard from
+// every volume: it needs volume zero and the tail, not the whole set.
+//
+// `part_size` is a **hint**. It comes from volume zero's yEnc `size=`, which
+// weaver does not validate anywhere else and which a posting is free to state
+// wrongly or not at all. Everything here is therefore provisional until the
+// volumes decode: see [`SevenZipRefusal::VolumeSize`] for what happens when
+// the bytes disagree with the plan derived from the hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ContainerGeometry {
-    /// Volume zero's declared length, which every volume but the last has.
+    // Volume zero's declared length, which every volume but the last has.
     pub(super) part_size: u64,
-    /// The container's length, from the start header's own coordinates: the
-    /// end header is the last thing in a 7z file, so where it ends is where the
-    /// file ends.
+    // The container's length, from the start header's own coordinates: the
+    // end header is the last thing in a 7z file, so where it ends is where the
+    // file ends.
     pub(super) total: u64,
-    /// How many volumes that is.
+    // How many volumes that is.
     pub(super) parts: u64,
-    /// Bytes posted after the container's end, in its one volume: an embedded
-    /// recovery set's packets. Zero for every split set and for a file that
-    /// ends where its end header does.
+    // Bytes posted after the container's end, in its one volume: an embedded
+    // recovery set's packets. Zero for every split set and for a file that
+    // ends where its end header does.
     pub(super) tail: u64,
 }
 
 impl ContainerGeometry {
-    /// Derives the geometry, or says why these two numbers do not describe one
-    /// container.
-    ///
-    /// `single` says the set is one file. Such a file may state a length past
-    /// its end header — the packets of a recovery set written into it — and
-    /// that excess is its [`Self::tail`] rather than a second part, because a
-    /// file that is the whole set has no part boundary to put one at. Whether
-    /// the excess really is a recovery set is not decided here: see
-    /// [`EMBEDDED_TAIL_MAGIC`].
+    // Derives the geometry, or says why these two numbers do not describe one
+    // container.
+    //
+    // `single` says the set is one file. Such a file may state a length past
+    // its end header — the packets of a recovery set written into it — and
+    // that excess is its [`Self::tail`] rather than a second part, because a
+    // file that is the whole set has no part boundary to put one at. Whether
+    // the excess really is a recovery set is not decided here: see
+    // [`EMBEDDED_TAIL_MAGIC`].
     pub(super) fn derive(
         part_size: u64,
         start: &StartHeader,
@@ -300,8 +300,8 @@ impl ContainerGeometry {
         Self::derive_from_total(part_size, total, tail)
     }
 
-    /// The same derivation from a total already in hand — the restore path,
-    /// where the start header's own bytes are long gone.
+    // The same derivation from a total already in hand — the restore path,
+    // where the start header's own bytes are long gone.
     pub(super) fn derive_from_total(
         part_size: u64,
         total: u64,
@@ -335,11 +335,11 @@ impl ContainerGeometry {
         })
     }
 
-    /// How long volume `volume_index` must be, or `None` for a volume this
-    /// geometry does not have.
-    ///
-    /// Every part is `part_size` except the last, which is whatever is left —
-    /// which is how a split writer produces the short tail real sets have.
+    // How long volume `volume_index` must be, or `None` for a volume this
+    // geometry does not have.
+    //
+    // Every part is `part_size` except the last, which is whatever is left —
+    // which is how a split writer produces the short tail real sets have.
     pub(super) fn expected_len(&self, volume_index: u32) -> Option<u64> {
         let index = u64::from(volume_index);
         if index >= self.parts {
@@ -351,8 +351,8 @@ impl ContainerGeometry {
         Some(self.part_size)
     }
 
-    /// Every volume's length, dense from volume zero, in the shape
-    /// [`SevenZipLayout::build`] resolves coordinates against.
+    // Every volume's length, dense from volume zero, in the shape
+    // [`SevenZipLayout::build`] resolves coordinates against.
     pub(super) fn lengths(&self) -> BTreeMap<u32, u64> {
         (0..self.parts as u32)
             .filter_map(|volume| Some((volume, self.expected_len(volume)?)))
@@ -360,75 +360,75 @@ impl ContainerGeometry {
     }
 }
 
-/// One entry the end header names, in container coordinates.
-///
-/// This is the durable form: it is what the restart cache stores and what the
-/// layout is rebuilt from, so it carries coordinates and never a reader.
+// One entry the end header names, in container coordinates.
+//
+// This is the durable form: it is what the restart cache stores and what the
+// layout is rebuilt from, so it carries coordinates and never a reader.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SevenZipEntryFacts {
-    /// Name exactly as the header states it. Not sanitized — destination policy
-    /// belongs to the plan, and the raw name is the archive's own key.
+    // Name exactly as the header states it. Not sanitized — destination policy
+    // belongs to the plan, and the raw name is the archive's own key.
     pub(crate) name: String,
-    /// Container offset of the entry's bytes, or `None` for a dataless entry:
-    /// a directory, or a file the archive records with no stream at all (which
-    /// is how 7z stores an empty file).
+    // Container offset of the entry's bytes, or `None` for a dataless entry:
+    // a directory, or a file the archive records with no stream at all (which
+    // is how 7z stores an empty file).
     pub(crate) start: Option<u64>,
-    /// Unpacked length. Zero for every dataless entry.
+    // Unpacked length. Zero for every dataless entry.
     pub(crate) size: u64,
-    /// The header's CRC32 of the entry's bytes. **Optional by design**: 7z
-    /// records checksums per sub-stream and an archive may simply carry none.
+    // The header's CRC32 of the entry's bytes. **Optional by design**: 7z
+    // records checksums per sub-stream and an archive may simply carry none.
     pub(crate) crc32: Option<u32>,
-    /// The entry is a directory rather than a file.
+    // The entry is a directory rather than a file.
     pub(crate) is_directory: bool,
-    /// Last-modified time as the header states it (100 ns ticks since 1601), or
-    /// `None` when the header states none.
+    // Last-modified time as the header states it (100 ns ticks since 1601), or
+    // `None` when the header states none.
     pub(crate) modified: Option<u64>,
-    /// Last-access time on the same scale, likewise only when stated. 7z keeps
-    /// each time behind its own presence bit, and an entry written by a tool
-    /// that recorded none has none to restore.
+    // Last-access time on the same scale, likewise only when stated. 7z keeps
+    // each time behind its own presence bit, and an entry written by a tool
+    // that recorded none has none to restore.
     #[serde(default)]
     pub(crate) accessed: Option<u64>,
 }
 
-/// Everything one 7z container's end header states, plus the volume lengths the
-/// coordinates were resolved against.
+// Everything one 7z container's end header states, plus the volume lengths the
+// coordinates were resolved against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SevenZipContainerFacts {
     pub(crate) entries: Vec<SevenZipEntryFacts>,
-    /// The container's length, as the start header's coordinates gave it.
-    ///
-    /// Cached because the start header is not: its 32 bytes sit below the
-    /// published floors and are never refetched, so a restored set has no way
-    /// to re-read them. With this and volume zero's cached length the geometry
-    /// is derivable again, which is what turns the map's container offsets back
-    /// into the (volume, offset) pairs everything downstream is expressed in.
-    ///
-    /// Zero means a row written before the geometry was cached; such a set
-    /// restores no layout and parses again over its refetched tail.
+    // The container's length, as the start header's coordinates gave it.
+    //
+    // Cached because the start header is not: its 32 bytes sit below the
+    // published floors and are never refetched, so a restored set has no way
+    // to re-read them. With this and volume zero's cached length the geometry
+    // is derivable again, which is what turns the map's container offsets back
+    // into the (volume, offset) pairs everything downstream is expressed in.
+    //
+    // Zero means a row written before the geometry was cached; such a set
+    // restores no layout and parses again over its refetched tail.
     #[serde(default)]
     pub(crate) total: u64,
-    /// Bytes the one volume carries after the container: an embedded recovery
-    /// set, admitted on its own signature before this map was. Cached so a
-    /// restored set derives the same volume length it routed against, rather
-    /// than refusing its own posted length as a wrong one.
+    // Bytes the one volume carries after the container: an embedded recovery
+    // set, admitted on its own signature before this map was. Cached so a
+    // restored set derives the same volume length it routed against, rather
+    // than refusing its own posted length as a wrong one.
     #[serde(default)]
     pub(crate) embedded_tail: u64,
 }
 
-/// What an admitted tail opens with: the packet signature of a recovery set
-/// written into the file after its archive.
-///
-/// The only thing allowed to follow a container in its one volume. Anything
-/// else is the posting disagreeing with the archive about where the file
-/// ends, which is the [`SevenZipRefusal::VolumeSize`] it always was.
+// What an admitted tail opens with: the packet signature of a recovery set
+// written into the file after its archive.
+//
+// The only thing allowed to follow a container in its one volume. Anything
+// else is the posting disagreeing with the archive about where the file
+// ends, which is the [`SevenZipRefusal::VolumeSize`] it always was.
 pub(super) const EMBEDDED_TAIL_MAGIC: &[u8; 8] = par3_rs::MAGIC;
 
-/// One dataless entry finalization creates rather than routes.
-///
-/// A directory, or an empty file. Both are headers with no bytes anywhere in
-/// the container, so there is nothing for the router to place and nothing for
-/// an extractor to decode — and an archive whose only difference from another
-/// is an empty `.nfo` is still an archive whose output must contain it.
+// One dataless entry finalization creates rather than routes.
+//
+// A directory, or an empty file. Both are headers with no bytes anywhere in
+// the container, so there is nothing for the router to place and nothing for
+// an extractor to decode — and an archive whose only difference from another
+// is an empty `.nfo` is still an archive whose output must contain it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SevenZipDatalessEntry {
     pub(crate) name: String,
@@ -437,32 +437,32 @@ pub(crate) struct SevenZipDatalessEntry {
     pub(crate) accessed: Option<u64>,
 }
 
-/// The container map, resolved against the geometry's volume lengths.
-///
-/// Built once, complete, from the end header. There is no growing it: a 7z
-/// container states its whole map in one place, so either this exists and is
-/// authoritative for every byte of every volume, or the set has no layout yet.
+// The container map, resolved against the geometry's volume lengths.
+//
+// Built once, complete, from the end header. There is no growing it: a 7z
+// container states its whole map in one place, so either this exists and is
+// authoritative for every byte of every volume, or the set has no layout yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SevenZipLayout {
-    /// Container offset each volume begins at, dense from volume zero.
+    // Container offset each volume begins at, dense from volume zero.
     bases: Vec<u64>,
-    /// Each volume's length, in the same order.
+    // Each volume's length, in the same order.
     lengths: Vec<u64>,
-    /// Data-bearing entries, in ascending container order, with their parts
-    /// already cut at the volume boundaries.
+    // Data-bearing entries, in ascending container order, with their parts
+    // already cut at the volume boundaries.
     members: Vec<StoredMember>,
-    /// Entries with no bytes at all, in header order.
+    // Entries with no bytes at all, in header order.
     dataless: Vec<SevenZipDatalessEntry>,
 }
 
 impl SevenZipLayout {
-    /// Resolves the container's entries against the volume lengths the
-    /// geometry puts there.
-    ///
-    /// `lengths` must be dense from volume zero, and is: they are derived from
-    /// the part size and the total rather than collected from the volumes, so
-    /// every boundary is known as soon as those two facts are, whether or not
-    /// the volume that sits at it has been heard from.
+    // Resolves the container's entries against the volume lengths the
+    // geometry puts there.
+    //
+    // `lengths` must be dense from volume zero, and is: they are derived from
+    // the part size and the total rather than collected from the volumes, so
+    // every boundary is known as soon as those two facts are, whether or not
+    // the volume that sits at it has been heard from.
     pub(super) fn build(
         lengths: &BTreeMap<u32, u64>,
         facts: &SevenZipContainerFacts,
@@ -536,17 +536,17 @@ impl SevenZipLayout {
         &self.dataless
     }
 
-    /// The container offset one volume begins at.
+    // The container offset one volume begins at.
     pub(super) fn volume_base(&self, volume: u32) -> Option<u64> {
         self.bases.get(volume as usize).copied()
     }
 
-    /// Where one volume's physical bytes belong.
-    ///
-    /// The same contract [`unrar_rs::StoredLayoutBuilder::map_physical_range`]
-    /// states: the returned slices tile `[offset, offset + len)` in order.
-    /// Anything that is not inside a member's range is envelope — the signature
-    /// header, the end header, and any padding a writer left between blocks.
+    // Where one volume's physical bytes belong.
+    //
+    // The same contract [`unrar_rs::StoredLayoutBuilder::map_physical_range`]
+    // states: the returned slices tile `[offset, offset + len)` in order.
+    // Anything that is not inside a member's range is envelope — the signature
+    // header, the end header, and any padding a writer left between blocks.
     pub(super) fn map_physical_range(
         &self,
         volume: u32,
@@ -597,7 +597,7 @@ impl SevenZipLayout {
         slices
     }
 
-    /// The container offset a member's first part begins at.
+    // The container offset a member's first part begins at.
     fn member_start(&self, member: &StoredMember) -> Option<u64> {
         let part = member.parts.first()?;
         Some(
@@ -618,14 +618,14 @@ fn push_envelope(slices: &mut Vec<MappedSlice>, len: u64) {
     }
 }
 
-/// Cuts one entry's container range at the volume boundaries and expresses it
-/// the way the router already understands a split stored member.
-///
-/// The volume seam is the only thing that splits a 7z member, and a member
-/// crossing it becomes exactly the shape a stored RAR member spanning two
-/// volumes has: an earlier part with `split_after`, a later one with
-/// `split_before`, and logical offsets that are the prefix sums of the parts
-/// before them.
+// Cuts one entry's container range at the volume boundaries and expresses it
+// the way the router already understands a split stored member.
+//
+// The volume seam is the only thing that splits a 7z member, and a member
+// crossing it becomes exactly the shape a stored RAR member spanning two
+// volumes has: an earlier part with `split_after`, a later one with
+// `split_before`, and logical offsets that are the prefix sums of the parts
+// before them.
 fn member_over(
     bases: &[u64],
     lengths: &[u64],
@@ -687,16 +687,16 @@ fn member_over(
     })
 }
 
-/// Reads one container's entries out of a parsed archive, refusing anything
-/// whose packed bytes are not its output bytes.
-///
-/// This is the whole eligibility decision, and it is taken over the **set**
-/// rather than per member. A 7z block is the unit of compression and several
-/// entries can share one; there is no per-member tolerance to fall back on the
-/// way there is for RAR, because tolerating one entry would mean decoding it
-/// out of a container the rest of which has already been routed away. So a
-/// container with anything but Copy blocks is refused whole, which hands it to
-/// the conventional extractor with its bytes still on disk.
+// Reads one container's entries out of a parsed archive, refusing anything
+// whose packed bytes are not its output bytes.
+//
+// This is the whole eligibility decision, and it is taken over the **set**
+// rather than per member. A 7z block is the unit of compression and several
+// entries can share one; there is no per-member tolerance to fall back on the
+// way there is for RAR, because tolerating one entry would mean decoding it
+// out of a container the rest of which has already been routed away. So a
+// container with anything but Copy blocks is refused whole, which hands it to
+// the conventional extractor with its bytes still on disk.
 pub(super) fn container_facts(
     archive: &sevenz_turbo::Archive,
 ) -> Result<SevenZipContainerFacts, SevenZipRefusal> {
@@ -841,12 +841,12 @@ pub(super) fn container_facts(
     })
 }
 
-/// Which refusal a non-`Copy` block earns.
-///
-/// AES is separated from the rest because it is the one refusal that says
-/// "routable, not yet implemented" rather than "not routable", and a metric
-/// that cannot tell those apart cannot say how much of the field would benefit
-/// from building the decrypting half.
+// Which refusal a non-`Copy` block earns.
+//
+// AES is separated from the rest because it is the one refusal that says
+// "routable, not yet implemented" rather than "not routable", and a metric
+// that cannot tell those apart cannot say how much of the field would benefit
+// from building the decrypting half.
 fn coder_refusal(block: &sevenz_turbo::Block) -> SevenZipRefusal {
     if block
         .coders
@@ -858,16 +858,16 @@ fn coder_refusal(block: &sevenz_turbo::Block) -> SevenZipRefusal {
     SevenZipRefusal::Coder
 }
 
-/// A reader over the whole container, assembled from what the volumes have
-/// staged.
-///
-/// [`SparseImage`] refuses an `End`-relative seek on purpose — a volume image
-/// has no end, because the last staged run stops wherever the last article
-/// happened to reach. A *container* does have one: its length is the sum of the
-/// volumes' declared lengths, which is a fact off the wire rather than an
-/// artefact of arrival order, and the 7z reader asks for it before it does
-/// anything else. So the end lives here, beside the number that justifies it,
-/// and the image underneath keeps its refusal.
+// A reader over the whole container, assembled from what the volumes have
+// staged.
+//
+// [`SparseImage`] refuses an `End`-relative seek on purpose — a volume image
+// has no end, because the last staged run stops wherever the last article
+// happened to reach. A *container* does have one: its length is the sum of the
+// volumes' declared lengths, which is a fact off the wire rather than an
+// artefact of arrival order, and the 7z reader asks for it before it does
+// anything else. So the end lives here, beside the number that justifies it,
+// and the image underneath keeps its refusal.
 pub(super) struct ContainerImage {
     image: SparseImage,
     total: u64,
@@ -887,29 +887,29 @@ impl ContainerImage {
         }
     }
 
-    /// Whether a read stopped short of the container's end on a byte the
-    /// volumes have not delivered.
-    ///
-    /// A sparse image answers a hole the way a file answers its end, so a
-    /// reader cannot tell the two apart and reports whichever parse error the
-    /// truncation produced. This says which one it was, and so whether the
-    /// error is a verdict on the container or only on how much of it is here.
+    // Whether a read stopped short of the container's end on a byte the
+    // volumes have not delivered.
+    //
+    // A sparse image answers a hole the way a file answers its end, so a
+    // reader cannot tell the two apart and reports whichever parse error the
+    // truncation produced. This says which one it was, and so whether the
+    // error is a verdict on the container or only on how much of it is here.
     pub(super) fn holed(&self) -> bool {
         self.holed
     }
 
-    /// Puts the image back at its first byte with nothing recorded, so the read
-    /// that follows is judged only on itself. What one pass over a keyed
-    /// container learned about holes says nothing about the next pass, which
-    /// stops in a different place or not at all.
+    // Puts the image back at its first byte with nothing recorded, so the read
+    // that follows is judged only on itself. What one pass over a keyed
+    // container learned about holes says nothing about the next pass, which
+    // stops in a different place or not at all.
     pub(super) fn restart(&mut self) -> std::io::Result<()> {
         self.image.seek(SeekFrom::Start(0))?;
         self.holed = false;
         Ok(())
     }
 
-    /// Reads exactly `len` bytes at `offset`, or `None` when any of them is a
-    /// hole the volumes have not delivered.
+    // Reads exactly `len` bytes at `offset`, or `None` when any of them is a
+    // hole the volumes have not delivered.
     pub(super) fn read_exact_at(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
         let mut out = vec![0u8; len];
         self.image.seek(SeekFrom::Start(offset)).ok()?;
@@ -943,42 +943,42 @@ impl Seek for ContainerImage {
     }
 }
 
-/// What one attempt at reading a container's map produced.
+// What one attempt at reading a container's map produced.
 pub(super) enum ParseOutcome {
-    /// The end header parsed and every entry passed the coder gate.
+    // The end header parsed and every entry passed the coder gate.
     Facts(Box<SevenZipContainerFacts>),
-    /// Not enough of the container has arrived yet. The next article retries.
+    // Not enough of the container has arrived yet. The next article retries.
     Incomplete,
-    /// A verdict about the container. No further byte changes it.
+    // A verdict about the container. No further byte changes it.
     Refused(SevenZipRefusal),
-    /// The first bytes are not a 7z signature at all.
+    // The first bytes are not a 7z signature at all.
     NotSevenZip,
 }
 
-/// Reads the container's map, given an image over the volumes and their total
-/// length.
-///
-/// `image_complete` says whether every byte of every volume has arrived. It is
-/// the difference between "the reader hit a hole" — wait, the article is coming
-/// — and "the reader hit a hole in a container that is entirely present", which
-/// is a container whose own coordinates point outside itself.
-///
-/// `passwords` are the job's archive-password candidates, in the harvest's own
-/// priority order, so that a header-encrypted container opens instead of being
-/// refused unread. The list is the same one the `-hp` gate proves a RAR set's
-/// headers against, and for the same reason: a set whose key is the NZB-meta
-/// password while the spec carries an operator's guess would otherwise refuse
-/// for a password that was sitting right there.
-///
-/// Tried in order, after one attempt with no key at all — the overwhelming
-/// majority of containers have no encrypted header, and for those the first
-/// attempt is the only one. A container with no encrypted header ignores a key
-/// entirely, so the no-key attempt is not a special case so much as the first
-/// candidate.
-///
-/// The list is bounded at four by construction — `Explicit`, `NzbMeta`,
-/// `FilenameConvention`, at most one each, plus the no-key attempt — so the
-/// work this loop can do is bounded however many times the reader is asked.
+// Reads the container's map, given an image over the volumes and their total
+// length.
+//
+// `image_complete` says whether every byte of every volume has arrived. It is
+// the difference between "the reader hit a hole" — wait, the article is coming
+// — and "the reader hit a hole in a container that is entirely present", which
+// is a container whose own coordinates point outside itself.
+//
+// `passwords` are the job's archive-password candidates, in the harvest's own
+// priority order, so that a header-encrypted container opens instead of being
+// refused unread. The list is the same one the `-hp` gate proves a RAR set's
+// headers against, and for the same reason: a set whose key is the NZB-meta
+// password while the spec carries an operator's guess would otherwise refuse
+// for a password that was sitting right there.
+//
+// Tried in order, after one attempt with no key at all — the overwhelming
+// majority of containers have no encrypted header, and for those the first
+// attempt is the only one. A container with no encrypted header ignores a key
+// entirely, so the no-key attempt is not a special case so much as the first
+// candidate.
+//
+// The list is bounded at four by construction — `Explicit`, `NzbMeta`,
+// `FilenameConvention`, at most one each, plus the no-key attempt — so the
+// work this loop can do is bounded however many times the reader is asked.
 pub(super) fn parse_container(
     mut image: ContainerImage,
     total: u64,

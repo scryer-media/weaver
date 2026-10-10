@@ -1,6 +1,6 @@
 use super::*;
 
-/// A job of `files` files, each of `segments` articles.
+// A job of `files` files, each of `segments` articles.
 fn multi_file_job_spec(name: &str, files: usize, segments: u32) -> JobSpec {
     JobSpec {
         name: name.to_string(),
@@ -28,9 +28,9 @@ fn multi_file_job_spec(name: &str, files: usize, segments: u32) -> JobSpec {
     }
 }
 
-/// Serves the job's queue in dispatch order, answering every article with
-/// "no such article", and stops as soon as the job is no longer running.
-/// Returns the articles that were handed out, in order.
+// Serves the job's queue in dispatch order, answering every article with
+// "no such article", and stops as soon as the job is no longer running.
+// Returns the articles that were handed out, in order.
 fn serve_until_the_job_stops(pipeline: &mut Pipeline, job_id: JobId) -> Vec<SegmentId> {
     let mut dispatched = Vec::new();
     loop {
@@ -53,14 +53,14 @@ fn job_failed(pipeline: &Pipeline, job_id: JobId) -> Option<String> {
     }
 }
 
-/// A post whose every article is gone is answered for by one article per file.
-///
-/// The articles of a job are served file by file, so a post with tens of
-/// thousands of articles would otherwise have to work through a whole file
-/// before it even asked about the second one. One article of each of the
-/// leading files, served first, says the same thing in a handful of round
-/// trips — and it rides the ordinary dispatch order, so it costs no lane of
-/// its own.
+// A post whose every article is gone is answered for by one article per file.
+//
+// The articles of a job are served file by file, so a post with tens of
+// thousands of articles would otherwise have to work through a whole file
+// before it even asked about the second one. One article of each of the
+// leading files, served first, says the same thing in a handful of round
+// trips — and it rides the ordinary dispatch order, so it costs no lane of
+// its own.
 #[tokio::test]
 async fn a_post_whose_first_articles_are_all_missing_fails_on_the_sample() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -111,8 +111,8 @@ async fn a_post_whose_first_articles_are_all_missing_fails_on_the_sample() {
     );
 }
 
-/// A handful of files is not a sample. A small post that loses its first file
-/// is an ordinary damaged post, and the health arithmetic rules on it.
+// A handful of files is not a sample. A small post that loses its first file
+// is an ordinary damaged post, and the health arithmetic rules on it.
 #[tokio::test]
 async fn a_small_post_is_not_judged_on_its_first_articles() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -145,8 +145,8 @@ async fn a_small_post_is_not_judged_on_its_first_articles() {
     );
 }
 
-/// A post that is merely damaged keeps going. The sample only speaks when
-/// almost none of it answered.
+// A post that is merely damaged keeps going. The sample only speaks when
+// almost none of it answered.
 #[tokio::test]
 async fn a_sample_that_mostly_arrives_leaves_the_job_alone() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -191,7 +191,7 @@ async fn a_sample_that_mostly_arrives_leaves_the_job_alone() {
     );
 }
 
-/// A restart in the middle of the sample finishes it rather than forgetting it.
+// A restart in the middle of the sample finishes it rather than forgetting it.
 #[tokio::test]
 async fn a_restart_mid_sample_still_reaches_the_verdict() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -253,7 +253,7 @@ async fn a_restart_mid_sample_still_reaches_the_verdict() {
     );
 }
 
-/// The first articles of `job_id`, in file order.
+// The first articles of `job_id`, in file order.
 fn sample_in_file_order(pipeline: &Pipeline, job_id: JobId) -> Vec<SegmentId> {
     let mut sample: Vec<SegmentId> = pipeline
         .jobs
@@ -266,18 +266,18 @@ fn sample_in_file_order(pipeline: &Pipeline, job_id: JobId) -> Vec<SegmentId> {
     sample
 }
 
-/// Books the job's ordinary articles missing, in file order, until the job
-/// stops running, then answers any health probe that armed along the way —
-/// the health arithmetic's own confirmation, which is what lets it abort. The
-/// probe answer leaves one sample present so that the probe does not rule on
-/// the job itself. Nothing of the first-article sample is touched.
+// Books the job's ordinary articles missing, in file order, until the job
+// stops running, then answers any health probe that armed along the way —
+// the health arithmetic's own confirmation, which is what lets it abort. The
+// probe answer leaves one sample present so that the probe does not rule on
+// the job itself. Nothing of the first-article sample is touched.
 fn fail_ordinary_articles_until_the_job_stops(pipeline: &mut Pipeline, job_id: JobId) {
     book_ordinary_articles_missing(pipeline, job_id);
     answer_pending_health_probe(pipeline, job_id);
 }
 
-/// Answers the health probe round a job has armed, if any, confirming the
-/// damage with one sample present so the probe does not rule on the job.
+// Answers the health probe round a job has armed, if any, confirming the
+// damage with one sample present so the probe does not rule on the job.
 fn answer_pending_health_probe(pipeline: &mut Pipeline, job_id: JobId) {
     let Some(state) = pipeline.jobs.get(&job_id) else {
         return;
@@ -320,9 +320,9 @@ fn book_ordinary_articles_missing(pipeline: &mut Pipeline, job_id: JobId) {
     }
 }
 
-/// The verdict is taken the moment it is certain, not when the sample is
-/// complete: once the articles ruled missing reach the failure share of the
-/// whole sample, the ones still outstanding cannot change the answer.
+// The verdict is taken the moment it is certain, not when the sample is
+// complete: once the articles ruled missing reach the failure share of the
+// whole sample, the ones still outstanding cannot change the answer.
 #[tokio::test]
 async fn a_certain_sample_decides_before_it_is_complete() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -355,7 +355,7 @@ async fn a_certain_sample_decides_before_it_is_complete() {
     );
 }
 
-/// Marks a sampled first article delivered and lets the sample read it.
+// Marks a sampled first article delivered and lets the sample read it.
 fn deliver_first_article(pipeline: &mut Pipeline, segment_id: SegmentId) {
     let state = pipeline.jobs.get_mut(&segment_id.file_id.job_id).unwrap();
     state
@@ -367,8 +367,8 @@ fn deliver_first_article(pipeline: &mut Pipeline, segment_id: SegmentId) {
     pipeline.note_first_article_settled(segment_id);
 }
 
-/// A health abort with the sample short of the failure share, and unable to
-/// reach it, is a health failure and says so.
+// A health abort with the sample short of the failure share, and unable to
+// reach it, is a health failure and says so.
 #[tokio::test]
 async fn a_health_abort_below_the_share_keeps_the_health_error() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -401,11 +401,11 @@ async fn a_health_abort_below_the_share_keeps_the_health_error() {
     );
 }
 
-/// The health arithmetic can reach its abort before the sample has settled:
-/// under load the ordinary articles of a dead post are answered for as fast
-/// as its first ones. The abort then waits for the sample, so that the job
-/// fails with the sample's diagnosis when the sample reaches its share —
-/// whichever order the answers arrive in.
+// The health arithmetic can reach its abort before the sample has settled:
+// under load the ordinary articles of a dead post are answered for as fast
+// as its first ones. The abort then waits for the sample, so that the job
+// fails with the sample's diagnosis when the sample reaches its share —
+// whichever order the answers arrive in.
 #[tokio::test]
 async fn a_health_abort_waits_for_a_sample_that_can_still_decide() {
     use crate::jobs::model::HealthDeferralKind;
@@ -447,10 +447,10 @@ async fn a_health_abort_waits_for_a_sample_that_can_still_decide() {
     );
 }
 
-/// A held abort is not held past the point the sample can decide: when an
-/// outstanding first article is delivered and the share goes out of reach,
-/// the health arithmetic runs again on that delivery and fails the job with
-/// the health error, with no further damage needed to prompt it.
+// A held abort is not held past the point the sample can decide: when an
+// outstanding first article is delivered and the share goes out of reach,
+// the health arithmetic runs again on that delivery and fails the job with
+// the health error, with no further damage needed to prompt it.
 #[tokio::test]
 async fn a_held_health_abort_lands_when_the_sample_settles_short() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -490,13 +490,13 @@ async fn a_held_health_abort_lands_when_the_sample_settles_short() {
     );
 }
 
-/// A health abort with the sample already past the failure share fails the
-/// job with the sample's diagnosis, worded as the complete sample words it.
-///
-/// The sample's rulings are recorded here without the gate being read, which
-/// is the state a health abort can meet: the ruling that made the sample
-/// certain landed, and the health arithmetic ran before anything read the
-/// sample again.
+// A health abort with the sample already past the failure share fails the
+// job with the sample's diagnosis, worded as the complete sample words it.
+//
+// The sample's rulings are recorded here without the gate being read, which
+// is the state a health abort can meet: the ruling that made the sample
+// certain landed, and the health arithmetic ran before anything read the
+// sample again.
 #[tokio::test]
 async fn a_health_abort_past_the_share_fails_with_the_sample_diagnosis() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -526,9 +526,9 @@ async fn a_health_abort_past_the_share_fails_with_the_sample_diagnosis() {
     );
 }
 
-/// A job whose payload files are `payload_segments` articles each (one entry
-/// per file), followed by one PAR2 recovery volume of `recovery_segments`
-/// articles.
+// A job whose payload files are `payload_segments` articles each (one entry
+// per file), followed by one PAR2 recovery volume of `recovery_segments`
+// articles.
 fn job_spec_with_recovery(name: &str, payload_segments: &[u32], recovery_segments: u32) -> JobSpec {
     let file = |filename: String, role: FileRole, segments: u32, tag: String| FileSpec {
         filename,
@@ -577,9 +577,9 @@ fn job_spec_with_recovery(name: &str, payload_segments: &[u32], recovery_segment
     }
 }
 
-/// The sample counts files, not bytes. Small files ruled missing beside a
-/// recovery volume that covers all of them are damage the repair can undo,
-/// and the gate leaves the job to the health arithmetic.
+// The sample counts files, not bytes. Small files ruled missing beside a
+// recovery volume that covers all of them are damage the repair can undo,
+// and the gate leaves the job to the health arithmetic.
 #[tokio::test]
 async fn missing_small_files_the_recovery_covers_leave_the_job_alone() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -608,8 +608,8 @@ async fn missing_small_files_the_recovery_covers_leave_the_job_alone() {
     );
 }
 
-/// Recovery that cannot cover the files the sample rules missing does not
-/// hold the gate back.
+// Recovery that cannot cover the files the sample rules missing does not
+// hold the gate back.
 #[tokio::test]
 async fn missing_files_beyond_the_recovery_still_fail_on_the_sample() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -637,10 +637,10 @@ async fn missing_files_beyond_the_recovery_still_fail_on_the_sample() {
     );
 }
 
-/// A parsed recovery set measures both sides in its own slices. The NZB's
-/// declared sizes are yEnc-encoded and run a few percent above the decoded
-/// bytes the set describes, so ten files lost outright can overrun the
-/// capacity in declared bytes while fitting it exactly in slices.
+// A parsed recovery set measures both sides in its own slices. The NZB's
+// declared sizes are yEnc-encoded and run a few percent above the decoded
+// bytes the set describes, so ten files lost outright can overrun the
+// capacity in declared bytes while fitting it exactly in slices.
 #[tokio::test]
 async fn a_parsed_set_weighs_missing_files_in_its_own_slices() {
     const DECLARED: u64 = 512;
@@ -709,9 +709,9 @@ async fn a_parsed_set_weighs_missing_files_in_its_own_slices() {
     );
 }
 
-/// Recovery volumes are never sampled, and a post that lists them first must
-/// not have them use up the sample's window: every payload file behind them
-/// still leads with its first article, and the gate still rules.
+// Recovery volumes are never sampled, and a post that lists them first must
+// not have them use up the sample's window: every payload file behind them
+// still leads with its first article, and the gate still rules.
 #[tokio::test]
 async fn recovery_volumes_listed_first_do_not_crowd_payload_out_of_the_sample() {
     const RECOVERY_VOLUMES: usize = 32;
@@ -751,20 +751,20 @@ async fn recovery_volumes_listed_first_do_not_crowd_payload_out_of_the_sample() 
     );
 }
 
-/// What [`two_set_verdict`] books missing.
+// What [`two_set_verdict`] books missing.
 #[derive(Clone, Copy)]
 enum TwoSetLoss {
-    /// The first articles of files 0-9: five of each set's files.
+    // The first articles of files 0-9: five of each set's files.
     TenSampledFiles,
-    /// The first articles of files 5-7, all set B's.
+    // The first articles of files 5-7, all set B's.
     ThreeSetBFiles,
-    /// Articles 1 onward of file 11, set B's sixteen-article file.
+    // Articles 1 onward of file 11, set B's sixteen-article file.
     SetBFileArticles(u32),
 }
 
-/// Completion repairs each set's files from that set, so neither set can spend
-/// its recovery slices on files described only by the other. With `shared`,
-/// both sets describe every payload file, and either can repair any of them.
+// Completion repairs each set's files from that set, so neither set can spend
+// its recovery slices on files described only by the other. With `shared`,
+// both sets describe every payload file, and either can repair any of them.
 async fn two_set_verdict(
     blocks_per_set: [u32; 2],
     recovery_segments: u32,
@@ -956,9 +956,9 @@ async fn health_deferral_cannot_spend_one_sets_slices_on_another() {
     );
 }
 
-/// A damaged file costs its set every slice it lost, not one slice whatever it
-/// lost: set A's spare slices do not stretch set B's two to cover a file that
-/// lost three or more.
+// A damaged file costs its set every slice it lost, not one slice whatever it
+// lost: set A's spare slices do not stretch set B's two to cover a file that
+// lost three or more.
 #[tokio::test]
 async fn health_deferral_charges_a_set_every_slice_its_file_lost() {
     assert!(
@@ -976,8 +976,8 @@ async fn health_deferral_charges_a_set_every_slice_its_file_lost() {
     );
 }
 
-/// A file both sets describe can be repaired from either, so it is not
-/// charged to the set listed first when that set has nothing to give.
+// A file both sets describe can be repaired from either, so it is not
+// charged to the set listed first when that set has nothing to give.
 #[tokio::test]
 async fn a_lost_file_both_sets_describe_is_charged_to_the_set_that_can_repair_it() {
     assert!(

@@ -1,11 +1,11 @@
-//! Explicit, file-backed clock override for deterministic end-to-end tests.
-//!
-//! Production always uses the system clock. The override is consulted only
-//! when `WEAVER_E2E_MODE=1` (or `true`) and `WEAVER_E2E_CLOCK_FILE` points to
-//! an RFC 3339 timestamp. The process-start configuration is cached, while the
-//! file itself is read on every call so an isolated e2e flow can advance reset
-//! boundaries without waiting for wall-clock time. The timestamp is an instant
-//! projected into the process timezone; the release harness pins `TZ=UTC`.
+// Explicit, file-backed clock override for deterministic end-to-end tests.
+//
+// Production always uses the system clock. The override is consulted only
+// when `WEAVER_E2E_MODE=1` (or `true`) and `WEAVER_E2E_CLOCK_FILE` points to
+// an RFC 3339 timestamp. The process-start configuration is cached, while the
+// file itself is read on every call so an isolated e2e flow can advance reset
+// boundaries without waiting for wall-clock time. The timestamp is an instant
+// projected into the process timezone; the release harness pins `TZ=UTC`.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -38,9 +38,9 @@ pub fn utc_now() -> DateTime<Utc> {
     local_now().with_timezone(&Utc)
 }
 
-/// Seconds since the Unix epoch on the same clock as [`local_now`], without
-/// resolving the local timezone. Per-article accounting only buckets and
-/// compares instants; it never needs a calendar.
+// Seconds since the Unix epoch on the same clock as [`local_now`], without
+// resolving the local timezone. Per-article accounting only buckets and
+// compares instants; it never needs a calendar.
 pub fn unix_seconds() -> i64 {
     match clock_config() {
         ClockConfig::System => Utc::now().timestamp(),
@@ -72,7 +72,7 @@ fn clock_config() -> &'static ClockConfig {
     })
 }
 
-/// Whether `WEAVER_E2E_MODE` is `1` or `true`.
+// Whether `WEAVER_E2E_MODE` is `1` or `true`.
 pub fn e2e_mode_enabled() -> bool {
     std::env::var(E2E_MODE_ENV)
         .ok()

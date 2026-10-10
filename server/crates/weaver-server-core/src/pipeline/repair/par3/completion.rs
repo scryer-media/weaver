@@ -1,4 +1,4 @@
-//! PAR3 completion policy and reconciliation of native verified installations.
+// PAR3 completion policy and reconciliation of native verified installations.
 
 use super::*;
 use crate::pipeline::JobStatus;
@@ -8,8 +8,8 @@ use par3_rs::session_repair::InstalledFile;
 mod pressure;
 
 impl Pipeline {
-    /// A refused virtual image becomes ordinary disk-backed source work. The
-    /// existing demotion ticket fences verification and owns reconstruction.
+    // A refused virtual image becomes ordinary disk-backed source work. The
+    // existing demotion ticket fences verification and owns reconstruction.
     pub(in crate::pipeline) async fn spill_par3_source(&mut self, job_id: JobId) -> bool {
         if self.direct_demotion_in_flight.contains_key(&job_id) {
             return true;
@@ -132,8 +132,8 @@ impl Pipeline {
         true
     }
 
-    /// Read-only presentation of a drained download awaiting native work.
-    /// Scheduler phases retain their own transition and completion contracts.
+    // Read-only presentation of a drained download awaiting native work.
+    // Scheduler phases retain their own transition and completion contracts.
     pub(in crate::pipeline) fn show_par3_verification_wait(&self, job_id: JobId) -> bool {
         self.par3_runtime
             .as_ref()
@@ -145,8 +145,8 @@ impl Pipeline {
             && !self.job_has_pending_download_pipeline_work(job_id)
     }
 
-    /// Return true when PAR3 owns the next completion step. PAR2 keeps its
-    /// existing first opportunity when a job has a usable PAR2 set.
+    // Return true when PAR3 owns the next completion step. PAR2 keeps its
+    // existing first opportunity when a job has a usable PAR2 set.
     pub(in crate::pipeline) async fn check_par3_completion(&mut self, job_id: JobId) -> bool {
         let admitted = self
             .par3_runtime
@@ -473,8 +473,8 @@ impl Pipeline {
         }
     }
 
-    /// Resolve a deferred archive check only after all native PAR3 assessments
-    /// are complete. PAR3 verification does not override an archive checksum.
+    // Resolve a deferred archive check only after all native PAR3 assessments
+    // are complete. PAR3 verification does not override an archive checksum.
     async fn settle_par3_archive_checks(&mut self, job_id: JobId) -> bool {
         let sets: Vec<_> = self
             .direct_store

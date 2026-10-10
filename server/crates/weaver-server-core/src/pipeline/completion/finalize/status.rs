@@ -47,8 +47,8 @@ impl Pipeline {
         self.persist_active_runtime_at(job_id, None);
     }
 
-    /// [`Self::persist_active_runtime`] that also records `output_dir` as the
-    /// job's output location in the same ordered write.
+    // [`Self::persist_active_runtime`] that also records `output_dir` as the
+    // job's output location in the same ordered write.
     pub(crate) fn persist_active_runtime_at(
         &self,
         job_id: JobId,
@@ -928,16 +928,16 @@ impl Pipeline {
         }
     }
 
-    /// Remove the volume images of container sets whose members were installed
-    /// straight from the wire.
-    ///
-    /// Such a set never writes its volumes, so there is normally nothing here.
-    /// A repair that rebuilt a volume is the exception: it lands the rebuilt
-    /// image at the volume's own name so the set can route it, and once the set
-    /// is finalized the image is spent. A job with only installed sets never
-    /// reaches the extraction cleanup that removes archive parts, so without
-    /// this the rebuilt volume would be released next to the members it
-    /// carried.
+    // Remove the volume images of container sets whose members were installed
+    // straight from the wire.
+    //
+    // Such a set never writes its volumes, so there is normally nothing here.
+    // A repair that rebuilt a volume is the exception: it lands the rebuilt
+    // image at the volume's own name so the set can route it, and once the set
+    // is finalized the image is spent. A job with only installed sets never
+    // reaches the extraction cleanup that removes archive parts, so without
+    // this the rebuilt volume would be released next to the members it
+    // carried.
     pub(super) async fn cleanup_installed_direct_set_volumes(&self, job_id: JobId) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;

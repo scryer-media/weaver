@@ -1,9 +1,9 @@
-//! Support reports: an NZB analysis plus what Weaver did with the job.
-//!
-//! The NZB half is [`weaver_nzb::analysis`]. This half appends the job's
-//! outcome from state Weaver already keeps, under the same rule: nothing in
-//! a report names the job, a file, a path, a server host or a password.
-//! Every string is a constant from a fixed list or a generated token.
+// Support reports: an NZB analysis plus what Weaver did with the job.
+//
+// The NZB half is [`weaver_nzb::analysis`]. This half appends the job's
+// outcome from state Weaver already keeps, under the same rule: nothing in
+// a report names the job, a file, a path, a server host or a password.
+// Every string is a constant from a fixed list or a generated token.
 
 #[cfg(test)]
 mod tests;
@@ -21,7 +21,7 @@ use crate::jobs::support_facts::JobSupportFacts;
 use crate::persistence::Database;
 use crate::{JobHistoryRow, JobId, JobInfo, SchedulerHandle, StateError};
 
-/// A report in both forms: text to paste, JSON to attach.
+// A report in both forms: text to paste, JSON to attach.
 #[derive(Debug, Clone)]
 pub struct SupportReport {
     pub text: String,
@@ -42,7 +42,7 @@ pub enum SupportReportError {
     Task(String),
 }
 
-/// Where the report was made. Every field is a fixed name.
+// Where the report was made. Every field is a fixed name.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ReportEnvironment {
     pub weaver_version: &'static str,
@@ -66,7 +66,7 @@ impl ReportEnvironment {
     }
 }
 
-/// Analyze NZB bytes that nobody submitted: the standalone analyzer.
+// Analyze NZB bytes that nobody submitted: the standalone analyzer.
 pub fn analyze_nzb_bytes(
     xml: &[u8],
     environment: &ReportEnvironment,
@@ -76,7 +76,7 @@ pub fn analyze_nzb_bytes(
     Ok(render(&nzb, None, environment))
 }
 
-/// The support report for one job, live or finished.
+// The support report for one job, live or finished.
 pub async fn job_support_report(
     db: &Database,
     handle: &SchedulerHandle,
@@ -92,7 +92,7 @@ pub async fn job_support_report(
     .map_err(|error| SupportReportError::Task(error.to_string()))?
 }
 
-/// The blocking body of [`job_support_report`], with every input explicit.
+// The blocking body of [`job_support_report`], with every input explicit.
 pub fn build_job_support_report(
     db: &Database,
     live: Option<JobInfo>,
@@ -138,7 +138,7 @@ fn analyze_xml(
     Ok(analyze(&nzb, &diagnostics, now_epoch_secs).with_weaver_version(environment.weaver_version))
 }
 
-/// The wall clock, for callers that analyze "as of now".
+// The wall clock, for callers that analyze "as of now".
 pub fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -179,7 +179,7 @@ fn render(
     SupportReport { text, json }
 }
 
-/// Where the job stands now, from the queue or from history.
+// Where the job stands now, from the queue or from history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobSource {
@@ -187,7 +187,7 @@ pub enum JobSource {
     History,
 }
 
-/// A failure message reduced to its cause. The message itself can name files.
+// A failure message reduced to its cause. The message itself can name files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureVerdict {
@@ -257,7 +257,7 @@ impl FailureVerdict {
     }
 }
 
-/// A server's stand-in: `s3` is configured server id 3, never its host.
+// A server's stand-in: `s3` is configured server id 3, never its host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerToken(u32);
 
@@ -280,11 +280,11 @@ pub struct ProviderOutcome {
     pub wire_bytes: u64,
 }
 
-/// The job's first direct-store demotion.
-///
-/// `reason` is the demotion's stable label. A stored label that is not made
-/// of lowercase letters, digits and underscores is read back as `unknown`, so
-/// the row cannot carry text into the report.
+// The job's first direct-store demotion.
+//
+// `reason` is the demotion's stable label. A stored label that is not made
+// of lowercase letters, digits and underscores is read back as `unknown`, so
+// the row cannot carry text into the report.
 #[derive(Debug, Clone, Serialize)]
 pub struct DemotionOutcome {
     pub reason: String,
@@ -294,8 +294,8 @@ pub struct DemotionOutcome {
     pub sets: u32,
 }
 
-/// A gap's position: the NZB report's file token and the segment's place in
-/// that file's segment list, counted from 1.
+// A gap's position: the NZB report's file token and the segment's place in
+// that file's segment list, counted from 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GapToken {
     file: u32,
@@ -320,16 +320,16 @@ pub struct ServerGapOutcome {
     pub refused: u32,
 }
 
-/// The job's articles that never arrived.
+// The job's articles that never arrived.
 #[derive(Debug, Clone, Serialize)]
 pub struct GapOutcome {
-    /// Articles no server had.
+    // Articles no server had.
     pub missing: u32,
-    /// Segments whose retries or decodes ran out.
+    // Segments whose retries or decodes ran out.
     pub failed: u32,
-    /// Per server, how many of those it was asked for and refused.
+    // Per server, how many of those it was asked for and refused.
     pub servers: Vec<ServerGapOutcome>,
-    /// The first gaps booked, in position order.
+    // The first gaps booked, in position order.
     pub sample: Vec<GapToken>,
 }
 
@@ -397,7 +397,7 @@ impl StageOutcome {
     }
 }
 
-/// How the output directory is written, never what it says.
+// How the output directory is written, never what it says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PathKind {
@@ -461,7 +461,7 @@ pub struct DiscardCount {
     pub bytes: u64,
 }
 
-/// What the job did, from state Weaver already keeps.
+// What the job did, from state Weaver already keeps.
 #[derive(Debug, Clone, Serialize)]
 pub struct JobSection {
     pub source: JobSource,
@@ -470,7 +470,7 @@ pub struct JobSection {
     pub post_state: Option<&'static str>,
     pub run_state: Option<&'static str>,
     pub failure: Option<FailureVerdict>,
-    /// 0-1000.
+    // 0-1000.
     pub health: u32,
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
@@ -495,7 +495,7 @@ pub struct JobSection {
     pub run_secs: Option<u64>,
 }
 
-/// Statuses a job can be stored with. Anything else reads as `other`.
+// Statuses a job can be stored with. Anything else reads as `other`.
 const KNOWN_STATUSES: &[&str] = &[
     "awaiting_queue_scripts",
     "queued",
@@ -636,8 +636,8 @@ impl JobSection {
         section
     }
 
-    /// Fold the job's recorded events into stage outcomes. Only the event
-    /// kinds are read; their messages can name files.
+    // Fold the job's recorded events into stage outcomes. Only the event
+    // kinds are read; their messages can name files.
     pub fn apply_events(&mut self, events: &[JobEvent]) {
         for event in events {
             match event.kind.as_str() {
@@ -663,7 +663,7 @@ impl JobSection {
         }
     }
 
-    /// The job's stored demotion and article-gap summary.
+    // The job's stored demotion and article-gap summary.
     pub fn apply_support_facts(&mut self, facts: &JobSupportFacts, now_epoch_secs: u64) {
         self.demotion = DemotionOutcome::of(facts, now_epoch_secs);
         self.gaps = GapOutcome::of(facts);
@@ -802,8 +802,8 @@ impl JobSection {
     }
 }
 
-/// A failure or completion is final for the run it ends; a later start
-/// begins a new run.
+// A failure or completion is final for the run it ends; a later start
+// begins a new run.
 fn advance(current: StageOutcome, next: StageOutcome) -> StageOutcome {
     match (current, next) {
         (_, StageOutcome::Started) => StageOutcome::Started,

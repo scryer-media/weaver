@@ -22,13 +22,13 @@ const INTERNAL_METADATA_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS weaver_int
 const LAST_FULL_VACUUM_KEY: &str = "sqlite_full_vacuum_success_epoch_secs";
 const INCREMENTAL_NO_PROGRESS_LIMIT: u64 = 2;
 
-/// Hot tables whose planner statistics are refreshed by the Postgres maintenance
-/// pass. These are the high-churn read/write tables behind the queue, history,
-/// event log, and async-operation surfaces; stale statistics on them are what
-/// make Postgres plan poorly (sqlite refreshes its own via VACUUM/analyze during
-/// the sqlite pass). Table identifiers are compile-time constants, never built
-/// from runtime input, so they are safe to interpolate into `ANALYZE` directly.
-/// VACUUM is intentionally omitted: Postgres autovacuum owns space reclamation.
+// Hot tables whose planner statistics are refreshed by the Postgres maintenance
+// pass. These are the high-churn read/write tables behind the queue, history,
+// event log, and async-operation surfaces; stale statistics on them are what
+// make Postgres plan poorly (sqlite refreshes its own via VACUUM/analyze during
+// the sqlite pass). Table identifiers are compile-time constants, never built
+// from runtime input, so they are safe to interpolate into `ANALYZE` directly.
+// VACUUM is intentionally omitted: Postgres autovacuum owns space reclamation.
 pub(crate) const POSTGRES_ANALYZE_TABLES: &[&str] = &[
     "job_events",
     "job_history",
@@ -117,10 +117,10 @@ pub(crate) struct DbMaintenanceSnapshot {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PostgresMaintenanceReport {
-    /// Tables that were successfully `ANALYZE`d.
+    // Tables that were successfully `ANALYZE`d.
     pub analyzed_tables: Vec<&'static str>,
-    /// Tables whose `ANALYZE` failed, with the error text. A single table
-    /// failing does not abort the pass; the rest are still analyzed.
+    // Tables whose `ANALYZE` failed, with the error text. A single table
+    // failing does not abort the pass; the rest are still analyzed.
     pub failed_tables: Vec<(&'static str, String)>,
     pub elapsed_ms: u64,
 }
@@ -190,10 +190,10 @@ impl Database {
         })
     }
 
-    /// Refresh Postgres planner statistics for the hot tables via per-table
-    /// `ANALYZE`. Returns the report of which tables were analyzed. Requires a
-    /// Postgres datastore; sqlite uses [`Database::run_sqlite_maintenance_pass`]
-    /// instead.
+    // Refresh Postgres planner statistics for the hot tables via per-table
+    // `ANALYZE`. Returns the report of which tables were analyzed. Requires a
+    // Postgres datastore; sqlite uses [`Database::run_sqlite_maintenance_pass`]
+    // instead.
     pub(crate) fn run_postgres_maintenance_pass(
         &self,
     ) -> Result<PostgresMaintenanceReport, StateError> {

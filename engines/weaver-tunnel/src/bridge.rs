@@ -1,4 +1,4 @@
-//! An explicitly owned, revocable loopback bridge for socket-based consumers.
+// An explicitly owned, revocable loopback bridge for socket-based consumers.
 use crate::{NoopTunnelObserver, TunnelError, TunnelProvider, socks5::Socks5Front};
 use std::{
     collections::HashMap,
@@ -12,7 +12,7 @@ use std::{
 
 type ReadCallback = Arc<dyn Fn(usize) + Send + Sync>;
 
-/// Protocol-aware feedback for one connection, independent of other streams.
+// Protocol-aware feedback for one connection, independent of other streams.
 #[derive(Default)]
 pub struct ConnectionOutcome {
     callbacks: Mutex<OutcomeCallbacks>,
@@ -36,7 +36,7 @@ impl std::fmt::Debug for ConnectionOutcome {
     }
 }
 impl ConnectionOutcome {
-    /// Recall an idle socket now, or a busy socket at its next article boundary.
+    // Recall an idle socket now, or a busy socket at its next article boundary.
     pub fn on_retire(&self, callback: impl Fn() + Send + Sync + 'static) {
         let mut callbacks = self.callbacks.lock().expect("connection outcome");
         if callbacks.retiring {
@@ -78,7 +78,7 @@ impl ConnectionOutcome {
         }
     }
 
-    /// Register during connection setup, before the first read seals the callbacks.
+    // Register during connection setup, before the first read seals the callbacks.
     pub fn on_read(&self, callback: impl Fn(usize) + Send + Sync + 'static) {
         debug_assert!(
             self.reads.get().is_none(),
@@ -150,7 +150,7 @@ impl ConnectionOutcome {
             callback();
         }
     }
-    /// The socket owner reports closure independently of failure evidence.
+    // The socket owner reports closure independently of failure evidence.
     pub fn closed(&self) {
         let callbacks = {
             let mut callbacks = self.callbacks.lock().expect("connection outcome");
@@ -250,8 +250,8 @@ impl Bridge {
         }))
     }
 
-    /// Dial on the owning runtime and hand the stream directly to an in-process
-    /// consumer. Dropping this future cancels establishment; no relay is used.
+    // Dial on the owning runtime and hand the stream directly to an in-process
+    // consumer. Dropping this future cancels establishment; no relay is used.
     pub async fn dial(
         &self,
         host: &str,

@@ -1,9 +1,9 @@
-//! NZBGet `manifest.json` v2 parsing and legacy bare-script adapter detection.
-//!
-//! The manifest supplies a display name, the options schema (including which
-//! options are secret), and the NZBGet adapter. Anything without a manifest is a
-//! bare script and runs under the SABnzbd contract unless it carries NZBGet's
-//! legacy header comment. A Go script carries that header in `//` comments.
+// NZBGet `manifest.json` v2 parsing and legacy bare-script adapter detection.
+//
+// The manifest supplies a display name, the options schema (including which
+// options are secret), and the NZBGet adapter. Anything without a manifest is a
+// bare script and runs under the SABnzbd contract unless it carries NZBGet's
+// legacy header comment. A Go script carries that header in `//` comments.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -14,7 +14,7 @@ use super::model::{
     ScriptSelectValue, ScriptTaskTime,
 };
 
-/// Manifest parse failure without leaking manifest contents.
+// Manifest parse failure without leaking manifest contents.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ManifestError {
     InvalidJson,
@@ -41,7 +41,7 @@ impl From<PostProcessingValidationError> for ManifestError {
     }
 }
 
-/// The NZBGet manifest file name looked for inside a package directory.
+// The NZBGet manifest file name looked for inside a package directory.
 pub const NZBGET_MANIFEST_FILE: &str = "manifest.json";
 
 const LEGACY_NZBGET_HEADER: &str = "### NZBGET ";
@@ -49,7 +49,7 @@ const MAX_LEGACY_PREAMBLE_LINES: usize = 64;
 const MAX_LEGACY_PREAMBLE_BYTES: usize = 8 * 1024;
 pub const MAX_LEGACY_METADATA_BYTES: usize = 1024 * 1024;
 
-/// Detect NZBGet kind declarations only in the initial comment preamble.
+// Detect NZBGet kind declarations only in the initial comment preamble.
 pub fn detect_bare_script_adapter(script: &str) -> ScriptAdapter {
     if bare_script_kind_header(script).is_some() {
         ScriptAdapter::Nzbget
@@ -91,12 +91,12 @@ fn bare_script_kind_header(script: &str) -> Option<&str> {
     None
 }
 
-/// The legacy header of a Go script, as the `#` comments every other bare
-/// script carries it in. Go has no `#` comments, so a Go script writes the
-/// same lines inside its leading `//` comments: `// ### NZBGET SCAN SCRIPT`,
-/// `// #ApiToken=`. Each of those lines comes back without the `//` and the
-/// one space after it. A comment that is not a header line, `//go:build`
-/// among them, comes back blank, and the header ends at the first line of code.
+// The legacy header of a Go script, as the `#` comments every other bare
+// script carries it in. Go has no `#` comments, so a Go script writes the
+// same lines inside its leading `//` comments: `// ### NZBGET SCAN SCRIPT`,
+// `// #ApiToken=`. Each of those lines comes back without the `//` and the
+// one space after it. A comment that is not a header line, `//go:build`
+// among them, comes back blank, and the header ends at the first line of code.
 pub fn go_script_header(script: &str) -> String {
     let script = script.strip_prefix('\u{feff}').unwrap_or(script);
     let mut header = String::new();
@@ -139,9 +139,9 @@ pub fn apply_bare_script_declarations(manifest: ScriptManifest, script: &str) ->
     apply_declarations(manifest, kinds, queue_events, task_times)
 }
 
-/// Words that mark a header option as a credential when one of them is a
-/// whole word of the option's name. A hint for the form, not a lock: the
-/// operator may still save the input as plain text.
+// Words that mark a header option as a credential when one of them is a
+// whole word of the option's name. A hint for the form, not a lock: the
+// operator may still save the input as plain text.
 const SECRET_NAME_HINTS: [&str; 7] = [
     "key",
     "apikey",
@@ -151,14 +151,14 @@ const SECRET_NAME_HINTS: [&str; 7] = [
     "passphrase",
     "secret",
 ];
-/// `pass` names a credential only as the last word of the name (`SmtpPass`,
-/// `DB_PASS`); leading, as in `PassThrough`, it means something else.
+// `pass` names a credential only as the last word of the name (`SmtpPass`,
+// `DB_PASS`); leading, as in `PassThrough`, it means something else.
 const TRAILING_SECRET_NAME_HINT: &str = "pass";
 const MAX_HEADER_OPTIONS: usize = 256;
 
-/// The words of an option name, lowercased: split on `_`, `-`, `.` and
-/// whitespace, on lower-to-upper case changes, before the last capital of an
-/// acronym run (`APIKey` is `api` and `key`), and between letters and digits.
+// The words of an option name, lowercased: split on `_`, `-`, `.` and
+// whitespace, on lower-to-upper case changes, before the last capital of an
+// acronym run (`APIKey` is `api` and `key`), and between letters and digits.
 fn option_name_words(name: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
@@ -190,7 +190,7 @@ fn option_name_words(name: &str) -> Vec<String> {
     words
 }
 
-/// Whether an option's name says it holds a credential.
+// Whether an option's name says it holds a credential.
 pub fn option_name_suggests_secret(name: &str) -> bool {
     let words = option_name_words(name);
     let is_hint = |word: &str| SECRET_NAME_HINTS.contains(&word);
@@ -203,10 +203,10 @@ pub fn option_name_suggests_secret(name: &str) -> bool {
             .is_some_and(|word| word == TRAILING_SECRET_NAME_HINT)
 }
 
-/// The options a bare NZBGet script declares in its header: the `#Name=value`
-/// lines of the `### OPTIONS ###` section, each with the comment lines above
-/// it as its description. An option whose name reads as a credential is
-/// declared secret and loses its default, since a secret never has one.
+// The options a bare NZBGet script declares in its header: the `#Name=value`
+// lines of the `### OPTIONS ###` section, each with the comment lines above
+// it as its description. An option whose name reads as a credential is
+// declared secret and loses its default, since a secret never has one.
 pub fn bare_script_options(script: &str) -> Vec<ScriptOption> {
     if bare_script_kind_header(script).is_none() {
         return Vec::new();
@@ -350,7 +350,7 @@ fn apply_declarations(
     manifest.with_declarations(kinds, events, times, problems)
 }
 
-/// Parses the NZBGet v24+/v2 manifest contract.
+// Parses the NZBGet v24+/v2 manifest contract.
 pub fn parse_nzbget_manifest(input: &str) -> Result<ScriptManifest, ManifestError> {
     let value: Value = serde_json::from_str(input).map_err(|_| ManifestError::InvalidJson)?;
     if !value.is_object() {
@@ -441,9 +441,9 @@ struct NzbgetOptionRaw {
     display_name: String,
     description: Vec<Value>,
     select: Vec<Value>,
-    /// NZBGet has no secret option type; weaver honours an explicit opt-in so
-    /// credentials in a manifest package go through the settings encryption
-    /// envelope and are masked in the UI.
+    // NZBGet has no secret option type; weaver honours an explicit opt-in so
+    // credentials in a manifest package go through the settings encryption
+    // envelope and are masked in the UI.
     #[serde(default)]
     secret: bool,
 }

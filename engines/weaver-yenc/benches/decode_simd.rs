@@ -73,10 +73,10 @@ fn bigbang_like_body() -> Vec<u8> {
     body
 }
 
-/// Column-accurate yEnc encoding at 128 encoded columns, matching what real
-/// posts (and rapidyenc's own bench) look like. `bigbang_like_body` breaks
-/// after 128 *input* bytes instead, which shifts line-break phase relative to
-/// the decoder's 64-byte windows and historically flattered the kernel.
+// Column-accurate yEnc encoding at 128 encoded columns, matching what real
+// posts (and rapidyenc's own bench) look like. `bigbang_like_body` breaks
+// after 128 *input* bytes instead, which shifts line-break phase relative to
+// the decoder's 64-byte windows and historically flattered the kernel.
 fn real_yenc_128col_body() -> Vec<u8> {
     let mut body = Vec::with_capacity(800 * 1024);
     let mut col = 0usize;
@@ -110,8 +110,8 @@ fn real_yenc_128col_body() -> Vec<u8> {
     body
 }
 
-/// Kernel-only lane: rapidyenc-semantics raw decode, no CRC. Directly
-/// comparable to `rapidyenc_decode` numbers from the parity bench.
+// Kernel-only lane: rapidyenc-semantics raw decode, no CRC. Directly
+// comparable to `rapidyenc_decode` numbers from the parity bench.
 fn bench_decode_only(c: &mut Criterion, name: &str, input: &[u8]) {
     let mut output = vec![0u8; input.len() + 64];
     c.bench_function(name, |b| {

@@ -1,17 +1,17 @@
-//! Secret removal for everything the diagnostics package collects.
-//!
-//! The package is written to be attached to a bug report, so the redaction
-//! rule is deliberately blunt: a key whose *name* suggests a credential loses
-//! its value, whatever the value happens to look like. Matching on names rather
-//! than on value shapes is what keeps a newly added credential field redacted
-//! on the day it is added, without anyone having to remember this module
-//! exists.
+// Secret removal for everything the diagnostics package collects.
+//
+// The package is written to be attached to a bug report, so the redaction
+// rule is deliberately blunt: a key whose *name* suggests a credential loses
+// its value, whatever the value happens to look like. Matching on names rather
+// than on value shapes is what keeps a newly added credential field redacted
+// on the day it is added, without anyone having to remember this module
+// exists.
 
-/// The single stand-in every removed value is replaced with.
+// The single stand-in every removed value is replaced with.
 pub(super) const REDACTED: &str = "<redacted>";
 
-/// Lowercases a key and drops every non-alphanumeric character, so
-/// `api_key`, `apiKey` and `API-KEY` all match the same needle.
+// Lowercases a key and drops every non-alphanumeric character, so
+// `api_key`, `apiKey` and `API-KEY` all match the same needle.
 fn normalize_key(key: &str) -> String {
     key.chars()
         .filter(|character| character.is_ascii_alphanumeric())
@@ -19,11 +19,11 @@ fn normalize_key(key: &str) -> String {
         .collect()
 }
 
-/// Needles for the GraphQL payloads (servers, settings, and anything else that
-/// grows a credential field later).
-///
-/// `username` is on the list because a provider account name identifies the
-/// subscription, and a bug report is not the place for it.
+// Needles for the GraphQL payloads (servers, settings, and anything else that
+// grows a credential field later).
+//
+// `username` is on the list because a provider account name identifies the
+// subscription, and a bug report is not the place for it.
 const SENSITIVE_JSON_NEEDLES: [&str; 12] = [
     "password",
     "passwd",
@@ -39,11 +39,11 @@ const SENSITIVE_JSON_NEEDLES: [&str; 12] = [
     "authorization",
 ];
 
-/// Needles for on-disk configuration files, where a bare `key` is far more
-/// likely to be a credential than a structural field name.
+// Needles for on-disk configuration files, where a bare `key` is far more
+// likely to be a credential than a structural field name.
 const SENSITIVE_CONFIG_NEEDLES: [&str; 4] = ["password", "secret", "key", "token"];
 
-/// Whether a JSON object key names something that must not leave the host.
+// Whether a JSON object key names something that must not leave the host.
 pub(super) fn is_sensitive_json_key(key: &str) -> bool {
     let normalized = normalize_key(key);
     SENSITIVE_JSON_NEEDLES
@@ -51,7 +51,7 @@ pub(super) fn is_sensitive_json_key(key: &str) -> bool {
         .any(|needle| normalized.contains(needle))
 }
 
-/// Whether a configuration key names something that must not leave the host.
+// Whether a configuration key names something that must not leave the host.
 pub(super) fn is_sensitive_config_key(key: &str) -> bool {
     let normalized = normalize_key(key);
     SENSITIVE_CONFIG_NEEDLES
@@ -59,11 +59,11 @@ pub(super) fn is_sensitive_config_key(key: &str) -> bool {
         .any(|needle| normalized.contains(needle))
 }
 
-/// Replaces every sensitively-named value in a JSON tree, in place.
-///
-/// A redacted key keeps its key and its null-ness: a field that was absent
-/// stays absent and a field that was `null` stays `null`, so the shape of the
-/// payload still tells a reader whether the credential was configured at all.
+// Replaces every sensitively-named value in a JSON tree, in place.
+//
+// A redacted key keeps its key and its null-ness: a field that was absent
+// stays absent and a field that was `null` stays `null`, so the shape of the
+// payload still tells a reader whether the credential was configured at all.
 pub(super) fn redact_json(value: &mut serde_json::Value, is_sensitive: fn(&str) -> bool) {
     match value {
         serde_json::Value::Object(map) => {
@@ -87,7 +87,7 @@ pub(super) fn redact_json(value: &mut serde_json::Value, is_sensitive: fn(&str) 
     }
 }
 
-/// Replaces every sensitively-named value in a parsed TOML document, in place.
+// Replaces every sensitively-named value in a parsed TOML document, in place.
 pub(super) fn redact_toml(value: &mut toml::Value) {
     match value {
         toml::Value::Table(table) => {
@@ -108,11 +108,11 @@ pub(super) fn redact_toml(value: &mut toml::Value) {
     }
 }
 
-/// Reads a TOML document and returns it with every credential value replaced.
-///
-/// A file that does not parse is never passed through verbatim: an
-/// unparseable config could hold a password on any line, and the whole point of
-/// this module is that nothing leaves without being understood first.
+// Reads a TOML document and returns it with every credential value replaced.
+//
+// A file that does not parse is never passed through verbatim: an
+// unparseable config could hold a password on any line, and the whole point of
+// this module is that nothing leaves without being understood first.
 pub(super) fn redact_toml_document(contents: &str) -> Result<String, toml::de::Error> {
     let mut document: toml::Value = toml::from_str(contents)?;
     redact_toml(&mut document);

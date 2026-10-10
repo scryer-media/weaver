@@ -1,8 +1,8 @@
-//! What a script's header offers as a starting point for an instance.
-//!
-//! A preset fills a form and seeds the instances a header asks for. It is read
-//! from the script each time it is wanted and is never saved: once an instance
-//! exists, editing the header changes nothing about it.
+// What a script's header offers as a starting point for an instance.
+//
+// A preset fills a form and seeds the instances a header asks for. It is read
+// from the script each time it is wanted and is never saved: once an instance
+// exists, editing the header changes nothing about it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,29 +15,29 @@ use super::model::{OptionValue, ScriptKind, ScriptManifest, ScriptName, ScriptTa
 use super::runner::option_value_text;
 use crate::persistence::{Database, StateError};
 
-/// One input a header declares.
+// One input a header declares.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PresetInput {
     pub name: String,
-    /// The header's default. Always empty for a secret.
+    // The header's default. Always empty for a secret.
     pub value: String,
-    /// The slot takes a secret rather than a plain value.
+    // The slot takes a secret rather than a plain value.
     pub secret: bool,
 }
 
-/// The triggers, run times and inputs a script's header declares.
+// The triggers, run times and inputs a script's header declares.
 #[derive(Debug, Clone, Default)]
 pub struct ScriptPreset {
-    /// One per instance the header asks for.
+    // One per instance the header asks for.
     pub triggers: Vec<InstanceTrigger>,
-    /// When a schedule instance is meant to run.
+    // When a schedule instance is meant to run.
     pub task_times: Vec<ScriptTaskTime>,
-    /// Every declared input at its default. A secret is never pre-filled.
+    // Every declared input at its default. A secret is never pre-filled.
     pub inputs: Vec<PresetInput>,
 }
 
-/// Secret links already saved for a script, by upper-cased input name, so a
-/// new instance of it starts linked to the same secrets.
+// Secret links already saved for a script, by upper-cased input name, so a
+// new instance of it starts linked to the same secrets.
 pub type SecretLinks = BTreeMap<String, String>;
 
 impl ScriptPreset {
@@ -81,21 +81,21 @@ impl ScriptPreset {
         }
     }
 
-    /// Whether the header declares nothing an instance could be filled from.
+    // Whether the header declares nothing an instance could be filled from.
     pub fn is_empty(&self) -> bool {
         self.triggers.is_empty() && self.inputs.is_empty()
     }
 
-    /// Whether the header's inputs no longer line up with what `instance` has
-    /// saved: an input it declares is missing, one the instance carries is no
-    /// longer declared, or one changed between secret and plain.
-    ///
-    /// Values are the operator's and never count. Nor does a secret that has
-    /// not been given a value yet, since there is nothing a header could fill
-    /// in for it. A secret of the instance's own counts as a secret, the same
-    /// as a linked one. The trigger is left out as well: any script may be
-    /// wired to any trigger, so one the header does not name is a choice, not
-    /// drift.
+    // Whether the header's inputs no longer line up with what `instance` has
+    // saved: an input it declares is missing, one the instance carries is no
+    // longer declared, or one changed between secret and plain.
+    //
+    // Values are the operator's and never count. Nor does a secret that has
+    // not been given a value yet, since there is nothing a header could fill
+    // in for it. A secret of the instance's own counts as a secret, the same
+    // as a linked one. The trigger is left out as well: any script may be
+    // wired to any trigger, so one the header does not name is a choice, not
+    // drift.
     pub fn drifted_from(&self, instance: &ScriptInstance) -> bool {
         let saved = |name: &str| {
             instance
@@ -117,21 +117,21 @@ impl ScriptPreset {
             .any(|input| !declared(input.name.as_str()))
     }
 
-    /// `instance` with its inputs brought back in line with the header: every
-    /// declared input, at the value already saved under that name or else its
-    /// default, and nothing the header no longer declares.
-    ///
-    /// A secret slot keeps the secret it is linked to. One with no link yet
-    /// is left out until the operator picks a secret for it. A plain value
-    /// saved for an input the header now calls secret is kept as it is, so the
-    /// run still gets it and the drift stays visible. An input that went from
-    /// a linked secret to plain starts again from the header's default,
-    /// because a stored secret is never turned back into plain text.
-    ///
-    /// A secret of the instance's own is kept, sealed as it is, under any
-    /// name the header still declares: it exists nowhere else, so dropping it
-    /// would lose it. Where the header calls that input plain, the drift
-    /// stays visible.
+    // `instance` with its inputs brought back in line with the header: every
+    // declared input, at the value already saved under that name or else its
+    // default, and nothing the header no longer declares.
+    //
+    // A secret slot keeps the secret it is linked to. One with no link yet
+    // is left out until the operator picks a secret for it. A plain value
+    // saved for an input the header now calls secret is kept as it is, so the
+    // run still gets it and the drift stays visible. An input that went from
+    // a linked secret to plain starts again from the header's default,
+    // because a stored secret is never turned back into plain text.
+    //
+    // A secret of the instance's own is kept, sealed as it is, under any
+    // name the header still declares: it exists nowhere else, so dropping it
+    // would lose it. Where the header calls that input plain, the drift
+    // stays visible.
     pub fn reapplied_to(&self, instance: &ScriptInstance) -> ScriptInstanceDraft {
         let mut draft = ScriptInstanceDraft::from_instance(instance);
         draft.inputs = self
@@ -163,9 +163,9 @@ impl ScriptPreset {
         draft
     }
 
-    /// A new instance of `script` on `trigger`, filled from the header. A
-    /// secret slot is linked when `links` has a secret for it, and left out
-    /// otherwise. A schedule job takes the run times the header declares.
+    // A new instance of `script` on `trigger`, filled from the header. A
+    // secret slot is linked when `links` has a secret for it, and left out
+    // otherwise. A schedule job takes the run times the header declares.
     pub fn draft(
         &self,
         script: &ScriptName,
@@ -193,8 +193,8 @@ impl ScriptPreset {
     }
 }
 
-/// The secrets the instances of one script already link, by input name. The
-/// first instance in run order wins where two differ.
+// The secrets the instances of one script already link, by input name. The
+// first instance in run order wins where two differ.
 pub fn secret_links_of<'a>(instances: impl IntoIterator<Item = &'a ScriptInstance>) -> SecretLinks {
     let mut links = SecretLinks::new();
     for instance in instances {
@@ -209,7 +209,7 @@ pub fn secret_links_of<'a>(instances: impl IntoIterator<Item = &'a ScriptInstanc
     links
 }
 
-/// What setting a script up from its header added.
+// What setting a script up from its header added.
 #[derive(Debug, Clone, Default)]
 pub struct HeaderSetup {
     pub instances: Vec<ScriptInstance>,
@@ -233,12 +233,12 @@ impl Database {
             .map_err(|error| HeaderSetupError::Script(error.to_string()))
     }
 
-    /// Create every instance a script's header asks for and does not have
-    /// yet: one per declared trigger, each filled from the header. A new
-    /// schedule job runs at the times the header declares.
-    ///
-    /// Running it again adds only what is still missing, so a trigger the
-    /// header gained later can be picked up without touching what is saved.
+    // Create every instance a script's header asks for and does not have
+    // yet: one per declared trigger, each filled from the header. A new
+    // schedule job runs at the times the header declares.
+    //
+    // Running it again adds only what is still missing, so a trigger the
+    // header gained later can be picked up without touching what is saved.
     pub fn set_up_script_from_header(
         &self,
         script: &ScriptName,
@@ -269,7 +269,7 @@ impl Database {
         Ok(setup)
     }
 
-    /// Bring one instance's inputs back in line with its script's header.
+    // Bring one instance's inputs back in line with its script's header.
     pub fn reapply_script_header(&self, id: &str) -> Result<ScriptInstance, HeaderSetupError> {
         let instance = self
             .script_instance(id)?
@@ -295,7 +295,7 @@ mod tests {
         }
     }
 
-    /// A saved input; a secret one is linked to the secret `value` names.
+    // A saved input; a secret one is linked to the secret `value` names.
     fn saved(name: &str, value: &str, secret: bool) -> InstanceInput {
         InstanceInput {
             name: OptionName::new(name).unwrap(),
@@ -308,7 +308,7 @@ mod tests {
         }
     }
 
-    /// A saved input that is a secret of the instance's own.
+    // A saved input that is a secret of the instance's own.
     fn sealed(name: &str) -> InstanceInput {
         InstanceInput {
             name: OptionName::new(name).unwrap(),

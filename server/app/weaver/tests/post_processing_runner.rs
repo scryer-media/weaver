@@ -1,8 +1,8 @@
-//! End-to-end post-processing: real scripts, the real supervisor, the real executor.
-//!
-//! A test harness cannot serve as its own process supervisor, so every request
-//! points `supervisor_executable` at the built `weaver` binary — the same binary
-//! that re-executes itself in production.
+// End-to-end post-processing: real scripts, the real supervisor, the real executor.
+//
+// A test harness cannot serve as its own process supervisor, so every request
+// points `supervisor_executable` at the built `weaver` binary — the same binary
+// that re-executes itself in production.
 
 #![cfg(unix)]
 
@@ -59,7 +59,7 @@ fn context(job_id: u64, working_directory: PathBuf) -> JobExecutionContext {
     }
 }
 
-/// A script timeout no test run can reach, for tests that are not about it.
+// A script timeout no test run can reach, for tests that are not about it.
 const OUT_OF_REACH: Duration = Duration::from_secs(3600);
 
 fn request(
@@ -107,23 +107,23 @@ fn enable_execution(db: &Database) {
     .unwrap();
 }
 
-/// A post-processing instance of `script`, not yet saved.
+// A post-processing instance of `script`, not yet saved.
 fn draft(script: &ScriptName) -> ScriptInstanceDraft {
     ScriptInstanceDraft::new(script.clone(), InstanceTrigger::PostProcessing)
 }
 
-/// A saved post-processing instance of `script` that the pass waits for.
+// A saved post-processing instance of `script` that the pass waits for.
 fn instance(db: &Database, script: &ScriptName) -> ScriptInstance {
     db.create_script_instance(draft(script)).unwrap()
 }
 
-/// A saved post-processing instance of `script` that nothing waits for.
+// A saved post-processing instance of `script` that nothing waits for.
 fn not_waited_for(db: &Database, script: &ScriptName) -> ScriptInstance {
     db.create_script_instance(draft(script).fire_and_forget())
         .unwrap()
 }
 
-/// A pipe a test script stops at, so the test decides when the script goes on.
+// A pipe a test script stops at, so the test decides when the script goes on.
 fn gate(directory: &Path, name: &str) -> PathBuf {
     let path = directory.join(name);
     let made = std::process::Command::new("mkfifo")
@@ -134,22 +134,22 @@ fn gate(directory: &Path, name: &str) -> PathBuf {
     path
 }
 
-/// Lets the script stopped at `gate` go on. Returns once the script is there
-/// to be let through, however long it takes to arrive.
+// Lets the script stopped at `gate` go on. Returns once the script is there
+// to be let through, however long it takes to arrive.
 async fn open_gate(gate: PathBuf) {
     tokio::task::spawn_blocking(move || fs::write(gate, "go\n").unwrap())
         .await
         .unwrap();
 }
 
-/// Returns once the script has written to `gate`, which it does when it starts.
+// Returns once the script has written to `gate`, which it does when it starts.
 async fn wait_at_gate(gate: PathBuf) {
     tokio::task::spawn_blocking(move || fs::read(gate).unwrap())
         .await
         .unwrap();
 }
 
-/// A finished job for script runs to be recorded against.
+// A finished job for script runs to be recorded against.
 fn finished_job(db: &Database, job_id: u64, working_directory: &Path) {
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
         job_id,

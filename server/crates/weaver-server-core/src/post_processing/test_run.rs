@@ -1,11 +1,11 @@
-//! Running a script instance on request against made-up inputs.
-//!
-//! A test run hands the script what a real run of the instance would:
-//! the same variables and arguments, built from a download that does not exist
-//! and a scratch directory that is removed when the run ends. Commands the
-//! script issues, whether it prints them or sends them through the API, are
-//! reported and never applied, and nothing about the run is stored: it is kept
-//! in memory for as long as it takes to read.
+// Running a script instance on request against made-up inputs.
+//
+// A test run hands the script what a real run of the instance would:
+// the same variables and arguments, built from a download that does not exist
+// and a scratch directory that is removed when the run ends. Commands the
+// script issues, whether it prints them or sends them through the API, are
+// reported and never applied, and nothing about the run is stored: it is kept
+// in memory for as long as it takes to read.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -32,16 +32,16 @@ use super::runner::{
 use crate::Database;
 use crate::settings::SharedConfig;
 
-/// Test runs allowed at once. One more is refused instead of queued: a test is
-/// something an operator is watching.
+// Test runs allowed at once. One more is refused instead of queued: a test is
+// something an operator is watching.
 const RUNNING_TESTS: usize = 4;
-/// Ended test runs kept so that their result can still be read.
+// Ended test runs kept so that their result can still be read.
 const KEPT_TESTS: usize = 16;
-/// Commands reported for one test run.
+// Commands reported for one test run.
 const REPORTED_COMMANDS: usize = 256;
 
-/// The download a test run is about. Its id is far above any weaver hands out,
-/// so a script that calls back with it reaches nothing.
+// The download a test run is about. Its id is far above any weaver hands out,
+// so a script that calls back with it reaches nothing.
 const TEST_JOB_ID: u64 = 2_000_000_000;
 const TEST_JOB_NAME: &str = "Weaver.Test.Download";
 const TEST_FILE_NAME: &str = "weaver-test.txt";
@@ -71,9 +71,9 @@ const TEST_FEED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </rss>
 "#;
 
-/// Variables a run is handed that are not made up for the test: the
-/// instance's own inputs, weaver's own directories, per-download parameters,
-/// and what lets the script call weaver back.
+// Variables a run is handed that are not made up for the test: the
+// instance's own inputs, weaver's own directories, per-download parameters,
+// and what lets the script call weaver back.
 const NOT_MADE_UP: [&str; 7] = [
     "NZBPO_",
     "NZBOP_",
@@ -84,7 +84,7 @@ const NOT_MADE_UP: [&str; 7] = [
     "WEAVER_RUN_TOKEN",
 ];
 
-/// What a test run of an instance stands in for.
+// What a test run of an instance stands in for.
 fn test_event(trigger: InstanceTrigger) -> ScriptEventLabel {
     match trigger {
         InstanceTrigger::PostProcessing => ScriptEventLabel::PostProcessing,
@@ -95,7 +95,7 @@ fn test_event(trigger: InstanceTrigger) -> ScriptEventLabel {
     }
 }
 
-/// Why a test run was not started.
+// Why a test run was not started.
 #[derive(Debug, thiserror::Error)]
 pub enum ScriptTestError {
     #[error("{0}")]
@@ -114,7 +114,7 @@ fn setup(error: impl std::fmt::Display) -> ScriptTestError {
     ScriptTestError::Setup(error.to_string())
 }
 
-/// How a test run ended.
+// How a test run ended.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ScriptTestOutcome {
     pub status: ScriptStatus,
@@ -123,7 +123,7 @@ pub struct ScriptTestOutcome {
     pub error_message: Option<String>,
 }
 
-/// A test run as it stands.
+// A test run as it stands.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ScriptTestSnapshot {
     pub id: String,
@@ -133,20 +133,20 @@ pub struct ScriptTestSnapshot {
     pub event: ScriptEventLabel,
     pub adapter: ScriptAdapter,
     pub started_at_epoch_ms: i64,
-    /// The run is ended after this long.
+    // The run is ended after this long.
     pub timeout_seconds: u64,
-    /// The variables made up for this run, in name order. The instance's own
-    /// inputs are left out: they are real, and some are secret.
+    // The variables made up for this run, in name order. The instance's own
+    // inputs are left out: they are real, and some are secret.
     pub inputs: Vec<(String, String)>,
-    /// The arguments made up for this run, in order.
+    // The arguments made up for this run, in order.
     pub arguments: Vec<String>,
-    /// What the script has printed so far, or all of it once the run has ended.
+    // What the script has printed so far, or all of it once the run has ended.
     pub log: String,
     pub log_truncated: bool,
-    /// Commands the script issued, in order. A test run applies none of them.
+    // Commands the script issued, in order. A test run applies none of them.
     pub commands: Vec<String>,
     pub commands_truncated: bool,
-    /// `None` while the script is still running.
+    // `None` while the script is still running.
     pub outcome: Option<ScriptTestOutcome>,
 }
 
@@ -178,8 +178,8 @@ impl TestRun {
         self.state().snapshot.outcome.is_none()
     }
 
-    /// Add a line the script printed, keeping the newest output once the log
-    /// is over its ceiling.
+    // Add a line the script printed, keeping the newest output once the log
+    // is over its ceiling.
     fn append(&self, line: &[u8]) {
         {
             let mut state = self.state();
@@ -241,7 +241,7 @@ impl TestRun {
     }
 }
 
-/// The test runs in progress and the last few that ended, oldest first.
+// The test runs in progress and the last few that ended, oldest first.
 #[derive(Default)]
 pub(crate) struct TestRuns(Mutex<VecDeque<Arc<TestRun>>>);
 
@@ -287,9 +287,9 @@ enum Execution {
     Event(Box<ExecutionSpec>),
 }
 
-/// Run the instance `instance_id` against made-up inputs and return the run
-/// as it stands. Read it again with [`Database::script_test`]. Whether the
-/// instance is turned on makes no difference to a test.
+// Run the instance `instance_id` against made-up inputs and return the run
+// as it stands. Read it again with [`Database::script_test`]. Whether the
+// instance is turned on makes no difference to a test.
 pub async fn start_script_test(
     db: &Database,
     config: &SharedConfig,
@@ -541,7 +541,7 @@ async fn execute(
     run.finish(result, started.elapsed());
 }
 
-/// The download a test run is about: verified, unpacked and complete.
+// The download a test run is about: verified, unpacked and complete.
 fn simulated_job(
     scratch: &Path,
     category: Option<String>,
@@ -593,7 +593,7 @@ fn simulated_queue_event(job: &JobExecutionContext, event: QueueEvent) -> EventC
     context
 }
 
-/// An event with no download behind it, run in the scratch directory.
+// An event with no download behind it, run in the scratch directory.
 fn jobless<const N: usize>(
     job: &JobExecutionContext,
     scratch: &Path,
@@ -652,7 +652,7 @@ fn simulated_feed(job: &JobExecutionContext, scratch: &Path) -> std::io::Result<
     ))
 }
 
-/// A command as the script wrote it, after the `[NZB]` marker.
+// A command as the script wrote it, after the `[NZB]` marker.
 fn command_text(directive: &Directive) -> String {
     let flag = |value: &bool| if *value { "1" } else { "0" };
     match directive {
@@ -672,14 +672,14 @@ fn command_text(directive: &Directive) -> String {
 }
 
 impl Database {
-    /// The test run `id` as it stands, or `None` when there is no such run or
-    /// it is no longer kept.
+    // The test run `id` as it stands, or `None` when there is no such run or
+    // it is no longer kept.
     pub fn script_test(&self, id: &str) -> Option<ScriptTestSnapshot> {
         Some(self.script_runtime.tests.find(id)?.snapshot())
     }
 
-    /// Ask the test run `id` to stop. False when there is no such run or it
-    /// has already ended.
+    // Ask the test run `id` to stop. False when there is no such run or it
+    // has already ended.
     pub fn cancel_script_test(&self, id: &str) -> bool {
         let Some(run) = self.script_runtime.tests.find(id) else {
             return false;
@@ -693,8 +693,8 @@ impl Database {
         true
     }
 
-    /// The test run `id` once `reached` holds for it, however long that
-    /// takes, or `None` when there is no such run.
+    // The test run `id` once `reached` holds for it, however long that
+    // takes, or `None` when there is no such run.
     pub async fn script_test_when(
         &self,
         id: &str,

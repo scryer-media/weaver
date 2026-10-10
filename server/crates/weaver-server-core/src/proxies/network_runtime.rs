@@ -24,7 +24,7 @@ pub use feed::FeedAttempt;
 mod draft;
 pub use draft::DraftNetworkRoute;
 
-/// The health reason of an egress whose download quota is used up.
+// The health reason of an egress whose download quota is used up.
 pub const QUOTA_REACHED: &str = "Quota reached";
 
 #[derive(Clone)]
@@ -90,12 +90,12 @@ impl Configuration {
         }
         Ok(configuration)
     }
-    /// The health a leg's egress contributes before any dial evidence. A
-    /// missing egress is Down under the warning recorded for that leg, so
-    /// the flow names which egress vanished instead of a generic removal.
-    ///
-    /// An egress whose download quota is used up is Down too, so routes move
-    /// their connections to the legs that can still download.
+    // The health a leg's egress contributes before any dial evidence. A
+    // missing egress is Down under the warning recorded for that leg, so
+    // the flow names which egress vanished instead of a generic removal.
+    //
+    // An egress whose download quota is used up is Down too, so routes move
+    // their connections to the legs that can still download.
     fn egress_health(
         &self,
         consumer: &str,
@@ -127,10 +127,10 @@ impl Configuration {
     }
 }
 
-/// A leg of a configured route whose consumer has not asked for a dialer,
-/// such as an inactive server. It carries no connections, but the route the
-/// operator configured and the health of its egress are still facts the
-/// flow reports.
+// A leg of a configured route whose consumer has not asked for a dialer,
+// such as an inactive server. It carries no connections, but the route the
+// operator configured and the health of its egress are still facts the
+// flow reports.
 pub struct DormantLeg {
     pub consumer: Consumer,
     pub position: usize,
@@ -152,7 +152,7 @@ impl LiveLeg {
             .as_ref()
             .map_or_else(Vec::new, |ladder| ladder.rung_states())
     }
-    /// For each rung, the first proxy hop on it known to be failing.
+    // For each rung, the first proxy hop on it known to be failing.
     pub fn failing_hops(&self) -> Vec<Option<weaver_tunnel::pipe::FailingHop>> {
         self.ladder
             .as_ref()
@@ -176,9 +176,9 @@ type StagedPoolMembers = HashMap<(u32, u32), Vec<(u32, Arc<dyn Dialer>)>>;
 
 pub struct NetworkRuntime {
     pub egress_controls: Arc<weaver_nntp::transfer::ServerTransferRegistry>,
-    /// The long-lived download policies. With one, the egress controls are
-    /// its egress registry, so counters outlive this runtime's rebuilds and
-    /// every egress quota is enforced.
+    // The long-lived download policies. With one, the egress controls are
+    // its egress registry, so counters outlive this runtime's rebuilds and
+    // every egress quota is enforced.
     quota_policy: Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>,
     #[cfg(test)]
     fixture_providers: Mutex<HashMap<u32, Arc<dyn TunnelProvider>>>,
@@ -186,9 +186,9 @@ pub struct NetworkRuntime {
     handle: tokio::runtime::Handle,
     configuration: RwLock<Configuration>,
     sessions: Mutex<HashMap<String, Arc<dyn Dialer>>>,
-    /// Live sessions a probe runtime may use but does not own. A probe of a
-    /// saved profile shares the session already holding its WireGuard permit
-    /// instead of competing with it for the budget, and never shuts it down.
+    // Live sessions a probe runtime may use but does not own. A probe of a
+    // saved profile shares the session already holding its WireGuard permit
+    // instead of competing with it for the budget, and never shuts it down.
     borrowed_sessions: HashMap<String, Arc<dyn Dialer>>,
     pools: Mutex<HashMap<(u32, u32), Arc<PoolStage>>>,
     routes: Mutex<HashMap<String, Arc<LiveNetworkRoute>>>,
@@ -197,9 +197,9 @@ pub struct NetworkRuntime {
     pool_updates: Mutex<StagedPoolMembers>,
     poll: Mutex<Option<tokio::task::JoinHandle<()>>>,
     quota_watch: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// What the last health publish was computed from. The periodic tick
-    /// republishes only when one of these moved; an idle daemon otherwise
-    /// recomputes nothing.
+    // What the last health publish was computed from. The periodic tick
+    // republishes only when one of these moved; an idle daemon otherwise
+    // recomputes nothing.
     health_inputs: Mutex<Option<(InterfaceSnapshot, HashSet<u32>)>>,
 }
 
@@ -281,8 +281,8 @@ impl NetworkRuntime {
         }
         Ok(runtime)
     }
-    /// Re-publish leg health whenever an egress runs out of quota or gets
-    /// quota back, so routes move off it or back onto it straight away.
+    // Re-publish leg health whenever an egress runs out of quota or gets
+    // quota back, so routes move off it or back onto it straight away.
     async fn follow_quota_state(
         runtime: std::sync::Weak<Self>,
         mut policy_changes: tokio::sync::watch::Receiver<u64>,
@@ -306,7 +306,7 @@ impl NetworkRuntime {
             }
         }
     }
-    /// Egresses whose download quota turns work away.
+    // Egresses whose download quota turns work away.
     pub fn quota_blocked_egresses(&self) -> HashSet<u32> {
         self.egress_controls
             .snapshots()
@@ -315,8 +315,8 @@ impl NetworkRuntime {
             .map(|snapshot| snapshot.stable_server_id.0)
             .collect()
     }
-    /// The live download-quota usage of one egress, when this runtime
-    /// enforces download policies.
+    // The live download-quota usage of one egress, when this runtime
+    // enforces download policies.
     pub fn egress_quota_usage(
         &self,
         egress_id: u32,
@@ -371,7 +371,7 @@ impl NetworkRuntime {
             .cloned()
             .collect()
     }
-    /// Legs of every configured route without a live counterpart.
+    // Legs of every configured route without a live counterpart.
     pub fn dormant_legs(&self) -> Vec<DormantLeg> {
         let snapshot = self.interfaces();
         let quota_blocked = self.quota_blocked_egresses();
@@ -425,9 +425,9 @@ impl NetworkRuntime {
             })
             .collect()
     }
-    /// [`refresh_health`](Self::refresh_health) only when the interfaces or
-    /// the quota-blocked set moved since the last publish. Configuration
-    /// changes publish through the reload path, which always refreshes.
+    // [`refresh_health`](Self::refresh_health) only when the interfaces or
+    // the quota-blocked set moved since the last publish. Configuration
+    // changes publish through the reload path, which always refreshes.
     pub fn refresh_health_if_changed(&self) {
         let snapshot = self.interfaces();
         let quota_blocked = self.quota_blocked_egresses();
@@ -444,7 +444,7 @@ impl NetworkRuntime {
         }
     }
 
-    /// Publish every live leg's egress health, quota included.
+    // Publish every live leg's egress health, quota included.
     pub fn refresh_health(&self) {
         self.refresh_health_from(self.interfaces(), self.quota_blocked_egresses());
     }
@@ -1184,7 +1184,7 @@ impl Drop for NetworkRuntime {
     }
 }
 
-/// Speed limits alone, for a runtime without download policies.
+// Speed limits alone, for a runtime without download policies.
 fn configure_egress_rates(
     controls: &weaver_nntp::transfer::ServerTransferRegistry,
     configuration: &Configuration,

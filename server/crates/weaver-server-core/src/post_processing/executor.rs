@@ -31,13 +31,13 @@ pub const SCRIPT_OUTPUT_EVENT_KIND: &str = "PostProcessingScriptOutput";
 
 type CancellationRegistry = Arc<Mutex<HashMap<u64, watch::Sender<bool>>>>;
 
-/// Process-local post-processing counters.
-///
-/// The run/attempt tables that used to answer the `/metrics` scrape are gone,
-/// so the same series are served from the executor itself — the same shape as
-/// the duplicate-admission counters elsewhere in this crate. Gauges are exact;
-/// counters reset with the process, which is what a Prometheus counter contract
-/// already expects.
+// Process-local post-processing counters.
+//
+// The run/attempt tables that used to answer the `/metrics` scrape are gone,
+// so the same series are served from the executor itself — the same shape as
+// the duplicate-admission counters elsewhere in this crate. Gauges are exact;
+// counters reset with the process, which is what a Prometheus counter contract
+// already expects.
 mod counters {
     use super::AtomicU64;
 
@@ -97,7 +97,7 @@ fn record_script_metrics(result: &ScriptResult, started: bool) {
     }
 }
 
-/// Guard that keeps a gauge honest across every early return.
+// Guard that keeps a gauge honest across every early return.
 struct GaugeGuard(&'static AtomicU64);
 
 impl GaugeGuard {
@@ -121,15 +121,15 @@ pub enum PostProcessingExecutorError {
     Shutdown,
 }
 
-/// What the job's post-processing produced.
+// What the job's post-processing produced.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct JobPostProcessingReport {
     pub summary: PostProcessingSummary,
     pub results: Vec<ScriptResult>,
 }
 
-/// The scripts root and the instances captured when a job enters
-/// post-processing. An instance's inputs are read when its turn comes.
+// The scripts root and the instances captured when a job enters
+// post-processing. An instance's inputs are read when its turn comes.
 #[derive(Clone)]
 pub struct PostProcessingJobAdmission {
     scripts_directory: PathBuf,
@@ -146,24 +146,24 @@ impl PostProcessingJobAdmission {
 pub struct PostProcessingExecutor {
     db: Database,
     scripts_directory: Arc<RwLock<PathBuf>>,
-    /// Admission gate for the NZBGet facade's `pausepost`/`resumepost`, which is
-    /// the only reason a pause survives: it gates admission, never a running
-    /// script, exactly as the RPC has always behaved.
+    // Admission gate for the NZBGet facade's `pausepost`/`resumepost`, which is
+    // the only reason a pause survives: it gates admission, never a running
+    // script, exactly as the RPC has always behaved.
     paused: watch::Sender<bool>,
     cancellations: CancellationRegistry,
-    /// Test hook: integration tests point this at the built `weaver` binary,
-    /// because a test harness cannot serve as its own process supervisor.
+    // Test hook: integration tests point this at the built `weaver` binary,
+    // because a test harness cannot serve as its own process supervisor.
     #[doc(hidden)]
     supervisor_executable: Option<PathBuf>,
 }
 
-/// What became of one entry of a job's list.
+// What became of one entry of a job's list.
 enum Attempt {
-    /// The script ran. Its result and output are already kept.
+    // The script ran. Its result and output are already kept.
     Ran(ScriptResult),
-    /// The script is not a post-processing script.
+    // The script is not a post-processing script.
 
-    /// The script could not be started.
+    // The script could not be started.
     NotStarted(ScriptResult),
 }
 
@@ -217,8 +217,8 @@ impl PostProcessingExecutor {
         *self.paused.borrow()
     }
 
-    /// Future post-processing jobs use `directory`; jobs that already entered
-    /// execution retain their admission-time snapshot.
+    // Future post-processing jobs use `directory`; jobs that already entered
+    // execution retain their admission-time snapshot.
     pub fn set_script_directory(&self, directory: PathBuf) {
         *self
             .scripts_directory
@@ -226,7 +226,7 @@ impl PostProcessingExecutor {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = directory;
     }
 
-    /// Snapshot the configured root for a post-processing admission.
+    // Snapshot the configured root for a post-processing admission.
     pub fn script_directory(&self) -> PathBuf {
         self.scripts_directory
             .read()
@@ -234,8 +234,8 @@ impl PostProcessingExecutor {
             .clone()
     }
 
-    /// Signal every in-flight script for `job_id` to stop, the ones nothing
-    /// waits for included. Returns whether a pass was there to stop.
+    // Signal every in-flight script for `job_id` to stop, the ones nothing
+    // waits for included. Returns whether a pass was there to stop.
     pub fn cancel_job(&self, job_id: u64) -> bool {
         self.db.cancel_background_scripts(job_id);
         let sender = self
@@ -253,7 +253,7 @@ impl PostProcessingExecutor {
         }
     }
 
-    /// One statement marking jobs that were mid-post-processing when weaver stopped.
+    // One statement marking jobs that were mid-post-processing when weaver stopped.
     pub fn recover_interrupted(&self) -> Result<u64, StateError> {
         let interrupted = self.db.recover_interrupted_post_processing()?;
         counters::INTERRUPTED.fetch_add(interrupted, Ordering::Relaxed);
@@ -261,8 +261,8 @@ impl PostProcessingExecutor {
         Ok(interrupted)
     }
 
-    /// The instances a job in `category` should run, without executing
-    /// anything.
+    // The instances a job in `category` should run, without executing
+    // anything.
     pub fn resolve_job_scripts(
         &self,
         category: Option<&str>,
@@ -271,7 +271,7 @@ impl PostProcessingExecutor {
             .script_instances_for(&ScriptEventLabel::PostProcessing, category)
     }
 
-    /// Capture the root and the instances for a newly admitted job.
+    // Capture the root and the instances for a newly admitted job.
     pub fn admit_job_scripts(
         &self,
         category: Option<&str>,
@@ -311,7 +311,7 @@ impl PostProcessingExecutor {
         .await
     }
 
-    /// Execute one already-admitted job from its immutable scripts-root snapshot.
+    // Execute one already-admitted job from its immutable scripts-root snapshot.
     pub async fn execute_job_at_script_directory(
         &self,
         scripts_directory: PathBuf,
@@ -334,7 +334,7 @@ impl PostProcessingExecutor {
         .await
     }
 
-    /// Execute one already-admitted job from its immutable configuration snapshot.
+    // Execute one already-admitted job from its immutable configuration snapshot.
     pub async fn execute_admitted_job(
         &self,
         job_id: u64,
@@ -636,9 +636,9 @@ impl PostProcessingExecutor {
         Ok(super::events::script_slot(&self.db, cancel_rx).await?)
     }
 
-    /// Start an entry nothing waits for. It runs against the job as it stands
-    /// when its turn comes, and what it returns has no part in how the job's
-    /// post-processing ends.
+    // Start an entry nothing waits for. It runs against the job as it stands
+    // when its turn comes, and what it returns has no part in how the job's
+    // post-processing ends.
     fn start_background(
         &self,
         admission: &PostProcessingJobAdmission,
@@ -866,8 +866,8 @@ impl PostProcessingExecutor {
         self.record_job_event(job_id, SCRIPT_EVENT_KIND, &message);
     }
 
-    /// Take what the script prints and what it asks for through the API until
-    /// it has ended. Both are applied here, one at a time.
+    // Take what the script prints and what it asks for through the API until
+    // it has ended. Both are applied here, one at a time.
     async fn consume_script_events(
         &self,
         context: &mut JobExecutionContext,
@@ -921,8 +921,8 @@ impl PostProcessingExecutor {
         }
     }
 
-    /// Apply one command to the download. The context is left as it was when
-    /// the command is refused.
+    // Apply one command to the download. The context is left as it was when
+    // the command is refused.
     async fn apply_to_job(
         &self,
         context: &mut JobExecutionContext,
@@ -950,7 +950,7 @@ impl PostProcessingExecutor {
     }
 }
 
-/// Why execution is refused, or `None` when it may proceed.
+// Why execution is refused, or `None` when it may proceed.
 // How the next script sees the ones before it, in NZBGet's terms: a failure
 // anywhere stays a failure, and a script that never ran changes nothing.
 fn previous_script_status(

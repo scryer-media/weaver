@@ -1,10 +1,10 @@
-//! Three named profiles that decide every hardware-derived limit at once.
-//!
-//! An operator picks a name, not a set of knobs: the profile answers how much
-//! memory a 7z decoder may hold, how much of the machine's RAM extraction may
-//! reserve, and how many decode and post-processing threads run. A profile that
-//! the machine cannot honour is never offered, so the pick is always one the
-//! hardware can keep.
+// Three named profiles that decide every hardware-derived limit at once.
+//
+// An operator picks a name, not a set of knobs: the profile answers how much
+// memory a 7z decoder may hold, how much of the machine's RAM extraction may
+// reserve, and how many decode and post-processing threads run. A profile that
+// the machine cannot honour is never offered, so the pick is always one the
+// hardware can keep.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,47 +13,47 @@ use crate::runtime::system_profile::SystemProfile;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
-/// Everything a profile decides, resolved against the machine it runs on.
+// Everything a profile decides, resolved against the machine it runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileTuning {
-    /// Memory a conventional 7z extraction may hold while decoding. The
-    /// extraction ceiling still bounds it; this only stops one archive from
-    /// taking the whole allowance.
+    // Memory a conventional 7z extraction may hold while decoding. The
+    // extraction ceiling still bounds it; this only stops one archive from
+    // taking the whole allowance.
     pub sevenz_decode_memory_bytes: u64,
-    /// The extraction memory ceiling, before the `[64 MiB, 64 GiB]` clamp and
-    /// before an explicit environment override replaces it.
+    // The extraction memory ceiling, before the `[64 MiB, 64 GiB]` clamp and
+    // before an explicit environment override replaces it.
     pub extraction_memory_bytes: u64,
-    /// Articles decoded at once.
+    // Articles decoded at once.
     pub decode_threads: usize,
-    /// Threads in the post-processing and chase pools: 7z and xz decode
-    /// threads, PAR2 verify and repair, and concurrent chases all come from
-    /// these. A profile change builds new pools for the work that starts after
-    /// it; work already running finishes on the pool it started on.
+    // Threads in the post-processing and chase pools: 7z and xz decode
+    // threads, PAR2 verify and repair, and concurrent chases all come from
+    // these. A profile change builds new pools for the work that starts after
+    // it; work already running finishes on the pool it started on.
     pub extract_threads: usize,
-    /// A cap on concurrent downloads, chosen by the profile rather
-    /// than derived from pressure. Per-job live memory scales with the number
-    /// of downloads in flight, which is the whole point of the efficient
-    /// profile; `None` leaves the configured connection count alone.
+    // A cap on concurrent downloads, chosen by the profile rather
+    // than derived from pressure. Per-job live memory scales with the number
+    // of downloads in flight, which is the whole point of the efficient
+    // profile; `None` leaves the configured connection count alone.
     pub max_concurrent_downloads_cap: Option<usize>,
-    /// The most streaming member extractions that run at once. Each holds a
-    /// decoder and its output buffers, so this is the bound fast storage
-    /// scales up to with the cores; slow storage stays below it on its own.
+    // The most streaming member extractions that run at once. Each holds a
+    // decoder and its output buffers, so this is the bound fast storage
+    // scales up to with the cores; slow storage stays below it on its own.
     pub max_concurrent_extractions: usize,
-    /// How much of the machine's memory PAR3 repair may hold, split between
-    /// the engine and weaver's own retained state.
+    // How much of the machine's memory PAR3 repair may hold, split between
+    // the engine and weaver's own retained state.
     pub par3_memory: MemoryShare,
-    /// A cap on the CPU workers PAR3 repair may run at once. `None` leaves
-    /// repair every core but one, as the widest profile wants; the smaller
-    /// profiles hold it to their post-processing thread count so a repair
-    /// cannot take the cores they left free.
+    // A cap on the CPU workers PAR3 repair may run at once. `None` leaves
+    // repair every core but one, as the widest profile wants; the smaller
+    // profiles hold it to their post-processing thread count so a repair
+    // cannot take the cores they left free.
     pub par3_cpu_cap: Option<usize>,
-    /// A cap on the direct-store resident holds limit Weaver derives from the
-    /// machine's memory. It never touches a configured limit. `None` leaves
-    /// the derived value alone.
+    // A cap on the direct-store resident holds limit Weaver derives from the
+    // machine's memory. It never touches a configured limit. `None` leaves
+    // the derived value alone.
     pub direct_store_resident_default_cap_bytes: Option<u64>,
 }
 
-/// A share of the machine's memory: a fraction of it, up to a ceiling.
+// A share of the machine's memory: a fraction of it, up to a ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryShare {
     pub divisor: u64,
@@ -61,24 +61,24 @@ pub struct MemoryShare {
 }
 
 impl MemoryShare {
-    /// This share of `memory_bytes`.
+    // This share of `memory_bytes`.
     pub fn of(self, memory_bytes: u64) -> u64 {
         (memory_bytes / self.divisor.max(1)).min(self.cap_bytes)
     }
 }
 
-/// One profile's whole definition: what it needs, and what it decides.
-///
-/// Every number the profiles differ by lives in [`TABLE`] below, so retuning a
-/// profile after a benchmark sweep is a one-line change here and nowhere else.
+// One profile's whole definition: what it needs, and what it decides.
+//
+// Every number the profiles differ by lives in [`TABLE`] below, so retuning a
+// profile after a benchmark sweep is a one-line change here and nowhere else.
 struct ProfileRow {
     profile: HardwareProfile,
-    /// Memory the machine must have for this profile to be offered.
+    // Memory the machine must have for this profile to be offered.
     min_memory_bytes: u64,
-    /// Physical cores, after any cgroup limit, the machine must have.
+    // Physical cores, after any cgroup limit, the machine must have.
     min_cores: usize,
     sevenz_decode_memory_bytes: u64,
-    /// The share of the machine's memory extraction may reserve.
+    // The share of the machine's memory extraction may reserve.
     extraction_memory_divisor: u64,
     max_concurrent_downloads_cap: Option<usize>,
     max_concurrent_extractions: usize,
@@ -86,8 +86,8 @@ struct ProfileRow {
     direct_store_resident_default_cap_bytes: Option<u64>,
 }
 
-/// Ordered from the least demanding to the most: `available` preserves this
-/// order, and `recommended` takes the last entry it yields.
+// Ordered from the least demanding to the most: `available` preserves this
+// order, and `recommended` takes the last entry it yields.
 const TABLE: [ProfileRow; 3] = [
     ProfileRow {
         profile: HardwareProfile::Efficient,
@@ -133,15 +133,15 @@ const TABLE: [ProfileRow; 3] = [
     },
 ];
 
-/// How hard Weaver leans on the machine it runs on.
+// How hard Weaver leans on the machine it runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HardwareProfile {
-    /// Small machines and shared hosts: the smallest limits that still work.
+    // Small machines and shared hosts: the smallest limits that still work.
     Efficient,
-    /// The default for an ordinary desktop or server.
+    // The default for an ordinary desktop or server.
     Balanced,
-    /// Large machines: the widest limits Weaver offers.
+    // Large machines: the widest limits Weaver offers.
     Performance,
 }
 
@@ -156,9 +156,9 @@ impl HardwareProfile {
         }
     }
 
-    /// Parse a persisted value. Unknown text reads as "never chosen", so a
-    /// hand-edited setting degrades to the recommendation instead of failing
-    /// startup or silently picking the widest limits.
+    // Parse a persisted value. Unknown text reads as "never chosen", so a
+    // hand-edited setting degrades to the recommendation instead of failing
+    // startup or silently picking the widest limits.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "efficient" => Some(Self::Efficient),
@@ -168,8 +168,8 @@ impl HardwareProfile {
         }
     }
 
-    /// Memory this machine can actually use: a container's limit where there is
-    /// one, the installed RAM otherwise.
+    // Memory this machine can actually use: a container's limit where there is
+    // one, the installed RAM otherwise.
     pub fn effective_memory_bytes(probe: &SystemProfile) -> u64 {
         match probe.memory.cgroup_limit {
             Some(limit) => limit.min(probe.memory.total_bytes.max(1)),
@@ -177,12 +177,12 @@ impl HardwareProfile {
         }
     }
 
-    /// Physical cores this machine can actually use. The physical count is
-    /// read host-wide, so it is capped by the CPUs this process may run on,
-    /// which an affinity mask or cpuset narrows without any quota. A
-    /// fractional cgroup quota rounds down but never to zero: half a core is
-    /// still one thread's worth of work, and a zero here would divide by
-    /// nothing downstream.
+    // Physical cores this machine can actually use. The physical count is
+    // read host-wide, so it is capped by the CPUs this process may run on,
+    // which an affinity mask or cpuset narrows without any quota. A
+    // fractional cgroup quota rounds down but never to zero: half a core is
+    // still one thread's worth of work, and a zero here would divide by
+    // nothing downstream.
     pub fn effective_cores(probe: &SystemProfile) -> usize {
         let cores = probe
             .cpu
@@ -195,8 +195,8 @@ impl HardwareProfile {
         }
     }
 
-    /// The profiles this machine can honour, least demanding first. Efficient
-    /// has no requirements, so this is never empty.
+    // The profiles this machine can honour, least demanding first. Efficient
+    // has no requirements, so this is never empty.
     pub fn available(probe: &SystemProfile) -> Vec<Self> {
         let memory = Self::effective_memory_bytes(probe);
         let cores = Self::effective_cores(probe);
@@ -207,7 +207,7 @@ impl HardwareProfile {
             .collect()
     }
 
-    /// The most capable profile this machine can honour.
+    // The most capable profile this machine can honour.
     pub fn recommended(probe: &SystemProfile) -> Self {
         Self::available(probe)
             .last()
@@ -215,8 +215,8 @@ impl HardwareProfile {
             .unwrap_or(Self::Efficient)
     }
 
-    /// Why this machine cannot offer a profile, phrased for an operator who
-    /// asked for it anyway. `None` when the profile is available.
+    // Why this machine cannot offer a profile, phrased for an operator who
+    // asked for it anyway. `None` when the profile is available.
     pub fn unmet_requirement(self, probe: &SystemProfile) -> Option<String> {
         let row = self.row();
         let memory = Self::effective_memory_bytes(probe);
@@ -234,23 +234,23 @@ impl HardwareProfile {
         ))
     }
 
-    /// Every derived limit, resolved against this machine.
-    ///
-    /// The two extraction knobs are independent, which is why the smallest
-    /// profile is not the single-threaded one. Memory is bounded by
-    /// `sevenz_decode_memory_bytes` alone: the decoder sizes its window from
-    /// that allowance and then runs as many workers as it is given inside it,
-    /// so at the efficient profile's allowance extra threads cost nothing in
-    /// memory and buy most of the wall time back — decoding a large archive
-    /// with one thread takes roughly twice as long as with two, and a single
-    /// thread is the slowest arrangement at every allowance. Threads are
-    /// therefore scaled with the machine's cores at every profile, and only
-    /// the allowance separates them.
-    ///
-    /// An incompressible stream — a video payload, the common case — needs no
-    /// help here: the decoder narrows itself to a couple of workers on that
-    /// shape whatever it is offered, so the wider counts below are spent only
-    /// on the archives that can use them.
+    // Every derived limit, resolved against this machine.
+    //
+    // The two extraction knobs are independent, which is why the smallest
+    // profile is not the single-threaded one. Memory is bounded by
+    // `sevenz_decode_memory_bytes` alone: the decoder sizes its window from
+    // that allowance and then runs as many workers as it is given inside it,
+    // so at the efficient profile's allowance extra threads cost nothing in
+    // memory and buy most of the wall time back — decoding a large archive
+    // with one thread takes roughly twice as long as with two, and a single
+    // thread is the slowest arrangement at every allowance. Threads are
+    // therefore scaled with the machine's cores at every profile, and only
+    // the allowance separates them.
+    //
+    // An incompressible stream — a video payload, the common case — needs no
+    // help here: the decoder narrows itself to a couple of workers on that
+    // shape whatever it is offered, so the wider counts below are spent only
+    // on the archives that can use them.
     pub fn tuning(self, probe: &SystemProfile) -> ProfileTuning {
         let row = self.row();
         let memory = Self::effective_memory_bytes(probe);
@@ -287,8 +287,8 @@ impl HardwareProfile {
     }
 }
 
-/// Whole gibibytes where the value divides evenly, one decimal otherwise, so a
-/// requirement reads as "16 GiB" and a machine as "7.8 GiB".
+// Whole gibibytes where the value divides evenly, one decimal otherwise, so a
+// requirement reads as "16 GiB" and a machine as "7.8 GiB".
 fn format_gibibytes(bytes: u64) -> String {
     if bytes.is_multiple_of(GIB) {
         format!("{} GiB", bytes / GIB)

@@ -1,5 +1,5 @@
-//! GraphQL sockets over a live connection: who may open one, and that an open
-//! socket loses its access the moment the credential it was admitted with does.
+// GraphQL sockets over a live connection: who may open one, and that an open
+// socket loses its access the moment the credential it was admitted with does.
 
 use super::*;
 use async_graphql::futures_util::{SinkExt, StreamExt};
@@ -92,7 +92,7 @@ impl SocketServer {
             .map(|(client, _)| client)
     }
 
-    /// A socket through `connection_init`, proven to answer a query.
+    // A socket through `connection_init`, proven to answer a query.
     async fn admitted(
         &self,
         headers: &[(header::HeaderName, String)],
@@ -140,7 +140,7 @@ async fn assert_answers(client: &mut Client, id: &str) {
     assert_eq!(receive(client).await["type"], "complete");
 }
 
-/// The socket is closed with `4403 Forbidden` without the client doing anything.
+// The socket is closed with `4403 Forbidden` without the client doing anything.
 async fn assert_closed_forbidden(client: &mut Client) {
     let message = client
         .next()

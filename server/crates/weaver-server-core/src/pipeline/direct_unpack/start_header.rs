@@ -1,57 +1,57 @@
-//! The 32-byte 7z signature header, parsed on its own.
-//!
-//! Direct unpack needs the archive's exact total length before a single packed
-//! byte has landed, because the gated reader answers `SeekFrom::End` from it and
-//! the admission check needs to know how much is coming. The signature header
-//! carries that: it is the first 32 bytes of the set's first part, and it
-//! declares where the end header sits, which is also where the archive stops.
-//!
-//! Layout (all integers little-endian):
-//!
-//! | Range   | Field                                            |
-//! |---------|--------------------------------------------------|
-//! | `0..6`  | magic `37 7A BC AF 27 1C`                        |
-//! | `6..8`  | format version (major, minor)                    |
-//! | `8..12` | CRC-32 of bytes `12..32`                         |
-//! | `12..20`| next header offset, relative to byte 32          |
-//! | `20..28`| next header size                                 |
-//! | `28..32`| CRC-32 of the end header                         |
-//!
-//! Weaver parses this itself rather than reaching into the 7z decoder: the
-//! decoder wants a reader positioned over a complete archive, and at admission
-//! time there is no complete archive — only these 32 bytes.
+// The 32-byte 7z signature header, parsed on its own.
+//
+// Direct unpack needs the archive's exact total length before a single packed
+// byte has landed, because the gated reader answers `SeekFrom::End` from it and
+// the admission check needs to know how much is coming. The signature header
+// carries that: it is the first 32 bytes of the set's first part, and it
+// declares where the end header sits, which is also where the archive stops.
+//
+// Layout (all integers little-endian):
+//
+// | Range   | Field                                            |
+// |---------|--------------------------------------------------|
+// | `0..6`  | magic `37 7A BC AF 27 1C`                        |
+// | `6..8`  | format version (major, minor)                    |
+// | `8..12` | CRC-32 of bytes `12..32`                         |
+// | `12..20`| next header offset, relative to byte 32          |
+// | `20..28`| next header size                                 |
+// | `28..32`| CRC-32 of the end header                         |
+//
+// Weaver parses this itself rather than reaching into the 7z decoder: the
+// decoder wants a reader positioned over a complete archive, and at admission
+// time there is no complete archive — only these 32 bytes.
 
 use std::fmt;
 use std::ops::Range;
 
-/// Byte length of the signature header.
+// Byte length of the signature header.
 pub const SIGNATURE_HEADER_LEN: u64 = 32;
 
-/// The 7z magic bytes that open every archive.
+// The 7z magic bytes that open every archive.
 pub const MAGIC: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 
-/// Why a byte slice is not a usable 7z signature header.
+// Why a byte slice is not a usable 7z signature header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartHeaderError {
-    /// Fewer than [`SIGNATURE_HEADER_LEN`] bytes were supplied.
+    // Fewer than [`SIGNATURE_HEADER_LEN`] bytes were supplied.
     TooShort {
-        /// How many bytes the caller actually had.
+        // How many bytes the caller actually had.
         len: usize,
     },
-    /// The leading six bytes are not [`MAGIC`].
+    // The leading six bytes are not [`MAGIC`].
     BadMagic,
-    /// The stored CRC-32 does not match the bytes it covers.
+    // The stored CRC-32 does not match the bytes it covers.
     CrcMismatch {
-        /// CRC recorded in bytes `8..12`.
+        // CRC recorded in bytes `8..12`.
         expected: u32,
-        /// CRC computed over bytes `12..32`.
+        // CRC computed over bytes `12..32`.
         actual: u32,
     },
-    /// `32 + next_header_offset + next_header_size` does not fit in a `u64`.
+    // `32 + next_header_offset + next_header_size` does not fit in a `u64`.
     LengthOverflow {
-        /// The declared end-header offset.
+        // The declared end-header offset.
         next_header_offset: u64,
-        /// The declared end-header size.
+        // The declared end-header size.
         next_header_size: u64,
     },
 }
@@ -80,22 +80,22 @@ impl fmt::Display for StartHeaderError {
 
 impl std::error::Error for StartHeaderError {}
 
-/// The two lengths the signature header exists to carry.
+// The two lengths the signature header exists to carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartHeader {
-    /// Offset of the end header, relative to byte 32 of the archive.
+    // Offset of the end header, relative to byte 32 of the archive.
     pub next_header_offset: u64,
-    /// Byte length of the end header.
+    // Byte length of the end header.
     pub next_header_size: u64,
-    /// CRC-32 the end header is expected to hash to.
+    // CRC-32 the end header is expected to hash to.
     pub next_header_crc: u32,
 }
 
 impl StartHeader {
-    /// Parse and validate the signature header.
-    ///
-    /// Only the first [`SIGNATURE_HEADER_LEN`] bytes are read; a longer slice
-    /// (the head of a part file, say) is accepted as-is.
+    // Parse and validate the signature header.
+    //
+    // Only the first [`SIGNATURE_HEADER_LEN`] bytes are read; a longer slice
+    // (the head of a part file, say) is accepted as-is.
     pub fn parse(bytes: &[u8]) -> Result<Self, StartHeaderError> {
         let header: &[u8; 32] = bytes
             .get(..32)
@@ -126,10 +126,10 @@ impl StartHeader {
         })
     }
 
-    /// Exact total byte length of the archive the header opens.
-    ///
-    /// The end header is the last structure in the file, so the archive ends
-    /// where it ends.
+    // Exact total byte length of the archive the header opens.
+    //
+    // The end header is the last structure in the file, so the archive ends
+    // where it ends.
     pub fn total_len(&self) -> Result<u64, StartHeaderError> {
         SIGNATURE_HEADER_LEN
             .checked_add(self.next_header_offset)
@@ -140,11 +140,11 @@ impl StartHeader {
             })
     }
 
-    /// Absolute byte range occupied by the end header.
-    ///
-    /// The range a direct-unpack worker has to have on disk before the decoder
-    /// can list the archive at all, which is why it is worth prefetching ahead
-    /// of the packed streams that precede it.
+    // Absolute byte range occupied by the end header.
+    //
+    // The range a direct-unpack worker has to have on disk before the decoder
+    // can list the archive at all, which is why it is worth prefetching ahead
+    // of the packed streams that precede it.
     pub fn end_header_range(&self) -> Result<Range<u64>, StartHeaderError> {
         let start = SIGNATURE_HEADER_LEN
             .checked_add(self.next_header_offset)
@@ -155,8 +155,8 @@ impl StartHeader {
         Ok(start..self.total_len()?)
     }
 
-    /// Absolute byte range holding the packed streams, between the signature
-    /// header and the end header.
+    // Absolute byte range holding the packed streams, between the signature
+    // header and the end header.
     pub fn packed_range(&self) -> Result<Range<u64>, StartHeaderError> {
         Ok(SIGNATURE_HEADER_LEN..self.end_header_range()?.start)
     }
@@ -166,7 +166,7 @@ impl StartHeader {
 mod tests {
     use super::*;
 
-    /// Build a well-formed signature header for the declared lengths.
+    // Build a well-formed signature header for the declared lengths.
     fn signature_header(next_header_offset: u64, next_header_size: u64) -> [u8; 32] {
         let mut header = [0u8; 32];
         header[..6].copy_from_slice(&MAGIC);

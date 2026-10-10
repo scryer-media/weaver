@@ -102,9 +102,9 @@ async fn routes(tx: &mut SqlTx<'_>) -> Result<Vec<Route>, StateError> {
         .collect()
 }
 
-/// The next free egress id. An id a route still names stays reserved even
-/// when its row is gone, as after restoring an older backup: a route must
-/// never rebind to an egress created later under a reused id.
+// The next free egress id. An id a route still names stays reserved even
+// when its row is gone, as after restoring an older backup: a route must
+// never rebind to an egress created later under a reused id.
 async fn next_egress_id(tx: &mut SqlTx<'_>) -> Result<u32, StateError> {
     let row = tx
         .fetch_optional(
@@ -126,7 +126,7 @@ async fn next_egress_id(tx: &mut SqlTx<'_>) -> Result<u32, StateError> {
         .ok_or_else(|| error("egress ids are exhausted"))
 }
 
-/// Serialize networking resource edits on a row that cannot be removed.
+// Serialize networking resource edits on a row that cannot be removed.
 pub(super) async fn lock_network(tx: &mut SqlTx<'_>) -> Result<(), StateError> {
     tx.execute("UPDATE egress_interfaces SET id = id WHERE id = 0", &[])
         .await?;

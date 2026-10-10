@@ -5,13 +5,13 @@ use crate::bandwidth::{QuotaTarget, ScheduleAction, ScheduleEntry, SpeedTarget};
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 
-/// The row every schedule read and write takes first, so saves and the
-/// tidying a load does never interleave. The value is only a lock sentinel.
+// The row every schedule read and write takes first, so saves and the
+// tidying a load does never interleave. The value is only a lock sentinel.
 const LOCK_KEY: &str = "schedule_write_lock";
 
 impl Database {
-    /// The saved schedule rules. A rule that names an egress or provider that
-    /// is gone loses that part, and is saved that way, with a log line.
+    // The saved schedule rules. A rule that names an egress or provider that
+    // is gone loses that part, and is saved that way, with a log line.
     pub fn list_schedules(&self) -> Result<Vec<ScheduleEntry>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -49,7 +49,7 @@ impl Database {
         })
     }
 
-    /// Drop every rule and every speed limit for a server being deleted.
+    // Drop every rule and every speed limit for a server being deleted.
     pub(crate) async fn remove_server_schedules(
         tx: &mut SqlTx<'_>,
         server_id: u32,
@@ -65,8 +65,8 @@ impl Database {
         write_schedules(tx, &entries).await
     }
 
-    /// Drop every quota rule and every speed limit for an egress being
-    /// deleted, so an egress later given the same id inherits none of them.
+    // Drop every quota rule and every speed limit for an egress being
+    // deleted, so an egress later given the same id inherits none of them.
     pub(crate) async fn remove_egress_schedules(
         tx: &mut SqlTx<'_>,
         egress_id: u32,
@@ -91,8 +91,8 @@ impl Database {
     }
 }
 
-/// Each rule as saved. One that cannot be read is left out with a warning
-/// rather than keeping every other rule from loading.
+// Each rule as saved. One that cannot be read is left out with a warning
+// rather than keeping every other rule from loading.
 async fn read_schedules(tx: &mut SqlTx<'_>) -> Result<Vec<ScheduleEntry>, StateError> {
     let json = tx
         .fetch_optional(
@@ -127,7 +127,7 @@ fn decode(json: &str) -> Result<Vec<ScheduleEntry>, StateError> {
         .collect())
 }
 
-/// The egresses and providers that exist, which a rule may name.
+// The egresses and providers that exist, which a rule may name.
 struct Holders {
     egresses: BTreeSet<u32>,
     servers: BTreeSet<u32>,
@@ -159,7 +159,7 @@ impl Holders {
         }
     }
 
-    /// Refuse a rule that names something that is not there.
+    // Refuse a rule that names something that is not there.
     fn check(&self, action: &ScheduleAction) -> Result<(), StateError> {
         let missing =
             |what: &str, id: u32| Err(StateError::Database(format!("{what} {id} not found")));
@@ -187,8 +187,8 @@ impl Holders {
         }
     }
 
-    /// Take out what names a deleted egress or provider. Returns whether
-    /// anything changed.
+    // Take out what names a deleted egress or provider. Returns whether
+    // anything changed.
     fn prune(&self, entries: &mut Vec<ScheduleEntry>) -> bool {
         let before = entries.clone();
         entries.retain(|entry| {
@@ -231,8 +231,8 @@ fn rule_name(entry: &ScheduleEntry) -> &str {
     }
 }
 
-/// Serialize schedule reads and saves on both SQL backends, including the
-/// first save on an empty installation.
+// Serialize schedule reads and saves on both SQL backends, including the
+// first save on an empty installation.
 async fn lock(tx: &mut SqlTx<'_>) -> Result<(), StateError> {
     tx.execute(
         "INSERT INTO settings (key, value) VALUES ({}, {}) ON CONFLICT(key) DO NOTHING",

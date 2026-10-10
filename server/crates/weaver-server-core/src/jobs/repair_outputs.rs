@@ -1,4 +1,4 @@
-//! Durable ownership of reconstructed files that have no NZB articles.
+// Durable ownership of reconstructed files that have no NZB articles.
 
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{StateError, jobs::ids::JobId, persistence::Database};
@@ -29,8 +29,8 @@ impl RepairOutput {
         Ok(())
     }
 
-    /// Preserve authenticated relative paths while rejecting non-directory
-    /// ancestors. Native installation checks these components again at write time.
+    // Preserve authenticated relative paths while rejecting non-directory
+    // ancestors. Native installation checks these components again at write time.
     pub fn destination(&self, directory: &std::path::Path) -> Result<std::path::PathBuf, String> {
         self.validate().map_err(|error| error.to_string())?;
         let mut path = directory.to_path_buf();
@@ -52,7 +52,7 @@ impl RepairOutput {
 }
 
 impl Database {
-    /// Reserve all destinations before native installation. Replays must agree.
+    // Reserve all destinations before native installation. Replays must agree.
     pub(crate) fn reserve_repair_outputs(
         &self,
         job: JobId,
@@ -128,8 +128,8 @@ pub(crate) fn identity(output: &RepairOutput) -> super::record::ActiveFileIdenti
     }
 }
 
-/// Recreate output membership, not verification evidence. A regular disk image
-/// at its declared length is available for fresh native verification on restore.
+// Recreate output membership, not verification evidence. A regular disk image
+// at its declared length is available for fresh native verification on restore.
 pub(crate) async fn restore_assembly(
     job: JobId,
     outputs: &[RepairOutput],

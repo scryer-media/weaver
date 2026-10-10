@@ -1,7 +1,7 @@
-//! Reduce names, subjects and message-IDs to closed classes.
-//!
-//! Every function here reads identifying text and returns either a constant
-//! from a fixed list or a number. Nothing it returns borrows from its input.
+// Reduce names, subjects and message-IDs to closed classes.
+//
+// Every function here reads identifying text and returns either a constant
+// from a fixed list or a number. Nothing it returns borrows from its input.
 
 use std::collections::HashMap;
 
@@ -11,7 +11,7 @@ use serde::ser::Serializer;
 use crate::deobfuscate::extract_filename;
 use crate::types::Nzb;
 
-/// A file extension from a fixed list, or a shape class for numbered ones.
+// A file extension from a fixed list, or a shape class for numbered ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileExt(&'static str);
 
@@ -30,7 +30,7 @@ impl Serialize for FileExt {
     }
 }
 
-/// Extensions a report may name. Anything else is reported as `other`.
+// Extensions a report may name. Anything else is reported as `other`.
 const KNOWN_EXTENSIONS: &[&str] = &[
     "rar", "par2", "par3", "7z", "zip", "tar", "gz", "tgz", "bz2", "tbz", "tbz2", "xz", "txz",
     "zst", "zstd", "br", "deflate", "nfo", "sfv", "srr", "srs", "nzb", "txt", "md5", "url", "jpg",
@@ -39,7 +39,7 @@ const KNOWN_EXTENSIONS: &[&str] = &[
     "azw3", "pdf", "cbz", "cbr", "srt", "ass", "sub", "idx", "sup", "exe", "msi", "dmg", "apk",
 ];
 
-/// Classify the extension of a name.
+// Classify the extension of a name.
 pub fn file_ext(name: &str) -> FileExt {
     let lower = name.to_ascii_lowercase();
     let Some((_, ext)) = lower.rsplit_once('.') else {
@@ -65,16 +65,16 @@ pub fn file_ext(name: &str) -> FileExt {
         .map_or(FileExt::OTHER, |known| FileExt(known))
 }
 
-/// How a name is numbered, without the name.
+// How a name is numbered, without the name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum NameShape {
-    /// No name could be read from the subject.
+    // No name could be read from the subject.
     #[serde(rename = "none")]
     None,
-    /// A name with no extension at all.
+    // A name with no extension at all.
     #[serde(rename = "bare")]
     Bare,
-    /// A name with an ordinary extension.
+    // A name with an ordinary extension.
     #[serde(rename = "plain")]
     Plain,
     #[serde(rename = "rar")]
@@ -134,7 +134,7 @@ fn has_volume_suffix(stem: &str) -> bool {
     })
 }
 
-/// Classify how a name is numbered.
+// Classify how a name is numbered.
 pub fn classify_name(name: &str) -> NameShape {
     let lower = name.to_ascii_lowercase();
     if let Some(stem) = lower.strip_suffix(".par2") {
@@ -184,20 +184,20 @@ pub fn classify_name(name: &str) -> NameShape {
     }
 }
 
-/// What the part of a name before its set or volume suffix looks like.
+// What the part of a name before its set or volume suffix looks like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StemClass {
     Empty,
-    /// Words a person would read, with separators.
+    // Words a person would read, with separators.
     Readable,
-    /// Exactly 32 hex digits, the most common hashed form.
+    // Exactly 32 hex digits, the most common hashed form.
     Hex32,
-    /// Another run of 16 or more hex digits.
+    // Another run of 16 or more hex digits.
     Hex,
-    /// A long unbroken run of mixed letters and digits.
+    // A long unbroken run of mixed letters and digits.
     Random,
-    /// Digits only.
+    // Digits only.
     Numeric,
 }
 
@@ -213,13 +213,13 @@ impl StemClass {
         }
     }
 
-    /// Whether the stem hides what the file is.
+    // Whether the stem hides what the file is.
     pub fn is_hashed(self) -> bool {
         matches!(self, Self::Hex32 | Self::Hex | Self::Random | Self::Numeric)
     }
 }
 
-/// Classify a stem.
+// Classify a stem.
 pub fn stem_class(stem: &str) -> StemClass {
     let stem = stem.trim();
     if stem.is_empty() {
@@ -247,14 +247,14 @@ pub fn stem_class(stem: &str) -> StemClass {
     StemClass::Readable
 }
 
-/// Where in a subject the file name came from.
+// Where in a subject the file name came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NameSource {
     Quoted,
     Bracketed,
     Unquoted,
-    /// The subject names no file; only the yEnc header can.
+    // The subject names no file; only the yEnc header can.
     Absent,
 }
 
@@ -269,8 +269,8 @@ impl NameSource {
     }
 }
 
-/// Read the file name a subject carries. Unquoted guesses count only when
-/// they look like a file name, so a bare random token reads as no name.
+// Read the file name a subject carries. Unquoted guesses count only when
+// they look like a file name, so a bare random token reads as no name.
 pub fn subject_name(subject: &str) -> (Option<String>, NameSource) {
     match extract_filename(subject) {
         Some((name, confidence)) if confidence >= 1.0 => (Some(name), NameSource::Quoted),
@@ -293,18 +293,18 @@ fn looks_like_file_name(name: &str) -> bool {
     }
 }
 
-/// Numbers a subject declares about its post.
+// Numbers a subject declares about its post.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SubjectNumbers {
-    /// `MM` from `[NN/MM]`: how many files the poster says there are.
+    // `MM` from `[NN/MM]`: how many files the poster says there are.
     pub file_total: Option<u32>,
-    /// `N` from `yEnc (1/N)`: how many segments this file should have.
+    // `N` from `yEnc (1/N)`: how many segments this file should have.
     pub segment_total: Option<u32>,
-    /// The size after the yEnc part marker, when the poster wrote one.
+    // The size after the yEnc part marker, when the poster wrote one.
     pub declared_bytes: Option<u64>,
 }
 
-/// Parse the counts out of a subject.
+// Parse the counts out of a subject.
 pub fn parse_subject_numbers(subject: &str) -> SubjectNumbers {
     let mut numbers = SubjectNumbers::default();
     let lower = subject.to_ascii_lowercase();
@@ -353,7 +353,7 @@ fn parse_fraction(text: &str) -> Option<(u32, u32)> {
     (total > 0).then_some((left.parse().ok()?, total))
 }
 
-/// The name of a PAR2 or PAR3 set, without its volume or extension.
+// The name of a PAR2 or PAR3 set, without its volume or extension.
 pub fn par_base_name(name: &str) -> &str {
     let lower = name.to_ascii_lowercase();
     let stem_len = if lower.ends_with(".par2") || lower.ends_with(".par3") {
@@ -370,15 +370,15 @@ pub fn par_base_name(name: &str) -> &str {
     stem
 }
 
-/// Whether a lowercased name marks itself as a sample.
+// Whether a lowercased name marks itself as a sample.
 pub fn is_sample_name(lower: &str) -> bool {
     lower
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|token| token == "sample")
 }
 
-/// Whether an archive set's name, with the set's own suffix removed, still
-/// ends in an archive extension: an archive packed inside another.
+// Whether an archive set's name, with the set's own suffix removed, still
+// ends in an archive extension: an archive packed inside another.
 pub fn names_inner_archive(base: &str, suffix_already_removed: bool) -> bool {
     const OUTER: &[&str] = &[
         ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".tbz", ".txz", ".7z", ".zip", ".tar",
@@ -397,7 +397,7 @@ pub fn names_inner_archive(base: &str, suffix_already_removed: bool) -> bool {
     INNER.iter().any(|ext| inner.ends_with(ext))
 }
 
-/// Whether a title or subject says the post needs a password.
+// Whether a title or subject says the post needs a password.
 pub fn name_mentions_password(text: &str) -> bool {
     if let Some(open) = text.find("{{")
         && let Some(close) = text[open + 2..].find("}}")
@@ -409,7 +409,7 @@ pub fn name_mentions_password(text: &str) -> bool {
     lower.contains("password") || lower.contains("passwort")
 }
 
-/// A guess at the posting tool, from the message-ID domain it leaves behind.
+// A guess at the posting tool, from the message-ID domain it leaves behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PosterTool {
@@ -445,7 +445,7 @@ const TOOL_MARKERS: &[(&str, PosterTool)] = &[
     ("gopoststuff", PosterTool::GopoststuffLike),
 ];
 
-/// A share of message-IDs below this is a coincidence, not a tool's mark.
+// A share of message-IDs below this is a coincidence, not a tool's mark.
 const TOOL_MARKER_PERMILLE: u64 = 900;
 
 fn message_id_domain(message_id: &str) -> Option<String> {
@@ -457,8 +457,8 @@ fn message_id_domain(message_id: &str) -> Option<String> {
     (!domain.is_empty()).then(|| domain.to_ascii_lowercase())
 }
 
-/// Guess the posting tool. Only a marker nearly every message-ID carries
-/// counts; anything less reads as `unknown`.
+// Guess the posting tool. Only a marker nearly every message-ID carries
+// counts; anything less reads as `unknown`.
 pub fn poster_tool(nzb: &Nzb) -> PosterTool {
     let mut total = 0u64;
     let mut hits: HashMap<PosterTool, u64> = HashMap::new();
@@ -484,14 +484,14 @@ pub fn poster_tool(nzb: &Nzb) -> PosterTool {
         .unwrap_or(PosterTool::Unknown)
 }
 
-/// How many distinct message-ID domains a post uses.
+// How many distinct message-ID domains a post uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DomainSpread {
     None,
     Single,
     Few,
-    /// So many that each message-ID likely carries its own random domain.
+    // So many that each message-ID likely carries its own random domain.
     Many,
 }
 

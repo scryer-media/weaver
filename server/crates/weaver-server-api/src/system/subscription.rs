@@ -135,7 +135,7 @@ async fn build_system_metrics_snapshot(
     }
 }
 
-/// A few atomic loads per server, the same counts `serverHealth` reports.
+// A few atomic loads per server, the same counts `serverHealth` reports.
 fn provider_connections(pool: &weaver_nntp::pool::NntpPool) -> Vec<ProviderConnections> {
     pool.server_configs()
         .iter()
@@ -156,7 +156,7 @@ fn provider_connections(pool: &weaver_nntp::pool::NntpPool) -> Vec<ProviderConne
         .collect()
 }
 
-/// One atomic load per server; empty in the steady state.
+// One atomic load per server; empty in the steady state.
 fn provider_holdoffs(pool: &weaver_nntp::pool::NntpPool) -> Vec<ProviderHoldoff> {
     pool.server_configs()
         .iter()

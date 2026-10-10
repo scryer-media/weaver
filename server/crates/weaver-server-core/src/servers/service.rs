@@ -3,7 +3,7 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::servers::ServerConfig;
 
-/// Shared serialization for server mutations and whole-generation reloads.
+// Shared serialization for server mutations and whole-generation reloads.
 pub static SERVER_MUTATION_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
@@ -22,8 +22,8 @@ impl ServersService {
         Self { db, config, handle }
     }
 
-    /// Persist operator intent even when the provider is offline. Scheduled
-    /// activation deliberately performs no connection probe.
+    // Persist operator intent even when the provider is offline. Scheduled
+    // activation deliberately performs no connection probe.
     pub async fn set_active(&self, server_id: u32, active: bool) -> Result<(), String> {
         let _guard = SERVER_MUTATION_GUARD.lock().await;
         let previous_active = self
@@ -89,8 +89,8 @@ impl ServersService {
         Ok(())
     }
 
-    /// Save a provider's speed limit and put it in force, as an edit on the
-    /// Servers screen does. 0 removes the limit.
+    // Save a provider's speed limit and put it in force, as an edit on the
+    // Servers screen does. 0 removes the limit.
     pub async fn set_server_speed_limit(
         &self,
         server_id: u32,
@@ -155,8 +155,8 @@ impl ServersService {
         Ok(())
     }
 
-    /// Save an egress's speed limit and put it in force, as an edit on the
-    /// Networking screen does. 0 removes the limit.
+    // Save an egress's speed limit and put it in force, as an edit on the
+    // Networking screen does. 0 removes the limit.
     pub async fn set_egress_speed_limit(
         &self,
         egress_id: u32,

@@ -104,8 +104,8 @@ impl Database {
         })
     }
 
-    /// Download usage counted against an egress. The egress id is carried in
-    /// `server_id`.
+    // Download usage counted against an egress. The egress id is carried in
+    // `server_id`.
     pub fn egress_download_usage(
         &self,
         egress_id: u32,
@@ -127,8 +127,8 @@ impl Database {
         })
     }
 
-    /// Store download usage counted against an egress, whose id is carried
-    /// in `server_id`. Usage for an egress that no longer exists is dropped.
+    // Store download usage counted against an egress, whose id is carried
+    // in `server_id`. Usage for an egress that no longer exists is dropped.
     pub fn upsert_egress_download_usage(
         &self,
         usage: &ServerDownloadUsage,

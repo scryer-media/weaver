@@ -157,9 +157,9 @@ impl Command {
         }
     }
 
-    /// Whether the command opens the database, and so may migrate it. Every
-    /// such command takes the pre-migration backup first: a one-shot download
-    /// on an upgraded install migrates the schema just as a server start does.
+    // Whether the command opens the database, and so may migrate it. Every
+    // such command takes the pre-migration backup first: a one-shot download
+    // on an upgraded install migrates the schema just as a server start does.
     pub(crate) fn opens_database(&self) -> bool {
         match self {
             Self::Download { .. } | Self::Serve { .. } => true,
@@ -232,7 +232,7 @@ pub(crate) enum NzbCommand {
     },
 }
 
-/// Where `weaver nzb report` looks when neither --url nor WEAVER_URL says.
+// Where `weaver nzb report` looks when neither --url nor WEAVER_URL says.
 pub(crate) const DEFAULT_REPORT_URL: &str = "http://127.0.0.1:9090";
 
 pub(crate) fn upgrade_backup_required(flag: bool, env: Option<&str>) -> bool {

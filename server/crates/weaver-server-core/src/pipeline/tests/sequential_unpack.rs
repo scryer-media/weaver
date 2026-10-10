@@ -131,8 +131,8 @@ async fn land(pipeline: &mut Pipeline, id: NzbFileId, name: &str, bytes: &[u8], 
     .await;
 }
 
-/// Waits, with no deadline, for the chase to have written `minimum` bytes of
-/// output. A chase that never writes early leaves the runner to end the test.
+// Waits, with no deadline, for the chase to have written `minimum` bytes of
+// output. A chase that never writes early leaves the runner to end the test.
 async fn wait_for_output(path: &std::path::Path, minimum: u64) {
     while !std::fs::metadata(path).is_ok_and(|m| m.len() >= minimum) {
         tokio::time::sleep(Duration::from_millis(10)).await;

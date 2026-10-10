@@ -539,9 +539,9 @@ impl NormalizedServerInput {
     }
 }
 
-/// Hand a successful probe's first-byte latency to the download runtime, so a
-/// server the lanes have never fetched from starts at a depth that suits the
-/// distance instead of the shallowest rung.
+// Hand a successful probe's first-byte latency to the download runtime, so a
+// server the lanes have never fetched from starts at a depth that suits the
+// distance instead of the shallowest rung.
 fn note_probe_first_byte_latency(
     handle: &SchedulerHandle,
     server_id: u32,
@@ -570,7 +570,7 @@ impl From<RoutedProbe> for TestConnectionResult {
     }
 }
 
-/// Probe every draft leg without changing live selection or tunnel sessions.
+// Probe every draft leg without changing live selection or tunnel sessions.
 fn probe_through_route<'a>(
     server: &'a weaver_server_core::servers::ServerConfig,
     route: Option<&'a std::sync::Arc<weaver_server_core::proxies::DraftNetworkRoute>>,
@@ -622,8 +622,8 @@ fn probe_through_route<'a>(
     })
 }
 
-/// Probe an active server before it is saved. `None` means the server is
-/// inactive and no probe ran, so previously learned facts are kept.
+// Probe an active server before it is saved. `None` means the server is
+// inactive and no probe ran, so previously learned facts are kept.
 async fn validate_server_before_save(
     input: &NormalizedServerInput,
     route: Option<&std::sync::Arc<weaver_server_core::proxies::DraftNetworkRoute>>,
@@ -647,9 +647,9 @@ async fn validate_server_before_save(
     }
 }
 
-/// Record what the save-time probe learned about this server's TLS suite.
-/// A TLS probe upserts the row, a plaintext probe clears it, and no probe
-/// (inactive server) leaves the stored facts untouched and returns them.
+// Record what the save-time probe learned about this server's TLS suite.
+// A TLS probe upserts the row, a plaintext probe clears it, and no probe
+// (inactive server) leaves the stored facts untouched and returns them.
 async fn persist_tls_diagnostics(
     db: &Database,
     server_id: u32,

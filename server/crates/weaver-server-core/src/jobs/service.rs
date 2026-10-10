@@ -30,24 +30,24 @@ struct RestoreSkipPlan {
     stats: RestoreSkipStats,
 }
 
-/// Whole segments that a contiguous byte floor covers, and the floor those
-/// segments actually account for.
+// Whole segments that a contiguous byte floor covers, and the floor those
+// segments actually account for.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct FloorCoveredSegments {
     pub(crate) segments: Vec<SegmentId>,
-    /// Never a partial segment: the end offset of the last segment lying
-    /// entirely below the requested floor.
+    // Never a partial segment: the end offset of the last segment lying
+    // entirely below the requested floor.
     pub(crate) floor: u64,
 }
 
-/// Walks `segments` in NZB order and returns every segment lying entirely below
-/// `floor`, together with the contiguous byte floor those whole segments
-/// account for.
-///
-/// Clamping belongs to the caller. `build_restore_skip_plan` clamps its floor
-/// to the declared file size and the partial file's on-disk length before
-/// calling. Direct-store coverage floors deliberately do not: for a direct set
-/// the source volume has no file at all, and file length never implies coverage.
+// Walks `segments` in NZB order and returns every segment lying entirely below
+// `floor`, together with the contiguous byte floor those whole segments
+// account for.
+//
+// Clamping belongs to the caller. `build_restore_skip_plan` clamps its floor
+// to the declared file size and the partial file's on-disk length before
+// calling. Direct-store coverage floors deliberately do not: for a direct set
+// the source volume has no file at all, and file length never implies coverage.
 pub(crate) fn segments_covered_by_floor(
     file_id: NzbFileId,
     segments: &[crate::jobs::model::SegmentSpec],
@@ -888,18 +888,18 @@ impl Pipeline {
         Ok(())
     }
 
-    /// How many of a job's payload files lead with their first article.
-    /// Recovery volumes are never sampled, so they do not count toward it:
-    /// counted by file index, a post that lists its recovery first would
-    /// sample few payload files or none, and the gate could never run.
-    ///
-    /// The wave exists to sample the post, not to reshape the job. A bounded
-    /// number of leading files answers "is this post still on the server" as
-    /// well as every file would, and every extra file in the wave costs the
-    /// direct store: the head of a later volume arrives long before the
-    /// sequential frontier reaches it, so it sits in a hold for the whole
-    /// stretch of volumes ahead of it. Thirty-two holds is a sample; a hold
-    /// per volume of a large set is a second copy of the download.
+    // How many of a job's payload files lead with their first article.
+    // Recovery volumes are never sampled, so they do not count toward it:
+    // counted by file index, a post that lists its recovery first would
+    // sample few payload files or none, and the gate could never run.
+    //
+    // The wave exists to sample the post, not to reshape the job. A bounded
+    // number of leading files answers "is this post still on the server" as
+    // well as every file would, and every extra file in the wave costs the
+    // direct store: the head of a later volume arrives long before the
+    // sequential frontier reaches it, so it sits in a hold for the whole
+    // stretch of volumes ahead of it. Thirty-two holds is a sample; a hold
+    // per volume of a large set is a second copy of the download.
     const FIRST_ARTICLE_SAMPLE_FILES: usize = 32;
 
     pub(crate) fn build_job_assembly(

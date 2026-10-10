@@ -145,7 +145,7 @@ impl Database {
         })
     }
 
-    /// When each feed is next due, without loading or decrypting the feeds.
+    // When each feed is next due, without loading or decrypting the feeds.
     pub(crate) fn list_rss_feed_schedules(
         &self,
     ) -> Result<Vec<crate::rss::model::RssFeedSchedule>, StateError> {

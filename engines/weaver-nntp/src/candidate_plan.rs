@@ -1,4 +1,4 @@
-//! Pure candidate selection shared by address races and proxy-member races.
+// Pure candidate selection shared by address races and proxy-member races.
 use crate::address_plan::{
     DELIVERY_MIN_SAMPLES, DELIVERY_REPIN_RATIO, RaceReason, SHADOW_EVERY_CONNECTS, SHADOW_RETRIES,
     SUSPECT_AFTER_FAILURES,
@@ -36,11 +36,11 @@ pub enum Attempt<C> {
         candidates: Vec<C>,
         reason: RaceReason,
     },
-    /// Dial the candidates in order. `shadow` names the challenger this
-    /// reconnect was pointed at, when it was: the caller reports that
-    /// connection's end through [`CandidatePlan::shadow_ended`]. `announce`
-    /// is what the plan decided for this connect, for the caller to log once
-    /// the plan's lock is released.
+    // Dial the candidates in order. `shadow` names the challenger this
+    // reconnect was pointed at, when it was: the caller reports that
+    // connection's end through [`CandidatePlan::shadow_ended`]. `announce`
+    // is what the plan decided for this connect, for the caller to log once
+    // the plan's lock is released.
     Dial {
         order: Vec<C>,
         shadow: Option<C>,
@@ -72,26 +72,26 @@ pub struct PlanSnapshot<C> {
 pub(crate) struct AddrStats {
     pub(crate) connect_ewma: Option<Duration>,
     pub(crate) consecutive_failures: u32,
-    /// Sessions in a row that connected and then never heard from the
-    /// server. A connect does not clear it; only a session that did hear
-    /// from the server does.
+    // Sessions in a row that connected and then never heard from the
+    // server. A connect does not clear it; only a session that did hear
+    // from the server does.
     pub(crate) setup_failures: u32,
     pub(crate) body_latency_ewma: Option<Duration>,
     pub(crate) delivery: Delivery,
 }
 
 impl AddrStats {
-    /// The address last refused a connect, or last connected without the
-    /// server answering.
+    // The address last refused a connect, or last connected without the
+    // server answering.
     pub(crate) fn failing(self) -> bool {
         self.consecutive_failures > 0 || self.setup_failures > 0
     }
 }
 
-/// What one address's connections delivered since the pin was last judged:
-/// warm fetches only, each booked as its bytes and its own wire time, so the
-/// quotient is what one connection to the address moves per second whatever
-/// the number of connections that happened to land there.
+// What one address's connections delivered since the pin was last judged:
+// warm fetches only, each booked as its bytes and its own wire time, so the
+// quotient is what one connection to the address moves per second whatever
+// the number of connections that happened to land there.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct Delivery {
     pub(crate) bytes: u64,
@@ -113,9 +113,9 @@ impl Delivery {
             .then(|| self.bytes as f64 / self.wire.as_secs_f64())
     }
 
-    /// The rate, once enough fetches and enough wire time stand behind it to
-    /// be evidence and while the latest of them is recent enough to still
-    /// describe the address.
+    // The rate, once enough fetches and enough wire time stand behind it to
+    // be evidence and while the latest of them is recent enough to still
+    // describe the address.
     pub(crate) fn measured_rate(self, now: Instant) -> Option<f64> {
         let fresh = self
             .last_at
@@ -126,26 +126,26 @@ impl Delivery {
     }
 }
 
-/// What the delivery booked since the pin was last judged says about it.
+// What the delivery booked since the pin was last judged says about it.
 enum DeliveryVerdict<C> {
-    /// A challenger out-delivered the pin by [`DELIVERY_REPIN_RATIO`].
+    // A challenger out-delivered the pin by [`DELIVERY_REPIN_RATIO`].
     Challenged {
         challenger: C,
         challenger_rate: f64,
         pin_rate: f64,
     },
-    /// The best measured challenger did not.
+    // The best measured challenger did not.
     Keep {
         best: C,
         best_rate: f64,
         pin_rate: f64,
     },
-    /// The pin or every challenger is short of [`DELIVERY_MIN_SAMPLES`] or
-    /// the timing's `delivery_min_wire`, or its evidence has gone stale.
+    // The pin or every challenger is short of [`DELIVERY_MIN_SAMPLES`] or
+    // the timing's `delivery_min_wire`, or its evidence has gone stale.
     Unmeasured,
 }
 
-/// What a connect decided, told once the plan's lock is released.
+// What a connect decided, told once the plan's lock is released.
 pub enum Announce<C> {
     Repinned {
         challenger: C,
@@ -229,35 +229,35 @@ pub struct CandidatePlan<C: Candidate> {
     pub(crate) pinned: Option<C>,
     pub(crate) chosen_at: Option<Instant>,
     pub(crate) per_addr: HashMap<C::Key, AddrStats>,
-    /// When a reconnect was last pointed at a challenger.
+    // When a reconnect was last pointed at a challenger.
     pub(crate) last_shadow_at: Option<Instant>,
-    /// Reconnects handed out since then.
+    // Reconnects handed out since then.
     pub(crate) connects_since_shadow: u32,
-    /// A challenger whose shadow connection ended before it was measured,
-    /// owed the next reconnect ahead of the usual pacing.
+    // A challenger whose shadow connection ended before it was measured,
+    // owed the next reconnect ahead of the usual pacing.
     pub(crate) shadow_owed: Option<C>,
-    /// Shadow connections in a row that ended without one response from
-    /// their challenger. Bounds how many reconnects a challenger that
-    /// connects but never answers may take ahead of the pacing.
+    // Shadow connections in a row that ended without one response from
+    // their challenger. Bounds how many reconnects a challenger that
+    // connects but never answers may take ahead of the pacing.
     pub(crate) idle_shadows: u32,
-    /// The challenger the last verdict found faster than the pin. It takes
-    /// the pin only if the next verdict finds the same, so one verdict's
-    /// worth of samples from one connection never moves the pin by itself.
+    // The challenger the last verdict found faster than the pin. It takes
+    // the pin only if the next verdict finds the same, so one verdict's
+    // worth of samples from one connection never moves the pin by itself.
     pub(crate) delivery_leader: Option<C>,
-    /// When delivery was last judged, since the last race. The next verdict
-    /// waits the timing's `delivery_verdict_interval` from it, or from the pin's choice
-    /// when there has been none.
+    // When delivery was last judged, since the last race. The next verdict
+    // waits the timing's `delivery_verdict_interval` from it, or from the pin's choice
+    // when there has been none.
     pub(crate) last_verdict_at: Option<Instant>,
-    /// Bumped whenever a race finishes, so a caller waiting on one can tell
-    /// that it did.
+    // Bumped whenever a race finishes, so a caller waiting on one can tell
+    // that it did.
     pub(crate) generation: u64,
     pub(crate) racing: bool,
-    /// A race some event asked for, still to run.
+    // A race some event asked for, still to run.
     pub(crate) pending: Option<RaceReason>,
-    /// Why the last race found nothing, handed to callers that waited on it.
+    // Why the last race found nothing, handed to callers that waited on it.
     pub(crate) last_race_error: Option<(io::ErrorKind, String)>,
-    /// When a race last found no address while nothing was pinned. Holds
-    /// further races off for the timing's `failed_race_holdoff`.
+    // When a race last found no address while nothing was pinned. Holds
+    // further races off for the timing's `failed_race_holdoff`.
     pub(crate) last_race_failed_at: Option<Instant>,
     pub(crate) races_won: u64,
     pub(crate) races_failed: u64,
@@ -265,8 +265,8 @@ pub struct CandidatePlan<C: Candidate> {
 }
 
 pub(crate) enum Next<C> {
-    /// Dial in order; `shadow` is the challenger this reconnect was pointed
-    /// at, when it was, whether or not the announce says so.
+    // Dial in order; `shadow` is the challenger this reconnect was pointed
+    // at, when it was, whether or not the announce says so.
     Dial {
         order: Vec<C>,
         announce: Option<Announce<C>>,
@@ -327,17 +327,17 @@ impl<C: Candidate> CandidatePlan<C> {
         self.per_addr.get(&addr.key()).copied().unwrap_or_default()
     }
 
-    /// A verdict may run: the pin was chosen, or last judged, at least
-    /// the timing's `delivery_verdict_interval` ago.
+    // A verdict may run: the pin was chosen, or last judged, at least
+    // the timing's `delivery_verdict_interval` ago.
     pub(crate) fn verdict_is_allowed(&self, now: Instant) -> bool {
         self.last_verdict_at.or(self.chosen_at).is_some_and(|at| {
             now.saturating_duration_since(at) >= timing().delivery_verdict_interval
         })
     }
 
-    /// Judge the pin on the delivery booked since it was last judged, when
-    /// there is enough of it. Leaves the pin's age alone, and leaves the
-    /// samples to keep gathering when there is not enough.
+    // Judge the pin on the delivery booked since it was last judged, when
+    // there is enough of it. Leaves the pin's age alone, and leaves the
+    // samples to keep gathering when there is not enough.
     pub(crate) fn judge_on_delivery(&mut self, now: Instant, pin: C) -> Option<Announce<C>> {
         let mut promoted = None;
         let announce = match self.delivery_verdict(now, pin) {
@@ -390,12 +390,12 @@ impl<C: Candidate> CandidatePlan<C> {
         Some(announce)
     }
 
-    /// A verdict judges every measured candidate afresh from here, except a
-    /// challenger it just pinned, which was pinned on that measure and keeps
-    /// it as the pin's own. A challenger still short of a measure keeps what
-    /// it has booked: one that only gets a few fetches per shadow connection
-    /// would otherwise lose them to every verdict on another challenger and
-    /// never be judged.
+    // A verdict judges every measured candidate afresh from here, except a
+    // challenger it just pinned, which was pinned on that measure and keeps
+    // it as the pin's own. A challenger still short of a measure keeps what
+    // it has booked: one that only gets a few fetches per shadow connection
+    // would otherwise lose them to every verdict on another challenger and
+    // never be judged.
     fn reset_judged(&mut self, now: Instant, promoted: Option<C>) {
         let keep = promoted.map(Candidate::key);
         for (key, stats) in &mut self.per_addr {
@@ -405,9 +405,9 @@ impl<C: Candidate> CandidatePlan<C> {
         }
     }
 
-    /// Compare the pin with the best measured challenger that is not
-    /// currently refusing connections: a pin should never move to an address
-    /// the next connect would fail on.
+    // Compare the pin with the best measured challenger that is not
+    // currently refusing connections: a pin should never move to an address
+    // the next connect would fail on.
     fn delivery_verdict(&self, now: Instant, pin: C) -> DeliveryVerdict<C> {
         let Some(pin_rate) = self.stats(pin).delivery.measured_rate(now) else {
             return DeliveryVerdict::Unmeasured;
@@ -440,15 +440,15 @@ impl<C: Candidate> CandidatePlan<C> {
         }
     }
 
-    /// Every race judges the pin afresh from here.
+    // Every race judges the pin afresh from here.
     pub(crate) fn reset_delivery(&mut self) {
         for stats in self.per_addr.values_mut() {
             stats.delivery = Delivery::default();
         }
     }
 
-    /// The order one connect dials: the usual order, or a challenger ahead of
-    /// it when this reconnect is the one to point at a challenger.
+    // The order one connect dials: the usual order, or a challenger ahead of
+    // it when this reconnect is the one to point at a challenger.
     pub(crate) fn dial_order_for_connect(&mut self, now: Instant) -> (Vec<C>, Option<Announce<C>>) {
         let order = self.dial_order();
         self.connects_since_shadow = self.connects_since_shadow.saturating_add(1);
@@ -468,21 +468,21 @@ impl<C: Candidate> CandidatePlan<C> {
         (order, Some(Announce::Shadow { challenger, pin }))
     }
 
-    /// The challenger this reconnect goes to, and the pin it stands in for,
-    /// if it is time for one: among the candidates not yet measured, by the
-    /// same measure a verdict holds them to, the one with the most fetches
-    /// booked, so one challenger reaches a verdict instead of every
-    /// challenger sharing the shadows and none arriving; never one that last
-    /// refused and never one that has yet to connect at all — an address that
-    /// swallows packets would hold this reconnect for the whole attempt
-    /// limit. `None` while the pin is too young, too recently or too often
-    /// shadowed, not yet measured itself, or already judged against every
-    /// challenger.
-    ///
-    /// A challenger owed a reconnect, because its last shadow connection
-    /// ended before it was measured, skips the pacing: a server that drops
-    /// connections early would otherwise end every shadow short of a verdict
-    /// and leave the pin unjudged for good.
+    // The challenger this reconnect goes to, and the pin it stands in for,
+    // if it is time for one: among the candidates not yet measured, by the
+    // same measure a verdict holds them to, the one with the most fetches
+    // booked, so one challenger reaches a verdict instead of every
+    // challenger sharing the shadows and none arriving; never one that last
+    // refused and never one that has yet to connect at all — an address that
+    // swallows packets would hold this reconnect for the whole attempt
+    // limit. `None` while the pin is too young, too recently or too often
+    // shadowed, not yet measured itself, or already judged against every
+    // challenger.
+    //
+    // A challenger owed a reconnect, because its last shadow connection
+    // ended before it was measured, skips the pacing: a server that drops
+    // connections early would otherwise end every shadow short of a verdict
+    // and leave the pin unjudged for good.
     pub(crate) fn shadow_candidate(&self, now: Instant) -> Option<(C, C)> {
         let pin = self.pinned?;
         if now.saturating_duration_since(self.chosen_at?) < timing().shadow_min_pin_age {
@@ -522,11 +522,11 @@ impl<C: Candidate> CandidatePlan<C> {
             .map(|(addr, _)| (addr, pin))
     }
 
-    /// The connection a reconnect pointed at `challenger` has ended after
-    /// `responses` answers from it. Ended before the challenger was
-    /// measured, it is owed the next reconnect, for as long as its
-    /// connections keep answering and up to [`SHADOW_RETRIES`] in a row that
-    /// did not; measured, the verdict takes it from here.
+    // The connection a reconnect pointed at `challenger` has ended after
+    // `responses` answers from it. Ended before the challenger was
+    // measured, it is owed the next reconnect, for as long as its
+    // connections keep answering and up to [`SHADOW_RETRIES`] in a row that
+    // did not; measured, the verdict takes it from here.
     pub fn shadow_ended(&mut self, challenger: C, responses: u64, now: Instant) {
         if !self.candidates.contains(&challenger) {
             if self.shadow_owed == Some(challenger) {
@@ -557,8 +557,8 @@ impl<C: Candidate> CandidatePlan<C> {
             .is_none_or(|at| now.saturating_duration_since(at) >= timing().replan_interval)
     }
 
-    /// The pin first, then every other candidate: the ones that last
-    /// connected before the ones that last failed, faster before slower.
+    // The pin first, then every other candidate: the ones that last
+    // connected before the ones that last failed, faster before slower.
     pub(crate) fn dial_order(&self) -> Vec<C> {
         let mut others: Vec<C> = self
             .candidates
@@ -599,7 +599,7 @@ impl<C: Candidate> Default for CandidatePlan<C> {
     }
 }
 impl<C: Candidate> CandidatePlan<C> {
-    /// Ordered leases do not start a detached race: DNS and HTTP must share a member.
+    // Ordered leases do not start a detached race: DNS and HTTP must share a member.
     pub fn lease_order(&self) -> Vec<C> {
         let mut order = self.dial_order();
         order.sort_by_key(|candidate| self.stats(*candidate).failing());

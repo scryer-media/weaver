@@ -197,12 +197,12 @@ enum UnbufferedStep {
     Continue,
 }
 
-/// Ciphertext read from the socket that rustls has not consumed yet. It
-/// outlives a single handshake or drain call: a socket read routinely
-/// ends inside a TLS record, and that record's head must still sit in
-/// front of whatever the next read appends. Starting the next call from
-/// an empty buffer hands rustls the tail of a record as if it were the
-/// start of one, and it reports an invalid content type.
+// Ciphertext read from the socket that rustls has not consumed yet. It
+// outlives a single handshake or drain call: a socket read routinely
+// ends inside a TLS record, and that record's head must still sit in
+// front of whatever the next read appends. Starting the next call from
+// an empty buffer hands rustls the tail of a record as if it were the
+// start of one, and it reports an invalid content type.
 struct UnbufferedInput {
     buf: Vec<u8>,
     len: usize,
@@ -778,8 +778,8 @@ async fn spawn_scripted_server(steps: Vec<ScriptStep>, hold_open_after_last: Dur
     spawn_shared_scripted_server(steps, hold_open_after_last).await
 }
 
-/// Longer than any test runs. A script answers or closes, so a connection's
-/// own timeouts only decide a test that sets them itself, never a slow runner.
+// Longer than any test runs. A script answers or closes, so a connection's
+// own timeouts only decide a test that sets them itself, never a slow runner.
 const UNREACHED_TIMEOUT: Duration = Duration::from_secs(3600);
 
 fn scripted_plain_config(port: u16) -> ServerConfig {
@@ -793,9 +793,9 @@ fn scripted_plain_config(port: u16) -> ServerConfig {
     }
 }
 
-/// A server that answers each AUTHINFO line as it arrives, then answers
-/// nothing until every pipelined line has arrived — so a client that
-/// pipelined AUTHINFO, or serialized MODE READER and GROUP, fails here.
+// A server that answers each AUTHINFO line as it arrives, then answers
+// nothing until every pipelined line has arrived — so a client that
+// pipelined AUTHINFO, or serialized MODE READER and GROUP, fails here.
 async fn spawn_pipelined_setup_server(
     auth: Vec<(&'static str, &'static [u8])>,
     expected: Vec<&'static str>,
@@ -845,9 +845,9 @@ fn pipelined_setup_config(port: u16) -> ServerConfig {
     }
 }
 
-/// A server that has proven it needs a selected group gets the GROUP in the
-/// same write, after the serial AUTHINFO exchange. Nothing else is ever added
-/// to that write — MODE READER in particular is never sent to anyone.
+// A server that has proven it needs a selected group gets the GROUP in the
+// same write, after the serial AUTHINFO exchange. Nothing else is ever added
+// to that write — MODE READER in particular is never sent to anyone.
 #[tokio::test]
 async fn known_pipelining_servers_authenticate_then_get_the_group_in_one_write() {
     let port = spawn_pipelined_setup_server(
@@ -871,9 +871,9 @@ async fn known_pipelining_servers_authenticate_then_get_the_group_in_one_write()
     crate::server_caps::forget("127.0.0.1", port);
 }
 
-/// Session setup is authentication and nothing else: a lane reaches its first
-/// command in four round trips, so nothing may be written between the last
-/// AUTHINFO answer and the caller's own command.
+// Session setup is authentication and nothing else: a lane reaches its first
+// command in four round trips, so nothing may be written between the last
+// AUTHINFO answer and the caller's own command.
 #[tokio::test]
 async fn an_unproven_server_gets_no_mode_reader_and_no_group() {
     let port = spawn_pipelined_setup_server(
@@ -902,10 +902,10 @@ async fn an_unproven_server_gets_no_mode_reader_and_no_group() {
     crate::server_caps::forget("127.0.0.1", port);
 }
 
-/// A 500 to BODY is the server refusing the command, and that is all it is.
-/// It surfaces as a plain error on that server; it must not silently rewrite
-/// how weaver talks to the server from then on, and it must not be read as a
-/// hint to start sending MODE READER.
+// A 500 to BODY is the server refusing the command, and that is all it is.
+// It surfaces as a plain error on that server; it must not silently rewrite
+// how weaver talks to the server from then on, and it must not be read as a
+// hint to start sending MODE READER.
 #[tokio::test]
 async fn a_500_after_setup_surfaces_as_an_error_and_teaches_nothing() {
     let port = spawn_pipelined_setup_server(
@@ -934,9 +934,9 @@ async fn a_500_after_setup_surfaces_as_an_error_and_teaches_nothing() {
     crate::server_caps::forget("127.0.0.1", port);
 }
 
-/// A 412 for a message-id fetch is the server insisting on a selected group,
-/// which RFC 3977 does not require of it — record it and pay the GROUP round
-/// trip on later connections to that server only.
+// A 412 for a message-id fetch is the server insisting on a selected group,
+// which RFC 3977 does not require of it — record it and pay the GROUP round
+// trip on later connections to that server only.
 #[tokio::test]
 async fn a_412_after_setup_teaches_the_process_to_select_a_group() {
     let port = spawn_pipelined_setup_server(

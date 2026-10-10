@@ -44,8 +44,8 @@ impl Pipeline {
         wait.pending_count += 1;
     }
 
-    /// Extends or ends `segment_id`'s run of established-transport failures,
-    /// returning the run when this failure belongs to one.
+    // Extends or ends `segment_id`'s run of established-transport failures,
+    // returning the run when this failure belongs to one.
     fn note_transport_failure_streak(
         &mut self,
         segment_id: SegmentId,
@@ -159,9 +159,9 @@ impl Pipeline {
             .set_egress_quota_block(self.parked_egress_quota_block());
     }
 
-    /// The egress quota holding parked work back, if one still is. Work parks
-    /// on an egress only when no server could be reached over any other leg,
-    /// so a parked entry whose egress is still out of quota is a real block.
+    // The egress quota holding parked work back, if one still is. Work parks
+    // on an egress only when no server could be reached over any other leg,
+    // so a parked entry whose egress is still out of quota is a real block.
     fn parked_egress_quota_block(&self) -> Option<crate::jobs::handle::EgressQuotaBlock> {
         if self.egress_quota_parked.is_empty() {
             return None;

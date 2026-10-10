@@ -132,10 +132,10 @@ fn runtime_lanes_for_status(
     }
 }
 
-/// Self-contained test harness that provides a fully-wired GraphQL schema
-/// backed by an in-memory database and a mock scheduler.
-///
-/// Each test should create its own harness for full isolation.
+// Self-contained test harness that provides a fully-wired GraphQL schema
+// backed by an in-memory database and a mock scheduler.
+//
+// Each test should create its own harness for full isolation.
 #[allow(dead_code)]
 pub struct TestHarness {
     pub schema: WeaverSchema,
@@ -148,8 +148,8 @@ pub struct TestHarness {
     pub server_transfer_policy:
         Arc<weaver_server_core::servers::transfer_policy::ServerTransferPolicyRegistry>,
     pub auth_cache: LoginAuthCache,
-    /// The same config the schema holds, so a policy mutation's live effect on
-    /// the trusted-network list is observable from a test.
+    // The same config the schema holds, so a policy mutation's live effect on
+    // the trusted-network list is observable from a test.
     pub security: weaver_server_core::security::RuntimeSecurityConfig,
     pub update_check: weaver_server_core::update_check::UpdateCheckService,
     _scheduler_task: JoinHandle<()>,
@@ -161,25 +161,25 @@ impl TestHarness {
         CallerIdentity::Local([7; 32])
     }
 
-    /// Create a new test harness with in-memory DB, default config, mock
-    /// scheduler, and a real GraphQL schema. Spawns the background
-    /// history-delete worker, matching production.
+    // Create a new test harness with in-memory DB, default config, mock
+    // scheduler, and a real GraphQL schema. Spawns the background
+    // history-delete worker, matching production.
     pub async fn new() -> Self {
         Self::new_with_options(true).await
     }
 
-    /// Like [`TestHarness::new`] but does not spawn the background
-    /// history-delete worker. Use this in tests that seed a delete operation and
-    /// assert on its initial `QUEUED` state, so the worker cannot claim the
-    /// operation (flipping it to `RUNNING`) before the assertion runs.
+    // Like [`TestHarness::new`] but does not spawn the background
+    // history-delete worker. Use this in tests that seed a delete operation and
+    // assert on its initial `QUEUED` state, so the worker cannot claim the
+    // operation (flipping it to `RUNNING`) before the assertion runs.
     pub async fn new_without_history_delete_worker() -> Self {
         Self::new_with_options(false).await
     }
 
-    /// Like [`TestHarness::new`] but with an explicit security posture, for
-    /// tests that pin what strict security, an environment pin, or a widened
-    /// bind address refuse. The config is shared with the schema, so a policy
-    /// mutation's live effect is observable on the caller's copy.
+    // Like [`TestHarness::new`] but with an explicit security posture, for
+    // tests that pin what strict security, an environment pin, or a widened
+    // bind address refuse. The config is shared with the schema, so a policy
+    // mutation's live effect is observable on the caller's copy.
     pub async fn new_with_security(
         security: weaver_server_core::security::RuntimeSecurityConfig,
     ) -> Self {
@@ -328,7 +328,7 @@ impl TestHarness {
         }
     }
 
-    /// Execute a GraphQL query/mutation with full admin access.
+    // Execute a GraphQL query/mutation with full admin access.
     pub async fn execute(&self, query: &str) -> Response {
         let request = Request::new(query)
             .data(CallerScope::Local)
@@ -336,13 +336,13 @@ impl TestHarness {
         self.schema.execute(request).await
     }
 
-    /// Execute a GraphQL query/mutation as a specific caller scope.
+    // Execute a GraphQL query/mutation as a specific caller scope.
     pub async fn execute_as(&self, query: &str, scope: CallerScope) -> Response {
         let request = Request::new(query).data(scope).data(Self::local_identity());
         self.schema.execute(request).await
     }
 
-    /// Execute a GraphQL query/mutation with variables.
+    // Execute a GraphQL query/mutation with variables.
     #[allow(dead_code)]
     pub async fn execute_with_variables(&self, query: &str, variables: Variables) -> Response {
         let request = Request::new(query)
@@ -352,7 +352,7 @@ impl TestHarness {
         self.schema.execute(request).await
     }
 
-    /// Submit a minimal test NZB and return the job ID.
+    // Submit a minimal test NZB and return the job ID.
     pub async fn submit_test_nzb(&self, name: &str) -> u64 {
         self.submit_test_nzb_with_options(name, None, None, &[])
             .await
@@ -364,7 +364,7 @@ impl TestHarness {
             .expect("failed to insert history row");
     }
 
-    /// Submit a test NZB with options, returning the job ID.
+    // Submit a test NZB with options, returning the job ID.
     pub async fn submit_test_nzb_with_options(
         &self,
         name: &str,
@@ -415,7 +415,7 @@ impl TestHarness {
     }
 }
 
-/// Assert that a GraphQL response has no errors.
+// Assert that a GraphQL response has no errors.
 pub fn assert_no_errors(response: &Response) {
     assert!(
         response.errors.is_empty(),
@@ -424,7 +424,7 @@ pub fn assert_no_errors(response: &Response) {
     );
 }
 
-/// Assert that a GraphQL response has at least one error.
+// Assert that a GraphQL response has at least one error.
 pub fn assert_has_errors(response: &Response) {
     assert!(
         !response.errors.is_empty(),
@@ -432,7 +432,7 @@ pub fn assert_has_errors(response: &Response) {
     );
 }
 
-/// Extract the `data` field from a response as JSON.
+// Extract the `data` field from a response as JSON.
 pub fn response_data(response: &Response) -> Value {
     response.data.clone().into_json().unwrap()
 }
@@ -513,7 +513,7 @@ impl BlockingDbOperation {
     }
 }
 
-/// Generate a minimal valid NZB XML for testing.
+// Generate a minimal valid NZB XML for testing.
 pub fn make_test_nzb(name: &str) -> String {
     // Use a unique message-id based on the name to avoid collisions.
     format!(
@@ -527,7 +527,7 @@ pub fn make_test_nzb(name: &str) -> String {
     )
 }
 
-/// Generate a multi-file NZB for testing jobs with multiple files.
+// Generate a multi-file NZB for testing jobs with multiple files.
 #[allow(dead_code)]
 pub fn make_multi_file_nzb(name: &str, file_count: usize) -> String {
     let mut files = String::new();
@@ -551,8 +551,8 @@ pub fn make_multi_file_nzb(name: &str, file_count: usize) -> String {
 // Mock scheduler
 // ---------------------------------------------------------------------------
 
-/// Spawn a mock scheduler that handles commands without performing real
-/// downloads. Returns the handle and the background task.
+// Spawn a mock scheduler that handles commands without performing real
+// downloads. Returns the handle and the background task.
 fn spawn_test_scheduler(
     db: Database,
 ) -> (

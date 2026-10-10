@@ -18,9 +18,9 @@ fn touch_until_after(path: &Path, older_than: SystemTime) -> SystemTime {
     panic!("failed to advance file mtime for {}", path.display());
 }
 
-/// Direct unpack stages outside the conventional tree, so nothing in the job
-/// lifecycle deletes it after a crash. The sweep treats it exactly like the
-/// conventional staging root: keyed by job id, removed when the job is gone.
+// Direct unpack stages outside the conventional tree, so nothing in the job
+// lifecycle deletes it after a crash. The sweep treats it exactly like the
+// conventional staging root: keyed by job id, removed when the job is gone.
 #[test]
 fn staging_cleanup_removes_orphaned_direct_unpack_dirs() {
     let temp = tempfile::tempdir().unwrap();

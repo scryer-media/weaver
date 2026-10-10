@@ -1,8 +1,8 @@
-//! Optional: when `WEAVER_RAPIDYENC_SRC` points at a rapidyenc checkout, compile
-//! its decode sources + a tiny extern-"C" shim via `cc` and link them, and emit
-//! `cfg(rapidyenc_linked)` so the timing harness can A/B against the real
-//! library in-process. When the env var is unset (normal builds, CI, everyone
-//! else) this is a complete no-op — no rapidyenc dependency, no behavior change.
+// Optional: when `WEAVER_RAPIDYENC_SRC` points at a rapidyenc checkout, compile
+// its decode sources + a tiny extern-"C" shim via `cc` and link them, and emit
+// `cfg(rapidyenc_linked)` so the timing harness can A/B against the real
+// library in-process. When the env var is unset (normal builds, CI, everyone
+// else) this is a complete no-op — no rapidyenc dependency, no behavior change.
 
 use std::env;
 use std::path::PathBuf;

@@ -50,8 +50,8 @@ const MAX_BUNDLE_CUMULATIVE_PATH_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BUNDLE_LONG_NAME_BYTES: usize =
     MAX_BUNDLE_CUMULATIVE_PATH_BYTES + MAX_BUNDLE_ARCHIVE_ENTRIES;
 const MAX_BACKUP_ZSTD_WINDOW_LOG: u32 = 26;
-/// Top-level directory pre-0.9 bundles used for extension packages. Weaver no
-/// longer writes it; the name survives only to recognize and skip those entries.
+// Top-level directory pre-0.9 bundles used for extension packages. Weaver no
+// longer writes it; the name survives only to recognize and skip those entries.
 const LEGACY_MANAGED_PACKAGE_DIR: &str = "managed-extensions";
 
 #[derive(Clone, Default)]
@@ -659,13 +659,13 @@ fn is_windows_device_name(component: &str) -> bool {
     })
 }
 
-/// Whether this entry is an extension package from a pre-0.9 bundle.
-///
-/// Those entries are recognized so they can be skipped rather than rejected as
-/// undeclared: the rest of the bundle is the operator's real data, and refusing
-/// the whole restore over a payload nothing reads any more would cost them far
-/// more than the packages are worth. Path safety is already enforced for every
-/// entry before this is consulted.
+// Whether this entry is an extension package from a pre-0.9 bundle.
+//
+// Those entries are recognized so they can be skipped rather than rejected as
+// undeclared: the rest of the bundle is the operator's real data, and refusing
+// the whole restore over a payload nothing reads any more would cost them far
+// more than the packages are worth. Path safety is already enforced for every
+// entry before this is consulted.
 fn is_legacy_managed_package_path(path: &Path) -> bool {
     path.components().next()
         == Some(Component::Normal(std::ffi::OsStr::new(
@@ -976,7 +976,7 @@ fn bundle_aad(metadata: &[u8; BUNDLE_METADATA_SIZE], index: u64) -> Vec<u8> {
     aad
 }
 
-/// File format: `WEAVER_ENC\0` (10 bytes) + salt (32 bytes) + nonce (12 bytes) + ciphertext+tag
+// File format: `WEAVER_ENC\0` (10 bytes) + salt (32 bytes) + nonce (12 bytes) + ciphertext+tag
 const ENCRYPT_MAGIC: &[u8; 10] = b"WEAVER_ENC";
 const SALT_LEN: usize = 32;
 const PBKDF2_ROUNDS: u32 = 600_000;
@@ -1361,8 +1361,8 @@ mod bundle_envelope_tests {
         assert!(entries.next().is_none());
     }
 
-    /// A bundle written before extension packages were removed, complete with
-    /// the `managed-extensions/` payload and the inventory that declared it.
+    // A bundle written before extension packages were removed, complete with
+    // the `managed-extensions/` payload and the inventory that declared it.
     fn legacy_package_bundle() -> Vec<u8> {
         use super::super::manifest::{BACKUP_FORMAT_VERSION, BACKUP_SCOPE};
 

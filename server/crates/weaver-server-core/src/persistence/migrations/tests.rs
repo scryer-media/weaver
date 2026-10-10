@@ -174,7 +174,7 @@ fn migrate_no_journal_file() {
     );
 }
 
-/// Write a journal entry in the binary format: [4-byte LE len][payload][4-byte LE CRC].
+// Write a journal entry in the binary format: [4-byte LE len][payload][4-byte LE CRC].
 fn write_journal_entry(buf: &mut Vec<u8>, entry: &JournalEntry) {
     let payload = rmp_serde::to_vec(entry).unwrap();
     let len = payload.len() as u32;

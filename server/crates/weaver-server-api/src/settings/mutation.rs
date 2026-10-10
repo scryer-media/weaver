@@ -13,8 +13,8 @@ use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::watch_folder::{WatchFolderConfig, WatchFolderMode, WatchFolderService};
 use weaver_server_core::{Database, SchedulerHandle};
 
-/// Refuse a schedule rule this machine could never apply, judged against the
-/// live probe as the hardware-profile choice is.
+// Refuse a schedule rule this machine could never apply, judged against the
+// live probe as the hardware-profile choice is.
 async fn validate_schedule_input(
     ctx: &Context<'_>,
     input: &crate::settings::types::ScheduleInput,

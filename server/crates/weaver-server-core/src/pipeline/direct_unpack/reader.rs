@@ -1,25 +1,25 @@
-//! A `Read + Seek` view of a 7z set that is still downloading.
-//!
-//! Same shape as [`SplitFileReader`](crate::pipeline::archive::split_reader::SplitFileReader):
-//! ordered part files presented as one contiguous archive stream. The
-//! difference is what happens at the end of the bytes. `SplitFileReader` opens
-//! finished files and a read past the end is simply end-of-file; here the files
-//! are still growing, so a read past the verified watermark parks until the
-//! download delivers more, and only an abort or a genuinely finished part ends
-//! it.
-//!
-//! # Arbitrary access is fine; only the frontier blocks
-//!
-//! The parts are on disk, so every byte below a part's watermark stays readable
-//! for the life of the set. Backward seeks, re-reads, and interleaved cursors
-//! are all served straight from the file — the gate is a frontier, not a
-//! ratchet. That is what lets this reader sit under a decoder whose access
-//! pattern weaver does not control: a chain that reads strictly forward simply
-//! never waits longer than the download, and one that jumps around still gets
-//! correct bytes, at worst waiting for the furthest offset it asks for.
-//!
-//! Blocking is by design and belongs on a blocking thread — the same
-//! `spawn_blocking` context that finalize-time extraction already uses.
+// A `Read + Seek` view of a 7z set that is still downloading.
+//
+// Same shape as [`SplitFileReader`](crate::pipeline::archive::split_reader::SplitFileReader):
+// ordered part files presented as one contiguous archive stream. The
+// difference is what happens at the end of the bytes. `SplitFileReader` opens
+// finished files and a read past the end is simply end-of-file; here the files
+// are still growing, so a read past the verified watermark parks until the
+// download delivers more, and only an abort or a genuinely finished part ends
+// it.
+//
+// # Arbitrary access is fine; only the frontier blocks
+//
+// The parts are on disk, so every byte below a part's watermark stays readable
+// for the life of the set. Backward seeks, re-reads, and interleaved cursors
+// are all served straight from the file — the gate is a frontier, not a
+// ratchet. That is what lets this reader sit under a decoder whose access
+// pattern weaver does not control: a chain that reads strictly forward simply
+// never waits longer than the download, and one that jumps around still gets
+// correct bytes, at worst waiting for the furthest offset it asks for.
+//
+// Blocking is by design and belongs on a blocking thread — the same
+// `spawn_blocking` context that finalize-time extraction already uses.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -28,36 +28,36 @@ use std::sync::Arc;
 
 use super::coverage::{PositionInPart, SetCoverage};
 
-/// One part file, opened on first use.
+// One part file, opened on first use.
 #[derive(Debug)]
 struct Part {
     path: PathBuf,
-    /// Opened lazily: a later part often does not exist on disk yet when the
-    /// reader is built, and opening it eagerly would fail the whole set.
+    // Opened lazily: a later part often does not exist on disk yet when the
+    // reader is built, and opening it eagerly would fail the whole set.
     file: Option<File>,
-    /// The coverage's rewrite count for this part when `file` was opened.
-    /// Repair installs a new file at the path rather than writing into the
-    /// old one, so a handle from before a repair reads the file that was moved
-    /// aside; when the count moves on, the path is opened again.
+    // The coverage's rewrite count for this part when `file` was opened.
+    // Repair installs a new file at the path rather than writing into the
+    // old one, so a handle from before a repair reads the file that was moved
+    // aside; when the count moves on, the path is opened again.
     opened_rewritten: u64,
-    /// Cached boundary length. Coverage aborts if repair changes a boundary
-    /// already used by this mapping walk.
+    // Cached boundary length. Coverage aborts if repair changes a boundary
+    // already used by this mapping walk.
     len: Option<u64>,
 }
 
-/// Coverage-gated reader over the ordered parts of one 7z set.
+// Coverage-gated reader over the ordered parts of one 7z set.
 #[derive(Debug)]
 pub struct GatedSplitReader {
     parts: Vec<Part>,
     coverage: Arc<SetCoverage>,
     position: u64,
-    /// Sequential formats discover EOF from completed parts, without an
-    /// archive-wide length declaration or a seek to the tail.
+    // Sequential formats discover EOF from completed parts, without an
+    // archive-wide length declaration or a seek to the tail.
     sequential: bool,
-    /// Cached signature-derived total. Coverage rejects contradictions; reads
-    /// still check for abort and repair pauses, including at cached EOF.
+    // Cached signature-derived total. Coverage rejects contradictions; reads
+    // still check for abort and repair pauses, including at cached EOF.
     total_len: Option<u64>,
-    /// Tests stop a disk read before it publishes consumption.
+    // Tests stop a disk read before it publishes consumption.
     #[cfg(test)]
     read_barrier: Option<(
         std::sync::mpsc::SyncSender<()>,
@@ -66,11 +66,11 @@ pub struct GatedSplitReader {
 }
 
 impl GatedSplitReader {
-    /// Build a reader over `paths`, gated by `coverage`.
-    ///
-    /// `paths` must be in archive order and must match the part count the
-    /// coverage was created with; the two describe the same set and a mismatch
-    /// would silently misplace every offset.
+    // Build a reader over `paths`, gated by `coverage`.
+    //
+    // `paths` must be in archive order and must match the part count the
+    // coverage was created with; the two describe the same set and a mismatch
+    // would silently misplace every offset.
     pub fn open(paths: &[impl AsRef<Path>], coverage: Arc<SetCoverage>) -> io::Result<Self> {
         if paths.is_empty() {
             return Err(io::Error::new(
@@ -108,8 +108,8 @@ impl GatedSplitReader {
         })
     }
 
-    /// Read a sequential archive before its final size is known. Missing
-    /// bytes still park, and only a completed final part supplies EOF.
+    // Read a sequential archive before its final size is known. Missing
+    // bytes still park, and only a completed final part supplies EOF.
     pub fn open_sequential(
         paths: &[impl AsRef<Path>],
         coverage: Arc<SetCoverage>,
@@ -119,17 +119,17 @@ impl GatedSplitReader {
         Ok(reader)
     }
 
-    /// Current offset in the concatenated archive stream.
+    // Current offset in the concatenated archive stream.
     pub fn position(&self) -> u64 {
         self.position
     }
 
-    /// The coverage this reader is gated by.
+    // The coverage this reader is gated by.
     pub fn coverage(&self) -> &Arc<SetCoverage> {
         &self.coverage
     }
 
-    /// The archive's total length, parking only on the first call.
+    // The archive's total length, parking only on the first call.
     fn total_len(&mut self) -> io::Result<u64> {
         if let Some(total) = self.total_len {
             return Ok(total);
@@ -139,15 +139,15 @@ impl GatedSplitReader {
         Ok(total)
     }
 
-    /// Map an archive offset onto a part, the offset within it, and how many
-    /// committed bytes follow.
-    ///
-    /// Walks the parts accumulating their lengths. Only parts the offset lies
-    /// *past* need a settled length; the part the offset lands in needs only a
-    /// watermark that has reached it, which is what lets the reader stream into
-    /// a part that is still downloading. `Ok(None)` means the offset is at or
-    /// past the end of the last part. The last element is the part's rewrite
-    /// count from the same answer, for [`Self::file_for`].
+    // Map an archive offset onto a part, the offset within it, and how many
+    // committed bytes follow.
+    //
+    // Walks the parts accumulating their lengths. Only parts the offset lies
+    // *past* need a settled length; the part the offset lands in needs only a
+    // watermark that has reached it, which is what lets the reader stream into
+    // a part that is still downloading. `Ok(None)` means the offset is at or
+    // past the end of the last part. The last element is the part's rewrite
+    // count from the same answer, for [`Self::file_for`].
     fn locate(&mut self, position: u64) -> io::Result<Option<(usize, u64, u64, u64)>> {
         let total = if self.sequential {
             u64::MAX
@@ -197,13 +197,13 @@ impl GatedSplitReader {
         Ok(None)
     }
 
-    /// The open handle for a part: opened on first use, and opened again after
-    /// every repair of it.
-    ///
-    /// `rewritten` is the coverage's count for this part from the same
-    /// `resolve_position` answer that placed the read, so the handle is judged
-    /// against the moment the bytes it is about to serve were placed, never
-    /// against a later or earlier one.
+    // The open handle for a part: opened on first use, and opened again after
+    // every repair of it.
+    //
+    // `rewritten` is the coverage's count for this part from the same
+    // `resolve_position` answer that placed the read, so the handle is judged
+    // against the moment the bytes it is about to serve were placed, never
+    // against a later or earlier one.
     fn file_for(&mut self, index: usize, rewritten: u64) -> io::Result<&mut File> {
         let part = &mut self.parts[index];
         if part.file.is_some() && part.opened_rewritten != rewritten {

@@ -676,8 +676,8 @@ pub(crate) async fn run(
     }
 }
 
-/// The GraphQL endpoint as a script on this host reaches it, given the address
-/// the server bound and the path it is served under.
+// The GraphQL endpoint as a script on this host reaches it, given the address
+// the server bound and the path it is served under.
 fn script_api_url(bound: SocketAddr, base_url: &str) -> String {
     let host = match bound.ip() {
         std::net::IpAddr::V4(ip) if ip.is_unspecified() => std::net::Ipv4Addr::LOCALHOST.into(),
@@ -720,9 +720,9 @@ mod script_api_url_tests {
     }
 }
 
-/// An explicit legacy migration may establish its first login with the startup
-/// code. Never infer that permission from missing credentials alone: a completed
-/// or unrecognized authenticated policy must continue to require recovery.
+// An explicit legacy migration may establish its first login with the startup
+// code. Never infer that permission from missing credentials alone: a completed
+// or unrecognized authenticated policy must continue to require recovery.
 fn prepare_credentialless_legacy_migration(
     db: &Database,
     explicit_migration: bool,
@@ -826,17 +826,17 @@ mod migration_tests {
     }
 }
 
-/// Why the serve loop is leaving a healthy process: a signal, or a restart the
-/// operator asked for. The teardown is identical; only the last step differs.
+// Why the serve loop is leaving a healthy process: a signal, or a restart the
+// operator asked for. The teardown is identical; only the last step differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeStop {
     Signal,
     Restart,
-    /// Shut down and stay down: an upgrade handed the installation to a helper
-    /// that needs these files released.
+    // Shut down and stay down: an upgrade handed the installation to a helper
+    // that needs these files released.
     ExitOnly,
-    /// Shut down with the code that asks the desktop wrapper to relaunch the
-    /// application from the bundle an upgrade just replaced.
+    // Shut down with the code that asks the desktop wrapper to relaunch the
+    // application from the bundle an upgrade just replaced.
     BundleRelaunch,
 }
 
@@ -862,11 +862,11 @@ impl ServeStop {
     }
 }
 
-/// Signal the event-persistence task to stop and await its final
-/// `flush_write_queue`, bounded so a stuck flush cannot hang process exit.
-/// Called after the pipeline task has completed (its broadcast sender dropped),
-/// so the only remaining reason the task is still running is the long-lived
-/// senders held by `SchedulerHandle` and its service clones.
+// Signal the event-persistence task to stop and await its final
+// `flush_write_queue`, bounded so a stuck flush cannot hang process exit.
+// Called after the pipeline task has completed (its broadcast sender dropped),
+// so the only remaining reason the task is still running is the long-lived
+// senders held by `SchedulerHandle` and its service clones.
 async fn finalize_event_persistence(
     task: tokio::task::JoinHandle<()>,
     shutdown: &Arc<tokio::sync::Notify>,

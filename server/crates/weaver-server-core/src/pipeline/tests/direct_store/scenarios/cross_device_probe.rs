@@ -1,4 +1,4 @@
-//! Cross-device probe
+// Cross-device probe
 
 use super::*;
 
@@ -1002,16 +1002,16 @@ async fn a_damage_demotion_puts_the_set_on_record_and_an_ordinary_one_does_not()
     );
 }
 
-/// The direct-store twin of `the_last_decode_to_settle_retires_the_probe`.
-///
-/// A routed source article leaves `handle_decode_success` at its early return,
-/// ahead of the reorder buffer and the conventional file-complete seam, so
-/// nothing further along that path can notice the job has drained. The last
-/// article of a fully routed set is exactly the article an in-flight probe
-/// ends up waiting behind: the download result that carried it ran the drain
-/// sequence while it was still decoding, and the route itself schedules
-/// nothing. Left there, the job holds its completion checkpoint — and with it
-/// PAR2 recovery promotion — until the probe's own soft timeout expires.
+// The direct-store twin of `the_last_decode_to_settle_retires_the_probe`.
+//
+// A routed source article leaves `handle_decode_success` at its early return,
+// ahead of the reorder buffer and the conventional file-complete seam, so
+// nothing further along that path can notice the job has drained. The last
+// article of a fully routed set is exactly the article an in-flight probe
+// ends up waiting behind: the download result that carried it ran the drain
+// sequence while it was still decoding, and the route itself schedules
+// nothing. Left there, the job holds its completion checkpoint — and with it
+// PAR2 recovery promotion — until the probe's own soft timeout expires.
 #[tokio::test]
 async fn the_last_routed_article_retires_the_probe() {
     let member_name = "Silver.Horizon.S01E09.mkv";

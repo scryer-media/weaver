@@ -1,7 +1,7 @@
-//! Small glob helpers for operator-supplied patterns.
+// Small glob helpers for operator-supplied patterns.
 
-/// Case-insensitive glob matcher supporting `*` (any sequence) and `?` (any
-/// single character). Other characters are literals.
+// Case-insensitive glob matcher supporting `*` (any sequence) and `?` (any
+// single character). Other characters are literals.
 pub(crate) fn glob_match_ci(pattern: &str, input: &str) -> bool {
     if !pattern.contains(['*', '?']) {
         return pattern.eq_ignore_ascii_case(input);

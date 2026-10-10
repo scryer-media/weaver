@@ -1,8 +1,8 @@
-//! Upgrade the post-processing lists and options shipped in 0.14.7.
-//! Saved SQL/JSON shapes and emitted defaults are local to this hook. Header
-//! parsing and script/option validation use the running build; fixture tests
-//! pin the resulting wiring, including multi-kind headers and sealed options.
-//! Other triggers did not run in 0.14.7 and are never enabled by this upgrade.
+// Upgrade the post-processing lists and options shipped in 0.14.7.
+// Saved SQL/JSON shapes and emitted defaults are local to this hook. Header
+// parsing and script/option validation use the running build; fixture tests
+// pin the resulting wiring, including multi-kind headers and sealed options.
+// Other triggers did not run in 0.14.7 and are never enabled by this upgrade.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -18,10 +18,10 @@ use crate::post_processing::model::{
 };
 
 pub(crate) const HOOK_ID: &str = "move_script_wiring_to_instances_v55";
-/// The schema that first has instances. A backup taken below it carries the
-/// earlier wiring instead.
+// The schema that first has instances. A backup taken below it carries the
+// earlier wiring instead.
 pub(crate) const SCHEMA_VERSION: i64 = 55;
-/// The table whose presence in a backup says its wiring is already instances.
+// The table whose presence in a backup says its wiring is already instances.
 pub(crate) const INSTANCES_TABLE: &str = "script_instances";
 
 const LISTS_KEY: &str = "post_processing.script_lists.v1";
@@ -34,8 +34,8 @@ const MAX_TIMEOUT_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MAX_INPUTS: usize = 256;
 const MAX_INPUT_VALUE_BYTES: usize = 64 * 1024;
 
-/// Run the step on a connection that is already inside the transaction it
-/// belongs to. The instance tables must be empty.
+// Run the step on a connection that is already inside the transaction it
+// belongs to. The instance tables must be empty.
 pub(crate) async fn move_script_wiring_to_instances(
     conn: &mut SqlConn<'_>,
 ) -> Result<(), StateError> {
@@ -73,7 +73,7 @@ struct SavedLists {
     categories: BTreeMap<String, Vec<SavedEntry>>,
 }
 
-/// A saved option value: `{"type": "integer", "value": 3}`.
+// A saved option value: `{"type": "integer", "value": 3}`.
 #[derive(Debug, Deserialize)]
 struct SavedValue {
     #[serde(rename = "type")]
@@ -83,7 +83,7 @@ struct SavedValue {
 }
 
 impl SavedValue {
-    /// The value as the script would have been handed it.
+    // The value as the script would have been handed it.
     fn text(&self) -> Option<String> {
         match (self.kind.as_str(), &self.value) {
             ("string", Value::String(text)) => Some(text.clone()),
@@ -114,15 +114,15 @@ struct SavedOptions {
     secrets: Vec<SavedSecret>,
 }
 
-/// Everything the earlier build saved, as it was read.
+// Everything the earlier build saved, as it was read.
 #[derive(Debug, Default)]
 struct Saved {
-    /// Where the scripts are, when a directory was ever settled.
+    // Where the scripts are, when a directory was ever settled.
     directory: Option<PathBuf>,
     lists: Option<String>,
     options: Option<String>,
     settings: Option<String>,
-    /// Secret names already taken, in their compared form.
+    // Secret names already taken, in their compared form.
     secret_names: BTreeSet<String>,
 }
 
@@ -140,14 +140,14 @@ impl Trigger {
 #[derive(Debug, Clone)]
 struct Input {
     name: String,
-    /// Plain text; empty for a secret.
+    // Plain text; empty for a secret.
     value: String,
-    /// The planned secret this input links.
+    // The planned secret this input links.
     secret_id: Option<String>,
 }
 
-/// A named secret made from a secret option that was saved for a script. The
-/// ciphertext is carried across as it was saved: the step never needs the key.
+// A named secret made from a secret option that was saved for a script. The
+// ciphertext is carried across as it was saved: the step never needs the key.
 #[derive(Debug, Clone)]
 struct PlannedSecret {
     id: String,
@@ -170,10 +170,10 @@ struct Instance {
 
 #[derive(Debug, Default)]
 struct Plan {
-    /// One per secret option saved for a script, shared by every instance of
-    /// that script.
+    // One per secret option saved for a script, shared by every instance of
+    // that script.
     secrets: Vec<PlannedSecret>,
-    /// In run order.
+    // In run order.
     instances: Vec<Instance>,
     settings: Option<String>,
     warnings: Vec<String>,
@@ -301,14 +301,14 @@ fn yes_no(value: bool) -> String {
     if value { "yes" } else { "no" }.to_string()
 }
 
-/// The form a secret's name is compared in: names that differ only by case
-/// are one name.
+// The form a secret's name is compared in: names that differ only by case
+// are one name.
 fn name_key(name: &str) -> String {
     name.to_lowercase()
 }
 
-/// The longest prefix of `text` that fits in `max` bytes, cut on a character
-/// boundary.
+// The longest prefix of `text` that fits in `max` bytes, cut on a character
+// boundary.
 fn cut_to(text: &str, max: usize) -> &str {
     let mut end = max.min(text.len());
     while !text.is_char_boundary(end) {
@@ -317,8 +317,8 @@ fn cut_to(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
-/// `<script> <option>`, made unique with a counter. When it does not fit,
-/// the script part is cut first so the option's name survives whole.
+// `<script> <option>`, made unique with a counter. When it does not fit,
+// the script part is cut first so the option's name survives whole.
 fn secret_name(script: &str, option: &str, taken: &BTreeSet<String>) -> String {
     for counter in 1_usize.. {
         let suffix = if counter == 1 {
@@ -348,8 +348,8 @@ fn new_id() -> Result<String, StateError> {
     Ok(hex::encode(entropy))
 }
 
-/// A script as an earlier build would have found it: its name, and its header
-/// when the file is still there to read.
+// A script as an earlier build would have found it: its name, and its header
+// when the file is still there to read.
 struct Known {
     name: String,
     manifest: Option<ScriptManifest>,
@@ -363,7 +363,7 @@ impl Known {
     }
 }
 
-/// The run policy an instance is created with.
+// The run policy an instance is created with.
 #[derive(Clone, Copy)]
 struct Policy {
     enabled: bool,
@@ -391,9 +391,9 @@ impl Policy {
 struct Planner<'a> {
     root: Option<&'a Path>,
     options: BTreeMap<String, SavedOptions>,
-    /// The planned secret for each script and upper-cased option name.
+    // The planned secret for each script and upper-cased option name.
     secret_ids: BTreeMap<(String, String), String>,
-    /// Secret names in use, in their compared form.
+    // Secret names in use, in their compared form.
     secret_names: BTreeSet<String>,
     plan: Plan,
 }
@@ -416,11 +416,11 @@ impl Planner<'_> {
         })
     }
 
-    /// The options saved for a script, as an instance's inputs: every option
-    /// its header declares, at the value the operator gave it or the header's
-    /// default, then anything else that was saved under its name. A saved
-    /// secret becomes a named secret, one per script and option, which every
-    /// instance of that script links.
+    // The options saved for a script, as an instance's inputs: every option
+    // its header declares, at the value the operator gave it or the header's
+    // default, then anything else that was saved under its name. A saved
+    // secret becomes a named secret, one per script and option, which every
+    // instance of that script links.
     fn inputs(&mut self, script: &Known) -> Result<Vec<Input>, StateError> {
         let mut inputs = Vec::new();
         for (name, value, ciphertext) in self.saved_inputs(script) {
@@ -459,8 +459,8 @@ impl Planner<'_> {
         Ok(id)
     }
 
-    /// Each input as a name, its plain value, and the saved ciphertext when
-    /// it is a secret.
+    // Each input as a name, its plain value, and the saved ciphertext when
+    // it is a secret.
     fn saved_inputs(&self, script: &Known) -> Vec<(String, String, Option<String>)> {
         let saved = self.options.get(&script.name);
         let plain = |name: &str| {
@@ -520,7 +520,7 @@ impl Planner<'_> {
         inputs
     }
 
-    /// Add an instance and return where it sits in the plan.
+    // Add an instance and return where it sits in the plan.
     fn add(
         &mut self,
         script: &Known,
@@ -551,7 +551,7 @@ impl Planner<'_> {
     }
 }
 
-/// A header's default for a plain option, as text.
+// A header's default for a plain option, as text.
 fn default_text(value: &OptionValue) -> Option<String> {
     match value {
         OptionValue::String(value) => Some(value.clone()),

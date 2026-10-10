@@ -1,12 +1,15 @@
-//! Turns a runtime snapshot into Prometheus exposition text.
-//!
-//! Every label set that mirrors an enum is derived from that enum's `ALL`
-//! constant, and every label set that mirrors a group of snapshot fields comes
-//! from an exhaustive `match`. Both exist so that adding a variant or a counter
-//! upstream is a compile error here rather than a silently missing series.
+// Turns a runtime snapshot into Prometheus exposition text.
+//
+// Every label set that mirrors an enum is derived from that enum's `ALL`
+// constant, and every label set that mirrors a group of snapshot fields comes
+// from an exhaustive `match`. Both exist so that adding a variant or a counter
+// upstream is a compile error here rather than a silently missing series.
 
 use std::collections::HashMap;
 
+use weaver_server_core::bandwidth::schedule_metrics::{
+    ActionOutcome, HoldReason, ScheduleMetricsSnapshot,
+};
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::instrumentation::{
     DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
@@ -14,9 +17,6 @@ use weaver_server_core::operations::instrumentation::{
     ServerMetricsSnapshot,
 };
 use weaver_server_core::operations::metrics_store::JOB_STATUS_KEYS;
-use weaver_server_core::bandwidth::schedule_metrics::{
-    ActionOutcome, HoldReason, ScheduleMetricsSnapshot,
-};
 use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot;
 use weaver_server_core::post_processing::run_metrics::{
     RunStatus, ScriptMetrics, ScriptRunMetricsSnapshot,
@@ -40,11 +40,11 @@ use super::{BuildInfo, ServerHealthInfo, ServerStateKind, ServerStateReason, job
 
 const BYTES_PER_MEBIBYTE: f64 = 1_048_576.0;
 
-/// Stable label values for the PAR3 work slots, indexed by array position.
+// Stable label values for the PAR3 work slots, indexed by array position.
 const SLOT_LABELS: [&str; weaver_server_core::PAR3_SLOTS] = ["0", "1"];
 
-/// Limiter labels for `weaver_pipeline_download_observed_limiter`, sorted so
-/// the exposition order is stable.
+// Limiter labels for `weaver_pipeline_download_observed_limiter`, sorted so
+// the exposition order is stable.
 pub(crate) const OBSERVED_LIMITERS: [&str; 8] = [
     "active",
     "decode_lagging",
@@ -77,9 +77,9 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) build: BuildInfo,
     pub(crate) start_time_seconds: f64,
     pub(crate) per_job_series: PerJobSeries,
-    /// Per-server article outcomes and latency. Keyed by durable server id, so
-    /// it is joined to `server_health` for the `server` label rather than by
-    /// position.
+    // Per-server article outcomes and latency. Keyed by durable server id, so
+    // it is joined to `server_health` for the `server` label rather than by
+    // position.
     pub(crate) server_metrics: &'a [ServerMetricsSnapshot],
     pub(crate) job_lifecycle: Option<&'a JobLifecycleMetricsSnapshot>,
     pub(crate) pipeline_histograms: Option<&'a PipelineHistogramsSnapshot>,
@@ -87,14 +87,14 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) process: Option<&'a ProcessMetricsSnapshot>,
     pub(crate) disk_space: &'a [DiskSpaceSnapshot],
     pub(crate) http_metrics: Option<&'a HttpMetricsSnapshot>,
-    /// The article buffer pool's occupancy. Absent in the render tests that
-    /// build no pool.
+    // The article buffer pool's occupancy. Absent in the render tests that
+    // build no pool.
     pub(crate) buffer_pool: Option<&'a weaver_server_core::runtime::buffers::BufferPoolMetrics>,
 }
 
 impl<'a> PrometheusRenderInput<'a> {
-    /// Start from the two inputs that have no meaningful empty value; every
-    /// other source is optional and defaults to "nothing to report".
+    // Start from the two inputs that have no meaningful empty value; every
+    // other source is optional and defaults to "nothing to report".
     pub(crate) fn new(
         snapshot: &'a MetricsSnapshot,
         download_block: &'a DownloadBlockState,
@@ -139,8 +139,8 @@ impl<'a> PrometheusRenderInput<'a> {
     }
 }
 
-/// Test-only entry point kept at its original shape so behavioural tests do
-/// not have to restate every optional input.
+// Test-only entry point kept at its original shape so behavioural tests do
+// not have to restate every optional input.
 #[cfg(test)]
 pub(crate) fn render_prometheus_metrics(
     snapshot: &MetricsSnapshot,
@@ -293,11 +293,11 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     out.finish()
 }
 
-/// Render a collected histogram through the encoder.
-///
-/// The snapshot's `counts` are per-bucket; [`Encoder::histogram`] owns the
-/// conversion to Prometheus' cumulative `le` series, so every call site stays a
-/// one-liner and none of them can get the accumulation wrong.
+// Render a collected histogram through the encoder.
+//
+// The snapshot's `counts` are per-bucket; [`Encoder::histogram`] owns the
+// conversion to Prometheus' cumulative `le` series, so every call site stays a
+// one-liner and none of them can get the accumulation wrong.
 fn render_histogram(
     out: &mut Encoder,
     family: &'static MetricFamily,
@@ -452,12 +452,12 @@ fn render_queues(out: &mut Encoder, snapshot: &MetricsSnapshot) {
     }
 }
 
-/// PAR3 recovery telemetry.
-///
-/// Every label set comes from an enum's `ALL`, so a new phase, stage, refusal
-/// reason or outcome class is a compile error here rather than a series that
-/// quietly stops being exported. Millisecond fields are divided once, at the
-/// edge; nothing upstream stores a float.
+// PAR3 recovery telemetry.
+//
+// Every label set comes from an enum's `ALL`, so a new phase, stage, refusal
+// reason or outcome class is a compile error here rather than a series that
+// quietly stops being exported. Millisecond fields are divided once, at the
+// edge; nothing upstream stores a float.
 fn render_par3(out: &mut Encoder, par3: &Par3MetricsSnapshot) {
     const MILLIS_PER_SECOND: f64 = 1000.0;
     let seconds = |millis: u64| millis as f64 / MILLIS_PER_SECOND;
@@ -1281,7 +1281,7 @@ fn render_server_transfers(
     }
 }
 
-/// Each egress's download quota, keyed by egress id.
+// Each egress's download quota, keyed by egress id.
 fn render_egress_quotas(
     out: &mut Encoder,
     egress_transfers: &[weaver_nntp::transfer::ServerTransferSnapshot],
@@ -1326,11 +1326,11 @@ fn render_egress_quotas(
     }
 }
 
-/// Per-server article outcomes and latency.
-///
-/// The collector keys by durable `stable_server_id`; the `server` host:port
-/// label is looked up from the health list so the two per-server families join
-/// without a translation table, exactly as the transfer metrics do.
+// Per-server article outcomes and latency.
+//
+// The collector keys by durable `stable_server_id`; the `server` host:port
+// label is looked up from the health list so the two per-server families join
+// without a translation table, exactly as the transfer metrics do.
 fn render_server_articles(
     out: &mut Encoder,
     server_metrics: &[ServerMetricsSnapshot],
@@ -1452,11 +1452,11 @@ fn render_db_runtime(out: &mut Encoder, db: &DbRuntimeMetricsSnapshot) {
     );
 }
 
-/// The pre-allocated article buffer pool, in bytes rather than in buffers.
-///
-/// Bytes, because the question this answers is how much of the process's
-/// resident set the pool accounts for; the tiers have different buffer sizes,
-/// so a count of buffers does not add up to anything.
+// The pre-allocated article buffer pool, in bytes rather than in buffers.
+//
+// Bytes, because the question this answers is how much of the process's
+// resident set the pool accounts for; the tiers have different buffer sizes,
+// so a count of buffers does not add up to anything.
 fn render_buffer_pool(
     out: &mut Encoder,
     pool: &weaver_server_core::runtime::buffers::BufferPoolMetrics,
@@ -1498,11 +1498,11 @@ fn render_buffer_pool(
     out.sample(&f::BUFFER_POOL_WAITS, &[], pool.wait_count);
 }
 
-/// Standard `process_*` collector series.
-///
-/// Every field is optional and an absent one is omitted rather than zeroed:
-/// "this platform cannot report RSS" and "this process uses no memory" must not
-/// look the same on a dashboard.
+// Standard `process_*` collector series.
+//
+// Every field is optional and an absent one is omitted rather than zeroed:
+// "this platform cannot report RSS" and "this process uses no memory" must not
+// look the same on a dashboard.
 fn render_process(out: &mut Encoder, process: &ProcessMetricsSnapshot, exporter_start: f64) {
     if let Some(cpu_seconds) = process.cpu_seconds_total {
         out.sample_f64(&f::PROCESS_CPU_SECONDS, &[], cpu_seconds);
@@ -1709,7 +1709,11 @@ pub(crate) fn render_script_runs(out: &mut Encoder, metrics: &ScriptRunMetricsSn
         out.sample(&f::PP_REFUSALS, &[("kind", kind.as_str())], count);
     }
     for &(summary, count) in &metrics.job_summaries {
-        out.sample(&f::PP_JOB_SUMMARIES, &[("summary", summary.as_str())], count);
+        out.sample(
+            &f::PP_JOB_SUMMARIES,
+            &[("summary", summary.as_str())],
+            count,
+        );
     }
     out.sample(
         &f::PP_INTERRUPTED_RECOVERED,
@@ -1878,7 +1882,8 @@ pub(crate) fn render_schedules(out: &mut Encoder, metrics: &ScheduleMetricsSnaps
         out.sample_f64(
             &f::SCHEDULE_RULE_LAST_FIRE,
             &[("rule_id", &rule.id)],
-            rule.last_fire_epoch_ms.map_or(0.0, |ms| ms as f64 / 1_000.0),
+            rule.last_fire_epoch_ms
+                .map_or(0.0, |ms| ms as f64 / 1_000.0),
         );
     }
     for rule in &metrics.rules {
@@ -1923,7 +1928,9 @@ pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot
         (&f::NETWORK_LEG_TARGET, |l| Some(l.target as f64)),
         (&f::NETWORK_LEG_OPEN, |l| Some(l.open as f64)),
         (&f::NETWORK_LEG_OPENING, |l| Some(l.opening as f64)),
-        (&f::NETWORK_LEG_THROUGHPUT, |l| Some(l.bytes_per_second as f64)),
+        (&f::NETWORK_LEG_THROUGHPUT, |l| {
+            Some(l.bytes_per_second as f64)
+        }),
         (&f::NETWORK_LEG_RUNG, |l| l.rung.map(|r| r as f64)),
     ];
     for (family, value) in leg_families {
@@ -2018,7 +2025,11 @@ pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot
         ] {
             out.sample(
                 &f::NETWORK_POOL_MEMBERS,
-                &[("pool_id", pool_id), ("egress_id", egress), ("stage", stage)],
+                &[
+                    ("pool_id", pool_id),
+                    ("egress_id", egress),
+                    ("stage", stage),
+                ],
                 count,
             );
         }
@@ -2030,7 +2041,11 @@ pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot
         ] {
             out.sample(
                 &f::NETWORK_POOL_CONNECTIONS,
-                &[("pool_id", pool_id), ("egress_id", egress), ("state", state)],
+                &[
+                    ("pool_id", pool_id),
+                    ("egress_id", egress),
+                    ("state", state),
+                ],
                 count,
             );
         }
@@ -2039,7 +2054,11 @@ pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot
         for (result, count) in [("won", pool.races_won), ("failed", pool.races_failed)] {
             out.sample(
                 &f::NETWORK_POOL_RACES,
-                &[("pool_id", pool_id), ("egress_id", egress), ("result", result)],
+                &[
+                    ("pool_id", pool_id),
+                    ("egress_id", egress),
+                    ("result", result),
+                ],
                 count,
             );
         }

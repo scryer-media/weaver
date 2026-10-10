@@ -1,64 +1,64 @@
-//! Restart-side validation of direct-store coverage.
-//!
-//! Synchronous restart is bounded and **reads zero destination bytes**. The
-//! barrier ordered data sync → checkpoint commit → floor publish, so a committed
-//! floor is already durable. Restart therefore does exactly three things before
-//! the job resumes:
-//!
-//! 1. validate the checkpoint framing, schema, generation and plan digest;
-//! 2. confirm every claimed destination exists;
-//! 3. confirm each is at least as long as its claimed extents.
-//!
-//! No byte verification and no destination reads beyond fs metadata. An earlier
-//! revision's "verify at most 64 MiB of destination tails" was dropped because
-//! the blob stores no tail digests, so the check had no reference value; the
-//! integrity gates re-arm in the background, from the verifier that must touch
-//! those bytes anyway — never synchronously at startup, and never twice.
-//!
-//! File length never implies coverage. A **longer** destination than the claim
-//! is expected and is not truncated; a **shorter** one means the claim outran
-//! what is on disk, which is not a partial-trust situation — the whole set drops
-//! to no coverage and redownloads.
-//!
-//! # What the probe is, and is not
-//!
-//! The probe is `std::fs::metadata`, which **follows symlinks**: a claimed path
-//! that is a symlink to a long enough regular file is accepted, and the length
-//! read is the target's. That is deliberate and it is not this module's stance
-//! to make — restart only reads metadata, and reading a symlinked file's length
-//! discloses nothing and writes nothing. The stance that matters belongs to the
-//! writer, which opens these paths for writing: it owns whether a destination
-//! may be a symlink at all (`O_NOFOLLOW`, or an `is_symlink` refusal before the
-//! open), and once it refuses to write through one, no checkpoint can come to
-//! claim one either. Snapshot decoding independently refuses paths that escape
-//! their root lexically, so the probe is only ever handed job-relative paths.
-//!
-//! A probe that cannot be completed is **not** a pass. "Could not check" is a
-//! refusal ([`CoverageRejection::ProbeFailed`]): accepting a checkpoint whose
-//! destinations were never validated is the one outcome this module exists to
-//! prevent.
-//!
-//! # Where job restore enters
-//!
-//! [`Pipeline::restore_direct_store_coverage`] is the seam. It runs before the
-//! job's assembly is built, because its output *is* part of the restore skip
-//! set, and it does five things in order:
-//!
-//! 1. rediscovers the job's candidate sets from the restored spec, gate-aware;
-//! 2. rebuilds each one's layout from `active_rar_volume_facts` — the header
-//!    bytes sit below the published floors and are never refetched, so the facts
-//!    are the only way back to the members, their destinations and the plan
-//!    digest;
-//! 3. validates every checkpoint row against those rebuilt plans ([`restore_job`]);
-//! 4. turns each accepted row's floors into skipped segments
-//!    ([`coverage_skip_plan`]), exactly the way legacy floors feed the same
-//!    machinery;
-//! 5. sweeps **both** of the job's roots — the working directory and the
-//!    staging root — of direct-store files nothing claims.
-//!
-//! A set with no accepted row is installed **fresh**: it redownloads and routes
-//! from zero, which is what an unwired restart already did, and its stale
-//! partials and envelopes are swept first so no byte of them survives.
+// Restart-side validation of direct-store coverage.
+//
+// Synchronous restart is bounded and **reads zero destination bytes**. The
+// barrier ordered data sync → checkpoint commit → floor publish, so a committed
+// floor is already durable. Restart therefore does exactly three things before
+// the job resumes:
+//
+// 1. validate the checkpoint framing, schema, generation and plan digest;
+// 2. confirm every claimed destination exists;
+// 3. confirm each is at least as long as its claimed extents.
+//
+// No byte verification and no destination reads beyond fs metadata. An earlier
+// revision's "verify at most 64 MiB of destination tails" was dropped because
+// the blob stores no tail digests, so the check had no reference value; the
+// integrity gates re-arm in the background, from the verifier that must touch
+// those bytes anyway — never synchronously at startup, and never twice.
+//
+// File length never implies coverage. A **longer** destination than the claim
+// is expected and is not truncated; a **shorter** one means the claim outran
+// what is on disk, which is not a partial-trust situation — the whole set drops
+// to no coverage and redownloads.
+//
+// # What the probe is, and is not
+//
+// The probe is `std::fs::metadata`, which **follows symlinks**: a claimed path
+// that is a symlink to a long enough regular file is accepted, and the length
+// read is the target's. That is deliberate and it is not this module's stance
+// to make — restart only reads metadata, and reading a symlinked file's length
+// discloses nothing and writes nothing. The stance that matters belongs to the
+// writer, which opens these paths for writing: it owns whether a destination
+// may be a symlink at all (`O_NOFOLLOW`, or an `is_symlink` refusal before the
+// open), and once it refuses to write through one, no checkpoint can come to
+// claim one either. Snapshot decoding independently refuses paths that escape
+// their root lexically, so the probe is only ever handed job-relative paths.
+//
+// A probe that cannot be completed is **not** a pass. "Could not check" is a
+// refusal ([`CoverageRejection::ProbeFailed`]): accepting a checkpoint whose
+// destinations were never validated is the one outcome this module exists to
+// prevent.
+//
+// # Where job restore enters
+//
+// [`Pipeline::restore_direct_store_coverage`] is the seam. It runs before the
+// job's assembly is built, because its output *is* part of the restore skip
+// set, and it does five things in order:
+//
+// 1. rediscovers the job's candidate sets from the restored spec, gate-aware;
+// 2. rebuilds each one's layout from `active_rar_volume_facts` — the header
+//    bytes sit below the published floors and are never refetched, so the facts
+//    are the only way back to the members, their destinations and the plan
+//    digest;
+// 3. validates every checkpoint row against those rebuilt plans ([`restore_job`]);
+// 4. turns each accepted row's floors into skipped segments
+//    ([`coverage_skip_plan`]), exactly the way legacy floors feed the same
+//    machinery;
+// 5. sweeps **both** of the job's roots — the working directory and the
+//    staging root — of direct-store files nothing claims.
+//
+// A set with no accepted row is installed **fresh**: it redownloads and routes
+// from zero, which is what an unwired restart already did, and its stale
+// partials and envelopes are swept first so no byte of them survives.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -73,32 +73,32 @@ use crate::jobs::model::JobSpec;
 use crate::jobs::service::segments_covered_by_floor;
 use crate::pipeline::Pipeline;
 
-/// The durable per-volume facts a restart rebuilds a set's layout from.
-///
-/// One row per (job, set, volume) of `active_rar_volume_facts`, whose column is
-/// an opaque blob — which is what lets a second container family join it with
-/// no migration and no invalidation of anything already written.
-///
-/// # The untagged fallback is the compatibility guarantee
-///
-/// Rows written before this envelope existed are a bare `RarVolumeFacts` map,
-/// and they belong to sets that are mid-download in a shipped release. Decoding
-/// tries the tagged form first and falls back to the bare one, so those rows
-/// restore exactly as they did — a new tag on the wire would otherwise turn
-/// every in-flight direct set into a redownload on the upgrade.
+// The durable per-volume facts a restart rebuilds a set's layout from.
+//
+// One row per (job, set, volume) of `active_rar_volume_facts`, whose column is
+// an opaque blob — which is what lets a second container family join it with
+// no migration and no invalidation of anything already written.
+//
+// # The untagged fallback is the compatibility guarantee
+//
+// Rows written before this envelope existed are a bare `RarVolumeFacts` map,
+// and they belong to sets that are mid-download in a shipped release. Decoding
+// tries the tagged form first and falls back to the bare one, so those rows
+// restore exactly as they did — a new tag on the wire would otherwise turn
+// every in-flight direct set into a redownload on the upgrade.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum DirectVolumeFacts {
     Rar(Box<unrar_rs::RarVolumeFacts>),
     SevenZip(Box<SevenZipVolumeFacts>),
 }
 
-/// What one volume of a 7z set contributes to the restored layout.
-///
-/// A 7z container states its map once, at the tail, so exactly one volume's row
-/// carries `container` and every row carries the one thing that is genuinely
-/// per volume: the length the wire declared for it. Both halves are needed —
-/// the map gives container offsets, and only the lengths turn those into the
-/// (volume, offset) pairs everything downstream is expressed in.
+// What one volume of a 7z set contributes to the restored layout.
+//
+// A 7z container states its map once, at the tail, so exactly one volume's row
+// carries `container` and every row carries the one thing that is genuinely
+// per volume: the length the wire declared for it. Both halves are needed —
+// the map gives container offsets, and only the lengths turn those into the
+// (volume, offset) pairs everything downstream is expressed in.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SevenZipVolumeFacts {
     pub(crate) declared_len: u64,
@@ -120,16 +120,16 @@ impl DirectVolumeFacts {
     }
 }
 
-/// Why a checkpoint row was refused. Every variant means the same thing for the
-/// set: **no coverage**, redownload from zero, and delete the row.
+// Why a checkpoint row was refused. Every variant means the same thing for the
+// set: **no coverage**, redownload from zero, and delete the row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CoverageRejection {
     Decode(SnapshotError),
-    /// A committed checkpoint always carries a generation of at least 1.
+    // A committed checkpoint always carries a generation of at least 1.
     InvalidGeneration,
-    /// Hard stop: safe redownload or demotion, never partial trust.
+    // Hard stop: safe redownload or demotion, never partial trust.
     PlanDigestMismatch,
-    /// The row names a set the current plan does not have.
+    // The row names a set the current plan does not have.
     UnknownSet,
     MissingDestination {
         path: String,
@@ -139,32 +139,32 @@ pub(crate) enum CoverageRejection {
         claimed: u64,
         actual: u64,
     },
-    /// The blob's volume-to-file mapping disagrees with the layout plan's.
-    /// `expected` is `None` when the plan has no such volume at all.
-    ///
-    /// The blob carries `file_index` so it is self-contained, but the plan is
-    /// authoritative: a flipped index would derive the refetch floor for the
-    /// wrong NZB file and skip segments of a file nothing ever wrote.
+    // The blob's volume-to-file mapping disagrees with the layout plan's.
+    // `expected` is `None` when the plan has no such volume at all.
+    //
+    // The blob carries `file_index` so it is self-contained, but the plan is
+    // authoritative: a flipped index would derive the refetch floor for the
+    // wrong NZB file and skip segments of a file nothing ever wrote.
     FileIndexMismatch {
         volume_index: u32,
         expected: Option<u32>,
         found: u32,
     },
-    /// The destination probe did not complete — the blocking task panicked, or
-    /// the runtime was torn down under it. Never an acceptance: a checkpoint
-    /// whose destinations went unchecked is not a checked checkpoint.
+    // The destination probe did not complete — the blocking task panicked, or
+    // the runtime was torn down under it. Never an acceptance: a checkpoint
+    // whose destinations went unchecked is not a checked checkpoint.
     ProbeFailed {
         error: String,
     },
-    /// The row claims coverage in a volume the rebuilt layout has no cached
-    /// facts for, so nothing it restores for that volume could ever be
-    /// classified.
+    // The row claims coverage in a volume the rebuilt layout has no cached
+    // facts for, so nothing it restores for that volume could ever be
+    // classified.
     UnclassifiableVolume {
         volume_index: u32,
     },
-    /// A volume the row still claims already has bytes in a conventional
-    /// file: a demotion's per-volume handback was interrupted before the row
-    /// retired. Two images of one volume are never reconciled.
+    // A volume the row still claims already has bytes in a conventional
+    // file: a demotion's per-volume handback was interrupted before the row
+    // retired. Two images of one volume are never reconciled.
     ConventionalBytes {
         file_index: u32,
     },
@@ -228,52 +228,52 @@ impl std::fmt::Display for CoverageRejection {
     }
 }
 
-/// The plan facts a checkpoint is validated against.
-///
-/// Both are read from the layout plan the job is resuming with, and both are
-/// authoritative over whatever the blob says about itself.
+// The plan facts a checkpoint is validated against.
+//
+// Both are read from the layout plan the job is resuming with, and both are
+// authoritative over whatever the blob says about itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ExpectedSet {
-    /// Digest of the exact layout plan. A mismatch is a hard stop.
+    // Digest of the exact layout plan. A mismatch is a hard stop.
     pub(crate) plan_digest: [u8; 32],
-    /// Volume index to NZB file index, from the plan. Checked against every
-    /// [`VolumeFloor`](super::snapshot::VolumeFloor) in the blob: the blob keeps
-    /// its own copy so a row is self-describing, but only the plan decides
-    /// which file a volume's floor is a floor *of*.
+    // Volume index to NZB file index, from the plan. Checked against every
+    // [`VolumeFloor`](super::snapshot::VolumeFloor) in the blob: the blob keeps
+    // its own copy so a row is self-describing, but only the plan decides
+    // which file a volume's floor is a floor *of*.
     pub(crate) volume_files: HashMap<u32, u32>,
-    /// The volumes the rebuilt layout actually has cached facts for.
-    ///
-    /// Not the same question as `volume_files`, which is what the *plan* has. A
-    /// set's facts are cached per volume and any subset of them can be missing
-    /// — a volume that never finished its confirming parse, a row that failed
-    /// to decode — and the layout rebuild happily proceeds without them,
-    /// because a volume that contributed no member changes nothing the plan
-    /// digest covers. The digest therefore still matches, and the row is
-    /// accepted for a set with a volume the router cannot classify a byte of:
-    /// its restored coverage can never be mapped, so its bytes are held for the
-    /// life of the set and it wedges exactly the way the other
-    /// unclassifiable-volume cases do. A row claiming coverage in a volume that
-    /// is not in here is refused instead.
+    // The volumes the rebuilt layout actually has cached facts for.
+    //
+    // Not the same question as `volume_files`, which is what the *plan* has. A
+    // set's facts are cached per volume and any subset of them can be missing
+    // — a volume that never finished its confirming parse, a row that failed
+    // to decode — and the layout rebuild happily proceeds without them,
+    // because a volume that contributed no member changes nothing the plan
+    // digest covers. The digest therefore still matches, and the row is
+    // accepted for a set with a volume the router cannot classify a byte of:
+    // its restored coverage can never be mapped, so its bytes are held for the
+    // life of the set and it wedges exactly the way the other
+    // unclassifiable-volume cases do. A row claiming coverage in a volume that
+    // is not in here is refused instead.
     pub(crate) fact_volumes: HashSet<u32>,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct RestoreOutcome {
-    /// Set name to accepted checkpoint.
+    // Set name to accepted checkpoint.
     pub(crate) accepted: HashMap<String, CoverageSnapshot>,
-    /// Set name and why it was refused. Each of these rows has been deleted.
+    // Set name and why it was refused. Each of these rows has been deleted.
     pub(crate) rejected: Vec<(String, CoverageRejection)>,
-    /// Rows left untouched because the gate is off.
+    // Rows left untouched because the gate is off.
     pub(crate) ignored: usize,
 }
 
-/// The two roots a direct set's destinations resolve against.
-///
-/// Envelopes are working data and live in the job's working directory; member
-/// payload lives in the job's staging root on the complete volume, so its commit
-/// rename and completion's publish are both same-filesystem. A checkpoint's
-/// claims mix the two, keyed by destination index, so restart has to carry both
-/// roots to probe them.
+// The two roots a direct set's destinations resolve against.
+//
+// Envelopes are working data and live in the job's working directory; member
+// payload lives in the job's staging root on the complete volume, so its commit
+// rename and completion's publish are both same-filesystem. A checkpoint's
+// claims mix the two, keyed by destination index, so restart has to carry both
+// roots to probe them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DestinationRoots {
     pub(crate) working_dir: PathBuf,
@@ -281,10 +281,10 @@ pub(crate) struct DestinationRoots {
 }
 
 impl DestinationRoots {
-    /// The roots a plan resolves its own derived paths against.
-    ///
-    /// Production code reaches the two roots through the plan itself; this is
-    /// for the tests that hand a plan's roots straight to [`restore_set`].
+    // The roots a plan resolves its own derived paths against.
+    //
+    // Production code reaches the two roots through the plan itself; this is
+    // for the tests that hand a plan's roots straight to [`restore_set`].
     #[cfg(test)]
     pub(crate) fn for_plan(plan: &DirectSetPlan) -> Self {
         Self {
@@ -293,10 +293,10 @@ impl DestinationRoots {
         }
     }
 
-    /// The root one claim's relative path hangs off, decided by the destination
-    /// key band rather than by the path text — see
-    /// [`super::set::envelope_volume_for_key`]. `volumes` is the plan's volume
-    /// set, which is what makes the classification exact.
+    // The root one claim's relative path hangs off, decided by the destination
+    // key band rather than by the path text — see
+    // [`super::set::envelope_volume_for_key`]. `volumes` is the plan's volume
+    // set, which is what makes the classification exact.
     fn resolve(
         &self,
         destination_key: u32,
@@ -311,18 +311,18 @@ impl DestinationRoots {
     }
 }
 
-/// One destination the checkpoint claims, ready to be probed.
+// One destination the checkpoint claims, ready to be probed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DestinationProbe {
-    /// Absolute path: the claim's own root joined with the claim's path.
+    // Absolute path: the claim's own root joined with the claim's path.
     pub(super) path: PathBuf,
-    /// The claim's path, for messages.
+    // The claim's path, for messages.
     pub(super) relative_path: String,
-    /// The length the file must have for the claim to be admissible.
+    // The length the file must have for the claim to be admissible.
     pub(super) claimed: u64,
 }
 
-/// A probe's answer. `actual` is `None` when nothing usable is at the path.
+// A probe's answer. `actual` is `None` when nothing usable is at the path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ProbedDestination {
     pub(super) relative_path: String,
@@ -330,8 +330,8 @@ pub(super) struct ProbedDestination {
     pub(super) actual: Option<u64>,
 }
 
-/// The real probe: fs metadata, nothing else. Regular files only — a directory
-/// or a socket where a destination should be is a missing destination.
+// The real probe: fs metadata, nothing else. Regular files only — a directory
+// or a socket where a destination should be is a missing destination.
 fn probe_destination_lengths(probes: Vec<DestinationProbe>) -> Vec<ProbedDestination> {
     probes
         .into_iter()
@@ -346,10 +346,10 @@ fn probe_destination_lengths(probes: Vec<DestinationProbe>) -> Vec<ProbedDestina
         .collect()
 }
 
-/// Validates one checkpoint against the current plan and the destinations on
-/// disk.
-///
-/// The fs probes run on the blocking pool; the decision itself is pure.
+// Validates one checkpoint against the current plan and the destinations on
+// disk.
+//
+// The fs probes run on the blocking pool; the decision itself is pure.
 pub(crate) async fn restore_set(
     roots: &DestinationRoots,
     blob: &[u8],
@@ -358,8 +358,8 @@ pub(crate) async fn restore_set(
     restore_set_with_probe(roots, blob, expected, probe_destination_lengths).await
 }
 
-/// [`restore_set`] with the destination probe injected, so the failure modes of
-/// probing — a panic, a torn-down runtime, a short answer — are testable.
+// [`restore_set`] with the destination probe injected, so the failure modes of
+// probing — a panic, a torn-down runtime, a short answer — are testable.
 pub(super) async fn restore_set_with_probe<F>(
     roots: &DestinationRoots,
     blob: &[u8],
@@ -462,21 +462,21 @@ where
     Ok(snapshot)
 }
 
-/// Validates every checkpoint row a job carries, deleting the ones it refuses.
-///
-/// With the gate off the rows are **ignored, not deleted**: a downgraded or
-/// temporarily disabled binary must not destroy coverage a re-enabled one could
-/// still validate. It simply sees no floors and redownloads, which is safe.
-///
-/// # `expected` must be complete
-///
-/// `expected` is the job's **whole** set of planned archive sets. A row naming a
-/// set that is absent from it is refused as [`CoverageRejection::UnknownSet`]
-/// and its row is **deleted** — that is the point of the variant, since a set
-/// the plan no longer has is a set whose coverage can never be validated again.
-/// So a caller that passes a partial map does not merely fail to restore those
-/// sets; it destroys their checkpoints. Build the map from the same layout plan
-/// the job is resuming with, for every set in it, before calling.
+// Validates every checkpoint row a job carries, deleting the ones it refuses.
+//
+// With the gate off the rows are **ignored, not deleted**: a downgraded or
+// temporarily disabled binary must not destroy coverage a re-enabled one could
+// still validate. It simply sees no floors and redownloads, which is safe.
+//
+// # `expected` must be complete
+//
+// `expected` is the job's **whole** set of planned archive sets. A row naming a
+// set that is absent from it is refused as [`CoverageRejection::UnknownSet`]
+// and its row is **deleted** — that is the point of the variant, since a set
+// the plan no longer has is a set whose coverage can never be validated again.
+// So a caller that passes a partial map does not merely fail to restore those
+// sets; it destroys their checkpoints. Build the map from the same layout plan
+// the job is resuming with, for every set in it, before calling.
 pub(crate) async fn restore_job<P: CoveragePersist + ?Sized>(
     gate: DirectStoreGate,
     job_id: JobId,
@@ -523,13 +523,13 @@ pub(crate) async fn restore_job<P: CoveragePersist + ?Sized>(
     outcome
 }
 
-/// Whether a finalized set's installation marker still describes this spec and
-/// this staging root.
-///
-/// Metadata only, like every other restart probe: the members were verified
-/// before they were committed, and what a restart can lose is the file, not its
-/// bytes. A probe that cannot complete is a refusal, for the same reason
-/// [`CoverageRejection::ProbeFailed`] is.
+// Whether a finalized set's installation marker still describes this spec and
+// this staging root.
+//
+// Metadata only, like every other restart probe: the members were verified
+// before they were committed, and what a restart can lose is the file, not its
+// bytes. A probe that cannot complete is a refusal, for the same reason
+// [`CoverageRejection::ProbeFailed`] is.
 async fn installed_set_still_present(
     plan: &DirectSetPlan,
     blob: &[u8],
@@ -585,12 +585,12 @@ async fn installed_set_still_present(
     Ok(marker)
 }
 
-/// Per-NZB-file refetch floors derived from a checkpoint.
-///
-/// Everything above a floor is redownloaded. Actual refetch can exceed the
-/// barrier interval, because floors are contiguous and coverage sitting above a
-/// stalled floor — a source-volume hole waiting on a slow article — goes with
-/// it. That is the accepted cost of a contiguous-floor model.
+// Per-NZB-file refetch floors derived from a checkpoint.
+//
+// Everything above a floor is redownloaded. Actual refetch can exceed the
+// barrier interval, because floors are contiguous and coverage sitting above a
+// stalled floor — a source-volume hole waiting on a slow article — goes with
+// it. That is the accepted cost of a contiguous-floor model.
 pub(crate) fn refetch_floors(snapshot: &CoverageSnapshot) -> HashMap<u32, u64> {
     let mut floors: HashMap<u32, u64> = HashMap::with_capacity(snapshot.floors.len());
     for entry in &snapshot.floors {
@@ -602,14 +602,14 @@ pub(crate) fn refetch_floors(snapshot: &CoverageSnapshot) -> HashMap<u32, u64> {
     floors
 }
 
-/// NZB file indices whose source volume the checkpoint says finished
-/// downloading.
-///
-/// Kept apart from [`refetch_floors`] because it answers a different question in
-/// different units: a floor is decoded source bytes and the spec's segment sizes
-/// are yEnc-encoded, so no floor can ever prove a file complete. A repeated file
-/// index in a malformed blob is resolved the same conservative way — every entry
-/// naming the file must agree it is complete.
+// NZB file indices whose source volume the checkpoint says finished
+// downloading.
+//
+// Kept apart from [`refetch_floors`] because it answers a different question in
+// different units: a floor is decoded source bytes and the spec's segment sizes
+// are yEnc-encoded, so no floor can ever prove a file complete. A repeated file
+// index in a malformed blob is resolved the same conservative way — every entry
+// naming the file must agree it is complete.
 pub(crate) fn complete_files(snapshot: &CoverageSnapshot) -> HashSet<u32> {
     let mut complete: HashSet<u32> = HashSet::new();
     let mut refuted: HashSet<u32> = HashSet::new();
@@ -627,17 +627,17 @@ pub(crate) fn complete_files(snapshot: &CoverageSnapshot) -> HashSet<u32> {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct DirectSkipPlan {
     pub(crate) skip: HashSet<SegmentId>,
-    /// NZB file index to the contiguous byte floor whole segments account for.
+    // NZB file index to the contiguous byte floor whole segments account for.
     pub(crate) file_progress: HashMap<u32, u64>,
 }
 
-/// Derives the segments a direct set may skip on restart.
-///
-/// Shares `segments_covered_by_floor` with the legacy restore path, but
-/// deliberately **without** its `metadata.len()` clamp: for a direct set the
-/// source volume never exists as a file, so clamping to its length would zero
-/// every floor and redownload the whole job. File length never implies
-/// coverage.
+// Derives the segments a direct set may skip on restart.
+//
+// Shares `segments_covered_by_floor` with the legacy restore path, but
+// deliberately **without** its `metadata.len()` clamp: for a direct set the
+// source volume never exists as a file, so clamping to its length would zero
+// every floor and redownload the whole job. File length never implies
+// coverage.
 pub(crate) fn coverage_skip_plan(
     job_id: JobId,
     spec: &JobSpec,
@@ -681,18 +681,18 @@ pub(crate) fn coverage_skip_plan(
     plan
 }
 
-/// Everything a job restore learned about its direct sets.
+// Everything a job restore learned about its direct sets.
 #[derive(Debug, Default)]
 pub(crate) struct DirectRestore {
-    /// Rebuilt sets, ready to install once the job state exists.
+    // Rebuilt sets, ready to install once the job state exists.
     pub(crate) sets: Vec<DirectSet>,
-    /// Segments the accepted checkpoints cover, to union into the restore skip
-    /// set exactly like legacy floors.
+    // Segments the accepted checkpoints cover, to union into the restore skip
+    // set exactly like legacy floors.
     pub(crate) skip: HashSet<SegmentId>,
     pub(crate) file_progress: HashMap<u32, u64>,
-    /// Sets whose installation marker was accepted: each is already in
-    /// [`Self::sets`], finalized, and carries the names its finalization
-    /// recorded as extracted, which only the live job state can hold.
+    // Sets whose installation marker was accepted: each is already in
+    // [`Self::sets`], finalized, and carries the names its finalization
+    // recorded as extracted, which only the live job state can hold.
     pub(crate) installed: Vec<(String, Vec<String>)>,
     pub(crate) accepted: usize,
     pub(crate) rejected: usize,
@@ -700,32 +700,32 @@ pub(crate) struct DirectRestore {
     pub(crate) swept: usize,
 }
 
-/// Filename markers of the files direct-store owns inside a working directory.
-///
-/// Only the partial suffix is still matched as a *pattern*; envelopes are swept
-/// by name, from the plans that produce them, because `.envelope` is an extension
-/// an extracted member can legitimately carry. See
-/// [`sweep_orphan_direct_files`].
+// Filename markers of the files direct-store owns inside a working directory.
+//
+// Only the partial suffix is still matched as a *pattern*; envelopes are swept
+// by name, from the plans that produce them, because `.envelope` is an extension
+// an extracted member can legitimately carry. See
+// [`sweep_orphan_direct_files`].
 const DIRECT_PARTIAL_SUFFIX: &str = ".direct.partial";
-/// Prefix of the holds scratch files. Matched as a prefix rather than a suffix
-/// because the set name is the tail of the component.
+// Prefix of the holds scratch files. Matched as a prefix rather than a suffix
+// because the set name is the tail of the component.
 pub(crate) const HOLDS_SCRATCH_PREFIX: &str = ".weaver-holds.";
 
-/// How deep the sweep walks below the working directory. Member partials live
-/// wherever their member's stored path puts them, which is archive-controlled;
-/// a bound keeps a hostile or pathological tree from turning the sweep into an
-/// unbounded startup cost.
+// How deep the sweep walks below the working directory. Member partials live
+// wherever their member's stored path puts them, which is archive-controlled;
+// a bound keeps a hostile or pathological tree from turning the sweep into an
+// unbounded startup cost.
 const SWEEP_MAX_DEPTH: usize = 8;
 
-/// The identity-admitted plans a job's coverage rows can rebuild.
-///
-/// A row that does not decode, or that carries no binding, is left for
-/// [`restore_job`] to refuse as it always has. A binding that does not hold
-/// against the spec ([`DirectSetPlan::from_identity_binding`]) is dropped
-/// here, and the same refusal then meets its row as an unknown set. Across
-/// rows, the live rungs' own exclusions hold: a file bound by two sets, or a
-/// second header volume set, is a state no live job could have reached, and
-/// every set involved is dropped rather than one of them chosen.
+// The identity-admitted plans a job's coverage rows can rebuild.
+//
+// A row that does not decode, or that carries no binding, is left for
+// [`restore_job`] to refuse as it always has. A binding that does not hold
+// against the spec ([`DirectSetPlan::from_identity_binding`]) is dropped
+// here, and the same refusal then meets its row as an unknown set. Across
+// rows, the live rungs' own exclusions hold: a file bound by two sets, or a
+// second header volume set, is a state no live job could have reached, and
+// every set involved is dropped rather than one of them chosen.
 fn rebuild_identity_plans(
     job_id: JobId,
     spec: &JobSpec,
@@ -799,12 +799,12 @@ fn rebuild_identity_plans(
 }
 
 impl Pipeline {
-    /// Restores a job's direct-store sets and the segments their coverage lets
-    /// the job skip.
-    ///
-    /// Called from `restore_job` before the assembly is built. It never inserts
-    /// anything into the pipeline itself — the job state does not exist yet — so
-    /// the caller installs [`DirectRestore::sets`] once it does.
+    // Restores a job's direct-store sets and the segments their coverage lets
+    // the job skip.
+    //
+    // Called from `restore_job` before the assembly is built. It never inserts
+    // anything into the pipeline itself — the job state does not exist yet — so
+    // the caller installs [`DirectRestore::sets`] once it does.
     pub(crate) async fn restore_direct_store_coverage(
         &mut self,
         job_id: JobId,
@@ -1326,12 +1326,12 @@ impl Pipeline {
         result
     }
 
-    /// Puts back the runtime record of every set restored as installed: its
-    /// name in `extracted_archives` and its members in the extracted-member
-    /// sets, exactly as its finalization left them.
-    ///
-    /// Called once the job's persisted extracted members are in place, because
-    /// that load replaces the job's entry wholesale.
+    // Puts back the runtime record of every set restored as installed: its
+    // name in `extracted_archives` and its members in the extracted-member
+    // sets, exactly as its finalization left them.
+    //
+    // Called once the job's persisted extracted members are in place, because
+    // that load replaces the job's entry wholesale.
     pub(crate) fn reinstate_installed_direct_sets(
         &mut self,
         job_id: JobId,
@@ -1348,7 +1348,7 @@ impl Pipeline {
         }
     }
 
-    /// The cached facts for every set of a job, decoded and keyed by set name.
+    // The cached facts for every set of a job, decoded and keyed by set name.
     async fn load_direct_volume_facts(
         &self,
         job_id: JobId,
@@ -1393,64 +1393,64 @@ impl Pipeline {
     }
 }
 
-/// Deletes every direct-store file in the working directory that no restored
-/// set claims.
-///
-/// Three populations end up here and all three are dead weight:
-///
-/// - a set whose checkpoint was refused, whose partials and envelopes hold bytes
-///   nothing may read and which is about to redownload over them;
-/// - a set that was killed before its first barrier, so no row exists at all;
-/// - holds scratch from a killed run, which is append-only and meaningless
-///   without the in-memory index that named its regions.
-///
-/// With the gate **off** nothing is claimed, so everything direct-store owns is
-/// swept. That is deliberate even though the rows themselves are kept: an
-/// operator who turns the switch off wants the working directory to be what the
-/// conventional path expects, and a re-enabled binary refuses the surviving rows
-/// on the destination probe rather than trusting them — the safe direction either
-/// way.
-///
-/// # What "direct-store's" means here
-///
-/// `owned` is the set of paths this job's *plans* name — every envelope, every
-/// holds scratch, every member partial the rebuilt layouts produce — and it is
-/// the primary rule. Matching by extension alone was collateral waiting to
-/// happen: the walk descends eight levels into an archive-controlled tree, and an
-/// **extracted member** called `chapter.envelope` is a file a user's archive can
-/// perfectly well contain. Deleting it is silent data loss in a job that
-/// otherwise succeeded.
-///
-/// Three narrower rules survive, each for a file that exists precisely because
-/// it is *not* in any current plan:
-///
-/// - holds scratch at the **top level only**, by prefix. A killed run's scratch
-///   for a set this spec no longer produces has no plan to name it, and it lives
-///   at the top level by construction ([`DirectSetPlan::holds_scratch_path`]).
-/// - `.direct.partial` at any depth. A member partial's path comes from the RAR
-///   header, so a set whose cached facts no longer rebuild has no way to name
-///   its own partials — and the suffix is a two-part one this codebase invented,
-///   not an extension an archive plausibly carries.
-/// - envelopes and repair scratch at the working directory's **top level** whose
-///   name rebuilds exactly from a set the job's durable rows name. A set
-///   admitted by identity is never rediscovered from the spec, so no plan names
-///   its envelopes, and its discriminator — the first file it bound — was never
-///   recorded; see [`names_durable_set_scratch`].
-///
-/// # Both roots
-///
-/// Member payload lives in the staging root and everything else in the working
-/// directory, so both are walked. The working directory is still walked for
-/// `.direct.partial` as well, and deliberately: a job checkpointed by a build
-/// that wrote payload there has partials sitting in it that no plan will ever
-/// name again, and this is what clears them.
-///
-/// The holds-scratch prefix rule applies to the working directory **only**. It
-/// is a name match rather than a plan match, and the staging root is shared with
-/// the incremental extractor's output — a member an archive happened to call
-/// `.weaver-holds.something` is a file a user's archive can contain, and the
-/// working directory is the one place nothing but this subsystem writes such a
-/// name.
+// Deletes every direct-store file in the working directory that no restored
+// set claims.
+//
+// Three populations end up here and all three are dead weight:
+//
+// - a set whose checkpoint was refused, whose partials and envelopes hold bytes
+//   nothing may read and which is about to redownload over them;
+// - a set that was killed before its first barrier, so no row exists at all;
+// - holds scratch from a killed run, which is append-only and meaningless
+//   without the in-memory index that named its regions.
+//
+// With the gate **off** nothing is claimed, so everything direct-store owns is
+// swept. That is deliberate even though the rows themselves are kept: an
+// operator who turns the switch off wants the working directory to be what the
+// conventional path expects, and a re-enabled binary refuses the surviving rows
+// on the destination probe rather than trusting them — the safe direction either
+// way.
+//
+// # What "direct-store's" means here
+//
+// `owned` is the set of paths this job's *plans* name — every envelope, every
+// holds scratch, every member partial the rebuilt layouts produce — and it is
+// the primary rule. Matching by extension alone was collateral waiting to
+// happen: the walk descends eight levels into an archive-controlled tree, and an
+// **extracted member** called `chapter.envelope` is a file a user's archive can
+// perfectly well contain. Deleting it is silent data loss in a job that
+// otherwise succeeded.
+//
+// Three narrower rules survive, each for a file that exists precisely because
+// it is *not* in any current plan:
+//
+// - holds scratch at the **top level only**, by prefix. A killed run's scratch
+//   for a set this spec no longer produces has no plan to name it, and it lives
+//   at the top level by construction ([`DirectSetPlan::holds_scratch_path`]).
+// - `.direct.partial` at any depth. A member partial's path comes from the RAR
+//   header, so a set whose cached facts no longer rebuild has no way to name
+//   its own partials — and the suffix is a two-part one this codebase invented,
+//   not an extension an archive plausibly carries.
+// - envelopes and repair scratch at the working directory's **top level** whose
+//   name rebuilds exactly from a set the job's durable rows name. A set
+//   admitted by identity is never rediscovered from the spec, so no plan names
+//   its envelopes, and its discriminator — the first file it bound — was never
+//   recorded; see [`names_durable_set_scratch`].
+//
+// # Both roots
+//
+// Member payload lives in the staging root and everything else in the working
+// directory, so both are walked. The working directory is still walked for
+// `.direct.partial` as well, and deliberately: a job checkpointed by a build
+// that wrote payload there has partials sitting in it that no plan will ever
+// name again, and this is what clears them.
+//
+// The holds-scratch prefix rule applies to the working directory **only**. It
+// is a name match rather than a plan match, and the staging root is shared with
+// the incremental extractor's output — a member an archive happened to call
+// `.weaver-holds.something` is a file a user's archive can contain, and the
+// working directory is the one place nothing but this subsystem writes such a
+// name.
 async fn sweep_orphan_direct_files(
     roots: &DestinationRoots,
     claimed: &HashSet<PathBuf>,
@@ -1484,14 +1484,14 @@ async fn sweep_orphan_direct_files(
     .unwrap_or(0)
 }
 
-/// Whether `name` is an envelope or repair scratch of one of `set_names`, under
-/// whatever discriminator and volume it carries.
-///
-/// The fallback for a set no current plan names — one admitted by identity,
-/// whose discriminator was the first file it bound and is recorded nowhere. The
-/// name is parsed for the two numbers and then rebuilt exactly as the set
-/// would have built it, so only a file this subsystem could have written under
-/// a set the job's own rows name ever matches; an extension alone never does.
+// Whether `name` is an envelope or repair scratch of one of `set_names`, under
+// whatever discriminator and volume it carries.
+//
+// The fallback for a set no current plan names — one admitted by identity,
+// whose discriminator was the first file it bound and is recorded nowhere. The
+// name is parsed for the two numbers and then rebuilt exactly as the set
+// would have built it, so only a file this subsystem could have written under
+// a set the job's own rows name ever matches; an extension alone never does.
 fn names_durable_set_scratch(name: &str, set_names: &BTreeSet<String>) -> bool {
     if set_names.is_empty() {
         return false;
@@ -1596,9 +1596,9 @@ mod durable_set_scratch_tests {
         set_names.iter().map(|name| name.to_string()).collect()
     }
 
-    /// The rule deletes a file only when its whole name rebuilds from a set the
-    /// job's own rows name. A user's file of exactly the same shape under any
-    /// other stem is left alone, however envelope-like it looks.
+    // The rule deletes a file only when its whole name rebuilds from a set the
+    // job's own rows name. A user's file of exactly the same shape under any
+    // other stem is left alone, however envelope-like it looks.
     #[test]
     fn only_a_name_rebuilt_from_a_collected_set_matches() {
         let collected = names(&["Silver Horizon"]);
@@ -1635,10 +1635,10 @@ mod durable_set_scratch_tests {
 mod facts_envelope_tests {
     use super::{DirectVolumeFacts, SevenZipVolumeFacts};
 
-    /// Rows written before the envelope existed are bare `RarVolumeFacts`
-    /// blobs, and there are live ones in shipped databases. Decoding has to
-    /// keep reading them as RAR, because the alternative is every in-flight
-    /// direct set on an upgraded install restarting from zero.
+    // Rows written before the envelope existed are bare `RarVolumeFacts`
+    // blobs, and there are live ones in shipped databases. Decoding has to
+    // keep reading them as RAR, because the alternative is every in-flight
+    // direct set on an upgraded install restarting from zero.
     #[test]
     fn a_bare_rar_blob_decodes_as_the_rar_arm() {
         let facts = unrar_rs::RarVolumeFacts {
@@ -1669,8 +1669,8 @@ mod facts_envelope_tests {
         );
     }
 
-    /// And the envelope round-trips both arms, so a row written now is read
-    /// back as what it is rather than falling through to the RAR fallback.
+    // And the envelope round-trips both arms, so a row written now is read
+    // back as what it is rather than falling through to the RAR fallback.
     #[test]
     fn the_envelope_round_trips_both_arms() {
         for facts in [

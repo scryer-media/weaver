@@ -1,4 +1,4 @@
-//! Connection-scoped recovery admission and stale-outcome fencing.
+// Connection-scoped recovery admission and stale-outcome fencing.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

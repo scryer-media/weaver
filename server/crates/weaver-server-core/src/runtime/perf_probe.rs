@@ -85,10 +85,10 @@ pub(crate) fn scope(label: &'static str) -> Scope {
     }
 }
 
-/// [`scope`] for a label only known at runtime (per-command / per-caller
-/// buckets). The `String` is built by the caller either way, so this stays out
-/// of the disabled fast path by never being reached when profiling is off —
-/// callers guard with [`enabled`] or accept one allocation.
+// [`scope`] for a label only known at runtime (per-command / per-caller
+// buckets). The `String` is built by the caller either way, so this stays out
+// of the disabled fast path by never being reached when profiling is off —
+// callers guard with [`enabled`] or accept one allocation.
 pub(crate) fn owned_scope(label: String) -> OwnedScope {
     OwnedScope {
         label,
@@ -133,13 +133,13 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
-    /// Close the scope early and hand its wall duration back to the caller.
-    ///
-    /// Exactly **one** clock read: the returned `Duration` is the same value
-    /// the probe records, so a caller that wants both a profile bucket and a
-    /// metric observation never reads the clock twice. Clearing `enabled`
-    /// makes the `Drop` below a no-op, which is what keeps the second read
-    /// from happening.
+    // Close the scope early and hand its wall duration back to the caller.
+    //
+    // Exactly **one** clock read: the returned `Duration` is the same value
+    // the probe records, so a caller that wants both a profile bucket and a
+    // metric observation never reads the clock twice. Clearing `enabled`
+    // makes the `Drop` below a no-op, which is what keeps the second read
+    // from happening.
     pub(crate) fn finish(mut self) -> Duration {
         let elapsed = self.started.elapsed();
         if self.enabled {
@@ -409,7 +409,7 @@ fn ns_to_us(ns: u128) -> u64 {
     u64::try_from(ns / 1_000).unwrap_or(u64::MAX)
 }
 
-/// Cumulative process (or thread) CPU time split by mode.
+// Cumulative process (or thread) CPU time split by mode.
 #[derive(Clone, Copy)]
 pub(crate) struct CpuUsage {
     user: Duration,
@@ -441,8 +441,8 @@ fn cpu_util_pct(cpu: Duration, wall: Duration) -> u64 {
     u64::try_from(cpu.as_millis().saturating_mul(100) / wall_ms).unwrap_or(u64::MAX)
 }
 
-/// Cumulative CPU time consumed by this process. Shared with
-/// `runtime::process_metrics`, which samples it at scrape time.
+// Cumulative CPU time consumed by this process. Shared with
+// `runtime::process_metrics`, which samples it at scrape time.
 #[cfg(unix)]
 pub(crate) fn process_cpu_usage() -> Option<CpuUsage> {
     let mut usage = MaybeUninit::<libc::rusage>::uninit();
@@ -464,8 +464,8 @@ fn timeval_to_duration(timeval: libc::timeval) -> Duration {
     Duration::new(seconds, micros.saturating_mul(1_000))
 }
 
-/// Cumulative CPU time consumed by this process. Shared with
-/// `runtime::process_metrics`, which samples it at scrape time.
+// Cumulative CPU time consumed by this process. Shared with
+// `runtime::process_metrics`, which samples it at scrape time.
 #[cfg(windows)]
 pub(crate) fn process_cpu_usage() -> Option<CpuUsage> {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
@@ -492,8 +492,8 @@ fn zero_filetime() -> windows_sys::Win32::Foundation::FILETIME {
     }
 }
 
-/// FILETIME counts 100 ns ticks. Granularity is the scheduler tick (~15.6 ms),
-/// which is fine for the aggregated deltas the probes report.
+// FILETIME counts 100 ns ticks. Granularity is the scheduler tick (~15.6 ms),
+// which is fine for the aggregated deltas the probes report.
 #[cfg(windows)]
 fn filetime_to_duration(filetime: windows_sys::Win32::Foundation::FILETIME) -> Duration {
     let ticks = ((filetime.dwHighDateTime as u64) << 32) | filetime.dwLowDateTime as u64;

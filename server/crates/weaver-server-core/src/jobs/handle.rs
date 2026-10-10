@@ -21,9 +21,9 @@ pub const PROPAGATION_WAIT_REASON: &str = "propagation_delay";
 
 type JobCancellationCallback = Arc<dyn Fn() + Send + Sync>;
 
-/// Signals active job work without waiting for the single-threaded scheduler
-/// loop. This lets a user cancellation interrupt a repair that currently owns
-/// that loop before the queued cancellation command is handled.
+// Signals active job work without waiting for the single-threaded scheduler
+// loop. This lets a user cancellation interrupt a repair that currently owns
+// that loop before the queued cancellation command is handled.
 #[derive(Clone, Default)]
 struct JobCancellationRegistry {
     state: Arc<Mutex<JobCancellationState>>,
@@ -89,10 +89,10 @@ impl JobCancellationRegistry {
     }
 }
 
-/// Shared read-only view of pipeline state for the control plane.
-///
-/// Written by the pipeline loop after each event, read by API handlers
-/// without going through the command channel.
+// Shared read-only view of pipeline state for the control plane.
+//
+// Written by the pipeline loop after each event, read by API handlers
+// without going through the command channel.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PipelineTurnObservation {
@@ -109,53 +109,53 @@ pub struct SharedPipelineState {
     job_revision: tokio::sync::watch::Sender<u64>,
     paused: Arc<AtomicBool>,
     schedule_replay_paused: Arc<AtomicBool>,
-    /// Why the schedule evaluator is holding download admission, while it is.
+    // Why the schedule evaluator is holding download admission, while it is.
     schedule_hold_reason: Arc<RwLock<Option<String>>>,
     post_processing_paused: Arc<AtomicBool>,
     metrics: Arc<PipelineMetrics>,
     metrics_snapshot: Arc<RwLock<MetricsSnapshot>>,
     download_block: Arc<RwLock<DownloadBlockState>>,
     server_quota_blocked: Arc<AtomicBool>,
-    /// The egress whose download quota holds work back, while one does.
+    // The egress whose download quota holds work back, while one does.
     egress_quota_block: Arc<RwLock<Option<EgressQuotaBlock>>>,
     proxy_runtime: Arc<RwLock<Option<Arc<crate::proxies::ProxyRuntime>>>>,
     server_transfer_policy:
         Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
     nntp_pool: Arc<RwLock<Option<Arc<weaver_nntp::pool::NntpPool>>>>,
     nntp_runtime_activation: Arc<RwLock<Option<NntpRuntimeActivation>>>,
-    /// Per-server BODY transport state from the download lanes, indexed by
-    /// pool server index. Published on the tuning tick, not per response.
+    // Per-server BODY transport state from the download lanes, indexed by
+    // pool server index. Published on the tuning tick, not per response.
     download_transport: Arc<RwLock<Vec<ServerTransportHealth>>>,
-    /// First-byte latency the last connection test measured, keyed by saved
-    /// server id. The download lanes read it once, to pick a starting depth
-    /// for a server they have never fetched from; every later depth decision
-    /// comes from their own measurements.
+    // First-byte latency the last connection test measured, keyed by saved
+    // server id. The download lanes read it once, to pick a starting depth
+    // for a server they have never fetched from; every later depth decision
+    // comes from their own measurements.
     server_probe_latency: Arc<RwLock<HashMap<u32, Duration>>>,
-    /// Memory one conventional 7z extraction may hold, as the hardware
-    /// profile in force decides it. Read when an extraction is admitted, so a
-    /// profile put in force now reaches the next extraction. `u64::MAX` means no profile cap, and
-    /// the extraction ceiling alone bounds the decoder.
+    // Memory one conventional 7z extraction may hold, as the hardware
+    // profile in force decides it. Read when an extraction is admitted, so a
+    // profile put in force now reaches the next extraction. `u64::MAX` means no profile cap, and
+    // the extraction ceiling alone bounds the decoder.
     sevenz_decode_memory_bytes: Arc<AtomicU64>,
-    /// The hardware profile whose limits are in force, and the scheduled one
-    /// overriding the operator's choice, if any. `None` until a pipeline has
-    /// resolved one.
+    // The hardware profile whose limits are in force, and the scheduled one
+    // overriding the operator's choice, if any. `None` until a pipeline has
+    // resolved one.
     hardware_profile: Arc<RwLock<Option<HardwareProfileInForce>>>,
     job_cancellations: JobCancellationRegistry,
-    /// The per-article stream (`ArticleDownloaded`, `SegmentDecoded`, ...),
-    /// kept off the job-level broadcast: a download emits several of these
-    /// per article, and every always-on job-level subscriber (event
-    /// persistence, the queue replay producer) was woken for each one only to
-    /// discard it. Nothing is even built here unless someone is listening.
+    // The per-article stream (`ArticleDownloaded`, `SegmentDecoded`, ...),
+    // kept off the job-level broadcast: a download emits several of these
+    // per article, and every always-on job-level subscriber (event
+    // persistence, the queue replay producer) was woken for each one only to
+    // discard it. Nothing is even built here unless someone is listening.
     segment_events: broadcast::Sender<PipelineEvent>,
-    /// Metrics snapshot refreshes, counted so tests can observe the cadence of
-    /// the orchestrator's periodic tick.
+    // Metrics snapshot refreshes, counted so tests can observe the cadence of
+    // the orchestrator's periodic tick.
     #[cfg(test)]
     metrics_refreshes: Arc<AtomicU64>,
 }
 
-/// The published job list: live jobs rebuilt on each publish, followed by the
-/// finished jobs, which are shared with the orchestrator and only rebuilt when
-/// history itself changes.
+// The published job list: live jobs rebuilt on each publish, followed by the
+// finished jobs, which are shared with the orchestrator and only rebuilt when
+// history itself changes.
 #[derive(Default)]
 struct PublishedJobs {
     live: Vec<JobInfo>,
@@ -168,8 +168,8 @@ impl PublishedJobs {
     }
 }
 
-/// Bounded like the job-level broadcast; a lagging listener drops articles,
-/// never the pipeline.
+// Bounded like the job-level broadcast; a lagging listener drops articles,
+// never the pipeline.
 const SEGMENT_EVENT_CAPACITY: usize = 1024;
 
 impl SharedPipelineState {
@@ -209,13 +209,13 @@ impl SharedPipelineState {
         }
     }
 
-    /// Subscribe to the per-article event stream. Job-level events stay on
-    /// [`SchedulerHandle::subscribe_events`].
+    // Subscribe to the per-article event stream. Job-level events stay on
+    // [`SchedulerHandle::subscribe_events`].
     pub fn subscribe_segment_events(&self) -> broadcast::Receiver<PipelineEvent> {
         self.segment_events.subscribe()
     }
 
-    /// Publish one per-article event, building it only if a listener exists.
+    // Publish one per-article event, building it only if a listener exists.
     pub fn publish_segment_event(&self, event: impl FnOnce() -> PipelineEvent) {
         if self.segment_events.receiver_count() > 0 {
             let _ = self.segment_events.send(event());
@@ -228,26 +228,26 @@ impl SharedPipelineState {
         self.jobs.read().unwrap().iter().cloned().collect()
     }
 
-    /// How many published jobs are in each status, counted under the read
-    /// lock without copying a job.
+    // How many published jobs are in each status, counted under the read
+    // lock without copying a job.
     pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
         crate::operations::metrics_store::JobStatusCounts::from_statuses(
             self.jobs.read().unwrap().iter().map(|job| &job.status),
         )
     }
 
-    /// The revision of the published job list; it moves on every publish.
+    // The revision of the published job list; it moves on every publish.
     pub fn job_revision(&self) -> u64 {
         *self.job_revision.borrow()
     }
 
-    /// Live download rate of every transferring job, read off the published
-    /// job list in place.
-    ///
-    /// Off the pipeline entirely: it takes the read side of the lock the
-    /// orchestrator already writes on its 100 ms tick and copies nothing but
-    /// `(job id, rate)` pairs, so a metrics subscriber sampling it every
-    /// 250 ms costs less than the job-list clone the queue readers make.
+    // Live download rate of every transferring job, read off the published
+    // job list in place.
+    //
+    // Off the pipeline entirely: it takes the read side of the lock the
+    // orchestrator already writes on its 100 ms tick and copies nothing but
+    // `(job id, rate)` pairs, so a metrics subscriber sampling it every
+    // 250 ms costs less than the job-list clone the queue readers make.
     pub fn job_download_rates(&self) -> Vec<(JobId, u64)> {
         let jobs = self.jobs.read().unwrap();
         let mut rates = job_download_rates(&jobs.live);
@@ -327,9 +327,9 @@ impl SharedPipelineState {
         self.publish_live_jobs(jobs, Arc::from(Vec::new()));
     }
 
-    /// Publish the live jobs together with the finished ones. The finished
-    /// list is shared, not copied: the orchestrator rebuilds it only when
-    /// history changes.
+    // Publish the live jobs together with the finished ones. The finished
+    // list is shared, not copied: the orchestrator rebuilds it only when
+    // history changes.
     pub fn publish_live_jobs(&self, live: Vec<JobInfo>, history: Arc<[JobInfo]>) {
         *self.jobs.write().unwrap() = PublishedJobs { live, history };
         self.job_revision
@@ -340,9 +340,9 @@ impl SharedPipelineState {
         self.job_revision.subscribe()
     }
 
-    /// Advance the rate windows and publish the metrics snapshot. Returns
-    /// whether any published rate is still above zero, so the caller keeps
-    /// sampling quickly until the gauges have settled.
+    // Advance the rate windows and publish the metrics snapshot. Returns
+    // whether any published rate is still above zero, so the caller keeps
+    // sampling quickly until the gauges have settled.
     pub fn refresh_metrics_snapshot(&self) -> bool {
         let snapshot = self.metrics.snapshot();
         let rates_moving = snapshot.current_download_speed > 0
@@ -354,7 +354,7 @@ impl SharedPipelineState {
         rates_moving
     }
 
-    /// How many times the metrics snapshot has been refreshed.
+    // How many times the metrics snapshot has been refreshed.
     #[cfg(test)]
     pub(crate) fn metrics_refresh_count(&self) -> u64 {
         self.metrics_refreshes.load(Ordering::Relaxed)
@@ -370,9 +370,9 @@ impl SharedPipelineState {
         *current = state;
     }
 
-    /// Lay the quota blocks over a pause-derived block state. A manual or
-    /// scheduled pause outranks both; an egress quota outranks a server quota,
-    /// since no server can be reached past it.
+    // Lay the quota blocks over a pause-derived block state. A manual or
+    // scheduled pause outranks both; an egress quota outranks a server quota,
+    // since no server can be reached past it.
     fn apply_quota_blocks(&self, state: &mut DownloadBlockState) {
         let egress = self.egress_quota_block.read().unwrap().clone();
         let quota_kind = matches!(
@@ -418,8 +418,8 @@ impl SharedPipelineState {
         self.egress_quota_block.read().unwrap().clone()
     }
 
-    /// Record which egress quota, if any, holds work back, and re-lay the
-    /// published block state over it.
+    // Record which egress quota, if any, holds work back, and re-lay the
+    // published block state over it.
     pub fn set_egress_quota_block(&self, block: Option<EgressQuotaBlock>) {
         let mut state = self.download_block.write().unwrap();
         {
@@ -432,26 +432,26 @@ impl SharedPipelineState {
         self.apply_quota_blocks(&mut state);
     }
 
-    /// Memory one conventional 7z extraction may hold. `u64::MAX` when no
-    /// profile has capped it.
+    // Memory one conventional 7z extraction may hold. `u64::MAX` when no
+    // profile has capped it.
     pub fn sevenz_decode_memory_bytes(&self) -> u64 {
         self.sevenz_decode_memory_bytes.load(Ordering::Relaxed)
     }
 
-    /// Apply the chosen profile's 7z decoder allowance. Extractions already
-    /// running keep the allowance they were admitted with.
+    // Apply the chosen profile's 7z decoder allowance. Extractions already
+    // running keep the allowance they were admitted with.
     pub fn set_sevenz_decode_memory_bytes(&self, bytes: u64) {
         self.sevenz_decode_memory_bytes
             .store(bytes.max(1), Ordering::Relaxed);
     }
 
-    /// The hardware profile in force, or `None` before a pipeline has
-    /// resolved one.
+    // The hardware profile in force, or `None` before a pipeline has
+    // resolved one.
     pub fn hardware_profile_in_force(&self) -> Option<HardwareProfileInForce> {
         *self.hardware_profile.read().unwrap()
     }
 
-    /// Publish the hardware profile the pipeline has put in force.
+    // Publish the hardware profile the pipeline has put in force.
     pub fn set_hardware_profile_in_force(&self, in_force: HardwareProfileInForce) {
         *self.hardware_profile.write().unwrap() = Some(in_force);
     }
@@ -507,8 +507,8 @@ impl SharedPipelineState {
         self.download_transport.read().unwrap().clone()
     }
 
-    /// Record what a connection test measured, so a server the lanes have
-    /// never fetched from can start at a sensible pipelining depth.
+    // Record what a connection test measured, so a server the lanes have
+    // never fetched from can start at a sensible pipelining depth.
     pub fn note_server_probe_latency(&self, server_id: u32, latency: Duration) {
         self.server_probe_latency
             .write()
@@ -525,20 +525,20 @@ impl SharedPipelineState {
     }
 }
 
-/// What the download lanes have learned about one server's BODY transport.
+// What the download lanes have learned about one server's BODY transport.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerTransportHealth {
-    /// Pool server index this describes.
+    // Pool server index this describes.
     pub server_idx: usize,
-    /// Command-to-status-line wait.
+    // Command-to-status-line wait.
     pub latency_ms: Option<f64>,
-    /// Status-line-to-terminator wait for one article.
+    // Status-line-to-terminator wait for one article.
     pub transfer_ms: Option<f64>,
-    /// "good", "moderate" or "slow"; absent until a latency is measured.
+    // "good", "moderate" or "slow"; absent until a latency is measured.
     pub latency_band: Option<String>,
-    /// BODY pipelining depth in use, where 1 means sequential.
+    // BODY pipelining depth in use, where 1 means sequential.
     pub pipeline_depth: u32,
-    /// Set once a server has proved twice that it cannot pipeline cleanly.
+    // Set once a server has proved twice that it cannot pipeline cleanly.
     pub pinned_sequential: bool,
 }
 
@@ -552,9 +552,9 @@ pub enum DownloadBlockKind {
 }
 
 impl DownloadBlockKind {
-    /// Every variant, in gate-reason label order. The Prometheus exporter
-    /// renders one series per variant; deriving the label set from `ALL` keeps
-    /// a new gate reason from silently vanishing off `/metrics`.
+    // Every variant, in gate-reason label order. The Prometheus exporter
+    // renders one series per variant; deriving the label set from `ALL` keeps
+    // a new gate reason from silently vanishing off `/metrics`.
     pub const ALL: [Self; 5] = [
         Self::None,
         Self::ManualPause,
@@ -574,9 +574,9 @@ impl DownloadBlockKind {
     }
 }
 
-/// Where a manual queue reorder should land a job. The order only breaks ties
-/// within a dispatch priority band: a LOW job moved to the top still yields to
-/// HIGH/NORMAL work.
+// Where a manual queue reorder should land a job. The order only breaks ties
+// within a dispatch priority band: a LOW job moved to the top still yields to
+// HIGH/NORMAL work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueueMoveTarget {
     Top,
@@ -584,8 +584,8 @@ pub enum QueueMoveTarget {
     Offset(i64),
 }
 
-/// Splice `job_id` to its new position in the manual queue order. Pure so the
-/// clamp/splice arithmetic is unit-testable apart from pipeline state.
+// Splice `job_id` to its new position in the manual queue order. Pure so the
+// clamp/splice arithmetic is unit-testable apart from pipeline state.
 pub fn splice_job_order(
     order: &mut Vec<JobId>,
     job_id: JobId,
@@ -648,8 +648,8 @@ mod splice_job_order_tests {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DownloadBlockState {
     pub kind: DownloadBlockKind,
-    /// The egress whose download quota is reached, while one is. The byte
-    /// and window fields below describe that egress's quota.
+    // The egress whose download quota is reached, while one is. The byte
+    // and window fields below describe that egress's quota.
     #[serde(default)]
     pub egress_id: Option<u32>,
     #[serde(default)]
@@ -660,16 +660,16 @@ pub struct DownloadBlockState {
     pub window_starts_at_epoch_ms: Option<f64>,
     pub window_ends_at_epoch_ms: Option<f64>,
     pub timezone_name: String,
-    /// Speed limit imposed by the active schedule (0 = no scheduled limit).
+    // Speed limit imposed by the active schedule (0 = no scheduled limit).
     #[serde(default)]
     pub scheduled_speed_limit: u64,
-    /// Why a schedule rule is holding new downloads, while one is.
+    // Why a schedule rule is holding new downloads, while one is.
     #[serde(default)]
     pub schedule_hold_reason: Option<String>,
 }
 
-/// An egress download quota that holds work back: no leg of the route the
-/// work needs has quota left.
+// An egress download quota that holds work back: no leg of the route the
+// work needs has quota left.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EgressQuotaBlock {
     pub egress_id: u32,
@@ -700,7 +700,7 @@ impl Default for DownloadBlockState {
     }
 }
 
-/// Commands sent to the scheduler's main loop.
+// Commands sent to the scheduler's main loop.
 #[derive(Clone)]
 pub struct RestoreJobRequest {
     pub job_id: JobId,
@@ -726,17 +726,17 @@ pub struct RestoreJobRequest {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AddJobOptions {
     pub initially_paused: bool,
-    /// SCORE admission generation that must still be authoritative when the
-    /// scheduler durably materializes this job.
+    // SCORE admission generation that must still be authoritative when the
+    // scheduler durably materializes this job.
     pub semantic_materialization_generation: Option<i64>,
-    /// Promotion-lease generation that owns this candidate materialization.
-    /// Unlike admission generations, this must also still hold an unexpired
-    /// durable promotion lease when the active job row is inserted.
+    // Promotion-lease generation that owns this candidate materialization.
+    // Unlike admission generations, this must also still hold an unexpired
+    // durable promotion lease when the active job row is inserted.
     pub semantic_promotion_generation: Option<i64>,
 }
 
-/// Internal provenance for cancellation. Semantic cancellation is intentionally
-/// narrower than a user cancel: it may interrupt only download-lane work.
+// Internal provenance for cancellation. Semantic cancellation is intentionally
+// narrower than a user cancel: it may interrupt only download-lane work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancellationOrigin {
     User,
@@ -744,14 +744,14 @@ pub enum CancellationOrigin {
     SemanticSuperseded,
 }
 
-/// Which hardware profile's limits the pipeline is running under, and why.
+// Which hardware profile's limits the pipeline is running under, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HardwareProfileInForce {
-    /// The profile whose limits the next download, decode and extraction use.
+    // The profile whose limits the next download, decode and extraction use.
     pub active: crate::runtime::HardwareProfile,
-    /// The profile a schedule rule put in force over the operator's choice.
-    /// `None` when no rule does, or when the rule's profile is one this
-    /// machine cannot honour and the choice stands instead.
+    // The profile a schedule rule put in force over the operator's choice.
+    // `None` when no rule does, or when the rule's profile is one this
+    // machine cannot honour and the choice stands instead.
     pub scheduled: Option<crate::runtime::HardwareProfile>,
 }
 
@@ -761,19 +761,19 @@ pub struct NntpRuntimeActivation {
     pub configured_connections: usize,
 }
 
-/// What deleting one history record left behind.
-///
-/// The record itself is always gone when this is returned. A working
-/// directory whose ownership marker names the job but no longer matches the
-/// directory is not removed — nothing proves it is still the job's — and is
-/// listed here so the caller can say so.
+// What deleting one history record left behind.
+//
+// The record itself is always gone when this is returned. A working
+// directory whose ownership marker names the job but no longer matches the
+// directory is not removed — nothing proves it is still the job's — and is
+// listed here so the caller can say so.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HistoryDeleteOutcome {
     pub left_in_place: Vec<std::path::PathBuf>,
 }
 
 pub enum SchedulerCommand {
-    /// Submit a new job.
+    // Submit a new job.
     AddJob {
         job_id: JobId,
         spec: JobSpec,
@@ -782,148 +782,156 @@ pub enum SchedulerCommand {
         options: AddJobOptions,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Restore a job from the journal (crash recovery).
+    // Restore a job from the journal (crash recovery).
     RestoreJob {
         request: Box<RestoreJobRequest>,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Pause a job.
+    // Pause a job.
     PauseJob {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Resume a paused job.
+    // Resume a paused job.
     ResumeJob {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Cancel and remove a job.
+    // Cancel and remove a job.
     CancelJob {
         job_id: JobId,
         origin: CancellationOrigin,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Update a job's category and/or metadata.
+    // Update a job's category and/or metadata.
     UpdateJob {
         job_id: JobId,
         update: JobUpdate,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Move a job within the manual queue order.
+    // Move a job within the manual queue order.
     ReorderJob {
         job_id: JobId,
         target: QueueMoveTarget,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Batch-move multiple jobs within the manual queue order in a single
-    /// round trip. Applied all-or-nothing: if any job id is unknown, no move
-    /// is applied. Persists the resulting order and publishes a snapshot
-    /// once for the whole batch rather than once per move.
+    // Batch-move multiple jobs within the manual queue order in a single
+    // round trip. Applied all-or-nothing: if any job id is unknown, no move
+    // is applied. Persists the resulting order and publishes a snapshot
+    // once for the whole batch rather than once per move.
     ReorderJobs {
         moves: Vec<(JobId, QueueMoveTarget)>,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Pause all jobs globally (pipeline-wide).
-    PauseAll { reply: oneshot::Sender<()> },
-    /// Resume all jobs globally.
-    ResumeAll { reply: oneshot::Sender<()> },
-    /// Pause admission of queued extension post-processing attempts.
-    PausePostProcessing { reply: oneshot::Sender<()> },
-    /// Resume admission of queued extension post-processing attempts.
-    ResumePostProcessing { reply: oneshot::Sender<()> },
-    /// Cancel the queued or active extension attempt for a job.
+    // Pause all jobs globally (pipeline-wide).
+    PauseAll {
+        reply: oneshot::Sender<()>,
+    },
+    // Resume all jobs globally.
+    ResumeAll {
+        reply: oneshot::Sender<()>,
+    },
+    // Pause admission of queued extension post-processing attempts.
+    PausePostProcessing {
+        reply: oneshot::Sender<()>,
+    },
+    // Resume admission of queued extension post-processing attempts.
+    ResumePostProcessing {
+        reply: oneshot::Sender<()>,
+    },
+    // Cancel the queued or active extension attempt for a job.
     CancelPostProcessing {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Set global speed limit (bytes/sec). 0 means unlimited. With
-    /// `replaces_schedule`, an operator's edit: it is in force at once, over
-    /// a scheduled limit, until the next scheduled speed rule fires. Without,
-    /// it is recorded and waits while a scheduled limit is in force.
+    // Set global speed limit (bytes/sec). 0 means unlimited. With
+    // `replaces_schedule`, an operator's edit: it is in force at once, over
+    // a scheduled limit, until the next scheduled speed rule fires. Without,
+    // it is recorded and waits while a scheduled limit is in force.
     SetSpeedLimit {
         bytes_per_sec: u64,
         replaces_schedule: bool,
         reply: oneshot::Sender<()>,
     },
-    /// Change the minimum post age and recalculate pending propagation holds.
+    // Change the minimum post age and recalculate pending propagation holds.
     SetPropagationDelay {
         seconds: u32,
         reply: oneshot::Sender<()>,
     },
-    /// Apply a scheduled action (pause, resume, or speed limit).
-    /// Sent by the schedule evaluator background task.
+    // Apply a scheduled action (pause, resume, or speed limit).
+    // Sent by the schedule evaluator background task.
     ApplyScheduleAction {
         action: crate::bandwidth::ScheduleAction,
         reply: oneshot::Sender<()>,
     },
-    /// Make this the operator's hardware profile: the one in force whenever
-    /// no schedule rule puts another in force.
+    // Make this the operator's hardware profile: the one in force whenever
+    // no schedule rule puts another in force.
     SetHardwareProfile {
         profile: crate::runtime::HardwareProfile,
         reply: oneshot::Sender<()>,
     },
-    /// Put a hardware profile in force from the schedule, or hand control
-    /// back to the operator's choice with `None`.
+    // Put a hardware profile in force from the schedule, or hand control
+    // back to the operator's choice with `None`.
     SetScheduledHardwareProfile {
         profile: Option<crate::runtime::HardwareProfile>,
         reply: oneshot::Sender<()>,
     },
-    /// Replace the NNTP client at runtime (hot-reload after server config change).
-    /// The client is boxed as `dyn Any` to avoid coupling weaver-scheduler to weaver-nntp.
+    // Replace the NNTP client at runtime (hot-reload after server config change).
+    // The client is boxed as `dyn Any` to avoid coupling weaver-scheduler to weaver-nntp.
     RebuildNntp {
         client: Box<dyn Any + Send>,
         total_connections: usize,
         reply: oneshot::Sender<Result<NntpRuntimeActivation, SchedulerError>>,
     },
-    /// Apply the asynchronous random-read disk measurement to the tuner.
+    // Apply the asynchronous random-read disk measurement to the tuner.
     UpdateRandomReadIops {
         random_read_iops: f64,
         reply: oneshot::Sender<()>,
     },
-    /// Update runtime storage directories after a restore.
+    // Update runtime storage directories after a restore.
     UpdateRuntimePaths {
         data_dir: PathBuf,
         intermediate_dir: PathBuf,
         complete_dir: PathBuf,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Reprocess a completed or failed job (re-run post-download stages without re-downloading).
+    // Reprocess a completed or failed job (re-run post-download stages without re-downloading).
     ReprocessJob {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Re-download a completed or failed job from its persisted NZB under the same job ID.
+    // Re-download a completed or failed job from its persisted NZB under the same job ID.
     RedownloadJob {
         job_id: JobId,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Delete a completed/failed/cancelled job from history.
+    // Delete a completed/failed/cancelled job from history.
     DeleteHistory {
         job_id: JobId,
         delete_files: bool,
         reply: oneshot::Sender<Result<HistoryDeleteOutcome, SchedulerError>>,
     },
-    /// Delete all completed/failed/cancelled jobs from history.
+    // Delete all completed/failed/cancelled jobs from history.
     DeleteAllHistory {
         delete_files: bool,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
     },
-    /// Copy a read-only diagnostics snapshot out of the pipeline actor.
-    ///
-    /// Answered from the same command loop as everything else, so the snapshot
-    /// is coherent with the turn it lands in rather than being stitched
-    /// together from fields read while the actor was running.
+    // Copy a read-only diagnostics snapshot out of the pipeline actor.
+    //
+    // Answered from the same command loop as everything else, so the snapshot
+    // is coherent with the turn it lands in rather than being stitched
+    // together from fields read while the actor was running.
     PipelineDiagnostics {
         reply: oneshot::Sender<Box<crate::pipeline::diagnostics::PipelineDiagnostics>>,
     },
-    /// Shutdown the scheduler gracefully.
+    // Shutdown the scheduler gracefully.
     Shutdown,
 }
 
-/// One `(job, bytes per second)` pair per job whose download phase currently
-/// reports a rate. The rate is the value `sample_phase_progress` published for
-/// that job on the metrics tick, so it is the same estimator and the same
-/// instant as the global speed gauge.
+// One `(job, bytes per second)` pair per job whose download phase currently
+// reports a rate. The rate is the value `sample_phase_progress` published for
+// that job on the metrics tick, so it is the same estimator and the same
+// instant as the global speed gauge.
 pub fn job_download_rates(jobs: &[JobInfo]) -> Vec<(JobId, u64)> {
     jobs.iter()
         .filter_map(|job| {
@@ -936,7 +944,7 @@ pub fn job_download_rates(jobs: &[JobInfo]) -> Vec<(JobId, u64)> {
         .collect()
 }
 
-/// Summary info about a job (returned by queries).
+// Summary info about a job (returned by queries).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobInfo {
     pub job_id: JobId,
@@ -944,10 +952,10 @@ pub struct JobInfo {
     pub name: String,
     pub status: JobStatus,
     pub download_state: crate::jobs::model::DownloadState,
-    /// Network download is complete, but decode/write or PAR2 discovery work remains.
+    // Network download is complete, but decode/write or PAR2 discovery work remains.
     #[serde(default)]
     pub finalizing_download: bool,
-    /// Weaver is fetching the minimum PAR2 metadata or recovery data needed to finish.
+    // Weaver is fetching the minimum PAR2 metadata or recovery data needed to finish.
     #[serde(default)]
     pub fetching_repair_data: bool,
     pub post_state: crate::jobs::model::PostState,
@@ -959,54 +967,54 @@ pub struct JobInfo {
     pub optional_recovery_downloaded_bytes: u64,
     #[serde(default)]
     pub phase_progress: Vec<crate::jobs::phase_progress::JobPhaseProgress>,
-    /// Bytes from segments that are permanently lost (430 / max retries).
+    // Bytes from segments that are permanently lost (430 / max retries).
     pub failed_bytes: u64,
-    /// Job health 0-1000 (1000 = perfect). Drops as articles fail.
-    ///
-    /// For a job that reached a terminal status this is the settled figure —
-    /// what the claim census concluded was delivered — not the live wire
-    /// counter, which knows nothing of the repairs and discards that answered
-    /// its misses.
+    // Job health 0-1000 (1000 = perfect). Drops as articles fail.
+    //
+    // For a job that reached a terminal status this is the settled figure —
+    // what the claim census concluded was delivered — not the live wire
+    // counter, which knows nothing of the repairs and discards that answered
+    // its misses.
     pub health: u32,
-    /// Files the settlement dropped from the delivery, with the bytes each one
-    /// took out of the accounting. Empty for every job that discarded nothing.
+    // Files the settlement dropped from the delivery, with the bytes each one
+    // took out of the accounting. Empty for every job that discarded nothing.
     #[serde(default)]
     pub terminal_discards: Vec<crate::jobs::model::TerminalDiscard>,
-    /// Total files in the NZB (all roles).
+    // Total files in the NZB (all roles).
     #[serde(default)]
     pub total_files: u32,
-    /// Files fully downloaded and committed.
+    // Files fully downloaded and committed.
     #[serde(default)]
     pub completed_files: u32,
-    /// PAR2 recovery volumes not yet fetched (fetched on demand).
+    // PAR2 recovery volumes not yet fetched (fetched on demand).
     #[serde(default)]
     pub remaining_par_files: u32,
     pub password: Option<String>,
-    /// Optional category (e.g. "tv", "movies").
+    // Optional category (e.g. "tv", "movies").
     pub category: Option<String>,
-    /// Arbitrary key-value metadata from the submitting client.
+    // Arbitrary key-value metadata from the submitting client.
     pub metadata: Vec<(String, String)>,
-    /// Output directory where extracted files land.
+    // Output directory where extracted files land.
     pub output_dir: Option<String>,
-    /// Which servers served this job's articles, and how much each carried.
-    ///
-    /// Reporting only, and only as far as attribution reached: articles
-    /// Weaver could not name a server for are absent, so these counts are a
-    /// floor. Empty for a job downloaded before this was recorded.
+    // Which servers served this job's articles, and how much each carried.
+    //
+    // Reporting only, and only as far as attribution reached: articles
+    // Weaver could not name a server for are absent, so these counts are a
+    // floor. Empty for a job downloaded before this was recorded.
     #[serde(default)]
     pub server_attribution: Vec<crate::jobs::server_attribution::JobServerContribution>,
-    /// Error message (only set when status is Failed).
+    // Error message (only set when status is Failed).
     pub error: Option<String>,
     #[serde(default)]
     pub download_wait_reason: Option<String>,
     #[serde(default)]
     pub download_retry_at_epoch_ms: Option<f64>,
-    /// Wall-clock creation time (Unix epoch milliseconds).
+    // Wall-clock creation time (Unix epoch milliseconds).
     pub created_at_epoch_ms: f64,
 }
 
-/// Handle for sending commands to the scheduler.
-/// Cloneable, can be shared across tasks.
+// Handle for sending commands to the scheduler.
+// Cloneable, can be shared across tasks.
 #[derive(Clone)]
 pub struct SchedulerHandle {
     cmd_tx: mpsc::Sender<SchedulerCommand>,
@@ -1015,8 +1023,8 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
-    /// Create a new handle from a command sender, event broadcast sender,
-    /// and shared pipeline state.
+    // Create a new handle from a command sender, event broadcast sender,
+    // and shared pipeline state.
     pub fn new(
         cmd_tx: mpsc::Sender<SchedulerCommand>,
         event_tx: broadcast::Sender<PipelineEvent>,
@@ -1029,7 +1037,7 @@ impl SchedulerHandle {
         }
     }
 
-    /// Submit a new download job.
+    // Submit a new download job.
     pub async fn add_job(
         &self,
         job_id: JobId,
@@ -1041,7 +1049,7 @@ impl SchedulerHandle {
             .await
     }
 
-    /// Submit a new download job with explicit scheduler options.
+    // Submit a new download job with explicit scheduler options.
     pub async fn add_job_with_options(
         &self,
         job_id: JobId,
@@ -1065,7 +1073,7 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Restore a job from crash-recovery journal.
+    // Restore a job from crash-recovery journal.
     pub async fn restore_job(&self, request: RestoreJobRequest) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -1078,7 +1086,7 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Pause a job.
+    // Pause a job.
     pub async fn pause_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -1088,7 +1096,7 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Resume a paused job.
+    // Resume a paused job.
     pub async fn resume_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -1098,7 +1106,7 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Cancel a job.
+    // Cancel a job.
     pub async fn cancel_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         self.cancel_job_with_origin(job_id, CancellationOrigin::User)
             .await
@@ -1134,7 +1142,7 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Update a job's category and/or metadata.
+    // Update a job's category and/or metadata.
     pub async fn update_job(&self, job_id: JobId, update: JobUpdate) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -1148,9 +1156,9 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Move a job within the manual queue order. Durable and reflected in
-    /// queue listings; breaks ties within a dispatch priority band rather than
-    /// overriding HIGH/NORMAL/LOW.
+    // Move a job within the manual queue order. Durable and reflected in
+    // queue listings; breaks ties within a dispatch priority band rather than
+    // overriding HIGH/NORMAL/LOW.
     pub async fn reorder_job(
         &self,
         job_id: JobId,
@@ -1168,11 +1176,11 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Move multiple jobs within the manual queue order in a single round
-    /// trip. All moves are applied atomically: if any job id is unknown, no
-    /// move is applied and `Err(SchedulerError::JobNotFound)` is returned.
-    /// The resulting order is persisted and the job snapshot is published
-    /// once for the whole batch, rather than once per move.
+    // Move multiple jobs within the manual queue order in a single round
+    // trip. All moves are applied atomically: if any job id is unknown, no
+    // move is applied and `Err(SchedulerError::JobNotFound)` is returned.
+    // The resulting order is persisted and the job snapshot is published
+    // once for the whole batch, rather than once per move.
     pub async fn reorder_jobs(
         &self,
         moves: Vec<(JobId, QueueMoveTarget)>,
@@ -1185,7 +1193,7 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Reprocess a completed or failed job (re-run post-download stages without re-downloading).
+    // Reprocess a completed or failed job (re-run post-download stages without re-downloading).
     pub async fn reprocess_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -1195,7 +1203,7 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Re-download a completed or failed job from its persisted NZB under the same job ID.
+    // Re-download a completed or failed job from its persisted NZB under the same job ID.
     pub async fn redownload_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -1205,7 +1213,7 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Delete a completed/failed/cancelled job from history.
+    // Delete a completed/failed/cancelled job from history.
     pub async fn delete_history(
         &self,
         job_id: JobId,
@@ -1223,7 +1231,7 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Delete all completed/failed/cancelled jobs from history.
+    // Delete all completed/failed/cancelled jobs from history.
     pub async fn delete_all_history(&self, delete_files: bool) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -1236,47 +1244,47 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Get info about a specific job (reads from shared state, no channel round-trip).
+    // Get info about a specific job (reads from shared state, no channel round-trip).
     pub fn get_job(&self, job_id: JobId) -> Result<JobInfo, SchedulerError> {
         self.state
             .get_job(job_id)
             .ok_or(SchedulerError::JobNotFound(job_id))
     }
 
-    /// List all jobs (reads from shared state, no channel round-trip).
+    // List all jobs (reads from shared state, no channel round-trip).
     pub fn list_jobs(&self) -> Vec<JobInfo> {
         self.state.list_jobs()
     }
 
-    /// How many jobs are in each status (reads from shared state, copies no
-    /// job).
+    // How many jobs are in each status (reads from shared state, copies no
+    // job).
     pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
         self.state.job_status_counts()
     }
 
-    /// The revision of the published job list; it moves on every publish.
+    // The revision of the published job list; it moves on every publish.
     pub fn job_revision(&self) -> u64 {
         self.state.job_revision()
     }
 
-    /// Wakes when the published job list changes.
+    // Wakes when the published job list changes.
     pub fn subscribe_job_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.state.subscribe_job_changes()
     }
 
-    /// Download rate of every transferring job (reads from shared state, no
-    /// channel round-trip). See [`SharedPipelineState::job_download_rates`].
+    // Download rate of every transferring job (reads from shared state, no
+    // channel round-trip). See [`SharedPipelineState::job_download_rates`].
     pub fn job_download_rates(&self) -> Vec<(JobId, u64)> {
         self.state.job_download_rates()
     }
 
-    /// The hardware profile in force and the scheduled one overriding the
-    /// operator's choice (reads from shared state, no channel round-trip).
+    // The hardware profile in force and the scheduled one overriding the
+    // operator's choice (reads from shared state, no channel round-trip).
     pub fn hardware_profile_in_force(&self) -> Option<HardwareProfileInForce> {
         self.state.hardware_profile_in_force()
     }
 
-    /// Get current metrics (reads from shared state, no channel round-trip).
+    // Get current metrics (reads from shared state, no channel round-trip).
     pub fn get_metrics(&self) -> MetricsSnapshot {
         self.state.metrics_snapshot()
     }
@@ -1285,22 +1293,22 @@ impl SchedulerHandle {
         self.state.metrics().extraction_rejections()
     }
 
-    /// Whether the pipeline task is gone.
-    ///
-    /// Reads the command channel's liveness without sending anything through
-    /// it, so a readiness probe can tell "the scheduler died" from "the
-    /// scheduler is busy" — a probe that queued a command behind the pipeline
-    /// loop would fail exactly when the box is most loaded.
+    // Whether the pipeline task is gone.
+    //
+    // Reads the command channel's liveness without sending anything through
+    // it, so a readiness probe can tell "the scheduler died" from "the
+    // scheduler is busy" — a probe that queued a command behind the pipeline
+    // loop would fail exactly when the box is most loaded.
     pub fn is_closed(&self) -> bool {
         self.cmd_tx.is_closed()
     }
 
-    /// Count one job accepted into the pipeline, labelled by where it came
-    /// from and which category it landed in.
-    ///
-    /// Called from the submission path, which is the only place that knows the
-    /// origin. Low-frequency by construction (one call per submitted job), so
-    /// the label map behind it is never contended.
+    // Count one job accepted into the pipeline, labelled by where it came
+    // from and which category it landed in.
+    //
+    // Called from the submission path, which is the only place that knows the
+    // origin. Low-frequency by construction (one call per submitted job), so
+    // the label map behind it is never contended.
     pub fn note_job_submitted(
         &self,
         origin: crate::jobs::SubmissionOrigin,
@@ -1312,38 +1320,38 @@ impl SchedulerHandle {
             .note_submitted(origin.as_str(), category.unwrap_or(""));
     }
 
-    /// Per-server article attempt counters and latency for the servers of the
-    /// currently active NNTP generation.
-    ///
-    /// Read on demand rather than folded into [`MetricsSnapshot`]: the 100 ms
-    /// snapshot tick must stay a fixed-size struct copy with no `Vec` in it.
-    /// This reads through a `RwLock` that is only ever write-locked when a new
-    /// NNTP runtime generation is activated, so it never contends with the
-    /// per-article path that increments the counters.
+    // Per-server article attempt counters and latency for the servers of the
+    // currently active NNTP generation.
+    //
+    // Read on demand rather than folded into [`MetricsSnapshot`]: the 100 ms
+    // snapshot tick must stay a fixed-size struct copy with no `Vec` in it.
+    // This reads through a `RwLock` that is only ever write-locked when a new
+    // NNTP runtime generation is activated, so it never contends with the
+    // per-article path that increments the counters.
     pub fn server_metrics_snapshot(
         &self,
     ) -> Vec<crate::operations::instrumentation::ServerMetricsSnapshot> {
         self.state.metrics().server_metrics.snapshot()
     }
 
-    /// Job lifecycle counters and duration histograms. Read on demand; see
-    /// [`Self::server_metrics_snapshot`] for why this is not in the tick.
+    // Job lifecycle counters and duration histograms. Read on demand; see
+    // [`Self::server_metrics_snapshot`] for why this is not in the tick.
     pub fn job_lifecycle_metrics_snapshot(
         &self,
     ) -> crate::operations::instrumentation::JobLifecycleMetricsSnapshot {
         self.state.metrics().job_lifecycle.snapshot()
     }
 
-    /// Pipeline stage duration histograms. Read on demand; see
-    /// [`Self::server_metrics_snapshot`] for why this is not in the tick.
+    // Pipeline stage duration histograms. Read on demand; see
+    // [`Self::server_metrics_snapshot`] for why this is not in the tick.
     pub fn pipeline_histograms_snapshot(
         &self,
     ) -> crate::operations::instrumentation::PipelineHistogramsSnapshot {
         self.state.metrics().pipeline_histograms.snapshot()
     }
 
-    /// Get a fresh atomics-based metrics snapshot without advancing the shared
-    /// speed tracker.
+    // Get a fresh atomics-based metrics snapshot without advancing the shared
+    // speed tracker.
     pub fn get_live_metrics(&self) -> MetricsSnapshot {
         self.state.raw_metrics_snapshot()
     }
@@ -1352,17 +1360,17 @@ impl SchedulerHandle {
         self.state.download_block()
     }
 
-    /// Per-server BODY transport state as last published by the download lanes.
+    // Per-server BODY transport state as last published by the download lanes.
     pub fn download_transport_health(&self) -> Vec<ServerTransportHealth> {
         self.state.download_transport_health()
     }
 
-    /// Record a connection test's first-byte latency for the download lanes.
+    // Record a connection test's first-byte latency for the download lanes.
     pub fn note_server_probe_latency(&self, server_id: u32, latency: Duration) {
         self.state.note_server_probe_latency(server_id, latency);
     }
 
-    /// Read-only pipeline internals for the diagnostics package.
+    // Read-only pipeline internals for the diagnostics package.
     pub async fn pipeline_diagnostics(
         &self,
     ) -> Result<crate::pipeline::diagnostics::PipelineDiagnostics, SchedulerError> {
@@ -1376,7 +1384,7 @@ impl SchedulerHandle {
             .map_err(|_| SchedulerError::ChannelClosed)
     }
 
-    /// Pause all download dispatch globally.
+    // Pause all download dispatch globally.
     pub async fn pause_all(&self) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -1387,7 +1395,7 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// Resume all download dispatch globally.
+    // Resume all download dispatch globally.
     pub async fn resume_all(&self) -> Result<(), SchedulerError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -1427,13 +1435,13 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Check whether the pipeline is globally paused (reads from shared state).
+    // Check whether the pipeline is globally paused (reads from shared state).
     pub fn is_globally_paused(&self) -> bool {
         self.state.is_paused()
     }
 
-    /// Hold or release download admission for the schedule evaluator. The
-    /// reason is published with the download block so the hold is visible.
+    // Hold or release download admission for the schedule evaluator. The
+    // reason is published with the download block so the hold is visible.
     pub(crate) fn set_schedule_admission_hold(&self, reason: Option<String>) {
         let held = reason.is_some();
         *self.state.schedule_hold_reason.write().unwrap() = reason;
@@ -1446,15 +1454,15 @@ impl SchedulerHandle {
         self.state.is_post_processing_paused()
     }
 
-    /// Set the global download speed limit as the operator's edit. 0 means
-    /// unlimited. It is in force at once, over a scheduled limit, until the
-    /// next scheduled speed rule fires.
+    // Set the global download speed limit as the operator's edit. 0 means
+    // unlimited. It is in force at once, over a scheduled limit, until the
+    // next scheduled speed rule fires.
     pub async fn set_speed_limit(&self, bytes_per_sec: u64) -> Result<(), SchedulerError> {
         self.send_speed_limit(bytes_per_sec, true).await
     }
 
-    /// Load the saved global speed limit, as a configuration reload does. It
-    /// waits while a scheduled limit is in force.
+    // Load the saved global speed limit, as a configuration reload does. It
+    // waits while a scheduled limit is in force.
     pub async fn restore_speed_limit(&self, bytes_per_sec: u64) -> Result<(), SchedulerError> {
         self.send_speed_limit(bytes_per_sec, false).await
     }
@@ -1487,7 +1495,7 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// Apply a scheduled action (called by the schedule evaluator).
+    // Apply a scheduled action (called by the schedule evaluator).
     pub async fn apply_schedule_action(
         &self,
         action: crate::bandwidth::ScheduleAction,
@@ -1501,9 +1509,9 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// Make `profile` the operator's hardware profile. Its limits are in
-    /// force when this returns unless a schedule rule has another in force;
-    /// work already running keeps the limits it started with.
+    // Make `profile` the operator's hardware profile. Its limits are in
+    // force when this returns unless a schedule rule has another in force;
+    // work already running keeps the limits it started with.
     pub async fn set_hardware_profile(
         &self,
         profile: crate::runtime::HardwareProfile,
@@ -1517,8 +1525,8 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// Put the schedule's hardware profile in force, or with `None` return to
-    /// the operator's choice (called by the schedule evaluator).
+    // Put the schedule's hardware profile in force, or with `None` return to
+    // the operator's choice (called by the schedule evaluator).
     pub async fn set_scheduled_hardware_profile(
         &self,
         profile: Option<crate::runtime::HardwareProfile>,
@@ -1565,7 +1573,7 @@ impl SchedulerHandle {
         self.state.nntp_runtime_activation()
     }
 
-    /// Replace the NNTP client at runtime (e.g. after server config changes).
+    // Replace the NNTP client at runtime (e.g. after server config changes).
     pub async fn rebuild_nntp<T: Send + 'static>(
         &self,
         client: T,
@@ -1583,7 +1591,7 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Update disk tuning after the background startup measurement completes.
+    // Update disk tuning after the background startup measurement completes.
     pub async fn update_random_read_iops(
         &self,
         random_read_iops: f64,
@@ -1600,7 +1608,7 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// Update the pipeline's runtime directories for future jobs.
+    // Update the pipeline's runtime directories for future jobs.
     pub async fn update_runtime_paths(
         &self,
         data_dir: PathBuf,
@@ -1620,23 +1628,23 @@ impl SchedulerHandle {
         rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
-    /// Replace the shared job snapshot without a pipeline command round-trip.
+    // Replace the shared job snapshot without a pipeline command round-trip.
     pub fn replace_jobs_snapshot(&self, jobs: Vec<JobInfo>) {
         self.state.publish_jobs(jobs);
     }
 
-    /// Subscribe to job-level pipeline events.
+    // Subscribe to job-level pipeline events.
     pub fn subscribe_events(&self) -> broadcast::Receiver<PipelineEvent> {
         self.event_tx.subscribe()
     }
 
-    /// Subscribe to the per-article event stream, which the job-level
-    /// broadcast does not carry.
+    // Subscribe to the per-article event stream, which the job-level
+    // broadcast does not carry.
     pub fn subscribe_segment_events(&self) -> broadcast::Receiver<PipelineEvent> {
         self.state.subscribe_segment_events()
     }
 
-    /// Signal shutdown.
+    // Signal shutdown.
     pub async fn shutdown(&self) -> Result<(), SchedulerError> {
         self.cmd_tx
             .send(SchedulerCommand::Shutdown)

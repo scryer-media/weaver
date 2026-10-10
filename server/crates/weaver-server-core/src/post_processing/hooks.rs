@@ -35,14 +35,14 @@ fn context(
     ))
 }
 
-/// How a URL submission ended, as reported to URL_COMPLETED scripts.
+// How a URL submission ended, as reported to URL_COMPLETED scripts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UrlStatus {
-    /// The NZB was fetched and accepted into the queue.
+    // The NZB was fetched and accepted into the queue.
     Success,
-    /// The NZB could not be fetched.
+    // The NZB could not be fetched.
     Failure,
-    /// The NZB was fetched but rejected on submission.
+    // The NZB was fetched but rejected on submission.
     ScanFailure,
 }
 

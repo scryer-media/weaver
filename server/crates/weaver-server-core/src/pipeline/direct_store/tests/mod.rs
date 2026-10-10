@@ -1,6 +1,6 @@
-//! Tests for the direct-store coverage checkpoint.
-//!
-//! Fixture names are invented throughout — never real media titles.
+// Tests for the direct-store coverage checkpoint.
+//
+// Fixture names are invented throughout — never real media titles.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -37,14 +37,14 @@ use super::par2_access::{DirectVolumeFileAccess, VirtualPar2Volume};
 
 use par2_rs::FileAccess;
 
-/// The reconstruction sweep as its single-volume callers read it: `Ok` when
-/// every volume rebuilt, `Err(first failure)` when one did not.
-///
-/// [`super::reconstruct::reconstruct_volumes`] itself reports per volume now —
-/// a refused volume comes back with `contiguous: 0` and its own `failure`, and
-/// its siblings keep their bytes. Every test below drives exactly one volume,
-/// where the two shapes say the same thing; the per-volume behaviour has its
-/// own test in `pipeline::tests::direct_store`.
+// The reconstruction sweep as its single-volume callers read it: `Ok` when
+// every volume rebuilt, `Err(first failure)` when one did not.
+//
+// [`super::reconstruct::reconstruct_volumes`] itself reports per volume now —
+// a refused volume comes back with `contiguous: 0` and its own `failure`, and
+// its siblings keep their bytes. Every test below drives exactly one volume,
+// where the two shapes say the same thing; the per-volume behaviour has its
+// own test in `pipeline::tests::direct_store`.
 fn sweep_volumes(
     provider: &super::provider::HybridVolumeProvider,
     plans: &[super::reconstruct::VolumeReconstruction],
@@ -83,8 +83,8 @@ struct Journal {
     committed: Option<Vec<u8>>,
 }
 
-/// One shared journal behind all three barrier traits, so the recorded order is
-/// a single interleaved log across drain, sync and persist.
+// One shared journal behind all three barrier traits, so the recorded order is
+// a single interleaved log across drain, sync and persist.
 #[derive(Debug, Clone, Default)]
 struct Recorder {
     journal: Arc<Mutex<Journal>>,
@@ -202,7 +202,7 @@ impl CoveragePersist for Recorder {
     }
 }
 
-/// Drives the barrier with one recorder standing in for all three traits.
+// Drives the barrier with one recorder standing in for all three traits.
 fn run_barrier(
     barrier: &mut CoverageBarrier,
     recorder: &Recorder,
@@ -211,7 +211,7 @@ fn run_barrier(
     run_barrier_at(barrier, recorder, trigger, Instant::now())
 }
 
-/// [`run_barrier`] on a synthetic clock, for the failure-backoff tests.
+// [`run_barrier`] on a synthetic clock, for the failure-backoff tests.
 fn run_barrier_at(
     barrier: &mut CoverageBarrier,
     recorder: &Recorder,
@@ -262,8 +262,8 @@ fn sample_snapshot() -> CoverageSnapshot {
     }
 }
 
-/// The plan facts [`sample_snapshot`] was written against: one volume, mapped
-/// to NZB file 0.
+// The plan facts [`sample_snapshot`] was written against: one volume, mapped
+// to NZB file 0.
 fn sample_expected() -> ExpectedSet {
     ExpectedSet {
         plan_digest: PLAN_DIGEST,
@@ -310,13 +310,13 @@ fn write_destination(dir: &Path, relative_path: &str, len: usize) {
     std::fs::write(dir.join(relative_path), vec![0u8; len]).unwrap();
 }
 
-/// A job's two roots, **deliberately on different paths** inside one temp dir.
-///
-/// The whole point of the split is that member payload and working data live
-/// apart, so a restart test that resolved a member claim against the working
-/// directory would pass against a single shared root and prove nothing. Here the
-/// staging root is the only place a `.direct.partial` is written, so a claim sent
-/// to the wrong root fails the probe.
+// A job's two roots, **deliberately on different paths** inside one temp dir.
+//
+// The whole point of the split is that member payload and working data live
+// apart, so a restart test that resolved a member claim against the working
+// directory would pass against a single shared root and prove nothing. Here the
+// staging root is the only place a `.direct.partial` is written, so a claim sent
+// to the wrong root fails the probe.
 fn sample_roots(temp_dir: &Path) -> DestinationRoots {
     let roots = DestinationRoots {
         working_dir: temp_dir.join("intermediate").join("Silver Horizon"),
@@ -420,15 +420,15 @@ fn envelope_plan() -> DirectSetPlan {
     }
 }
 
-/// A hand-built virtual volume over one envelope and two member partials.
-///
-/// The physical layout is deliberately the awkward one: header, member A, a gap
-/// of envelope, member B, trailer — so a whole-volume read crosses four
-/// destination boundaries in both directions.
+// A hand-built virtual volume over one envelope and two member partials.
+//
+// The physical layout is deliberately the awkward one: header, member A, a gap
+// of envelope, member B, trailer — so a whole-volume read crosses four
+// destination boundaries in both directions.
 struct ProviderFixture {
     _dir: tempfile::TempDir,
     volume: super::provider::VirtualVolume,
-    /// The bytes a conventionally downloaded volume would have held.
+    // The bytes a conventionally downloaded volume would have held.
     conventional: Vec<u8>,
 }
 
@@ -442,13 +442,13 @@ const PROVIDER_MEMBER_B: usize = 180;
 
 const PROVIDER_TRAILER: usize = 16;
 
-/// The physical ranges this fixture's envelope file actually received: the
-/// non-member regions, clipped to what was covered.
-///
-/// Derived from the fixture's own layout rather than from the `extents` the
-/// [`super::provider::VirtualVolume`] is given, because the failure the provider
-/// has to survive is exactly an extent going missing — a map derived from the
-/// extents would hand the missing member's range straight back to the envelope.
+// The physical ranges this fixture's envelope file actually received: the
+// non-member regions, clipped to what was covered.
+//
+// Derived from the fixture's own layout rather than from the `extents` the
+// [`super::provider::VirtualVolume`] is given, because the failure the provider
+// has to survive is exactly an extent going missing — a map derived from the
+// extents would hand the missing member's range straight back to the envelope.
 fn provider_envelope_covered(covered: &ByteRanges) -> ByteRanges {
     let member_a_at = PROVIDER_HEADER as u64;
     let member_b_at = (PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP) as u64;
@@ -477,9 +477,9 @@ fn provider_fixture(covered: ByteRanges) -> ProviderFixture {
     provider_fixture_with_extents(covered, true)
 }
 
-/// `with_extents == false` builds the volume the router used to hand the
-/// provider once a routed member turned ineligible: the bytes are covered, the
-/// partial still holds them, and the extent that says so is gone.
+// `with_extents == false` builds the volume the router used to hand the
+// provider once a routed member turned ineligible: the bytes are covered, the
+// partial still holds them, and the extent that says so is gone.
 fn provider_fixture_with_extents(covered: ByteRanges, with_extents: bool) -> ProviderFixture {
     use std::io::{Seek, SeekFrom, Write};
 
@@ -581,16 +581,16 @@ const CIPHER_IV: [u8; 16] = [0x7C; 16];
 
 const CIPHER_LG2: u8 = 4;
 
-/// A whole encrypted member, built the way the write side builds one: derive the
-/// real key material, encrypt the padded plaintext, then feed the cipher through
-/// [`super::router::crypt::MemberCrypt::decrypt_range`] in `chunk`-sized pieces
-/// so the checkpoints and the retained padding come out of the production path
-/// rather than out of a constructor.
-///
-/// Returns `(posted cipher, plaintext, write-side state, destination coverage)`;
-/// the read-side facts come from `crypt.cipher_facts(len, &covered)`, which is
-/// the production hand-off, and a test wanting a *holed* member simply passes a
-/// coverage map with a gap in it.
+// A whole encrypted member, built the way the write side builds one: derive the
+// real key material, encrypt the padded plaintext, then feed the cipher through
+// [`super::router::crypt::MemberCrypt::decrypt_range`] in `chunk`-sized pieces
+// so the checkpoints and the retained padding come out of the production path
+// rather than out of a constructor.
+//
+// Returns `(posted cipher, plaintext, write-side state, destination coverage)`;
+// the read-side facts come from `crypt.cipher_facts(len, &covered)`, which is
+// the production hand-off, and a test wanting a *holed* member simply passes a
+// coverage map with a gap in it.
 fn encrypted_member_facts(
     payload_len: usize,
     chunk: usize,
@@ -658,8 +658,8 @@ fn encrypted_member_facts(
     (posted, plain, crypt, covered)
 }
 
-/// A one-member virtual volume whose whole image is that member, so a read at
-/// physical offset *n* is a read at member-logical offset *n*.
+// A one-member virtual volume whose whole image is that member, so a read at
+// physical offset *n* is a read at member-logical offset *n*.
 fn cipher_volume(
     dir: &Path,
     plain: &[u8],
@@ -690,8 +690,8 @@ fn cipher_volume(
     }
 }
 
-/// One article per 100 bytes of the fixture volume, which is the granularity the
-/// coverage map's boundaries actually fall on.
+// One article per 100 bytes of the fixture volume, which is the granularity the
+// coverage map's boundaries actually fall on.
 fn provider_article_crcs(conventional: &[u8]) -> CrcRuns {
     let mut runs = CrcRuns::default();
     let mut offset = 0usize;
@@ -725,8 +725,8 @@ fn reconstruction_target(
     }
 }
 
-/// [`reconstruction_target`] with the repair scratch's policy for a run that
-/// stops inside an article.
+// [`reconstruction_target`] with the repair scratch's policy for a run that
+// stops inside an article.
 fn repair_scratch_target(
     fixture: &ProviderFixture,
     path: std::path::PathBuf,
@@ -738,13 +738,13 @@ fn repair_scratch_target(
     target
 }
 
-/// A PAR2 set describing one file with **descriptions only** — no IFSC packet,
-/// so no slice checksums.
-///
-/// That is the shape that argument names: with no per-slice data the verifier
-/// falls back to a whole-file MD5, which is the read that degrades into
-/// thousands of ranged reads across member partials unless the adapter offers a
-/// real sequential reader.
+// A PAR2 set describing one file with **descriptions only** — no IFSC packet,
+// so no slice checksums.
+//
+// That is the shape that argument names: with no per-slice data the verifier
+// falls back to a whole-file MD5, which is the read that degrades into
+// thousands of ranged reads across member partials unless the adapter offers a
+// real sequential reader.
 fn descriptor_only_par2_set(filename: &str, bytes: &[u8]) -> par2_rs::Par2FileSet {
     let file_id = par2_rs::FileId::from_bytes([7u8; 16]);
     par2_rs::Par2FileSet {
@@ -769,7 +769,7 @@ fn descriptor_only_par2_set(filename: &str, bytes: &[u8]) -> par2_rs::Par2FileSe
     }
 }
 
-/// The adapter under test, over the provider fixture's single virtual volume.
+// The adapter under test, over the provider fixture's single virtual volume.
 fn virtual_file_access(
     fixture: &ProviderFixture,
     par2_set: &par2_rs::Par2FileSet,
@@ -795,7 +795,7 @@ fn virtual_file_access(
     )
 }
 
-/// The adapter over one encrypted virtual volume, plus the overlay counters.
+// The adapter over one encrypted virtual volume, plus the overlay counters.
 fn encrypted_file_access(
     volume: super::provider::VirtualVolume,
     par2_set: &par2_rs::Par2FileSet,
@@ -837,8 +837,8 @@ fn floor_entry(volume_index: u32, file_index: u32, floor: u64, complete: bool) -
     }
 }
 
-/// One member header record, in the shape a split RAR5 member has. Callers set
-/// the four fields that differ between a chain's parts on the value returned.
+// One member header record, in the shape a split RAR5 member has. Callers set
+// the four fields that differ between a chain's parts on the value returned.
 fn member_facts(
     name: &str,
     data_offset: u64,
@@ -882,7 +882,7 @@ fn member_facts(
     }
 }
 
-/// Cached facts for one RAR volume, in the envelope restore reads them from.
+// Cached facts for one RAR volume, in the envelope restore reads them from.
 fn volume_facts(
     volume_number: u32,
     more_volumes: bool,
@@ -927,9 +927,9 @@ const REARM_PART: u64 = 400;
 
 const REARM_MEMBER: &str = "Silver.Horizon.S01E04.mkv";
 
-/// A router rebuilt exactly the way restore rebuilds one: from cached facts for
-/// a two-volume set holding a single member split across both, with the whole
-/// member seeded as restart coverage.
+// A router rebuilt exactly the way restore rebuilds one: from cached facts for
+// a two-volume set holding a single member split across both, with the whole
+// member seeded as restart coverage.
 fn rearm_router() -> DirectSetRouter {
     let plan = DirectSetPlan {
         set_name: SET.to_string(),
@@ -973,8 +973,8 @@ fn rearm_router() -> DirectSetRouter {
     router
 }
 
-/// A PAR2 set describing one file with **slice checksums**, which is what makes
-/// per-slice damage attribution a question at all.
+// A PAR2 set describing one file with **slice checksums**, which is what makes
+// per-slice damage attribution a question at all.
 fn sliced_par2_set(filename: &str, bytes: &[u8], slice_size: u64) -> par2_rs::Par2FileSet {
     let file_id = par2_rs::FileId::from_bytes([11u8; 16]);
     let mut checksums = Vec::new();
@@ -1009,9 +1009,9 @@ fn sliced_par2_set(filename: &str, bytes: &[u8], slice_size: u64) -> par2_rs::Pa
     }
 }
 
-/// The provider fixture's volume with one **interior** hole: everything is
-/// covered except `[hole_start, hole_end)`, which sits in the middle of member A
-/// with healthy bytes on both sides.
+// The provider fixture's volume with one **interior** hole: everything is
+// covered except `[hole_start, hole_end)`, which sits in the middle of member A
+// with healthy bytes on both sides.
 fn covered_with_interior_hole(hole_start: u64, hole_end: u64) -> ByteRanges {
     let total =
         (PROVIDER_HEADER + PROVIDER_MEMBER_A + PROVIDER_GAP + PROVIDER_MEMBER_B + PROVIDER_TRAILER)
@@ -1022,7 +1022,7 @@ fn covered_with_interior_hole(hole_start: u64, hole_end: u64) -> ByteRanges {
     covered
 }
 
-/// Which slices `verify_slices` calls damaged, as a set of indices.
+// Which slices `verify_slices` calls damaged, as a set of indices.
 fn damaged_slice_indices(valid: &[bool]) -> Vec<usize> {
     valid
         .iter()
@@ -1033,13 +1033,13 @@ fn damaged_slice_indices(valid: &[bool]) -> Vec<usize> {
 
 const HOLE_SLICE_SIZE: u64 = 64;
 
-/// A one-volume set holding one whole stored member, rebuilt from facts the way
-/// restore rebuilds one — so a test can drive [`DirectSetRouter`]'s drain
-/// without a parseable RAR image in front of it.
-///
-/// `member` is the member's final (post-repair) bytes: the layout's whole-member
-/// CRC32 is taken over them, so the set verifies exactly when the composition
-/// ends up describing the repaired image and not the damaged one.
+// A one-volume set holding one whole stored member, rebuilt from facts the way
+// restore rebuilds one — so a test can drive [`DirectSetRouter`]'s drain
+// without a parseable RAR image in front of it.
+//
+// `member` is the member's final (post-repair) bytes: the layout's whole-member
+// CRC32 is taken over them, so the set verifies exactly when the composition
+// ends up describing the repaired image and not the damaged one.
 fn straddle_router(member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
     let plan = DirectSetPlan {
         set_name: SET.to_string(),
@@ -1079,9 +1079,9 @@ fn straddle_router(member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
 
 const STRADDLE_MEMBER: &str = "Silver.Horizon.S01E25.mkv";
 
-/// Deliberately all under `0x80`: MessagePack encodes those as one-byte
-/// positive fixints, so the salt survives into the blob as a literal 16-byte
-/// run and a byte scan can prove the row is really in there.
+// Deliberately all under `0x80`: MessagePack encodes those as one-byte
+// positive fixints, so the salt survives into the blob as a literal 16-byte
+// run and a byte scan can prove the row is really in there.
 const CRYPT_SALT: [u8; 16] = [0x5A; 16];
 
 const CRYPT_IV: [u8; 16] = [0x3E; 16];
@@ -1099,22 +1099,22 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-/// A one-volume set holding one whole **encrypted** stored member, rebuilt from
-/// facts the way restore rebuilds one and then driven through the router's own
-/// routing path.
-///
-/// The point of going the long way round is that the crypt rows the test reads
-/// are then the ones a real download produces — derived keys, real AES-CBC
-/// ciphertext, a real checkpoint at the decrypted frontier and real retained
-/// padding. A hand-written row proves only that the struct it was written into
-/// serializes.
+// A one-volume set holding one whole **encrypted** stored member, rebuilt from
+// facts the way restore rebuilds one and then driven through the router's own
+// routing path.
+//
+// The point of going the long way round is that the crypt rows the test reads
+// are then the ones a real download produces — derived keys, real AES-CBC
+// ciphertext, a real checkpoint at the decrypted frontier and real retained
+// padding. A hand-written row proves only that the struct it was written into
+// serializes.
 fn encrypted_crypt_router(plain: &[u8], header_bytes: u64) -> DirectSetRouter {
     encrypted_crypt_router_partial(plain, header_bytes, usize::MAX).0
 }
 
-/// [`encrypted_crypt_router`] with only the first `staged` cipher bytes routed,
-/// handing back the whole cipher so the caller can stage the rest and watch what
-/// moves. `staged` is clamped to the member, so `usize::MAX` is "all of it".
+// [`encrypted_crypt_router`] with only the first `staged` cipher bytes routed,
+// handing back the whole cipher so the caller can stage the rest and watch what
+// moves. `staged` is clamped to the member, so `usize::MAX` is "all of it".
 fn encrypted_crypt_router_partial(
     plain: &[u8],
     header_bytes: u64,
@@ -1179,18 +1179,18 @@ fn encrypted_crypt_router_partial(
     (router, cipher)
 }
 
-/// The write path's cost account: one pass over the member's cipher stream,
-/// whatever shape the articles arrive in.
-///
-/// The transform is the one thing an encrypted member pays that a plain one
-/// does not, so the way it silently becomes expensive is by running twice over
-/// bytes it has already resolved — a straddling block re-derived by both of
-/// its halves, a held span re-decrypted when it is finally released. Neither
-/// changes a single output byte, which is why this is asked of an accounting
-/// counter and not of the member's contents.
-///
-/// The articles are deliberately not block-aligned, so every boundary in the
-/// run is a straddling cipher block with one half in each article.
+// The write path's cost account: one pass over the member's cipher stream,
+// whatever shape the articles arrive in.
+//
+// The transform is the one thing an encrypted member pays that a plain one
+// does not, so the way it silently becomes expensive is by running twice over
+// bytes it has already resolved — a straddling block re-derived by both of
+// its halves, a held span re-decrypted when it is finally released. Neither
+// changes a single output byte, which is why this is asked of an accounting
+// counter and not of the member's contents.
+//
+// The articles are deliberately not block-aligned, so every boundary in the
+// run is a straddling cipher block with one half in each article.
 #[test]
 fn the_write_transform_decrypts_each_cipher_byte_once() {
     const HEADER: u64 = 1024;
@@ -1229,14 +1229,14 @@ fn the_write_transform_decrypts_each_cipher_byte_once() {
     );
 }
 
-/// Stages one encrypted member out of order and reports what the write path
-/// copied out of staging.
-///
-/// `order` names the spans of each window in arrival order, so a window whose
-/// first span arrives last leaves every span behind it waiting on a CBC
-/// predecessor that is not here. The drain runs after every arrival, which is
-/// what the set's own routing does: one gap must not cost a pass over the run
-/// behind it per article landing anywhere in the set.
+// Stages one encrypted member out of order and reports what the write path
+// copied out of staging.
+//
+// `order` names the spans of each window in arrival order, so a window whose
+// first span arrives last leaves every span behind it waiting on a CBC
+// predecessor that is not here. The drain runs after every arrival, which is
+// what the set's own routing does: one gap must not cost a pass over the run
+// behind it per article landing anywhere in the set.
 fn encrypted_out_of_order_copy_bytes(windows: usize, order: &[usize]) -> (u64, u64, u64) {
     const HEADER: u64 = 1021;
     let spans = order.len();
@@ -1281,21 +1281,21 @@ fn encrypted_out_of_order_copy_bytes(windows: usize, order: &[usize]) -> (u64, u
     )
 }
 
-/// The write path resolves a run before it materializes it.
-///
-/// A held run is one whose CBC predecessor has not arrived. Nothing about it
-/// can be routed, so every byte pulled out of staging on its behalf is a copy
-/// made and thrown away — and the drain of a set revisits every staged volume
-/// on every article, so a run that is copied before it is resolved is copied
-/// again on each arrival, for as long as the gap in front of it lasts. That
-/// turns one missing article into a pass over the whole run behind it per
-/// article received.
-///
-/// Counted rather than timed: the routed bytes are identical either way, which
-/// is exactly why only an accounting counter can tell the two apart. The
-/// allowance is a cipher block per edge of each span — the genuinely small
-/// reads that assemble a straddling block — and the articles are deliberately
-/// unaligned, so every boundary in the run is such a block.
+// The write path resolves a run before it materializes it.
+//
+// A held run is one whose CBC predecessor has not arrived. Nothing about it
+// can be routed, so every byte pulled out of staging on its behalf is a copy
+// made and thrown away — and the drain of a set revisits every staged volume
+// on every article, so a run that is copied before it is resolved is copied
+// again on each arrival, for as long as the gap in front of it lasts. That
+// turns one missing article into a pass over the whole run behind it per
+// article received.
+//
+// Counted rather than timed: the routed bytes are identical either way, which
+// is exactly why only an accounting counter can tell the two apart. The
+// allowance is a cipher block per edge of each span — the genuinely small
+// reads that assemble a straddling block — and the articles are deliberately
+// unaligned, so every boundary in the run is such a block.
 #[test]
 fn a_held_encrypted_run_is_not_copied_out_of_staging() {
     let (copied, cipher_len, spans) =
@@ -1308,11 +1308,11 @@ fn a_held_encrypted_run_is_not_copied_out_of_staging() {
     );
 }
 
-/// The same, with the gap held open while a long run piles up behind it.
-///
-/// Twenty-four spans arrive before the one that unblocks them, so a path that
-/// re-copies the pending run on every arrival pays the whole triangle rather
-/// than the member.
+// The same, with the gap held open while a long run piles up behind it.
+//
+// Twenty-four spans arrive before the one that unblocks them, so a path that
+// re-copies the pending run on every arrival pays the whole triangle rather
+// than the member.
 #[test]
 fn a_long_run_behind_one_gap_is_not_recopied_per_arrival() {
     let order: Vec<usize> = (1..25).chain(std::iter::once(0)).collect();
@@ -1331,8 +1331,8 @@ mod par3_source_access;
 mod recording_test_doubles;
 mod repair_transactions;
 
-/// [`straddle_router`] against a real working directory, so the set's holds
-/// scratch can be created.
+// [`straddle_router`] against a real working directory, so the set's holds
+// scratch can be created.
 fn straddle_router_in(dir: &Path, member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
     let plan = DirectSetPlan {
         set_name: SET.to_string(),
@@ -1366,8 +1366,8 @@ fn straddle_router_in(dir: &Path, member: &[u8], header_bytes: u64) -> (DirectSe
     (router, member_id)
 }
 
-/// The bytes a routed span carries, joined — what the vectored write puts on
-/// disk, in the order it puts it there.
+// The bytes a routed span carries, joined — what the vectored write puts on
+// disk, in the order it puts it there.
 fn span_bytes(span: &super::router::RoutedSpan) -> Vec<u8> {
     span.bytes.iter().flat_map(|piece| piece.to_vec()).collect()
 }
@@ -1376,7 +1376,7 @@ const TOUCH_MEMBER_BYTES: usize = 400;
 
 const TOUCH_HEADER_BYTES: u64 = 64;
 
-/// One volume image whose member starts at [`TOUCH_HEADER_BYTES`].
+// One volume image whose member starts at [`TOUCH_HEADER_BYTES`].
 fn touch_once_image() -> Vec<u8> {
     (0..TOUCH_HEADER_BYTES as usize + TOUCH_MEMBER_BYTES)
         .map(|index| ((index * 31 + 7) % 251) as u8)
@@ -1481,8 +1481,8 @@ fn a_routed_span_reports_the_length_of_every_piece_it_carries() {
     );
 }
 
-/// A router with a plan and no layout: everything staged into it is a hold,
-/// because nothing can be mapped until a header parse binds the layout.
+// A router with a plan and no layout: everything staged into it is a hold,
+// because nothing can be mapped until a header parse binds the layout.
 fn layoutless_router() -> DirectSetRouter {
     DirectSetRouter::new(DirectSetPlan {
         set_name: SET.to_string(),
@@ -1495,8 +1495,8 @@ fn layoutless_router() -> DirectSetRouter {
     })
 }
 
-/// One pooled article of `len` bytes from a pool with a single small slot,
-/// handed over the way the routing seam hands it: as a view of the slot.
+// One pooled article of `len` bytes from a pool with a single small slot,
+// handed over the way the routing seam hands it: as a view of the slot.
 fn pooled_article(
     len: usize,
 ) -> (
@@ -1588,16 +1588,16 @@ fn a_long_hold_keeps_its_view_unless_the_pool_is_scarce() {
     );
 }
 
-/// A decoder batch as the inline decode produces it: an allocation of its own,
-/// adopted by `Bytes` without a copy.
+// A decoder batch as the inline decode produces it: an allocation of its own,
+// adopted by `Bytes` without a copy.
 fn decoder_batch(len: usize) -> bytes::Bytes {
     let payload: Vec<u8> = (0..len as u32).map(|index| (index % 251) as u8).collect();
     bytes::Bytes::from(payload.into_boxed_slice())
 }
 
-/// The holds budget charges a view its own length, so a view kept past its
-/// article must cover most of the batch it keeps alive. One that covers less
-/// than half leaves it, whatever its length and whatever the pool's state.
+// The holds budget charges a view its own length, so a view kept past its
+// article must cover most of the batch it keeps alive. One that covers less
+// than half leaves it, whatever its length and whatever the pool's state.
 #[test]
 fn a_hold_covering_less_than_half_its_batch_is_copied_out() {
     const BATCH: usize = 512 * 1024;
@@ -1638,9 +1638,9 @@ fn a_hold_covering_most_of_its_batch_keeps_its_view() {
     assert!(!batch.is_unique(), "the kept view still shares the batch");
 }
 
-/// A view kept whole when its article drained can be cut down later, by the
-/// drain trimming routed bytes or by a repair overwriting part of it. The cut
-/// still pins the whole batch, so it faces the same rule.
+// A view kept whole when its article drained can be cut down later, by the
+// drain trimming routed bytes or by a repair overwriting part of it. The cut
+// still pins the whole batch, so it faces the same rule.
 #[test]
 fn cutting_a_kept_view_down_to_a_sliver_copies_the_sliver_out() {
     const BATCH: usize = 512 * 1024;

@@ -2,14 +2,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::*;
 
-/// How long a job's computed retention exclusions stay fresh. Retention is
-/// day-granular; the TTL only exists to pick up server-config edits and
-/// day-boundary crossings without recomputing per lease.
+// How long a job's computed retention exclusions stay fresh. Retention is
+// day-granular; the TTL only exists to pick up server-config edits and
+// day-boundary crossings without recomputing per lease.
 const JOB_RETENTION_EXCLUDES_TTL: Duration = Duration::from_secs(60);
 
 impl Pipeline {
-    /// Newest known post date across the job's files. `None` when the NZB
-    /// carried no usable dates — such jobs are never retention-skipped.
+    // Newest known post date across the job's files. `None` when the NZB
+    // carried no usable dates — such jobs are never retention-skipped.
     pub(crate) fn job_posted_at_epoch(spec: &JobSpec) -> Option<u64> {
         spec.files
             .iter()
@@ -17,24 +17,24 @@ impl Pipeline {
             .max()
     }
 
-    /// When this job's articles become old enough to fetch, or `None` if they
-    /// already are.
-    ///
-    /// `Some` means dispatch holds off. Queue snapshots expose the reason and
-    /// deadline so clients can distinguish propagation from active downloading.
-    /// Pause, resume and delete retain their ordinary lifecycle semantics.
-    ///
-    /// The answer is computed once per job and cached. It is derived from wall
-    /// time (the NZB's date is an epoch second) but stored as an [`Instant`],
-    /// so a system-clock adjustment after the job was admitted cannot move a
-    /// deadline the pipeline has already committed to — the same reason the
-    /// restart-lead retry beside it stores one.
-    ///
-    /// A job with no parseable dates is never deferred: `job_posted_at_epoch`
-    /// is `None` and the question has no answer, which is different from
-    /// answering "wait". Missing dates on *some* files contribute nothing —
-    /// the anchor is the newest date the NZB does carry, because that is the
-    /// article most likely still in flight.
+    // When this job's articles become old enough to fetch, or `None` if they
+    // already are.
+    //
+    // `Some` means dispatch holds off. Queue snapshots expose the reason and
+    // deadline so clients can distinguish propagation from active downloading.
+    // Pause, resume and delete retain their ordinary lifecycle semantics.
+    //
+    // The answer is computed once per job and cached. It is derived from wall
+    // time (the NZB's date is an epoch second) but stored as an [`Instant`],
+    // so a system-clock adjustment after the job was admitted cannot move a
+    // deadline the pipeline has already committed to — the same reason the
+    // restart-lead retry beside it stores one.
+    //
+    // A job with no parseable dates is never deferred: `job_posted_at_epoch`
+    // is `None` and the question has no answer, which is different from
+    // answering "wait". Missing dates on *some* files contribute nothing —
+    // the anchor is the newest date the NZB does carry, because that is the
+    // article most likely still in flight.
     pub(in crate::pipeline) fn propagation_hold_until(&mut self, job_id: JobId) -> Option<Instant> {
         let delay = self.propagation_delay;
         #[cfg(test)]
@@ -87,8 +87,8 @@ impl Pipeline {
         Some(ready_at)
     }
 
-    /// How long until the earliest deferred job becomes eligible, for the run
-    /// loop's sleep. `None` when nothing is deferred.
+    // How long until the earliest deferred job becomes eligible, for the run
+    // loop's sleep. `None` when nothing is deferred.
     pub(crate) fn next_propagation_delay(&self) -> Option<Duration> {
         let now = Instant::now();
         self.propagation_ready_at
@@ -98,10 +98,10 @@ impl Pipeline {
             .map(|ready_at| ready_at.saturating_duration_since(now))
     }
 
-    /// Pool server indices whose retention window is shorter than this job's
-    /// post age. These servers are skipped for the job's articles without a
-    /// network attempt, carry no health penalty, and count toward
-    /// per-article exhaustion.
+    // Pool server indices whose retention window is shorter than this job's
+    // post age. These servers are skipped for the job's articles without a
+    // network attempt, carry no health penalty, and count toward
+    // per-article exhaustion.
     pub(in crate::pipeline) fn job_retention_excludes(&mut self, job_id: JobId) -> Arc<Vec<usize>> {
         let now = Instant::now();
         if let Some((computed_at, excludes)) = self.job_retention_exclude_cache.get(&job_id)
@@ -140,9 +140,9 @@ impl Pipeline {
             .collect()
     }
 
-    /// Set union of two exclusion lists, order-preserving and duplicate-free.
-    /// Small sets (one entry per configured server at most), so the linear
-    /// membership scan is cheaper than any set type.
+    // Set union of two exclusion lists, order-preserving and duplicate-free.
+    // Small sets (one entry per configured server at most), so the linear
+    // membership scan is cheaper than any set type.
     pub(in crate::pipeline) fn union_exclude_servers(
         first: &[usize],
         second: &[usize],
@@ -156,11 +156,11 @@ impl Pipeline {
         merged
     }
 
-    /// Union of a work item's failure exclusions and the job's retention
-    /// exclusions — the effective exclude set for server ordering. Failure
-    /// excludes stay per-article on the work item; retention excludes stay
-    /// job-derived so a server-config change applies without rewriting
-    /// queued work.
+    // Union of a work item's failure exclusions and the job's retention
+    // exclusions — the effective exclude set for server ordering. Failure
+    // excludes stay per-article on the work item; retention excludes stay
+    // job-derived so a server-config change applies without rewriting
+    // queued work.
     pub(in crate::pipeline) fn effective_exclude_servers(
         &mut self,
         job_id: JobId,
@@ -179,11 +179,11 @@ impl Pipeline {
         merged
     }
 
-    /// Number of distinct, currently-valid pool indices unavailable to this
-    /// article: the union of its failure exclusions and the job's retention
-    /// exclusions. Indices outside the current pool are ignored — a server
-    /// config rebuild can shrink or reorder the pool, and stale indices must
-    /// not inflate exhaustion math into spurious "article missing" verdicts.
+    // Number of distinct, currently-valid pool indices unavailable to this
+    // article: the union of its failure exclusions and the job's retention
+    // exclusions. Indices outside the current pool are ignored — a server
+    // config rebuild can shrink or reorder the pool, and stale indices must
+    // not inflate exhaustion math into spurious "article missing" verdicts.
     pub(in crate::pipeline) fn unavailable_server_count(
         &mut self,
         job_id: JobId,
@@ -209,10 +209,10 @@ impl Pipeline {
                 .count()
     }
 
-    /// Whether an article carrying `failure_excludes` has no server left
-    /// that may fetch it, once the job's retention exclusions are counted.
-    /// An unconfigured pool answers no: nothing can be booked against
-    /// servers that do not exist yet.
+    // Whether an article carrying `failure_excludes` has no server left
+    // that may fetch it, once the job's retention exclusions are counted.
+    // An unconfigured pool answers no: nothing can be booked against
+    // servers that do not exist yet.
     pub(in crate::pipeline) fn no_server_can_serve(
         &mut self,
         job_id: JobId,
@@ -222,10 +222,10 @@ impl Pipeline {
         server_count > 0 && self.unavailable_server_count(job_id, failure_excludes) >= server_count
     }
 
-    /// Book one article as missing because no server may fetch it. The
-    /// article is not necessarily gone from Usenet, but nothing configured
-    /// can prove otherwise, and leaving it queued would hold the job at
-    /// downloading forever with nothing in flight.
+    // Book one article as missing because no server may fetch it. The
+    // article is not necessarily gone from Usenet, but nothing configured
+    // can prove otherwise, and leaving it queued would hold the job at
+    // downloading forever with nothing in flight.
     pub(in crate::pipeline) fn book_unservable_work(&mut self, work: &DownloadWork) {
         warn!(
             segment = %work.segment_id,
@@ -242,8 +242,8 @@ impl Pipeline {
         }
     }
 
-    /// Book as missing every queued article of `job_id` that no server may
-    /// fetch. Returns how many were retired.
+    // Book as missing every queued article of `job_id` that no server may
+    // fetch. Returns how many were retired.
     pub(in crate::pipeline) fn retire_unservable_queued_work(&mut self, job_id: JobId) -> usize {
         let server_count = self.nntp.pool().server_count();
         if server_count == 0 {

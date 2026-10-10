@@ -1,4 +1,4 @@
-//! Metadata compatibility preserves the actual decoded-byte envelope.
+// Metadata compatibility preserves the actual decoded-byte envelope.
 use super::*;
 
 fn decoded_layout(
@@ -125,8 +125,8 @@ fn actual_file_end_addition_is_checked() {
     );
 }
 
-/// An article that declares no usable start never guesses an encoded offset:
-/// it is laid after the part before it, and waits if that part is not placed.
+// An article that declares no usable start never guesses an encoded offset:
+// it is laid after the part before it, and waits if that part is not placed.
 #[test]
 fn missing_begin_follows_the_part_before_it() {
     let mut expected = ExpectedSegmentLayout {

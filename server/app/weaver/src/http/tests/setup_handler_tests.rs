@@ -26,9 +26,9 @@ fn peer(value: &str) -> SocketAddr {
     value.parse().expect("test peer address is valid")
 }
 
-/// `RuntimeSecurityConfig` keeps its trusted-network list private behind a
-/// shared lock, so `..default()` update syntax is unavailable outside that
-/// crate; the public fields are assigned instead.
+// `RuntimeSecurityConfig` keeps its trusted-network list private behind a
+// shared lock, so `..default()` update syntax is unavailable outside that
+// crate; the public fields are assigned instead.
 fn env_pinned_bind(address: &str) -> RuntimeSecurityConfig {
     let mut security = RuntimeSecurityConfig::default();
     security.http_bind_address = address.parse().expect("test bind address is valid");
@@ -87,7 +87,7 @@ fn setting(db: &Database, key: &str) -> Option<String> {
     db.get_setting(key).expect("settings table is readable")
 }
 
-/// No access mode, credentials, or bind address stored — a fresh install.
+// No access mode, credentials, or bind address stored — a fresh install.
 fn assert_nothing_written(db: &Database) {
     assert_eq!(setting(db, SETTING_ACCESS_MODE), None);
     assert_eq!(setting(db, SETTING_TRUSTED_NETWORKS), None);

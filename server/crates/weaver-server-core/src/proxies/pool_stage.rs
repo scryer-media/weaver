@@ -628,7 +628,7 @@ impl PoolStage {
     pub fn revision(&self) -> u64 {
         self.state.revision.load(Ordering::Acquire)
     }
-    /// Each lease keeps the same member for DNS validation and its HTTP fetch.
+    // Each lease keeps the same member for DNS validation and its HTTP fetch.
     pub fn lease_members(&self) -> Vec<(u32, Arc<dyn Dialer>)> {
         let members = self.state.members.read().expect("pool members");
         let order = self.state.plan.lock().expect("pool plan").lease_order();

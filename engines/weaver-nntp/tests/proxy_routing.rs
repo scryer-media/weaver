@@ -415,7 +415,7 @@ async fn blocking_routed_tls_read_obeys_timeout_and_revocation() {
     }
 }
 
-/// An opt-in local transport measurement; wall-clock rates are informational.
+// An opt-in local transport measurement; wall-clock rates are informational.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "local throughput measurement"]
 async fn local_route_throughput() {

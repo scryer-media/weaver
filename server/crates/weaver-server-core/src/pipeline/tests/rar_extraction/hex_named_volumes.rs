@@ -1,9 +1,9 @@
-//! A multi-volume RAR set posted under obfuscated, extensionless hex names.
-//!
-//! Nothing in such a filename says which set a volume belongs to or where in
-//! it the volume sits, so the volumes have to be grouped by what their headers
-//! say. The fixture is the RARLAB-written five-volume encrypted set; only the
-//! names change.
+// A multi-volume RAR set posted under obfuscated, extensionless hex names.
+//
+// Nothing in such a filename says which set a volume belongs to or where in
+// it the volume sits, so the volumes have to be grouped by what their headers
+// say. The fixture is the RARLAB-written five-volume encrypted set; only the
+// names change.
 
 use super::*;
 
@@ -16,8 +16,8 @@ fn rarlab_five_volume_set() -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// A different 32-hex name per volume, none of them carrying an extension or
-/// any hint of order. Deliberately not sorted in volume order either.
+// A different 32-hex name per volume, none of them carrying an extension or
+// any hint of order. Deliberately not sorted in volume order either.
 fn hex_names(count: usize) -> Vec<String> {
     (0..count)
         .map(|index| {
@@ -84,10 +84,10 @@ async fn extensionless_hex_volumes_group_into_one_set() {
     assert_completed_with_member(&pipeline, job_id, &complete_dir, name);
 }
 
-/// A hex-named set whose first volume never arrived takes the missing-volume
-/// route rather than an extraction attempt that cannot open, and with no PAR2
-/// to repair from the failure names every volume seen and why none of them is
-/// volume 0.
+// A hex-named set whose first volume never arrived takes the missing-volume
+// route rather than an extraction attempt that cannot open, and with no PAR2
+// to repair from the failure names every volume seen and why none of them is
+// volume 0.
 #[tokio::test]
 async fn extensionless_hex_volumes_without_a_first_volume_report_what_was_seen() {
     let temp_dir = tempfile::tempdir().unwrap();

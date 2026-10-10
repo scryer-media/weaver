@@ -1,23 +1,23 @@
-//! Signed upgrade-manifest generation for a release.
-//!
-//! The manifest is what an installed Weaver reads to decide what to download
-//! and what to trust: for every supported layout it names the release asset, its
-//! exact byte length, its BLAKE3 hash, and — for archives — every regular file
-//! inside it with its size and executable bit. The running build verifies all of
-//! that before anything is promoted, so a manifest that disagrees with the
-//! assets is a release that cannot install itself.
-//!
-//! Two generations are published for every release. v1 is frozen and its parser
-//! rejects anything it does not recognise, so it can never grow a field; v2 is
-//! forward-tolerant and is where new platforms, channels and archive kinds go.
-//! Clients read v2 first and fall back to v1 only when the v2 asset is absent,
-//! which is what a release published before v2 existed looks like. Both are
-//! generated from the same assets in the same pass, so they cannot disagree
-//! about a release.
-//!
-//! Generation is deterministic: artifacts and their members are sorted, so two
-//! runs over the same assets produce byte-identical output and the signature
-//! covers something reproducible.
+// Signed upgrade-manifest generation for a release.
+//
+// The manifest is what an installed Weaver reads to decide what to download
+// and what to trust: for every supported layout it names the release asset, its
+// exact byte length, its BLAKE3 hash, and — for archives — every regular file
+// inside it with its size and executable bit. The running build verifies all of
+// that before anything is promoted, so a manifest that disagrees with the
+// assets is a release that cannot install itself.
+//
+// Two generations are published for every release. v1 is frozen and its parser
+// rejects anything it does not recognise, so it can never grow a field; v2 is
+// forward-tolerant and is where new platforms, channels and archive kinds go.
+// Clients read v2 first and fall back to v1 only when the v2 asset is absent,
+// which is what a release published before v2 existed looks like. Both are
+// generated from the same assets in the same pass, so they cannot disagree
+// about a release.
+//
+// Generation is deterministic: artifacts and their members are sorted, so two
+// runs over the same assets produce byte-identical output and the signature
+// covers something reproducible.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -28,15 +28,15 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 
-/// Schema identifier of the frozen v1 manifest. Must match the running build's
-/// `weaver_server_core::application_upgrade::UPGRADE_MANIFEST_SCHEMA_VERSION`.
+// Schema identifier of the frozen v1 manifest. Must match the running build's
+// `weaver_server_core::application_upgrade::UPGRADE_MANIFEST_SCHEMA_VERSION`.
 const UPGRADE_MANIFEST_SCHEMA_V1: &str = "weaver.upgrade.manifest.v1";
 
-/// Schema identifier of the forward-tolerant v2 manifest.
+// Schema identifier of the forward-tolerant v2 manifest.
 const UPGRADE_MANIFEST_SCHEMA_V2: &str = "weaver.upgrade.manifest.v2";
 
-/// Cap on a single archive member we are willing to hash and describe. Far above
-/// anything Weaver ships; a release that trips it is a packaging bug.
+// Cap on a single archive member we are willing to hash and describe. Far above
+// anything Weaver ships; a release that trips it is a packaging bug.
 const MAX_ARCHIVE_MEMBER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Args)]
@@ -70,21 +70,21 @@ pub(crate) enum UpgradeManifestGeneration {
     V2,
 }
 
-/// One release asset the manifest describes, and how to classify it.
+// One release asset the manifest describes, and how to classify it.
 struct UpgradeManifestAssetSpec {
     platform: &'static str,
     arch: &'static str,
     channel: &'static str,
     archive: &'static str,
-    /// The asset filename for an architecture, e.g. `weaver-linux-arm64-portable.tar.gz`.
+    // The asset filename for an architecture, e.g. `weaver-linux-arm64-portable.tar.gz`.
     asset_name: fn(&str) -> String,
 }
 
-/// The assets both generations describe.
-///
-/// Every layout an installed Weaver can replace in place appears here: the
-/// portable tarballs, the Windows portable tarball the helper swaps executables
-/// from, and the MSI a direct Windows install upgrades through.
+// The assets both generations describe.
+//
+// Every layout an installed Weaver can replace in place appears here: the
+// portable tarballs, the Windows portable tarball the helper swaps executables
+// from, and the MSI a direct Windows install upgrades through.
 const UPGRADE_MANIFEST_ASSETS: &[UpgradeManifestAssetSpec] = &[
     UpgradeManifestAssetSpec {
         platform: "linux",
@@ -144,13 +144,13 @@ const UPGRADE_MANIFEST_ASSETS: &[UpgradeManifestAssetSpec] = &[
     },
 ];
 
-/// Assets only v2 describes.
-///
-/// The macOS application bundle is upgraded by replacing the whole `.app`, which
-/// is a channel v1's frozen parser has never heard of — so it appears only here.
-/// A v1 manifest that carried one would be rejected outright by every shipped
-/// build, which is what the `the_v1_manifest_never_carries_v2_only_artifacts`
-/// test guards.
+// Assets only v2 describes.
+//
+// The macOS application bundle is upgraded by replacing the whole `.app`, which
+// is a channel v1's frozen parser has never heard of — so it appears only here.
+// A v1 manifest that carried one would be rejected outright by every shipped
+// build, which is what the `the_v1_manifest_never_carries_v2_only_artifacts`
+// test guards.
 const UPGRADE_MANIFEST_V2_ONLY_ASSETS: &[UpgradeManifestAssetSpec] = &[
     UpgradeManifestAssetSpec {
         platform: "darwin",
@@ -226,7 +226,7 @@ pub(crate) fn run_upgrade_manifest(args: UpgradeManifestArgs) -> Result<()> {
     Ok(())
 }
 
-/// Build one generation's manifest from the assets on disk.
+// Build one generation's manifest from the assets on disk.
 fn generate_upgrade_manifest(
     generation: UpgradeManifestGeneration,
     version: &str,
@@ -266,7 +266,7 @@ fn generate_upgrade_manifest(
     })
 }
 
-/// Total order over artifacts, so generation is deterministic.
+// Total order over artifacts, so generation is deterministic.
 fn upgrade_manifest_artifact_sort_key(artifact: &UpgradeArtifact) -> (&str, &str, &str) {
     (
         artifact.platform.as_str(),
@@ -328,18 +328,18 @@ fn blake3_of(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Every regular file in a `.tar.gz`, sorted by path.
-///
-/// Links, devices, fifos and sockets are refused rather than skipped: the
-/// installed build extracts this archive over its own installation, and a member
-/// it cannot describe is a member it must not be asked to trust. Directory
-/// entries carry no content and are not described.
-///
-/// Directories are held to what installed builds accept, not only to what a
-/// manifest can describe. Those builds validate every entry's path before its
-/// type and skip directory entries only in the application-bundle channel, so a
-/// flat archive with any directory entry, including the `./` root that
-/// `tar -C dir .` writes, is one they refuse to install.
+// Every regular file in a `.tar.gz`, sorted by path.
+//
+// Links, devices, fifos and sockets are refused rather than skipped: the
+// installed build extracts this archive over its own installation, and a member
+// it cannot describe is a member it must not be asked to trust. Directory
+// entries carry no content and are not described.
+//
+// Directories are held to what installed builds accept, not only to what a
+// manifest can describe. Those builds validate every entry's path before its
+// type and skip directory entries only in the application-bundle channel, so a
+// flat archive with any directory entry, including the `./` root that
+// `tar -C dir .` writes, is one they refuse to install.
 fn collect_tar_gz_members(
     path: &Path,
     allows_directories: bool,
@@ -408,10 +408,10 @@ fn collect_tar_gz_members(
     sort_and_validate_archive_members(members, path)
 }
 
-/// Sort members by path and refuse a duplicate.
-///
-/// A duplicate path means the extraction order decides what is installed, which
-/// is not something a signed manifest may leave open.
+// Sort members by path and refuse a duplicate.
+//
+// A duplicate path means the extraction order decides what is installed, which
+// is not something a signed manifest may leave open.
 fn sort_and_validate_archive_members(
     mut members: Vec<UpgradeArtifactMember>,
     path: &Path,
@@ -430,12 +430,12 @@ fn sort_and_validate_archive_members(
     Ok(members)
 }
 
-/// Normalize an archive member path the way the installed build does.
-///
-/// The running build refuses an absolute, escaping or non-UTF-8 member path, so
-/// this refuses the same shapes rather than publishing a manifest describing an
-/// archive that can never be extracted. `./x` normalizes to `x`, which is what
-/// `tar -C dir .` writes.
+// Normalize an archive member path the way the installed build does.
+//
+// The running build refuses an absolute, escaping or non-UTF-8 member path, so
+// this refuses the same shapes rather than publishing a manifest describing an
+// archive that can never be extracted. `./x` normalizes to `x`, which is what
+// `tar -C dir .` writes.
 fn archive_member_path(path: &Path) -> Result<String> {
     let raw = path.to_string_lossy();
     let windows_drive_prefix = raw.as_bytes().get(1) == Some(&b':')
@@ -471,8 +471,8 @@ fn archive_member_path(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
-    /// Synthetic release assets: byte lengths differ per asset so a manifest
-    /// that mixed two up could not pass.
+    // Synthetic release assets: byte lengths differ per asset so a manifest
+    // that mixed two up could not pass.
     fn write_fixture_assets(dir: &Path) {
         std::fs::create_dir_all(dir).expect("create fixture directory");
         for spec in UPGRADE_MANIFEST_ASSETS
@@ -491,7 +491,7 @@ mod tests {
         }
     }
 
-    /// The archive layout each channel actually ships.
+    // The archive layout each channel actually ships.
     fn fixture_members(
         spec: &UpgradeManifestAssetSpec,
         asset_name: &str,
@@ -582,10 +582,10 @@ mod tests {
         encoded
     }
 
-    /// Set to `1` to rewrite the committed examples from the fixtures instead of
-    /// comparing against them. The examples are generated artefacts, but they are
-    /// committed because the running build's manifest parser test reads them as
-    /// its own fixture — so regenerating is a deliberate, reviewable edit.
+    // Set to `1` to rewrite the committed examples from the fixtures instead of
+    // comparing against them. The examples are generated artefacts, but they are
+    // committed because the running build's manifest parser test reads them as
+    // its own fixture — so regenerating is a deliberate, reviewable edit.
     const REGENERATE_ENV: &str = "WEAVER_REGENERATE_UPGRADE_MANIFEST_EXAMPLES";
 
     fn example_path(name: &str) -> PathBuf {
@@ -596,7 +596,7 @@ mod tests {
             .join(name)
     }
 
-    /// The committed example, or the generated one after rewriting it.
+    // The committed example, or the generated one after rewriting it.
     fn golden(name: &str, generated: &str) -> String {
         let path = example_path(name);
         if std::env::var(REGENERATE_ENV).as_deref() == Ok("1") {
@@ -610,9 +610,9 @@ mod tests {
         })
     }
 
-    /// The committed example is the contract the running build's parser test
-    /// reads. Regenerate it with:
-    /// `cargo run -p xtask -- ci upgrade-manifest --schema v1 …`
+    // The committed example is the contract the running build's parser test
+    // reads. Regenerate it with:
+    // `cargo run -p xtask -- ci upgrade-manifest --schema v1 …`
     #[test]
     fn v1_generation_is_deterministic_and_matches_the_committed_example() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -633,9 +633,9 @@ mod tests {
         assert_eq!(first, golden("manifest.v2.example.json", &first));
     }
 
-    /// v1's parser is frozen and rejects an unknown channel outright, so a v1
-    /// manifest carrying the bundle artifact would make every shipped build
-    /// unable to read the release at all.
+    // v1's parser is frozen and rejects an unknown channel outright, so a v1
+    // manifest carrying the bundle artifact would make every shipped build
+    // unable to read the release at all.
     #[test]
     fn the_v1_manifest_never_carries_v2_only_artifacts() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -651,8 +651,8 @@ mod tests {
         assert_eq!(v1.artifacts.len() + 2, v2.artifacts.len());
     }
 
-    /// The bundle archive is rooted at `Weaver.app/`, because the installed
-    /// build promotes the staged bundle by that exact name.
+    // The bundle archive is rooted at `Weaver.app/`, because the installed
+    // build promotes the staged bundle by that exact name.
     #[test]
     fn the_bundle_archive_is_described_rooted_at_the_app_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -679,8 +679,8 @@ mod tests {
         );
     }
 
-    /// A symlink in an upgrade archive is refused at generation time rather than
-    /// published for an installed build to discover.
+    // A symlink in an upgrade archive is refused at generation time rather than
+    // published for an installed build to discover.
     #[test]
     fn a_link_member_is_refused_rather_than_described() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -714,8 +714,8 @@ mod tests {
         assert!(error.to_string().contains("non-regular member"), "{error}");
     }
 
-    /// Escaping and absolute member paths are refused, so a signed manifest can
-    /// never describe an extraction outside the install directory.
+    // Escaping and absolute member paths are refused, so a signed manifest can
+    // never describe an extraction outside the install directory.
     #[test]
     fn unsafe_member_paths_are_refused() {
         for raw in ["/etc/passwd", "../weaver", "C:\\weaver.exe", "dir\\weaver"] {
@@ -732,10 +732,10 @@ mod tests {
         );
     }
 
-    /// `tar -C dir .` writes a `./` root entry that installed builds refuse, so
-    /// a flat archive packed that way fails generation instead of shipping a
-    /// release no installation can upgrade to. The bundle archive may carry
-    /// directories, but not one whose path normalizes to nothing.
+    // `tar -C dir .` writes a `./` root entry that installed builds refuse, so
+    // a flat archive packed that way fails generation instead of shipping a
+    // release no installation can upgrade to. The bundle archive may carry
+    // directories, but not one whose path normalizes to nothing.
     #[test]
     fn an_archive_installed_builds_refuse_fails_generation() {
         let cases = [
@@ -788,8 +788,8 @@ mod tests {
         }
     }
 
-    /// A missing asset fails the release rather than publishing a manifest that
-    /// silently omits a platform.
+    // A missing asset fails the release rather than publishing a manifest that
+    // silently omits a platform.
     #[test]
     fn a_missing_asset_fails_generation() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -810,8 +810,8 @@ mod tests {
         );
     }
 
-    /// Every asset the manifests name is distinct, so no two artifacts can be
-    /// hashed from the same file.
+    // Every asset the manifests name is distinct, so no two artifacts can be
+    // hashed from the same file.
     #[test]
     fn every_described_asset_name_is_distinct() {
         let mut seen = BTreeSet::new();

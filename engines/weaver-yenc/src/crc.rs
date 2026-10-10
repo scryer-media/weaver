@@ -1,21 +1,21 @@
-/// Thin wrapper around `crc-fast` for streaming CRC32 computation
-/// during yEnc decode.
-///
-/// On x86_64 CPUs with AVX2 + VPCLMULQDQ but no AVX512VL, large updates fold
-/// through the in-tree 4x256-bit VPCLMULQDQ kernel (`x86_vpclmul`) instead,
-/// because `crc-fast` drops to its 128-bit SSE tier there. `crc-fast` remains the fallback and
-/// small-update path, so externally visible CRC semantics stay identical.
-///
-/// While the folding path is running the authoritative value is the plain `u32`
-/// in `folded` (finalized/post-xor domain) and `hasher` is stale; it is
-/// materialized back into a `crc_fast::Digest` only when a non-folded update
-/// arrives. Consequently `hasher`'s internal byte counter is not a valid total
-/// once `folded` has been used, so `crc_fast::Digest::get_amount`/`combine` must
-/// not be surfaced through this wrapper without first tracking the folded bytes
-/// here.
-/// Whether large updates on this host fold through the in-tree 256-bit
-/// carry-less multiply kernel rather than `crc-fast`. Reads the gate
-/// [`Crc32::new`] reads.
+// Thin wrapper around `crc-fast` for streaming CRC32 computation
+// during yEnc decode.
+//
+// On x86_64 CPUs with AVX2 + VPCLMULQDQ but no AVX512VL, large updates fold
+// through the in-tree 4x256-bit VPCLMULQDQ kernel (`x86_vpclmul`) instead,
+// because `crc-fast` drops to its 128-bit SSE tier there. `crc-fast` remains the fallback and
+// small-update path, so externally visible CRC semantics stay identical.
+//
+// While the folding path is running the authoritative value is the plain `u32`
+// in `folded` (finalized/post-xor domain) and `hasher` is stale; it is
+// materialized back into a `crc_fast::Digest` only when a non-folded update
+// arrives. Consequently `hasher`'s internal byte counter is not a valid total
+// once `folded` has been used, so `crc_fast::Digest::get_amount`/`combine` must
+// not be surfaced through this wrapper without first tracking the folded bytes
+// here.
+// Whether large updates on this host fold through the in-tree 256-bit
+// carry-less multiply kernel rather than `crc-fast`. Reads the gate
+// [`Crc32::new`] reads.
 pub fn wide_fold_selected() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -32,8 +32,8 @@ pub struct Crc32 {
     hasher: crc_fast::Digest,
     #[cfg(target_arch = "x86_64")]
     use_vpclmul: bool,
-    /// Carried CRC value in the finalized (post-xor) domain. `Some` means
-    /// `hasher` is stale and this is the live state.
+    // Carried CRC value in the finalized (post-xor) domain. `Some` means
+    // `hasher` is stale and this is the live state.
     #[cfg(target_arch = "x86_64")]
     folded: Option<u32>,
 }
@@ -42,7 +42,7 @@ impl Crc32 {
     #[cfg(target_arch = "x86_64")]
     const VPCLMUL_MIN_UPDATE: usize = 256;
 
-    /// Create a new CRC32 hasher.
+    // Create a new CRC32 hasher.
     pub fn new() -> Self {
         Self {
             hasher: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc),
@@ -53,7 +53,7 @@ impl Crc32 {
         }
     }
 
-    /// Feed a chunk of decoded bytes into the hasher.
+    // Feed a chunk of decoded bytes into the hasher.
     #[inline]
     pub fn update(&mut self, data: &[u8]) {
         #[cfg(target_arch = "x86_64")]
@@ -84,12 +84,12 @@ impl Crc32 {
         self.hasher.update(data);
     }
 
-    /// Finalize and return the CRC32 value. Consumes the hasher.
+    // Finalize and return the CRC32 value. Consumes the hasher.
     pub fn finalize(self) -> u32 {
         self.current()
     }
 
-    /// Get the current CRC32 value without consuming this wrapper.
+    // Get the current CRC32 value without consuming this wrapper.
     pub fn current(&self) -> u32 {
         #[cfg(target_arch = "x86_64")]
         if let Some(crc) = self.folded {
@@ -99,26 +99,26 @@ impl Crc32 {
         self.hasher.finalize() as u32
     }
 
-    /// Return the CRC32 of everything fed since the last checkpoint and restart
-    /// from the initial state, so the next `update` begins a fresh segment.
-    ///
-    /// This is the segment-CRC checkpoint primitive: the returned value is a
-    /// standalone CRC32 over the bytes of the closed segment (standard
-    /// init/finalize, not a running prefix), which is what makes segments
-    /// composable with [`crc32_combine`] in any tiling — including block
-    /// tilings that straddle article boundaries.
-    ///
-    /// Any pending folded streak is finalized before the cut: [`Self::current`]
-    /// reads the carried post-xor value, and the restart clears the carried
-    /// state so the next large update re-enters the folding path from the CRC
-    /// init state rather than from the closed segment's value.
+    // Return the CRC32 of everything fed since the last checkpoint and restart
+    // from the initial state, so the next `update` begins a fresh segment.
+    //
+    // This is the segment-CRC checkpoint primitive: the returned value is a
+    // standalone CRC32 over the bytes of the closed segment (standard
+    // init/finalize, not a running prefix), which is what makes segments
+    // composable with [`crc32_combine`] in any tiling — including block
+    // tilings that straddle article boundaries.
+    //
+    // Any pending folded streak is finalized before the cut: [`Self::current`]
+    // reads the carried post-xor value, and the restart clears the carried
+    // state so the next large update re-enters the folding path from the CRC
+    // init state rather than from the closed segment's value.
     pub fn checkpoint(&mut self) -> u32 {
         let crc = self.current();
         self.restart();
         crc
     }
 
-    /// Discard all accumulated state and return to the initial CRC32 value.
+    // Discard all accumulated state and return to the initial CRC32 value.
     fn restart(&mut self) {
         self.hasher.reset();
         #[cfg(target_arch = "x86_64")]
@@ -128,50 +128,50 @@ impl Crc32 {
     }
 }
 
-/// Combine two CRC32 values as if their byte ranges were concatenated:
-/// given `crc_a` over `A`, `crc_b` over `B` and `len_b == B.len()`, returns the
-/// CRC32 of `A || B`.
-///
-/// The combine is the polynomial identity `crc(A || B) = crc(A) * x^(8*len_b) ^ crc(B)`
-/// over GF(2)[x] mod the CRC polynomial, evaluated the way zlib's
-/// `crc32_combine` does since 1.2.12: `x^(8*len_b) mod P` comes from a table
-/// of `x^(2^n) mod P` and a square-and-multiply over the bits of `len_b`, and
-/// the final step is one polynomial multiply of that power by `crc_a`. Each
-/// multiply is three carry-less multiplies and a Barrett reduction where the
-/// CPU has them (PCLMULQDQ on x86_64, PMULL on aarch64), and a 32-step
-/// shift-and-xor loop otherwise; a whole combine is a few dozen to a few
-/// hundred single-word operations. The generalized 32x32 (or 64x64) GF(2)
-/// zeros-operator construction in `crc-fast` and
-/// `par2_rs::checksum::Crc32CombineOp` computes the same thing by matrix
-/// squaring, at roughly forty times the cost of even the scalar loop, which
-/// mattered once every article cut and every checkpoint segment paid it.
-///
-/// Bit-identical to `crc_fast::checksum_combine` for every `len_b >= 1`
-/// (`combine_matches_crc_fast` below) and to `Crc32CombineOp`
-/// (`combine_matches_par2_rs_combine_op` in `tests/segment_combine.rs`).
-///
-/// `len_b == 0` is the identity on well-formed input: `x^0` is 1, so the
-/// result is `crc_a ^ crc_b`, and the CRC32 of an empty range is 0, hence
-/// `crc32_combine(a, 0, 0) == a`. This keeps `crc-fast`'s xor semantics
-/// rather than `Crc32CombineOp`'s short-circuit to `a` for any `crc_b` at that
-/// length; the two differ only on a zero-length record carrying a non-zero
-/// CRC — malformed, and unreachable from [`crate::segment::SegmentedCrc32`],
-/// which never emits zero-length segments — and the divergence is pinned by
-/// `zero_length_combine_agrees_on_well_formed_input_only`.
-///
-/// Repeated combines over ranges of one length should build a
-/// [`Crc32Combine`] once and reuse it; that skips the square-and-multiply.
+// Combine two CRC32 values as if their byte ranges were concatenated:
+// given `crc_a` over `A`, `crc_b` over `B` and `len_b == B.len()`, returns the
+// CRC32 of `A || B`.
+//
+// The combine is the polynomial identity `crc(A || B) = crc(A) * x^(8*len_b) ^ crc(B)`
+// over GF(2)[x] mod the CRC polynomial, evaluated the way zlib's
+// `crc32_combine` does since 1.2.12: `x^(8*len_b) mod P` comes from a table
+// of `x^(2^n) mod P` and a square-and-multiply over the bits of `len_b`, and
+// the final step is one polynomial multiply of that power by `crc_a`. Each
+// multiply is three carry-less multiplies and a Barrett reduction where the
+// CPU has them (PCLMULQDQ on x86_64, PMULL on aarch64), and a 32-step
+// shift-and-xor loop otherwise; a whole combine is a few dozen to a few
+// hundred single-word operations. The generalized 32x32 (or 64x64) GF(2)
+// zeros-operator construction in `crc-fast` and
+// `par2_rs::checksum::Crc32CombineOp` computes the same thing by matrix
+// squaring, at roughly forty times the cost of even the scalar loop, which
+// mattered once every article cut and every checkpoint segment paid it.
+//
+// Bit-identical to `crc_fast::checksum_combine` for every `len_b >= 1`
+// (`combine_matches_crc_fast` below) and to `Crc32CombineOp`
+// (`combine_matches_par2_rs_combine_op` in `tests/segment_combine.rs`).
+//
+// `len_b == 0` is the identity on well-formed input: `x^0` is 1, so the
+// result is `crc_a ^ crc_b`, and the CRC32 of an empty range is 0, hence
+// `crc32_combine(a, 0, 0) == a`. This keeps `crc-fast`'s xor semantics
+// rather than `Crc32CombineOp`'s short-circuit to `a` for any `crc_b` at that
+// length; the two differ only on a zero-length record carrying a non-zero
+// CRC — malformed, and unreachable from [`crate::segment::SegmentedCrc32`],
+// which never emits zero-length segments — and the divergence is pinned by
+// `zero_length_combine_agrees_on_well_formed_input_only`.
+//
+// Repeated combines over ranges of one length should build a
+// [`Crc32Combine`] once and reuse it; that skips the square-and-multiply.
 #[inline]
 pub fn crc32_combine(crc_a: u32, crc_b: u32, len_b: u64) -> u32 {
     Crc32Combine::new(len_b).combine(crc_a, crc_b)
 }
 
-/// The reflected CRC-32/ISO-HDLC polynomial.
+// The reflected CRC-32/ISO-HDLC polynomial.
 const CRC32_POLY_REFLECTED: u32 = 0xEDB8_8320;
 
-/// `x^(2^n) mod P` for `n` in `0..32`, in the reflected representation where
-/// `x^0` is bit 31. The table wraps at 32 because `P` is irreducible over
-/// GF(2), so `x^(2^32) == x` and the powers repeat.
+// `x^(2^n) mod P` for `n` in `0..32`, in the reflected representation where
+// `x^0` is bit 31. The table wraps at 32 because `P` is irreducible over
+// GF(2), so `x^(2^32) == x` and the powers repeat.
 static X2N_TABLE: [u32; 32] = build_x2n_table();
 
 const fn build_x2n_table() -> [u32; 32] {
@@ -185,11 +185,11 @@ const fn build_x2n_table() -> [u32; 32] {
     table
 }
 
-/// Product of two polynomials modulo `P`, reflected representation.
-///
-/// Runtime entry point: the carry-less-multiply kernel when the CPU has one,
-/// the scalar loop otherwise. Both are bit-identical
-/// (`clmul_multiply_matches_the_scalar_loop`).
+// Product of two polynomials modulo `P`, reflected representation.
+//
+// Runtime entry point: the carry-less-multiply kernel when the CPU has one,
+// the scalar loop otherwise. Both are bit-identical
+// (`clmul_multiply_matches_the_scalar_loop`).
 #[inline]
 fn multmodp_runtime(a: u32, b: u32) -> u32 {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -200,9 +200,9 @@ fn multmodp_runtime(a: u32, b: u32) -> u32 {
     multmodp(a, b)
 }
 
-/// Product of two polynomials modulo `P`, reflected representation: the
-/// portable shift-and-xor loop, usable in `const` context (it builds
-/// [`X2N_TABLE`]) and the fallback where no carry-less multiply exists.
+// Product of two polynomials modulo `P`, reflected representation: the
+// portable shift-and-xor loop, usable in `const` context (it builds
+// [`X2N_TABLE`]) and the fallback where no carry-less multiply exists.
 #[inline]
 const fn multmodp(a: u32, b: u32) -> u32 {
     if a == 0 {
@@ -228,7 +228,7 @@ const fn multmodp(a: u32, b: u32) -> u32 {
     p
 }
 
-/// `x^(n * 2^k) mod P`.
+// `x^(n * 2^k) mod P`.
 #[inline]
 fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
     let mut p = 1u32 << 31; // x^0
@@ -242,20 +242,20 @@ fn x2nmodp(mut n: u64, mut k: u32) -> u32 {
     p
 }
 
-/// A CRC32 combine operator for a fixed suffix length: `x^(8*len_b) mod P`,
-/// computed once, so that combining is a single polynomial multiply.
-///
-/// Segment cuts on a fixed checkpoint stride, and articles of one poster's
-/// size, combine ranges of the same length over and over; building the
-/// operator once per length is what keeps those at tens of nanoseconds.
+// A CRC32 combine operator for a fixed suffix length: `x^(8*len_b) mod P`,
+// computed once, so that combining is a single polynomial multiply.
+//
+// Segment cuts on a fixed checkpoint stride, and articles of one poster's
+// size, combine ranges of the same length over and over; building the
+// operator once per length is what keeps those at tens of nanoseconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Crc32Combine {
-    /// `x^(8*len_b) mod P`; `x^0` for a zero-length suffix.
+    // `x^(8*len_b) mod P`; `x^0` for a zero-length suffix.
     power: u32,
 }
 
 impl Crc32Combine {
-    /// Build the operator for a suffix of `len_b` bytes.
+    // Build the operator for a suffix of `len_b` bytes.
     #[inline]
     pub fn new(len_b: u64) -> Self {
         Self {
@@ -263,46 +263,46 @@ impl Crc32Combine {
         }
     }
 
-    /// CRC32 of `A || B` from `crc_a` over `A` and `crc_b` over the suffix
-    /// `B` this operator was built for.
+    // CRC32 of `A || B` from `crc_a` over `A` and `crc_b` over the suffix
+    // `B` this operator was built for.
     #[inline]
     pub fn combine(&self, crc_a: u32, crc_b: u32) -> u32 {
         multmodp_runtime(self.power, crc_a) ^ crc_b
     }
 }
 
-/// Carry-less-multiply `multmodp`: one 32x32 product and a Barrett reduction,
-/// all in the reflected representation the rest of this module uses.
-///
-/// With `refl_n(Q)` the `n`-bit integer whose bit `n-1-j` is the coefficient
-/// of `x^j`, a carry-less multiply of `refl_m(A)` by `refl_n(B)` yields
-/// `refl_(m+n-1)(A*B)` — reflection commutes with polynomial multiplication
-/// up to that one-bit width shift. So for reflected 32-bit `a` and `b`:
-///
-/// 1. `t = clmul(a, b) << 1` is `refl_64(T)` for `T = A*B`, degree at most 62.
-///    Its high 32 bits hold `x^0..x^31` of `T`; its low 32 bits hold
-///    `refl_32(T_hi)` for `T_hi = floor(T / x^32)`.
-/// 2. Barrett: `floor(T / P) = floor(T_hi * mu / x^32)` exactly, with
-///    `mu = floor(x^64 / P)`, because the discarded terms all have negative
-///    degree and GF(2) has no carries to lift them. `clmul(refl_32(T_hi),
-///    refl_33(mu))` is `refl_64(T_hi * mu)`, and its low 32 bits are
-///    `refl_32(q)` for that quotient `q`.
-/// 3. `clmul(refl_32(q), refl_33(P))` is `refl_64(q * P)`. `T ^ q*P` is the
-///    remainder, degree below 32, so it sits in the high 32 bits of
-///    `t ^ refl_64(q * P)` and the low 32 bits cancel.
-///
-/// The constants are derived at compile time from the polynomial: `refl_33(P)`
-/// is `0x1DB710641` and `refl_33(mu)` is `0x1F7011641`, the same pair zlib's
-/// PCLMULQDQ folding uses for its final reduction.
+// Carry-less-multiply `multmodp`: one 32x32 product and a Barrett reduction,
+// all in the reflected representation the rest of this module uses.
+//
+// With `refl_n(Q)` the `n`-bit integer whose bit `n-1-j` is the coefficient
+// of `x^j`, a carry-less multiply of `refl_m(A)` by `refl_n(B)` yields
+// `refl_(m+n-1)(A*B)` — reflection commutes with polynomial multiplication
+// up to that one-bit width shift. So for reflected 32-bit `a` and `b`:
+//
+// 1. `t = clmul(a, b) << 1` is `refl_64(T)` for `T = A*B`, degree at most 62.
+//    Its high 32 bits hold `x^0..x^31` of `T`; its low 32 bits hold
+//    `refl_32(T_hi)` for `T_hi = floor(T / x^32)`.
+// 2. Barrett: `floor(T / P) = floor(T_hi * mu / x^32)` exactly, with
+//    `mu = floor(x^64 / P)`, because the discarded terms all have negative
+//    degree and GF(2) has no carries to lift them. `clmul(refl_32(T_hi),
+//    refl_33(mu))` is `refl_64(T_hi * mu)`, and its low 32 bits are
+//    `refl_32(q)` for that quotient `q`.
+// 3. `clmul(refl_32(q), refl_33(P))` is `refl_64(q * P)`. `T ^ q*P` is the
+//    remainder, degree below 32, so it sits in the high 32 bits of
+//    `t ^ refl_64(q * P)` and the low 32 bits cancel.
+//
+// The constants are derived at compile time from the polynomial: `refl_33(P)`
+// is `0x1DB710641` and `refl_33(mu)` is `0x1F7011641`, the same pair zlib's
+// PCLMULQDQ folding uses for its final reduction.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod clmul {
     use std::sync::OnceLock;
 
-    /// The CRC-32/ISO-HDLC polynomial with its `x^32` term, natural
-    /// representation (bit `j` is the coefficient of `x^j`).
+    // The CRC-32/ISO-HDLC polynomial with its `x^32` term, natural
+    // representation (bit `j` is the coefficient of `x^j`).
     const P_NATURAL: u64 = 0x1_04C1_1DB7;
 
-    /// `floor(x^64 / P)` by polynomial long division, natural representation.
+    // `floor(x^64 / P)` by polynomial long division, natural representation.
     const fn barrett_mu_natural() -> u64 {
         let mut remainder: u128 = 1u128 << 64;
         let mut quotient: u64 = 0;
@@ -317,7 +317,7 @@ mod clmul {
         quotient
     }
 
-    /// `refl_33`: bit `32 - j` of the result is bit `j` of `value`.
+    // `refl_33`: bit `32 - j` of the result is bit `j` of `value`.
     const fn reflect33(value: u64) -> u64 {
         let mut out = 0u64;
         let mut j = 0;
@@ -330,9 +330,9 @@ mod clmul {
         out
     }
 
-    /// `refl_33(P)`.
+    // `refl_33(P)`.
     pub(super) const P_REFLECTED: u64 = reflect33(P_NATURAL);
-    /// `refl_33(mu)`, `mu = floor(x^64 / P)`.
+    // `refl_33(mu)`, `mu = floor(x^64 / P)`.
     pub(super) const MU_REFLECTED: u64 = reflect33(barrett_mu_natural());
 
     pub(super) fn available() -> bool {
@@ -374,26 +374,26 @@ mod clmul {
         vmull_p64(a, b) as u64
     }
 
-    /// Product of two polynomials modulo `P`, reflected representation.
-    ///
-    /// # Safety
-    ///
-    /// The CPU must have the carry-less multiply the kernel is compiled for:
-    /// PCLMULQDQ on x86_64, PMULL (the `aes` feature) on aarch64. Check with
-    /// [`available`].
+    // Product of two polynomials modulo `P`, reflected representation.
+    //
+    // # Safety
+    //
+    // The CPU must have the carry-less multiply the kernel is compiled for:
+    // PCLMULQDQ on x86_64, PMULL (the `aes` feature) on aarch64. Check with
+    // [`available`].
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "pclmulqdq")]
     pub(super) unsafe fn multmodp(a: u32, b: u32) -> u32 {
         unsafe { reduce(a, b) }
     }
 
-    /// Product of two polynomials modulo `P`, reflected representation.
-    ///
-    /// # Safety
-    ///
-    /// The CPU must have the carry-less multiply the kernel is compiled for:
-    /// PCLMULQDQ on x86_64, PMULL (the `aes` feature) on aarch64. Check with
-    /// [`available`].
+    // Product of two polynomials modulo `P`, reflected representation.
+    //
+    // # Safety
+    //
+    // The CPU must have the carry-less multiply the kernel is compiled for:
+    // PCLMULQDQ on x86_64, PMULL (the `aes` feature) on aarch64. Check with
+    // [`available`].
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "aes")]
     pub(super) unsafe fn multmodp(a: u32, b: u32) -> u32 {
@@ -428,8 +428,8 @@ mod x86_vpclmul {
     use std::arch::x86_64::*;
     use std::sync::OnceLock;
 
-    /// `x^n mod P` in the reflected representation (`x^0` is bit 31), by
-    /// square-and-multiply in `const` context.
+    // `x^n mod P` in the reflected representation (`x^0` is bit 31), by
+    // square-and-multiply in `const` context.
     const fn xnmodp(mut n: u64) -> u32 {
         let mut power = 1u32 << 31; // x^0
         let mut square = 1u32 << 30; // x^1, then x^2, x^4, ...
@@ -443,31 +443,31 @@ mod x86_vpclmul {
         power
     }
 
-    /// Folding constant for a distance of `n` bits: `x^n mod P`, reflected and
-    /// shifted left one bit, the 33-bit form PCLMULQDQ folding multiplies by.
+    // Folding constant for a distance of `n` bits: `x^n mod P`, reflected and
+    // shifted left one bit, the 33-bit form PCLMULQDQ folding multiplies by.
     const fn fold_constant(n: u64) -> u64 {
         (xnmodp(n) as u64) << 1
     }
 
-    /// Main loop: eight 128-bit streams (four YMM registers) each move 1024
-    /// bits forward, so a stream's low and high 64-bit halves fold by
-    /// `x^(1024 + 32)` and `x^(1024 - 32)`.
+    // Main loop: eight 128-bit streams (four YMM registers) each move 1024
+    // bits forward, so a stream's low and high 64-bit halves fold by
+    // `x^(1024 + 32)` and `x^(1024 - 32)`.
     const FOLD_1024_LO: i64 = fold_constant(1024 + 32) as i64;
     const FOLD_1024_HI: i64 = fold_constant(1024 - 32) as i64;
-    /// Collapsing the streams and folding the tail: fold by 128 bits.
+    // Collapsing the streams and folding the tail: fold by 128 bits.
     const FOLD_128_LO: i64 = fold_constant(128 + 32) as i64;
     const FOLD_128_HI: i64 = fold_constant(128 - 32) as i64;
-    /// The 96-to-64-bit step of the 128-to-32-bit reduction.
+    // The 96-to-64-bit step of the 128-to-32-bit reduction.
     const FOLD_64: i64 = fold_constant(64) as i64;
-    /// Barrett reduction to 32 bits.
+    // Barrett reduction to 32 bits.
     const BARRETT_P: i64 = super::clmul::P_REFLECTED as i64;
     const BARRETT_MU: i64 = super::clmul::MU_REFLECTED as i64;
 
-    /// Below this a single 128-bit stream folds the input; at and above it the
-    /// eight-stream loop runs at least once.
+    // Below this a single 128-bit stream folds the input; at and above it the
+    // eight-stream loop runs at least once.
     const WIDE_MIN: usize = 256;
 
-    /// The CPU features the kernel is compiled for.
+    // The CPU features the kernel is compiled for.
     pub(super) fn capable() -> bool {
         is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("pclmulqdq")
@@ -488,7 +488,7 @@ mod x86_vpclmul {
         })
     }
 
-    /// CRC32 of `data` continuing from `initial` (finalized domain).
+    // CRC32 of `data` continuing from `initial` (finalized domain).
     #[inline]
     pub(super) fn update(initial: u32, data: &[u8]) -> u32 {
         debug_assert!(capable());
@@ -497,10 +497,10 @@ mod x86_vpclmul {
         unsafe { fold(initial, data) }
     }
 
-    /// Four 256-bit registers hold eight 128-bit streams; each iteration folds
-    /// 128 bytes. The streams are collapsed into one in increasing byte
-    /// offset, the remaining whole blocks and the final partial block fold
-    /// into it, and a Barrett reduction yields the CRC.
+    // Four 256-bit registers hold eight 128-bit streams; each iteration folds
+    // 128 bytes. The streams are collapsed into one in increasing byte
+    // offset, the remaining whole blocks and the final partial block fold
+    // into it, and a Barrett reduction yields the CRC.
     #[target_feature(enable = "avx2,pclmulqdq,sse4.1,ssse3,vpclmulqdq")]
     fn fold(crc: u32, mut data: &[u8]) -> u32 {
         if data.len() < 16 {
@@ -539,8 +539,8 @@ mod x86_vpclmul {
         reduce_to_crc(x, data)
     }
 
-    /// Folds the remaining whole 16-byte blocks into `x`, then the final
-    /// partial block, and reduces the 128-bit remainder to the CRC.
+    // Folds the remaining whole 16-byte blocks into `x`, then the final
+    // partial block, and reduces the 128-bit remainder to the CRC.
     #[target_feature(enable = "pclmulqdq,sse4.1,ssse3")]
     fn reduce_to_crc(mut x: __m128i, mut data: &[u8]) -> u32 {
         let k = _mm_set_epi64x(FOLD_128_HI, FOLD_128_LO);
@@ -582,8 +582,8 @@ mod x86_vpclmul {
         !(_mm_extract_epi32::<1>(_mm_xor_si128(x, t2)) as u32)
     }
 
-    /// `b ^ a.lo * k.lo ^ a.hi * k.hi`: `a` moved forward by the distance
-    /// `k` encodes and added into `b`.
+    // `b ^ a.lo * k.lo ^ a.hi * k.hi`: `a` moved forward by the distance
+    // `k` encodes and added into `b`.
     #[inline]
     #[target_feature(enable = "pclmulqdq,sse2")]
     fn fold128(a: __m128i, b: __m128i, k: __m128i) -> __m128i {
@@ -593,7 +593,7 @@ mod x86_vpclmul {
         )
     }
 
-    /// [`fold128`] on both 128-bit lanes at once.
+    // [`fold128`] on both 128-bit lanes at once.
     #[inline]
     #[target_feature(enable = "avx2,vpclmulqdq")]
     fn fold256(a: __m256i, b: __m256i, k: __m256i) -> __m256i {
@@ -621,9 +621,9 @@ mod x86_vpclmul {
         unsafe { _mm256_loadu_si256(head.as_ptr().cast()) }
     }
 
-    /// Runs the kernel wherever the CPU has the features, including the
-    /// AVX-512 parts where production stays on `crc-fast`, so those hosts
-    /// cover it too.
+    // Runs the kernel wherever the CPU has the features, including the
+    // AVX-512 parts where production stays on `crc-fast`, so those hosts
+    // cover it too.
     #[cfg(test)]
     pub(super) fn test_update_forced(initial: u32, data: &[u8]) -> Option<u32> {
         capable().then(|| update(initial, data))
@@ -1001,10 +1001,10 @@ mod tests {
         }
     }
 
-    /// The x86 guard for the same interaction: a checkpoint taken while the
-    /// folded streak is carrying state must drop that state, so the next large
-    /// update re-enters the folding path from the CRC init value instead of
-    /// from the closed segment's CRC.
+    // The x86 guard for the same interaction: a checkpoint taken while the
+    // folded streak is carrying state must drop that state, so the next large
+    // update re-enters the folding path from the CRC init value instead of
+    // from the closed segment's CRC.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn crc32_checkpoint_clears_pending_folded_streak() {
@@ -1072,8 +1072,8 @@ mod tests {
         }
     }
 
-    /// Lengths across the eight-stream loop, its collapse and the tail, from
-    /// carried CRC values, against `crc-fast` continuing from the same state.
+    // Lengths across the eight-stream loop, its collapse and the tail, from
+    // carried CRC values, against `crc-fast` continuing from the same state.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn crc32_forced_wide_fold_matches_crc_fast_from_carried_state() {
@@ -1112,10 +1112,10 @@ mod tests {
         }
     }
 
-    /// Every length through the tail and partial-fold boundaries, from a
-    /// non-zero carried CRC as well as the init state, over byte patterns that
-    /// stress the reductions, checked against a bitwise CRC built up one byte
-    /// at a time.
+    // Every length through the tail and partial-fold boundaries, from a
+    // non-zero carried CRC as well as the init state, over byte patterns that
+    // stress the reductions, checked against a bitwise CRC built up one byte
+    // at a time.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn crc32_forced_vpclmul_matches_bitwise_over_adversarial_inputs() {

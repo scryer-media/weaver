@@ -19,7 +19,7 @@ pub enum Directive {
 }
 
 impl Directive {
-    /// The command's name as a script writes it after `[NZB]`.
+    // The command's name as a script writes it after `[NZB]`.
     pub fn command(&self) -> &'static str {
         match self {
             Self::Parameter { .. } => "NZBPR",
@@ -37,8 +37,8 @@ impl Directive {
         }
     }
 
-    /// Whether a script run for `event` may issue this command, however it
-    /// sends it.
+    // Whether a script run for `event` may issue this command, however it
+    // sends it.
     pub fn allowed_for(&self, event: &ScriptEventLabel) -> bool {
         match event {
             ScriptEventLabel::PostProcessing => matches!(
@@ -60,8 +60,8 @@ impl Directive {
         }
     }
 
-    /// Whether this command could have been written on one `[NZB]` line. A
-    /// command that reaches weaver any other way is held to the same grammar.
+    // Whether this command could have been written on one `[NZB]` line. A
+    // command that reaches weaver any other way is held to the same grammar.
     pub fn well_formed(&self) -> bool {
         let one_line = |value: &str| !value.contains(['\0', '\n', '\r']);
         match self {
@@ -80,7 +80,7 @@ impl Directive {
         }
     }
 
-    /// The same command with each of its texts passed through `map`.
+    // The same command with each of its texts passed through `map`.
     pub fn map_text(self, mut map: impl FnMut(&str) -> String) -> Self {
         match self {
             Self::Parameter { name, value } => Self::Parameter {
@@ -166,7 +166,7 @@ pub(crate) fn validate_parameter_size<'a>(
     Ok(())
 }
 
-/// Parse one complete, already-redacted line. Fragmented lines never enter here.
+// Parse one complete, already-redacted line. Fragmented lines never enter here.
 pub fn parse_line(event: &ScriptEventLabel, line: &str) -> (String, Option<ScriptOutputEvent>) {
     let line = line.trim_end();
     let (level, text) = [

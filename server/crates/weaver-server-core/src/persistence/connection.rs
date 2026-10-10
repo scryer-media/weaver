@@ -38,22 +38,22 @@ enum PostgresDatabaseRuntimeJob {
 
 #[derive(Clone)]
 enum DatabaseRuntimeWorker {
-    /// SQLite carries two executors on purpose. `writer` is a single thread —
-    /// SQLite is at its best with one writer, and serialising there is what keeps
-    /// same-key state transitions ordered. `reads` is a small multi-threaded
-    /// executor, because in WAL mode readers take a snapshot and neither block
-    /// the writer nor are blocked by it, so there is no reason for a query to
-    /// queue behind the download pipeline's writes. The pool already has 16
-    /// connections, each on its own sqlx worker thread; before this split, 15 of
-    /// them could never be in flight.
+    // SQLite carries two executors on purpose. `writer` is a single thread —
+    // SQLite is at its best with one writer, and serialising there is what keeps
+    // same-key state transitions ordered. `reads` is a small multi-threaded
+    // executor, because in WAL mode readers take a snapshot and neither block
+    // the writer nor are blocked by it, so there is no reason for a query to
+    // queue behind the download pipeline's writes. The pool already has 16
+    // connections, each on its own sqlx worker thread; before this split, 15 of
+    // them could never be in flight.
     Sqlite {
         writer: SqliteDatabaseRuntimeWorker,
         reads: SqliteReadRuntimeWorker,
     },
-    /// PostgreSQL needs none of this: its executor is already multi-threaded with
-    /// a permit per pooled connection, so reads and writes are concurrent
-    /// whichever entry point they use. `run_sql_blocking_read` forwards to the
-    /// same executor rather than adding a second one.
+    // PostgreSQL needs none of this: its executor is already multi-threaded with
+    // a permit per pooled connection, so reads and writes are concurrent
+    // whichever entry point they use. `run_sql_blocking_read` forwards to the
+    // same executor rather than adding a second one.
     Postgres(PostgresDatabaseRuntimeWorker),
 }
 
@@ -104,7 +104,7 @@ impl DatabaseRuntimeWorker {
         }
     }
 
-    /// Dispatch a **pure read** — no writes, and not part of a write transaction.
+    // Dispatch a **pure read** — no writes, and not part of a write transaction.
     fn block_on_read<T, Fut>(
         &self,
         caller: &'static std::panic::Location<'static>,
@@ -136,14 +136,14 @@ impl DatabaseRuntimeWorker {
         }
     }
 
-    /// Saturation and latency counters for whichever executor is in use.
-    ///
-    /// For SQLite this is the WRITE executor's gauge: the read lane is a
-    /// separate sqlx pool whose calls never queue behind the writer, so
-    /// folding it into this single snapshot would blur the one saturation
-    /// signal that matters (the serialized writer). Exposing the read lane
-    /// as its own metric is follow-up work on the metrics surface, not
-    /// something to smuggle into an accessor.
+    // Saturation and latency counters for whichever executor is in use.
+    //
+    // For SQLite this is the WRITE executor's gauge: the read lane is a
+    // separate sqlx pool whose calls never queue behind the writer, so
+    // folding it into this single snapshot would blur the one saturation
+    // signal that matters (the serialized writer). Exposing the read lane
+    // as its own metric is follow-up work on the metrics surface, not
+    // something to smuggle into an accessor.
     fn runtime_metrics(&self) -> &Arc<DbRuntimeMetrics> {
         match self {
             Self::Sqlite { writer, .. } => &writer.metrics,
@@ -152,34 +152,34 @@ impl DatabaseRuntimeWorker {
     }
 }
 
-/// The SQLite executor is a single thread, so *every* database call in the
-/// process — reads included — is serialized behind whatever is already running
-/// or queued on it. A caller's wall time is therefore `wait + exec`, and only
-/// `exec` is that caller's own cost; `wait` is somebody else's work. Reporting
-/// only the sum (as `db.runtime.sqlite.block_on` did) makes a victim of queueing
-/// look identical to a slow query, which is what made post-processing finalize
-/// latency unattributable.
-///
-/// These probes split the two and attribute both to the `#[track_caller]` call
-/// site, and sample the queue depth seen at submit. All of it is behind
-/// `WEAVER_PROFILE_HOT_PATHS`; when that is off `record*` returns immediately
-/// and the only residual cost is the depth counter.
+// The SQLite executor is a single thread, so *every* database call in the
+// process — reads included — is serialized behind whatever is already running
+// or queued on it. A caller's wall time is therefore `wait + exec`, and only
+// `exec` is that caller's own cost; `wait` is somebody else's work. Reporting
+// only the sum (as `db.runtime.sqlite.block_on` did) makes a victim of queueing
+// look identical to a slow query, which is what made post-processing finalize
+// latency unattributable.
+//
+// These probes split the two and attribute both to the `#[track_caller]` call
+// site, and sample the queue depth seen at submit. All of it is behind
+// `WEAVER_PROFILE_HOT_PATHS`; when that is off `record*` returns immediately
+// and the only residual cost is the depth counter.
 #[derive(Clone)]
 struct SqliteDatabaseRuntimeWorker {
     tx: std_mpsc::Sender<SqliteDatabaseRuntimeJob>,
-    /// Executor saturation and operation latency. Not hot-path state: every
-    /// site that touches it is already blocking on a channel round-trip to the
-    /// database thread and already reads the clock for the `perf_probe` record
-    /// alongside it.
+    // Executor saturation and operation latency. Not hot-path state: every
+    // site that touches it is already blocking on a channel round-trip to the
+    // database thread and already reads the clock for the `perf_probe` record
+    // alongside it.
     metrics: Arc<DbRuntimeMetrics>,
-    /// Jobs submitted but not yet picked up by the executor thread. The channel
-    /// itself is unbounded and exposes no depth, so this is the only queueing
-    /// signal available.
+    // Jobs submitted but not yet picked up by the executor thread. The channel
+    // itself is unbounded and exposes no depth, so this is the only queueing
+    // signal available.
     queue_depth: Arc<AtomicUsize>,
 }
 
-/// Bookkeeping shared by both submit paths: count the job in, and hand back the
-/// enqueue instant so the executor side can split wait from exec.
+// Bookkeeping shared by both submit paths: count the job in, and hand back the
+// enqueue instant so the executor side can split wait from exec.
 struct SqliteSubmission {
     queued_at: Instant,
     queue_depth: Arc<AtomicUsize>,
@@ -200,7 +200,7 @@ impl SqliteSubmission {
         }
     }
 
-    /// Called on the executor thread the moment the job is picked up.
+    // Called on the executor thread the moment the job is picked up.
     fn start(self) -> SqliteExecution {
         let waited = self.queued_at.elapsed();
         self.queue_depth.fetch_sub(1, Ordering::AcqRel);
@@ -240,8 +240,8 @@ impl Drop for SqliteExecution {
     }
 }
 
-/// `file:line` of the call site, with the workspace-relative tail only so the
-/// bucket labels stay stable across checkouts.
+// `file:line` of the call site, with the workspace-relative tail only so the
+// bucket labels stay stable across checkouts.
 fn caller_label(location: &std::panic::Location<'static>) -> String {
     let file = location.file();
     let short = file
@@ -357,8 +357,8 @@ struct PostgresDatabaseRuntimeWorker {
     in_flight: Arc<AtomicUsize>,
     blocked_submissions: Arc<AtomicUsize>,
     concurrency: usize,
-    /// Executor saturation and operation latency. See the sqlite worker for
-    /// why this is not hot-path state.
+    // Executor saturation and operation latency. See the sqlite worker for
+    // why this is not hot-path state.
     metrics: Arc<DbRuntimeMetrics>,
 }
 
@@ -547,20 +547,20 @@ impl PostgresDatabaseRuntimeWorker {
     }
 }
 
-/// Multi-threaded executor for pure SQLite reads.
-///
-/// WAL gives every reader a consistent snapshot taken at its own BEGIN, and a
-/// reader neither blocks nor is blocked by the single writer. So reads only need
-/// an executor that can drive several of them at once; the concurrency limit is
-/// the pool size, since each in-flight read holds one pooled connection.
-///
-/// Ordering note, deliberately unchanged: a read submitted *after* a synchronous
-/// write call has returned still observes that write, because the caller blocked
-/// until the writer committed and the reader's snapshot is taken afterwards.
-/// Writes queued through `writer_tx` (`try_queue_write` / `try_queue_archive_job`)
-/// were already asynchronous with respect to readers before this split — that is
-/// why `flush_write_queue` and the archive `committed` oneshot exist — so callers
-/// that need read-your-write on those paths must keep using them.
+// Multi-threaded executor for pure SQLite reads.
+//
+// WAL gives every reader a consistent snapshot taken at its own BEGIN, and a
+// reader neither blocks nor is blocked by the single writer. So reads only need
+// an executor that can drive several of them at once; the concurrency limit is
+// the pool size, since each in-flight read holds one pooled connection.
+//
+// Ordering note, deliberately unchanged: a read submitted *after* a synchronous
+// write call has returned still observes that write, because the caller blocked
+// until the writer committed and the reader's snapshot is taken afterwards.
+// Writes queued through `writer_tx` (`try_queue_write` / `try_queue_archive_job`)
+// were already asynchronous with respect to readers before this split — that is
+// why `flush_write_queue` and the archive `committed` oneshot exist — so callers
+// that need read-your-write on those paths must keep using them.
 #[derive(Clone)]
 struct SqliteReadRuntimeWorker {
     tx: std_mpsc::Sender<SqliteReadJob>,
@@ -668,9 +668,9 @@ impl SqliteReadRuntimeWorker {
     }
 }
 
-/// Read concurrency defaults to the SQLite pool size: every in-flight read holds
-/// one pooled connection, so more workers than connections only queues inside
-/// sqlx instead of here.
+// Read concurrency defaults to the SQLite pool size: every in-flight read holds
+// one pooled connection, so more workers than connections only queues inside
+// sqlx instead of here.
 fn sqlite_read_concurrency_from_env() -> usize {
     let pool_max = crate::persistence::sql_services::sqlite_max_connections_from_env() as usize;
     std::env::var("WEAVER_SQLITE_READ_CONCURRENCY")
@@ -748,12 +748,12 @@ impl DatabaseWriterExecutor {
 
 type WriteOp = Box<dyn FnOnce(&Database) -> Result<(), StateError> + Send + 'static>;
 
-/// A writer-queue command plus the instant it was enqueued.
-///
-/// A command's latency is `queue wait + execution`: on SQLite the ordered writer
-/// takes one command at a time, and on Postgres the wait also covers the
-/// command's lane. Carrying the enqueue instant is what lets the consumer
-/// report those two separately per command kind.
+// A writer-queue command plus the instant it was enqueued.
+//
+// A command's latency is `queue wait + execution`: on SQLite the ordered writer
+// takes one command at a time, and on Postgres the wait also covers the
+// command's lane. Carrying the enqueue instant is what lets the consumer
+// report those two separately per command kind.
 struct QueuedWrite {
     queued_at: Instant,
     command: DbWriteCommand,
@@ -764,27 +764,27 @@ enum DbWriteCommand {
         job_id: crate::jobs::ids::JobId,
         history: Box<crate::history::JobHistoryRow>,
         typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
-        /// Fired once the archive transaction has committed and the row has
-        /// been re-cached, so callers can hold a terminal event until the
-        /// history row is queryable through the read paths.
+        // Fired once the archive transaction has committed and the row has
+        // been re-cached, so callers can hold a terminal event until the
+        // history row is queryable through the read paths.
         committed: Option<oneshot::Sender<()>>,
     },
     InsertJobEvents {
         events: Vec<crate::history::JobEvent>,
     },
-    /// A generic ordered write. Same-key state transitions land in enqueue
-    /// order: on SQLite every command is awaited before the next, and on
-    /// Postgres writes on one lane keep their order and a write with no lane
-    /// is a barrier.
-    /// `op` runs on a
-    /// `Database` clone the writer task holds, letting it call methods that
-    /// live on `Database` (e.g. `set_active_job_runtime` / `update_active_job`)
-    /// without duplicating them onto `DatabaseWriterExecutor`.
+    // A generic ordered write. Same-key state transitions land in enqueue
+    // order: on SQLite every command is awaited before the next, and on
+    // Postgres writes on one lane keep their order and a write with no lane
+    // is a barrier.
+    // `op` runs on a
+    // `Database` clone the writer task holds, letting it call methods that
+    // live on `Database` (e.g. `set_active_job_runtime` / `update_active_job`)
+    // without duplicating them onto `DatabaseWriterExecutor`.
     Write {
         label: &'static str,
-        /// The lane this write extends. On Postgres writes on one lane keep
-        /// their order while other lanes' writes run alongside; `None` makes
-        /// the write a barrier against every other queued write.
+        // The lane this write extends. On Postgres writes on one lane keep
+        // their order while other lanes' writes run alongside; `None` makes
+        // the write a barrier against every other queued write.
         lane: Option<WriteLane>,
         op: WriteOp,
     },
@@ -793,24 +793,24 @@ enum DbWriteCommand {
     },
 }
 
-/// Where an ordered write sits relative to the others on the Postgres writer.
+// Where an ordered write sits relative to the others on the Postgres writer.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum WriteLane {
-    /// Writes for one job, applied in submission order.
+    // Writes for one job, applied in submission order.
     Job(u64),
-    /// Job event batches, applied in submission order.
+    // Job event batches, applied in submission order.
     Events,
-    /// Server attribution and support facts checkpoints, applied in submission
-    /// order. They only set `active_jobs.server_attribution` and
-    /// `active_jobs.support_facts`, which a job's other writes never touch and
-    /// its archive reads.
+    // Server attribution and support facts checkpoints, applied in submission
+    // order. They only set `active_jobs.server_attribution` and
+    // `active_jobs.support_facts`, which a job's other writes never touch and
+    // its archive reads.
     ServerAttribution,
 }
 
 impl DbWriteCommand {
-    /// The lanes this command must wait out, and the lane it then extends.
-    /// `None` is a barrier: it runs after everything queued before it and
-    /// before anything queued after it, exactly as on the serial writer.
+    // The lanes this command must wait out, and the lane it then extends.
+    // `None` is a barrier: it runs after everything queued before it and
+    // before anything queued after it, exactly as on the serial writer.
     fn lanes(&self) -> Option<(&'static [WriteLane], WriteLane)> {
         match self {
             // After every earlier write for its job, after every earlier
@@ -830,8 +830,8 @@ impl DbWriteCommand {
     }
 }
 
-/// Starts the profiling scope for one writer command. The per-command labels
-/// allocate, so nothing is built unless profiling is on.
+// Starts the profiling scope for one writer command. The per-command labels
+// allocate, so nothing is built unless profiling is on.
 fn writer_command_scope(
     command: &DbWriteCommand,
     queued_at: Instant,
@@ -845,8 +845,8 @@ fn writer_command_scope(
     })
 }
 
-/// Runs one writer command to completion. An archive's `committed` signal and a
-/// flush's reply fire only after everything the command stands for is done.
+// Runs one writer command to completion. An archive's `committed` signal and a
+// flush's reply fire only after everything the command stands for is done.
 async fn execute_write_command(
     command: DbWriteCommand,
     writer: &DatabaseWriterExecutor,
@@ -918,8 +918,8 @@ async fn execute_write_command(
     }
 }
 
-/// The SQLite writer: one command at a time, each awaited before the next.
-/// SQLite has a single writer connection, so there is nothing to overlap.
+// The SQLite writer: one command at a time, each awaited before the next.
+// SQLite has a single writer connection, so there is nothing to overlap.
 async fn run_serial_writes(
     mut rx: mpsc::Receiver<QueuedWrite>,
     writer: DatabaseWriterExecutor,
@@ -931,29 +931,29 @@ async fn run_serial_writes(
     }
 }
 
-/// Ordered writes a Postgres writer runs at once: half the pool, so queued
-/// writes never take every connection from reads and synchronous writes.
+// Ordered writes a Postgres writer runs at once: half the pool, so queued
+// writes never take every connection from reads and synchronous writes.
 fn postgres_write_lane_concurrency() -> usize {
     (crate::persistence::sql_services::postgres_max_connections_from_env() as usize / 2).max(1)
 }
 
-/// Commands the Postgres writer holds taken from the queue per write it runs
-/// at once. Past that the writer stops taking commands, so the bounded queue
-/// fills and senders see it full, as on the serial writer.
+// Commands the Postgres writer holds taken from the queue per write it runs
+// at once. Past that the writer stops taking commands, so the bounded queue
+// fills and senders see it full, as on the serial writer.
 const POSTGRES_WRITES_TAKEN_PER_LANE_SLOT: usize = 4;
 
-/// The Postgres writer. Postgres has no single-writer limit, so ordered writes
-/// for different jobs run at once, up to `concurrency`, while each lane keeps
-/// submission order:
-///
-/// - a job's writes apply one after another, in the order they were queued;
-/// - an archive also waits for every event batch and every server attribution
-///   checkpoint queued before it;
-/// - a barrier (`Flush`, or a write with no lane) waits for everything queued
-///   before it and holds back everything queued after it;
-/// - at most `max_taken` commands are taken and unfinished at once; the rest
-///   stay in the queue;
-/// - when the queue closes, every write already taken is finished first.
+// The Postgres writer. Postgres has no single-writer limit, so ordered writes
+// for different jobs run at once, up to `concurrency`, while each lane keeps
+// submission order:
+//
+// - a job's writes apply one after another, in the order they were queued;
+// - an archive also waits for every event batch and every server attribution
+//   checkpoint queued before it;
+// - a barrier (`Flush`, or a write with no lane) waits for everything queued
+//   before it and holds back everything queued after it;
+// - at most `max_taken` commands are taken and unfinished at once; the rest
+//   stay in the queue;
+// - when the queue closes, every write already taken is finished first.
 async fn run_postgres_write_lanes(
     mut rx: mpsc::Receiver<QueuedWrite>,
     writer: DatabaseWriterExecutor,
@@ -1010,18 +1010,18 @@ async fn run_postgres_write_lanes(
     while in_flight.join_next().await.is_some() {}
 }
 
-/// Forget the lanes whose last taken write has finished, so the table holds
-/// only lanes with unfinished work instead of every job the writer has seen.
-/// A finished tail has nothing left to wait for, and a write on a lane with no
-/// tail waits for nothing, so dropping it changes no ordering. A write that
-/// panicked dropped its sender, which ends its wait just as finishing does.
+// Forget the lanes whose last taken write has finished, so the table holds
+// only lanes with unfinished work instead of every job the writer has seen.
+// A finished tail has nothing left to wait for, and a write on a lane with no
+// tail waits for nothing, so dropping it changes no ordering. A write that
+// panicked dropped its sender, which ends its wait just as finishing does.
 fn prune_finished_lane_tails(tails: &mut HashMap<WriteLane, watch::Receiver<bool>>) {
     tails.retain(|_, done| !*done.borrow() && done.has_changed().is_ok());
 }
 
 impl DbWriteCommand {
-    /// Stable bucket label. `Write` carries a caller-supplied `&'static str`, so
-    /// generic ordered writes stay distinguishable from each other.
+    // Stable bucket label. `Write` carries a caller-supplied `&'static str`, so
+    // generic ordered writes stay distinguishable from each other.
     fn label(&self) -> &'static str {
         match self {
             Self::ArchiveJob { .. } => "archive_job",
@@ -1036,10 +1036,10 @@ impl DbWriteCommand {
 struct JobHistoryCache {
     rows: BTreeMap<u64, JobHistoryRow>,
     insertion_order: VecDeque<u64>,
-    /// Bumped on every invalidation (`remove`/`clear`). A cache-populate site
-    /// that captured a generation *before* its DB read may only insert when the
-    /// generation still matches; otherwise an intervening delete has moved the
-    /// cache forward and the row it read is stale, so the insert is dropped.
+    // Bumped on every invalidation (`remove`/`clear`). A cache-populate site
+    // that captured a generation *before* its DB read may only insert when the
+    // generation still matches; otherwise an intervening delete has moved the
+    // cache forward and the row it read is stale, so the insert is dropped.
     generation: u64,
 }
 
@@ -1065,10 +1065,10 @@ impl JobHistoryCache {
         }
     }
 
-    /// Insert a row read from the database only if no invalidation happened
-    /// since `observed_generation` was captured. Guards the read-then-cache
-    /// race with a concurrent delete: a reader that fetched the row just before
-    /// a delete would otherwise re-populate it after the delete's invalidation.
+    // Insert a row read from the database only if no invalidation happened
+    // since `observed_generation` was captured. Guards the read-then-cache
+    // race with a concurrent delete: a reader that fetched the row just before
+    // a delete would otherwise re-populate it after the delete's invalidation.
     fn insert_if_generation(&mut self, row: JobHistoryRow, observed_generation: u64) {
         if self.generation == observed_generation {
             self.insert(row);
@@ -1089,7 +1089,7 @@ impl JobHistoryCache {
     }
 }
 
-/// SQL-backed persistent store for config, servers, and job history.
+// SQL-backed persistent store for config, servers, and job history.
 #[derive(Clone)]
 pub struct Database {
     pub(crate) rss_schedule_cache: Arc<crate::rss::ScheduleCache>,
@@ -1098,10 +1098,10 @@ pub struct Database {
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
     writer_tx: mpsc::Sender<QueuedWrite>,
-    /// Count of in-flight background re-sends into the bounded writer queue
-    /// (archive jobs and generic ordered writes) spawned when `try_send` hit a
-    /// full queue. `flush_write_queue` waits for this to reach zero before its
-    /// own `Flush` so a re-send in progress is not skipped at shutdown.
+    // Count of in-flight background re-sends into the bounded writer queue
+    // (archive jobs and generic ordered writes) spawned when `try_send` hit a
+    // full queue. `flush_write_queue` waits for this to reach zero before its
+    // own `Flush` so a re-send in progress is not skipped at shutdown.
     pending_write_retries: Arc<AtomicUsize>,
     pending_write_notify: Arc<Notify>,
     pub(crate) history_delete_wake: Arc<Notify>,
@@ -1111,17 +1111,17 @@ pub struct Database {
 }
 
 impl Database {
-    /// Executor engine, saturation and operation-latency histogram for the
-    /// database runtime backing this handle.
-    ///
-    /// Read at scrape time. Cheap: a handful of `Relaxed` atomic loads plus one
-    /// `Vec` for the histogram buckets.
+    // Executor engine, saturation and operation-latency histogram for the
+    // database runtime backing this handle.
+    //
+    // Read at scrape time. Cheap: a handful of `Relaxed` atomic loads plus one
+    // `Vec` for the histogram buckets.
     pub fn runtime_metrics_snapshot(&self) -> DbRuntimeMetricsSnapshot {
         self.sql_worker.runtime_metrics().snapshot()
     }
 
-    /// Open (or create) the database at `path`.
-    /// Runs schema migrations and configures SQLite pragmas.
+    // Open (or create) the database at `path`.
+    // Runs schema migrations and configures SQLite pragmas.
     pub fn open(path: &Path) -> Result<Self, StateError> {
         Self::open_target(DatabaseTarget::SqlitePath(path.to_path_buf()))
     }
@@ -1149,7 +1149,7 @@ impl Database {
         Ok(db)
     }
 
-    /// Open an in-memory database (for tests).
+    // Open an in-memory database (for tests).
     pub fn open_in_memory() -> Result<Self, StateError> {
         let tempdir =
             Arc::new(tempfile::tempdir().map_err(|e| StateError::Database(e.to_string()))?);
@@ -1181,17 +1181,17 @@ impl Database {
         self.sql_services.datastore()
     }
 
-    /// Stable, non-sensitive name of the configured persistence engine.
+    // Stable, non-sensitive name of the configured persistence engine.
     pub fn engine_name(&self) -> &'static str {
         self.datastore().engine().as_str()
     }
 
-    /// Highest migration version this database's ledger held when this handle
-    /// opened it, before the migrations that open ran. `None` means nothing had
-    /// ever migrated it — a database this process created.
-    ///
-    /// This is how startup tells a fresh install from an upgrade, and from
-    /// which release line it is upgrading.
+    // Highest migration version this database's ledger held when this handle
+    // opened it, before the migrations that open ran. `None` means nothing had
+    // ever migrated it — a database this process created.
+    //
+    // This is how startup tells a fresh install from an upgrade, and from
+    // which release line it is upgrading.
     pub fn pre_migration_schema_version(&self) -> Option<i64> {
         self.sql_services.pre_migration_schema_version()
     }
@@ -1234,9 +1234,9 @@ impl Database {
             .get(job_id)
     }
 
-    /// Snapshot the cache invalidation generation before a DB read whose result
-    /// will be cached. Pair with [`Self::cache_job_history_at`] to insert only
-    /// if no invalidation raced the read.
+    // Snapshot the cache invalidation generation before a DB read whose result
+    // will be cached. Pair with [`Self::cache_job_history_at`] to insert only
+    // if no invalidation raced the read.
     pub(crate) fn job_history_cache_generation(&self) -> u64 {
         self.job_history_cache
             .lock()
@@ -1244,10 +1244,10 @@ impl Database {
             .generation()
     }
 
-    /// Cache a freshly-read row only if the cache generation still matches
-    /// `observed_generation` (captured before the read). Drops the insert when a
-    /// concurrent delete has invalidated the cache in between, preventing a
-    /// deleted job from being resurrected in the cache.
+    // Cache a freshly-read row only if the cache generation still matches
+    // `observed_generation` (captured before the read). Drops the insert when a
+    // concurrent delete has invalidated the cache in between, preventing a
+    // deleted job from being resurrected in the cache.
     pub(crate) fn cache_job_history_at(&self, row: JobHistoryRow, observed_generation: u64) {
         self.job_history_cache
             .lock()
@@ -1279,13 +1279,13 @@ impl Database {
             .block_on(std::panic::Location::caller(), future)
     }
 
-    /// Run a **pure read**: no writes, and not inside a write transaction.
-    ///
-    /// Reads dispatched here run on the multi-threaded read executor instead of
-    /// queueing behind the single writer. Use [`Self::run_sql_blocking`] for
-    /// anything that writes, and for reads that must sit inside a write
-    /// transaction (read-modify-write), where the ordering the single writer
-    /// provides is the point.
+    // Run a **pure read**: no writes, and not inside a write transaction.
+    //
+    // Reads dispatched here run on the multi-threaded read executor instead of
+    // queueing behind the single writer. Use [`Self::run_sql_blocking`] for
+    // anything that writes, and for reads that must sit inside a write
+    // transaction (read-modify-write), where the ordering the single writer
+    // provides is the point.
     #[track_caller]
     pub(crate) fn run_sql_blocking_read<T, Fut>(&self, future: Fut) -> Result<T, StateError>
     where
@@ -1310,22 +1310,22 @@ impl Database {
             .block_on_local(std::panic::Location::caller(), build)
     }
 
-    /// Set the encryption key used to protect sensitive fields (passwords).
+    // Set the encryption key used to protect sensitive fields (passwords).
     pub fn set_encryption_key(&mut self, key: crate::persistence::encryption::EncryptionKey) {
         self.encryption_key = Some(key);
     }
 
-    /// Get a reference to the encryption key, if set.
+    // Get a reference to the encryption key, if set.
     pub(crate) fn encryption_key(&self) -> Option<&crate::persistence::encryption::EncryptionKey> {
         self.encryption_key.as_ref()
     }
 
-    /// Answer a trivial query, to prove the datastore is reachable.
-    ///
-    /// Deliberately touches no table: a readiness probe must report on the
-    /// connection, not on whether some particular schema object exists. This is
-    /// a blocking call — callers on an async runtime must wrap it in
-    /// `spawn_blocking`.
+    // Answer a trivial query, to prove the datastore is reachable.
+    //
+    // Deliberately touches no table: a readiness probe must report on the
+    // connection, not on whether some particular schema object exists. This is
+    // a blocking call — callers on an async runtime must wrap it in
+    // `spawn_blocking`.
     pub fn probe_liveness(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -1339,12 +1339,12 @@ impl Database {
         })
     }
 
-    /// Check if the database has no settings (i.e. fresh / needs migration).
-    ///
-    /// The install-generation stamp and the last-started-version marker are
-    /// written the moment a new database is created, before any configuration
-    /// is imported into it, so they do not make the database hold settings of
-    /// its own.
+    // Check if the database has no settings (i.e. fresh / needs migration).
+    //
+    // The install-generation stamp and the last-started-version marker are
+    // written the moment a new database is created, before any configuration
+    // is imported into it, so they do not make the database hold settings of
+    // its own.
     pub fn is_empty(&self) -> Result<bool, StateError> {
         use crate::persistence::sql_runtime::SqlArg;
         let datastore = self.datastore();
@@ -1365,15 +1365,15 @@ impl Database {
         })
     }
 
-    /// Build a `Database` handle for the writer task to run generic `Write`
-    /// ops against. It shares the sql services/worker/cache but carries a
-    /// *detached* `writer_tx` (a throwaway channel whose receiver is dropped),
-    /// so it does NOT hold the real writer channel open. That keeps the
-    /// all-senders-dropped shutdown contract intact — the real queue still
-    /// closes when every external `Database` handle drops — while letting
-    /// `Write` ops call methods that live only on `Database`
-    /// (`set_active_job_runtime`, `update_active_job`), which touch only
-    /// `datastore()` / `run_sql_blocking()` and never `writer_tx`.
+    // Build a `Database` handle for the writer task to run generic `Write`
+    // ops against. It shares the sql services/worker/cache but carries a
+    // *detached* `writer_tx` (a throwaway channel whose receiver is dropped),
+    // so it does NOT hold the real writer channel open. That keeps the
+    // all-senders-dropped shutdown contract intact — the real queue still
+    // closes when every external `Database` handle drops — while letting
+    // `Write` ops call methods that live only on `Database`
+    // (`set_active_job_runtime`, `update_active_job`), which touch only
+    // `datastore()` / `run_sql_blocking()` and never `writer_tx`.
     fn writer_task_handle(&self) -> Database {
         let (detached_tx, _detached_rx) = mpsc::channel(1);
         Database {
@@ -1440,10 +1440,10 @@ impl Database {
         self.try_send_with_retry(command, "archive")
     }
 
-    /// Queue the durable history archive and hand back a signal that fires once
-    /// that write has committed. Terminal job events are published off this
-    /// signal, so a subscriber that observes one can immediately read the row
-    /// back through the history facade instead of racing the write queue.
+    // Queue the durable history archive and hand back a signal that fires once
+    // that write has committed. Terminal job events are published off this
+    // signal, so a subscriber that observes one can immediately read the row
+    // back through the history facade instead of racing the write queue.
     pub fn try_queue_archive_job_with_terminal_cause(
         &self,
         job_id: crate::jobs::ids::JobId,
@@ -1463,14 +1463,14 @@ impl Database {
         Ok(committed_rx)
     }
 
-    /// Queue a generic ordered write. It runs after every write queued before
-    /// it and before every write queued after it, so two writes to the same
-    /// row land in enqueue order — closing the same-key reorder hazard that
-    /// detached `db_fire_and_forget` tasks have. Backpressure matches
-    /// [`Self::try_queue_archive_job`]: on a full queue, a background re-send is
-    /// spawned and tracked by `pending_write_retries` so `flush_write_queue`
-    /// waits for it. `op` runs against a `Database` handle inside the writer
-    /// task; use it to call methods that live on `Database`.
+    // Queue a generic ordered write. It runs after every write queued before
+    // it and before every write queued after it, so two writes to the same
+    // row land in enqueue order — closing the same-key reorder hazard that
+    // detached `db_fire_and_forget` tasks have. Backpressure matches
+    // [`Self::try_queue_archive_job`]: on a full queue, a background re-send is
+    // spawned and tracked by `pending_write_retries` so `flush_write_queue`
+    // waits for it. `op` runs against a `Database` handle inside the writer
+    // task; use it to call methods that live on `Database`.
     pub fn try_queue_write(
         &self,
         label: &'static str,
@@ -1484,9 +1484,9 @@ impl Database {
         self.try_send_with_retry(command, label)
     }
 
-    /// [`Self::try_queue_write`] for a write that belongs to one job. It keeps
-    /// its order against that job's other queued writes and its archive, and on
-    /// Postgres runs alongside other jobs' writes instead of behind them.
+    // [`Self::try_queue_write`] for a write that belongs to one job. It keeps
+    // its order against that job's other queued writes and its archive, and on
+    // Postgres runs alongside other jobs' writes instead of behind them.
     pub fn try_queue_job_write(
         &self,
         job_id: crate::jobs::ids::JobId,
@@ -1501,10 +1501,10 @@ impl Database {
         self.try_send_with_retry(command, label)
     }
 
-    /// Queue a server attribution or support facts checkpoint. Checkpoints keep their order
-    /// against each other, and a job's archive waits for the ones queued
-    /// before it; on Postgres they otherwise run alongside other writes
-    /// instead of holding every lane back.
+    // Queue a server attribution or support facts checkpoint. Checkpoints keep their order
+    // against each other, and a job's archive waits for the ones queued
+    // before it; on Postgres they otherwise run alongside other writes
+    // instead of holding every lane back.
     pub fn try_queue_server_attribution_write(
         &self,
         op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
@@ -1518,10 +1518,10 @@ impl Database {
         self.try_send_with_retry(command, LABEL)
     }
 
-    /// Shared enqueue path for ordered writer commands. Tries a non-blocking
-    /// send; on a full queue spawns a background re-send tracked by
-    /// `pending_write_retries`/`pending_write_notify` (so a flush cannot race
-    /// past an in-flight re-send), falling back to a blocking send off-runtime.
+    // Shared enqueue path for ordered writer commands. Tries a non-blocking
+    // send; on a full queue spawns a background re-send tracked by
+    // `pending_write_retries`/`pending_write_notify` (so a flush cannot race
+    // past an in-flight re-send), falling back to a blocking send off-runtime.
     fn try_send_with_retry(
         &self,
         command: DbWriteCommand,
@@ -1561,9 +1561,9 @@ impl Database {
         }
     }
 
-    /// Stamp a command with its enqueue instant and sample how full the ordered
-    /// writer queue already is. Depth is derived from the channel rather than a
-    /// separate counter so it cannot drift from reality.
+    // Stamp a command with its enqueue instant and sample how full the ordered
+    // writer queue already is. Depth is derived from the channel rather than a
+    // separate counter so it cannot drift from reality.
     fn enqueue_write(&self, command: DbWriteCommand) -> QueuedWrite {
         let depth = self
             .writer_tx
@@ -1632,9 +1632,9 @@ impl Database {
         }
     }
 
-    /// Return whether any persisted credential requires the encryption key.
-    /// This check intentionally reads raw storage before a key is installed so
-    /// startup can refuse to replace a missing key over encrypted state.
+    // Return whether any persisted credential requires the encryption key.
+    // This check intentionally reads raw storage before a key is installed so
+    // startup can refuse to replace a missing key over encrypted state.
     pub fn has_encrypted_credentials(&self) -> Result<bool, StateError> {
         use crate::persistence::encryption::is_encrypted;
         use crate::persistence::sql_runtime::SqlRuntime;
@@ -1668,8 +1668,8 @@ impl Database {
         self.has_encrypted_persisted_jwt_signing_secret()
     }
 
-    /// Prove that every encrypted persisted credential can be authenticated by
-    /// the selected key before startup exposes any decrypted configuration.
+    // Prove that every encrypted persisted credential can be authenticated by
+    // the selected key before startup exposes any decrypted configuration.
     pub fn validate_encrypted_credentials(
         &self,
         key: &crate::persistence::encryption::EncryptionKey,
@@ -1772,11 +1772,11 @@ impl Database {
         self.validate_persisted_jwt_signing_secret(key)
     }
 
-    /// Re-encrypt any plaintext passwords in the database.
-    ///
-    /// On upgrade from a version without encryption, passwords are stored as
-    /// plaintext. This reads each one and re-writes it, which triggers the
-    /// encrypt-on-write path. Idempotent — already-encrypted values pass through.
+    // Re-encrypt any plaintext passwords in the database.
+    //
+    // On upgrade from a version without encryption, passwords are stored as
+    // plaintext. This reads each one and re-writes it, which triggers the
+    // encrypt-on-write path. Idempotent — already-encrypted values pass through.
     pub fn migrate_plaintext_credentials(&self) -> Result<(), StateError> {
         use crate::persistence::encryption::{is_encrypted, maybe_encrypt};
         use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};

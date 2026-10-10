@@ -1,4 +1,4 @@
-//! Direct-store writes and finalization, including mixed-member chase handoff.
+// Direct-store writes and finalization, including mixed-member chase handoff.
 
 use super::*;
 use crate::pipeline::direct_store::barrier::{BarrierError, CoveragePersist};
@@ -29,7 +29,7 @@ fn installed_tolerated_members(targets: &[ToleratedTarget]) -> Result<ToleratedE
     Ok(result)
 }
 
-/// One of an archive's recorded times, in Windows FILETIME ticks.
+// One of an archive's recorded times, in Windows FILETIME ticks.
 fn archive_filetime(filetime_ticks: u64) -> filetime::FileTime {
     const TICKS_PER_SECOND: u64 = 10_000_000;
     const EPOCH_OFFSET_SECONDS: i64 = 11_644_473_600;
@@ -38,16 +38,16 @@ fn archive_filetime(filetime_ticks: u64) -> filetime::FileTime {
     filetime::FileTime::from_unix_time(seconds, nanos)
 }
 
-/// The installation marker a finalized set leaves in place of its coverage row.
-///
-/// `produced` is every other output finalization left in place, as
-/// [`produced_outputs`] found it on disk.
-///
-/// `None` when there is nothing to re-check at restore. A set with no committed
-/// byte-bearing member would be trusted on the marker's word alone, and a path
-/// that is not UTF-8 or not under the staging root cannot be recorded in the
-/// form restore probes. Either way the set redownloads after a restart, which
-/// is what it did before the marker existed.
+// The installation marker a finalized set leaves in place of its coverage row.
+//
+// `produced` is every other output finalization left in place, as
+// [`produced_outputs`] found it on disk.
+//
+// `None` when there is nothing to re-check at restore. A set with no committed
+// byte-bearing member would be trusted on the marker's word alone, and a path
+// that is not UTF-8 or not under the staging root cannot be recorded in the
+// form restore probes. Either way the set redownloads after a restart, which
+// is what it did before the marker existed.
 fn installed_marker(
     plan: &DirectSetPlan,
     members: &[(String, u64, PathBuf, PathBuf)],
@@ -102,20 +102,20 @@ fn installed_marker(
     encode_installed(&installed).ok()
 }
 
-/// The outputs of a finalized set that the commit loop did not rename into
-/// place: tolerated members and the entries the archive stores no bytes for.
+// The outputs of a finalized set that the commit loop did not rename into
+// place: tolerated members and the entries the archive stores no bytes for.
 #[derive(Debug, Default)]
 struct ProducedOutputs {
     files: Vec<(PathBuf, u64)>,
     directories: Vec<PathBuf>,
 }
 
-/// Probes each recorded output the stored members do not account for.
-///
-/// `None` when one of them cannot be probed or is neither a file nor a
-/// directory: a marker that left it out would restore the set without
-/// noticing it is gone, so the set gets no marker and redownloads after a
-/// restart instead.
+// Probes each recorded output the stored members do not account for.
+//
+// `None` when one of them cannot be probed or is neither a file nor a
+// directory: a marker that left it out would restore the set without
+// noticing it is gone, so the set gets no marker and redownloads after a
+// restart instead.
 async fn produced_outputs(paths: Vec<PathBuf>) -> Option<ProducedOutputs> {
     let mut produced = ProducedOutputs::default();
     for path in paths {
@@ -131,14 +131,14 @@ async fn produced_outputs(paths: Vec<PathBuf>) -> Option<ProducedOutputs> {
     Some(produced)
 }
 
-/// An archive's recorded times put on an entry weaver has just created.
-///
-/// The pair the conventional extractor restores: the modification time, which
-/// every writer records, and the access time when the header carries one.
-/// Neither is invented — an entry whose header states no modification time
-/// keeps the time of its creation here, exactly as it does there. Best effort:
-/// the entry exists either way, and a filesystem that refuses a time still
-/// holds the right bytes.
+// An archive's recorded times put on an entry weaver has just created.
+//
+// The pair the conventional extractor restores: the modification time, which
+// every writer records, and the access time when the header carries one.
+// Neither is invented — an entry whose header states no modification time
+// keeps the time of its creation here, exactly as it does there. Best effort:
+// the entry exists either way, and a filesystem that refuses a time still
+// holds the right bytes.
 fn apply_archive_times(path: &std::path::Path, modified: Option<u64>, accessed: Option<u64>) {
     let Some(modified) = modified.map(archive_filetime) else {
         return;
@@ -154,16 +154,16 @@ fn apply_archive_times(path: &std::path::Path, modified: Option<u64>, accessed: 
 }
 
 impl Pipeline {
-    /// The routing seam. Replaces the conventional write for one decoded
-    /// segment of a direct source volume.
-    ///
-    /// `declared_volume_len` is the total length this article's yEnc header
-    /// states for its file. It is carried in rather than derived here because
-    /// only the decoder sees it, and it is the one fact a 7z set cannot do
-    /// without: the volumes are a byte split of one container, so their
-    /// lengths are what turn a container offset into the (volume, offset) pair
-    /// everything else is expressed in — and a volume declares its length on
-    /// its *first* article, long before it finishes arriving.
+    // The routing seam. Replaces the conventional write for one decoded
+    // segment of a direct source volume.
+    //
+    // `declared_volume_len` is the total length this article's yEnc header
+    // states for its file. It is carried in rather than derived here because
+    // only the decoder sees it, and it is the one fact a 7z set cannot do
+    // without: the volumes are a byte split of one container, so their
+    // lengths are what turn a container offset into the (volume, offset) pair
+    // everything else is expressed in — and a volume declares its length on
+    // its *first* article, long before it finishes arriving.
     pub(crate) async fn handle_direct_decode_success(
         &mut self,
         set_index: usize,
@@ -308,16 +308,16 @@ impl Pipeline {
         DirectRouteOutcome::Routed
     }
 
-    /// Writes every destination a batch of routed spans touches, then records
-    /// them as coverage. `false` means the set demoted or the job failed, and
-    /// the caller must stop.
-    ///
-    /// The record only happens once **all** the writes returned: partial failure
-    /// leaves orphan bytes, and the coverage map is the truth, not the bytes.
-    /// This awaits the writes on the pipeline task, so it is for the repair
-    /// paths, which run once per repair. Routed articles and a completed
-    /// volume's trailing region go through the set's placement lane instead
-    /// ([`Self::enqueue_direct_placement`]), which records them the same way.
+    // Writes every destination a batch of routed spans touches, then records
+    // them as coverage. `false` means the set demoted or the job failed, and
+    // the caller must stop.
+    //
+    // The record only happens once **all** the writes returned: partial failure
+    // leaves orphan bytes, and the coverage map is the truth, not the bytes.
+    // This awaits the writes on the pipeline task, so it is for the repair
+    // paths, which run once per repair. Routed articles and a completed
+    // volume's trailing region go through the set's placement lane instead
+    // ([`Self::enqueue_direct_placement`]), which records them the same way.
     pub(super) async fn place_direct_spans(
         &mut self,
         job_id: JobId,
@@ -335,13 +335,13 @@ impl Pipeline {
         false
     }
 
-    /// What a placement whose writes did not all return does to its set: a
-    /// destination that could not be made sparse, or a write the destination
-    /// did not refuse outright, demotes the set; a refusal fails the job.
-    ///
-    /// `handoffs` are the routed articles the failed writes carried. They go
-    /// back to the conventional path, which the demotion is told about before
-    /// it plans its sweep.
+    // What a placement whose writes did not all return does to its set: a
+    // destination that could not be made sparse, or a write the destination
+    // did not refuse outright, demotes the set; a refusal fails the job.
+    //
+    // `handoffs` are the routed articles the failed writes carried. They go
+    // back to the conventional path, which the demotion is told about before
+    // it plans its sweep.
     pub(super) async fn handle_direct_placement_failure(
         &mut self,
         job_id: JobId,
@@ -423,10 +423,10 @@ impl Pipeline {
         }
     }
 
-    /// Places bytes and admits coverage only after every destination write
-    /// succeeds. It does not choose a demotion policy: a repair caller may
-    /// already own verified materialized outputs that reconstruction must not
-    /// overwrite. Filesystem errors retain their original error values.
+    // Places bytes and admits coverage only after every destination write
+    // succeeds. It does not choose a demotion policy: a repair caller may
+    // already own verified materialized outputs that reconstruction must not
+    // overwrite. Filesystem errors retain their original error values.
     pub(in crate::pipeline) async fn try_place_direct_spans(
         &mut self,
         job_id: JobId,
@@ -449,7 +449,7 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Admits spans whose every write returned as the set's coverage.
+    // Admits spans whose every write returned as the set's coverage.
     pub(super) fn record_direct_placement(
         &mut self,
         job_id: JobId,
@@ -480,15 +480,15 @@ impl Pipeline {
         }
     }
 
-    /// Caches whatever volume facts the set's parse just accepted, so a restart
-    /// can rebuild its layout.
-    ///
-    /// The rows go into `active_rar_volume_facts` — the same table, keyed the
-    /// same way, that the conventional path fills from a parsed volume file.
-    /// There is no writer conflict: `try_update_archive_topology` needs a file
-    /// to parse and it is suppressed for direct volumes, so for a live direct
-    /// set this is the only writer, and after a demotion the conventional path
-    /// upserts the same facts over the materialized volumes.
+    // Caches whatever volume facts the set's parse just accepted, so a restart
+    // can rebuild its layout.
+    //
+    // The rows go into `active_rar_volume_facts` — the same table, keyed the
+    // same way, that the conventional path fills from a parsed volume file.
+    // There is no writer conflict: `try_update_archive_topology` needs a file
+    // to parse and it is suppressed for direct volumes, so for a live direct
+    // set this is the only writer, and after a demotion the conventional path
+    // upserts the same facts over the materialized volumes.
     pub(in crate::pipeline) async fn cache_direct_volume_facts(
         &mut self,
         job_id: JobId,
@@ -537,28 +537,28 @@ impl Pipeline {
         }
     }
 
-    /// The gate re-arm: recomputes the member CRC for every restart-seeded
-    /// range with **one sequential read** of the partials that hold them.
-    ///
-    /// `CrcRuns` does not survive a restart, so the bytes a previous run wrote
-    /// are covered and unverified; the whole-member gate refuses to compose over
-    /// them until they are re-read. This is the "PAR2 absent" arm — the direct
-    /// analogue of `checksum_completed_file`'s fallback for physical files, at
-    /// the same cost and the same assurance. It deliberately verifies what is on
-    /// **disk now**, so a byte corrupted while the process was down fails the
-    /// member gate and demotes the set instead of being committed.
-    ///
-    /// Runs **once** per set: every run it reads leaves the seeded set, so a
-    /// second call finds nothing to do — and if anything is still seeded after
-    /// a full pass, the set demotes rather than being re-read on every
-    /// completion check for the life of the job.
-    ///
-    /// The read itself runs off the pipeline task: it is the whole pre-restart
-    /// download read back from disk, and awaiting it here stalled every lane
-    /// of every job for as long as the disk took. `start` reads and hashes on
-    /// a blocking thread and the result comes back through
-    /// [`Self::handle_direct_rearm_done`], which re-arms the gates and resumes
-    /// the completion check the read interrupted.
+    // The gate re-arm: recomputes the member CRC for every restart-seeded
+    // range with **one sequential read** of the partials that hold them.
+    //
+    // `CrcRuns` does not survive a restart, so the bytes a previous run wrote
+    // are covered and unverified; the whole-member gate refuses to compose over
+    // them until they are re-read. This is the "PAR2 absent" arm — the direct
+    // analogue of `checksum_completed_file`'s fallback for physical files, at
+    // the same cost and the same assurance. It deliberately verifies what is on
+    // **disk now**, so a byte corrupted while the process was down fails the
+    // member gate and demotes the set instead of being committed.
+    //
+    // Runs **once** per set: every run it reads leaves the seeded set, so a
+    // second call finds nothing to do — and if anything is still seeded after
+    // a full pass, the set demotes rather than being re-read on every
+    // completion check for the life of the job.
+    //
+    // The read itself runs off the pipeline task: it is the whole pre-restart
+    // download read back from disk, and awaiting it here stalled every lane
+    // of every job for as long as the disk took. `start` reads and hashes on
+    // a blocking thread and the result comes back through
+    // [`Self::handle_direct_rearm_done`], which re-arms the gates and resumes
+    // the completion check the read interrupted.
     pub(super) fn start_direct_rearm(&mut self, job_id: JobId, set_index: usize) {
         if self.direct_rearm_in_flight.contains(&(job_id, set_index)) {
             return;
@@ -613,12 +613,12 @@ impl Pipeline {
         });
     }
 
-    /// The second half of [`Self::start_direct_rearm`]: the checksums are in,
-    /// so the gates re-arm and the completion check that started the read is
-    /// resumed. Nothing happens if the set moved on while the read ran — it
-    /// demoted, finalized, or its plan changed so the runs read are no longer
-    /// the runs seeded — except that a changed plan is read again on the next
-    /// check.
+    // The second half of [`Self::start_direct_rearm`]: the checksums are in,
+    // so the gates re-arm and the completion check that started the read is
+    // resumed. Nothing happens if the set moved on while the read ran — it
+    // demoted, finalized, or its plan changed so the runs read are no longer
+    // the runs seeded — except that a changed plan is read again on the next
+    // check.
     pub(in crate::pipeline) async fn handle_direct_rearm_done(&mut self, done: DirectRearmDone) {
         let DirectRearmDone {
             job_id,
@@ -711,7 +711,7 @@ impl Pipeline {
         self.check_job_completion(job_id).await;
     }
 
-    /// Groups routed spans into one sub-batch per destination path.
+    // Groups routed spans into one sub-batch per destination path.
     pub(super) fn direct_write_batches(
         &self,
         job_id: JobId,
@@ -770,45 +770,45 @@ impl Pipeline {
         batches
     }
 
-    /// Creates the parent directory of every destination that needs one, and
-    /// creates the destination file itself **marked sparse**, once per job (the
-    /// Windows sparse rule).
-    ///
-    /// A member stored inside a directory — `Silver.Horizon/S01E06.mkv` — names
-    /// a partial inside that directory, and the disk owner thread opens
-    /// destinations with `create(true)` but never `create_dir_all`, so the
-    /// first routed byte would fail with `ENOENT`. The conventional path never
-    /// hits this because extraction creates the directory as it writes the
-    /// member out; routing writes the member *before* extraction exists.
-    ///
-    /// The file is created here for the same reason, one step earlier than the
-    /// disk owner would: `FSCTL_SET_SPARSE` has to be issued on a handle that
-    /// has had nothing written through it, and the owner pool is shared with
-    /// every conventional write in the process — it is not the place to teach
-    /// about direct-store's sparseness. Creating (and marking) here leaves the
-    /// pool's `open_or_reuse` opening a file that already exists and already
-    /// carries the attribute, on Windows and everywhere else.
-    ///
-    /// Records a member name that **direct** finalization produced, in both the
-    /// job-wide `extracted_members` (which completion reads) and the runtime's
-    /// direct-only mirror (which the claim assertions subtract).
-    ///
-    /// Recorded under the *destination-relative* name, not the archive's own.
-    /// RAR4 stores paths with `\` separators, and the destination is derived
-    /// through `resolve_member_path`, which rewrites them to `/`. Recording the
-    /// raw name left the two disagreeing for any RAR4 member with a directory
-    /// component: completion resolved `work\sample.mkv` against the job's
-    /// roots, found nothing on disk, declared the member a stale extracted
-    /// record and re-ran conventional extraction — which then failed with "no
-    /// on-disk RAR volumes", because direct finalization had deliberately never
-    /// written any. A flat RAR4 member has no separator and so never showed it.
-    ///
-    /// The name is relative to the **staging root**, which is where the commit
-    /// rename put the file and where the incremental extractor writes the
-    /// members it produces — so completion resolves a direct member and an
-    /// extracted one through exactly the same root
-    /// (`Pipeline::resolve_job_input_path` tries the working dir and then the
-    /// staging dir, and only the second can match a direct member).
+    // Creates the parent directory of every destination that needs one, and
+    // creates the destination file itself **marked sparse**, once per job (the
+    // Windows sparse rule).
+    //
+    // A member stored inside a directory — `Silver.Horizon/S01E06.mkv` — names
+    // a partial inside that directory, and the disk owner thread opens
+    // destinations with `create(true)` but never `create_dir_all`, so the
+    // first routed byte would fail with `ENOENT`. The conventional path never
+    // hits this because extraction creates the directory as it writes the
+    // member out; routing writes the member *before* extraction exists.
+    //
+    // The file is created here for the same reason, one step earlier than the
+    // disk owner would: `FSCTL_SET_SPARSE` has to be issued on a handle that
+    // has had nothing written through it, and the owner pool is shared with
+    // every conventional write in the process — it is not the place to teach
+    // about direct-store's sparseness. Creating (and marking) here leaves the
+    // pool's `open_or_reuse` opening a file that already exists and already
+    // carries the attribute, on Windows and everywhere else.
+    //
+    // Records a member name that **direct** finalization produced, in both the
+    // job-wide `extracted_members` (which completion reads) and the runtime's
+    // direct-only mirror (which the claim assertions subtract).
+    //
+    // Recorded under the *destination-relative* name, not the archive's own.
+    // RAR4 stores paths with `\` separators, and the destination is derived
+    // through `resolve_member_path`, which rewrites them to `/`. Recording the
+    // raw name left the two disagreeing for any RAR4 member with a directory
+    // component: completion resolved `work\sample.mkv` against the job's
+    // roots, found nothing on disk, declared the member a stale extracted
+    // record and re-ran conventional extraction — which then failed with "no
+    // on-disk RAR volumes", because direct finalization had deliberately never
+    // written any. A flat RAR4 member has no separator and so never showed it.
+    //
+    // The name is relative to the **staging root**, which is where the commit
+    // rename put the file and where the incremental extractor writes the
+    // members it produces — so completion resolves a direct member and an
+    // extracted one through exactly the same root
+    // (`Pipeline::resolve_job_input_path` tries the working dir and then the
+    // staging dir, and only the second can match a direct member).
     pub(in crate::pipeline::direct_store) fn record_direct_extracted(
         &mut self,
         job_id: JobId,
@@ -826,11 +826,11 @@ impl Pipeline {
             .insert(name);
     }
 
-    /// Member names the **incremental extractor** owns for this job: the
-    /// blended `extracted_members` minus everything direct finalization put
-    /// there. The claim assertions compare against this, not the blend — a
-    /// sibling direct set finalizing the same member name is last-writer-wins
-    /// by design, not a second checkpoint system claiming the member.
+    // Member names the **incremental extractor** owns for this job: the
+    // blended `extracted_members` minus everything direct finalization put
+    // there. The claim assertions compare against this, not the blend — a
+    // sibling direct set finalizing the same member name is last-writer-wins
+    // by design, not a second checkpoint system claiming the member.
     pub(super) fn extraction_claimed_members(&self, job_id: JobId) -> HashSet<String> {
         let mut claimed = self
             .extracted_members
@@ -843,8 +843,8 @@ impl Pipeline {
         claimed
     }
 
-    /// A sparse-marking refusal includes its path and underlying I/O error.
-    /// The caller chooses how to handle it before any hole is introduced.
+    // A sparse-marking refusal includes its path and underlying I/O error.
+    // The caller chooses how to handle it before any hole is introduced.
     pub(super) async fn prepare_direct_destinations(
         &mut self,
         job_id: JobId,
@@ -868,7 +868,7 @@ impl Pipeline {
         result
     }
 
-    /// The destinations of `batches` this job has not created yet.
+    // The destinations of `batches` this job has not created yet.
     pub(super) fn unprepared_direct_destinations(
         &self,
         job_id: JobId,
@@ -901,7 +901,7 @@ impl Pipeline {
             .extend(prepared);
     }
 
-    /// The suppressed twin of `commit_persisted_segment`.
+    // The suppressed twin of `commit_persisted_segment`.
     // The extra four arguments are the conventional seam's own dual-CRC
     // contract, carried here rather than re-derived: placement, the article's
     // pCRC and whether it was independently verified, and the block-aligned
@@ -1113,9 +1113,9 @@ impl Pipeline {
             .await;
     }
 
-    /// What a completed volume does once every byte it routed is the set's
-    /// coverage: checkpoint the phase change, judge an open identity plan,
-    /// and finalize whatever is ready.
+    // What a completed volume does once every byte it routed is the set's
+    // coverage: checkpoint the phase change, judge an open identity plan,
+    // and finalize whatever is ready.
     pub(super) async fn finish_direct_volume_completion(
         &mut self,
         job_id: JobId,
@@ -1152,13 +1152,13 @@ impl Pipeline {
         self.check_job_completion(job_id).await;
     }
 
-    /// Commits every set of `job_id` whose members have all passed their gates
-    /// and whose job is allowed to finalize (see
-    /// [`Self::direct_finalization_waits_for_par2`]).
-    ///
-    /// Called from the routing seam and from the completion gate, because those
-    /// are the two moments the answer can change: the last article of the last
-    /// volume, and the verification that clears a par2-bearing job.
+    // Commits every set of `job_id` whose members have all passed their gates
+    // and whose job is allowed to finalize (see
+    // [`Self::direct_finalization_waits_for_par2`]).
+    //
+    // Called from the routing seam and from the completion gate, because those
+    // are the two moments the answer can change: the last article of the last
+    // volume, and the verification that clears a par2-bearing job.
     pub(crate) async fn finalize_ready_direct_sets(&mut self, job_id: JobId) {
         if self.direct_store.sets_for(job_id).is_empty() {
             return;
@@ -1260,22 +1260,22 @@ impl Pipeline {
         self.release_retained_direct_volumes(job_id).await;
     }
 
-    /// Whether a direct set must keep its envelopes and partials because the
-    /// job's PAR2 verification has not concluded.
-    ///
-    /// Finalization renames the partials to their destinations and deletes the
-    /// envelopes, which together *are* the virtual volume image: after it,
-    /// nothing can answer a PAR2 read about a source volume, and nothing can
-    /// reconstruct one for a demotion either. A par2-bearing set therefore
-    /// waits — routed, gated, byte-complete, but uncommitted — until the job is
-    /// verified, bypassed, or has no parsed PAR2 set to verify against.
-    ///
-    /// The release conditions are the completion gate's own, so a job that will
-    /// never verify releases rather than waiting for something that is not
-    /// coming — which matters because PAR2 is posted last and downloaded last:
-    /// at the moment a set's final volume lands there is usually **no parsed
-    /// PAR2 set yet**, and "no set" must mean "not yet" while an article can
-    /// still arrive, and "never" once the download pipeline has drained.
+    // Whether a direct set must keep its envelopes and partials because the
+    // job's PAR2 verification has not concluded.
+    //
+    // Finalization renames the partials to their destinations and deletes the
+    // envelopes, which together *are* the virtual volume image: after it,
+    // nothing can answer a PAR2 read about a source volume, and nothing can
+    // reconstruct one for a demotion either. A par2-bearing set therefore
+    // waits — routed, gated, byte-complete, but uncommitted — until the job is
+    // verified, bypassed, or has no parsed PAR2 set to verify against.
+    //
+    // The release conditions are the completion gate's own, so a job that will
+    // never verify releases rather than waiting for something that is not
+    // coming — which matters because PAR2 is posted last and downloaded last:
+    // at the moment a set's final volume lands there is usually **no parsed
+    // PAR2 set yet**, and "no set" must mean "not yet" while an article can
+    // still arrive, and "never" once the download pipeline has drained.
     pub(super) fn direct_finalization_waits_for_par2(&self, job_id: JobId) -> bool {
         if !self.job_spec_has_par2_file(job_id) {
             return false;
@@ -1292,8 +1292,8 @@ impl Pipeline {
         self.job_has_pending_download_pipeline_work(job_id)
     }
 
-    /// Polls the automatic barrier triggers for every live set. Called from the
-    /// orchestrator's existing periodic seam.
+    // Polls the automatic barrier triggers for every live set. Called from the
+    // orchestrator's existing periodic seam.
     pub(crate) async fn poll_direct_store_barriers(&mut self) {
         let now = Instant::now();
         for job_id in self.direct_store.active_jobs() {
@@ -1314,9 +1314,9 @@ impl Pipeline {
         }
     }
 
-    /// Demands a barrier for every live set of every job. Shutdown's entry
-    /// point: a demanded barrier is always attempted, however many have just
-    /// failed, so the last interval's work is not lost for free.
+    // Demands a barrier for every live set of every job. Shutdown's entry
+    // point: a demanded barrier is always attempted, however many have just
+    // failed, so the last interval's work is not lost for free.
     pub(crate) async fn demand_direct_store_barriers_for_all_jobs(
         &mut self,
         demand: BarrierDemand,
@@ -1326,10 +1326,10 @@ impl Pipeline {
         }
     }
 
-    /// Demands a barrier for every live set of a job — pause, shutdown, phase
-    /// change, demotion and finalization all go through here. A finalized set
-    /// is not live: its row is the installation marker, which a barrier
-    /// would overwrite (see [`DirectSet::run_barrier`]).
+    // Demands a barrier for every live set of a job — pause, shutdown, phase
+    // change, demotion and finalization all go through here. A finalized set
+    // is not live: its row is the installation marker, which a barrier
+    // would overwrite (see [`DirectSet::run_barrier`]).
     pub(crate) async fn demand_direct_store_barriers(
         &mut self,
         job_id: JobId,
@@ -1353,16 +1353,16 @@ impl Pipeline {
         }
     }
 
-    /// Starts a polled barrier and returns at once: the checkpoint snapshot is
-    /// taken here, on the pipeline task, and the destination syncs run on a
-    /// task of their own. [`Self::handle_direct_barrier_done`] commits the
-    /// snapshot once they are in. The controller refuses a second prepare
-    /// while one is out, so a set has at most one barrier in flight.
-    ///
-    /// The barrier used to run whole on the pipeline task, syncs included.
-    /// Under a slow destination — a network share answering fsyncs in seconds
-    /// — every lane of every job stopped for the whole sync, once per 256 MiB
-    /// batch, and the download ran in bursts between them.
+    // Starts a polled barrier and returns at once: the checkpoint snapshot is
+    // taken here, on the pipeline task, and the destination syncs run on a
+    // task of their own. [`Self::handle_direct_barrier_done`] commits the
+    // snapshot once they are in. The controller refuses a second prepare
+    // while one is out, so a set has at most one barrier in flight.
+    //
+    // The barrier used to run whole on the pipeline task, syncs included.
+    // Under a slow destination — a network share answering fsyncs in seconds
+    // — every lane of every job stopped for the whole sync, once per 256 MiB
+    // batch, and the download ran in bursts between them.
     pub(in crate::pipeline) fn start_direct_barrier(
         &mut self,
         job_id: JobId,
@@ -1430,7 +1430,7 @@ impl Pipeline {
         );
     }
 
-    /// The syncs of a started barrier are in: commit its snapshot.
+    // The syncs of a started barrier are in: commit its snapshot.
     pub(in crate::pipeline) async fn handle_direct_barrier_done(
         &mut self,
         done: DirectBarrierDone,
@@ -1454,10 +1454,10 @@ impl Pipeline {
             .await;
     }
 
-    /// Waits for a set's in-flight barrier, if any, and commits it. A demanded
-    /// barrier cannot start until the flight is settled — the controller has
-    /// one snapshot out at a time — and it must not wait for the done message
-    /// either, because the demand may be the pipeline's own shutdown.
+    // Waits for a set's in-flight barrier, if any, and commits it. A demanded
+    // barrier cannot start until the flight is settled — the controller has
+    // one snapshot out at a time — and it must not wait for the done message
+    // either, because the demand may be the pipeline's own shutdown.
     async fn join_direct_barrier_flight(&mut self, job_id: JobId, set_index: usize) {
         let Some(flight) = self.direct_barrier_flights.remove(&(job_id, set_index)) else {
             return;
@@ -1552,8 +1552,8 @@ impl Pipeline {
         }
     }
 
-    /// Runs a demanded barrier whole, on the pipeline task, after settling
-    /// any barrier the set has in flight.
+    // Runs a demanded barrier whole, on the pipeline task, after settling
+    // any barrier the set has in flight.
     pub(in crate::pipeline) async fn run_direct_barrier(
         &mut self,
         job_id: JobId,
@@ -1618,20 +1618,20 @@ impl Pipeline {
         Self::report_direct_barrier(job_id, dirty_bytes, outcome);
     }
 
-    /// Commits a finished set: every member's partial becomes its destination
-    /// through the extractor's own path resolution, and the set is marked
-    /// extracted so the `Extracting` phase is pure bookkeeping.
-    ///
-    /// # The phase looks instant, and that is the documented behaviour
-    ///
-    /// There is nothing left to extract here — the payload has been at its
-    /// destination since the articles arrived — so `Extracting` completes
-    /// immediately and may not be visible at all. The settled answer to that:
-    /// **document it, add no synthetic delay, and change no GraphQL surface.**
-    /// The README carries the user-facing wording; the rule for this function
-    /// is that it must not slow down, and must not emit a phase it did not
-    /// really run, to make the UI look more familiar. A set that demotes
-    /// reports a real extraction phase because it really runs one.
+    // Commits a finished set: every member's partial becomes its destination
+    // through the extractor's own path resolution, and the set is marked
+    // extracted so the `Extracting` phase is pure bookkeeping.
+    //
+    // # The phase looks instant, and that is the documented behaviour
+    //
+    // There is nothing left to extract here — the payload has been at its
+    // destination since the articles arrived — so `Extracting` completes
+    // immediately and may not be visible at all. The settled answer to that:
+    // **document it, add no synthetic delay, and change no GraphQL surface.**
+    // The README carries the user-facing wording; the rule for this function
+    // is that it must not slow down, and must not emit a phase it did not
+    // really run, to make the UI look more familiar. A set that demotes
+    // reports a real extraction phase because it really runs one.
     pub(super) async fn finalize_direct_set(&mut self, job_id: JobId, set_index: usize) {
         self.run_direct_barrier(
             job_id,
@@ -2028,41 +2028,41 @@ impl Pipeline {
         );
     }
 
-    /// Keeps a finalizing set's virtual volume image alive past its own commit,
-    /// when the job's PAR2 story can still need it.
-    ///
-    /// # The gap this closes
-    ///
-    /// Finalization renames a set's member partials to their destinations and
-    /// deletes its per-volume envelopes, so nothing can serve its source volumes
-    /// afterwards. If the job's recovery set also covers a **second** direct set
-    /// that is later found damaged, Reed–Solomon needs the surviving input
-    /// slices from *every* file it describes — the finalized set's volumes
-    /// included — and `execute_repair` fails on the ones it cannot open. The two
-    /// halves were mutually exclusive: with the finalized set's volumes absent
-    /// the neighbour could not repair, and materializing them under their own
-    /// names is the whole thing direct-store exists not to do.
-    ///
-    /// Retaining is the narrow answer. The bytes are already on disk twice over
-    /// — the envelope holds every non-member byte at its true physical offset,
-    /// and the member bytes are byte-identical at their destinations, because a
-    /// commit is a rename — so the image needs no reconstruction, only a pointer
-    /// swap and a stay of execution for the envelopes.
-    ///
-    /// # What is *not* retained
-    ///
-    /// - a job with no PAR2 file: there is no repair to serve;
-    /// - a set with no **live** neighbour: nothing left in this job can ask, and
-    ///   the release sweep below deletes what the last one held;
-    /// - an **encrypted** set that cannot reproduce its posted bytes. One that
-    ///   can is retained like any other: a commit is a rename, so
-    ///   the overlay re-encrypts out of the committed member exactly as it did
-    ///   out of the partial;
-    /// - an image with a hole in it — see
-    ///   [`DirectSet::retain_finalized_volumes`].
-    ///
-    /// A set that retains nothing keeps today's behaviour exactly, and
-    /// `forgive_finalized_direct_volumes` keeps excusing its absent volumes.
+    // Keeps a finalizing set's virtual volume image alive past its own commit,
+    // when the job's PAR2 story can still need it.
+    //
+    // # The gap this closes
+    //
+    // Finalization renames a set's member partials to their destinations and
+    // deletes its per-volume envelopes, so nothing can serve its source volumes
+    // afterwards. If the job's recovery set also covers a **second** direct set
+    // that is later found damaged, Reed–Solomon needs the surviving input
+    // slices from *every* file it describes — the finalized set's volumes
+    // included — and `execute_repair` fails on the ones it cannot open. The two
+    // halves were mutually exclusive: with the finalized set's volumes absent
+    // the neighbour could not repair, and materializing them under their own
+    // names is the whole thing direct-store exists not to do.
+    //
+    // Retaining is the narrow answer. The bytes are already on disk twice over
+    // — the envelope holds every non-member byte at its true physical offset,
+    // and the member bytes are byte-identical at their destinations, because a
+    // commit is a rename — so the image needs no reconstruction, only a pointer
+    // swap and a stay of execution for the envelopes.
+    //
+    // # What is *not* retained
+    //
+    // - a job with no PAR2 file: there is no repair to serve;
+    // - a set with no **live** neighbour: nothing left in this job can ask, and
+    //   the release sweep below deletes what the last one held;
+    // - an **encrypted** set that cannot reproduce its posted bytes. One that
+    //   can is retained like any other: a commit is a rename, so
+    //   the overlay re-encrypts out of the committed member exactly as it did
+    //   out of the partial;
+    // - an image with a hole in it — see
+    //   [`DirectSet::retain_finalized_volumes`].
+    //
+    // A set that retains nothing keeps today's behaviour exactly, and
+    // `forgive_finalized_direct_volumes` keeps excusing its absent volumes.
     pub(super) fn retain_finalized_direct_volumes(
         &mut self,
         job_id: JobId,
@@ -2127,22 +2127,22 @@ impl Pipeline {
         retained
     }
 
-    /// Deletes what [`Self::retain_finalized_direct_volumes`] kept, once the job
-    /// has no live direct set left to ask for it.
-    ///
-    /// The window is deliberately the job's *direct* sets rather than the job:
-    /// the only reader of a retained image is the repair behind
-    /// [`Self::resolve_direct_sets_before_par2_repairer`], which runs for live
-    /// sets only, so the moment the last one finalizes or demotes there is
-    /// nothing left that can read one. Called from the two seams that can change
-    /// that answer — a set finalizing and a set demoting — so the deferral costs
-    /// one directory of envelopes for one job for the span between them and not
-    /// a byte longer.
-    ///
-    /// Anything a crash leaves behind is swept at restart: a finalized set
-    /// retired its checkpoint row, so restore rebuilds it fresh, claims none of
-    /// its envelopes and `sweep_orphan_direct_files` deletes every one of them.
-    /// Nothing about retention is persisted, and nothing needs to be.
+    // Deletes what [`Self::retain_finalized_direct_volumes`] kept, once the job
+    // has no live direct set left to ask for it.
+    //
+    // The window is deliberately the job's *direct* sets rather than the job:
+    // the only reader of a retained image is the repair behind
+    // [`Self::resolve_direct_sets_before_par2_repairer`], which runs for live
+    // sets only, so the moment the last one finalizes or demotes there is
+    // nothing left that can read one. Called from the two seams that can change
+    // that answer — a set finalizing and a set demoting — so the deferral costs
+    // one directory of envelopes for one job for the span between them and not
+    // a byte longer.
+    //
+    // Anything a crash leaves behind is swept at restart: a finalized set
+    // retired its checkpoint row, so restore rebuilds it fresh, claims none of
+    // its envelopes and `sweep_orphan_direct_files` deletes every one of them.
+    // Nothing about retention is persisted, and nothing needs to be.
     pub(super) async fn release_retained_direct_volumes(&mut self, job_id: JobId) {
         let sets = self.direct_store.sets_for(job_id);
         if sets.iter().all(|set| set.retained_volumes().is_none()) {
@@ -2180,47 +2180,47 @@ impl Pipeline {
         }
     }
 
-    /// The member tolerance: extracts **only** the tolerated member indices,
-    /// through the hybrid virtual-volume provider, straight to their
-    /// destinations.
-    ///
-    /// The ticket first consumes an eligible virtual-volume chase, checking
-    /// its produced names against the final tolerated-member list. If no
-    /// usable chase exists, one blocking task decodes those members from their
-    /// envelopes after the last article. Stored members remain router-owned
-    /// on both paths.
-    ///
-    /// Returns the raw member names that were produced, for
-    /// `extracted_members`. The distinction that separates this from the
-    /// out-of-scope per-member physical fallback is that it extracts a strict
-    /// *subset*: a direct-routed `Store` member is never re-extracted and never
-    /// overwritten here, which is checked rather than assumed — a tolerated
-    /// member resolving onto a stored member's destination is refused, and the
-    /// set demotes.
-    ///
-    /// # Directory members are created, never extracted
-    ///
-    /// A directory entry is a dataless header. It is created through the same
-    /// [`ExtractionRoot`] the conventional extractor creates one through — same
-    /// path validator, same budget, same "already there is fine, a
-    /// non-directory in the way is not" rule — and never through
-    /// `File::create`, which would leave an empty *file* named like the
-    /// directory the archive describes.
-    ///
-    /// Directory times are restored after the stored-member commit loop,
-    /// because each rename into a directory can change its mtime. Fallback
-    /// carries the parsed member metadata; installed chase output carries its
-    /// already-restored filesystem times and needs no second header walk.
-    ///
-    /// **Off the pipeline task.** The tolerance no longer caps a member's size,
-    /// so this decode can run as long as a conventional extraction of the same
-    /// bytes, and it reads the virtual volumes off disk. The first call for a
-    /// set snapshots everything the decode needs and hands it to a blocking
-    /// worker as a [`DirectToleratedWork`] ticket, returning `Ok(None)`; the
-    /// ticket's completion re-enters [`Self::finalize_ready_direct_sets`], and
-    /// the call that finds its result parked returns `Ok(Some(_))`. One ticket
-    /// per job: a sibling set that is ready at the same time waits its turn,
-    /// which is the same serialization the commit loop imposes anyway.
+    // The member tolerance: extracts **only** the tolerated member indices,
+    // through the hybrid virtual-volume provider, straight to their
+    // destinations.
+    //
+    // The ticket first consumes an eligible virtual-volume chase, checking
+    // its produced names against the final tolerated-member list. If no
+    // usable chase exists, one blocking task decodes those members from their
+    // envelopes after the last article. Stored members remain router-owned
+    // on both paths.
+    //
+    // Returns the raw member names that were produced, for
+    // `extracted_members`. The distinction that separates this from the
+    // out-of-scope per-member physical fallback is that it extracts a strict
+    // *subset*: a direct-routed `Store` member is never re-extracted and never
+    // overwritten here, which is checked rather than assumed — a tolerated
+    // member resolving onto a stored member's destination is refused, and the
+    // set demotes.
+    //
+    // # Directory members are created, never extracted
+    //
+    // A directory entry is a dataless header. It is created through the same
+    // [`ExtractionRoot`] the conventional extractor creates one through — same
+    // path validator, same budget, same "already there is fine, a
+    // non-directory in the way is not" rule — and never through
+    // `File::create`, which would leave an empty *file* named like the
+    // directory the archive describes.
+    //
+    // Directory times are restored after the stored-member commit loop,
+    // because each rename into a directory can change its mtime. Fallback
+    // carries the parsed member metadata; installed chase output carries its
+    // already-restored filesystem times and needs no second header walk.
+    //
+    // **Off the pipeline task.** The tolerance no longer caps a member's size,
+    // so this decode can run as long as a conventional extraction of the same
+    // bytes, and it reads the virtual volumes off disk. The first call for a
+    // set snapshots everything the decode needs and hands it to a blocking
+    // worker as a [`DirectToleratedWork`] ticket, returning `Ok(None)`; the
+    // ticket's completion re-enters [`Self::finalize_ready_direct_sets`], and
+    // the call that finds its result parked returns `Ok(Some(_))`. One ticket
+    // per job: a sibling set that is ready at the same time waits its turn,
+    // which is the same serialization the commit loop imposes anyway.
     pub(super) async fn extract_tolerated_members(
         &mut self,
         job_id: JobId,
@@ -2565,13 +2565,13 @@ impl Pipeline {
         Ok(None)
     }
 
-    /// The tolerated-extraction ticket's completion, on the pipeline task.
-    ///
-    /// Parks the result for the finalization pass and re-enters that pass at
-    /// once: the set the ticket belongs to is ready and waiting on nothing but
-    /// this, and the completion check will not judge the job while the ticket
-    /// is outstanding. A ticket the demotion or job-teardown seams already
-    /// forgot is discarded by the fence.
+    // The tolerated-extraction ticket's completion, on the pipeline task.
+    //
+    // Parks the result for the finalization pass and re-enters that pass at
+    // once: the set the ticket belongs to is ready and waiting on nothing but
+    // this, and the completion check will not judge the job while the ticket
+    // is outstanding. A ticket the demotion or job-teardown seams already
+    // forgot is discarded by the fence.
     pub(in crate::pipeline) async fn handle_direct_tolerated_done(
         &mut self,
         done: DirectToleratedWorkDone,
@@ -2612,18 +2612,18 @@ impl Pipeline {
     }
 }
 
-/// Whether a failed destination write is the filesystem refusing the location
-/// itself, which the conventional path writes into as well — as opposed to a
-/// failure tied to a name only direct store derives, such as an envelope or a
-/// member partial the filesystem finds too long.
-///
-/// `AlreadyExists` is what creating a directory reports, on every platform,
-/// when a file stands where the directory belongs. Destination opens create
-/// or reuse, so they never report it themselves.
-/// Creates each destination in `paths` — its parent directory, then the file
-/// itself marked sparse — and returns the ones it created alongside the
-/// verdict. Free of the pipeline so a placement task can run it; the caller
-/// records what it created. See [`Pipeline::prepare_direct_destinations`].
+// Whether a failed destination write is the filesystem refusing the location
+// itself, which the conventional path writes into as well — as opposed to a
+// failure tied to a name only direct store derives, such as an envelope or a
+// member partial the filesystem finds too long.
+//
+// `AlreadyExists` is what creating a directory reports, on every platform,
+// when a file stands where the directory belongs. Destination opens create
+// or reuse, so they never report it themselves.
+// Creates each destination in `paths` — its parent directory, then the file
+// itself marked sparse — and returns the ones it created alongside the
+// verdict. Free of the pipeline so a placement task can run it; the caller
+// records what it created. See [`Pipeline::prepare_direct_destinations`].
 pub(super) async fn prepare_direct_destination_paths(
     job_id: JobId,
     paths: Vec<PathBuf>,

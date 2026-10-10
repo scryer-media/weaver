@@ -406,11 +406,11 @@ fn transport_interruption_is_not_a_missing_trailer() {
     assert!(decoder.decode_available(&mut input).unwrap().is_none());
 }
 
-/// An `=ypart` line marks a slice of a larger file even when neither `=ybegin
-/// part=` nor a usable `begin=` came with it. The whole-file size must not be
-/// held against the slice, `pcrc32` is what checks it, and the file-wide
-/// `crc32` must survive as the whole-file expectation rather than being
-/// replaced by the part's own checksum.
+// An `=ypart` line marks a slice of a larger file even when neither `=ybegin
+// part=` nor a usable `begin=` came with it. The whole-file size must not be
+// held against the slice, `pcrc32` is what checks it, and the file-wide
+// `crc32` must survive as the whole-file expectation rather than being
+// replaced by the part's own checksum.
 #[test]
 fn an_unplaceable_part_without_a_part_number_is_still_a_part() {
     let mut crc = weaver_yenc::crc::Crc32::new();
@@ -446,10 +446,10 @@ fn an_unplaceable_part_without_a_part_number_is_still_a_part() {
     }
 }
 
-/// A part whose `=ypart begin=` cannot be read still decodes: the bytes are
-/// intact, only their position is unknown. Every chunking must agree that the
-/// article is delivered, that the defect is recorded, and that no offset is
-/// invented for it.
+// A part whose `=ypart begin=` cannot be read still decodes: the bytes are
+// intact, only their position is unknown. Every chunking must agree that the
+// article is delivered, that the defect is recorded, and that no offset is
+// invented for it.
 #[test]
 fn unusable_multipart_starts_decode_without_a_position() {
     for range in [
@@ -497,7 +497,7 @@ fn unusable_multipart_starts_decode_without_a_position() {
     }
 }
 
-/// What one decode path made of an article: the bytes and the verdict.
+// What one decode path made of an article: the bytes and the verdict.
 #[derive(Debug, PartialEq)]
 struct Verdict {
     data: Vec<u8>,
@@ -524,8 +524,8 @@ fn whole_buffer_verdict(article: &[u8]) -> Verdict {
     Verdict::of(output[..result.bytes_written].to_vec(), &result)
 }
 
-/// The whole-buffer, streaming and fused decoders give one verdict for the
-/// article at every wire split, and it is `expected`.
+// The whole-buffer, streaming and fused decoders give one verdict for the
+// article at every wire split, and it is `expected`.
 fn assert_three_way(article: &[u8], expected: &Verdict, name: &str) {
     assert_eq!(
         &whole_buffer_verdict(article),
@@ -574,12 +574,12 @@ fn table_article(body: &[u8], pcrc32: u32) -> Vec<u8> {
     .concat()
 }
 
-/// A lone `=` ending the last body line before the trailer, and every related
-/// shape: whole-buffer, streaming and fused decode each the way rapidyenc and
-/// sabctools do, byte for byte and verdict for verdict, at every wire split.
-/// The `=` escapes the line's `\r` (0xA3), the `\r` still breaks the line, the
-/// trailer is found, and a damaged article reports its CRC mismatch with its
-/// data kept.
+// A lone `=` ending the last body line before the trailer, and every related
+// shape: whole-buffer, streaming and fused decode each the way rapidyenc and
+// sabctools do, byte for byte and verdict for verdict, at every wire split.
+// The `=` escapes the line's `\r` (0xA3), the `\r` still breaks the line, the
+// trailer is found, and a damaged article reports its CRC mismatch with its
+// data kept.
 #[test]
 fn escape_before_trailer_agrees_on_every_path() {
     let ab = crc32(b"AB");
@@ -683,9 +683,9 @@ fn escape_before_trailer_agrees_on_every_path() {
     assert_three_way(&lf_only, &verdict, "T9");
 }
 
-/// T11: the escape before the trailer at every offset of a 64-byte window, and
-/// across a 64 KiB read, deep in a body long enough for the SIMD kernels, gives
-/// one verdict on every path.
+// T11: the escape before the trailer at every offset of a 64-byte window, and
+// across a 64 KiB read, deep in a body long enough for the SIMD kernels, gives
+// one verdict on every path.
 #[test]
 fn escape_before_trailer_agrees_at_every_window_offset() {
     let line = [b'k'; 128];

@@ -1,8 +1,8 @@
-//! The decode matrix's own budget
-//! What the quick pass is allowed to be blocked by
-//! The whole-file-CRC quick-verification arm.
-//! Evidence seeding on the authoritative pass.
-//! Repairing on the verdict that asked for the recovery.
+// The decode matrix's own budget
+// What the quick pass is allowed to be blocked by
+// The whole-file-CRC quick-verification arm.
+// Evidence seeding on the authoritative pass.
+// Repairing on the verdict that asked for the recovery.
 
 use super::*;
 
@@ -10,14 +10,14 @@ use super::*;
 // The decode matrix's own budget
 // ---------------------------------------------------------------------------
 
-/// The budget is what refuses this set, and raising it is what accepts it.
-///
-/// The differential is the whole test: the same bytes, the same damage, the
-/// same recovery — only the limit moves. That is what makes the refusal
-/// actionable rather than a dead end, and it also settles what weaver's own
-/// 128 MiB default has to do with it: nothing. The default is far below the
-/// budget's floor, so the floor is what ruled, and only an explicitly larger
-/// limit changes the answer.
+// The budget is what refuses this set, and raising it is what accepts it.
+//
+// The differential is the whole test: the same bytes, the same damage, the
+// same recovery — only the limit moves. That is what makes the refusal
+// actionable rather than a dead end, and it also settles what weaver's own
+// 128 MiB default has to do with it: nothing. The default is far below the
+// budget's floor, so the floor is what ruled, and only an explicitly larger
+// limit changes the answer.
 #[test]
 fn the_decode_matrix_budget_refuses_only_absurdly_damaged_sets() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -63,10 +63,10 @@ fn the_decode_matrix_budget_refuses_only_absurdly_damaged_sets() {
     }
 }
 
-/// A job refused for a resource limit must say which knob exists.
-///
-/// The refusal used to reach the operator as a bare internal message with no
-/// stated remedy, which is how a *tunable* limit ends up looking permanent.
+// A job refused for a resource limit must say which knob exists.
+//
+// The refusal used to reach the operator as a bare internal message with no
+// stated remedy, which is how a *tunable* limit ends up looking permanent.
 #[tokio::test]
 async fn a_resource_limited_par2_verdict_names_the_memory_override() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -130,14 +130,14 @@ async fn a_resource_limited_par2_verdict_names_the_memory_override() {
 // What the quick pass is allowed to be blocked by
 // ---------------------------------------------------------------------------
 
-/// A clean payload beside a short *unprotected* file must not force a
-/// whole-set read.
-///
-/// The quick pass answers for the recovery set, so the only thing that can stop
-/// it is a file the set describes. An `.nfo` that lost an article is not one:
-/// the pass could not have spoken for it either way, and letting it turn the
-/// job away meant reading every byte of a payload already proven — the cost
-/// that made a clean job look like a slow one.
+// A clean payload beside a short *unprotected* file must not force a
+// whole-set read.
+//
+// The quick pass answers for the recovery set, so the only thing that can stop
+// it is a file the set describes. An `.nfo` that lost an article is not one:
+// the pass could not have spoken for it either way, and letting it turn the
+// job away meant reading every byte of a payload already proven — the cost
+// that made a clean job look like a slow one.
 #[tokio::test]
 async fn a_short_unprotected_file_does_not_force_the_authoritative_pass() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -329,12 +329,12 @@ async fn retained_promoted_recovery_buffer_does_not_report_active_fetch() {
     );
 }
 
-/// A metadata candidate that arrived without yielding a set is finished.
-///
-/// The gate asks for metadata on every entry. A promoted index that completed
-/// and parsed into nothing looks exactly like one that was never tried, so
-/// without the promoted flag being consulted the same file is enqueued again on
-/// every lap, forever.
+// A metadata candidate that arrived without yielding a set is finished.
+//
+// The gate asks for metadata on every entry. A promoted index that completed
+// and parsed into nothing looks exactly like one that was never tried, so
+// without the promoted flag being consulted the same file is enqueued again on
+// every lap, forever.
 #[tokio::test]
 async fn a_promoted_metadata_candidate_is_never_promoted_twice() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -371,7 +371,7 @@ async fn a_promoted_metadata_candidate_is_never_promoted_twice() {
     );
 }
 
-/// The second candidate takes its turn once the first is finished.
+// The second candidate takes its turn once the first is finished.
 #[tokio::test]
 async fn an_untried_metadata_candidate_follows_an_exhausted_one() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1051,11 +1051,11 @@ async fn queued_prefix_probe_rearms_only_its_selected_recovery_ordinal_once() {
     );
 }
 
-/// Once every candidate has settled, promotion reports that it is finished.
-///
-/// The callers read `false` as "nothing can produce metadata" and own the
-/// terminal failure from there; reporting `true` forever is what kept the job
-/// alive with nothing left to try.
+// Once every candidate has settled, promotion reports that it is finished.
+//
+// The callers read `false` as "nothing can produce metadata" and own the
+// terminal failure from there; reporting `true` forever is what kept the job
+// alive with nothing left to try.
 #[tokio::test]
 async fn exhausted_metadata_candidates_stop_promising_metadata() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1085,9 +1085,9 @@ async fn exhausted_metadata_candidates_stop_promising_metadata() {
     );
 }
 
-/// A metadata probe may reuse an article that ordinary bootstrap already
-/// exhausted. The second terminal result must still settle discovery without
-/// counting the missing bytes twice.
+// A metadata probe may reuse an article that ordinary bootstrap already
+// exhausted. The second terminal result must still settle discovery without
+// counting the missing bytes twice.
 #[tokio::test]
 async fn metadata_probe_observes_a_previously_booked_terminal_failure() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1266,14 +1266,14 @@ async fn a_failed_full_carrier_scan_preserves_prefix_discovery_and_restart_reope
     );
 }
 
-/// A candidate whose only article is missing everywhere closes discovery.
-///
-/// A discovery probe was only ever retired when the article had been recorded
-/// as an unavailable promoted recovery article, which is a narrower ledger than
-/// the terminal one: an article retired during the ordinary download pass never
-/// reaches it. The probe therefore stayed "still coming" for the rest of the
-/// job's life, discovery never closed, and the job waited on articles that had
-/// already been answered for.
+// A candidate whose only article is missing everywhere closes discovery.
+//
+// A discovery probe was only ever retired when the article had been recorded
+// as an unavailable promoted recovery article, which is a narrower ledger than
+// the terminal one: an article retired during the ordinary download pass never
+// reaches it. The probe therefore stayed "still coming" for the rest of the
+// job's life, discovery never closed, and the job waited on articles that had
+// already been answered for.
 #[tokio::test]
 async fn metadata_candidates_missing_on_every_server_close_discovery() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1310,7 +1310,7 @@ async fn metadata_candidates_missing_on_every_server_close_discovery() {
     );
 }
 
-/// A candidate still on the wire keeps the job waiting without re-enqueuing it.
+// A candidate still on the wire keeps the job waiting without re-enqueuing it.
 #[tokio::test]
 async fn a_metadata_candidate_still_in_flight_enqueues_nothing() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1336,13 +1336,13 @@ async fn a_metadata_candidate_still_in_flight_enqueues_nothing() {
     );
 }
 
-/// A repair's leftovers are shed even when a *later* set settles the job clean.
-///
-/// Purging by directory difference only ever ran in the repair tail, so a job
-/// whose last set needed no repair never reached it: the earlier set's damaged
-/// original stayed on disk and shipped with the payload. The aggregate settling
-/// is the moment every set that was going to rewrite this directory has done
-/// so, whichever kind of verdict happened to close it.
+// A repair's leftovers are shed even when a *later* set settles the job clean.
+//
+// Purging by directory difference only ever ran in the repair tail, so a job
+// whose last set needed no repair never reached it: the earlier set's damaged
+// original stayed on disk and shipped with the payload. The aggregate settling
+// is the moment every set that was going to rewrite this directory has done
+// so, whichever kind of verdict happened to close it.
 #[tokio::test]
 async fn repair_leftovers_are_shed_when_a_clean_set_settles_the_job() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1409,14 +1409,14 @@ async fn repair_leftovers_are_shed_when_a_clean_set_settles_the_job() {
     );
 }
 
-/// An index that can still arrive is not a residual to finalize around.
-///
-/// The shortcut that finalizes a job whose only incomplete files are archive
-/// residuals also tolerated an incomplete PAR2 index, on the reasoning that a
-/// job which already loaded a set has all the recovery data it is going to use.
-/// That reasoning predates a posting carrying more than one set: a second index
-/// still on the wire may describe files nothing has verified yet, and taking
-/// the shortcut delivers them unchecked.
+// An index that can still arrive is not a residual to finalize around.
+//
+// The shortcut that finalizes a job whose only incomplete files are archive
+// residuals also tolerated an incomplete PAR2 index, on the reasoning that a
+// job which already loaded a set has all the recovery data it is going to use.
+// That reasoning predates a posting carrying more than one set: a second index
+// still on the wire may describe files nothing has verified yet, and taking
+// the shortcut delivers them unchecked.
 #[tokio::test]
 async fn a_second_index_still_on_the_wire_is_not_an_ignorable_residual() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1546,11 +1546,11 @@ async fn a_second_index_still_on_the_wire_is_not_an_ignorable_residual() {
 // The whole-file-CRC quick-verification arm.
 // ---------------------------------------------------------------------------
 
-/// The arm's whole point: a file the grid never covered, carrying no MD5, is
-/// proved against the description's own slice CRC32s without a byte being read.
-///
-/// The payloads are moved off their paths for the duration of the pass, so a
-/// verdict that needed to read them could not have been reached at all.
+// The arm's whole point: a file the grid never covered, carrying no MD5, is
+// proved against the description's own slice CRC32s without a byte being read.
+//
+// The payloads are moved off their paths for the duration of the pass, so a
+// verdict that needed to read them could not have been reached at all.
 #[tokio::test]
 async fn a_clean_file_settles_from_its_streamed_whole_file_crc_without_reading_it() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1620,8 +1620,8 @@ async fn a_clean_file_settles_from_its_streamed_whole_file_crc_without_reading_i
     );
 }
 
-/// A trusted digest is the stronger instrument. When it contradicts the
-/// description the CRC arm binds, nothing here may settle the set.
+// A trusted digest is the stronger instrument. When it contradicts the
+// description the CRC arm binds, nothing here may settle the set.
 #[tokio::test]
 async fn a_streamed_file_crc_that_contradicts_a_measured_digest_falls_to_the_authoritative_pass() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1670,8 +1670,8 @@ async fn a_streamed_file_crc_that_contradicts_a_measured_digest_falls_to_the_aut
     );
 }
 
-/// The length gate. A file whose decoded length is not the described length is
-/// never a candidate, wherever its CRC32 might land.
+// The length gate. A file whose decoded length is not the described length is
+// never a candidate, wherever its CRC32 might land.
 #[tokio::test]
 async fn a_streamed_file_crc_at_the_wrong_length_never_binds_a_description() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1718,7 +1718,7 @@ async fn a_streamed_file_crc_at_the_wrong_length_never_binds_a_description() {
     );
 }
 
-/// The in-stream `Damaged` veto runs before every arm, this one included.
+// The in-stream `Damaged` veto runs before every arm, this one included.
 #[tokio::test]
 async fn a_damaged_in_stream_verdict_vetoes_the_whole_file_crc_arm() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1786,8 +1786,8 @@ async fn a_damaged_in_stream_verdict_vetoes_the_whole_file_crc_arm() {
     );
 }
 
-/// The streamed CRC32 is a fold of part CRCs. An article that never verified its
-/// declared part CRC leaves that fold unattested, and the arm refuses it.
+// The streamed CRC32 is a fold of part CRCs. An article that never verified its
+// declared part CRC leaves that fold unattested, and the arm refuses it.
 #[tokio::test]
 async fn a_file_with_an_unverified_part_crc_does_not_take_the_whole_file_crc_arm() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1842,18 +1842,18 @@ async fn a_file_with_an_unverified_part_crc_does_not_take_the_whole_file_crc_arm
     assert_eq!(evidence, QuickPar2Evidence::FileCrc);
 }
 
-/// The whole arm, driven by the production decode path rather than a hand-set
-/// checksum — and the shape that shows why there is nothing left for the MD5
-/// substitution to retire.
-///
-/// The first article lands before the recovery set is served, so it streams an
-/// MD5 and closes nothing on the block grid. The second lands after, so the
-/// substitution retires the hash — discarding the half-built digest — and the
-/// grid closes only the block that article covers. What survives is exactly the
-/// arm's input: no digest of any generation, a folded whole-file CRC32, every
-/// part CRC verified, and a grid that covers one of the two slices. Before the
-/// arm this set had no evidence at all and re-read every byte it had just
-/// written.
+// The whole arm, driven by the production decode path rather than a hand-set
+// checksum — and the shape that shows why there is nothing left for the MD5
+// substitution to retire.
+//
+// The first article lands before the recovery set is served, so it streams an
+// MD5 and closes nothing on the block grid. The second lands after, so the
+// substitution retires the hash — discarding the half-built digest — and the
+// grid closes only the block that article covers. What survives is exactly the
+// arm's input: no digest of any generation, a folded whole-file CRC32, every
+// part CRC verified, and a grid that covers one of the two slices. Before the
+// arm this set had no evidence at all and re-read every byte it had just
+// written.
 #[tokio::test]
 async fn a_partly_gridded_file_that_streamed_no_md5_settles_from_its_whole_file_crc() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1927,9 +1927,9 @@ async fn a_partly_gridded_file_that_streamed_no_md5_settles_from_its_whole_file_
 // Evidence seeding on the authoritative pass.
 // ---------------------------------------------------------------------------
 
-/// F2a, on the path a conventional job actually takes. The intact file's
-/// in-stream verdicts place its slices, so the analysis reads the damaged file
-/// and stops there.
+// F2a, on the path a conventional job actually takes. The intact file's
+// in-stream verdicts place its slices, so the analysis reads the damaged file
+// and stops there.
 #[tokio::test]
 async fn a_damaged_job_reads_only_its_damaged_file_when_the_grid_seeded_evidence() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1969,10 +1969,10 @@ async fn a_damaged_job_reads_only_its_damaged_file_when_the_grid_seeded_evidence
     );
 }
 
-/// The same job with the retained session switched off falls to the one-shot
-/// repairer, which has no seat for evidence in the crate's published API — so it
-/// reads both files. This is the control that pins the saving above to the
-/// seeding rather than to anything else about the fixture.
+// The same job with the retained session switched off falls to the one-shot
+// repairer, which has no seat for evidence in the crate's published API — so it
+// reads both files. This is the control that pins the saving above to the
+// seeding rather than to anything else about the fixture.
 #[tokio::test]
 async fn the_one_shot_repairer_reads_every_file_because_it_has_no_seat_for_evidence() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2003,8 +2003,8 @@ async fn the_one_shot_repairer_reads_every_file_because_it_has_no_seat_for_evide
     );
 }
 
-/// A job the grid never covered is unchanged: every described file is read, and
-/// the verdict is reached the way it always was.
+// A job the grid never covered is unchanged: every described file is read, and
+// the verdict is reached the way it always was.
 #[tokio::test]
 async fn a_damaged_job_with_no_in_stream_evidence_still_reads_and_verifies_every_file() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2034,13 +2034,13 @@ async fn a_damaged_job_with_no_in_stream_evidence_still_reads_and_verifies_every
 // Repairing on the verdict that asked for the recovery.
 // ---------------------------------------------------------------------------
 
-/// The defect this section exists for: a job whose recovery arrives must not
-/// pay for the damaged-path analysis twice.
-///
-/// The first pass reads the damaged payload, promotes the volume and parks. The
-/// second finds the volume landed and repairs on the verdict the first pass
-/// already reached — one authoritative analysis, one retained session, one scan
-/// of the sources for the whole ladder.
+// The defect this section exists for: a job whose recovery arrives must not
+// pay for the damaged-path analysis twice.
+//
+// The first pass reads the damaged payload, promotes the volume and parks. The
+// second finds the volume landed and repairs on the verdict the first pass
+// already reached — one authoritative analysis, one retained session, one scan
+// of the sources for the whole ladder.
 #[tokio::test]
 async fn a_landed_recovery_volume_repairs_on_the_analysis_that_asked_for_it() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2105,14 +2105,14 @@ async fn a_landed_recovery_volume_repairs_on_the_analysis_that_asked_for_it() {
     );
 }
 
-/// The shortcut is an optimisation, not a promise about the disk.
-///
-/// With the retained session forced off — the one-shot shape a session
-/// eviction, open failure or restart leaves behind — the parked verdict reaches
-/// the repair through par2-rs's scan carry, and the carry is stat-gated. Rewrite
-/// the damaged file between the two passes and the gate refuses it: par2-rs
-/// rescans on its own and repairs what is actually there, without weaver ever
-/// running a second analysis of its own.
+// The shortcut is an optimisation, not a promise about the disk.
+//
+// With the retained session forced off — the one-shot shape a session
+// eviction, open failure or restart leaves behind — the parked verdict reaches
+// the repair through par2-rs's scan carry, and the carry is stat-gated. Rewrite
+// the damaged file between the two passes and the gate refuses it: par2-rs
+// rescans on its own and repairs what is actually there, without weaver ever
+// running a second analysis of its own.
 #[tokio::test]
 async fn a_damaged_file_rewritten_before_the_parked_repair_is_rescanned_by_par2_rs() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2176,9 +2176,9 @@ async fn a_damaged_file_rewritten_before_the_parked_repair_is_rescanned_by_par2_
     );
 }
 
-/// A path-backed session refuses `FileId`-keyed evidence, so the conventional
-/// pass names a path — and it has to be the name the file now carries, not the
-/// one the NZB gave it.
+// A path-backed session refuses `FileId`-keyed evidence, so the conventional
+// pass names a path — and it has to be the name the file now carries, not the
+// one the NZB gave it.
 #[tokio::test]
 async fn slice_evidence_is_keyed_to_the_name_a_renamed_file_now_carries() {
     let temp_dir = tempfile::tempdir().unwrap();

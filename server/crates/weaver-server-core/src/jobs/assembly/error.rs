@@ -1,6 +1,6 @@
 use crate::jobs::ids::NzbFileId;
 
-/// Errors that can occur during file and job assembly.
+// Errors that can occur during file and job assembly.
 #[derive(Debug, thiserror::Error)]
 pub enum AssemblyError {
     #[error("segment {segment_number} out of range (total: {total_segments})")]

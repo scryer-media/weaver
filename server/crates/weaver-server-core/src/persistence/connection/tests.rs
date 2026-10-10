@@ -665,10 +665,10 @@ fn normalize_sqlite_index_expression(_table: &str, column: &str, collation: &str
     }
 }
 
-/// Append a canonical descending marker so both dialects encode index sort
-/// direction identically. Postgres only prints the non-default `DESC` in
-/// `pg_indexes.indexdef` (ascending is implicit), so ascending columns carry no
-/// suffix on either side and descending columns become `"<expr> desc"`.
+// Append a canonical descending marker so both dialects encode index sort
+// direction identically. Postgres only prints the non-default `DESC` in
+// `pg_indexes.indexdef` (ascending is implicit), so ascending columns carry no
+// suffix on either side and descending columns become `"<expr> desc"`.
 fn normalize_index_direction(expression: &str, descending: bool) -> String {
     if descending {
         format!("{} desc", expression.trim())
@@ -677,11 +677,11 @@ fn normalize_index_direction(expression: &str, descending: bool) -> String {
     }
 }
 
-/// Split a trailing Postgres sort-direction clause off an index-column
-/// expression, returning the bare expression plus whether it is descending. A
-/// default `NULLS FIRST/LAST` clause (which Postgres omits from `indexdef`) is
-/// dropped as well so it does not create spurious drift against SQLite, which
-/// never surfaces one.
+// Split a trailing Postgres sort-direction clause off an index-column
+// expression, returning the bare expression plus whether it is descending. A
+// default `NULLS FIRST/LAST` clause (which Postgres omits from `indexdef`) is
+// dropped as well so it does not create spurious drift against SQLite, which
+// never surfaces one.
 fn split_postgres_index_direction(expression: &str) -> (String, bool) {
     let mut rest = expression.trim();
     if let Some(stripped) = strip_trailing_keyword(rest, "nulls first")
@@ -698,9 +698,9 @@ fn split_postgres_index_direction(expression: &str) -> (String, bool) {
     (rest.to_string(), false)
 }
 
-/// Strip a whitespace-delimited trailing keyword (case-insensitive), returning
-/// the prefix when the keyword is present and preceded by whitespace (so column
-/// names ending in the keyword's letters, like `foodesc`, are not matched).
+// Strip a whitespace-delimited trailing keyword (case-insensitive), returning
+// the prefix when the keyword is present and preceded by whitespace (so column
+// names ending in the keyword's letters, like `foodesc`, are not matched).
 fn strip_trailing_keyword<'a>(value: &'a str, keyword: &str) -> Option<&'a str> {
     let trimmed = value.trim_end();
     let prefix = trimmed.get(..trimmed.len().checked_sub(keyword.len())?)?;
@@ -1163,9 +1163,9 @@ async fn try_queue_write_full_queue_resend_is_covered_by_flush() {
     );
 }
 
-/// Drives the Postgres lane writer directly. The ops below never touch the
-/// database, so an in-memory SQLite handle stands in for the one they receive;
-/// what is under test is only when each op is allowed to run.
+// Drives the Postgres lane writer directly. The ops below never touch the
+// database, so an in-memory SQLite handle stands in for the one they receive;
+// what is under test is only when each op is allowed to run.
 fn spawn_lane_writer(
     db: &Database,
     concurrency: usize,
@@ -1231,7 +1231,7 @@ fn push_lane_log(log: &LaneLog, entry: &'static str) {
     log.lock().unwrap().push(entry);
 }
 
-/// An op that blocks until `release` fires, then logs `entry`.
+// An op that blocks until `release` fires, then logs `entry`.
 fn gated_lane_op(
     log: &LaneLog,
     entry: &'static str,
@@ -1401,8 +1401,8 @@ async fn postgres_lanes_finish_every_taken_write_when_the_queue_closes() {
     assert_eq!(*log.lock().unwrap(), vec!["job1", "job1-after"]);
 }
 
-/// An op that reports it started, then blocks until `release` fires and logs
-/// `entry`.
+// An op that reports it started, then blocks until `release` fires and logs
+// `entry`.
 fn announced_gated_lane_op(
     log: &LaneLog,
     entry: &'static str,
@@ -1796,11 +1796,11 @@ async fn postgres_bulk_hot_paths_when_configured() {
     admin_pool.close().await;
 }
 
-/// Exercise the write ops whose Postgres arms today run as guarded autocommit
-/// statements (converted from `run_in_transaction`) plus the bulk primitives, so
-/// those pg-only code paths — unreachable on the sqlite-default suite — are
-/// validated end to end against a real Postgres. Row effects are asserted with
-/// reads after each step so a failure localizes to the offending op.
+// Exercise the write ops whose Postgres arms today run as guarded autocommit
+// statements (converted from `run_in_transaction`) plus the bulk primitives, so
+// those pg-only code paths — unreachable on the sqlite-default suite — are
+// validated end to end against a real Postgres. Row effects are asserted with
+// reads after each step so a failure localizes to the offending op.
 #[tokio::test]
 async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
     let Some((admin_pool, schema, target_url)) =
@@ -2887,10 +2887,10 @@ async fn postgres_runtime_smoke_when_configured() {
     admin_pool.close().await;
 }
 
-/// The direct-store coverage checkpoint is one replaced row per
-/// archive set. This is the Postgres twin of the sqlite roundtrip in
-/// `jobs::repository::tests`, so both engines are proven to upsert, read back
-/// and delete through the same three statements.
+// The direct-store coverage checkpoint is one replaced row per
+// archive set. This is the Postgres twin of the sqlite roundtrip in
+// `jobs::repository::tests`, so both engines are proven to upsert, read back
+// and delete through the same three statements.
 #[tokio::test]
 async fn postgres_direct_coverage_roundtrip_when_configured() {
     let Some((admin_pool, schema, target_url)) =

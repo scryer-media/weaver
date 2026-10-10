@@ -9,8 +9,8 @@ impl DownloadPipelineBacklog {
     }
 }
 
-/// A single actor-state view shared by work selection and queue availability.
-/// Parked retries and cached sockets cannot advance the durable byte floor.
+// A single actor-state view shared by work selection and queue availability.
+// Parked retries and cached sockets cannot advance the durable byte floor.
 #[derive(Clone, Copy)]
 pub(in crate::pipeline) struct CheckpointAdmission {
     pub(in crate::pipeline) enforced: bool,
@@ -45,9 +45,9 @@ impl CheckpointDecision {
     }
 }
 
-/// What a lease being built weighs against the restart checkpoint: the
-/// payload bytes it carries (recovery is exempt), and whether it holds
-/// anything at all.
+// What a lease being built weighs against the restart checkpoint: the
+// payload bytes it carries (recovery is exempt), and whether it holds
+// anything at all.
 #[derive(Clone, Copy, Default)]
 pub(in crate::pipeline) struct CheckpointLease {
     payload_bytes: u64,
@@ -84,7 +84,7 @@ impl CheckpointAdmission {
         self.decision_with_lease(work, CheckpointLease::of(leased))
     }
 
-    /// [`Self::decision`] against a lease already summed.
+    // [`Self::decision`] against a lease already summed.
     pub(in crate::pipeline) fn decision_with_lease(
         self,
         work: &DownloadWork,
@@ -123,15 +123,15 @@ impl DownloadPressure {
 }
 
 impl Pipeline {
-    /// Whether ahead-of-cursor UU parking is at one of its aggregate limits.
-    ///
-    /// This is the predicate the memory park consults, so it
-    /// only ever caps on evidence: the byte cap, the segment cap, or a
-    /// free-space reading (fresh or held from the last good probe) that shows
-    /// the reserve gone. A filesystem that has never produced a reading does
-    /// not cap here; it only refuses to *spill* (see
-    /// [`Self::admit_uu_spill`]), because memory parking never touches it and
-    /// a probe outage must not stall every UU job's dispatch.
+    // Whether ahead-of-cursor UU parking is at one of its aggregate limits.
+    //
+    // This is the predicate the memory park consults, so it
+    // only ever caps on evidence: the byte cap, the segment cap, or a
+    // free-space reading (fresh or held from the last good probe) that shows
+    // the reserve gone. A filesystem that has never produced a reading does
+    // not cap here; it only refuses to *spill* (see
+    // [`Self::admit_uu_spill`]), because memory parking never touches it and
+    // a probe outage must not stall every UU job's dispatch.
     pub(in crate::pipeline) fn uu_spool_admission_capped(
         &mut self,
         additional_spooled_bytes: usize,
@@ -158,9 +158,9 @@ impl Pipeline {
         byte_limit_reached || segment_limit_reached || free_space_too_low
     }
 
-    /// After a refused spill, fetch only known UU cursors until parking can
-    /// retain the refused bytes. Memory parking remains available to arrivals
-    /// already in flight, and yEnc retains its ordinary dispatch path.
+    // After a refused spill, fetch only known UU cursors until parking can
+    // retain the refused bytes. Memory parking remains available to arrivals
+    // already in flight, and yEnc retains its ordinary dispatch path.
     pub(in crate::pipeline) fn uu_spool_dispatch_capped(&mut self) -> bool {
         let available = self.uu_spool_capacity().best_available_bytes();
         if let Some(bytes) = self.uu_spool_blocked_spill_bytes {
@@ -174,13 +174,13 @@ impl Pipeline {
         self.uu_spool_limits_reached(0, available) || self.uu_spool_blocked_spill_bytes.is_some()
     }
 
-    /// Admit `spilled_bytes` of UU spool to disk, debiting the cached
-    /// free-space reading so a burst of spills inside one probe interval
-    /// cannot each see the same headroom.
-    ///
-    /// Unlike the memory park, a spill needs a reading to be judged: without
-    /// one the bytes are refused and the part is requeued, which keeps the
-    /// spool from writing blind into a filesystem it cannot measure.
+    // Admit `spilled_bytes` of UU spool to disk, debiting the cached
+    // free-space reading so a burst of spills inside one probe interval
+    // cannot each see the same headroom.
+    //
+    // Unlike the memory park, a spill needs a reading to be judged: without
+    // one the bytes are refused and the part is requeued, which keeps the
+    // spool from writing blind into a filesystem it cannot measure.
     pub(in crate::pipeline) fn admit_uu_spill(&mut self, spilled_bytes: usize) -> bool {
         let available = self.uu_spool_capacity().best_available_bytes();
         let admitted =
@@ -197,8 +197,8 @@ impl Pipeline {
         admitted
     }
 
-    /// The spool filesystem's reading less the spills admitted against it.
-    /// Reads the sampler's cache; never touches the filesystem.
+    // The spool filesystem's reading less the spills admitted against it.
+    // Reads the sampler's cache; never touches the filesystem.
     pub(in crate::pipeline) fn uu_spool_capacity(&mut self) -> crate::operations::Capacity {
         #[cfg(test)]
         if let Some(available) = self.uu_spool_available_bytes_for_test {
@@ -450,15 +450,15 @@ impl Pipeline {
         );
     }
 
-    /// Every configured connection is available to downloads, always.
-    ///
-    /// Nothing is held back here any more. Two subtractions used to live in
-    /// this function and both reserved capacity for work that was not asking
-    /// for it: a bandwidth-derived recovery reserve, whose recovery blocks stay
-    /// parked until a checkpoint promotes them, and one connection per job
-    /// running a health probe, which is a handful of STAT round trips that ride
-    /// the lanes rather than opening a connection of their own. Between them
-    /// they idled connections for the whole of a job's main download.
+    // Every configured connection is available to downloads, always.
+    //
+    // Nothing is held back here any more. Two subtractions used to live in
+    // this function and both reserved capacity for work that was not asking
+    // for it: a bandwidth-derived recovery reserve, whose recovery blocks stay
+    // parked until a checkpoint promotes them, and one connection per job
+    // running a health probe, which is a handful of STAT round trips that ride
+    // the lanes rather than opening a connection of their own. Between them
+    // they idled connections for the whole of a job's main download.
     pub(in crate::pipeline::download::worker) fn effective_download_connection_capacity(
         &self,
         configured_max: usize,

@@ -1,17 +1,17 @@
-//! What a header-encrypted (`-hp`) set pays to learn its own layout.
-//!
-//! A volume's headers are parsed out of the image its articles stage, and the
-//! image grows one article at a time — so the walk is retried as the volume
-//! arrives. On a `-hp` set every one of those walks has to decrypt the headers,
-//! and the key for that comes from a PBKDF2 run of up to 2^24 iterations over
-//! (password, salt, KDF count). All three are properties of the volume rather
-//! than of the walk, and a store volume's end-of-archive record sits past the
-//! whole payload, so the naive shape pays the full derivation once per arriving
-//! article for the entire volume and learns nothing new until its last one.
-//!
-//! Two things bound that, and this file pins both: the set derives into one
-//! cache that outlives the walks, and a walk that ran out of bytes is not
-//! repeated until the image can serve the byte it stopped at.
+// What a header-encrypted (`-hp`) set pays to learn its own layout.
+//
+// A volume's headers are parsed out of the image its articles stage, and the
+// image grows one article at a time — so the walk is retried as the volume
+// arrives. On a `-hp` set every one of those walks has to decrypt the headers,
+// and the key for that comes from a PBKDF2 run of up to 2^24 iterations over
+// (password, salt, KDF count). All three are properties of the volume rather
+// than of the walk, and a store volume's end-of-archive record sits past the
+// whole payload, so the naive shape pays the full derivation once per arriving
+// article for the entire volume and learns nothing new until its last one.
+//
+// Two things bound that, and this file pins both: the set derives into one
+// cache that outlives the walks, and a walk that ran out of bytes is not
+// repeated until the image can serve the byte it stopped at.
 
 use super::*;
 
@@ -22,9 +22,9 @@ const PARSE_COST_PASSWORD: &str = "lantern-tide";
 
 const PARSE_COST_MEMBER: &str = "Silver.Horizon.S03E04.mkv";
 
-/// The piece size the volumes are handed to the router in. Small enough that a
-/// fixture volume takes tens of them, which is the point: the cost under test
-/// is the one that scales with this number.
+// The piece size the volumes are handed to the router in. Small enough that a
+// fixture volume takes tens of them, which is the point: the cost under test
+// is the one that scales with this number.
 const PIECE_BYTES: usize = 512;
 
 fn parse_cost_router(volumes: &[(String, Vec<u8>)]) -> DirectSetRouter {
@@ -47,9 +47,9 @@ fn parse_cost_router(volumes: &[(String, Vec<u8>)]) -> DirectSetRouter {
     router
 }
 
-/// Feeds every volume in ascending, in-order pieces — the cheapest possible
-/// arrival order for the parser, and the one that makes the retry count a
-/// property of the gate rather than of the shuffle.
+// Feeds every volume in ascending, in-order pieces — the cheapest possible
+// arrival order for the parser, and the one that makes the retry count a
+// property of the gate rather than of the shuffle.
 fn route_in_pieces(router: &mut DirectSetRouter, volumes: &[(String, Vec<u8>)]) -> usize {
     let mut pieces = 0;
     for (index, (_, image)) in volumes.iter().enumerate() {
@@ -66,9 +66,9 @@ fn route_in_pieces(router: &mut DirectSetRouter, volumes: &[(String, Vec<u8>)]) 
     pieces
 }
 
-/// The whole point, in one number each: a set that arrives in a hundred pieces
-/// derives its keys a fixed number of times and walks its headers a fixed
-/// number of times.
+// The whole point, in one number each: a set that arrives in a hundred pieces
+// derives its keys a fixed number of times and walks its headers a fixed
+// number of times.
 #[tokio::test]
 async fn a_header_encrypted_set_pays_for_its_key_once_however_many_articles_arrive() {
     let payload: Vec<u8> = (0..40_000u32).map(|index| (index % 251) as u8).collect();
@@ -114,20 +114,20 @@ async fn a_header_encrypted_set_pays_for_its_key_once_however_many_articles_arri
     );
 }
 
-/// The gate is about what the image can *reach*, not about how much of it has
-/// arrived — and the walk that ends the volume still runs.
-///
-/// A stored volume's end-of-archive record sits past its whole payload, and
-/// the walk that stops there names the least the record could occupy: on a
-/// `-hp` volume that is exactly the record's own size, so the offset it asks
-/// the image to reach is the volume's own end. Every piece between the first
-/// and the last leaves that answer where it was; the piece that carries the
-/// record is the one that lets the walk read it. Reaching an offset means
-/// holding every byte *below* it — the byte at the volume's length does not
-/// exist, and a gate that waited for it would never walk this volume again
-/// unless its last article arrived to force the question (see
-/// `a_repaired_volume_tail_reroutes_into_a_header_encrypted_member`, where it
-/// never does).
+// The gate is about what the image can *reach*, not about how much of it has
+// arrived — and the walk that ends the volume still runs.
+//
+// A stored volume's end-of-archive record sits past its whole payload, and
+// the walk that stops there names the least the record could occupy: on a
+// `-hp` volume that is exactly the record's own size, so the offset it asks
+// the image to reach is the volume's own end. Every piece between the first
+// and the last leaves that answer where it was; the piece that carries the
+// record is the one that lets the walk read it. Reaching an offset means
+// holding every byte *below* it — the byte at the volume's length does not
+// exist, and a gate that waited for it would never walk this volume again
+// unless its last article arrived to force the question (see
+// `a_repaired_volume_tail_reroutes_into_a_header_encrypted_member`, where it
+// never does).
 #[tokio::test]
 async fn a_walk_is_repeated_only_once_it_could_answer_differently() {
     let payload: Vec<u8> = (0..20_000u32).map(|index| (index % 251) as u8).collect();

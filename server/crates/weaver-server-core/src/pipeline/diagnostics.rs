@@ -1,16 +1,16 @@
-//! A read-only snapshot of pipeline state that no other surface exposes.
-//!
-//! Everything here is copied out of the pipeline actor while it is blocked on
-//! the reply channel, so the rules are the same as for any other command
-//! handler: read fields, allocate bounded amounts, and never touch disk or the
-//! network. Nothing in this module may mutate pipeline state — a diagnostics
-//! read that changes what it is measuring is worse than no diagnostics at all.
-//!
-//! The snapshot exists because the fields that explain a stalled queue — the
-//! pressure latches, the deferred refill backlog, the per-job queue lengths —
-//! live inside the actor and are reachable nowhere else. The counters that are
-//! already published as metrics are folded in too, so one artefact answers the
-//! whole question rather than needing to be read alongside a scrape.
+// A read-only snapshot of pipeline state that no other surface exposes.
+//
+// Everything here is copied out of the pipeline actor while it is blocked on
+// the reply channel, so the rules are the same as for any other command
+// handler: read fields, allocate bounded amounts, and never touch disk or the
+// network. Nothing in this module may mutate pipeline state — a diagnostics
+// read that changes what it is measuring is worse than no diagnostics at all.
+//
+// The snapshot exists because the fields that explain a stalled queue — the
+// pressure latches, the deferred refill backlog, the per-job queue lengths —
+// live inside the actor and are reachable nowhere else. The counters that are
+// already published as metrics are folded in too, so one artefact answers the
+// whole question rather than needing to be read alongside a scrape.
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +18,7 @@ use super::Pipeline;
 use crate::jobs::JobStatus;
 use crate::runtime::tuning::TunedParameters;
 
-/// Everything the diagnostics package records about the running pipeline.
+// Everything the diagnostics package records about the running pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineDiagnostics {
     pub captured_at_epoch_ms: f64,
@@ -40,19 +40,19 @@ pub struct PipelineDiagnostics {
     pub memory: MemoryDiagnostics,
 }
 
-/// Tuner-owned concurrency parameters and the connection ceiling they respect.
+// Tuner-owned concurrency parameters and the connection ceiling they respect.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunerDiagnostics {
     #[serde(flatten)]
     pub params: TunedParameters,
-    /// Sum of the configured connections across every active server, as the
-    /// last NNTP activation reported it.
+    // Sum of the configured connections across every active server, as the
+    // last NNTP activation reported it.
     pub configured_connections: Option<usize>,
-    /// Size of the owned download lane pool.
+    // Size of the owned download lane pool.
     pub owned_lane_workers: usize,
 }
 
-/// Byte-pressure limits and the latches they drive.
+// Byte-pressure limits and the latches they drive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PressureDiagnostics {
     pub write_buf_max_pending: usize,
@@ -60,7 +60,7 @@ pub struct PressureDiagnostics {
     pub write_backlog_budget_bytes: usize,
     pub download_decode_hard_pressure_latched: bool,
     pub download_write_hard_pressure_latched: bool,
-    /// How long downloads have been blocked by hard pressure, if they are.
+    // How long downloads have been blocked by hard pressure, if they are.
     pub hard_stall_seconds: Option<f64>,
     pub write_buffered_bytes: usize,
     pub write_buffered_segments: usize,
@@ -78,7 +78,7 @@ pub struct PressureDiagnostics {
     pub uu_parked_segments: usize,
 }
 
-/// Per-job queue depths and in-flight work.
+// Per-job queue depths and in-flight work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobPipelineDiagnostics {
     pub job_id: u64,
@@ -96,55 +96,55 @@ pub struct JobPipelineDiagnostics {
     pub finalizing_download: bool,
     pub download_wait_reason: Option<String>,
     pub download_wait_pending: Option<usize>,
-    /// Optional so older diagnostic packets deserialize as unknown, not zero.
+    // Optional so older diagnostic packets deserialize as unknown, not zero.
     #[serde(default)]
     pub accepted_download_bytes: Option<u64>,
     #[serde(default)]
     pub durable_download_floor_bytes: Option<u64>,
-    /// Current undurable estimate plus the next queued primary article, if any.
+    // Current undurable estimate plus the next queued primary article, if any.
     #[serde(default)]
     pub projected_undurable_download_bytes: Option<u64>,
     #[serde(default)]
     pub checkpoint_lead_limit_bytes: Option<u64>,
-    /// Admission for the next primary article; no queue or retry state is changed.
+    // Admission for the next primary article; no queue or retry state is changed.
     #[serde(default)]
     pub checkpoint_admission: Option<String>,
-    /// Central infrastructure queue only; ordinary article retries are separate.
+    // Central infrastructure queue only; ordinary article retries are separate.
     #[serde(default)]
     pub infrastructure_retries_timed: Option<usize>,
     #[serde(default)]
     pub infrastructure_retries_indefinite: Option<usize>,
     #[serde(default)]
     pub infrastructure_retry_next_deadline_epoch_ms: Option<f64>,
-    /// The segment with the longest run of established-transport failures, and
-    /// the run's length: the article to suspect when a server never recovers.
+    // The segment with the longest run of established-transport failures, and
+    // the run's length: the article to suspect when a server never recovers.
     #[serde(default)]
     pub worst_transport_failure_segment: Option<String>,
     #[serde(default)]
     pub worst_transport_failure_streak: Option<u32>,
 }
 
-/// Direct-store admission state for one job.
+// Direct-store admission state for one job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectStoreJobDiagnostics {
     pub job_id: u64,
     #[serde(flatten)]
     pub counts: DirectSetCounts,
-    /// Reconstruction sweeps this job's demoted sets still have in flight.
+    // Reconstruction sweeps this job's demoted sets still have in flight.
     pub demotion_sweeps_in_flight: usize,
 }
 
-/// How the sets admitted for one job are currently split.
+// How the sets admitted for one job are currently split.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct DirectSetCounts {
     pub total: usize,
-    /// Sets still routing bytes directly into their members.
+    // Sets still routing bytes directly into their members.
     pub admitted: usize,
     pub demoted: usize,
     pub finalized: usize,
 }
 
-/// Connection leases held against one configured server.
+// Connection leases held against one configured server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolServerDiagnostics {
     pub server_index: usize,
@@ -168,15 +168,15 @@ pub struct PoolServerDiagnostics {
     pub recovery_quarantined: bool,
 }
 
-/// Where this process's memory is, in the terms the pipeline can account for.
-///
-/// The resident set is the whole process; the rest are the pieces of it the
-/// download side owns, so a bundle shows both the total and how much of it is
-/// explained.
+// Where this process's memory is, in the terms the pipeline can account for.
+//
+// The resident set is the whole process; the rest are the pieces of it the
+// download side owns, so a bundle shows both the total and how much of it is
+// explained.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryDiagnostics {
-    /// Working set on Windows, resident set elsewhere. `None` on a platform
-    /// that cannot answer cheaply.
+    // Working set on Windows, resident set elsewhere. `None` on a platform
+    // that cannot answer cheaply.
     pub process_resident_bytes: Option<u64>,
     pub buffer_pool_small_in_use_bytes: usize,
     pub buffer_pool_small_total_bytes: usize,
@@ -185,13 +185,13 @@ pub struct MemoryDiagnostics {
     pub buffer_pool_large_in_use_bytes: usize,
     pub buffer_pool_large_total_bytes: usize,
     pub buffer_pool_waits: usize,
-    /// Raw article bytes dispatched to lanes and not yet answered.
+    // Raw article bytes dispatched to lanes and not yet answered.
     pub lane_inflight_bytes: u64,
     pub jobs_eligible: usize,
     pub jobs_hot: usize,
 }
 
-/// Download lane occupancy, taken from the published lane counters.
+// Download lane occupancy, taken from the published lane counters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaneDiagnostics {
     pub active: usize,
@@ -211,10 +211,10 @@ pub struct LaneDiagnostics {
 }
 
 impl Pipeline {
-    /// Copy the read-only diagnostics snapshot out of the actor.
-    ///
-    /// `&self`, deliberately: the command handler must not be able to mutate
-    /// anything on the way to answering.
+    // Copy the read-only diagnostics snapshot out of the actor.
+    //
+    // `&self`, deliberately: the command handler must not be able to mutate
+    // anything on the way to answering.
     pub(crate) fn diagnostics_snapshot(&self) -> PipelineDiagnostics {
         let metrics = self.metrics.snapshot();
         let now = std::time::Instant::now();

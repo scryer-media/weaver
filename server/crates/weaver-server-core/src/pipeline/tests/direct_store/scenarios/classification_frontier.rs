@@ -1,10 +1,10 @@
-//! The classification frontier
-//! Demotion after a routed member turns ineligible
-//! The staged-bytes budget
-//! Zero-length stored members
-//! The member tolerance
-//! Directory members: dataless, free, and never a reason to demote
-//! Review fixes: what a *later* PAR2 pass sees, what an unbindable volume does,
+// The classification frontier
+// Demotion after a routed member turns ineligible
+// The staged-bytes budget
+// Zero-length stored members
+// The member tolerance
+// Directory members: dataless, free, and never a reason to demote
+// Review fixes: what a *later* PAR2 pass sees, what an unbindable volume does,
 
 use super::*;
 
@@ -222,13 +222,13 @@ async fn a_partially_covered_volume_that_fails_its_composed_crc_refetches_alone(
     );
 }
 
-/// A demotion whose reason leaves the image truthful — the router's
-/// [`VolumeDemand::Virtual`] class — must schedule no article the set already
-/// received.
-///
-/// The fetch schedule is the assertion, not a status string: a demotion that
-/// "succeeded" while quietly requeueing a routed article is exactly the excess
-/// this path exists to stop paying, and only the queue can tell the difference.
+// A demotion whose reason leaves the image truthful — the router's
+// [`VolumeDemand::Virtual`] class — must schedule no article the set already
+// received.
+//
+// The fetch schedule is the assertion, not a status string: a demotion that
+// "succeeded" while quietly requeueing a routed article is exactly the excess
+// this path exists to stop paying, and only the queue can tell the difference.
 #[tokio::test]
 async fn a_virtual_reason_demotion_schedules_nothing_it_already_received() {
     let member_name = "Silver.Horizon.S01E26.mkv";
@@ -270,14 +270,14 @@ async fn a_virtual_reason_demotion_schedules_nothing_it_already_received() {
     }
 }
 
-/// A demotion that does need real files under it still refetches only what its
-/// evidence actually contradicts.
-///
-/// One article of one volume disagrees with the yEnc part CRC32 the wire
-/// delivered for it. The covered range it sits in is *merged* — volume 0 was
-/// routed end to end, so the coverage map holds one entry for the whole volume
-/// — and charging the merged range would cost the volume. The article is the
-/// unit the composition can vouch for, so the article is what comes back.
+// A demotion that does need real files under it still refetches only what its
+// evidence actually contradicts.
+//
+// One article of one volume disagrees with the yEnc part CRC32 the wire
+// delivered for it. The covered range it sits in is *merged* — volume 0 was
+// routed end to end, so the coverage map holds one entry for the whole volume
+// — and charging the merged range would cost the volume. The article is the
+// unit the composition can vouch for, so the article is what comes back.
 #[tokio::test]
 async fn a_real_reason_demotion_refetches_only_the_article_that_disagreed() {
     let member_name = "Silver.Horizon.S01E27.mkv";
@@ -569,11 +569,11 @@ async fn a_small_blake2_only_member_rides_the_tolerance_and_both_members_match_t
     );
 }
 
-/// The shape the retired size ceiling threw whole sets away for: the ineligible
-/// member is **larger than the stored one**, so it is nowhere near
-/// `min(64 MiB, 1% of packed archive bytes)`. A store video beside a compressed
-/// subtitle pack is this set at a different scale, and it has to route
-/// everything routable and stream-extract the rest.
+// The shape the retired size ceiling threw whole sets away for: the ineligible
+// member is **larger than the stored one**, so it is nowhere near
+// `min(64 MiB, 1% of packed archive bytes)`. A store video beside a compressed
+// subtitle pack is this set at a different scale, and it has to route
+// everything routable and stream-extract the rest.
 #[tokio::test]
 async fn an_ineligible_member_larger_than_the_stored_one_rides_the_tolerance() {
     let store_name = "Amber.Trail.S02E04.mkv";
@@ -633,9 +633,9 @@ async fn an_ineligible_member_larger_than_the_stored_one_rides_the_tolerance() {
     );
 }
 
-/// The case an earlier shape could only demote: a BLAKE2sp-only member the
-/// router adopted while its chain was open, whose routed bytes are migrated out
-/// of its partial and into the envelope so it can ride the tolerance after all.
+// The case an earlier shape could only demote: a BLAKE2sp-only member the
+// router adopted while its chain was open, whose routed bytes are migrated out
+// of its partial and into the envelope so it can ride the tolerance after all.
 #[tokio::test]
 async fn a_split_blake2_only_member_migrates_to_the_envelope_and_matches_the_extractor() {
     let store_name = "Silver.Horizon.S01E51.mkv";
@@ -781,11 +781,11 @@ async fn a_migration_that_cannot_read_its_partial_demotes_cleanly() {
     assert_volumes_are_never_fabricated(&working_dir, &volumes);
 }
 
-/// The one size bound the tolerance still has is not the tolerance's: an
-/// adopted member that resolves ineligible at chain close is moved into the
-/// envelope through memory, and a move over `MIGRATION_CEILING_BYTES` is
-/// refused before a byte of it is read. The member then demotes on its own
-/// reason, which is the answer it had before migration existed.
+// The one size bound the tolerance still has is not the tolerance's: an
+// adopted member that resolves ineligible at chain close is moved into the
+// envelope through memory, and a move over `MIGRATION_CEILING_BYTES` is
+// refused before a byte of it is read. The member then demotes on its own
+// reason, which is the answer it had before migration existed.
 #[tokio::test]
 async fn a_migration_over_its_ceiling_demotes_on_the_members_own_reason() {
     let store_name = "Silver.Horizon.S01E55.mkv";

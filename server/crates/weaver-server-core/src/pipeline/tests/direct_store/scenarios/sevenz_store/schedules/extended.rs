@@ -1,9 +1,9 @@
-//! 7z format coverage beyond the archive matrix proper: obfuscated sets and
-//! a one-volume set that carries its own recovery.
-//!
-//! Smoke selections here run in the default suite. The campaigns are opt-in
-//! and separate from the archive matrix proper; run them with:
-//! `cargo nextest run --profile archive-matrix-extended --run-ignored all --no-fail-fast`
+// 7z format coverage beyond the archive matrix proper: obfuscated sets and
+// a one-volume set that carries its own recovery.
+//
+// Smoke selections here run in the default suite. The campaigns are opt-in
+// and separate from the archive matrix proper; run them with:
+// `cargo nextest run --profile archive-matrix-extended --run-ignored all --no-fail-fast`
 use super::*;
 
 mod embedded_par3;

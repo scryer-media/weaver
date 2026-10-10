@@ -1,4 +1,4 @@
-//! HTTP/3 uses the same native stream and revocation paths as SSH and WireGuard.
+// HTTP/3 uses the same native stream and revocation paths as SSH and WireGuard.
 use crate::{TunnelError, shared::SharedProvider};
 pub use proxy_tunnels::{Http3ProxyCredentials, Http3TunnelSpec};
 

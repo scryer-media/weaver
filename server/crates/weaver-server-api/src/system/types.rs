@@ -1303,9 +1303,9 @@ impl ServerHealth {
     }
 }
 
-/// The pinned address of the server at `pool_index`. A pool rebuilt since the
-/// health row was read may hold a different server there; that reads as no
-/// pin rather than another server's.
+// The pinned address of the server at `pool_index`. A pool rebuilt since the
+// health row was read may hold a different server there; that reads as no
+// pin rather than another server's.
 pub(crate) fn pinned_address_in(
     pool: &weaver_nntp::pool::NntpPool,
     pool_index: usize,
@@ -1321,20 +1321,20 @@ pub(crate) fn pinned_address_in(
         .map(|address| address.ip().to_string())
 }
 
-/// Reduce one server's health state, holdoff and socket counts to the single
-/// word `ServerHealth::activity` carries.
-///
-/// The order matters more than any one arm: a server that is switched off, or
-/// paused, or being held back by the provider is not "idle" and not "busy" —
-/// it is in a state someone can act on, and that state outranks whatever the
-/// sockets happen to be doing. Only once nothing is holding the server back do
-/// the counts decide, and "preparing" is the honest answer for sockets that
-/// are held open while no article is being fetched and a job is waiting on
-/// them. Without a waiting job those same open sockets are only the pool's
-/// keep-alive, which outlives a finished download by minutes, and that is
-/// "idle". So are they while another server in the pool is carrying the
-/// requests: a backup whose sockets sit open behind a busy primary is not
-/// preparing anything, the job simply has no work for it yet.
+// Reduce one server's health state, holdoff and socket counts to the single
+// word `ServerHealth::activity` carries.
+//
+// The order matters more than any one arm: a server that is switched off, or
+// paused, or being held back by the provider is not "idle" and not "busy" —
+// it is in a state someone can act on, and that state outranks whatever the
+// sockets happen to be doing. Only once nothing is holding the server back do
+// the counts decide, and "preparing" is the honest answer for sockets that
+// are held open while no article is being fetched and a job is waiting on
+// them. Without a waiting job those same open sockets are only the pool's
+// keep-alive, which outlives a finished download by minutes, and that is
+// "idle". So are they while another server in the pool is carrying the
+// requests: a backup whose sockets sit open behind a busy primary is not
+// preparing anything, the job simply has no work for it yet.
 pub(crate) fn server_activity(
     state: &str,
     holdoff_active: bool,
@@ -1369,8 +1369,8 @@ mod tests {
     use weaver_server_core::events::model::PipelineEvent;
     use weaver_server_core::jobs::JobId;
 
-    /// Two configured servers with the same host and port: a connect through
-    /// the second pins its address, and only the second reports a pin.
+    // Two configured servers with the same host and port: a connect through
+    // the second pins its address, and only the second reports a pin.
     #[test]
     fn a_pinned_address_belongs_to_its_own_server_not_its_twin() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -44,9 +44,9 @@ impl PhaseAttemptCounters {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// Grow the phase total by this attempt's expected output size. Rolled
-    /// back with the attempt, so a retried attempt reserving again does not
-    /// double-count.
+    // Grow the phase total by this attempt's expected output size. Rolled
+    // back with the attempt, so a retried attempt reserving again does not
+    // double-count.
     pub fn reserve_total(&self, bytes: u64) {
         if bytes == 0 {
             return;

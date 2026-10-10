@@ -240,9 +240,7 @@ mod tests {
             },
             DialError::Destination(io()),
             DialError::Refused(io()),
-            DialError::Timeout {
-                stage: "x".into(),
-            },
+            DialError::Timeout { stage: "x".into() },
             DialError::Fatal(crate::TunnelError::Configuration("x".into())),
         ];
         let mut results: Vec<DialResult> = errors

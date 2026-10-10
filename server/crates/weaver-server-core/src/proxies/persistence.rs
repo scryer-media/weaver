@@ -252,7 +252,7 @@ impl Database {
         })
     }
 
-    /// Pin only the revision that authenticated; stale handshakes cannot undo an edit.
+    // Pin only the revision that authenticated; stale handshakes cannot undo an edit.
     pub fn pin_proxy_host_key(
         &self,
         id: u32,

@@ -2,17 +2,17 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategoryConfig {
-    /// Stable identifier for CRUD operations.
+    // Stable identifier for CRUD operations.
     #[serde(default)]
     pub id: u32,
-    /// Unique category name (canonical form).
+    // Unique category name (canonical form).
     pub name: String,
-    /// Optional destination directory override. If absent, uses
-    /// `{complete_dir}/{name}/` as the default.
+    // Optional destination directory override. If absent, uses
+    // `{complete_dir}/{name}/` as the default.
     #[serde(default)]
     pub dest_dir: Option<String>,
-    /// Comma-separated aliases for matching from RSS/URL/API submissions.
-    /// Supports glob-style wildcards (`*` and `?`).
+    // Comma-separated aliases for matching from RSS/URL/API submissions.
+    // Supports glob-style wildcards (`*` and `?`).
     #[serde(default)]
     pub aliases: String,
 }
@@ -29,12 +29,12 @@ pub fn validate_category_path_component(input: &str) -> Result<String, CategoryV
     Ok(trimmed.to_string())
 }
 
-/// Resolve a category string to a canonical category name.
-///
-/// 1. Exact case-insensitive match on category names.
-/// 2. Glob match against comma-separated aliases.
-///
-/// Returns the canonical name of the first match, or `None`.
+// Resolve a category string to a canonical category name.
+//
+// 1. Exact case-insensitive match on category names.
+// 2. Glob match against comma-separated aliases.
+//
+// Returns the canonical name of the first match, or `None`.
 pub fn resolve_category(categories: &[CategoryConfig], input: &str) -> Option<String> {
     resolve_category_config(categories, input).map(|category| category.name.clone())
 }
@@ -90,11 +90,11 @@ pub fn resolve_submission_category(
     validate_category_path_component(input).map(Some)
 }
 
-/// Resolve the configured completion parent for a category.
-///
-/// Explicit destination overrides are trusted administrator input. Categories
-/// without an override remain constrained to a single safe path component
-/// beneath `complete_dir`.
+// Resolve the configured completion parent for a category.
+//
+// Explicit destination overrides are trusted administrator input. Categories
+// without an override remain constrained to a single safe path component
+// beneath `complete_dir`.
 pub fn completion_parent(
     complete_dir: &std::path::Path,
     categories: &[CategoryConfig],

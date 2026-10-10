@@ -16,7 +16,7 @@ const ENVIRONMENT: ReportEnvironment = ReportEnvironment {
     hardware_profile: Some("balanced"),
 };
 
-/// An NZB whose every free-text field carries the sentinel.
+// An NZB whose every free-text field carries the sentinel.
 fn sentinel_nzb() -> Vec<u8> {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>

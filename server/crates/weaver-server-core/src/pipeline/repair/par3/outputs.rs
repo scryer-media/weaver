@@ -1,11 +1,11 @@
-//! Reserve logical output identities before a native repair writes them.
+// Reserve logical output identities before a native repair writes them.
 
 use super::*;
 use crate::jobs::{assembly::FileAssembly, repair_outputs::RepairOutput};
 use par3_rs::session_repair::InstalledFile;
 
 impl Pipeline {
-    /// The assessed layout of one set, when the runtime is willing to show it.
+    // The assessed layout of one set, when the runtime is willing to show it.
     fn par3_view(
         &self,
         job: JobId,
@@ -18,13 +18,13 @@ impl Pipeline {
             .map(|(_, view)| view)
     }
 
-    /// The first name in an assessed set that weaver refuses to create, with
-    /// the rule that refused it.
-    ///
-    /// The check runs against the whole resolved relative path, so a directory
-    /// component is refused on the same rules as the file's own last
-    /// component. A refusal is never repaired by rewriting the name: a set
-    /// that asks for a name weaver will not create is a defect in the set.
+    // The first name in an assessed set that weaver refuses to create, with
+    // the rule that refused it.
+    //
+    // The check runs against the whole resolved relative path, so a directory
+    // component is refused on the same rules as the file's own last
+    // component. A refusal is never repaired by rewriting the name: a set
+    // that asks for a name weaver will not create is a defect in the set.
     pub(super) fn par3_unsafe_output_path(
         &self,
         job: JobId,
@@ -38,22 +38,22 @@ impl Pipeline {
         })
     }
 
-    /// Bytes the working directory is short of what installing this set needs,
-    /// or `None` when it has room.
-    ///
-    /// Only the files the repair will actually write count. A file whose
-    /// protected data is already verified at its expected length is never
-    /// rebuilt, so its bytes are neither needed nor freed, and counting them
-    /// would refuse a large set on a disk that comfortably holds the handful
-    /// of damaged files in it.
-    ///
-    /// Of those that will be written, the allowance is every output length:
-    /// the engine stages each reconstruction in full beside its destination
-    /// before it renames any of them into place, and a damaged file already on
-    /// disk is not free space until that rename lands, so the probe has
-    /// already left it out. A rename adds nothing. Only an embedded carrier's
-    /// self-repair also keeps a scratch tree beside its staged archive, and
-    /// only that path is allowed one more copy of its output.
+    // Bytes the working directory is short of what installing this set needs,
+    // or `None` when it has room.
+    //
+    // Only the files the repair will actually write count. A file whose
+    // protected data is already verified at its expected length is never
+    // rebuilt, so its bytes are neither needed nor freed, and counting them
+    // would refuse a large set on a disk that comfortably holds the handful
+    // of damaged files in it.
+    //
+    // Of those that will be written, the allowance is every output length:
+    // the engine stages each reconstruction in full beside its destination
+    // before it renames any of them into place, and a damaged file already on
+    // disk is not free space until that rename lands, so the probe has
+    // already left it out. A rename adds nothing. Only an embedded carrier's
+    // self-repair also keeps a scratch tree beside its staged archive, and
+    // only that path is allowed one more copy of its output.
     pub(super) async fn par3_output_space_shortfall(
         &mut self,
         job: JobId,
@@ -204,15 +204,15 @@ impl Pipeline {
         Ok(())
     }
 
-    /// A direct set holding a volume the repair is about to rebuild under
-    /// another name, when the repair will create an output no posted file
-    /// answers to.
-    ///
-    /// Such a volume is a posted file nothing could name. Its bytes sit in the
-    /// set's destinations, where neither the rebuilt archive nor the check
-    /// that retires the posted copy can reach them, and the set can never be
-    /// made whole from a file the repair writes beside it. The set writes
-    /// itself out first.
+    // A direct set holding a volume the repair is about to rebuild under
+    // another name, when the repair will create an output no posted file
+    // answers to.
+    //
+    // Such a volume is a posted file nothing could name. Its bytes sit in the
+    // set's destinations, where neither the rebuilt archive nor the check
+    // that retires the posted copy can reach them, and the set can never be
+    // made whole from a file the repair writes beside it. The set writes
+    // itself out first.
     pub(super) fn par3_direct_set_behind_unposted_output(
         &self,
         job: JobId,
@@ -243,28 +243,28 @@ impl Pipeline {
         })
     }
 
-    /// Find the posted files a repair's new outputs were rebuilt from.
-    ///
-    /// A posted file that cannot be named — its name says nothing and it lost
-    /// bytes, so no whole-image identity can be read from it — is rebuilt
-    /// under the name the set describes, and the posted copy is left beside
-    /// the output. The copy is superseded when the bytes that did arrive are
-    /// the output's own bytes at the same offsets, and those of no other
-    /// output. The output is a verified image on disk, so that is a direct
-    /// comparison and nothing is hashed.
-    ///
-    /// A posted file of which nothing arrived has no bytes to compare. It is
-    /// accounted for by count instead: every output the repair had to create
-    /// stands for one posted file that could not be named, so once the
-    /// comparison has claimed what it can, the outputs left over are owed
-    /// exactly that many posted files. When no more empty files than that
-    /// remain, each is one of them. When more remain, nothing says which, and
-    /// none is claimed.
-    ///
-    /// The comparison is deliberately small. It runs once per repair that
-    /// created an output no posted file answered to, only over incomplete
-    /// files no set describes, and reads at most [`SUPERSEDED_WINDOWS`]
-    /// windows of [`SUPERSEDED_WINDOW_BYTES`] from each.
+    // Find the posted files a repair's new outputs were rebuilt from.
+    //
+    // A posted file that cannot be named — its name says nothing and it lost
+    // bytes, so no whole-image identity can be read from it — is rebuilt
+    // under the name the set describes, and the posted copy is left beside
+    // the output. The copy is superseded when the bytes that did arrive are
+    // the output's own bytes at the same offsets, and those of no other
+    // output. The output is a verified image on disk, so that is a direct
+    // comparison and nothing is hashed.
+    //
+    // A posted file of which nothing arrived has no bytes to compare. It is
+    // accounted for by count instead: every output the repair had to create
+    // stands for one posted file that could not be named, so once the
+    // comparison has claimed what it can, the outputs left over are owed
+    // exactly that many posted files. When no more empty files than that
+    // remain, each is one of them. When more remain, nothing says which, and
+    // none is claimed.
+    //
+    // The comparison is deliberately small. It runs once per repair that
+    // created an output no posted file answered to, only over incomplete
+    // files no set describes, and reads at most [`SUPERSEDED_WINDOWS`]
+    // windows of [`SUPERSEDED_WINDOW_BYTES`] from each.
     pub(super) async fn note_par3_superseded_sources(
         &mut self,
         job: JobId,
@@ -392,13 +392,13 @@ impl Pipeline {
     }
 }
 
-/// Windows of a posted copy compared against a rebuilt output.
+// Windows of a posted copy compared against a rebuilt output.
 const SUPERSEDED_WINDOWS: usize = 3;
-/// Bytes compared from the front of each window.
+// Bytes compared from the front of each window.
 const SUPERSEDED_WINDOW_BYTES: usize = 64 * 1024;
 
-/// Whether every window of `copy` holds the bytes `output` has at the same
-/// offset, with something other than zeros in at least one of them.
+// Whether every window of `copy` holds the bytes `output` has at the same
+// offset, with something other than zeros in at least one of them.
 fn holds_windows_of(
     copy: &std::path::Path,
     output: &std::path::Path,

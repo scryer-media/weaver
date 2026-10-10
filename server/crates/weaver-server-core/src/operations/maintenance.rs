@@ -105,13 +105,13 @@ struct StagingCleanupReport {
     removed_bytes: u64,
 }
 
-/// Per-job roots swept for directories whose job is gone.
-///
-/// Direct unpack stages its members outside the conventional tree so a demotion
-/// can delete them without the conventional extractor ever seeing them — which
-/// also means nothing in the job lifecycle deletes them after a crash. Both
-/// roots are keyed by job id and orphan the same way, so they sweep the same
-/// way.
+// Per-job roots swept for directories whose job is gone.
+//
+// Direct unpack stages its members outside the conventional tree so a demotion
+// can delete them without the conventional extractor ever seeing them — which
+// also means nothing in the job lifecycle deletes them after a crash. Both
+// roots are keyed by job id and orphan the same way, so they sweep the same
+// way.
 const SWEPT_STAGING_ROOTS: [&str; 2] = [".weaver-staging", ".weaver-direct-unpack"];
 
 fn cleanup_stale_staging_dirs(

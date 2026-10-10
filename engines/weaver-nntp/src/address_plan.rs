@@ -1,55 +1,55 @@
-//! Which of a server's resolved addresses new connections dial.
-//!
-//! A provider hostname usually resolves to several addresses, and they are
-//! rarely equally close. Spreading a server's connections across all of them
-//! runs the transfer at the average of their speeds. Instead, the first
-//! connect races every resolved address, pins the one that answers first, and
-//! every later connect dials the pin.
-//!
-//! The plan only races again when it has a reason to: the pin keeps refusing
-//! connections, the provider just lifted an over-limit holdoff, or the plan
-//! has aged past [`ADDRESS_REPLAN_INTERVAL`]. A race runs inside one connect
-//! whether or not the server is busy: the winning stream is the connection
-//! that connect returns, so a race costs only its losing handshakes, and a
-//! race of any outcome restarts the pin's age, so age alone races at most once
-//! per interval. Existing connections stay where they are; only connections
-//! opened after a repin go to the new address.
-//!
-//! A connect that finds the pin refusing tries the remaining candidates in
-//! order of their measured connect time, so one bad address never fails a
-//! connect the server could have served. A race loser that merely timed out
-//! is not booked as a failure: it was slower than the winner, not broken.
-//!
-//! When a race finds no address at all and nothing is pinned, connects dial
-//! the known candidates one at a time for [`FAILED_RACE_HOLDOFF`] instead of
-//! racing again, so a server that is down does not start a burst of race
-//! threads on every reconnect attempt.
-//!
-//! A race measures handshakes, and the address that shakes hands fastest is
-//! not always the one that delivers articles fastest. So while the pin is
-//! busy, the plan also measures delivery: every warm article fetch books its
-//! bytes and wire time against the address that served it, and now and then a
-//! connection the server was reopening anyway is pointed at a challenger
-//! instead of the pin — at most one in [`SHADOW_EVERY_CONNECTS`], no sooner
-//! than [`SHADOW_INTERVAL`] apart, never an extra connection and never a
-//! handshake the server would not have paid for regardless. Once the pin and a
-//! challenger have each delivered at least [`DELIVERY_MIN_SAMPLES`] articles
-//! over at least [`DELIVERY_MIN_WIRE`] of wire time, the next connect judges
-//! that evidence, no sooner than [`DELIVERY_VERDICT_INTERVAL`] after the pin
-//! was chosen or last judged: a challenger that delivered
-//! [`DELIVERY_REPIN_RATIO`] times the pin's per-connection rate at two
-//! verdicts running takes the pin, and otherwise the pin stays, with no race
-//! and no losing handshakes either way. Every verdict judges the next one from
-//! fresh samples, so a busy server settles a faster address within a few
-//! verdicts rather than a few intervals.
-//!
-//! Verdicts run on their own clock and leave the pin's age alone: neither a
-//! verdict nor a pin moved on one restarts it. The pin still races on age,
-//! busy or idle, at least once per [`ADDRESS_REPLAN_INTERVAL`], because a race
-//! is also where the hostname is resolved again, and a server whose delivery
-//! keeps being judged would otherwise never learn of an address the provider
-//! added or withdrew. A server that never gathers the evidence — an idle one,
-//! or one whose connections never turned over — only ever races.
+// Which of a server's resolved addresses new connections dial.
+//
+// A provider hostname usually resolves to several addresses, and they are
+// rarely equally close. Spreading a server's connections across all of them
+// runs the transfer at the average of their speeds. Instead, the first
+// connect races every resolved address, pins the one that answers first, and
+// every later connect dials the pin.
+//
+// The plan only races again when it has a reason to: the pin keeps refusing
+// connections, the provider just lifted an over-limit holdoff, or the plan
+// has aged past [`ADDRESS_REPLAN_INTERVAL`]. A race runs inside one connect
+// whether or not the server is busy: the winning stream is the connection
+// that connect returns, so a race costs only its losing handshakes, and a
+// race of any outcome restarts the pin's age, so age alone races at most once
+// per interval. Existing connections stay where they are; only connections
+// opened after a repin go to the new address.
+//
+// A connect that finds the pin refusing tries the remaining candidates in
+// order of their measured connect time, so one bad address never fails a
+// connect the server could have served. A race loser that merely timed out
+// is not booked as a failure: it was slower than the winner, not broken.
+//
+// When a race finds no address at all and nothing is pinned, connects dial
+// the known candidates one at a time for [`FAILED_RACE_HOLDOFF`] instead of
+// racing again, so a server that is down does not start a burst of race
+// threads on every reconnect attempt.
+//
+// A race measures handshakes, and the address that shakes hands fastest is
+// not always the one that delivers articles fastest. So while the pin is
+// busy, the plan also measures delivery: every warm article fetch books its
+// bytes and wire time against the address that served it, and now and then a
+// connection the server was reopening anyway is pointed at a challenger
+// instead of the pin — at most one in [`SHADOW_EVERY_CONNECTS`], no sooner
+// than [`SHADOW_INTERVAL`] apart, never an extra connection and never a
+// handshake the server would not have paid for regardless. Once the pin and a
+// challenger have each delivered at least [`DELIVERY_MIN_SAMPLES`] articles
+// over at least [`DELIVERY_MIN_WIRE`] of wire time, the next connect judges
+// that evidence, no sooner than [`DELIVERY_VERDICT_INTERVAL`] after the pin
+// was chosen or last judged: a challenger that delivered
+// [`DELIVERY_REPIN_RATIO`] times the pin's per-connection rate at two
+// verdicts running takes the pin, and otherwise the pin stays, with no race
+// and no losing handshakes either way. Every verdict judges the next one from
+// fresh samples, so a busy server settles a faster address within a few
+// verdicts rather than a few intervals.
+//
+// Verdicts run on their own clock and leave the pin's age alone: neither a
+// verdict nor a pin moved on one restarts it. The pin still races on age,
+// busy or idle, at least once per [`ADDRESS_REPLAN_INTERVAL`], because a race
+// is also where the hostname is resolved again, and a server whose delivery
+// keeps being judged would otherwise never learn of an address the provider
+// added or withdrew. A server that never gathers the evidence — an idle one,
+// or one whose connections never turned over — only ever races.
 
 use crate::candidate_plan::{CandidatePlan, Next};
 type PlanState = CandidatePlan<SocketAddr>;
@@ -60,106 +60,106 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
 
-/// How old a pin may get before the next connect races the server's
-/// addresses again. Every race, won or failed, restarts the pin's age, so this
-/// is also the most often a server races on age alone, busy or idle. A
-/// delivery verdict does not restart it, even one that moves the pin, so a
-/// server whose connects keep coming resolves its hostname again at least
-/// this often.
+// How old a pin may get before the next connect races the server's
+// addresses again. Every race, won or failed, restarts the pin's age, so this
+// is also the most often a server races on age alone, busy or idle. A
+// delivery verdict does not restart it, even one that moves the pin, so a
+// server whose connects keep coming resolves its hostname again at least
+// this often.
 pub const ADDRESS_REPLAN_INTERVAL: Duration = Duration::from_mins(10);
 
-/// How long after a race in which no address answered, with nothing pinned,
-/// connects dial the known candidates one after another instead of racing.
-/// A race dials each candidate on its own thread, each held for up to
-/// [`ADDRESS_ATTEMPT_LIMIT`]; against a server that is down, racing on every
-/// reconnect attempt would keep those threads blocked for nothing. A
-/// minute is long enough to absorb a reconnect loop and short enough that a
-/// server coming back is raced, and pinned, soon after.
+// How long after a race in which no address answered, with nothing pinned,
+// connects dial the known candidates one after another instead of racing.
+// A race dials each candidate on its own thread, each held for up to
+// [`ADDRESS_ATTEMPT_LIMIT`]; against a server that is down, racing on every
+// reconnect attempt would keep those threads blocked for nothing. A
+// minute is long enough to absorb a reconnect loop and short enough that a
+// server coming back is raced, and pinned, soon after.
 pub const FAILED_RACE_HOLDOFF: Duration = Duration::from_mins(1);
 
-/// Longest one connect attempt to one address may take, whatever the connect
-/// timeout, so an address that swallows packets neither holds a race thread
-/// for long nor delays the fall-over to the next candidate.
+// Longest one connect attempt to one address may take, whatever the connect
+// timeout, so an address that swallows packets neither holds a race thread
+// for long nor delays the fall-over to the next candidate.
 pub const ADDRESS_ATTEMPT_LIMIT: Duration = Duration::from_secs(15);
 
-/// Consecutive connect failures on the pin that make it suspect. A suspect pin
-/// is raced again on the next connect, however young it is.
+// Consecutive connect failures on the pin that make it suspect. A suspect pin
+// is raced again on the next connect, however young it is.
 pub const SUSPECT_AFTER_FAILURES: u32 = 2;
 
-/// Most addresses a race dials at once, each on its own thread for the length
-/// of one connect. Far more than a server resolves to; it bounds the threads
-/// a resolver answering with an absurd number of addresses could start. Any
-/// beyond it are raced in further batches of this many, in the order they
-/// resolved.
+// Most addresses a race dials at once, each on its own thread for the length
+// of one connect. Far more than a server resolves to; it bounds the threads
+// a resolver answering with an absurd number of addresses could start. Any
+// beyond it are raced in further batches of this many, in the order they
+// resolved.
 const MAX_RACE_CANDIDATES: usize = 256;
 
-/// Warm article fetches an address must have served since the pin was last
-/// judged before its delivery rate counts as evidence, for the pin and for a
-/// challenger alike. A busy server fills this in seconds; an idle one never
-/// does, and its pin only ever races on age.
+// Warm article fetches an address must have served since the pin was last
+// judged before its delivery rate counts as evidence, for the pin and for a
+// challenger alike. A busy server fills this in seconds; an idle one never
+// does, and its pin only ever races on age.
 pub const DELIVERY_MIN_SAMPLES: u32 = 16;
 
-/// Wire time an address's booked fetches must add up to, besides
-/// [`DELIVERY_MIN_SAMPLES`], before its delivery rate counts as evidence. A
-/// handful of small articles finishes within the round trips it costs to ask
-/// for them and says more about latency than about throughput; this keeps
-/// them from out-voting an address that was moving large ones.
+// Wire time an address's booked fetches must add up to, besides
+// [`DELIVERY_MIN_SAMPLES`], before its delivery rate counts as evidence. A
+// handful of small articles finishes within the round trips it costs to ask
+// for them and says more about latency than about throughput; this keeps
+// them from out-voting an address that was moving large ones.
 pub const DELIVERY_MIN_WIRE: Duration = Duration::from_secs(10);
 
-/// Least time between two delivery verdicts, and least age of a pin before its
-/// first. A busy server measures the pin and a challenger well within it, so
-/// it is what paces the two verdicts that move a pin; it also keeps one
-/// verdict's samples from being judged again before fresh ones have come in.
+// Least time between two delivery verdicts, and least age of a pin before its
+// first. A busy server measures the pin and a challenger well within it, so
+// it is what paces the two verdicts that move a pin; it also keeps one
+// verdict's samples from being judged again before fresh ones have come in.
 pub const DELIVERY_VERDICT_INTERVAL: Duration = Duration::from_mins(1);
 
-/// How much faster, per connection, a challenger must have delivered than the
-/// pin to take the pin on that evidence alone. Addresses of one provider are
-/// usually within a few percent of each other, and moving the pin for less
-/// than this would just chase noise from one address to the next.
+// How much faster, per connection, a challenger must have delivered than the
+// pin to take the pin on that evidence alone. Addresses of one provider are
+// usually within a few percent of each other, and moving the pin for less
+// than this would just chase noise from one address to the next.
 pub const DELIVERY_REPIN_RATIO: f64 = 1.15;
 
-/// Youngest a pin may be when a reconnect is first pointed at a challenger.
-/// A fresh pin has yet to show what it delivers, and the first connections
-/// after a race are the ones a download is waiting on.
+// Youngest a pin may be when a reconnect is first pointed at a challenger.
+// A fresh pin has yet to show what it delivers, and the first connections
+// after a race are the ones a download is waiting on.
 pub const SHADOW_MIN_PIN_AGE: Duration = Duration::from_secs(30);
 
-/// Least time between two reconnects pointed at a challenger.
+// Least time between two reconnects pointed at a challenger.
 pub const SHADOW_INTERVAL: Duration = Duration::from_secs(30);
 
-/// One reconnect in this many, counted since the last one pointed at a
-/// challenger, may be pointed at a challenger; the rest go to the pin. A
-/// challenger keeps whatever it is given for the life of that connection, so
-/// this bounds the share of a busy server's connections that are off the pin
-/// at any time.
+// One reconnect in this many, counted since the last one pointed at a
+// challenger, may be pointed at a challenger; the rest go to the pin. A
+// challenger keeps whatever it is given for the life of that connection, so
+// this bounds the share of a busy server's connections that are off the pin
+// at any time.
 pub const SHADOW_EVERY_CONNECTS: u32 = 8;
 
-/// How many shadow connections in a row may end without one response from
-/// their challenger and still earn it the next reconnect ahead of the pacing
-/// above. Past this the challenger waits its usual turn: one that connects
-/// but never answers must not keep a busy pool's reconnects off the pin. A
-/// connection that answered, however briefly, starts the count over, so a
-/// server that drops connections early is still measured.
+// How many shadow connections in a row may end without one response from
+// their challenger and still earn it the next reconnect ahead of the pacing
+// above. Past this the challenger waits its usual turn: one that connects
+// but never answers must not keep a busy pool's reconnects off the pin. A
+// connection that answered, however briefly, starts the count over, so a
+// server that drops connections early is still measured.
 pub const SHADOW_RETRIES: u32 = 8;
 
-/// How long booked delivery stays evidence. A server idle for longer than
-/// this has samples from a different time, and possibly the pin's from one
-/// time and a challenger's from another, so they are not judged.
+// How long booked delivery stays evidence. A server idle for longer than
+// this has samples from a different time, and possibly the pin's from one
+// time and a challenger's from another, so they are not judged.
 pub const DELIVERY_EVIDENCE_AGE: Duration = ADDRESS_REPLAN_INTERVAL;
 
-/// Why the pin moved, or a race ran.
+// Why the pin moved, or a race ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RaceReason {
-    /// Nothing was pinned yet.
+    // Nothing was pinned yet.
     Initial,
-    /// The pin aged past [`ADDRESS_REPLAN_INTERVAL`].
+    // The pin aged past [`ADDRESS_REPLAN_INTERVAL`].
     Interval,
-    /// An over-limit holdoff cleared, so the provider's view of this client
-    /// may have changed.
+    // An over-limit holdoff cleared, so the provider's view of this client
+    // may have changed.
     OverLimitCleared,
-    /// The pin failed [`SUSPECT_AFTER_FAILURES`] connects in a row.
+    // The pin failed [`SUSPECT_AFTER_FAILURES`] connects in a row.
     Suspect,
-    /// A challenger out-delivered the pin by [`DELIVERY_REPIN_RATIO`]. No
-    /// race ran: the pin moved on measured delivery alone.
+    // A challenger out-delivered the pin by [`DELIVERY_REPIN_RATIO`]. No
+    // race ran: the pin moved on measured delivery alone.
     Delivery,
 }
 
@@ -193,38 +193,38 @@ impl RaceReason {
     }
 }
 
-/// One candidate address as the plan last measured it.
+// One candidate address as the plan last measured it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AddressSnapshot {
     pub address: SocketAddr,
-    /// Smoothed TCP connect time, once any connect to it has finished.
+    // Smoothed TCP connect time, once any connect to it has finished.
     pub connect_time: Option<Duration>,
-    /// Smoothed article fetch time on connections to it.
+    // Smoothed article fetch time on connections to it.
     pub body_latency: Option<Duration>,
     pub consecutive_failures: u32,
-    /// Bytes per second of wire time one connection to it delivered, over the
-    /// warm fetches booked since the pin was last judged.
+    // Bytes per second of wire time one connection to it delivered, over the
+    // warm fetches booked since the pin was last judged.
     pub delivery_bytes_per_second: Option<f64>,
-    /// Warm fetches booked against it since the pin was last judged.
+    // Warm fetches booked against it since the pin was last judged.
     pub delivery_samples: u32,
 }
 
-/// A server's address plan at one moment.
+// A server's address plan at one moment.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AddressPlanSnapshot {
     pub pinned: Option<SocketAddr>,
     pub addresses: Vec<AddressSnapshot>,
-    /// Races that pinned an address.
+    // Races that pinned an address.
     pub races_won: u64,
-    /// Races in which no address answered.
+    // Races in which no address answered.
     pub races_failed: u64,
-    /// Pin changes, by the reason of the race or the delivery verdict that
-    /// made them.
+    // Pin changes, by the reason of the race or the delivery verdict that
+    // made them.
     pub repins: Vec<(RaceReason, u64)>,
 }
 
-/// Opens connections to one address for a plan. The plan decides which
-/// address; the dialer only knows how.
+// Opens connections to one address for a plan. The plan decides which
+// address; the dialer only knows how.
 pub(crate) trait AddressDialer: Send + Sync + 'static {
     type Stream: Send + 'static;
 
@@ -233,7 +233,7 @@ pub(crate) trait AddressDialer: Send + Sync + 'static {
     fn dial(&self, addr: SocketAddr) -> io::Result<Self::Stream>;
 }
 
-/// Plain TCP to a hostname's resolved addresses.
+// Plain TCP to a hostname's resolved addresses.
 pub(crate) struct TcpDialer {
     host: String,
     port: u16,
@@ -271,14 +271,14 @@ impl AddressDialer for TcpDialer {
     }
 }
 
-/// The address plan a new connection to one server goes through.
+// The address plan a new connection to one server goes through.
 #[derive(Clone)]
 pub struct AddressRoute {
     pub(crate) plan: Arc<AddressPlan>,
 }
 
 impl AddressRoute {
-    /// Open a TCP socket to the address this route's plan picks.
+    // Open a TCP socket to the address this route's plan picks.
     pub(crate) fn connect_tcp(
         &self,
         host: &str,
@@ -289,8 +289,8 @@ impl AddressRoute {
         self.plan.connect(&dialer)
     }
 
-    /// Watch the session being set up on a socket this route opened to
-    /// `addr`.
+    // Watch the session being set up on a socket this route opened to
+    // `addr`.
     pub(crate) fn watch_setup(&self, addr: SocketAddr) -> SetupWatch {
         SetupWatch {
             plan: Arc::clone(&self.plan),
@@ -300,10 +300,10 @@ impl AddressRoute {
     }
 }
 
-/// One session's setup on a connected socket, from the connect to the point
-/// where the server has answered over it. Dropped before that point, it books
-/// a failed setup against the address: a handshake that failed, a greeting
-/// that never came, or a setup abandoned because it ran out of time.
+// One session's setup on a connected socket, from the connect to the point
+// where the server has answered over it. Dropped before that point, it books
+// a failed setup against the address: a handshake that failed, a greeting
+// that never came, or a setup abandoned because it ran out of time.
 pub(crate) struct SetupWatch {
     plan: Arc<AddressPlan>,
     addr: SocketAddr,
@@ -311,8 +311,8 @@ pub(crate) struct SetupWatch {
 }
 
 impl SetupWatch {
-    /// The server answered over this socket. What it said is the server's
-    /// answer, not the address's.
+    // The server answered over this socket. What it said is the server's
+    // answer, not the address's.
     pub(crate) fn reached_server(mut self) {
         self.reached = true;
         self.plan.record_setup(self.addr, true);
@@ -327,13 +327,13 @@ impl Drop for SetupWatch {
     }
 }
 
-/// The address state of one server. See the module docs.
+// The address state of one server. See the module docs.
 pub struct AddressPlan {
     label: String,
     state: Mutex<PlanState>,
     race_finished: Condvar,
-    /// A clock the tests hold still and move by hand, so nothing they assert
-    /// depends on how fast the machine runs them.
+    // A clock the tests hold still and move by hand, so nothing they assert
+    // depends on how fast the machine runs them.
     #[cfg(test)]
     frozen_clock: Mutex<Option<Instant>>,
 }
@@ -349,15 +349,15 @@ impl AddressPlan {
         }
     }
 
-    /// Plain data behind the lock, so a panic elsewhere must not stop every
-    /// later connect.
+    // Plain data behind the lock, so a panic elsewhere must not stop every
+    // later connect.
     fn state(&self) -> MutexGuard<'_, PlanState> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The moment every plan decision is dated by.
+    // The moment every plan decision is dated by.
     fn now(&self) -> Instant {
         #[cfg(test)]
         if let Some(frozen) = *self
@@ -370,8 +370,8 @@ impl AddressPlan {
         Instant::now()
     }
 
-    /// Open a stream through `dialer` to the address this plan picks, racing
-    /// the candidates first when a race is due.
+    // Open a stream through `dialer` to the address this plan picks, racing
+    // the candidates first when a race is due.
     pub(crate) fn connect<D: AddressDialer>(
         self: &Arc<Self>,
         dialer: &Arc<D>,
@@ -543,8 +543,8 @@ impl AddressPlan {
         Err(error)
     }
 
-    /// Book one finished connect to `addr`: its time when it connected,
-    /// `None` when it failed.
+    // Book one finished connect to `addr`: its time when it connected,
+    // `None` when it failed.
     fn record_connect(&self, addr: SocketAddr, connected_in: Option<Duration>) {
         let now = self.now();
         let mut state = self.state();
@@ -562,8 +562,8 @@ impl AddressPlan {
         }
     }
 
-    /// Book one session's setup on a socket connected to `addr`: whether the
-    /// server answered over it.
+    // Book one session's setup on a socket connected to `addr`: whether the
+    // server answered over it.
     pub(crate) fn record_setup(&self, addr: SocketAddr, reached: bool) {
         let mut state = self.state();
         let pending = state.pending;
@@ -577,8 +577,8 @@ impl AddressPlan {
         }
     }
 
-    /// Book how long an article fetch took on a connection to `ip`. Ignored
-    /// for an address the plan does not know.
+    // Book how long an article fetch took on a connection to `ip`. Ignored
+    // for an address the plan does not know.
     pub(crate) fn record_body_latency(&self, ip: IpAddr, elapsed: Duration) {
         let mut state = self.state();
         let candidate = state
@@ -591,14 +591,14 @@ impl AddressPlan {
         }
     }
 
-    /// Book one warm article fetch on a connection to `ip`: its decoded bytes
-    /// and the wire time they took. Ignored for an address the plan does not
-    /// know, and for a fetch that moved nothing.
-    ///
-    /// The caller keeps a connection's first fetch out of this: it pays for
-    /// the tail of the handshake and runs through a congestion window still
-    /// opening, and would count against whichever address was connected to
-    /// most recently.
+    // Book one warm article fetch on a connection to `ip`: its decoded bytes
+    // and the wire time they took. Ignored for an address the plan does not
+    // know, and for a fetch that moved nothing.
+    //
+    // The caller keeps a connection's first fetch out of this: it pays for
+    // the tail of the handshake and runs through a congestion window still
+    // opening, and would count against whichever address was connected to
+    // most recently.
     pub(crate) fn record_delivery(&self, ip: IpAddr, bytes: u64, wire: Duration) {
         let mut state = self.state();
         let candidate = state
@@ -611,10 +611,10 @@ impl AddressPlan {
         }
     }
 
-    /// The provider accepts new connections again after refusing them. Its
-    /// addresses may have been rebalanced meanwhile, so the next connect races
-    /// again, busy or not: this is exactly when a fresh look is worth the
-    /// losing handshakes.
+    // The provider accepts new connections again after refusing them. Its
+    // addresses may have been rebalanced meanwhile, so the next connect races
+    // again, busy or not: this is exactly when a fresh look is worth the
+    // losing handshakes.
     pub(crate) fn note_over_limit_cleared(&self) {
         self.state().over_limit_cleared(self.now());
     }
@@ -651,29 +651,29 @@ impl AddressPlan {
         }
     }
 
-    /// Make the pin look `age` older, as if the clock had moved on.
+    // Make the pin look `age` older, as if the clock had moved on.
     #[cfg(test)]
     pub(crate) fn age_pin_by(&self, age: Duration) {
         let mut state = self.state();
         state.chosen_at = state.chosen_at.and_then(|at| at.checked_sub(age));
     }
 
-    /// Make the last failed race look `age` older, as if the clock had moved on.
+    // Make the last failed race look `age` older, as if the clock had moved on.
     #[cfg(test)]
     pub(crate) fn age_failed_race_by(&self, age: Duration) {
         let mut state = self.state();
         state.last_race_failed_at = state.last_race_failed_at.and_then(|at| at.checked_sub(age));
     }
 
-    /// Stop the plan's clock where it stands. From here on only
-    /// [`Self::advance`] moves it.
+    // Stop the plan's clock where it stands. From here on only
+    // [`Self::advance`] moves it.
     #[cfg(test)]
     pub(crate) fn freeze_clock(&self) {
         let now = self.now();
         *self.frozen_clock.lock().unwrap() = Some(now);
     }
 
-    /// Move the frozen clock forward.
+    // Move the frozen clock forward.
     #[cfg(test)]
     pub(crate) fn advance(&self, by: Duration) {
         let mut clock = self.frozen_clock.lock().unwrap();
@@ -682,8 +682,8 @@ impl AddressPlan {
     }
 }
 
-/// The right to run a race. Dropping it unfinished (a panic mid-race) still
-/// releases the callers waiting on the race.
+// The right to run a race. Dropping it unfinished (a panic mid-race) still
+// releases the callers waiting on the race.
 struct RaceTicket<'a> {
     plan: &'a AddressPlan,
     reason: RaceReason,
@@ -787,7 +787,7 @@ impl Drop for RaceTicket<'_> {
     }
 }
 
-/// A connect that ran out of time rather than being turned away.
+// A connect that ran out of time rather than being turned away.
 fn is_slow(error: &io::Error) -> bool {
     matches!(
         error.kind(),

@@ -1,5 +1,5 @@
-//! Per-job reuse for repeated message IDs. Ordinary batches do not enter here.
-//! Cache files are disposable; restart reestablishes article evidence normally.
+// Per-job reuse for repeated message IDs. Ordinary batches do not enter here.
+// Cache files are disposable; restart reestablishes article evidence normally.
 
 use super::*;
 use crate::MessageId;
@@ -383,16 +383,16 @@ impl RepeatedArticles {
         reply
     }
 
-    /// The one fetch this cache cannot replay, and the last request in the
-    /// pipeline still issued through an async connection.
-    ///
-    /// On a server the owned download lanes serve, this acquire refuses to
-    /// queue behind them: it comes straight back as a capacity refusal rather
-    /// than spending the whole soft-timeout budget waiting for an article
-    /// transfer to end. That refusal is local capacity, never article
-    /// evidence, so the work requeues without spending the segment's retry
-    /// budget and the short-lived cached failure expires on its own. No
-    /// article is lost; the duplicates simply wait for a lane to free up.
+    // The one fetch this cache cannot replay, and the last request in the
+    // pipeline still issued through an async connection.
+    //
+    // On a server the owned download lanes serve, this acquire refuses to
+    // queue behind them: it comes straight back as a capacity refusal rather
+    // than spending the whole soft-timeout budget waiting for an article
+    // transfer to end. That refusal is local capacity, never article
+    // evidence, so the work requeues without spending the segment's retry
+    // budget and the short-lived cached failure expires on its own. No
+    // article is lost; the duplicates simply wait for a lane to free up.
     async fn fetch_uncached(work: &DownloadWork, excludes: &[usize], nntp: &NntpClient) -> Reply {
         let trace = nntp
             .fetch_body_decoded_with_groups_excluding_traced(
@@ -705,10 +705,10 @@ mod tests {
         ));
     }
 
-    /// "Every connection is busy" is local capacity, not article evidence.
-    /// A refusal that arrives without waiting must never latch as this
-    /// message id's answer: it has to expire so the duplicates come back, and
-    /// it has to leave the segment's retry budget alone.
+    // "Every connection is busy" is local capacity, not article evidence.
+    // A refusal that arrives without waiting must never latch as this
+    // message id's answer: it has to expire so the duplicates come back, and
+    // it has to leave the segment's retry budget alone.
     #[tokio::test]
     async fn a_capacity_refusal_expires_and_keeps_the_retry_budget() {
         let root = tempfile::tempdir().unwrap();

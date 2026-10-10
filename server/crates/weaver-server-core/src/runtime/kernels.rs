@@ -1,11 +1,11 @@
-//! Which compute kernel each hot-path library dispatches to on this host.
-//!
-//! Every library resolves its tiers once, from CPU feature probes and a few
-//! escape-hatch environment variables. Only some of those gates are public. A
-//! public gate is called directly; a private one is mirrored here with the same
-//! probes and the same variables, so the report reads what the dispatcher
-//! reads. Nothing in the pipeline consults this — it feeds System info and bug
-//! reports.
+// Which compute kernel each hot-path library dispatches to on this host.
+//
+// Every library resolves its tiers once, from CPU feature probes and a few
+// escape-hatch environment variables. Only some of those gates are public. A
+// public gate is called directly; a private one is mirrored here with the same
+// probes and the same variables, so the report reads what the dispatcher
+// reads. Nothing in the pipeline consults this — it feeds System info and bug
+// reports.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelComponent {
@@ -23,19 +23,19 @@ pub enum KernelComponent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelSelection {
     pub component: KernelComponent,
-    /// The crate that owns the dispatch.
+    // The crate that owns the dispatch.
     pub library: &'static str,
-    /// Every kernel this build can select on this architecture, in the order
-    /// the dispatcher tries them.
+    // Every kernel this build can select on this architecture, in the order
+    // the dispatcher tries them.
     pub ladder: Vec<&'static str>,
-    /// The rung the dispatcher selected; always an entry of `ladder`.
+    // The rung the dispatcher selected; always an entry of `ladder`.
     pub kernel: &'static str,
-    /// The environment variable that moved the selection off the rung the CPU
-    /// alone would have picked, when one did.
+    // The environment variable that moved the selection off the rung the CPU
+    // alone would have picked, when one did.
     pub pinned_by: Option<&'static str>,
 }
 
-/// One row per dispatch site, in pipeline order.
+// One row per dispatch site, in pipeline order.
 pub fn selected_kernels() -> Vec<KernelSelection> {
     vec![
         selection(
@@ -109,8 +109,8 @@ pub fn selected_kernels() -> Vec<KernelSelection> {
     ]
 }
 
-/// `select(true)` is the live selection; `select(false)` is the same ladder
-/// with every environment variable ignored, which is how a pin is recognised.
+// `select(true)` is the live selection; `select(false)` is the same ladder
+// with every environment variable ignored, which is how a pin is recognised.
 fn selection(
     component: KernelComponent,
     library: &'static str,
@@ -191,8 +191,8 @@ const CRC_PMULL_SHA3: &str = "PMULL + SHA3";
 const CRC_PMULL: &str = "PMULL";
 const CRC_TABLES: &str = "Lookup tables";
 
-/// `RARPAR_CRC32_VPCLMUL`: `0` stands the 256-bit fold down, `1` engages it
-/// alongside AVX-512VL too. It never enables the fold on a CPU without it.
+// `RARPAR_CRC32_VPCLMUL`: `0` stands the 256-bit fold down, `1` engages it
+// alongside AVX-512VL too. It never enables the fold on a CPU without it.
 const RARPAR_CRC_ENV: &str = "RARPAR_CRC32_VPCLMUL";
 
 fn crc_ladder() -> Vec<&'static str> {
@@ -216,7 +216,7 @@ fn crc_ladder() -> Vec<&'static str> {
     }
 }
 
-/// The tier `crc-fast` runs for everything the 256-bit fold does not take.
+// The tier `crc-fast` runs for everything the 256-bit fold does not take.
 fn crc_fast_kernel() -> &'static str {
     match crc_fast::get_calculator_target(crc_fast::CrcAlgorithm::Crc32IsoHdlc).as_str() {
         "x86_64-avx512-vpclmulqdq" => CRC_VPCLMUL_512,
@@ -236,7 +236,7 @@ fn yenc_crc_kernel(_read_env: bool) -> &'static str {
     }
 }
 
-/// par2-rs and unrar-rs carry the same fold behind the same gate.
+// par2-rs and unrar-rs carry the same fold behind the same gate.
 fn rarpar_crc_kernel(read_env: bool) -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
@@ -311,8 +311,8 @@ fn gf16_repair_ladder() -> Vec<&'static str> {
     }
 }
 
-/// PAR2 repair: the XOR-JIT on the CPU families it is tuned for, otherwise the
-/// folded controller over the split byte-plane layout, otherwise plain batches.
+// PAR2 repair: the XOR-JIT on the CPU families it is tuned for, otherwise the
+// folded controller over the split byte-plane layout, otherwise plain batches.
 #[cfg(target_arch = "x86_64")]
 fn gf16_repair_kernel(read_env: bool) -> &'static str {
     if reedsolomon_rs::xor_jit::JitWidth::detect().is_some() {
@@ -347,8 +347,8 @@ fn gf16_repair_kernel(read_env: bool) -> &'static str {
     }
 }
 
-/// aarch64 repair batches multiply through PMULL once a group has more than
-/// three inputs, unless `WEAVER_GF16_CLMUL_BATCH=0` keeps the NEON shuffle.
+// aarch64 repair batches multiply through PMULL once a group has more than
+// three inputs, unless `WEAVER_GF16_CLMUL_BATCH=0` keeps the NEON shuffle.
 #[cfg(target_arch = "aarch64")]
 fn gf16_repair_kernel(read_env: bool) -> &'static str {
     if env_is(read_env, "WEAVER_GF16_CLMUL_BATCH", "0") {
@@ -387,7 +387,7 @@ fn gf16_region_ladder() -> Vec<&'static str> {
     }
 }
 
-/// RAR5 recovery volumes accumulate one region at a time (`mul_acc_region`).
+// RAR5 recovery volumes accumulate one region at a time (`mul_acc_region`).
 fn gf16_region_kernel(_read_env: bool) -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
@@ -465,8 +465,8 @@ fn sha1_ladder() -> Vec<&'static str> {
     }
 }
 
-/// SHA-NI first; without it the measured-faster SSSE3 kernel ahead of AVX2.
-/// `UNRAR_RS_SHA1_X86` names a vector tier (or `0`) and stands SHA-NI down.
+// SHA-NI first; without it the measured-faster SSSE3 kernel ahead of AVX2.
+// `UNRAR_RS_SHA1_X86` names a vector tier (or `0`) and stands SHA-NI down.
 #[cfg(target_arch = "x86_64")]
 fn sha1_kernel(read_env: bool) -> &'static str {
     let hw_off = env_is(read_env, SHA1_HW_ENV, "0");
@@ -533,8 +533,8 @@ fn aes_ladder() -> Vec<&'static str> {
     }
 }
 
-/// AWS-LC's own CPU capability dispatch: the hardware AES instructions, then
-/// the vector-permutation AES, then its constant-time software AES.
+// AWS-LC's own CPU capability dispatch: the hardware AES instructions, then
+// the vector-permutation AES, then its constant-time software AES.
 fn aes_kernel(_read_env: bool) -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {

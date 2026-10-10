@@ -1,28 +1,28 @@
-//! Process-wide accounting of what direct-store holds cost the host.
-//!
-//! Every set bounds its own holds twice — a RAM budget that pages to scratch
-//! and a scratch ceiling that demotes — and both are per set. Nothing summed
-//! across sets, so a queue with many direct sets in flight multiplied both
-//! numbers with no upper bound, and neither was derived from anything the box
-//! actually has. This module is the sum and the host: one accountant per
-//! pipeline, shared by every router it admits, charged with each set's live
-//! resident and scratch bytes and consulted before a set spends more.
-//!
-//! The accountant never routes and never demotes on its own. It answers two
-//! questions the router already asks of its own ceilings — *am I over RAM?*
-//! and *may I write this much more scratch?* — with the process total in view,
-//! and the router acts exactly as it does for its own limits: a RAM breach
-//! pages, a scratch refusal demotes the set that asked. Which set pages under a
-//! shared breach is the one routing at the time; a set that stops routing keeps
-//! what it holds resident, up to its own budget, which is what keeps the policy
-//! local to the router's existing seams rather than a scheduler over sets.
-//!
-//! The scratch question has a second half the per-set ceiling could not ask:
-//! the working directory's free space. A scratch that fills the disk demotes
-//! its set gracefully through the write-failed path, but only after starving
-//! the downloads sharing that volume. The accountant keeps a reserve — the same
-//! rule the extractor keeps for its own output — and refuses a spill that would
-//! eat into it, before the write.
+// Process-wide accounting of what direct-store holds cost the host.
+//
+// Every set bounds its own holds twice — a RAM budget that pages to scratch
+// and a scratch ceiling that demotes — and both are per set. Nothing summed
+// across sets, so a queue with many direct sets in flight multiplied both
+// numbers with no upper bound, and neither was derived from anything the box
+// actually has. This module is the sum and the host: one accountant per
+// pipeline, shared by every router it admits, charged with each set's live
+// resident and scratch bytes and consulted before a set spends more.
+//
+// The accountant never routes and never demotes on its own. It answers two
+// questions the router already asks of its own ceilings — *am I over RAM?*
+// and *may I write this much more scratch?* — with the process total in view,
+// and the router acts exactly as it does for its own limits: a RAM breach
+// pages, a scratch refusal demotes the set that asked. Which set pages under a
+// shared breach is the one routing at the time; a set that stops routing keeps
+// what it holds resident, up to its own budget, which is what keeps the policy
+// local to the router's existing seams rather than a scheduler over sets.
+//
+// The scratch question has a second half the per-set ceiling could not ask:
+// the working directory's free space. A scratch that fills the disk demotes
+// its set gracefully through the write-failed path, but only after starving
+// the downloads sharing that volume. The accountant keeps a reserve — the same
+// rule the extractor keeps for its own output — and refuses a spill that would
+// eat into it, before the write.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,25 +30,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::router::DemotionReason;
 use crate::operations::disk::{CapacityDebits, CapacityReader};
 
-/// The process-wide ceilings, resolved once with the rest of the direct-store
-/// settings.
+// The process-wide ceilings, resolved once with the rest of the direct-store
+// settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HoldsLimits {
-    /// RAM-resident holds across every set, in bytes. Over it, the routing set
-    /// pages its own holds to scratch exactly as it does over its own budget.
+    // RAM-resident holds across every set, in bytes. Over it, the routing set
+    // pages its own holds to scratch exactly as it does over its own budget.
     pub(crate) resident_bytes: u64,
-    /// Holds scratch across every set, in bytes. A spill that would exceed it
-    /// demotes the set that asked, after that set has compacted its own
-    /// scratch and found it still does not fit.
+    // Holds scratch across every set, in bytes. A spill that would exceed it
+    // demotes the set that asked, after that set has compacted its own
+    // scratch and found it still does not fit.
     pub(crate) scratch_bytes: u64,
-    /// Free space the working directory's filesystem must keep. A spill that
-    /// would leave less demotes the set that asked. Zero disables the check.
+    // Free space the working directory's filesystem must keep. A spill that
+    // would leave less demotes the set that asked. Zero disables the check.
     pub(crate) disk_reserve_bytes: u64,
 }
 
 impl HoldsLimits {
-    /// No ceilings at all, for routers built by hand in tests and for a
-    /// runtime that was never given settings.
+    // No ceilings at all, for routers built by hand in tests and for a
+    // runtime that was never given settings.
     pub(crate) const UNBOUNDED: Self = Self {
         resident_bytes: u64::MAX,
         scratch_bytes: u64::MAX,
@@ -56,28 +56,28 @@ impl HoldsLimits {
     };
 }
 
-/// One router's standing charge against the accountant: what it last
-/// published, so the next publication is a delta rather than a re-count.
+// One router's standing charge against the accountant: what it last
+// published, so the next publication is a delta rather than a re-count.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct HoldsCharge {
     resident: u64,
     scratch: u64,
 }
 
-/// The working directory's latest free-space reading. Reading it never
-/// touches the filesystem: the runtime's sampler refreshes it on its own
-/// thread. No reading at all is treated as no reserve to enforce rather than
-/// as an empty disk, since a probe failure must not demote a set that was
-/// routing fine.
+// The working directory's latest free-space reading. Reading it never
+// touches the filesystem: the runtime's sampler refreshes it on its own
+// thread. No reading at all is treated as no reserve to enforce rather than
+// as an empty disk, since a probe failure must not demote a set that was
+// routing fine.
 pub(crate) type DiskProbe = CapacityReader;
 
-/// See the module documentation.
+// See the module documentation.
 pub(crate) struct HoldsAccountant {
     limits: HoldsLimits,
     resident: AtomicU64,
     scratch: AtomicU64,
-    /// Spills admitted against the current reading, so a burst of paging
-    /// between refreshes cannot run ahead of the reserve on one number.
+    // Spills admitted against the current reading, so a burst of paging
+    // between refreshes cannot run ahead of the reserve on one number.
     disk: Mutex<CapacityDebits>,
     probe: DiskProbe,
 }
@@ -100,19 +100,19 @@ impl Default for HoldsAccountant {
 }
 
 impl HoldsAccountant {
-    /// An accountant with no free-space reading: the reserve is not
-    /// enforced until [`Self::with_probe`] gives it one.
+    // An accountant with no free-space reading: the reserve is not
+    // enforced until [`Self::with_probe`] gives it one.
     pub(crate) fn new(limits: HoldsLimits) -> Self {
         Self::with_probe(limits, CapacityReader::unknown())
     }
 
-    /// An accountant that never refuses anything.
+    // An accountant that never refuses anything.
     pub(crate) fn unbounded() -> Self {
         Self::new(HoldsLimits::UNBOUNDED)
     }
 
-    /// An accountant whose free-space reading is whatever `probe` reads:
-    /// the working root's sampler in production, a fixed reading in tests.
+    // An accountant whose free-space reading is whatever `probe` reads:
+    // the working root's sampler in production, a fixed reading in tests.
     pub(crate) fn with_probe(limits: HoldsLimits, probe: DiskProbe) -> Self {
         Self {
             limits,
@@ -123,23 +123,23 @@ impl HoldsAccountant {
         }
     }
 
-    /// RAM-resident holds across every set that has published.
+    // RAM-resident holds across every set that has published.
     pub(crate) fn resident_bytes(&self) -> u64 {
         self.resident.load(Ordering::Acquire)
     }
 
-    /// Scratch bytes across every set that has published.
+    // Scratch bytes across every set that has published.
     pub(crate) fn scratch_bytes(&self) -> u64 {
         self.scratch.load(Ordering::Acquire)
     }
 
-    /// Whether the process total of resident holds is over the shared limit.
-    /// The caller publishes first, so its own bytes are in the total.
+    // Whether the process total of resident holds is over the shared limit.
+    // The caller publishes first, so its own bytes are in the total.
     pub(crate) fn resident_over_limit(&self) -> bool {
         self.resident_bytes() > self.limits.resident_bytes
     }
 
-    /// Replaces one router's charge with its current figures.
+    // Replaces one router's charge with its current figures.
     pub(crate) fn publish(&self, charge: &mut HoldsCharge, resident: u64, scratch: u64) {
         adjust(&self.resident, charge.resident, resident);
         adjust(&self.scratch, charge.scratch, scratch);
@@ -147,17 +147,17 @@ impl HoldsAccountant {
         charge.scratch = scratch;
     }
 
-    /// How many more bytes one router may commit to its holds, judged against
-    /// what the process can still honour once every other set's published
-    /// holds are counted: RAM up to the shared resident limit, capped by
-    /// `resident_budget` (the most this router keeps resident before it pages),
-    /// plus whatever is left of the shared scratch total.
-    ///
-    /// `charge` is the caller's own standing charge, taken back out of the
-    /// totals so only other sets count as spent; `committed` is what the
-    /// caller already holds or has on its way. The same quarter the per-set
-    /// admission keeps back is kept back here, so the sum of every set's
-    /// admissions stops short of the point where a spill is refused.
+    // How many more bytes one router may commit to its holds, judged against
+    // what the process can still honour once every other set's published
+    // holds are counted: RAM up to the shared resident limit, capped by
+    // `resident_budget` (the most this router keeps resident before it pages),
+    // plus whatever is left of the shared scratch total.
+    //
+    // `charge` is the caller's own standing charge, taken back out of the
+    // totals so only other sets count as spent; `committed` is what the
+    // caller already holds or has on its way. The same quarter the per-set
+    // admission keeps back is kept back here, so the sum of every set's
+    // admissions stops short of the point where a spill is refused.
     pub(crate) fn admission_room(
         &self,
         charge: &HoldsCharge,
@@ -174,19 +174,19 @@ impl HoldsAccountant {
             .saturating_sub(committed)
     }
 
-    /// Withdraws one router's charge entirely. A router dropping is the one
-    /// caller: its bytes are gone with it, whatever it last published.
+    // Withdraws one router's charge entirely. A router dropping is the one
+    // caller: its bytes are gone with it, whatever it last published.
     pub(crate) fn release(&self, charge: &mut HoldsCharge) {
         self.publish(charge, 0, 0);
     }
 
-    /// Whether `bytes` more scratch may be written to the working directory:
-    /// inside the shared scratch ceiling, and leaving the filesystem its
-    /// reserve.
-    ///
-    /// Judged on the published totals, so a router calls this with its own
-    /// scratch charge current. Admission spends the free-space estimate; a
-    /// spill the caller then fails to make is reconciled at the next reading.
+    // Whether `bytes` more scratch may be written to the working directory:
+    // inside the shared scratch ceiling, and leaving the filesystem its
+    // reserve.
+    //
+    // Judged on the published totals, so a router calls this with its own
+    // scratch charge current. Admission spends the free-space estimate; a
+    // spill the caller then fails to make is reconciled at the next reading.
     pub(crate) fn admit_scratch(&self, bytes: u64) -> Result<(), DemotionReason> {
         if self.scratch_bytes().saturating_add(bytes) > self.limits.scratch_bytes {
             return Err(DemotionReason::HoldsScratchCeiling);
@@ -237,7 +237,7 @@ mod tests {
         }
     }
 
-    /// A reader of whatever `reading` holds, counting reads.
+    // A reader of whatever `reading` holds, counting reads.
     fn probe_returning(reading: Arc<Mutex<Capacity>>, calls: Arc<AtomicUsize>) -> DiskProbe {
         CapacityReader::from_fn(move || {
             calls.fetch_add(1, Ordering::AcqRel);

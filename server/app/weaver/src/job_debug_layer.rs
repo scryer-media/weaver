@@ -1,9 +1,9 @@
-//! The tracing layer that feeds each job's debug ring.
-//!
-//! It carries its own filter, so it sees a job's DEBUG and TRACE events
-//! whatever the output filter is set to. Only events with a `job_id` field
-//! qualify, and that is decided per callsite from the event's metadata, so a
-//! callsite without one is never enabled on this layer's account.
+// The tracing layer that feeds each job's debug ring.
+//
+// It carries its own filter, so it sees a job's DEBUG and TRACE events
+// whatever the output filter is set to. Only events with a `job_id` field
+// qualify, and that is decided per callsite from the event's metadata, so a
+// callsite without one is never enabled on this layer's account.
 
 use std::fmt::{self, Write as _};
 
@@ -19,15 +19,15 @@ use weaver_server_core::runtime::job_debug_ring::{self, CapturedEvent};
 
 pub(crate) struct JobDebugRingLayer;
 
-/// Whether an event belongs in a job's ring: DEBUG or finer, with a `job_id`.
+// Whether an event belongs in a job's ring: DEBUG or finer, with a `job_id`.
 pub(crate) fn captures(metadata: &Metadata<'_>) -> bool {
     metadata.is_event()
         && *metadata.level() >= Level::DEBUG
         && metadata.fields().field("job_id").is_some()
 }
 
-/// The ring's own filter. The verdict depends on the callsite alone, so it is
-/// cached per callsite: one without a `job_id` is never asked about again.
+// The ring's own filter. The verdict depends on the callsite alone, so it is
+// cached per callsite: one without a `job_id` is never asked about again.
 pub(crate) struct JobDebugFilter;
 
 impl<S> Filter<S> for JobDebugFilter {
@@ -48,7 +48,7 @@ impl<S> Filter<S> for JobDebugFilter {
     }
 }
 
-/// The layer with its filter attached, ready to add to the registry.
+// The layer with its filter attached, ready to add to the registry.
 pub(crate) fn layer<S>() -> Filtered<JobDebugRingLayer, JobDebugFilter, S>
 where
     S: Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
@@ -76,8 +76,8 @@ struct LineVisitor {
 }
 
 impl LineVisitor {
-    /// The event in parts. The ring stamps the capture time itself and
-    /// renders it only when the ring is dumped.
+    // The event in parts. The ring stamps the capture time itself and
+    // renders it only when the ring is dumped.
     fn into_event(self, metadata: &'static Metadata<'static>) -> CapturedEvent {
         CapturedEvent {
             level: *metadata.level(),
@@ -164,8 +164,8 @@ mod tests {
         assert_eq!(lines[1].message, "trace detail", "{lines:?}");
     }
 
-    /// WARN records whose message mentions stall diagnostics, as
-    /// `(message, fields)`.
+    // WARN records whose message mentions stall diagnostics, as
+    // `(message, fields)`.
     #[derive(Clone, Default)]
     struct StallRecords(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
 

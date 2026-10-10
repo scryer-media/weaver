@@ -1,4 +1,4 @@
-//! Local HTTP/3 CONNECT fixture with an explicit destination map and private CA.
+// Local HTTP/3 CONNECT fixture with an explicit destination map and private CA.
 use crate::{Http3ProxyCredentials, Http3TunnelSpec, TunnelProvider, shared::SharedProvider};
 use base64::Engine;
 use bytes::{Buf, Bytes};

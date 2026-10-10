@@ -1,4 +1,4 @@
-//! Explicit source bindings and consistency of shared authenticated descriptions.
+// Explicit source bindings and consistency of shared authenticated descriptions.
 
 use super::*;
 use par3_rs::layout::{ExtentKind, FileLayout};

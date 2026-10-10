@@ -9,14 +9,14 @@ use axum::response::{IntoResponse, Response};
 use weaver_server_api::auth::CallerIdentity;
 use weaver_server_core::runtime::restart::RestartController;
 
-/// How long the accepted response is given to reach the browser before the
-/// process starts tearing itself down. The page polls for the server coming
-/// back, so it has to learn the restart was accepted before it stops answering.
+// How long the accepted response is given to reach the browser before the
+// process starts tearing itself down. The page polls for the server coming
+// back, so it has to learn the restart was accepted before it stops answering.
 const RESTART_RESPONSE_GRACE: Duration = Duration::from_millis(500);
 
-/// Restart Weaver. REST rather than GraphQL because this is a process-lifecycle
-/// action and the first-run wizard — one of its two callers — is mounted
-/// outside the GraphQL client.
+// Restart Weaver. REST rather than GraphQL because this is a process-lifecycle
+// action and the first-run wizard — one of its two callers — is mounted
+// outside the GraphQL client.
 pub(super) async fn restart_handler(
     Extension(request_auth): Extension<super::RequestAuthContext>,
     Extension(restart): Extension<RestartController>,

@@ -5,18 +5,18 @@ use weaver_model::files::FileRole;
 
 use super::file::FileAssembly;
 
-/// Aggregates file assemblies for an entire download job.
+// Aggregates file assemblies for an entire download job.
 pub struct JobAssembly {
     job_id: JobId,
     files: HashMap<NzbFileId, FileAssembly>,
     has_par3_candidates: bool,
 
-    /// Archive topologies keyed by archive set name (e.g., "Show.S01E01.7z").
-    /// Supports multiple independent archive sets per job (e.g., season packs).
+    // Archive topologies keyed by archive set name (e.g., "Show.S01E01.7z").
+    // Supports multiple independent archive sets per job (e.g., season packs).
     archive_topologies: HashMap<String, ArchiveTopology>,
 }
 
-/// Type of archive detected in a job.
+// Type of archive detected in a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveType {
     Rar,
@@ -35,57 +35,59 @@ pub enum ArchiveType {
     Split,
 }
 
-/// Archive topology for extraction readiness.
+// Archive topology for extraction readiness.
 #[derive(Debug, Clone)]
 pub struct ArchiveTopology {
-    /// What kind of archive this topology describes.
+    // What kind of archive this topology describes.
     pub archive_type: ArchiveType,
-    /// Maps filename -> volume number.
+    // Maps filename -> volume number.
     pub volume_map: HashMap<String, u32>,
-    /// Volume numbers that are fully downloaded and verified.
+    // Volume numbers that are fully downloaded and verified.
     pub complete_volumes: HashSet<u32>,
-    /// Total expected volume count (if known).
+    // Total expected volume count (if known).
     pub expected_volume_count: Option<u32>,
-    /// Archive members and which volumes they span.
+    // Archive members and which volumes they span.
     pub members: Vec<ArchiveMember>,
-    /// Volumes occupied by continuation entries whose starting header has not
-    /// arrived yet. These spans must never be considered deletable.
+    // Volumes occupied by continuation entries whose starting header has not
+    // arrived yet. These spans must never be considered deletable.
     pub unresolved_spans: Vec<ArchivePendingSpan>,
 }
 
-/// A member (file) within an archive set.
+// A member (file) within an archive set.
 #[derive(Debug, Clone)]
 pub struct ArchiveMember {
     pub name: String,
-    /// First volume this member starts in.
+    // First volume this member starts in.
     pub first_volume: u32,
-    /// Last volume this member ends in.
+    // Last volume this member ends in.
     pub last_volume: u32,
-    /// Unpacked size in bytes.
+    // Unpacked size in bytes.
     pub unpacked_size: u64,
 }
 
-/// A protected span whose starting member header has not been observed yet.
+// A protected span whose starting member header has not been observed yet.
 #[derive(Debug, Clone)]
 pub struct ArchivePendingSpan {
     pub first_volume: u32,
     pub last_volume: u32,
 }
 
-/// Whether the job's archives are ready for extraction.
+// Whether the job's archives are ready for extraction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtractionReadiness {
-    /// No archive detected (standalone files only).
+    // No archive detected (standalone files only).
     NotApplicable,
-    /// Some members can be extracted now.
+    // Some members can be extracted now.
     Partial {
         extractable: Vec<String>,
         waiting_on: Vec<String>,
     },
-    /// All volumes are ready, full extraction possible.
+    // All volumes are ready, full extraction possible.
     Ready,
-    /// Cannot proceed without repair or missing data.
-    Blocked { reason: String },
+    // Cannot proceed without repair or missing data.
+    Blocked {
+        reason: String,
+    },
 }
 
 impl JobAssembly {
@@ -98,56 +100,56 @@ impl JobAssembly {
         }
     }
 
-    /// Add a file to track.
+    // Add a file to track.
     pub fn add_file(&mut self, assembly: FileAssembly) {
         self.has_par3_candidates |= matches!(assembly.role(), FileRole::Par3 { .. });
         self.files.insert(assembly.file_id(), assembly);
     }
 
-    /// Whether admission saw a declared PAR3 carrier. This is a discovery hint,
-    /// retained across renaming; it does not establish a set or its capacity.
+    // Whether admission saw a declared PAR3 carrier. This is a discovery hint,
+    // retained across renaming; it does not establish a set or its capacity.
     pub fn has_par3_candidates(&self) -> bool {
         self.has_par3_candidates
     }
 
-    /// Get a file assembly by id (mutable).
+    // Get a file assembly by id (mutable).
     pub fn file_mut(&mut self, file_id: NzbFileId) -> Option<&mut FileAssembly> {
         self.files.get_mut(&file_id)
     }
 
-    /// Get a file assembly by id (immutable).
+    // Get a file assembly by id (immutable).
     pub fn file(&self, file_id: NzbFileId) -> Option<&FileAssembly> {
         self.files.get(&file_id)
     }
 
-    /// Set archive topology for a named set.
+    // Set archive topology for a named set.
     pub fn set_archive_topology(&mut self, set_name: String, topology: ArchiveTopology) {
         self.archive_topologies.insert(set_name, topology);
     }
 
-    /// Forget a named set's topology, returning whatever was there.
-    ///
-    /// A set stops being something to extract once its output exists by other
-    /// means — a plain split set whose joined file the recovery data rebuilt
-    /// from the parts is the case this exists for. Removing the topology is
-    /// what stops readiness from waiting on parts nothing needs any more.
+    // Forget a named set's topology, returning whatever was there.
+    //
+    // A set stops being something to extract once its output exists by other
+    // means — a plain split set whose joined file the recovery data rebuilt
+    // from the parts is the case this exists for. Removing the topology is
+    // what stops readiness from waiting on parts nothing needs any more.
     pub fn remove_archive_topology(&mut self, set_name: &str) -> Option<ArchiveTopology> {
         self.archive_topologies.remove(set_name)
     }
 
-    /// Mark a volume as complete and verified within a named set.
+    // Mark a volume as complete and verified within a named set.
     pub fn mark_volume_complete(&mut self, set_name: &str, volume_number: u32) {
         if let Some(topo) = self.archive_topologies.get_mut(set_name) {
             topo.complete_volumes.insert(volume_number);
         }
     }
 
-    /// Check aggregate extraction readiness across all archive sets.
-    ///
-    /// - `Ready` if all sets are individually ready.
-    /// - `NotApplicable` if no archive files exist.
-    /// - `Blocked` if any set is blocked and none are ready.
-    /// - `Partial` if some sets are ready, others not.
+    // Check aggregate extraction readiness across all archive sets.
+    //
+    // - `Ready` if all sets are individually ready.
+    // - `NotApplicable` if no archive files exist.
+    // - `Blocked` if any set is blocked and none are ready.
+    // - `Partial` if some sets are ready, others not.
     pub fn extraction_readiness(&self) -> ExtractionReadiness {
         if self.archive_topologies.is_empty() {
             // Check if there are archive files without any topology yet.
@@ -224,7 +226,7 @@ impl JobAssembly {
         }
     }
 
-    /// Check extraction readiness for a single named archive set.
+    // Check extraction readiness for a single named archive set.
     pub fn set_extraction_readiness(&self, set_name: &str) -> ExtractionReadiness {
         let topo = match self.archive_topologies.get(set_name) {
             Some(t) => t,
@@ -297,7 +299,7 @@ impl JobAssembly {
         }
     }
 
-    /// Return names of archive sets that are fully ready for extraction.
+    // Return names of archive sets that are fully ready for extraction.
     pub fn ready_archive_sets(&self) -> Vec<String> {
         self.archive_topologies
             .keys()
@@ -311,11 +313,11 @@ impl JobAssembly {
             .collect()
     }
 
-    /// Check if streaming extraction can start for any member (RAR only).
-    ///
-    /// Returns `Some((member_name, first_volume))` when the first volume of
-    /// a member is complete. This allows extraction to begin immediately,
-    /// blocking on subsequent volumes as they arrive.
+    // Check if streaming extraction can start for any member (RAR only).
+    //
+    // Returns `Some((member_name, first_volume))` when the first volume of
+    // a member is complete. This allows extraction to begin immediately,
+    // blocking on subsequent volumes as they arrive.
     pub fn streaming_extraction_ready(&self) -> Option<(String, u32)> {
         // Streaming extraction only applies to RAR — find the first RAR topology.
         for topo in self.archive_topologies.values() {
@@ -331,32 +333,32 @@ impl JobAssembly {
         None
     }
 
-    /// Get the first archive topology (backward-compat convenience for single-set jobs).
+    // Get the first archive topology (backward-compat convenience for single-set jobs).
     pub fn archive_topology(&self) -> Option<&ArchiveTopology> {
         self.archive_topologies.values().next()
     }
 
-    /// Get a specific archive set's topology.
+    // Get a specific archive set's topology.
     pub fn archive_topology_for(&self, set_name: &str) -> Option<&ArchiveTopology> {
         self.archive_topologies.get(set_name)
     }
 
-    /// Get a mutable reference to a specific archive set's topology.
+    // Get a mutable reference to a specific archive set's topology.
     pub fn archive_topology_for_mut(&mut self, set_name: &str) -> Option<&mut ArchiveTopology> {
         self.archive_topologies.get_mut(set_name)
     }
 
-    /// Get all archive topologies.
+    // Get all archive topologies.
     pub fn archive_topologies(&self) -> &HashMap<String, ArchiveTopology> {
         &self.archive_topologies
     }
 
-    /// Get all archive topologies (mutable).
+    // Get all archive topologies (mutable).
     pub fn archive_topologies_mut(&mut self) -> &mut HashMap<String, ArchiveTopology> {
         &mut self.archive_topologies
     }
 
-    /// Overall job progress (average of file progresses, weighted by bytes).
+    // Overall job progress (average of file progresses, weighted by bytes).
     pub fn progress(&self) -> f64 {
         let total_bytes: u64 = self.files.values().map(|f| f.total_bytes()).sum();
         if total_bytes == 0 {
@@ -372,9 +374,9 @@ impl JobAssembly {
         weighted_progress / total_bytes as f64
     }
 
-    /// Total optional recovery bytes and how many of those bytes were received.
-    ///
-    /// Protection-only jobs treat recovery bytes as required, so both values return 0.
+    // Total optional recovery bytes and how many of those bytes were received.
+    //
+    // Protection-only jobs treat recovery bytes as required, so both values return 0.
     pub fn optional_recovery_bytes(&self) -> (u64, u64) {
         let has_payload_files = self
             .files
@@ -396,18 +398,18 @@ impl JobAssembly {
         })
     }
 
-    /// Number of complete files (all types).
+    // Number of complete files (all types).
     pub fn complete_file_count(&self) -> usize {
         self.files.values().filter(|f| f.is_complete()).count()
     }
 
-    /// Total number of files (all types).
+    // Total number of files (all types).
     pub fn total_file_count(&self) -> usize {
         self.files.len()
     }
 
-    /// Number of data files (excludes recovery volumes).
-    /// Includes protection indexes, archive volumes, and standalone files.
+    // Number of data files (excludes recovery volumes).
+    // Includes protection indexes, archive volumes, and standalone files.
     pub fn data_file_count(&self) -> usize {
         self.files
             .values()
@@ -415,7 +417,7 @@ impl JobAssembly {
             .count()
     }
 
-    /// Number of complete data files (excludes recovery volumes).
+    // Number of complete data files (excludes recovery volumes).
     pub fn complete_data_file_count(&self) -> usize {
         self.files
             .values()
@@ -423,17 +425,17 @@ impl JobAssembly {
             .count()
     }
 
-    /// Iterator over all files.
+    // Iterator over all files.
     pub fn files(&self) -> impl Iterator<Item = &FileAssembly> {
         self.files.values()
     }
 
-    /// Mutable iterator over all files.
+    // Mutable iterator over all files.
     pub fn files_mut(&mut self) -> impl Iterator<Item = &mut FileAssembly> {
         self.files.values_mut()
     }
 
-    /// The job id.
+    // The job id.
     pub fn job_id(&self) -> JobId {
         self.job_id
     }

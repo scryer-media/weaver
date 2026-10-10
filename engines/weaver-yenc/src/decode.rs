@@ -4,27 +4,27 @@ use crate::header;
 use crate::segment::{CheckpointPlan, Segment, SegmentedCrc32};
 use crate::types::{CrcVerification, DecodeResult, YencHeaderDefects, YencMetadata};
 
-/// Decoder state equivalent to rapidyenc's public `RapidYencDecoderState`.
+// Decoder state equivalent to rapidyenc's public `RapidYencDecoderState`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RapidyencDecodeState {
-    /// Previous decoded position is at a CRLF line boundary.
+    // Previous decoded position is at a CRLF line boundary.
     #[default]
     CrLf,
-    /// Previous input ended after an escape marker.
+    // Previous input ended after an escape marker.
     Eq,
-    /// Previous input ended after a carriage return.
+    // Previous input ended after a carriage return.
     Cr,
-    /// No special boundary state is pending.
+    // No special boundary state is pending.
     None,
-    /// Previous input ended after a raw `\r\n.` prefix.
+    // Previous input ended after a raw `\r\n.` prefix.
     CrLfDot,
-    /// Previous input ended after a raw `\r\n.\r` prefix.
+    // Previous input ended after a raw `\r\n.\r` prefix.
     CrLfDotCr,
-    /// Previous input ended after a line-start escape marker.
+    // Previous input ended after a line-start escape marker.
     CrLfEq,
 }
 
-/// End marker reported by rapidyenc-style incremental decode.
+// End marker reported by rapidyenc-style incremental decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RapidyencDecodeEnd {
     None,
@@ -32,7 +32,7 @@ pub enum RapidyencDecodeEnd {
     Article,
 }
 
-/// Progress reported by rapidyenc-style incremental decode.
+// Progress reported by rapidyenc-style incremental decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RapidyencDecodeProgress {
     pub source_consumed: usize,
@@ -40,48 +40,48 @@ pub struct RapidyencDecodeProgress {
     pub end: RapidyencDecodeEnd,
 }
 
-/// Options for decoding.
+// Options for decoding.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DecodeOptions {
-    /// If true, perform NNTP dot-unstuffing (strip leading dot from lines
-    /// starting with `..`). Default: false (assumes transport layer handled it).
+    // If true, perform NNTP dot-unstuffing (strip leading dot from lines
+    // starting with `..`). Default: false (assumes transport layer handled it).
     pub dot_unstuffing: bool,
 }
 
-/// Upper bound on the decoded length of `input_len` encoded bytes.
-///
-/// yEnc never expands: escapes are two bytes in and one byte out, line breaks
-/// and NNTP dot-stuffing only shrink the stream. So `input.len()` is both a
-/// sufficient and the smallest always-sufficient output size, and it is the
-/// size the whole-article entry points require — see [`decode`].
+// Upper bound on the decoded length of `input_len` encoded bytes.
+//
+// yEnc never expands: escapes are two bytes in and one byte out, line breaks
+// and NNTP dot-stuffing only shrink the stream. So `input.len()` is both a
+// sufficient and the smallest always-sufficient output size, and it is the
+// size the whole-article entry points require — see [`decode`].
 pub const fn max_decoded_len(input_len: usize) -> usize {
     input_len
 }
 
-/// Decode a complete yEnc article (headers + data + trailer) from `input` into `output`.
-///
-/// Returns metadata and CRC verification results.
-///
-/// # Output buffer contract
-///
-/// `output` must be at least [`max_decoded_len`]`(input.len())` bytes. A
-/// smaller buffer is rejected up front with [`YencError::BufferTooSmall`] —
-/// deliberately, and even when the decoded data would have fit: the SIMD
-/// kernels store full vector widths and only the byte-at-a-time scalar kernel
-/// can honour a compact destination, so accepting an undersized buffer here
-/// would silently trade an order of magnitude of throughput for a saved
-/// allocation. The byte-level [`decode_body`]/[`decode_chunk`] entry points do
-/// accept compact buffers, with that cost documented.
-///
-/// Do **not** size `output` from [`crate::YencMetadata::size`]. That field is
-/// `0` whenever the poster omitted or mangled `size=` (see
-/// [`crate::YencHeaderDefects::missing_size`] and
-/// [`crate::YencHeaderDefects::invalid_size`]), and it describes the whole
-/// *file* rather than this article's part. Size from `input.len()`, or use
-/// [`decode_nntp_append`], which sizes itself.
-/// Checkpoints tile a file from a known starting offset. An article that
-/// cannot say where it starts gets no grid at all, so nothing downstream reads
-/// its checksums as block evidence against a guessed position.
+// Decode a complete yEnc article (headers + data + trailer) from `input` into `output`.
+//
+// Returns metadata and CRC verification results.
+//
+// # Output buffer contract
+//
+// `output` must be at least [`max_decoded_len`]`(input.len())` bytes. A
+// smaller buffer is rejected up front with [`YencError::BufferTooSmall`] —
+// deliberately, and even when the decoded data would have fit: the SIMD
+// kernels store full vector widths and only the byte-at-a-time scalar kernel
+// can honour a compact destination, so accepting an undersized buffer here
+// would silently trade an order of magnitude of throughput for a saved
+// allocation. The byte-level [`decode_body`]/[`decode_chunk`] entry points do
+// accept compact buffers, with that cost documented.
+//
+// Do **not** size `output` from [`crate::YencMetadata::size`]. That field is
+// `0` whenever the poster omitted or mangled `size=` (see
+// [`crate::YencHeaderDefects::missing_size`] and
+// [`crate::YencHeaderDefects::invalid_size`]), and it describes the whole
+// *file* rather than this article's part. Size from `input.len()`, or use
+// [`decode_nntp_append`], which sizes itself.
+// Checkpoints tile a file from a known starting offset. An article that
+// cannot say where it starts gets no grid at all, so nothing downstream reads
+// its checksums as block evidence against a guessed position.
 pub(crate) fn collapse_plan_without_offset(
     metadata: &YencMetadata,
     plan: CheckpointPlan,
@@ -97,17 +97,17 @@ pub fn decode(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, YencError
     decode_with_options(input, output, DecodeOptions::default())
 }
 
-/// Decode a yEnc article from raw NNTP data (with dot-stuffing still present).
-///
-/// This is the fast path for the download pipeline: the NNTP codec passes raw
-/// data without dot-unstuffing, and this function handles unstuffing inline
-/// during the yEnc body decode pass. This eliminates a separate scan over the
-/// entire article body.
-///
-/// Headers (`=ybegin`, `=ypart`) are not affected by dot-stuffing (they start
-/// with `=`, not `.`), so header parsing works on raw data without changes.
-///
-/// `output` is subject to the same [`max_decoded_len`] contract as [`decode`].
+// Decode a yEnc article from raw NNTP data (with dot-stuffing still present).
+//
+// This is the fast path for the download pipeline: the NNTP codec passes raw
+// data without dot-unstuffing, and this function handles unstuffing inline
+// during the yEnc body decode pass. This eliminates a separate scan over the
+// entire article body.
+//
+// Headers (`=ybegin`, `=ypart`) are not affected by dot-stuffing (they start
+// with `=`, not `.`), so header parsing works on raw data without changes.
+//
+// `output` is subject to the same [`max_decoded_len`] contract as [`decode`].
 pub fn decode_nntp(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, YencError> {
     decode_with_options(
         input,
@@ -118,12 +118,12 @@ pub fn decode_nntp(input: &[u8], output: &mut [u8]) -> Result<DecodeResult, Yenc
     )
 }
 
-/// Decode a raw NNTP yEnc article, appending decoded bytes to `output`.
-///
-/// Unlike [`decode_nntp`], the destination does not need to be pre-sized (or
-/// zero-initialized): decoded bytes are written straight into the vector's
-/// spare capacity. Decoded output never exceeds the encoded input, so one
-/// `input.len()` reservation is always sufficient.
+// Decode a raw NNTP yEnc article, appending decoded bytes to `output`.
+//
+// Unlike [`decode_nntp`], the destination does not need to be pre-sized (or
+// zero-initialized): decoded bytes are written straight into the vector's
+// spare capacity. Decoded output never exceeds the encoded input, so one
+// `input.len()` reservation is always sufficient.
 pub fn decode_nntp_append(input: &[u8], output: &mut Vec<u8>) -> Result<DecodeResult, YencError> {
     let start = output.len();
     output.reserve(input.len());
@@ -147,13 +147,13 @@ pub fn decode_nntp_append(input: &[u8], output: &mut Vec<u8>) -> Result<DecodeRe
     Ok(result)
 }
 
-/// Decode bytes with rapidyenc's `rapidyenc_decode` semantics.
+// Decode bytes with rapidyenc's `rapidyenc_decode` semantics.
 pub fn decode_rapidyenc(input: &[u8], output: &mut [u8]) -> Result<usize, YencError> {
     let mut state = RapidyencDecodeState::default();
     decode_rapidyenc_ex(true, input, output, &mut state)
 }
 
-/// Decode bytes with rapidyenc's `rapidyenc_decode_ex` semantics.
+// Decode bytes with rapidyenc's `rapidyenc_decode_ex` semantics.
 pub fn decode_rapidyenc_ex(
     is_raw: bool,
     input: &[u8],
@@ -163,7 +163,7 @@ pub fn decode_rapidyenc_ex(
     crate::simd::decode_rapidyenc_into(input, output, is_raw, state)
 }
 
-/// Decode bytes with rapidyenc's raw incremental end-detecting semantics.
+// Decode bytes with rapidyenc's raw incremental end-detecting semantics.
 pub fn decode_rapidyenc_incremental(
     input: &[u8],
     output: &mut [u8],
@@ -177,13 +177,13 @@ pub fn decode_rapidyenc_incremental(
     })
 }
 
-/// Decode a raw NNTP yEnc body chunk into `output`, stopping at the next yEnc
-/// control line.
-///
-/// This is the lower-level streaming hook used when an outer NNTP parser owns
-/// response-boundary handling. It appends decoded bytes to `output`, updates
-/// `decode_state` and CRC, performs NNTP dot-unstuffing, and reports exact
-/// source bytes consumed.
+// Decode a raw NNTP yEnc body chunk into `output`, stopping at the next yEnc
+// control line.
+//
+// This is the lower-level streaming hook used when an outer NNTP parser owns
+// response-boundary handling. It appends decoded bytes to `output`, updates
+// `decode_state` and CRC, performs NNTP dot-unstuffing, and reports exact
+// source bytes consumed.
 pub fn decode_body_chunk_until_control(
     decode_state: &mut DecodeState,
     input: &[u8],
@@ -192,9 +192,9 @@ pub fn decode_body_chunk_until_control(
     decode_body_chunk_until_end(decode_state, input, output)
 }
 
-/// Shared post-decode validation for every article entry point (whole-buffer,
-/// streaming, and the fused NNTP decoder), so all three agree on which
-/// inconsistencies fail an article and which are merely recorded.
+// Shared post-decode validation for every article entry point (whole-buffer,
+// streaming, and the fused NNTP decoder), so all three agree on which
+// inconsistencies fail an article and which are merely recorded.
 fn finalize_decode(
     metadata: YencMetadata,
     yend: Option<header::YendFields>,
@@ -263,11 +263,11 @@ fn finalize_decode(
     })
 }
 
-/// Decode a complete yEnc article with custom options.
-///
-/// Rule: weaver never fails an article another tool would accept; where readings differ it decodes as rapidyenc and sabctools do.
-///
-/// `output` is subject to the same [`max_decoded_len`] contract as [`decode`].
+// Decode a complete yEnc article with custom options.
+//
+// Rule: weaver never fails an article another tool would accept; where readings differ it decodes as rapidyenc and sabctools do.
+//
+// `output` is subject to the same [`max_decoded_len`] contract as [`decode`].
 pub fn decode_with_options(
     input: &[u8],
     output: &mut [u8],
@@ -292,10 +292,10 @@ pub fn decode_with_options(
     decode_with_line_scan(input, output, options)
 }
 
-/// The whole-buffer decode that locates the trailer by walking the body's lines
-/// before decoding it. Used for articles without dot-stuffing (the kernel's end
-/// detection only runs in raw mode) and for the raw articles the single pass
-/// defers on.
+// The whole-buffer decode that locates the trailer by walking the body's lines
+// before decoding it. Used for articles without dot-stuffing (the kernel's end
+// detection only runs in raw mode) and for the raw articles the single pass
+// defers on.
 fn decode_with_line_scan(
     input: &[u8],
     output: &mut [u8],
@@ -340,9 +340,9 @@ fn decode_with_line_scan(
     )
 }
 
-/// The whole-buffer entry has no chunk boundaries to checkpoint against and no
-/// PAR2 block size to checkpoint at, so it reports the same single segment a
-/// streaming decode with no segment plan would.
+// The whole-buffer entry has no chunk boundaries to checkpoint against and no
+// PAR2 block size to checkpoint at, so it reports the same single segment a
+// streaming decode with no segment plan would.
 fn whole_buffer_segments(
     metadata: &YencMetadata,
     bytes_written: usize,
@@ -359,16 +359,16 @@ fn whole_buffer_segments(
     }
 }
 
-/// Whole-buffer decode of a raw (dot-stuffed) article in one pass over the
-/// body: the kernel's own end detection finds the `=y` that ends the body, as
-/// the streaming and fused decoders do, instead of a separate line walk over
-/// the body before the decode.
-///
-/// Returns `None` where the two readings of the body boundary could differ, and
-/// the caller falls back to the line-scanning path for an identical result: an
-/// NNTP terminator (`\r\n.\r\n`) inside the article, which the line scan
-/// decodes past, and an input that ends inside an escape with no control line
-/// after it, which the line scan fails.
+// Whole-buffer decode of a raw (dot-stuffed) article in one pass over the
+// body: the kernel's own end detection finds the `=y` that ends the body, as
+// the streaming and fused decoders do, instead of a separate line walk over
+// the body before the decode.
+//
+// Returns `None` where the two readings of the body boundary could differ, and
+// the caller falls back to the line-scanning path for an identical result: an
+// NNTP terminator (`\r\n.\r\n`) inside the article, which the line scan
+// decodes past, and an input that ends inside an escape with no control line
+// after it, which the line scan fails.
 fn decode_raw_single_pass(
     input: &[u8],
     output: &mut [u8],
@@ -418,21 +418,21 @@ fn decode_raw_single_pass(
     .map(Some)
 }
 
-/// True when `body` ends inside an escape: an odd run of trailing `=`, since
-/// each `=` that opens an escape takes the next byte, including a `=`.
+// True when `body` ends inside an escape: an odd run of trailing `=`, since
+// each `=` that opens an escape takes the next byte, including a `=`.
 fn ends_in_open_escape(body: &[u8]) -> bool {
     body.iter().rev().take_while(|&&b| b == b'=').count() % 2 == 1
 }
 
-/// Result of incrementally decoding a full NNTP yEnc article.
+// Result of incrementally decoding a full NNTP yEnc article.
 #[derive(Debug)]
 pub struct DecodedArticle {
     pub data: Vec<u8>,
     pub result: DecodeResult,
 }
 
-/// Finalize a caller-owned streaming yEnc decode using the same validation
-/// rules as [`StreamingArticleDecoder`].
+// Finalize a caller-owned streaming yEnc decode using the same validation
+// rules as [`StreamingArticleDecoder`].
 pub fn finish_streaming_article(
     metadata: YencMetadata,
     yend: Option<header::YendFields>,
@@ -467,9 +467,9 @@ pub fn finish_streaming_result(
     )
 }
 
-/// How much leading junk may precede `=ybegin` before the article is declared
-/// header-less. Bounded so a body that never contains a yEnc header cannot make
-/// the streaming decoder buffer without limit.
+// How much leading junk may precede `=ybegin` before the article is declared
+// header-less. Bounded so a body that never contains a yEnc header cannot make
+// the streaming decoder buffer without limit.
 pub(crate) const MAX_HEADER_SCAN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,10 +480,10 @@ enum StreamingStage {
     Finished,
 }
 
-/// Incremental yEnc article decoder for raw NNTP BODY data.
-///
-/// This keeps only the small yEnc header/trailer lines buffered while decoding
-/// body bytes as chunks arrive from the socket.
+// Incremental yEnc article decoder for raw NNTP BODY data.
+//
+// This keeps only the small yEnc header/trailer lines buffered while decoding
+// body bytes as chunks arrive from the socket.
 #[derive(Debug, Clone)]
 pub struct StreamingArticleDecoder {
     stage: StreamingStage,
@@ -512,19 +512,19 @@ impl StreamingArticleDecoder {
         }
     }
 
-    /// Checkpoint this article's CRC pass at multiples of `block_size` so its
-    /// [`DecodeResult::segments`] can be folded into PAR2 block CRC32s.
-    ///
-    /// Must be set before the yEnc header is consumed. `None` (the default)
-    /// produces one coarse segment for the article.
+    // Checkpoint this article's CRC pass at multiples of `block_size` so its
+    // [`DecodeResult::segments`] can be folded into PAR2 block CRC32s.
+    //
+    // Must be set before the yEnc header is consumed. `None` (the default)
+    // produces one coarse segment for the article.
     pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
         self.checkpoint_plan = checkpoint_plan;
     }
 
-    /// Feed the next raw NNTP BODY chunk into the decoder.
-    ///
-    /// `output` is appended with decoded bytes. Chunks are expected to end on a
-    /// line boundary, which matches the NNTP raw streaming fetch path.
+    // Feed the next raw NNTP BODY chunk into the decoder.
+    //
+    // `output` is appended with decoded bytes. Chunks are expected to end on a
+    // line boundary, which matches the NNTP raw streaming fetch path.
     pub fn feed_chunk(&mut self, input: &[u8], output: &mut Vec<u8>) -> Result<(), YencError> {
         if input.is_empty() {
             return Ok(());
@@ -805,19 +805,19 @@ fn next_line_len(buf: &[u8]) -> Option<usize> {
     memchr::memchr(b'\n', buf).map(|idx| idx + 1)
 }
 
-/// Decode raw yEnc-encoded data (no headers/trailers) from `input` into `output`.
-///
-/// Updates the CRC hasher with decoded bytes. Returns the number of bytes written.
-///
-/// # Output buffer contract
-///
-/// Unlike the whole-article [`decode`] entry points, this accepts an `output`
-/// shorter than [`max_decoded_len`]`(input.len())`: a caller that already knows
-/// the exact decoded length (a fixed-size part, a preallocated slot) should not
-/// have to over-allocate. The cost is explicit rather than free — a compact
-/// destination cannot take the SIMD kernels' full-width stores and runs the
-/// byte-at-a-time scalar kernel instead, roughly an order of magnitude slower.
-/// Overflow is a typed [`YencError::BufferTooSmall`], never a truncated write.
+// Decode raw yEnc-encoded data (no headers/trailers) from `input` into `output`.
+//
+// Updates the CRC hasher with decoded bytes. Returns the number of bytes written.
+//
+// # Output buffer contract
+//
+// Unlike the whole-article [`decode`] entry points, this accepts an `output`
+// shorter than [`max_decoded_len`]`(input.len())`: a caller that already knows
+// the exact decoded length (a fixed-size part, a preallocated slot) should not
+// have to over-allocate. The cost is explicit rather than free — a compact
+// destination cannot take the SIMD kernels' full-width stores and runs the
+// byte-at-a-time scalar kernel instead, roughly an order of magnitude slower.
+// Overflow is a typed [`YencError::BufferTooSmall`], never a truncated write.
 pub fn decode_body(
     input: &[u8],
     output: &mut [u8],
@@ -850,41 +850,41 @@ fn decode_body_with_line_length(
     Ok(written)
 }
 
-/// Persistent state for streaming yEnc decode across chunk boundaries.
-///
-/// Tracks whether the previous chunk ended mid-escape sequence or at a line
-/// boundary, so the next chunk continues correctly.
+// Persistent state for streaming yEnc decode across chunk boundaries.
+//
+// Tracks whether the previous chunk ended mid-escape sequence or at a line
+// boundary, so the next chunk continues correctly.
 #[derive(Debug, Clone)]
 pub struct DecodeState {
-    /// If true, the previous chunk ended with an `=` escape character.
-    /// The next byte in the following chunk is the escaped value.
+    // If true, the previous chunk ended with an `=` escape character.
+    // The next byte in the following chunk is the escaped value.
     pub escape_pending: bool,
-    /// If true, we're at the start of a line (for dot-unstuffing).
+    // If true, we're at the start of a line (for dot-unstuffing).
     pub at_line_start: bool,
-    /// If true, the previous chunk ended with a dot at line start (dot-unstuffing).
-    /// The next byte determines whether it's a terminator, stuffed dot, or data.
+    // If true, the previous chunk ended with a dot at line start (dot-unstuffing).
+    // The next byte determines whether it's a terminator, stuffed dot, or data.
     pub dot_pending: bool,
-    /// If true, the previous chunk ended after a raw CR and needs the next byte
-    /// to decide whether this is a real CRLF line boundary.
+    // If true, the previous chunk ended after a raw CR and needs the next byte
+    // to decide whether this is a real CRLF line boundary.
     pub(crate) cr_pending: bool,
-    /// Running CRC32 state, checkpointed at PAR2 block boundaries.
-    ///
-    /// One pass serves both integrity families: the article `pcrc32` is the
-    /// fold of every segment, and the segments themselves are the block-aligned
-    /// evidence the collector assembles into block CRC32s. With no segment plan
-    /// declared this is a single segment and behaves exactly as the plain
-    /// [`Crc32`] it replaced.
+    // Running CRC32 state, checkpointed at PAR2 block boundaries.
+    //
+    // One pass serves both integrity families: the article `pcrc32` is the
+    // fold of every segment, and the segments themselves are the block-aligned
+    // evidence the collector assembles into block CRC32s. With no segment plan
+    // declared this is a single segment and behaves exactly as the plain
+    // [`Crc32`] it replaced.
     pub(crate) crc: SegmentedCrc32,
-    /// Trusted encoded-column line length hint from `=ybegin line=...`.
+    // Trusted encoded-column line length hint from `=ybegin line=...`.
     pub(crate) line_length_hint: Option<usize>,
-    /// Total bytes decoded so far across all chunks.
+    // Total bytes decoded so far across all chunks.
     pub bytes_decoded: u64,
-    /// Number of CRC update calls made while streaming this body.
+    // Number of CRC update calls made while streaming this body.
     pub crc_update_calls: u64,
 }
 
 impl DecodeState {
-    /// Create a new decode state for streaming decode.
+    // Create a new decode state for streaming decode.
     pub fn new() -> Self {
         Self {
             escape_pending: false,
@@ -898,25 +898,25 @@ impl DecodeState {
         }
     }
 
-    /// Provide the encoded-column line length from `=ybegin line=...`.
+    // Provide the encoded-column line length from `=ybegin line=...`.
     pub fn set_line_length_hint(&mut self, line_length: Option<u32>) {
         self.line_length_hint = line_length
             .and_then(|value| usize::try_from(value).ok())
             .filter(|&value| value > 0);
     }
 
-    /// Declare where this article's decoded bytes land in the reconstructed
-    /// file, and the immutable checkpoint geometry for its CRC pass.
-    ///
-    /// The decoders call this once the yEnc header is parsed — `file_offset`
-    /// comes from the article's own `=ypart begin` (`0` for a single-part
-    /// article), and `block_size` is the recovery set's slice size, which is
-    /// only known once a PAR2 packet set has been parsed. Passing `None` is the
-    /// availability policy for an article decoded before then: one segment for
-    /// the whole article, never a delayed or repeated decode.
-    ///
-    /// Only meaningful before the first body byte is decoded; calling it later
-    /// would discard the CRC accumulated so far, so it is a no-op then.
+    // Declare where this article's decoded bytes land in the reconstructed
+    // file, and the immutable checkpoint geometry for its CRC pass.
+    //
+    // The decoders call this once the yEnc header is parsed — `file_offset`
+    // comes from the article's own `=ypart begin` (`0` for a single-part
+    // article), and `block_size` is the recovery set's slice size, which is
+    // only known once a PAR2 packet set has been parsed. Passing `None` is the
+    // availability policy for an article decoded before then: one segment for
+    // the whole article, never a delayed or repeated decode.
+    //
+    // Only meaningful before the first body byte is decoded; calling it later
+    // would discard the CRC accumulated so far, so it is a no-op then.
     pub fn set_segment_plan(&mut self, file_offset: u64, checkpoint_plan: CheckpointPlan) {
         if !self.crc.is_empty() {
             debug_assert!(
@@ -928,19 +928,19 @@ impl DecodeState {
         self.crc = SegmentedCrc32::new(file_offset, checkpoint_plan);
     }
 
-    /// Finalize and return the CRC32 of all decoded data. Consumes the state.
+    // Finalize and return the CRC32 of all decoded data. Consumes the state.
     pub fn finalize_crc(self) -> u32 {
         self.crc.finish_article().0
     }
 
-    /// Finalize and return both the article CRC32 and its segment records.
+    // Finalize and return both the article CRC32 and its segment records.
     pub fn finish_segments(self) -> (u32, Vec<Segment>) {
         self.crc.finish_article()
     }
 
-    /// Finalize segments with any defensive-collapse reason retained for the
-    /// transport/server handoff. The ordinary [`Self::finish_segments`] API
-    /// remains for callers that only need CRC evidence.
+    // Finalize segments with any defensive-collapse reason retained for the
+    // transport/server handoff. The ordinary [`Self::finish_segments`] API
+    // remains for callers that only need CRC evidence.
     pub fn finish_segments_with_reason(
         self,
     ) -> (
@@ -957,7 +957,7 @@ impl DecodeState {
         self.crc.checkpoint_plan()
     }
 
-    /// Get the current CRC32 value without consuming the state.
+    // Get the current CRC32 value without consuming the state.
     pub fn current_crc(&self) -> u32 {
         self.crc.current_crc()
     }
@@ -969,15 +969,15 @@ impl Default for DecodeState {
     }
 }
 
-/// Decode a chunk of raw yEnc body data, updating persistent state.
-///
-/// Unlike `decode_body`, this function can be called repeatedly with
-/// successive chunks of the same article body. State (escape sequences,
-/// line position, CRC) carries over between calls.
-///
-/// Returns the number of bytes written to `output`.
-///
-/// `output` follows the same compact-buffer contract as [`decode_body`].
+// Decode a chunk of raw yEnc body data, updating persistent state.
+//
+// Unlike `decode_body`, this function can be called repeatedly with
+// successive chunks of the same article body. State (escape sequences,
+// line position, CRC) carries over between calls.
+//
+// Returns the number of bytes written to `output`.
+//
+// `output` follows the same compact-buffer contract as [`decode_body`].
 pub fn decode_chunk(
     input: &[u8],
     output: &mut [u8],
@@ -1022,7 +1022,7 @@ fn decode_chunk_until_end(
 mod tests {
     use super::*;
 
-    /// Helper: encode a single byte using yEnc rules (for test construction).
+    // Helper: encode a single byte using yEnc rules (for test construction).
     fn yenc_encode_byte(b: u8) -> Vec<u8> {
         let encoded = b.wrapping_add(42);
         match encoded {
@@ -1033,7 +1033,7 @@ mod tests {
         }
     }
 
-    /// Helper: encode a byte slice to raw yEnc data (no headers).
+    // Helper: encode a byte slice to raw yEnc data (no headers).
     fn encode_raw(data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         for &b in data {
@@ -1228,7 +1228,7 @@ mod tests {
 
     // ── Broken-poster corpus: whole-buffer + streaming, every split point ──
 
-    /// NNTP dot-stuffing, as a real server applies it on the wire.
+    // NNTP dot-stuffing, as a real server applies it on the wire.
     fn dot_stuff_lines(input: &[u8]) -> Vec<u8> {
         let mut output = Vec::with_capacity(input.len());
         let mut at_line_start = true;
@@ -1242,8 +1242,8 @@ mod tests {
         output
     }
 
-    /// Build a single-part article from caller-supplied header/trailer lines
-    /// around a genuinely valid, dot-stuffed encoded body.
+    // Build a single-part article from caller-supplied header/trailer lines
+    // around a genuinely valid, dot-stuffed encoded body.
     fn broken_poster_article(
         prologue: &[u8],
         ybegin: &[u8],
@@ -1261,14 +1261,14 @@ mod tests {
         dot_stuff_lines(&article)
     }
 
-    /// Leading `\x04` encodes to `.`, so the body exercises dot-unstuffing too.
+    // Leading `\x04` encodes to `.`, so the body exercises dot-unstuffing too.
     const TOLERANT_BODY: &[u8] = b"\x04tolerant poster body\r\n\0";
 
     fn healthy_yend(size: u64, crc: u32) -> Vec<u8> {
         format!("=yend size={size} crc32={crc:08x}\r\n").into_bytes()
     }
 
-    /// Feed an article through `StreamingArticleDecoder` split at `split`.
+    // Feed an article through `StreamingArticleDecoder` split at `split`.
     fn decode_streaming_split(article: &[u8], split: usize) -> Result<DecodedArticle, YencError> {
         let mut decoder = StreamingArticleDecoder::new();
         let mut output = Vec::new();
@@ -1277,14 +1277,14 @@ mod tests {
         decoder.finish(output)
     }
 
-    /// Every entry point must agree on a tolerated article, at every split
-    /// point of the streaming one.
+    // Every entry point must agree on a tolerated article, at every split
+    // point of the streaming one.
     fn assert_all_entry_points_agree(article: &[u8], expected_data: &[u8]) {
         assert_entry_points_agree_at_splits(article, expected_data, 0..=article.len());
     }
 
-    /// [`assert_all_entry_points_agree`] over a chosen set of split points, for
-    /// articles too large to sweep byte by byte.
+    // [`assert_all_entry_points_agree`] over a chosen set of split points, for
+    // articles too large to sweep byte by byte.
     fn assert_entry_points_agree_at_splits(
         article: &[u8],
         expected_data: &[u8],
@@ -1318,8 +1318,8 @@ mod tests {
         }
     }
 
-    /// Every entry point must reject a broken article the same way, at every
-    /// split point of the streaming one.
+    // Every entry point must reject a broken article the same way, at every
+    // split point of the streaming one.
     fn assert_all_entry_points_reject(article: &[u8], expected_reason: &str) {
         let mut whole_out = vec![0u8; max_decoded_len(article.len())];
         let whole =
@@ -1347,9 +1347,9 @@ mod tests {
     // `=yend ` lines instead, which disagreed with the streaming and fused
     // decoders on the three inputs below.
 
-    /// A `\r\n=y…` line that is not `=yend`. The kernel stops there, so the
-    /// article cannot decode past it — the line scan used to step over the
-    /// line, decode it as body data, and carry on to the real `=yend`.
+    // A `\r\n=y…` line that is not `=yend`. The kernel stops there, so the
+    // article cannot decode past it — the line scan used to step over the
+    // line, decode it as body data, and carry on to the real `=yend`.
     #[test]
     fn stray_control_line_in_body_is_rejected_by_every_entry_point() {
         for stray in [
@@ -1373,9 +1373,9 @@ mod tests {
         }
     }
 
-    /// An article truncated in the middle of its control line: `\r\n=y` and
-    /// nothing more. Every entry point rejects it rather than one of them
-    /// silently reporting a complete, trailer-less article.
+    // An article truncated in the middle of its control line: `\r\n=y` and
+    // nothing more. Every entry point rejects it rather than one of them
+    // silently reporting a complete, trailer-less article.
     #[test]
     fn truncated_control_line_is_rejected_by_every_entry_point() {
         let mut article = Vec::new();
@@ -1388,11 +1388,11 @@ mod tests {
         assert_all_entry_points_reject(&article, "unexpected trailing line after yEnc body");
     }
 
-    /// A bare `\n=yend ` is *not* a trailer: the kernel reaches its line-start
-    /// state only through a literal CRLF, so the would-be trailer is body data
-    /// everywhere. The whole-buffer path used to accept it, decoding 24 bytes
-    /// with a verified CRC where the streaming path decoded the trailer text
-    /// into the payload.
+    // A bare `\n=yend ` is *not* a trailer: the kernel reaches its line-start
+    // state only through a literal CRLF, so the would-be trailer is body data
+    // everywhere. The whole-buffer path used to accept it, decoding 24 bytes
+    // with a verified CRC where the streaming path decoded the trailer text
+    // into the payload.
     #[test]
     fn bare_lf_trailer_is_body_data_in_every_entry_point() {
         let mut article = Vec::new();
@@ -1411,9 +1411,9 @@ mod tests {
         assert_eq!(result.crc_status, CrcVerification::Unverified);
     }
 
-    /// A dot-stuffed trailer (`\r\n.=yend `). The kernel strips the one leading
-    /// `.` at line start in raw mode before looking for `=y`, so this really is
-    /// the trailer; the line scan used to miss it entirely.
+    // A dot-stuffed trailer (`\r\n.=yend `). The kernel strips the one leading
+    // `.` at line start in raw mode before looking for `=y`, so this really is
+    // the trailer; the line scan used to miss it entirely.
     #[test]
     fn dot_prefixed_trailer_is_found_by_every_entry_point() {
         let base = broken_poster_article(
@@ -1438,10 +1438,10 @@ mod tests {
         assert_eq!(result.crc_status, CrcVerification::Verified);
     }
 
-    /// An article that ends on its `=yend` with no line terminator. The
-    /// whole-buffer path always parsed that trailer; `process_trailer` only
-    /// ever sees complete lines, so the streaming decoder now recovers it at
-    /// `finish` instead of reporting a trailer-less article.
+    // An article that ends on its `=yend` with no line terminator. The
+    // whole-buffer path always parsed that trailer; `process_trailer` only
+    // ever sees complete lines, so the streaming decoder now recovers it at
+    // `finish` instead of reporting a trailer-less article.
     #[test]
     fn unterminated_trailer_is_parsed_by_every_entry_point() {
         let base = broken_poster_article(
@@ -1463,10 +1463,10 @@ mod tests {
         assert_eq!(result.crc_status, CrcVerification::Verified);
     }
 
-    /// The whole-buffer `=ybegin` scan is bounded at the same 64 KiB the
-    /// streaming and fused decoders use, so all three call the same articles
-    /// header-less. The article is too large to sweep byte by byte, so this
-    /// checks the boundary on both sides at a spread of split points.
+    // The whole-buffer `=ybegin` scan is bounded at the same 64 KiB the
+    // streaming and fused decoders use, so all three call the same articles
+    // header-less. The article is too large to sweep byte by byte, so this
+    // checks the boundary on both sides at a spread of split points.
     #[test]
     fn leading_junk_scan_bound_agrees_across_entry_points() {
         const JUNK_LINE: &[u8] = b"this line is not a yenc header at all\r\n";
@@ -1516,8 +1516,8 @@ mod tests {
 
     // ── B8: the output-buffer contract ──────────────────────────────────
 
-    /// The whole-article entry points reject an undersized destination with a
-    /// typed error instead of silently dropping to the scalar kernel.
+    // The whole-article entry points reject an undersized destination with a
+    // typed error instead of silently dropping to the scalar kernel.
     #[test]
     fn article_decode_rejects_undersized_output_instead_of_degrading() {
         let article = broken_poster_article(
@@ -1548,8 +1548,8 @@ mod tests {
         assert_eq!(&sized[..result.bytes_written], TOLERANT_BODY);
     }
 
-    /// The byte-level API keeps the compact-buffer fallback, and it still
-    /// produces the same bytes as the SIMD path.
+    // The byte-level API keeps the compact-buffer fallback, and it still
+    // produces the same bytes as the SIMD path.
     #[test]
     fn body_decode_compact_buffer_matches_the_simd_path() {
         let encoded = encode_raw(TOLERANT_BODY);
@@ -1581,9 +1581,9 @@ mod tests {
 
     // ── E19: pre-reservation for oversized articles ─────────────────────
 
-    /// An article whose declared size exceeds the 16 MiB reservation cap used
-    /// to get *no* pre-reservation at all, so the one article that most needed
-    /// a head start grew from zero one doubling at a time.
+    // An article whose declared size exceeds the 16 MiB reservation cap used
+    // to get *no* pre-reservation at all, so the one article that most needed
+    // a head start grew from zero one doubling at a time.
     #[test]
     fn streaming_reserves_the_cap_for_articles_larger_than_it() {
         const CAP: usize = 16 * 1024 * 1024;
@@ -1638,7 +1638,7 @@ mod tests {
         );
     }
 
-    /// Junk before `=ybegin`, including `=`-bearing and partial-prefix junk.
+    // Junk before `=ybegin`, including `=`-bearing and partial-prefix junk.
     #[test]
     fn tolerates_leading_junk_before_ybegin_at_every_split_point() {
         let article = broken_poster_article(
@@ -1656,7 +1656,7 @@ mod tests {
         assert_eq!(result.metadata.name, "junk.bin");
     }
 
-    /// Every combination of missing `line=`/`size=`/`name=`.
+    // Every combination of missing `line=`/`size=`/`name=`.
     #[test]
     fn tolerates_every_missing_ybegin_field_combination_at_every_split_point() {
         for line_field in [None, Some("line=128")] {
@@ -1685,8 +1685,8 @@ mod tests {
         }
     }
 
-    /// Garbage `crc32=` leaves the article decoded but explicitly
-    /// unverified -- it must never read back as "verified".
+    // Garbage `crc32=` leaves the article decoded but explicitly
+    // unverified -- it must never read back as "verified".
     #[test]
     fn tolerates_garbage_crc32_at_every_split_point() {
         for garbage in ["nothex", "", "  ", "DEADBEEFDEADBEEF0", "1234ZZZZ", "0x99"] {
@@ -1710,7 +1710,7 @@ mod tests {
         }
     }
 
-    /// `=ypart end=` past `=ybegin size=`, and the healthy inverse.
+    // `=ypart end=` past `=ybegin size=`, and the healthy inverse.
     #[test]
     fn tolerates_ypart_end_past_declared_size_at_every_split_point() {
         for (declared_size, expect_defect) in [(10u64, true), (100_000u64, false)] {
@@ -1734,8 +1734,8 @@ mod tests {
         }
     }
 
-    /// Tab and case variants of field names behave identically on the
-    /// whole-buffer, streaming, and `parse_ybegin_line` entry points.
+    // Tab and case variants of field names behave identically on the
+    // whole-buffer, streaming, and `parse_ybegin_line` entry points.
     #[test]
     fn tolerates_tab_and_case_field_variants_at_every_split_point() {
         for ybegin in [
@@ -1754,8 +1754,8 @@ mod tests {
         }
     }
 
-    /// Known damage remains distinct from missing checksums, even when the
-    /// decoded bytes are retained for repair.
+    // Known damage remains distinct from missing checksums, even when the
+    // decoded bytes are retained for repair.
     #[test]
     fn genuine_crc_mismatch_remains_distinct_from_unverified() {
         let article = broken_poster_article(
@@ -1770,8 +1770,8 @@ mod tests {
         assert_eq!(result.crc_status, CrcVerification::Mismatch);
     }
 
-    /// A body with no `=ybegin` at all is still a hard failure, and the
-    /// streaming decoder must not buffer without bound while looking for one.
+    // A body with no `=ybegin` at all is still a hard failure, and the
+    // streaming decoder must not buffer without bound while looking for one.
     #[test]
     fn header_scan_is_bounded_and_still_reports_missing_header() {
         let mut junk = Vec::new();
@@ -2828,13 +2828,13 @@ mod tests {
         }
     }
 
-    /// The single-pass raw decode must give exactly what the line-scanning
-    /// decode gives — same result, same defects, same error, same bytes — on
-    /// every article, including the ones that exercise the trailer rules: a
-    /// bare-LF `=yend` (not a trailer), a dot-stuffed `.=yend` (a trailer in
-    /// raw mode), a non-`=yend` control line (an error), garbage after
-    /// `=yend`, a missing trailer, a lone `=` or `\r` before the trailer, and an
-    /// NNTP terminator inside the article (the single pass defers to the scan).
+    // The single-pass raw decode must give exactly what the line-scanning
+    // decode gives — same result, same defects, same error, same bytes — on
+    // every article, including the ones that exercise the trailer rules: a
+    // bare-LF `=yend` (not a trailer), a dot-stuffed `.=yend` (a trailer in
+    // raw mode), a non-`=yend` control line (an error), garbage after
+    // `=yend`, a missing trailer, a lone `=` or `\r` before the trailer, and an
+    // NNTP terminator inside the article (the single pass defers to the scan).
     fn assert_single_pass_matches_line_scan(article: &[u8]) {
         let options = DecodeOptions {
             dot_unstuffing: true,
@@ -2901,8 +2901,8 @@ mod tests {
         assert_eq!(data, b"AB");
     }
 
-    /// A bare `\n` does not reach line start, so `=yend` after it is body data
-    /// (an escape of `y`) and the article has no trailer.
+    // A bare `\n` does not reach line start, so `=yend` after it is body data
+    // (an escape of `y`) and the article has no trailer.
     #[test]
     fn raw_article_trailer_after_bare_lf_is_body_data() {
         let (result, _) = nntp(&[ONE_PART, b"kl\n=yend size=2\r\n"].concat()).unwrap();
@@ -2931,10 +2931,10 @@ mod tests {
         assert!(matches!(err, YencError::InvalidHeader { ref field, .. } if field == "=yend"));
     }
 
-    /// A lone `=` ending the last line before the trailer escapes the line's
-    /// `\r` (0xA3) and the trailer still counts, as rapidyenc and sabctools
-    /// read it; an input that ends inside an escape with no control line after
-    /// it still fails on the dangling escape.
+    // A lone `=` ending the last line before the trailer escapes the line's
+    // `\r` (0xA3) and the trailer still counts, as rapidyenc and sabctools
+    // read it; an input that ends inside an escape with no control line after
+    // it still fails on the dangling escape.
     #[test]
     fn raw_article_dangling_escape_before_trailer_decodes_the_cr() {
         for tail in [&b"kl=\r\n=yend size=2\r\n"[..], b"kl=\r\n.=yend size=2\r\n"] {
@@ -2956,8 +2956,8 @@ mod tests {
         assert_eq!(data, [b'A', b'='.wrapping_sub(106)]);
     }
 
-    /// An NNTP terminator inside the article does not stop the whole-buffer
-    /// decode; the trailer after it still counts.
+    // An NNTP terminator inside the article does not stop the whole-buffer
+    // decode; the trailer after it still counts.
     #[test]
     fn raw_article_terminator_inside_body_keeps_decoding() {
         let (result, data) = nntp(&[ONE_PART, b"kl\r\n.\r\n=yend size=2\r\n"].concat()).unwrap();
@@ -3072,8 +3072,8 @@ mod tests {
         }
     }
 
-    /// Bodies drawn only from the bytes the boundary rules look at, so every
-    /// ordering of line breaks, stuffed dots, escapes and `=y` turns up.
+    // Bodies drawn only from the bytes the boundary rules look at, so every
+    // ordering of line breaks, stuffed dots, escapes and `=y` turns up.
     #[test]
     fn single_pass_matches_line_scan_on_dense_control_bytes() {
         const ALPHABET: &[u8] = b"\r\n.=yea";
@@ -3101,10 +3101,10 @@ mod tests {
         }
     }
 
-    /// The fuzz corpus seeds are the repository's hand-built edge-case articles
-    /// (bare-LF and dot-prefixed trailers, leading junk, truncation, missing
-    /// fields); each one, and each one cut short at every byte, decodes the
-    /// same both ways.
+    // The fuzz corpus seeds are the repository's hand-built edge-case articles
+    // (bare-LF and dot-prefixed trailers, leading junk, truncation, missing
+    // fields); each one, and each one cut short at every byte, decodes the
+    // same both ways.
     #[test]
     fn single_pass_matches_line_scan_on_fuzz_seed_articles() {
         let dir =

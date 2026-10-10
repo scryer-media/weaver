@@ -1,56 +1,56 @@
-//! How much decoder memory a 7z archive actually needs, read off its coders.
-//!
-//! A chase used to reserve the whole configured decoder allowance for its
-//! entire life, parks included, so every chase in the process single-filed
-//! through one reservation and a chase parked on a repair held the rest back
-//! for as long as the park lasted. The allowance is a ceiling, not a
-//! requirement: what a decode needs is written in the archive's own coder
-//! properties, and for almost every archive it is a dictionary of a few dozen
-//! megabytes.
-//!
-//! The model is for the **single-threaded** decoders. The multi-threaded LZMA2
-//! reader is a different animal — it buffers a whole run of dependent chunks
-//! before decoding any of it, so its footprint scales with the block rather
-//! than the dictionary — and the chase does not use it (see
-//! `SevenZipDecodeMemory` in the finalize extraction module). Nothing here is
-//! meant to be exact to the byte; each entry is the decoder's dominant
-//! allocation plus a margin that covers its state and buffers.
+// How much decoder memory a 7z archive actually needs, read off its coders.
+//
+// A chase used to reserve the whole configured decoder allowance for its
+// entire life, parks included, so every chase in the process single-filed
+// through one reservation and a chase parked on a repair held the rest back
+// for as long as the park lasted. The allowance is a ceiling, not a
+// requirement: what a decode needs is written in the archive's own coder
+// properties, and for almost every archive it is a dictionary of a few dozen
+// megabytes.
+//
+// The model is for the **single-threaded** decoders. The multi-threaded LZMA2
+// reader is a different animal — it buffers a whole run of dependent chunks
+// before decoding any of it, so its footprint scales with the block rather
+// than the dictionary — and the chase does not use it (see
+// `SevenZipDecodeMemory` in the finalize extraction module). Nothing here is
+// meant to be exact to the byte; each entry is the decoder's dominant
+// allocation plus a margin that covers its state and buffers.
 
 use sevenz_turbo::{Archive, EncoderMethod};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 
-/// Range decoder input buffer plus the LZMA state tables. The LZMA2 reader's
-/// own accounting names 40 KiB of state and a 64 KiB compressed-chunk buffer;
-/// LZMA's is the same order. Rounded up to a full megabyte.
+// Range decoder input buffer plus the LZMA state tables. The LZMA2 reader's
+// own accounting names 40 KiB of state and a 64 KiB compressed-chunk buffer;
+// LZMA's is the same order. Rounded up to a full megabyte.
 const LZ_STATE_BYTES: u64 = MIB;
-/// The PPMd model is one allocation of exactly the declared size; this covers
-/// the decoder's own tables around it.
+// The PPMd model is one allocation of exactly the declared size; this covers
+// the decoder's own tables around it.
 const PPMD_STATE_BYTES: u64 = MIB;
-/// A bzip2 block is at most 900 KiB, and the decoder holds a few times that.
+// A bzip2 block is at most 900 KiB, and the decoder holds a few times that.
 const BZIP2_BYTES: u64 = 8 * MIB;
-/// Deflate's window is 32 KiB and the reader wraps its input in a buffer.
+// Deflate's window is 32 KiB and the reader wraps its input in a buffer.
 const DEFLATE_BYTES: u64 = MIB;
-/// Brotli's largest standard window is 16 MiB.
+// Brotli's largest standard window is 16 MiB.
 const BROTLI_BYTES: u64 = 32 * MIB;
-/// The zstd decoder refuses frames whose window exceeds 128 MiB unless told
-/// otherwise, and nothing here tells it otherwise.
+// The zstd decoder refuses frames whose window exceeds 128 MiB unless told
+// otherwise, and nothing here tells it otherwise.
 const ZSTD_BYTES: u64 = 160 * MIB;
-/// An LZ4 frame block is at most 4 MiB, plus a 64 KiB dictionary.
+// An LZ4 frame block is at most 4 MiB, plus a 64 KiB dictionary.
 const LZ4_BYTES: u64 = 16 * MIB;
-/// Branch-call-jump filters and the delta filter keep a few hundred bytes of
-/// state; AES keeps a block. One megabyte covers any of them with room.
+// Branch-call-jump filters and the delta filter keep a few hundred bytes of
+// state; AES keeps a block. One megabyte covers any of them with room.
 const FILTER_BYTES: u64 = MIB;
-/// BCJ2 reads four streams at once and keeps a range coder over one of them.
-/// Its sub-streams' own decoders are separate coders in the same block and
-/// are summed with it.
+// BCJ2 reads four streams at once and keeps a range coder over one of them.
+// Its sub-streams' own decoders are separate coders in the same block and
+// are summed with it.
 const BCJ2_BYTES: u64 = 16 * MIB;
 
-/// A coder this module has no memory model for.
-///
-/// Sizing stops at the first one: a reservation built from a chain with an
-/// unknown link in it would be a guess presented as a measurement.
+// A coder this module has no memory model for.
+//
+// Sizing stops at the first one: a reservation built from a chain with an
+// unknown link in it would be a guess presented as a measurement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnsizedCoder {
     pub(crate) method_id: Vec<u8>,
@@ -63,11 +63,11 @@ impl std::fmt::Display for UnsizedCoder {
     }
 }
 
-/// Bytes a single-threaded decode of `archive` needs for its decoders.
-///
-/// Blocks decode one after another, so the answer is the most expensive block,
-/// not the sum of them. Within a block the coders are nested readers that are
-/// all live at once, so a block costs the sum of its chain.
+// Bytes a single-threaded decode of `archive` needs for its decoders.
+//
+// Blocks decode one after another, so the answer is the most expensive block,
+// not the sum of them. Within a block the coders are nested readers that are
+// all live at once, so a block costs the sum of its chain.
 pub(crate) fn decoder_memory_bytes(archive: &Archive) -> Result<u64, UnsizedCoder> {
     let mut largest_block = 0u64;
     for block in &archive.blocks {
@@ -83,7 +83,7 @@ pub(crate) fn decoder_memory_bytes(archive: &Archive) -> Result<u64, UnsizedCode
     Ok(largest_block)
 }
 
-/// Bytes one coder's decoder needs, from its method id and property bytes.
+// Bytes one coder's decoder needs, from its method id and property bytes.
 pub(crate) fn coder_memory_bytes(method_id: &[u8], properties: &[u8]) -> Result<u64, UnsizedCoder> {
     if method_id == EncoderMethod::ID_COPY {
         Ok(0)
@@ -128,8 +128,8 @@ pub(crate) fn coder_memory_bytes(method_id: &[u8], properties: &[u8]) -> Result<
     }
 }
 
-/// LZMA properties are five bytes: lc/lp/pb, then the dictionary size as a
-/// little-endian `u32`.
+// LZMA properties are five bytes: lc/lp/pb, then the dictionary size as a
+// little-endian `u32`.
 fn lzma_dictionary_bytes(method_id: &[u8], properties: &[u8]) -> Result<u64, UnsizedCoder> {
     if properties.len() < 5 {
         return Err(UnsizedCoder {
@@ -141,10 +141,10 @@ fn lzma_dictionary_bytes(method_id: &[u8], properties: &[u8]) -> Result<u64, Uns
     Ok(u64::from(dict))
 }
 
-/// LZMA2 properties are one byte encoding the dictionary size: values up to 39
-/// map to `(2 | (p & 1)) << (p / 2 + 11)`, and 40 means the 4 GiB maximum.
-/// This is the decoder's own decoding of the byte; the decoder also rounds the
-/// dictionary up to a multiple of sixteen before allocating it.
+// LZMA2 properties are one byte encoding the dictionary size: values up to 39
+// map to `(2 | (p & 1)) << (p / 2 + 11)`, and 40 means the 4 GiB maximum.
+// This is the decoder's own decoding of the byte; the decoder also rounds the
+// dictionary up to a multiple of sixteen before allocating it.
 fn lzma2_dictionary_bytes(method_id: &[u8], properties: &[u8]) -> Result<u64, UnsizedCoder> {
     let Some(&bits) = properties.first() else {
         return Err(UnsizedCoder {
@@ -173,8 +173,8 @@ fn lzma2_dictionary_bytes(method_id: &[u8], properties: &[u8]) -> Result<u64, Un
     Ok((dict + 15) & !15)
 }
 
-/// PPMd properties are five bytes: the model order, then the model memory
-/// size as a little-endian `u32`. The decoder allocates exactly that.
+// PPMd properties are five bytes: the model order, then the model memory
+// size as a little-endian `u32`. The decoder allocates exactly that.
 fn ppmd_model_bytes(method_id: &[u8], properties: &[u8]) -> Result<u64, UnsizedCoder> {
     if properties.len() < 5 {
         return Err(UnsizedCoder {
@@ -212,8 +212,8 @@ mod tests {
             .collect()
     }
 
-    /// Encode `members` with `methods` (library order: output end first) and
-    /// hand back the parsed archive.
+    // Encode `members` with `methods` (library order: output end first) and
+    // hand back the parsed archive.
     fn archive_for(methods: Vec<EncoderConfiguration>, members: usize, solid: bool) -> Archive {
         archive_for_with_password(methods, members, solid, Password::empty())
     }

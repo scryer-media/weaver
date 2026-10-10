@@ -1,4 +1,4 @@
-//! DNS-over-TCP fixture. Only names in the explicit table receive addresses.
+// DNS-over-TCP fixture. Only names in the explicit table receive addresses.
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},

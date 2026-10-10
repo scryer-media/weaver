@@ -1,9 +1,9 @@
 use super::*;
 
-/// Forward-date the last refill so the next refill adds no tokens, whatever
-/// time the runner lets pass between two calls. That refill stamps the real
-/// `now` again, so the tests call this before every balance-touching step and
-/// the balance only moves by what the test consumes, refunds or backdates.
+// Forward-date the last refill so the next refill adds no tokens, whatever
+// time the runner lets pass between two calls. That refill stamps the real
+// `now` again, so the tests call this before every balance-touching step and
+// the balance only moves by what the test consumes, refunds or backdates.
 fn freeze_refill(bucket: &mut TokenBucket) {
     bucket.last_refill = Instant::now() + Duration::from_secs(3600);
 }
@@ -122,11 +122,11 @@ fn refund_reduces_wait_without_exceeding_capacity() {
     assert!(bucket.should_wait());
 }
 
-/// Dispatch charges every BODY's estimate here before any egress or provider
-/// paces its read, and holds the next dispatch while the balance is short. So
-/// the global limit holds downloads to its rate whatever the egress and
-/// provider limits would allow, and raising those changes nothing: this
-/// bucket never sees them.
+// Dispatch charges every BODY's estimate here before any egress or provider
+// paces its read, and holds the next dispatch while the balance is short. So
+// the global limit holds downloads to its rate whatever the egress and
+// provider limits would allow, and raising those changes nothing: this
+// bucket never sees them.
 #[test]
 fn a_global_speed_limit_holds_downloads_an_egress_or_provider_would_let_through() {
     let mut global = TokenBucket::new(1_000);

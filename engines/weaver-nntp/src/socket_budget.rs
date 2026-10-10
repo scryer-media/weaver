@@ -1,4 +1,4 @@
-//! Physical socket ownership, independent of checked-out work and client generations.
+// Physical socket ownership, independent of checked-out work and client generations.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -97,8 +97,8 @@ impl SocketBudget {
         self.publish();
     }
 
-    /// Withdraw unavailable idle paths immediately. Other weight changes drain
-    /// on demand, preserving warm sockets while there is no replacement work.
+    // Withdraw unavailable idle paths immediately. Other weight changes drain
+    // on demand, preserving warm sockets while there is no replacement work.
     pub(crate) fn configure_legs(&self, targets: &[u16]) {
         let (changed, recalls) = {
             let mut state = self.state.lock().expect("socket budget poisoned");
@@ -163,8 +163,8 @@ impl SocketBudget {
         self.acquire(false)
     }
 
-    /// Only the explicitly enabled IP-replacement path may use this extra
-    /// slot; it is never poolable or available to ordinary dispatch.
+    // Only the explicitly enabled IP-replacement path may use this extra
+    // slot; it is never poolable or available to ordinary dispatch.
     pub(crate) fn try_acquire_replacement(self: &Arc<Self>) -> Option<SocketSlot> {
         self.acquire(true)
     }
@@ -210,8 +210,8 @@ impl SocketBudget {
         })
     }
 
-    /// Ask one idle owner to close its exact socket. Removing the entry in
-    /// `SocketSlot::drop` acknowledges closure; a recall never refunds a slot.
+    // Ask one idle owner to close its exact socket. Removing the entry in
+    // `SocketSlot::drop` acknowledges closure; a recall never refunds a slot.
     pub(crate) fn recall_idle(&self) -> bool {
         let excess = {
             let state = self.state.lock().expect("socket budget poisoned");
@@ -283,7 +283,7 @@ impl SocketBudget {
     }
 }
 
-/// Must be stored after the transport so local closure precedes its refund.
+// Must be stored after the transport so local closure precedes its refund.
 pub(crate) struct SocketSlot {
     budget: Arc<SocketBudget>,
     id: u64,
@@ -347,9 +347,9 @@ impl SocketSlot {
         });
     }
 
-    /// Claim whether this socket can take another article. An excess socket
-    /// transitions to closing atomically with the decision, so other lanes
-    /// count it as gone before making their own claims.
+    // Claim whether this socket can take another article. An excess socket
+    // transitions to closing atomically with the decision, so other lanes
+    // count it as gone before making their own claims.
     pub(crate) fn claim_reuse(&self) -> bool {
         let mut state = self.budget.state.lock().expect("socket budget poisoned");
         if self.reusable_in(&state) {

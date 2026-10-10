@@ -1,8 +1,8 @@
-//! Direct-store routing.
-//!
-//! The spine is differential: the identical job gate is run with routing on and
-//! off, and the outputs must be byte-identical. With routing on, no source
-//! volume may ever appear on disk.
+// Direct-store routing.
+//
+// The spine is differential: the identical job gate is run with routing on and
+// off, and the outputs must be byte-identical. With routing on, no source
+// volume may ever appear on disk.
 
 use super::*;
 
@@ -16,19 +16,19 @@ use crate::pipeline::direct_store::barrier::BarrierDemand;
 
 mod scenarios;
 
-/// A real NZB's `<segment bytes=…>` is the yEnc-**encoded** article size, about
-/// 3% larger than the decoded payload. Every fixture here declares inflated
-/// sizes so no routing arithmetic can accidentally be right by reading an NZB
-/// total: all of it goes through `file_offset`/`decoded_size`.
+// A real NZB's `<segment bytes=…>` is the yEnc-**encoded** article size, about
+// 3% larger than the decoded payload. Every fixture here declares inflated
+// sizes so no routing arithmetic can accidentally be right by reading an NZB
+// total: all of it goes through `file_offset`/`decoded_size`.
 fn yenc_declared_bytes(decoded_len: u32) -> u32 {
     decoded_len + decoded_len.div_ceil(32) + 2
 }
 
-/// One stored member split across `volume_count` volumes, RAR5, unencrypted.
-///
-/// Non-final parts carry the packed CRC32 of *their* bytes (the RAR5 spec's
-/// rule for split files); the final part carries the whole-member CRC32. That
-/// is exactly what the two integrity layers read.
+// One stored member split across `volume_count` volumes, RAR5, unencrypted.
+//
+// Non-final parts carry the packed CRC32 of *their* bytes (the RAR5 spec's
+// rule for split files); the final part carries the whole-member CRC32. That
+// is exactly what the two integrity layers read.
 fn single_member_store_set(
     member_name: &str,
     payload: &[u8],
@@ -80,14 +80,14 @@ fn single_member_store_set(
         .collect()
 }
 
-/// A job's **payload root**: `complete/.weaver-staging/<job_id>` under the
-/// harness's temp dir.
-///
-/// Direct-store member payload is born here rather than in the working
-/// directory, so completion publishes it by a same-volume rename exactly as it
-/// publishes a member the incremental extractor produced. Mirrors
-/// `Pipeline::deterministic_extraction_staging_dir` against the layout
-/// `new_direct_pipeline_with` configures.
+// A job's **payload root**: `complete/.weaver-staging/<job_id>` under the
+// harness's temp dir.
+//
+// Direct-store member payload is born here rather than in the working
+// directory, so completion publishes it by a same-volume rename exactly as it
+// publishes a member the incremental extractor produced. Mirrors
+// `Pipeline::deterministic_extraction_staging_dir` against the layout
+// `new_direct_pipeline_with` configures.
 fn payload_root(temp_dir: &TempDir, job_id: JobId) -> PathBuf {
     temp_dir
         .path()
@@ -96,29 +96,29 @@ fn payload_root(temp_dir: &TempDir, job_id: JobId) -> PathBuf {
         .join(job_id.0.to_string())
 }
 
-/// The `.direct.partial` one member routes into, under the payload root.
+// The `.direct.partial` one member routes into, under the payload root.
 fn direct_partial(temp_dir: &TempDir, job_id: JobId, member_name: &str) -> PathBuf {
     payload_root(temp_dir, job_id).join(format!("{member_name}.f0.direct.partial"))
 }
 
-/// Waits until every unlink queued for a file under `root` has landed.
-///
-/// A demotion deletes its routed outputs behind their cached write handles, on
-/// the closer thread, and returns without waiting. A close of the root's
-/// handles is acknowledged only after every removal queued ahead of it is
-/// done, so this is the event an "it was deleted" assertion depends on.
+// Waits until every unlink queued for a file under `root` has landed.
+//
+// A demotion deletes its routed outputs behind their cached write handles, on
+// the closer thread, and returns without waiting. A close of the root's
+// handles is acknowledged only after every removal queued ahead of it is
+// done, so this is the event an "it was deleted" assertion depends on.
 async fn settle_direct_output_removals(root: &std::path::Path) {
     crate::pipeline::close_cached_write_handles_under(root).await;
 }
 
-/// A member sitting **unpublished** in the job's staging root.
-///
-/// The third place a finished member can legitimately be, and the one this
-/// harness gained when direct-store started writing payload onto the complete
-/// volume: `complete_dir/.weaver-staging/<job_id>/<member>` is where both direct
-/// finalization and the incremental extractor leave a member until the final
-/// move renames it into the output directory. The job id is wildcarded because
-/// one harness temp dir only ever runs one job.
+// A member sitting **unpublished** in the job's staging root.
+//
+// The third place a finished member can legitimately be, and the one this
+// harness gained when direct-store started writing payload onto the complete
+// volume: `complete_dir/.weaver-staging/<job_id>/<member>` is where both direct
+// finalization and the incremental extractor leave a member until the final
+// move renames it into the output directory. The job id is wildcarded because
+// one harness temp dir only ever runs one job.
 fn staging_member(complete_dir: &Path, member_name: &str) -> Option<Vec<u8>> {
     std::fs::read_dir(complete_dir.join(".weaver-staging"))
         .ok()?
@@ -126,7 +126,7 @@ fn staging_member(complete_dir: &Path, member_name: &str) -> Option<Vec<u8>> {
         .find_map(|entry| std::fs::read(entry.path().join(member_name)).ok())
 }
 
-/// Whether any `.direct.partial` is left at the top level of `root`.
+// Whether any `.direct.partial` is left at the top level of `root`.
 fn any_direct_partial(root: &Path) -> bool {
     std::fs::read_dir(root)
         .map(|entries| {
@@ -140,8 +140,8 @@ fn any_direct_partial(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The RAR5 extra record that points a main header at a `QO` block: a LOCATOR
-/// record carrying the quick-open offset **relative to the main header itself**.
+// The RAR5 extra record that points a main header at a `QO` block: a LOCATOR
+// record carrying the quick-open offset **relative to the main header itself**.
 fn build_test_rar_locator_extra(qopen_offset_from_main: u64) -> Vec<u8> {
     let mut record = Vec::new();
     record.extend_from_slice(&encode_test_rar_vint(0x01)); // LOCATOR.
@@ -152,9 +152,9 @@ fn build_test_rar_locator_extra(qopen_offset_from_main: u64) -> Vec<u8> {
     out
 }
 
-/// One cached header inside a `QO` block: `crc32(size || body) || size || body`,
-/// where the body is the header's offset *back* from the `QO` header, its
-/// length, and the header bytes themselves.
+// One cached header inside a `QO` block: `crc32(size || body) || size || body`,
+// where the body is the header's offset *back* from the `QO` header, its
+// length, and the header bytes themselves.
 fn build_test_rar_qopen_record(
     qopen_header_offset: u64,
     original_header_offset: u64,
@@ -178,19 +178,19 @@ fn build_test_rar_qopen_record(
     out
 }
 
-/// Where the `QO` block starts in the last volume. Fixed rather than derived,
-/// because the locator that names it lives in the main header *before* it and
-/// its own vint width would otherwise depend on the answer.
+// Where the `QO` block starts in the last volume. Fixed rather than derived,
+// because the locator that names it lives in the main header *before* it and
+// its own vint width would otherwise depend on the answer.
 const QOPEN_OFFSET: u64 = 512;
 
-/// A two-volume stored set whose **last** volume carries a locator and a `QO`
-/// cache, past its end-of-archive record where a real archiver puts one.
-///
-/// `forged_name` is the whole point. `None` builds an honest cache that echoes
-/// exactly the header the physical walk finds. `Some(name)` appends a second
-/// cached file header that no physical header describes — the shape the RAR
-/// spec warns can be crafted, and the one direct-store forbids routing a byte
-/// on.
+// A two-volume stored set whose **last** volume carries a locator and a `QO`
+// cache, past its end-of-archive record where a real archiver puts one.
+//
+// `forged_name` is the whole point. `None` builds an honest cache that echoes
+// exactly the header the physical walk finds. `Some(name)` appends a second
+// cached file header that no physical header describes — the shape the RAR
+// spec warns can be crafted, and the one direct-store forbids routing a byte
+// on.
 fn quick_open_store_set(
     member_name: &str,
     payload: &[u8],
@@ -199,17 +199,17 @@ fn quick_open_store_set(
     quick_open_store_set_shaped(member_name, payload, forged_name, true)
 }
 
-/// The same fixture, with control over whether the `QO` block is closed by a
-/// cached **end-of-archive** record.
-///
-/// `cached_end_record` is what decides whether the cache is used at all:
-/// unrar's reader adopts a Quick Open list only once it has seen the end record
-/// that proves the list is complete, and drops the whole cache otherwise. Real
-/// archivers do not write one — a `QO` block caches file headers, and the end
-/// header comes after it — so `false` is the shape found in the wild, where the
-/// locator is present, the cache is read and rejected, and the physical walk
-/// supplies the members. `true` is the shape the cross-check tests need, and
-/// the only one in which a forged cache entry can reach anything at all.
+// The same fixture, with control over whether the `QO` block is closed by a
+// cached **end-of-archive** record.
+//
+// `cached_end_record` is what decides whether the cache is used at all:
+// unrar's reader adopts a Quick Open list only once it has seen the end record
+// that proves the list is complete, and drops the whole cache otherwise. Real
+// archivers do not write one — a `QO` block caches file headers, and the end
+// header comes after it — so `false` is the shape found in the wild, where the
+// locator is present, the cache is read and rejected, and the physical walk
+// supplies the members. `true` is the shape the cross-check tests need, and
+// the only one in which a forged cache entry can reach anything at all.
 fn quick_open_store_set_shaped(
     member_name: &str,
     payload: &[u8],
@@ -290,13 +290,13 @@ fn quick_open_store_set_shaped(
     ]
 }
 
-/// A two-volume stored set whose **last** volume holds two members — the tail
-/// of one split across both volumes, then a second one whole — under a locator
-/// and an honest, end-record-closed `QO` cache past the end header.
-///
-/// Also returns the physical offset of the second member's file header, so a
-/// test can place that header inside an article that has not arrived while the
-/// article carrying the cache has.
+// A two-volume stored set whose **last** volume holds two members — the tail
+// of one split across both volumes, then a second one whole — under a locator
+// and an honest, end-record-closed `QO` cache past the end header.
+//
+// Also returns the physical offset of the second member's file header, so a
+// test can place that header inside an article that has not arrived while the
+// article carrying the cache has.
 fn quick_open_two_member_store_set(
     split_name: &str,
     split_payload: &[u8],
@@ -385,8 +385,8 @@ fn quick_open_two_member_store_set(
     )
 }
 
-/// The member names the library reports for a volume under its **default**
-/// options, which consult the Quick Open cache.
+// The member names the library reports for a volume under its **default**
+// options, which consult the Quick Open cache.
 fn library_default_member_names(volume: &[u8]) -> Vec<String> {
     unrar_rs::RarArchive::parse_volume_facts(std::io::Cursor::new(volume.to_vec()), None)
         .expect("the fixture volume parses")
@@ -396,8 +396,8 @@ fn library_default_member_names(volume: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// The decoded extent of one article, for a volume cut into `articles` equal
-/// pieces. At `articles == 2` this is the head/tail split every fixture uses.
+// The decoded extent of one article, for a volume cut into `articles` equal
+// pieces. At `articles == 2` this is the head/tail split every fixture uses.
 fn article_extent(volume_len: usize, segment_number: u32, articles: usize) -> (usize, usize) {
     let chunk = volume_len.div_ceil(articles);
     let start = (segment_number as usize * chunk).min(volume_len);
@@ -405,8 +405,8 @@ fn article_extent(volume_len: usize, segment_number: u32, articles: usize) -> (u
     (start, end)
 }
 
-/// Two articles per volume, so a volume's payload arrives after its header and
-/// routing has to split at least one article across destinations.
+// Two articles per volume, so a volume's payload arrives after its header and
+// routing has to split at least one article across destinations.
 pub(super) fn direct_store_job_spec(name: &str, volumes: &[(String, Vec<u8>)]) -> JobSpec {
     direct_store_job_spec_with_articles(name, volumes, 2)
 }
@@ -448,7 +448,7 @@ fn direct_store_job_spec_with_articles(
     }
 }
 
-/// Article arrival plan: `(file index, segment number)` in submission order.
+// Article arrival plan: `(file index, segment number)` in submission order.
 fn in_order_arrivals(volume_count: usize) -> Vec<(u32, u32)> {
     (0..volume_count as u32)
         .flat_map(|file_index| [(file_index, 0), (file_index, 1)])
@@ -485,10 +485,10 @@ async fn submit_volume_article_of(
     .await;
 }
 
-/// [`submit_volume_article`] for a set whose volumes are **not** NZB files
-/// `0..n-1`: `ordinal` picks the bytes out of `volumes`, `file_index` is what
-/// the job knows the file as. The two are the same number only when nothing
-/// precedes the set in the NZB.
+// [`submit_volume_article`] for a set whose volumes are **not** NZB files
+// `0..n-1`: `ordinal` picks the bytes out of `volumes`, `file_index` is what
+// the job knows the file as. The two are the same number only when nothing
+// precedes the set in the NZB.
 async fn submit_volume_article_indexed_of(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -517,14 +517,14 @@ async fn submit_volume_article_indexed_of(
     .await;
 }
 
-/// What one whole job gate produced.
+// What one whole job gate produced.
 #[derive(Debug, PartialEq, Eq)]
 struct GateOutcome {
     member: Option<Vec<u8>>,
-    /// Which of the two candidate directories the member landed in. Recorded
-    /// rather than searched: "the file is in one of these places" would pass
-    /// even if routing and the conventional extractor disagreed about where a
-    /// finished member belongs.
+    // Which of the two candidate directories the member landed in. Recorded
+    // rather than searched: "the file is in one of these places" would pass
+    // even if routing and the conventional extractor disagreed about where a
+    // finished member belongs.
     member_location: Option<&'static str>,
     status: Option<JobStatus>,
     volume_file_seen: bool,
@@ -582,12 +582,12 @@ async fn run_direct_store_gate_with_ceilings(
     .await
 }
 
-/// The gate runner with one extra input: the job's password.
-///
-/// Everything else is the original harness unchanged, deliberately — the whole
-/// point of the encrypted differentials is that turning the gate off with the
-/// *same* password reproduces the same bytes, so both sides must run through
-/// exactly the same code.
+// The gate runner with one extra input: the job's password.
+//
+// Everything else is the original harness unchanged, deliberately — the whole
+// point of the encrypted differentials is that turning the gate off with the
+// *same* password reproduces the same bytes, so both sides must run through
+// exactly the same code.
 #[allow(clippy::too_many_arguments)]
 async fn run_gate_with_password(
     gate: DirectStoreGate,
@@ -649,9 +649,9 @@ async fn run_gate_with_password(
     }
 }
 
-/// Runs one job gate and returns the direct sets' final debug shape, without
-/// driving extraction to a terminal state. Used where the point is what the
-/// router decided, not what the job finished as.
+// Runs one job gate and returns the direct sets' final debug shape, without
+// driving extraction to a terminal state. Used where the point is what the
+// router decided, not what the job finished as.
 async fn run_direct_store_routing_only(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -674,8 +674,8 @@ async fn run_direct_store_routing_only(
     (shape, working_dir)
 }
 
-/// [`run_direct_store_routing_only`], also reporting how many Quick Open
-/// cross-check walks the job's first set ran while routing.
+// [`run_direct_store_routing_only`], also reporting how many Quick Open
+// cross-check walks the job's first set ran while routing.
 async fn run_direct_store_routing_only_counting_walks(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -700,13 +700,13 @@ async fn run_direct_store_routing_only_counting_walks(
     (shape, walks)
 }
 
-/// A store set whose **last** volume carries a second, small member.
-///
-/// The second member's file header sits past the first member's data area, so
-/// the last volume's *first* article never reaches it: a header walk over that
-/// truncated prefix sees the first member's chain close and would conclude the
-/// volume holds nothing else. Everything after that point is filed as envelope
-/// and deleted at finalization — one whole file, silently lost.
+// A store set whose **last** volume carries a second, small member.
+//
+// The second member's file header sits past the first member's data area, so
+// the last volume's *first* article never reaches it: a header walk over that
+// truncated prefix sees the first member's chain close and would conclude the
+// volume holds nothing else. Everything after that point is filed as envelope
+// and deleted at finalization — one whole file, silently lost.
 fn store_set_with_a_member_hidden_past_the_first(
     member_name: &str,
     payload: &[u8],
@@ -756,17 +756,17 @@ fn store_set_with_a_member_hidden_past_the_first(
     ]
 }
 
-/// Slice size for the PAR2 fixtures. Small enough that every volume carries
-/// several slices — so a single damaged article shows up as damaged *slices*
-/// rather than as one whole-file verdict — and large enough that the sets stay
-/// quick to build.
+// Slice size for the PAR2 fixtures. Small enough that every volume carries
+// several slices — so a single damaged article shows up as damaged *slices*
+// rather than as one whole-file verdict — and large enough that the sets stay
+// quick to build.
 const PAR2_SLICE_BYTES: u64 = 256;
 
-/// A real PAR2 index over the set's **decoded volume bytes**.
-///
-/// The descriptions therefore name the volume files direct routing never
-/// creates, which is exactly the shape the adapter has to answer for: file id,
-/// length and every slice checksum are defined in source-volume space.
+// A real PAR2 index over the set's **decoded volume bytes**.
+//
+// The descriptions therefore name the volume files direct routing never
+// creates, which is exactly the shape the adapter has to answer for: file id,
+// length and every slice checksum are defined in source-volume space.
 fn par2_index_over_volumes(volumes: &[(String, Vec<u8>)]) -> Vec<u8> {
     let described: Vec<(&str, &[u8])> = volumes
         .iter()
@@ -775,11 +775,11 @@ fn par2_index_over_volumes(volumes: &[(String, Vec<u8>)]) -> Vec<u8> {
     build_test_par2_index_for_files(&described, PAR2_SLICE_BYTES)
 }
 
-/// The set's spec plus a real, parseable PAR2 index file.
-///
-/// The index is a data file the pipeline downloads and parses like any other,
-/// so `par2_set` loads through the production path rather than being installed
-/// into the runtime by hand.
+// The set's spec plus a real, parseable PAR2 index file.
+//
+// The index is a data file the pipeline downloads and parses like any other,
+// so `par2_set` loads through the production path rather than being installed
+// into the runtime by hand.
 fn par2_bearing_job_spec(
     name: &str,
     volumes: &[(String, Vec<u8>)],
@@ -790,10 +790,10 @@ fn par2_bearing_job_spec(
     (spec, file_index)
 }
 
-/// Appends the index as one more downloadable file and returns its NZB index.
-///
-/// Split out of [`par2_bearing_job_spec`] so a spec built with a different
-/// article count — the restart harness's — can carry one too.
+// Appends the index as one more downloadable file and returns its NZB index.
+//
+// Split out of [`par2_bearing_job_spec`] so a spec built with a different
+// article count — the restart harness's — can carry one too.
 fn append_par2_index(spec: &mut JobSpec, par2_bytes: &[u8]) -> u32 {
     let index_filename = "silver.horizon.par2".to_string();
     let file_index = spec.files.len() as u32;
@@ -812,7 +812,7 @@ fn append_par2_index(spec: &mut JobSpec, par2_bytes: &[u8]) -> u32 {
     file_index
 }
 
-/// What one par2-bearing job gate produced.
+// What one par2-bearing job gate produced.
 #[derive(Debug)]
 struct Par2GateOutcome {
     member: Option<Vec<u8>>,
@@ -821,24 +821,24 @@ struct Par2GateOutcome {
     volume_file_seen: bool,
     admitted: bool,
     authoritative_verify_calls: usize,
-    /// Whether *some* pass reached a genuine PAR2 verdict for this job — the
-    /// conventional authoritative pass, the direct session short-circuit, or
-    /// the direct quiet pass's own read. The three used to be interchangeable
-    /// non-vacuity evidence because a clean direct verdict always fell
-    /// through to a conventional whole-set read anyway; now that the direct
-    /// gate settles a clean verdict itself instead of asking the whole-set
-    /// pass to reach the same answer again, `authoritative_verify_calls`
-    /// alone no longer proves a par2-bearing direct job did its job.
+    // Whether *some* pass reached a genuine PAR2 verdict for this job — the
+    // conventional authoritative pass, the direct session short-circuit, or
+    // the direct quiet pass's own read. The three used to be interchangeable
+    // non-vacuity evidence because a clean direct verdict always fell
+    // through to a conventional whole-set read anyway; now that the direct
+    // gate settles a clean verdict itself instead of asking the whole-set
+    // pass to reach the same answer again, `authoritative_verify_calls`
+    // alone no longer proves a par2-bearing direct job did its job.
     verdict_reached: bool,
     demotions: String,
 }
 
-/// Runs one whole par2-bearing job gate.
-///
-/// The PAR2 index arrives **after** every volume, which is both the realistic
-/// posting order and the one that matters: at the moment the last volume
-/// completes there is no parsed PAR2 set yet, so a set that finalized on its own
-/// gates would have deleted the volume image the verifier is about to need.
+// Runs one whole par2-bearing job gate.
+//
+// The PAR2 index arrives **after** every volume, which is both the realistic
+// posting order and the one that matters: at the moment the last volume
+// completes there is no parsed PAR2 set yet, so a set that finalized on its own
+// gates would have deleted the volume image the verifier is about to need.
 async fn run_par2_direct_gate(
     gate: DirectStoreGate,
     job_id: JobId,
@@ -848,9 +848,9 @@ async fn run_par2_direct_gate(
     run_par2_direct_gate_with_password(gate, job_id, member_name, volumes, None).await
 }
 
-/// [`run_par2_direct_gate`] with one extra input, so an encrypted
-/// set's par2-bearing differential runs through exactly the same code the
-/// plaintext one does.
+// [`run_par2_direct_gate`] with one extra input, so an encrypted
+// set's par2-bearing differential runs through exactly the same code the
+// plaintext one does.
 async fn run_par2_direct_gate_with_password(
     gate: DirectStoreGate,
     job_id: JobId,
@@ -948,9 +948,9 @@ async fn run_par2_direct_gate_with_password(
     }
 }
 
-/// The same volume bytes under hex names that classify to nothing — the shape
-/// of a fully obfuscated posting. The real names survive only inside the PAR2
-/// descriptions the caller builds from the un-obfuscated list.
+// The same volume bytes under hex names that classify to nothing — the shape
+// of a fully obfuscated posting. The real names survive only inside the PAR2
+// descriptions the caller builds from the un-obfuscated list.
 fn obfuscate_volumes(volumes: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
     volumes
         .iter()
@@ -964,14 +964,14 @@ fn obfuscate_volumes(volumes: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// Runs one whole **obfuscated** par2-bearing job gate.
-///
-/// The spec's filenames are hex, so `DirectSetPlan::discover` finds nothing
-/// and any admission must come from the PAR2 descriptions, which carry the
-/// real names. `par2_first` decides whether the index arrives before any
-/// volume article — the identity window — or after them all, which is too
-/// late by construction: every volume's bytes have already landed
-/// conventionally.
+// Runs one whole **obfuscated** par2-bearing job gate.
+//
+// The spec's filenames are hex, so `DirectSetPlan::discover` finds nothing
+// and any admission must come from the PAR2 descriptions, which carry the
+// real names. `par2_first` decides whether the index arrives before any
+// volume article — the identity window — or after them all, which is too
+// late by construction: every volume's bytes have already landed
+// conventionally.
 async fn run_obfuscated_par2_gate(
     gate: DirectStoreGate,
     job_id: JobId,
@@ -1059,11 +1059,11 @@ async fn run_obfuscated_par2_gate(
     }
 }
 
-/// [`single_member_rar4_store_set`] with **numbered** end-of-archive records
-/// — the shape WinRAR's new-numbering era actually writes. The unnumbered
-/// variant is kept for the paths that must tolerate it; a renamed
-/// conventional set needs the numbers, because every unnumbered volume's
-/// parsed facts claim position zero and the fact-driven topology collides.
+// [`single_member_rar4_store_set`] with **numbered** end-of-archive records
+// — the shape WinRAR's new-numbering era actually writes. The unnumbered
+// variant is kept for the paths that must tolerate it; a renamed
+// conventional set needs the numbers, because every unnumbered volume's
+// parsed facts claim position zero and the fact-driven topology collides.
 fn single_member_rar4_store_set_numbered(
     member_name: &str,
     payload: &[u8],
@@ -1109,9 +1109,9 @@ fn single_member_rar4_store_set_numbered(
         .collect()
 }
 
-/// Runs one whole **par2-less obfuscated** job gate: hex names, no index
-/// anywhere, so the only admissible evidence is the volumes' own RAR5
-/// headers.
+// Runs one whole **par2-less obfuscated** job gate: hex names, no index
+// anywhere, so the only admissible evidence is the volumes' own RAR5
+// headers.
 async fn run_obfuscated_headers_gate(
     job_id: JobId,
     member_name: &str,
@@ -1175,39 +1175,39 @@ async fn run_obfuscated_headers_gate(
     }
 }
 
-/// Corrupts one byte of a volume's **recovery-record data area** — envelope
-/// bytes that belong to no member and to no header.
-///
-/// The placement is the whole point, and it is the only placement that isolates
-/// PAR2 as the detector:
-///
-/// - the yEnc layer is regenerated per article by the harness, so the transport
-///   gate passes;
-/// - the byte is outside every member's packed range, so neither the per-part
-///   packed CRC32 nor the whole-member CRC32 covers it;
-/// - it is inside a service block's *data*, not a header, so the header walk
-///   still parses and the volume still confirms — damaging a header instead
-///   would stop the walk and demote the set for a different reason entirely.
-///
-/// PAR2 covers the volume image, so PAR2 is the only layer left that can see it.
+// Corrupts one byte of a volume's **recovery-record data area** — envelope
+// bytes that belong to no member and to no header.
+//
+// The placement is the whole point, and it is the only placement that isolates
+// PAR2 as the detector:
+//
+// - the yEnc layer is regenerated per article by the harness, so the transport
+//   gate passes;
+// - the byte is outside every member's packed range, so neither the per-part
+//   packed CRC32 nor the whole-member CRC32 covers it;
+// - it is inside a service block's *data*, not a header, so the header walk
+//   still parses and the volume still confirms — damaging a header instead
+//   would stop the walk and demote the set for a different reason entirely.
+//
+// PAR2 covers the volume image, so PAR2 is the only layer left that can see it.
 fn damage_recovery_record(volumes: &mut [(String, Vec<u8>)], volume: usize, rr_bytes: usize) {
     let offset = find_recovery_offset(&volumes[volume].1, rr_bytes);
     volumes[volume].1[offset + rr_bytes / 2] ^= 0xFF;
 }
 
-/// What one damaged par2-bearing gate ended up with.
+// What one damaged par2-bearing gate ended up with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DamagedGateOutcome {
     status: Option<JobStatus>,
     member: Option<Vec<u8>>,
-    /// Every volume's bytes as they finally sit in the working directory. For
-    /// the conventional gate these are what the articles delivered; for the
-    /// direct gate they are what demotion reconstructed, and the two must agree
-    /// byte for byte or the reconstruction fabricated something.
+    // Every volume's bytes as they finally sit in the working directory. For
+    // the conventional gate these are what the articles delivered; for the
+    // direct gate they are what demotion reconstructed, and the two must agree
+    // byte for byte or the reconstruction fabricated something.
     volume_files: Vec<Option<Vec<u8>>>,
-    /// Whether the gate re-armed its own completion check on the way out of the
-    /// demotion, sampled before anything else drives the job. Without it the
-    /// job's next move waits on the 30 s reconcile sweep.
+    // Whether the gate re-armed its own completion check on the way out of the
+    // demotion, sampled before anything else drives the job. Without it the
+    // job's next move waits on the 30 s reconcile sweep.
     rearmed_after_demotion: bool,
 }
 
@@ -1290,9 +1290,9 @@ async fn run_damaged_par2_gate(
     (outcome, sets_after_verification)
 }
 
-/// Removes one segment from the job's queue, standing in for the dispatch that
-/// pops it in the real pipeline. Without this the harness's queue still holds
-/// every article, and "already queued" would cover everything.
+// Removes one segment from the job's queue, standing in for the dispatch that
+// pops it in the real pipeline. Without this the harness's queue still holds
+// every article, and "already queued" would cover everything.
 pub(super) fn take_queued_segment(pipeline: &mut Pipeline, job_id: JobId, segment_id: SegmentId) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let queued = state.download_queue.drain_all();
@@ -1367,8 +1367,8 @@ fn queued_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(u32, u32)> {
     out
 }
 
-/// Drives one set to "volume 0 fully routed, volumes 1 and 2 still queued" and
-/// then demotes it. Returns the pipeline so the caller can inspect the fallout.
+// Drives one set to "volume 0 fully routed, volumes 1 and 2 still queued" and
+// then demotes it. Returns the pipeline so the caller can inspect the fallout.
 async fn demote_mid_download(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -1385,8 +1385,8 @@ async fn demote_mid_download(
     .await
 }
 
-/// [`demote_mid_download`] with the demotion reason spelled out, for the tests
-/// that turn on the reason's [`VolumeDemand`] rather than on the sweep.
+// [`demote_mid_download`] with the demotion reason spelled out, for the tests
+// that turn on the reason's [`VolumeDemand`] rather than on the sweep.
 async fn demote_mid_download_for(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -1410,9 +1410,9 @@ async fn demote_mid_download_for(
     (pipeline, working_dir, other_file_bytes)
 }
 
-/// [`demote_mid_download_for`] stopped where the demotion returns, with the
-/// reconstruction sweep still an outstanding ticket. For the tests whose
-/// subject is the detachment itself.
+// [`demote_mid_download_for`] stopped where the demotion returns, with the
+// reconstruction sweep still an outstanding ticket. For the tests whose
+// subject is the detachment itself.
 async fn demote_mid_download_leaving_the_sweep_outstanding(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -1431,10 +1431,10 @@ async fn demote_mid_download_leaving_the_sweep_outstanding(
     .await
 }
 
-/// [`demote_mid_download_leaving_the_sweep_outstanding`] with the set's
-/// coverage checkpointed before the demotion when `checkpoint` is set — so the
-/// row the sweep's finish retires, and a crash inside the handback would leave
-/// standing, actually exists.
+// [`demote_mid_download_leaving_the_sweep_outstanding`] with the set's
+// coverage checkpointed before the demotion when `checkpoint` is set — so the
+// row the sweep's finish retires, and a crash inside the handback would leave
+// standing, actually exists.
 async fn demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -1497,26 +1497,26 @@ async fn demote_mid_download_leaving_the_sweep_outstanding_with_checkpoint(
     (pipeline, working_dir, OTHER_FILE_BYTES)
 }
 
-/// The set the fixtures above demote: one member across three store volumes,
-/// with volume 0 whole, volume 1 half covered and volume 2 not started.
+// The set the fixtures above demote: one member across three store volumes,
+// with volume 0 whole, volume 1 half covered and volume 2 not started.
 pub(super) fn demotion_fixture_volumes(member_name: &str) -> Vec<(String, Vec<u8>)> {
     let payload: Vec<u8> = (0..2400u32).map(|index| (index % 173) as u8).collect();
     single_member_store_set(member_name, &payload, 3)
 }
 
-/// Every volume's payload article before any of its headers, so nothing has a
-/// destination and the whole set piles up as holds.
+// Every volume's payload article before any of its headers, so nothing has a
+// destination and the whole set piles up as holds.
 fn payload_before_header_arrivals(volume_count: usize) -> Vec<(u32, u32)> {
     let mut arrivals: Vec<(u32, u32)> = (0..volume_count as u32).map(|index| (index, 1)).collect();
     arrivals.extend((0..volume_count as u32).map(|index| (index, 0)));
     arrivals
 }
 
-/// A store set whose closing header states a BLAKE2sp digest and no CRC32.
-///
-/// Every earlier part carries a packed CRC32, so the member is provisionally
-/// routable and its bytes really are placed; only when the chain closes does it
-/// resolve ineligible, because BLAKE2sp accepts bytes in order only.
+// A store set whose closing header states a BLAKE2sp digest and no CRC32.
+//
+// Every earlier part carries a packed CRC32, so the member is provisionally
+// routable and its bytes really are placed; only when the chain closes does it
+// resolve ineligible, because BLAKE2sp accepts bytes in order only.
 fn blake2_only_store_set(
     member_name: &str,
     payload: &[u8],
@@ -1578,19 +1578,19 @@ fn blake2_store_set(
         .collect()
 }
 
-/// No source volume of `volumes` that exists on disk holds a byte the set never
-/// downloaded.
-///
-/// The assertion demotion has to satisfy however it goes: a reconstruction
-/// writes the runs it verified, a refused run leaves its range untouched, a
-/// refetch fallback leaves no file at all, and none of them may leave bytes that
-/// were never downloaded looking like bytes that were.
-///
-/// A rebuilt volume is sparse where the sweep did not write — a run it could not
-/// vouch for, an article that never arrived — so the check is per byte rather
-/// than "a byte-exact prefix": every byte either is the posted volume's, or is a
-/// zero standing for a hole the refetch fills. Only a non-zero byte that
-/// disagrees is fabrication, and that is the failure this exists to catch.
+// No source volume of `volumes` that exists on disk holds a byte the set never
+// downloaded.
+//
+// The assertion demotion has to satisfy however it goes: a reconstruction
+// writes the runs it verified, a refused run leaves its range untouched, a
+// refetch fallback leaves no file at all, and none of them may leave bytes that
+// were never downloaded looking like bytes that were.
+//
+// A rebuilt volume is sparse where the sweep did not write — a run it could not
+// vouch for, an article that never arrived — so the check is per byte rather
+// than "a byte-exact prefix": every byte either is the posted volume's, or is a
+// zero standing for a hole the refetch fills. Only a non-zero byte that
+// disagrees is fabrication, and that is the failure this exists to catch.
 fn assert_volumes_are_never_fabricated(
     working_dir: &std::path::Path,
     volumes: &[(String, Vec<u8>)],
@@ -1620,11 +1620,11 @@ fn assert_volumes_are_never_fabricated(
     }
 }
 
-/// The RAR4 twin of [`single_member_store_set`].
-///
-/// RAR4 states the whole-member CRC32 in the *last* part's header and each
-/// earlier part's own packed CRC32 in its own — the same two integrity layers,
-/// in a completely different container.
+// The RAR4 twin of [`single_member_store_set`].
+//
+// RAR4 states the whole-member CRC32 in the *last* part's header and each
+// earlier part's own packed CRC32 in its own — the same two integrity layers,
+// in a completely different container.
 fn single_member_rar4_store_set(
     member_name: &str,
     payload: &[u8],
@@ -1671,14 +1671,14 @@ fn single_member_rar4_store_set(
         .collect()
 }
 
-/// A store set carrying several members, split across `volume_count` volumes.
-///
-/// The members are laid end to end and the concatenation is cut into equal
-/// volume payloads, so member boundaries and volume boundaries deliberately do
-/// **not** line up: members start mid-volume, at least one is split across
-/// volumes, and one volume carries the tail of one member and the head of the
-/// next. That is the shape a season pack posts as, and the shape the first
-/// shape demoted on sight.
+// A store set carrying several members, split across `volume_count` volumes.
+//
+// The members are laid end to end and the concatenation is cut into equal
+// volume payloads, so member boundaries and volume boundaries deliberately do
+// **not** line up: members start mid-volume, at least one is split across
+// volumes, and one volume carries the tail of one member and the head of the
+// next. That is the shape a season pack posts as, and the shape the first
+// shape demoted on sight.
 fn multi_member_store_set(
     members: &[(&str, Vec<u8>)],
     volume_count: usize,
@@ -1750,14 +1750,14 @@ fn multi_member_store_set(
         .collect()
 }
 
-/// One member as a gate saw it: name, bytes, and which of the two candidate
-/// directories it landed in.
+// One member as a gate saw it: name, bytes, and which of the two candidate
+// directories it landed in.
 type GateMember = (String, Option<Vec<u8>>, Option<&'static str>);
 
-/// What one whole job gate produced for a multi-member set.
+// What one whole job gate produced for a multi-member set.
 #[derive(Debug, PartialEq, Eq)]
 struct MultiGateOutcome {
-    /// One entry per requested member name, in the order asked for.
+    // One entry per requested member name, in the order asked for.
     members: Vec<GateMember>,
     status: Option<JobStatus>,
     volume_file_seen: bool,
@@ -1816,12 +1816,12 @@ async fn run_multi_member_gate(
     }
 }
 
-/// A store set whose volumes each carry a recovery record after the payload.
-///
-/// The RR is a service header plus a data area belonging to no member, so every
-/// byte of it is envelope. At `rr_bytes` well over the old 32 KiB half-slot
-/// this set could not route at all before envelope v2 — it demoted with
-/// `EnvelopeTooLarge`, which is why every `-rr` post did.
+// A store set whose volumes each carry a recovery record after the payload.
+//
+// The RR is a service header plus a data area belonging to no member, so every
+// byte of it is envelope. At `rr_bytes` well over the old 32 KiB half-slot
+// this set could not route at all before envelope v2 — it demoted with
+// `EnvelopeTooLarge`, which is why every `-rr` post did.
 fn recovery_record_store_set(
     member_name: &str,
     payload: &[u8],
@@ -1874,25 +1874,25 @@ fn recovery_record_store_set(
         .collect()
 }
 
-/// Physical offset of the recovery record's data area inside a fixture volume.
-///
-/// Found by construction rather than by scanning for a byte pattern: the RR data
-/// is the last `rr_bytes` before the end-of-archive header, whose encoded length
-/// the builder fixes.
+// Physical offset of the recovery record's data area inside a fixture volume.
+//
+// Found by construction rather than by scanning for a byte pattern: the RR data
+// is the last `rr_bytes` before the end-of-archive header, whose encoded length
+// the builder fixes.
 fn find_recovery_offset(volume: &[u8], rr_bytes: usize) -> usize {
     let end_header = build_test_rar_end_header(true).len();
     volume.len() - end_header - rr_bytes
 }
 
-/// A two-volume store set whose second volume carries a second member after the
-/// first, with both members' payloads sized so that — cut into three articles —
-/// the second member's *header* lands in the middle article and its *data*
-/// spans the middle/last boundary.
-///
-/// That geometry is the whole point: with the middle article missing, the header
-/// walk seeks to the end of the first member's data, finds a hole where the
-/// second member's header should be, and stops. Everything the last article
-/// carries is then a member's payload that the layout cannot name yet.
+// A two-volume store set whose second volume carries a second member after the
+// first, with both members' payloads sized so that — cut into three articles —
+// the second member's *header* lands in the middle article and its *data*
+// spans the middle/last boundary.
+//
+// That geometry is the whole point: with the middle article missing, the header
+// walk seeks to the end of the first member's data, finds a hole where the
+// second member's header should be, and stops. Everything the last article
+// carries is then a member's payload that the layout cannot name yet.
 fn set_with_a_second_member_behind_a_header_hole(
     first_name: &str,
     first_payload: &[u8],
@@ -1942,17 +1942,17 @@ fn set_with_a_second_member_behind_a_header_hole(
     ]
 }
 
-/// Three volumes, each carrying a recovery record, whose split member's chain
-/// closes with a BLAKE2sp digest and no CRC32 (`-htb`), and whose last volume
-/// hides a second member past the first's data area.
-///
-/// Every ingredient earns its place. The `-htb` close is the confirmed-reachable
-/// transition that flips a member from `ProvisionallyDirect` to `Ineligible`
-/// *after* its bytes have been routed. The recovery record makes each envelope
-/// file long and sparse, so a read at the member's physical offsets succeeds and
-/// returns zeros instead of failing — which is what makes the failure silent.
-/// The hidden member is what a real multi-member store looks like at the moment
-/// the demotion fires: one member routed, one the layout has not reached.
+// Three volumes, each carrying a recovery record, whose split member's chain
+// closes with a BLAKE2sp digest and no CRC32 (`-htb`), and whose last volume
+// hides a second member past the first's data area.
+//
+// Every ingredient earns its place. The `-htb` close is the confirmed-reachable
+// transition that flips a member from `ProvisionallyDirect` to `Ineligible`
+// *after* its bytes have been routed. The recovery record makes each envelope
+// file long and sparse, so a read at the member's physical offsets succeeds and
+// returns zeros instead of failing — which is what makes the failure silent.
+// The hidden member is what a real multi-member store looks like at the moment
+// the demotion fires: one member routed, one the layout has not reached.
 fn blake2_close_with_recovery_and_hidden_member(
     member_name: &str,
     payload: &[u8],
@@ -2017,16 +2017,16 @@ fn blake2_close_with_recovery_and_hidden_member(
         .collect()
 }
 
-/// A two-volume set whose **last** volume carries a recovery record between the
-/// split member's final part and a second, whole member.
-///
-/// The geometry is what makes the retained region observable: the second
-/// member's data area ends far past the volume's first article, so the volume is
-/// unconfirmed while that article is routed — and the recovery record, sitting
-/// *below* the last known member extent, is classified envelope, written, and
-/// then held in RAM for the header walk to seek through.
-///
-/// Returns the physical offset of the recovery record's data inside volume 1.
+// A two-volume set whose **last** volume carries a recovery record between the
+// split member's final part and a second, whole member.
+//
+// The geometry is what makes the retained region observable: the second
+// member's data area ends far past the volume's first article, so the volume is
+// unconfirmed while that article is routed — and the recovery record, sitting
+// *below* the last known member extent, is classified envelope, written, and
+// then held in RAM for the header walk to seek through.
+//
+// Returns the physical offset of the recovery record's data inside volume 1.
 fn recovery_record_between_members_set(
     first_name: &str,
     first_payload: &[u8],
@@ -2083,10 +2083,10 @@ fn recovery_record_between_members_set(
     )
 }
 
-/// A two-volume store set whose last volume declares a zero-length member after
-/// the split one. An empty stored file is ordinary in a real archive — a
-/// placeholder, a `.nfo` that never got written — and RAR states its CRC32 as
-/// `0x00000000`, the checksum of no bytes.
+// A two-volume store set whose last volume declares a zero-length member after
+// the split one. An empty stored file is ordinary in a real archive — a
+// placeholder, a `.nfo` that never got written — and RAR states its CRC32 as
+// `0x00000000`, the checksum of no bytes.
 fn store_set_with_an_empty_member(
     member_name: &str,
     payload: &[u8],
@@ -2134,40 +2134,40 @@ fn store_set_with_an_empty_member(
     ]
 }
 
-/// What the extra, ineligible member of a tolerance fixture looks like.
+// What the extra, ineligible member of a tolerance fixture looks like.
 #[derive(Clone, Copy)]
 enum ToleranceExtra {
-    /// An **unsplit** stored member whose header carries a real BLAKE2sp digest
-    /// and no CRC32.
-    ///
-    /// Unsplit is load-bearing: the classifier only reaches the hash fields
-    /// once the chain is complete, so a *split* BLAKE2sp-only member is
-    /// `ProvisionallyDirect` — and routes into a partial — until its last
-    /// header lands. An unsplit one is `Ineligible` from its single header, so
-    /// every byte of it goes to the envelope, which is the shape the
-    /// tolerance describes and the one the extraction can read back.
+    // An **unsplit** stored member whose header carries a real BLAKE2sp digest
+    // and no CRC32.
+    //
+    // Unsplit is load-bearing: the classifier only reaches the hash fields
+    // once the chain is complete, so a *split* BLAKE2sp-only member is
+    // `ProvisionallyDirect` — and routes into a partial — until its last
+    // header lands. An unsplit one is `Ineligible` from its single header, so
+    // every byte of it goes to the envelope, which is the shape the
+    // tolerance describes and the one the extraction can read back.
     Blake2OnlyStore,
-    /// A stored member with a real BLAKE2sp digest and no CRC32, **split**
-    /// across the last two volumes.
-    ///
-    /// The case the unsplit variant above cannot reach: the classifier only sees
-    /// the hash fields when the chain completes, so this member is
-    /// `ProvisionallyDirect` from its first header, gets adopted, and routes its
-    /// first part into a `.direct.partial` — and only then, at chain close,
-    /// resolves `Blake2OnlyNoCrc32`. Its already-routed bytes are in the wrong
-    /// file for the tolerance, which is what the migration exists to fix.
+    // A stored member with a real BLAKE2sp digest and no CRC32, **split**
+    // across the last two volumes.
+    //
+    // The case the unsplit variant above cannot reach: the classifier only sees
+    // the hash fields when the chain completes, so this member is
+    // `ProvisionallyDirect` from its first header, gets adopted, and routes its
+    // first part into a `.direct.partial` — and only then, at chain close,
+    // resolves `Blake2OnlyNoCrc32`. Its already-routed bytes are in the wrong
+    // file for the tolerance, which is what the migration exists to fix.
     Blake2OnlySplit,
-    /// An unsplit compressed member. The data area is not really compressed —
-    /// nothing extracts it — so this is only good for what the
-    /// *classification* decides.
+    // An unsplit compressed member. The data area is not really compressed —
+    // nothing extracts it — so this is only good for what the
+    // *classification* decides.
     Compressed { declared_unpacked: u64, solid: bool },
-    /// A compressed member split across the last two volumes, so its packed
-    /// total is a lower bound until the chain closes.
+    // A compressed member split across the last two volumes, so its packed
+    // total is a lower bound until the chain closes.
     CompressedSplit,
 }
 
-/// A store set of `volume_count` volumes carrying one split stored member plus
-/// one extra, ineligible member.
+// A store set of `volume_count` volumes carrying one split stored member plus
+// one extra, ineligible member.
 fn store_set_with_extra_member(
     store_name: &str,
     store_payload: &[u8],
@@ -2290,7 +2290,7 @@ fn store_set_with_extra_member(
         .collect()
 }
 
-/// The set's final router shape after every article of every volume.
+// The set's final router shape after every article of every volume.
 async fn tolerance_shape(job_id: JobId, volumes: &[(String, Vec<u8>)]) -> String {
     let temp_dir = tempfile::tempdir().unwrap();
     let arrivals = in_order_arrivals(volumes.len());
@@ -2298,23 +2298,23 @@ async fn tolerance_shape(job_id: JobId, volumes: &[(String, Vec<u8>)]) -> String
     shape
 }
 
-/// Where a store set's directory entries sit relative to its file members.
+// Where a store set's directory entries sit relative to its file members.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DirectoryPlacement {
-    /// Written into the first volume, ahead of every member header — the shape
-    /// an archiver produces when it walks a tree breadth-first.
+    // Written into the first volume, ahead of every member header — the shape
+    // an archiver produces when it walks a tree breadth-first.
     Leading,
-    /// Written into the **last** volume, after the final part of the last
-    /// member. This is the shape a folder-tree store set really has, and the
-    /// one that used to spend a whole download only to demote on the closing
-    /// volume's last article.
+    // Written into the **last** volume, after the final part of the last
+    // member. This is the shape a folder-tree store set really has, and the
+    // one that used to spend a whole download only to demote on the closing
+    // volume's last article.
     Trailing,
 }
 
-/// A store set carrying `members` plus dataless directory entries.
-///
-/// `directories` is `(name, unix mode, mtime)`. The entries carry no data area,
-/// so they cost the set nothing but a header.
+// A store set carrying `members` plus dataless directory entries.
+//
+// `directories` is `(name, unix mode, mtime)`. The entries carry no data area,
+// so they cost the set nothing but a header.
 fn store_set_with_directories(
     members: &[(&str, Vec<u8>)],
     volume_count: usize,
@@ -2393,14 +2393,14 @@ fn store_set_with_directories(
         .collect()
 }
 
-/// Runs a par2-bearing direct job up to its verification verdict and hands the
-/// **live** pipeline back, so a test can keep driving the completion gate.
-///
-/// Live verification is on, as it is in production: a direct set never enters
-/// the archive topology, so `clean_par2_integrity_gate` reads `None` for it and
-/// the completion gate would take its repair-first branch — which materializes
-/// every live set — rather than letting one finalize. The live short-circuit is
-/// what reaches a clean verdict for a par2-bearing direct job.
+// Runs a par2-bearing direct job up to its verification verdict and hands the
+// **live** pipeline back, so a test can keep driving the completion gate.
+//
+// Live verification is on, as it is in production: a direct set never enters
+// the archive topology, so `clean_par2_integrity_gate` reads `None` for it and
+// the completion gate would take its repair-first branch — which materializes
+// every live set — rather than letting one finalize. The live short-circuit is
+// what reaches a clean verdict for a par2-bearing direct job.
 async fn direct_job_after_verification(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -2447,12 +2447,12 @@ fn no_volume_file(working_dir: &std::path::Path, volumes: &[(String, Vec<u8>)]) 
         .all(|(filename, _)| !working_dir.join(filename).exists())
 }
 
-/// The "before" half of a restart differential.
-///
-/// Runs a job's first articles with routing on, demands a barrier so the
-/// coverage is durable, and retires the pipeline — which is the process going
-/// away. The database and the working directory both live under `temp_dir`, so
-/// the "after" half opens exactly the state a real restart would find.
+// The "before" half of a restart differential.
+//
+// Runs a job's first articles with routing on, demands a barrier so the
+// coverage is durable, and retires the pipeline — which is the process going
+// away. The database and the working directory both live under `temp_dir`, so
+// the "after" half opens exactly the state a real restart would find.
 async fn direct_store_before_restart(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -2464,8 +2464,8 @@ async fn direct_store_before_restart(
         .await
 }
 
-/// [`direct_store_before_restart`] with one extra input. The password is
-/// never persisted, so the "after" half has to be handed one of its own.
+// [`direct_store_before_restart`] with one extra input. The password is
+// never persisted, so the "after" half has to be handed one of its own.
 async fn direct_store_before_restart_with_password(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -2497,9 +2497,9 @@ async fn direct_store_before_restart_with_password(
     working_dir
 }
 
-/// [`queued_segments`] without draining: restart tests need to *read* the queue
-/// and then keep feeding the pipeline, and a drained queue makes the completion
-/// gate conclude the download is exhausted and fail the job.
+// [`queued_segments`] without draining: restart tests need to *read* the queue
+// and then keep feeding the pipeline, and a drained queue makes the completion
+// gate conclude the download is exhausted and fail the job.
 fn peek_queued_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(u32, u32)> {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let work = state.download_queue.drain_all();
@@ -2519,8 +2519,8 @@ fn peek_queued_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(u32, u32
     out
 }
 
-/// Pops one article off the queue — standing in for the dispatch that would have
-/// fetched it — and feeds its decoded bytes in.
+// Pops one article off the queue — standing in for the dispatch that would have
+// fetched it — and feeds its decoded bytes in.
 async fn dispatch_and_submit(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -2548,13 +2548,13 @@ async fn dispatch_and_submit(
     .await;
 }
 
-/// The "after" half: a fresh pipeline over the same database and working
-/// directory, with the job restored through the real restore seam.
-///
-/// `complete_files` and `file_progress` are deliberately **empty**. Suppression
-/// keeps both of them empty for a direct set's source volumes — no legacy
-/// floor, no completed-file row — so a restore that skips anything at all is
-/// skipping it on the strength of the direct checkpoint and nothing else.
+// The "after" half: a fresh pipeline over the same database and working
+// directory, with the job restored through the real restore seam.
+//
+// `complete_files` and `file_progress` are deliberately **empty**. Suppression
+// keeps both of them empty for a direct set's source volumes — no legacy
+// floor, no completed-file row — so a restore that skips anything at all is
+// skipping it on the strength of the direct checkpoint and nothing else.
 async fn direct_store_after_restart(
     temp_dir: &TempDir,
     gate: DirectStoreGate,
@@ -2575,11 +2575,11 @@ async fn direct_store_after_restart(
     .await
 }
 
-/// [`direct_store_after_restart`] with the password the restored job holds.
-///
-/// `None` is the "operator restarted and the password is gone" case: the set
-/// must demote by name rather than wedge, because nothing in the checkpoint can
-/// supply one.
+// [`direct_store_after_restart`] with the password the restored job holds.
+//
+// `None` is the "operator restarted and the password is gone" case: the set
+// must demote by name rather than wedge, because nothing in the checkpoint can
+// supply one.
 #[allow(clippy::too_many_arguments)]
 async fn direct_store_after_restart_with_password(
     temp_dir: &TempDir,
@@ -2620,13 +2620,13 @@ async fn direct_store_after_restart_with_password(
     pipeline
 }
 
-/// Reads the member out of wherever the gate left it, the same three candidate
-/// places every other differential here checks.
-///
-/// `staging` is the middle one and it is not hypothetical: both direct
-/// finalization and the incremental extractor write a member into the job's
-/// staging root, and it only reaches `complete` when the final move renames it
-/// out. A gate that stopped before the move leaves it there.
+// Reads the member out of wherever the gate left it, the same three candidate
+// places every other differential here checks.
+//
+// `staging` is the middle one and it is not hypothetical: both direct
+// finalization and the incremental extractor write a member into the job's
+// staging root, and it only reaches `complete` when the final move renames it
+// out. A gate that stopped before the move leaves it there.
 fn member_after_gate(
     complete_dir: &Path,
     working_dir: &Path,
@@ -2646,7 +2646,7 @@ fn member_after_gate(
     }
 }
 
-/// Reads the one accepted coverage row of a job back out of the database.
+// Reads the one accepted coverage row of a job back out of the database.
 fn coverage_snapshot_of(
     pipeline: &Pipeline,
     job_id: JobId,
@@ -2659,16 +2659,16 @@ fn coverage_snapshot_of(
     crate::pipeline::direct_store::snapshot::decode(blob).expect("the row must decode")
 }
 
-/// A PAR2 index over the set's decoded volume bytes that also carries
-/// **recovery blocks**, so the damage it describes can actually be repaired.
-///
-/// `build_test_par2_index_for_files` stops at descriptions and slice checksums,
-/// which is why every damaged-set test before repair landed could only assert a
-/// verdict: with no recovery stream neither gate can repair, so "repairs while
-/// direct" had nothing to compare against. The blocks are computed over the
-/// global input-slice ordering PAR2 defines — files in main-packet order,
-/// slices in order within each file, each padded to `slice_size` — which is the
-/// same ordering `plan_repair` reconstructs from the parsed set.
+// A PAR2 index over the set's decoded volume bytes that also carries
+// **recovery blocks**, so the damage it describes can actually be repaired.
+//
+// `build_test_par2_index_for_files` stops at descriptions and slice checksums,
+// which is why every damaged-set test before repair landed could only assert a
+// verdict: with no recovery stream neither gate can repair, so "repairs while
+// direct" had nothing to compare against. The blocks are computed over the
+// global input-slice ordering PAR2 defines — files in main-packet order,
+// slices in order within each file, each padded to `slice_size` — which is the
+// same ordering `plan_repair` reconstructs from the parsed set.
 fn build_test_par2_with_recovery(
     files: &[(&str, &[u8])],
     slice_size: u64,
@@ -2743,12 +2743,12 @@ fn repairable_par2_index(volumes: &[(String, Vec<u8>)], recovery_blocks: usize) 
     build_test_par2_with_recovery(&described, PAR2_SLICE_BYTES, recovery_blocks)
 }
 
-/// PAR3 carriers authored over `volumes`, named the way a poster's would be:
-/// the index and the recovery volumes of one set, `(filename, bytes)`.
-///
-/// Authored rather than checked in because every direct-store fixture is built
-/// in the test that uses it, and a carrier over bytes that are not the ones
-/// posted protects nothing.
+// PAR3 carriers authored over `volumes`, named the way a poster's would be:
+// the index and the recovery volumes of one set, `(filename, bytes)`.
+//
+// Authored rather than checked in because every direct-store fixture is built
+// in the test that uses it, and a carrier over bytes that are not the ones
+// posted protects nothing.
 fn par3_carriers_over(
     volumes: &[(String, Vec<u8>)],
     block_size: u64,
@@ -2782,8 +2782,8 @@ fn par3_carriers_over(
         .collect()
 }
 
-/// Appends `files` to the spec as single-article NZB files, each stated at its
-/// yEnc-encoded size, and returns their file indices in order.
+// Appends `files` to the spec as single-article NZB files, each stated at its
+// yEnc-encoded size, and returns their file indices in order.
 fn append_single_article_files(spec: &mut JobSpec, files: &[(String, Vec<u8>)]) -> Vec<u32> {
     files
         .iter()
@@ -2807,12 +2807,12 @@ fn append_single_article_files(spec: &mut JobSpec, files: &[(String, Vec<u8>)]) 
         .collect()
 }
 
-/// Settles every PAR3 work unit a worker currently owns for the job, the way
-/// the select loop would between two completion checks.
-///
-/// Only work a worker holds is waited for. A direct set's PAR3 work can also
-/// be parked on a spill or on a dispatch that the next completion check has
-/// to make, and waiting on the channel for those would wait forever.
+// Settles every PAR3 work unit a worker currently owns for the job, the way
+// the select loop would between two completion checks.
+//
+// Only work a worker holds is waited for. A direct set's PAR3 work can also
+// be parked on a spill or on a dispatch that the next completion check has
+// to make, and waiting on the channel for those would wait forever.
 async fn settle_par3_work(pipeline: &mut Pipeline, job_id: JobId) {
     while pipeline
         .par3_runtime
@@ -2824,8 +2824,8 @@ async fn settle_par3_work(pipeline: &mut Pipeline, job_id: JobId) {
     }
 }
 
-/// The lost cohort's size in the job's retained PAR3 view, `None` while the
-/// runtime has no settled view to offer.
+// The lost cohort's size in the job's retained PAR3 view, `None` while the
+// runtime has no settled view to offer.
 fn par3_lost_blocks(pipeline: &Pipeline, job_id: JobId) -> Option<u64> {
     let runtime = pipeline.par3_runtime.as_ref()?;
     let mut views = runtime.assessments(job_id).peekable();
@@ -2838,12 +2838,12 @@ fn par3_lost_blocks(pipeline: &Pipeline, job_id: JobId) -> Option<u64> {
     )
 }
 
-/// What a direct set protected by PAR3 reached.
+// What a direct set protected by PAR3 reached.
 #[derive(Debug)]
 struct Par3RepairOutcome {
     status: Option<JobStatus>,
-    /// Every set shape observed, in order — a demotion shows up as `Demoted`
-    /// even when the set later finalized or was pruned.
+    // Every set shape observed, in order — a demotion shows up as `Demoted`
+    // even when the set later finalized or was pruned.
     sets: Vec<String>,
     volume_file_seen: bool,
     repair_scratch_left: usize,
@@ -2851,7 +2851,7 @@ struct Par3RepairOutcome {
     finalized: usize,
     output_root: PathBuf,
     working_dir: PathBuf,
-    /// Keeps the job's directories alive for the assertions.
+    // Keeps the job's directories alive for the assertions.
     _temp_dir: tempfile::TempDir,
 }
 
@@ -2864,7 +2864,7 @@ impl Par3RepairOutcome {
         self.sets.iter().any(|shape| shape.contains("Demoted"))
     }
 
-    /// A published member's bytes, wherever the job left them.
+    // A published member's bytes, wherever the job left them.
     fn member(&self, name: &str) -> Option<Vec<u8>> {
         std::fs::read(self.output_root.join(name))
             .ok()
@@ -2872,14 +2872,14 @@ impl Par3RepairOutcome {
     }
 }
 
-/// Drives a direct set whose recovery is a PAR3 set authored over its volumes,
-/// with every article of `absent_ordinal` never arriving, to whatever the job
-/// reaches.
-///
-/// `spec` describes the volumes as NZB files `0..volumes.len()`; the carriers
-/// are appended after them. Articles the pipeline asks for again — a header
-/// probe, a refetch after demotion — are answered from `volumes` for every
-/// volume but the absent one, the way a server that still holds them would.
+// Drives a direct set whose recovery is a PAR3 set authored over its volumes,
+// with every article of `absent_ordinal` never arriving, to whatever the job
+// reaches.
+//
+// `spec` describes the volumes as NZB files `0..volumes.len()`; the carriers
+// are appended after them. Articles the pipeline asks for again — a header
+// probe, a refetch after demotion — are answered from `volumes` for every
+// volume but the absent one, the way a server that still holds them would.
 async fn run_direct_set_with_par3(
     job_id: JobId,
     mut spec: JobSpec,
@@ -3019,41 +3019,41 @@ async fn run_direct_set_with_par3(
     }
 }
 
-/// What one repairable-damage gate produced.
+// What one repairable-damage gate produced.
 #[derive(Debug)]
 struct RepairGateOutcome {
     status: Option<JobStatus>,
     member: Option<Vec<u8>>,
-    /// Whether any source volume file existed at any point. For the direct gate
-    /// this must stay false: repair-while-direct materializes only the *damaged*
-    /// volumes, and it does so under a scratch name, never the volume's own.
+    // Whether any source volume file existed at any point. For the direct gate
+    // this must stay false: repair-while-direct materializes only the *damaged*
+    // volumes, and it does so under a scratch name, never the volume's own.
     volume_file_seen: bool,
-    /// Repair scratch left behind. Always zero — the temporaries are deleted
-    /// whether the repair succeeded or fell back.
+    // Repair scratch left behind. Always zero — the temporaries are deleted
+    // whether the repair succeeded or fell back.
     repair_scratch_left: usize,
-    /// The set's `Debug` shape immediately after verification concluded.
+    // The set's `Debug` shape immediately after verification concluded.
     sets: String,
-    /// Source volumes a repair materialized. The scratch is deleted as soon as
-    /// its spans are routed, so nothing on disk can distinguish "materialized
-    /// one volume" from "materialized every volume and tidied up".
+    // Source volumes a repair materialized. The scratch is deleted as soon as
+    // its spans are routed, so nothing on disk can distinguish "materialized
+    // one volume" from "materialized every volume and tidied up".
     materialized: usize,
-    /// Sets that committed their members from their own partials. Sticky,
-    /// because a set can finalize, complete its job and be pruned inside one
-    /// completion check — so `sets` below may never show the state.
+    // Sets that committed their members from their own partials. Sticky,
+    // because a set can finalize, complete its job and be pruned inside one
+    // completion check — so `sets` below may never show the state.
     finalized: usize,
-    /// `(files stood in for, files read)` per direct verification pass, so a
-    /// test can prove a pass read a volume rather than standing in for it on
-    /// wire evidence.
+    // `(files stood in for, files read)` per direct verification pass, so a
+    // test can prove a pass read a volume rather than standing in for it on
+    // wire evidence.
     verify_read_splits: Vec<(usize, usize)>,
 }
 
-/// Keeps the last non-empty reading of a job's direct sets, and never lets a
-/// later one hide a `Finalized` it already saw.
-///
-/// The runtime is pruned the moment the job finishes, and finalization is a
-/// different completion check from the one that repairs — so a single snapshot
-/// can only ever show one of the two, and which one it shows depends on how many
-/// steps the harness happened to take.
+// Keeps the last non-empty reading of a job's direct sets, and never lets a
+// later one hide a `Finalized` it already saw.
+//
+// The runtime is pruned the moment the job finishes, and finalization is a
+// different completion check from the one that repairs — so a single snapshot
+// can only ever show one of the two, and which one it shows depends on how many
+// steps the harness happened to take.
 fn sample_direct_sets(pipeline: &Pipeline, job_id: JobId, sets: &mut String) {
     let current = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     if current == "[]" {
@@ -3065,7 +3065,7 @@ fn sample_direct_sets(pipeline: &Pipeline, job_id: JobId, sets: &mut String) {
     *sets = current;
 }
 
-/// Every path a direct set could have materialized a volume at, damaged or not.
+// Every path a direct set could have materialized a volume at, damaged or not.
 fn direct_scratch_left(working_dir: &Path) -> usize {
     let mut left = 0usize;
     let Ok(entries) = std::fs::read_dir(working_dir) else {
@@ -3080,13 +3080,13 @@ fn direct_scratch_left(working_dir: &Path) -> usize {
     left
 }
 
-/// Where the PAR2 index sits **in the NZB**, which decides whether a set's
-/// volume indices and its job file indices happen to be the same numbers.
-///
-/// Appended last is the usual posting order, and it is also the one that hides
-/// bugs: the set's volumes are then files `0..n-1`, so volume index and file
-/// index coincide and a seam that confuses the two still works. Leading, they
-/// never agree.
+// Where the PAR2 index sits **in the NZB**, which decides whether a set's
+// volume indices and its job file indices happen to be the same numbers.
+//
+// Appended last is the usual posting order, and it is also the one that hides
+// bugs: the set's volumes are then files `0..n-1`, so volume index and file
+// index coincide and a seam that confuses the two still works. Leading, they
+// never agree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexPosition {
     First,
@@ -3094,7 +3094,7 @@ enum IndexPosition {
 }
 
 impl IndexPosition {
-    /// The NZB file index of the set's volume `ordinal`.
+    // The NZB file index of the set's volume `ordinal`.
     fn volume_file_index(self, ordinal: u32) -> u32 {
         match self {
             Self::First => ordinal + 1,
@@ -3103,8 +3103,8 @@ impl IndexPosition {
     }
 }
 
-/// [`par2_bearing_job_spec`] with the index placed at either end of the NZB, and
-/// a chosen number of articles per volume.
+// [`par2_bearing_job_spec`] with the index placed at either end of the NZB, and
+// a chosen number of articles per volume.
 fn par2_bearing_job_spec_positioned(
     name: &str,
     volumes: &[(String, Vec<u8>)],
@@ -3166,14 +3166,14 @@ async fn run_repairable_par2_gate_at(
     .await
 }
 
-/// [`run_repairable_par2_gate_at`] with a chosen number of articles per volume.
-///
-/// One article per volume is not a corner case — a volume small enough to post
-/// whole is ordinary — and it is the only shape in which a repair's rewrite,
-/// which is widened to whole articles, reaches a volume's **first** byte and
-/// therefore the first cipher block of a member extent that starts there. With
-/// two articles the damaged one is always bounded away from at least one of the
-/// extent's edges.
+// [`run_repairable_par2_gate_at`] with a chosen number of articles per volume.
+//
+// One article per volume is not a corner case — a volume small enough to post
+// whole is ordinary — and it is the only shape in which a repair's rewrite,
+// which is widened to whole articles, reaches a volume's **first** byte and
+// therefore the first cipher block of a member extent that starts there. With
+// two articles the damaged one is always bounded away from at least one of the
+// extent's edges.
 #[allow(clippy::too_many_arguments)]
 async fn run_repairable_par2_gate_with_articles(
     gate: DirectStoreGate,
@@ -3199,14 +3199,14 @@ async fn run_repairable_par2_gate_with_articles(
     .await
 }
 
-/// [`run_repairable_par2_gate_with_articles`] with one volume that never
-/// arrives.
-///
-/// `absent_ordinal` names a volume whose articles are all withheld — the
-/// harness's stand-in for a volume every server answered `430` for. Nothing of
-/// it is ever routed, so it has no envelope content, no covered run and no
-/// staged image: the repair has to create its target from the length PAR2
-/// describes and write every slice of it.
+// [`run_repairable_par2_gate_with_articles`] with one volume that never
+// arrives.
+//
+// `absent_ordinal` names a volume whose articles are all withheld — the
+// harness's stand-in for a volume every server answered `430` for. Nothing of
+// it is ever routed, so it has no envelope content, no covered run and no
+// staged image: the repair has to create its target from the length PAR2
+// describes and write every slice of it.
 #[allow(clippy::too_many_arguments)]
 async fn run_repairable_par2_gate_inner(
     gate: DirectStoreGate,
@@ -3324,13 +3324,13 @@ async fn run_repairable_par2_gate_inner(
     }
 }
 
-/// Corrupts `len` bytes of one volume's **member payload**, leaving every
-/// header and the end record intact.
-///
-/// The damage the wire cannot see. The harness delivers decoded bytes, so the
-/// yEnc part CRC is computed over what is delivered and always agrees — exactly
-/// as it does for an article a server corrupted before its own CRC was taken.
-/// What disagrees is the archive's packed CRC32 for the part, one layer up.
+// Corrupts `len` bytes of one volume's **member payload**, leaving every
+// header and the end record intact.
+//
+// The damage the wire cannot see. The harness delivers decoded bytes, so the
+// yEnc part CRC is computed over what is delivered and always agrees — exactly
+// as it does for an article a server corrupted before its own CRC was taken.
+// What disagrees is the archive's packed CRC32 for the part, one layer up.
 fn damage_member_payload(volumes: &mut [(String, Vec<u8>)], volume: usize, len: usize) {
     let end_header = build_test_rar_end_header(volume + 1 < volumes.len());
     let bytes = &mut volumes[volume].1;
@@ -3341,9 +3341,9 @@ fn damage_member_payload(volumes: &mut [(String, Vec<u8>)], volume: usize, len: 
     }
 }
 
-/// A par2-bearing direct job driven to the point where its one set is live and
-/// carries repairable PAR2 damage, with the live pipeline handed back so a test
-/// can drive the repair seam itself and watch what it refuses.
+// A par2-bearing direct job driven to the point where its one set is live and
+// carries repairable PAR2 damage, with the live pipeline handed back so a test
+// can drive the repair seam itself and watch what it refuses.
 async fn live_damaged_direct_job(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -3389,9 +3389,9 @@ async fn live_damaged_direct_job(
     (pipeline, working_dir)
 }
 
-/// The envelope-damage fixture every repair test is built on: three volumes
-/// carrying one stored member and a recovery record, with the record's data
-/// area damaged in the middle volume.
+// The envelope-damage fixture every repair test is built on: three volumes
+// carrying one stored member and a recovery record, with the record's data
+// area damaged in the middle volume.
 fn repairable_envelope_damage(
     member_name: &str,
     payload: &[u8],
@@ -3404,15 +3404,15 @@ fn repairable_envelope_damage(
     (volumes, par2_bytes)
 }
 
-/// The same envelope damage, with the recovery split out of the index and into
-/// a **separate recovery volume** — which is where recovery actually lives.
-///
-/// This is the shape every real damaged job has and no earlier fixture did.
-/// `recovery_blocks_available` counts slices that have been *merged*, and a
-/// recovery volume is only fetched once damage is known, so at the moment the
-/// first damage verdict is reached the merged count is structurally zero. Every
-/// fixture that baked the recovery into the index handed the repair blocks it
-/// would never have had in the field.
+// The same envelope damage, with the recovery split out of the index and into
+// a **separate recovery volume** — which is where recovery actually lives.
+//
+// This is the shape every real damaged job has and no earlier fixture did.
+// `recovery_blocks_available` counts slices that have been *merged*, and a
+// recovery volume is only fetched once damage is known, so at the moment the
+// first damage verdict is reached the merged count is structurally zero. Every
+// fixture that baked the recovery into the index handed the repair blocks it
+// would never have had in the field.
 type RecoveryVolumeFixture = (Vec<(String, Vec<u8>)>, Vec<u8>, Vec<u8>);
 
 fn recovery_in_a_separate_volume(
@@ -3435,13 +3435,13 @@ fn recovery_in_a_separate_volume(
     (volumes, index_bytes, recovery_bytes)
 }
 
-/// Appends a PAR2 **recovery volume** to a spec as one more downloadable file,
-/// and returns its NZB index.
-///
-/// The name is the payload: `recovery_block_count` is parsed straight out of
-/// `.volNNN+CC.par2`, and that parse is the whole of the job's advertised
-/// recovery capacity before a single recovery byte has been fetched. Nothing
-/// delivers this file — that is the point of the fixture.
+// Appends a PAR2 **recovery volume** to a spec as one more downloadable file,
+// and returns its NZB index.
+//
+// The name is the payload: `recovery_block_count` is parsed straight out of
+// `.volNNN+CC.par2`, and that parse is the whole of the job's advertised
+// recovery capacity before a single recovery byte has been fetched. Nothing
+// delivers this file — that is the point of the fixture.
 fn append_par2_recovery_volume(spec: &mut JobSpec, filename: &str, bytes: &[u8]) -> u32 {
     let file_index = spec.files.len() as u32;
     spec.total_bytes += u64::from(yenc_declared_bytes(bytes.len() as u32));
@@ -3461,19 +3461,19 @@ fn append_par2_recovery_volume(spec: &mut JobSpec, filename: &str, bytes: &[u8])
 
 const RECOVERY_VOLUME_NAME: &str = "silver.horizon.vol000+04.par2";
 
-/// A live, damaged direct job whose recovery is advertised in the NZB and has
-/// **not** been downloaded — the state every damaged direct set is really in
-/// when its first verdict lands.
-///
-/// Returns the pipeline, the working directory, and the two PAR2 file indices —
-/// the index, which each test delivers itself because delivering it *is* the
-/// moment the damage verdict happens, and the recovery volume, which is what the
-/// wait is waiting for.
-///
-/// Stops one step short of the verdict on purpose. Every test here is about what
-/// happens at that instant, and half of them need to change the job's state
-/// first: empty the recovery pool, spend the defer budget, leave the payload in
-/// flight.
+// A live, damaged direct job whose recovery is advertised in the NZB and has
+// **not** been downloaded — the state every damaged direct set is really in
+// when its first verdict lands.
+//
+// Returns the pipeline, the working directory, and the two PAR2 file indices —
+// the index, which each test delivers itself because delivering it *is* the
+// moment the damage verdict happens, and the recovery volume, which is what the
+// wait is waiting for.
+//
+// Stops one step short of the verdict on purpose. Every test here is about what
+// happens at that instant, and half of them need to change the job's state
+// first: empty the recovery pool, spend the defer budget, leave the payload in
+// flight.
 async fn direct_job_with_undownloaded_recovery(
     temp_dir: &TempDir,
     job_id: JobId,
@@ -3517,9 +3517,9 @@ async fn direct_job_with_undownloaded_recovery(
     (pipeline, working_dir, index_file_index, recovery_file_index)
 }
 
-/// Delivers the PAR2 index, which is what produces the damage verdict and drives
-/// the completion gate into the direct-aware seam. Nothing here is a test hook:
-/// this is the ordinary decode path a real index arrives on.
+// Delivers the PAR2 index, which is what produces the damage verdict and drives
+// the completion gate into the direct-aware seam. Nothing here is a test hook:
+// this is the ordinary decode path a real index arrives on.
 async fn deliver_par2_index(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -3541,7 +3541,7 @@ async fn deliver_par2_index(
     .await;
 }
 
-/// What the quiet direct pass concluded, as `(blocks_needed, blocks_available)`.
+// What the quiet direct pass concluded, as `(blocks_needed, blocks_available)`.
 fn insufficient_verdict(pipeline: &Pipeline) -> Option<(u32, u32)> {
     match pipeline.last_direct_verdict.as_ref()?.repairable {
         par2_rs::verify::Repairability::Insufficient {
@@ -3553,12 +3553,12 @@ fn insufficient_verdict(pipeline: &Pipeline) -> Option<(u32, u32)> {
     }
 }
 
-/// Renames a generated set's volume files onto a different archive base name,
-/// so one job can carry two direct sets.
-///
-/// Safe by construction: a RAR5 volume's own bytes carry its *number* in the
-/// main header and nothing about the filename, which is what
-/// `archive_base_name` groups on.
+// Renames a generated set's volume files onto a different archive base name,
+// so one job can carry two direct sets.
+//
+// Safe by construction: a RAR5 volume's own bytes carry its *number* in the
+// main header and nothing about the filename, which is what
+// `archive_base_name` groups on.
 fn renamed_set(base: &str, volumes: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
     volumes
         .into_iter()
@@ -3567,12 +3567,12 @@ fn renamed_set(base: &str, volumes: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<
         .collect()
 }
 
-/// Envelope files still sitting in `working_dir`.
-///
-/// Top level only, and by suffix, which is enough here and deliberately not
-/// enough in production: `sweep_orphan_direct_files` walks eight levels into a
-/// tree the *archive* names, where `chapter.envelope` is a file a real archive
-/// can perfectly well contain. These fixtures name their own members.
+// Envelope files still sitting in `working_dir`.
+//
+// Top level only, and by suffix, which is enough here and deliberately not
+// enough in production: `sweep_orphan_direct_files` walks eight levels into a
+// tree the *archive* names, where `chapter.envelope` is a file a real archive
+// can perfectly well contain. These fixtures name their own members.
 fn direct_envelopes_left(working_dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(working_dir) else {
         return 0;
@@ -3583,25 +3583,25 @@ fn direct_envelopes_left(working_dir: &Path) -> usize {
         .count()
 }
 
-/// One recovery set over two direct sets, one of which finalizes while the other
-/// is still damaged.
+// One recovery set over two direct sets, one of which finalizes while the other
+// is still damaged.
 struct TwoSetPar2Fixture {
-    /// Both sets' volumes, in NZB order: set A first, then set B.
+    // Both sets' volumes, in NZB order: set A first, then set B.
     volumes: Vec<(String, Vec<u8>)>,
-    /// Set B's volumes alone, for the assertions about what must not appear
-    /// under a live volume's own name.
+    // Set B's volumes alone, for the assertions about what must not appear
+    // under a live volume's own name.
     live_set: Vec<(String, Vec<u8>)>,
     par2_bytes: Vec<u8>,
-    /// The `(file index, segment number)` that never arrives.
+    // The `(file index, segment number)` that never arrives.
     lost: (u32, u32),
 }
 
-/// Builds the quiet-pass fixture.
-///
-/// Set A is clean and gate-passed. Set B loses the second half of its middle
-/// volume — member payload, recovery record and end-of-archive record together —
-/// which is what keeps its member gate open so it cannot finalize alongside its
-/// neighbour, and what leaves damage only PAR2 can answer.
+// Builds the quiet-pass fixture.
+//
+// Set A is clean and gate-passed. Set B loses the second half of its middle
+// volume — member payload, recovery record and end-of-archive record together —
+// which is what keeps its member gate open so it cannot finalize alongside its
+// neighbour, and what leaves damage only PAR2 can answer.
 fn two_set_par2_fixture(
     finalized_member: &str,
     live_member: &str,
@@ -3628,15 +3628,15 @@ fn two_set_par2_fixture(
     }
 }
 
-/// Drives the quiet-pass fixture to the state the capability lives in: every
-/// article but the lost one delivered, the PAR2 index parsed, the download
-/// pipeline drained, and set A finalized while set B is still live and damaged.
-///
-/// Reaching the state directly, because it is a *state*, not a sequence: a job
-/// whose PAR2 already read clean once released its ready sets, and one of them
-/// being ready while the other is not is the whole shape. Later passes happen
-/// for reasons that have nothing to do with the direct sets — a conventional
-/// member failing extraction is enough.
+// Drives the quiet-pass fixture to the state the capability lives in: every
+// article but the lost one delivered, the PAR2 index parsed, the download
+// pipeline drained, and set A finalized while set B is still live and damaged.
+//
+// Reaching the state directly, because it is a *state*, not a sequence: a job
+// whose PAR2 already read clean once released its ready sets, and one of them
+// being ready while the other is not is the whole shape. Later passes happen
+// for reasons that have nothing to do with the direct sets — a conventional
+// member failing extraction is enough.
 async fn direct_job_with_one_finalized_neighbour(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -3701,10 +3701,10 @@ async fn direct_job_with_one_finalized_neighbour(
     working_dir
 }
 
-/// A job something failed earlier in the same completion pass — a repair, a
-/// health verdict — commits none of its ready direct sets: a failed job's
-/// output is not published, and with post-processing scripts configured the
-/// job is still present when the pass reaches its sets.
+// A job something failed earlier in the same completion pass — a repair, a
+// health verdict — commits none of its ready direct sets: a failed job's
+// output is not published, and with post-processing scripts configured the
+// job is still present when the pass reaches its sets.
 #[tokio::test]
 async fn a_failed_job_does_not_finalize_its_ready_direct_sets() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3763,9 +3763,9 @@ async fn a_failed_job_does_not_finalize_its_ready_direct_sets() {
     );
 }
 
-/// [`par2_bearing_job_spec`] with a chosen article count per volume, so a
-/// fixture can lose a *middle* article and leave an interior hole rather than a
-/// truncated tail.
+// [`par2_bearing_job_spec`] with a chosen article count per volume, so a
+// fixture can lose a *middle* article and leave an interior hole rather than a
+// truncated tail.
 fn par2_bearing_job_spec_with_articles(
     name: &str,
     volumes: &[(String, Vec<u8>)],
@@ -3790,26 +3790,26 @@ fn par2_bearing_job_spec_with_articles(
     (spec, file_index)
 }
 
-/// The KDF tuple every encrypted fixture here shares. `lg2 = 4` is 16 PBKDF2
-/// rounds: real archives use 2^15 and up, and paying that per fixture would put
-/// seconds into the suite for a number nothing under test reads.
+// The KDF tuple every encrypted fixture here shares. `lg2 = 4` is 16 PBKDF2
+// rounds: real archives use 2^15 and up, and paying that per fixture would put
+// seconds into the suite for a number nothing under test reads.
 const TEST_CRYPT_SALT: [u8; 16] = [0x5A; 16];
 
 const TEST_CRYPT_IV: [u8; 16] = [0xA5; 16];
 
 const TEST_CRYPT_KDF_LG2: u8 = 4;
 
-/// A RAR4 end-of-archive header that **states its volume number**, which
-/// [`build_test_rar4_end_header`] does not.
-///
-/// RAR4 has no per-volume number anywhere else — RAR5 carries one in the main
-/// header, RAR4 carries it in `ENDARC` behind the `VOLUME_NUMBER` flag — and
-/// `unrar-rs` reads `RarVolumeFacts::volume_number` from exactly there. Both
-/// halves of a differential key volumes by the layout rather than by that
-/// parsed number (an old-numbering set states none at all), but a numbered end
-/// record is what modern RAR4 writers emit for `.partNN` sets, and it is the
-/// cross-check the conventional path (`persist_rar_volume_facts`) holds the
-/// layout against — so the realistic fixture states it.
+// A RAR4 end-of-archive header that **states its volume number**, which
+// [`build_test_rar4_end_header`] does not.
+//
+// RAR4 has no per-volume number anywhere else — RAR5 carries one in the main
+// header, RAR4 carries it in `ENDARC` behind the `VOLUME_NUMBER` flag — and
+// `unrar-rs` reads `RarVolumeFacts::volume_number` from exactly there. Both
+// halves of a differential key volumes by the layout rather than by that
+// parsed number (an old-numbering set states none at all), but a numbered end
+// record is what modern RAR4 writers emit for `.partNN` sets, and it is the
+// cross-check the conventional path (`persist_rar_volume_facts`) holds the
+// layout against — so the realistic fixture states it.
 fn build_test_rar4_end_header_numbered(more_volumes: bool, volume: u16) -> Vec<u8> {
     let mut flags: u16 = 0x0004; // VOLUME_NUMBER
     if more_volumes {

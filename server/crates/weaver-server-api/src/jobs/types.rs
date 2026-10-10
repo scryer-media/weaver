@@ -19,9 +19,9 @@ use crate::system::types::{DownloadBlock, Metrics};
 
 pub use weaver_server_core::CLIENT_REQUEST_ID_ATTRIBUTE_KEY;
 
-/// The core loader deliberately caps a single database request at 256
-/// identities. API result sets are not universally capped, so callers must
-/// merge bounded batches before projecting duplicate data onto items.
+// The core loader deliberately caps a single database request at 256
+// identities. API result sets are not universally capped, so callers must
+// merge bounded batches before projecting duplicate data onto items.
 pub(crate) const DUPLICATE_SUMMARY_BATCH_SIZE: usize = 256;
 
 pub(crate) fn load_duplicate_summaries_chunked(
@@ -1176,8 +1176,8 @@ pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
     )
 }
 
-/// Projects just the display data needed by queue tables. Full release parsing
-/// stays on detail/snapshot paths, where callers actually render it.
+// Projects just the display data needed by queue tables. Full release parsing
+// stays on detail/snapshot paths, where callers actually render it.
 pub(crate) fn queue_table_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
     let (client_request_id, attributes) = split_attributes(&info.metadata);
     let state = queue_item_state_from_job_info(info);
@@ -1537,9 +1537,9 @@ fn wait_reason_for_post_state(
     }
 }
 
-/// Resolve the user-facing queue state from the authoritative runtime lanes.
-/// Active download work is always primary; post-processing and completion-tail
-/// overlays become primary only after that lane finishes.
+// Resolve the user-facing queue state from the authoritative runtime lanes.
+// Active download work is always primary; post-processing and completion-tail
+// overlays become primary only after that lane finishes.
 pub fn queue_item_state_from_job_info(info: &weaver_server_core::JobInfo) -> QueueItemState {
     resolve_queue_item_state(info, true)
 }
@@ -1637,8 +1637,8 @@ fn resolve_queue_item_state(
     }
 }
 
-/// Resolve the queue state for compatibility counters that must treat a live
-/// download lane as active, even while post-processing overlaps it.
+// Resolve the queue state for compatibility counters that must treat a live
+// download lane as active, even while post-processing overlaps it.
 pub fn queue_item_state_from_job_info_for_download_accounting(
     info: &weaver_server_core::JobInfo,
 ) -> QueueItemState {

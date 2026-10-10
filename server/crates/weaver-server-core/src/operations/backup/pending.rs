@@ -335,9 +335,9 @@ fn cleanup_restore_location_pointers(root: &Path) -> Result<(), BackupServiceErr
     Ok(())
 }
 
-/// Runs the promotion with the live handle parked in `live_db`; the slot is
-/// emptied only when the handle is handed back or consumed by the promotion,
-/// so the caller can close whatever is still open when a step fails.
+// Runs the promotion with the live handle parked in `live_db`; the slot is
+// emptied only when the handle is handed back or consumed by the promotion,
+// so the caller can close whatever is still open when a step fails.
 fn apply_pending_restore_inner(
     live_db: &mut Option<Database>,
     data_dir: &Path,
@@ -472,8 +472,8 @@ fn apply_pending_restore_inner(
     ))
 }
 
-/// Runs the sqlite promotion with the live handle parked in `live_db`, so the
-/// caller can close whichever handle is still open when a step fails.
+// Runs the sqlite promotion with the live handle parked in `live_db`, so the
+// caller can close whichever handle is still open when a step fails.
 #[allow(clippy::too_many_arguments)]
 fn apply_sqlite_restore(
     live_db: &mut Option<Database>,
