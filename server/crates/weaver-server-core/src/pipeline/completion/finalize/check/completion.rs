@@ -6,6 +6,16 @@ use super::*;
 use crate::pipeline::repair::backend::AlternateRepairReason;
 
 impl Pipeline {
+    // The recovery-volume restore runs only once no extraction task is
+    // active, so while one is, a hole in a RAR set that carries `.rev` files
+    // is not yet a verdict: an eager extraction of the members around the
+    // hole can still be running when the downloads drain.
+    fn rar_recovery_restore_pending(&self, job_id: JobId) -> bool {
+        self.job_has_only_rar_archives(job_id)
+            && self.job_has_active_extraction_tasks(job_id)
+            && self.job_has_rar_recovery_volume_files(job_id)
+    }
+
     /// Whether the job has archive extraction to run once its PAR2 verdict
     /// lands.
     ///
@@ -1053,6 +1063,7 @@ impl Pipeline {
         // exhausted-work failure obscures the topology defect.
         if download_pipeline_exhausted
             && (par2_bypassed || !self.job_spec_has_par2_file(job_id))
+            && !self.rar_recovery_restore_pending(job_id)
             && let Some(error) = self.missing_numbered_archive_part(job_id)
         {
             self.fail_job(job_id, error);
@@ -2887,6 +2898,7 @@ impl Pipeline {
         // its turn first; failing here before then condemned sets whose
         // `.rev` files would have rebuilt the missing part.
         if download_pipeline_exhausted
+            && !self.rar_recovery_restore_pending(job_id)
             && let Some(error) = self.missing_numbered_archive_part(job_id)
         {
             self.fail_job(job_id, error);
