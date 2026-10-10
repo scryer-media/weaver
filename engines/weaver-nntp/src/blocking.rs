@@ -1639,9 +1639,6 @@ impl BlockingNntpConnection {
     }
 
     fn charge_active_body(&mut self, bytes: usize) -> Duration {
-        if let Some(outcome) = &self.route_outcome {
-            outcome.read(bytes);
-        }
         // Both levels are charged before either is waited on, so the read
         // waits for the later deadline: the lower of the two rates.
         let egress_charge = match (self.egress_accounting.front_mut(), &self.egress_control) {
@@ -1665,6 +1662,13 @@ impl BlockingNntpConnection {
         };
         let egress_wait = egress_charge.map_or(Duration::ZERO, |charge| charge.wait_blocking());
         let server_wait = server_charge.map_or(Duration::ZERO, |charge| charge.wait_blocking());
+        // The route counts these bytes once their wait is over. A chunk is
+        // read before the rate it owes is paid, so counting it on arrival
+        // would put every connection's first unpaid chunk into the leg's
+        // first second, ahead of the time the limit allots it.
+        if let Some(outcome) = &self.route_outcome {
+            outcome.read(bytes);
+        }
         if let Some(BodyTransferAccounting::Tracked(permit)) = self.egress_accounting.front_mut() {
             permit.add_throttle_wait(egress_wait);
         }
