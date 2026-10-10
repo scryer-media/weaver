@@ -184,6 +184,8 @@ pub enum RunnerError {
     InvalidEntrypoint,
     #[error("script environment value is invalid")]
     InvalidEnvironment,
+    #[error("batch script argument contains a line break")]
+    InvalidBatchArgument,
     #[error("script timeout is too large for this platform")]
     InvalidTimeout,
     #[error("post-processing supervisor protocol failed: {0}")]
@@ -200,6 +202,12 @@ struct SupervisorRequest {
     cwd: PathBuf,
     /// Compile the Go source before executing it with the script arguments.
     go_run: bool,
+    /// `args` is an already escaped cmd.exe command line.
+    #[serde(default)]
+    raw_args: bool,
+    /// The directory a Go script is built under.
+    #[serde(default)]
+    go_build_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -374,12 +382,17 @@ pub async fn execute_spec_tapped(
         return Err(RunnerError::InvalidEntrypoint);
     }
     let (program, mut args) = resolve_program(&entrypoint, &spec.interpreters)?;
-    append_script_arguments(&entrypoint, &mut args, spec.argv);
+    let raw_args = append_script_arguments(&entrypoint, &mut args, spec.argv)?;
     let go_run = is_go_source(&entrypoint);
     let mut env = sanitized_platform_environment()?;
     if go_run {
         insert_go_environment(&mut env, &spec.facts)?;
     }
+    let go_build_root = if go_run {
+        go_build_root(&spec.facts)?
+    } else {
+        None
+    };
     insert_nzbget_global_options(&mut env, &spec.facts)?;
     insert_compat_options(&mut env, "NZBPO", &spec.options)?;
     insert_options(&mut env, "SAB_OPTION_", &spec.options)?;
@@ -424,6 +437,8 @@ pub async fn execute_spec_tapped(
             env,
             cwd: fs::canonicalize(spec.cwd)?,
             go_run,
+            raw_args,
+            go_build_root,
         },
         capture: CapturePolicy {
             secrets: Arc::new(secrets.clone()),
@@ -550,8 +565,13 @@ fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecuti
     if go_run {
         insert_go_environment(&mut env, &request.context.compatibility)?;
     }
+    let go_build_root = if go_run {
+        go_build_root(&request.context.compatibility)?
+    } else {
+        None
+    };
     let adapter_args = adapter_environment_and_args(request, &mut env)?;
-    append_script_arguments(&entrypoint, &mut args, adapter_args);
+    let raw_args = append_script_arguments(&entrypoint, &mut args, adapter_args)?;
 
     let final_directory = fs::canonicalize(&request.context.final_directory)?;
 
@@ -567,6 +587,8 @@ fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecuti
             env,
             cwd: final_directory,
             go_run,
+            raw_args,
+            go_build_root,
         },
         capture: CapturePolicy::default(),
     })
@@ -584,12 +606,85 @@ fn is_go_source(entrypoint: &Path) -> bool {
     script_extension(entrypoint) == "go"
 }
 
-fn append_script_arguments(entrypoint: &Path, args: &mut Vec<OsString>, values: Vec<OsString>) {
-    // cmd.exe reinterprets argument text as shell syntax. Batch scripts get
-    // download-derived values exclusively through their compatibility env.
-    if !matches!(script_extension(entrypoint).as_str(), "bat" | "cmd") {
+fn is_batch_script(entrypoint: &Path) -> bool {
+    matches!(script_extension(entrypoint).as_str(), "bat" | "cmd")
+}
+
+/// Adds the script's positional arguments. Returns true when `args` is a
+/// finished cmd.exe command line that the supervisor must pass verbatim.
+///
+/// std only escapes for cmd.exe when the program it spawns is the batch file
+/// itself; here the program is the configured interpreter, so std's ordinary
+/// quoting would reach cmd.exe unescaped. The batch tail is built with the
+/// same rules std uses for batch files instead.
+fn append_script_arguments(
+    entrypoint: &Path,
+    args: &mut Vec<OsString>,
+    values: Vec<OsString>,
+) -> Result<bool, RunnerError> {
+    if !is_batch_script(entrypoint) {
         args.extend(values);
+        return Ok(false);
     }
+    let script = entrypoint.to_str().ok_or(RunnerError::InvalidEntrypoint)?;
+    // `/S /C "…"`: cmd.exe strips the outer quotes and runs what they held.
+    let mut tail = format!("\"\"{script}\"");
+    for value in values {
+        let value = value
+            .into_string()
+            .map_err(|_| RunnerError::InvalidBatchArgument)?;
+        tail.push(' ');
+        append_batch_argument(&mut tail, &value)?;
+    }
+    tail.push('"');
+    *args = vec![
+        OsString::from("/D"),
+        OsString::from("/V:OFF"),
+        OsString::from("/S"),
+        OsString::from("/C"),
+        OsString::from(tail),
+    ];
+    Ok(true)
+}
+
+/// Quotes one argument for a batch file's command line, after std's
+/// `append_bat_arg`: anything but a known-safe character forces quotes, `"`
+/// is doubled, `%` is defused with an empty `%cd:~,%` substring so no
+/// variable can expand, and backslashes before a quote are doubled. A line
+/// break would end the command, so it is refused.
+fn append_batch_argument(line: &mut String, value: &str) -> Result<(), RunnerError> {
+    if value.contains(['\r', '\n', '\0']) {
+        return Err(RunnerError::InvalidBatchArgument);
+    }
+    const UNQUOTED: &str = r"#$*+-./:?@\_";
+    let quote = value.is_empty()
+        || value.ends_with('\\')
+        || value.chars().any(|c| {
+            (c.is_ascii() && !(c.is_ascii_alphanumeric() || UNQUOTED.contains(c))) || c.is_control()
+        });
+    if quote {
+        line.push('"');
+    }
+    let mut backslashes = 0_usize;
+    for c in value.chars() {
+        if c == '\\' {
+            backslashes += 1;
+        } else {
+            if c == '"' {
+                line.extend(std::iter::repeat_n('\\', backslashes));
+                line.push('"');
+            } else if c == '%' {
+                line.push_str("%%cd:~,");
+            }
+            backslashes = 0;
+        }
+        line.push(c);
+    }
+    if quote {
+        line.extend(std::iter::repeat_n('\\', backslashes));
+        line.push('"');
+    }
+    Ok(())
 }
 
 fn resolve_program(
@@ -996,6 +1091,16 @@ fn sanitized_platform_environment() -> Result<BTreeMap<OsStringWire, OsStringWir
 
 /// The Go build cache, kept under weaver's data directory.
 const GO_BUILD_CACHE_DIR: &str = ".weaver-go-cache";
+/// Where a Go script's executable is built, beside the cache: the system
+/// temporary directory may be mounted noexec.
+const GO_BUILD_OUTPUT_DIR: &str = ".weaver-go-build";
+
+fn go_build_root(facts: &CompatibilityFacts) -> Result<Option<PathBuf>, RunnerError> {
+    Ok(match facts.data_dir.as_deref() {
+        Some(data_dir) => Some(std::path::absolute(data_dir)?.join(GO_BUILD_OUTPUT_DIR)),
+        None => None,
+    })
+}
 
 /// What `go run` needs beyond the platform environment. Go will not build
 /// without a build cache and looks for one under a home directory the daemon
@@ -1709,10 +1814,17 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
         .into_iter()
         .map(OsStringWire::into_os)
         .collect();
-    // The Go compiler cache remains under the configured data directory.
+    // The executable is built under the data directory, beside the Go cache.
     // Build and execute separately: a download name ending in .go must never
     // be interpreted by the compiler as another source file.
-    let build_dir = request.go_run.then(tempfile::tempdir).transpose()?;
+    let build_dir = if !request.go_run {
+        None
+    } else if let Some(root) = &request.go_build_root {
+        fs::create_dir_all(root)?;
+        Some(tempfile::tempdir_in(root)?)
+    } else {
+        Some(tempfile::tempdir()?)
+    };
     let mut commands = Vec::new();
     if let Some(build_dir) = &build_dir {
         let source = args
@@ -1731,7 +1843,21 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
         commands.push(run);
     } else {
         let mut run = std::process::Command::new(&request.program);
-        run.args(args);
+        #[cfg(windows)]
+        if request.raw_args {
+            use std::os::windows::process::CommandExt;
+            for arg in &args {
+                run.raw_arg(arg);
+            }
+        } else {
+            run.args(&args);
+        }
+        // Batch scripts only run on Windows.
+        #[cfg(not(windows))]
+        {
+            let _ = request.raw_args;
+            run.args(&args);
+        }
         commands.push(run);
     }
     let parent_pipe_lost = Arc::new(AtomicBool::new(false));
@@ -2432,14 +2558,63 @@ mod go_run_tests {
     }
 
     #[test]
-    fn batch_scripts_receive_no_download_arguments() {
-        let mut args = vec![OsString::from("trusted.cmd")];
-        append_script_arguments(
-            Path::new("trusted.cmd"),
+    fn batch_scripts_receive_escaped_download_arguments() {
+        let entrypoint = Path::new(r"C:\scripts\trusted.cmd");
+        let (_, mut args) = resolve_program(entrypoint, &InterpreterConfig::default()).unwrap();
+        let raw = append_script_arguments(
+            entrypoint,
             &mut args,
-            vec![OsString::from("name&command%value")],
+            vec![
+                OsString::from("name&command%PATH%value"),
+                OsString::from(r#"say "hi"|more"#),
+                OsString::from(r"C:\complete\job name\"),
+                OsString::from("plain-1.0"),
+                OsString::new(),
+                OsString::from("a^b<c>d"),
+            ],
+        )
+        .unwrap();
+        assert!(raw);
+        assert_eq!(
+            args,
+            [
+                "/D",
+                "/V:OFF",
+                "/S",
+                "/C",
+                concat!(
+                    r#"""C:\scripts\trusted.cmd" "#,
+                    r#""name&command%%cd:~,%PATH%%cd:~,%value" "#,
+                    r#""say ""hi""|more" "#,
+                    r#""C:\complete\job name\\" "#,
+                    r#"plain-1.0 "#,
+                    r#""" "#,
+                    r#""a^b<c>d""#,
+                    r#"""#,
+                ),
+            ]
         );
-        assert_eq!(args, ["trusted.cmd"]);
+        for line_break in ["one\ntwo", "one\rtwo"] {
+            assert!(matches!(
+                append_script_arguments(
+                    entrypoint,
+                    &mut Vec::new(),
+                    vec![OsString::from(line_break)],
+                ),
+                Err(RunnerError::InvalidBatchArgument)
+            ));
+        }
+
+        let mut args = vec![OsString::from("script.py")];
+        assert!(
+            !append_script_arguments(
+                Path::new("script.py"),
+                &mut args,
+                vec![OsString::from("a&b")],
+            )
+            .unwrap()
+        );
+        assert_eq!(args, ["script.py", "a&b"]);
         assert!(
             resolve_program(
                 Path::new("/scripts/unsafe%name.cmd"),

@@ -223,7 +223,7 @@ fn compute_daily_window(now: DateTime<Local>, reset_minutes: u16) -> QuotaWindow
     } else {
         let previous = today
             .pred_opt()
-            .expect("previous day exists for daily bandwidth cap");
+            .expect("previous day exists for a daily quota window");
         local_datetime(
             previous.year(),
             previous.month(),
@@ -234,7 +234,7 @@ fn compute_daily_window(now: DateTime<Local>, reset_minutes: u16) -> QuotaWindow
     let next_day = start
         .date_naive()
         .succ_opt()
-        .expect("next day exists for daily bandwidth cap");
+        .expect("next day exists for a daily quota window");
     let end = local_datetime(
         next_day.year(),
         next_day.month(),

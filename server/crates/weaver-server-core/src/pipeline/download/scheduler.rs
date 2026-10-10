@@ -7,7 +7,7 @@
 //! job the user has running still holds an article that connection's server
 //! is allowed to fetch. The only things allowed to leave a slot idle are the
 //! ones that are about the whole link rather than about any one job: a global
-//! pause, hard byte pressure, an exhausted bandwidth-cap window, the rate
+//! pause, hard byte pressure, an exhausted download quota, the rate
 //! limiter, and an NNTP pool handover still draining its old sockets.
 //!
 //! The second obligation pulls the other way and is just as firm: a
@@ -84,7 +84,7 @@
 //!   restart checkpoint held its articles.
 //!
 //! Everything lane-side is the caller's: recording the lane's owner,
-//! connection and lane gauges, ISP bandwidth reservations, activation of the
+//! connection and lane gauges, download quota reservations, activation of the
 //! work it was handed, and returning unused work to the queue.
 
 use super::worker::DownloadPressure;

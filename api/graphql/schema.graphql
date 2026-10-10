@@ -684,7 +684,7 @@ type GlobalQueueState {
 }
 
 """
-When instances that are not narrowed to a category run.
+When script jobs that are not narrowed to a category run.
 """
 enum GlobalScriptsRun {
 	"""
@@ -692,7 +692,7 @@ enum GlobalScriptsRun {
 	"""
 	ALWAYS
 	"""
-	Only for a download whose category has no instances of its own.
+	Only for a download whose category has no script jobs of its own.
 	"""
 	ONLY_WITHOUT_CATEGORY_SCRIPTS
 }
@@ -1172,7 +1172,13 @@ type LiveScriptRun {
 	The same value the script was handed as `WEAVER_RUN_ID`.
 	"""
 	runId: String!
+	"""
+	The script job the run is for.
+	"""
 	instanceId: String!
+	"""
+	The script job's name.
+	"""
 	instanceName: String!
 	"""
 	What started the run.
@@ -1618,7 +1624,7 @@ type MutationRoot {
 	setPostProcessingSettings(input: PostProcessingSettingsInput!): PostProcessingSettingsGql!
 	"""
 	Select the sole live source of scripts. Changing it turns every
-	instance off, because a name in the new directory is not the script
+	script job off, because a name in the new directory is not the script
 	that was wired up. What was saved in them is kept, and script files
 	are never touched.
 	"""
@@ -1642,43 +1648,43 @@ type MutationRoot {
 	"""
 	updateSecret(id: String!, name: String, value: String): Secret!
 	"""
-	Remove a secret. Refused while any instance links it.
+	Remove a secret. Refused while any script job links it.
 	"""
 	deleteSecret(id: String!): Boolean!
 	"""
-	Replace everything saved in an instance. Each input is sent as a value,
-	as the secret it links, or as a secret of the instance's own; one of
+	Replace everything saved in a script job. Each input is sent as a value,
+	as the secret it links, or as a secret of the script job's own; one of
 	those sent without a value keeps the secret already saved under that
-	name. A schedule left out keeps the saved one; an instance that no
+	name. A schedule left out keeps the saved one; a script job that no
 	longer runs on a schedule loses its run times.
 	"""
 	updateScriptInstance(id: String!, input: ScriptInstanceInput!): ScriptInstance!
 	"""
-	Remove an instance. False when there was no such instance.
+	Remove a script job. False when there was no such script job.
 	"""
 	deleteScriptInstance(id: String!): Boolean!
 	"""
-	Put the instances of one trigger in the order given. They keep the
+	Put the script jobs of one trigger in the order given. They keep the
 	places they hold among the others, and any that are not named follow
 	the ones that are.
 	"""
 	reorderScriptInstances(trigger: ScriptKind!, ids: [String!]!): [ScriptInstance!]!
 	"""
-	Create every instance a script's header asks for and does not have
+	Create every script job a script's header asks for and does not have
 	yet: one per declared trigger, filled from the header, a new schedule
-	instance carrying every declared run time. Returns the instances it
+	script job carrying every declared run time. Returns the script jobs it
 	added. After this the header is not read again.
 	"""
 	setUpScriptFromHeader(script: String!): [ScriptInstance!]!
 	"""
-	Bring one instance's inputs back in line with its script's header:
+	Bring one script job's inputs back in line with its script's header:
 	every declared input, at the value already saved or else its default,
 	and nothing the header no longer declares.
 	"""
 	reapplyScriptHeader(id: String!): ScriptInstance!
 	"""
-	Run an instance once against made-up inputs: a download that does not
-	exist, in a scratch directory that is removed afterwards. The instance
+	Run a script job once against made-up inputs: a download that does not
+	exist, in a scratch directory that is removed afterwards. The script job
 	supplies the script, the trigger and its saved inputs. Commands the
 	script prints are reported and never applied. Read the run again with
 	`scriptTestRun`.
@@ -1696,7 +1702,7 @@ type MutationRoot {
 	"""
 	scriptRun: ScriptRunActions!
 	"""
-	Run the job's post-processing instances again against its retained
+	Run the job's post-processing script jobs again against its retained
 	output directory.
 	"""
 	rerunPostProcessing(jobId: Int!): Boolean!
@@ -2010,8 +2016,8 @@ type PostProcessingSettingsGql {
 	"""
 	strictSecurityRefusesExecution: Boolean!
 	"""
-	Whether instances for every category also run for a category that has
-	instances of its own.
+	Whether script jobs for every category also run for a category that has
+	script jobs of its own.
 	"""
 	globalScriptsRun: GlobalScriptsRun!
 }
@@ -2300,15 +2306,15 @@ type QueryRoot {
 	jobOutputFiles(jobId: Int!): JobOutputResult
 	postProcessingSettings: PostProcessingSettingsGql!
 	"""
-	Every saved instance, in run order.
+	Every saved script job, in run order.
 	"""
 	scriptInstances: [ScriptInstance!]!
 	"""
-	One saved instance, or null when there is none by that id.
+	One saved script job, or null when there is none by that id.
 	"""
 	scriptInstance(id: String!): ScriptInstance
 	"""
-	Every named secret, by name, with the instances that link it. Values
+	Every named secret, by name, with the script jobs that link it. Values
 	are never returned.
 	"""
 	secrets: [Secret!]!
@@ -2773,7 +2779,7 @@ type RoutingStatus {
 
 type RssFeed {
 	"""
-	The feed script instances that rewrite this feed, in the order they run.
+	The feed script jobs that rewrite this feed, in the order they run.
 	"""
 	scriptInstanceIds: [String!]!
 	id: Int!
@@ -2799,7 +2805,7 @@ type RssFeed {
 
 input RssFeedInput {
 	"""
-	The feed script instances that rewrite this feed, in the order they
+	The feed script jobs that rewrite this feed, in the order they
 	run. Omission keeps the ones already attached.
 	"""
 	scriptInstanceIds: [String!]
@@ -3045,7 +3051,7 @@ type ScriptGql {
 	"""
 	options: [ScriptOptionGql!]!
 	"""
-	What the header offers as a starting point for an instance.
+	What the header offers as a starting point for a script job.
 	"""
 	preset: ScriptPreset!
 }
@@ -3065,7 +3071,7 @@ type ScriptInstance {
 	queueEvent: ScriptQueueEvent
 	inputs: [ScriptInstanceValue!]!
 	"""
-	Empty runs for every category. Only post-processing and queue instances
+	Empty runs for every category. Only post-processing and queue script jobs
 	can be narrowed.
 	"""
 	categories: [String!]!
@@ -3081,7 +3087,7 @@ type ScriptInstance {
 	"""
 	timeoutSeconds: Int
 	"""
-	When a schedule instance runs. Empty for every other trigger.
+	When a schedule script job runs. Empty for every other trigger.
 	"""
 	schedule: ScriptInstanceSchedule!
 	runOrder: Int!
@@ -3091,7 +3097,7 @@ type ScriptInstance {
 	"""
 	scriptProblem: String
 	"""
-	The script's header no longer declares the inputs this instance holds.
+	The script's header no longer declares the inputs this script job holds.
 	"""
 	headerDrift: Boolean!
 }
@@ -3116,14 +3122,14 @@ input ScriptInstanceInput {
 	blocking: Boolean! = true
 	timeoutSeconds: Int
 	"""
-	When a schedule instance runs; ignored for every other trigger.
+	When a schedule script job runs; ignored for every other trigger.
 	Omitted on an update, the saved one is kept.
 	"""
 	schedule: ScriptInstanceScheduleInput
 }
 
 """
-An instance that links a secret.
+A script job that links a secret.
 """
 type ScriptInstanceRef {
 	id: String!
@@ -3131,7 +3137,7 @@ type ScriptInstanceRef {
 }
 
 """
-When a schedule instance runs.
+When a schedule script job runs.
 """
 type ScriptInstanceSchedule {
 	"""
@@ -3149,7 +3155,7 @@ type ScriptInstanceSchedule {
 }
 
 """
-When a schedule instance runs.
+When a schedule script job runs.
 """
 input ScriptInstanceScheduleInput {
 	"""
@@ -3168,12 +3174,12 @@ input ScriptInstanceScheduleInput {
 
 """
 One saved input: a value, a link to a named secret, or a secret of the
-instance's own. A secret's value is never read back out.
+script job's own. A secret's value is never read back out.
 """
 type ScriptInstanceValue {
 	name: String!
 	"""
-	Empty when the input is a secret, linked or the instance's own.
+	Empty when the input is a secret, linked or the script job's own.
 	"""
 	value: String!
 	"""
@@ -3181,8 +3187,8 @@ type ScriptInstanceValue {
 	"""
 	secret: SecretRef
 	"""
-	The input is a secret of the instance's own: kept encrypted with the
-	instance, write-only, and not among the named secrets.
+	The input is a secret of the script job's own: kept encrypted with the
+	script job, write-only, and not among the named secrets.
 	"""
 	sealed: Boolean!
 }
@@ -3191,7 +3197,7 @@ input ScriptInstanceValueInput {
 	name: String!
 	"""
 	A plain value, or with `secret` the value to keep as a secret of the
-	instance's own. Give this or `secretId`, not both.
+	script job's own. Give this or `secretId`, not both.
 	"""
 	value: String
 	"""
@@ -3200,10 +3206,10 @@ input ScriptInstanceValueInput {
 	"""
 	secretId: String
 	"""
-	True makes the input a secret of the instance's own: `value` is kept
-	encrypted with the instance, is never read back, and does not become a
+	True makes the input a secret of the script job's own: `value` is kept
+	encrypted with the script job, is never read back, and does not become a
 	named secret. On an update, true with no `value` keeps the secret the
-	instance already holds under this name. Omitted means false.
+	script job already holds under this name. Omitted means false.
 	"""
 	secret: Boolean
 }
@@ -3257,15 +3263,15 @@ enum ScriptOptionTypeGql {
 
 """
 What a script's header offers as a starting point. It fills a form and
-nothing more: a saved instance never follows the header.
+nothing more: a saved script job never follows the header.
 """
 type ScriptPreset {
 	"""
-	One per instance the header asks for.
+	One per script job the header asks for.
 	"""
 	triggers: [ScriptPresetTrigger!]!
 	"""
-	When a schedule instance is meant to run.
+	When a schedule script job is meant to run.
 	"""
 	taskTimes: [String!]!
 	"""
@@ -3315,11 +3321,11 @@ type ScriptResultGql {
 	outputRetained: Boolean!
 	script: String!
 	"""
-	The instance that ran, when the run came from one.
+	The script job that ran, when the run came from one.
 	"""
 	instanceId: String
 	"""
-	The instance's name as it was when it ran.
+	The script job's name as it was when it ran.
 	"""
 	instanceName: String
 	event: String!
@@ -3352,11 +3358,11 @@ type ScriptRun {
 	jobName: String
 	script: String!
 	"""
-	The instance that ran, when the run came from one.
+	The script job that ran, when the run came from one.
 	"""
 	instanceId: String
 	"""
-	The instance's name as it was when it ran.
+	The script job's name as it was when it ran.
 	"""
 	instanceName: String
 	event: String!
@@ -3474,7 +3480,7 @@ type ScriptTestInput {
 }
 
 """
-An instance run against made-up inputs, as it stands.
+A script job run against made-up inputs, as it stands.
 """
 type ScriptTestRun {
 	id: String!
@@ -3503,7 +3509,7 @@ type ScriptTestRun {
 	log: String!
 	logTruncated: Boolean!
 	"""
-	The variables made up for this run, in name order. The instance's own
+	The variables made up for this run, in name order. The script job's own
 	inputs are left out.
 	"""
 	inputs: [ScriptTestInput!]!
@@ -3528,7 +3534,7 @@ type Secret {
 	createdAt: DateTime!
 	updatedAt: DateTime!
 	"""
-	The instances that link it, by name.
+	The script jobs that link it, by name.
 	"""
 	usedBy: [ScriptInstanceRef!]!
 }

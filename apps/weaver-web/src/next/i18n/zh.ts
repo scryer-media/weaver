@@ -574,7 +574,6 @@ export const nextZh: LocaleDictionary = {
   "next.settings.panel.proxies": "代理",
   "next.settings.panel.proxiesNote": "服务商和订阅源可用的隧道",
   "next.settings.panel.bandwidth": "带宽",
-  "next.settings.panel.bandwidthNote": "上限与运营商流量限额",
   "next.settings.panel.schedules": "计划",
   "next.settings.panel.schedulesNote": "weaver 何时暂停和恢复",
   "next.settings.panel.scripts": "脚本",

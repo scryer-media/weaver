@@ -102,6 +102,27 @@ impl Database {
         Ok(())
     }
 
+    /// Serialises writes to `script_job_state` with the effects cache.
+    pub(crate) fn lock_script_effects_writer(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.script_runtime
+            .effects_writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Callers hold `lock_script_effects_writer` across the committed write.
+    pub(crate) fn cache_script_effects(&self, job_id: u64, effects: JobScriptEffects) {
+        if let Some(cache) = self
+            .script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+        {
+            cache.insert(job_id, effects);
+        }
+    }
+
     pub(crate) fn forget_script_effects(&self, job_id: u64) {
         let _writer = self
             .script_runtime

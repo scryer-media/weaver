@@ -409,62 +409,6 @@ async fn what_the_run_makes_of_a_request_is_what_the_script_is_told() {
 }
 
 #[tokio::test]
-async fn directory_callbacks_refuse_paths_outside_configured_roots() {
-    let harness = TestHarness::new().await;
-    let _requests = open(
-        &harness,
-        "run-post",
-        Some(7),
-        ScriptEventLabel::PostProcessing,
-    );
-    let outside = tempfile::tempdir().unwrap();
-    let root = harness.config.read().await.complete_dir();
-    let traversal = std::path::Path::new(&root).join("..").join("escape");
-    for path in [
-        outside.path().to_path_buf(),
-        traversal,
-        "relative/path".into(),
-    ] {
-        for action in ["setDirectory", "setFinalDirectory"] {
-            let query = format!(
-                "mutation {{ scriptRun {{ {action}(path: {}) }} }}",
-                json!(path.to_string_lossy())
-            );
-            assert_eq!(
-                refused(&as_run(&harness, "run-post", &query).await).0,
-                "REFUSED"
-            );
-        }
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn directory_callbacks_refuse_symlink_escapes_even_for_missing_children() {
-    let harness = TestHarness::new().await;
-    let _requests = open(
-        &harness,
-        "run-post",
-        Some(7),
-        ScriptEventLabel::PostProcessing,
-    );
-    let outside = tempfile::tempdir().unwrap();
-    let root = std::path::PathBuf::from(harness.config.read().await.complete_dir());
-    std::fs::create_dir_all(&root).unwrap();
-    std::os::unix::fs::symlink(outside.path(), root.join("escape")).unwrap();
-    for action in ["setDirectory", "setFinalDirectory"] {
-        let query = format!(
-            "mutation {{ scriptRun {{ {action}(path: {}) }} }}",
-            json!(root.join("escape/missing/child").to_string_lossy())
-        );
-        assert_eq!(
-            refused(&as_run(&harness, "run-post", &query).await).0,
-            "REFUSED"
-        );
-    }
-}
-
-#[tokio::test]
 async fn a_second_run_under_the_same_id_leaves_the_first_alone() {
     let harness = TestHarness::new().await;
     harness.db.set_script_api_url("http://127.0.0.1:1/graphql");

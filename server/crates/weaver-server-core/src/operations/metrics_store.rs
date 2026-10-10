@@ -1102,9 +1102,48 @@ pub struct MetricsHistoryCadence {
     last_prune_raw: Option<i64>,
     last_prune_5m: Option<i64>,
     last_prune_1h: Option<i64>,
+    /// The values of the last written sample, timestamp zeroed.
+    last_written: Option<RawMetricsHistoryPoint>,
 }
 
 impl MetricsHistoryCadence {
+    /// A sample's values with the timestamp zeroed, for comparing samples.
+    pub fn sample_values(
+        snapshot: &MetricsSnapshot,
+        jobs: &JobStatusCounts,
+    ) -> RawMetricsHistoryPoint {
+        RawMetricsHistoryPoint::from_snapshot(0, snapshot, jobs)
+    }
+
+    /// Whether writing `values` under `plan` would only repeat the last
+    /// written sample: the values are unchanged and no roll-up closes and no
+    /// prune falls due with it. Every roll-up bucket still gets the sample
+    /// that opens it, so an idle daemon writes once per bucket, not per tick.
+    pub fn repeats_last_write(
+        &self,
+        plan: &MetricsHistoryWritePlan,
+        values: &RawMetricsHistoryPoint,
+    ) -> bool {
+        plan.rollup_5m_bucket.is_none()
+            && plan.rollup_1h_bucket.is_none()
+            && !plan.prune_raw
+            && !plan.prune_5m
+            && !plan.prune_1h
+            && self.last_written.as_ref() == Some(values)
+    }
+
+    /// [`Self::commit`], remembering the written values for
+    /// [`Self::repeats_last_write`].
+    pub fn commit_written(
+        &mut self,
+        recorded_at_epoch_sec: i64,
+        plan: &MetricsHistoryWritePlan,
+        values: RawMetricsHistoryPoint,
+    ) {
+        self.commit(recorded_at_epoch_sec, plan);
+        self.last_written = Some(values);
+    }
+
     /// What the sample taken at `recorded_at_epoch_sec` should write.
     ///
     /// The first sample closes the buckets just before its own, so a bucket

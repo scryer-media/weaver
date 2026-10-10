@@ -127,8 +127,10 @@ impl RssService {
     }
 
     /// How long the poller sleeps before looking again: until the earliest
-    /// enabled feed falls due. Pauses and an empty feed list park the timer;
-    /// edits and resume transitions wake the loop through watch channels.
+    /// enabled feed falls due, and never longer than one tick, so a wall-clock
+    /// jump after a host suspend is noticed. Pauses and an empty feed list
+    /// park the timer; edits and resume transitions wake the loop through
+    /// watch channels.
     pub(super) fn next_due_sync_delay(&self) -> Option<std::time::Duration> {
         if self.is_scheduled_paused() {
             return None;
@@ -146,12 +148,8 @@ impl RssService {
             .map(|secs| {
                 // A feed already due is retried on the next second rather
                 // than in a tight loop, should its poll keep failing to land.
-                std::time::Duration::from_secs(secs.max(1) as u64)
+                std::time::Duration::from_secs(secs.max(1) as u64).min(tick)
             })
-    }
-
-    pub async fn reload_state(&self) {
-        self.inner.db.invalidate_rss_schedules();
     }
 
     pub async fn run_all_sync(&self) -> Result<RssSyncReport, RssServiceError> {

@@ -476,7 +476,11 @@ impl ServerTransferPolicyRegistry {
         let (usage, result) = {
             let mut policies = book.policies();
             let policy = policies.get_mut(&server_id).ok_or_else(|| {
-                StateError::Database(format!("{scope:?} {server_id} has no transfer policy"))
+                let scope = match scope {
+                    TransferScope::Server => "server",
+                    TransferScope::Egress => "egress",
+                };
+                StateError::Database(format!("{scope} {server_id} has no transfer policy"))
             })?;
             policy.generation = policy.generation.wrapping_add(1).max(1);
             policy.window = server_quota_window(now, &policy.quota);

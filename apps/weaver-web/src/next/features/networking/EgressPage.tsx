@@ -326,13 +326,20 @@ export function EgressEditor({
         extraActions={
           editing.id >= 0 ? (
             <>
-              <SecondaryButton disabled={busy} onClick={() => {
-                void action(RESET_EGRESS_USAGE, { id: editing.id }).then((failure) => {
-                  setError(failure ?? null);
-                });
-              }}>
-                {t("next.providers.resetUsage")}
-              </SecondaryButton>
+              {editing.downloadQuota?.enabled ? (
+                <SecondaryButton
+                  icon="reset"
+                  disabled={busy}
+                  onClick={() => {
+                    // `action` re-executes the networking and flow queries on success.
+                    void action(RESET_EGRESS_USAGE, { id: editing.id }).then((failure) => {
+                      setError(failure ?? null);
+                    });
+                  }}
+                >
+                  {t("next.providers.resetUsage")}
+                </SecondaryButton>
+              ) : null}
               <SecondaryButton icon="test" onClick={() => setTesting(editing)}>
                 {t("next.networking.egress.test")}
               </SecondaryButton>

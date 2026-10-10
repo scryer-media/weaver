@@ -574,7 +574,6 @@ export const nextJa: LocaleDictionary = {
   "next.settings.panel.proxies": "プロキシ",
   "next.settings.panel.proxiesNote": "プロバイダーとフィードが使えるトンネル",
   "next.settings.panel.bandwidth": "帯域幅",
-  "next.settings.panel.bandwidthNote": "上限と ISP の容量制限",
   "next.settings.panel.schedules": "スケジュール",
   "next.settings.panel.schedulesNote": "weaver が一時停止・再開するタイミング",
   "next.settings.panel.scripts": "スクリプト",

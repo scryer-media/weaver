@@ -479,8 +479,8 @@ impl Pipeline {
 
     /// Fill idle connections from the global article scheduler.
     ///
-    /// After the whole-link gates (pause, rate limiter, NNTP handover, ISP
-    /// bandwidth cap, byte pressure), each connection asks the one global
+    /// After the whole-link gates (pause, rate limiter, NNTP handover,
+    /// download quota, byte pressure), each connection asks the one global
     /// "what should this server fetch next?" in turn: articles come from the
     /// hot job, and from exactly one spill job only when the hot job has
     /// nothing that server may fetch. Completion-critical work (PAR2

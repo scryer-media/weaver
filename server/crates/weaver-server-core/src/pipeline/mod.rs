@@ -2879,7 +2879,7 @@ pub struct Pipeline {
     /// state change, so the next tick must take them again.
     pub(super) footprint_metrics_stale: bool,
     /// Whether the last dispatch pass was held back by a gate that lifts with
-    /// time alone (a schedule window, the rate limiter, the bandwidth cap,
+    /// time alone (a schedule window, the rate limiter, a download quota,
     /// byte pressure) or found eligible work it could not place, so the idle
     /// tick must try again. Without it nothing would wake dispatch when such
     /// a gate lifts.

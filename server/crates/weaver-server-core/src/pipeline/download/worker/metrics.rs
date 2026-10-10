@@ -188,7 +188,7 @@ impl Pipeline {
     /// open, which is indistinguishable from a slow server in every metric the
     /// job exposes.
     ///
-    /// Lanes sit below their cap for many ordinary reasons — a bandwidth cap,
+    /// Lanes sit below their cap for many ordinary reasons — a download quota,
     /// byte pressure, a hot job whose spillover is blocked, the tail of a job
     /// with fewer articles left than lanes — so an underfill alone says
     /// nothing. It is reported only when a lane actually failed to open inside

@@ -2,6 +2,10 @@ use std::time::Duration;
 
 use crate::servers::ServerConfig;
 
+/// How long a server connection may take to dial, for the pool's routes and
+/// for the connectivity probe alike.
+pub(crate) const SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 pub struct ServerConnectivityResult {
     pub success: bool,
@@ -47,7 +51,7 @@ pub async fn probe_server_connection_with_route(
                     std::sync::Arc::new(weaver_tunnel::pipe::Egress {
                         id: 0,
                         binding: weaver_tunnel::egress::SocketEgress::System,
-                        timeout: Duration::from_secs(30),
+                        timeout: SERVER_CONNECT_TIMEOUT,
                     }),
                 )),
                 egress_controls: std::sync::Arc::new(
@@ -67,6 +71,7 @@ pub async fn probe_server_connection_with_route(
         tls_ca_cert: config.tls_ca_cert.clone(),
         tls_name_mismatch_certificate_der: config.tls_name_mismatch_certificate_der.clone(),
         pipelining: weaver_nntp::PipeliningCapability::Probe,
+        connect_timeout: SERVER_CONNECT_TIMEOUT,
         ..Default::default()
     };
     let start = std::time::Instant::now();

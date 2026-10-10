@@ -960,8 +960,12 @@ async fn due_sync_uses_a_cached_schedule_until_the_actual_deadline() {
     let service = build_service(temp.path(), db.clone(), Arc::new(StdMutex::new(Vec::new())));
     db.insert_rss_feed(&scheduled_feed(1, Some(service.now())))
         .unwrap();
-    let delay = service.next_due_sync_delay().unwrap();
-    assert_eq!(delay, Duration::from_secs(900));
+    // The feed is 900 s away; the poller still looks again within one tick.
+    assert_eq!(
+        service.next_due_sync_delay(),
+        Some(Duration::from_secs(crate::rss::model::RSS_SYNC_TICK_SECS))
+    );
+    let delay = Duration::from_secs(900);
     let target = crate::rss::poller::RssSyncTarget::AllEnabledFeeds;
     assert!(service.load_target_feeds(target, true).unwrap().is_empty());
     assert_eq!(
@@ -990,7 +994,7 @@ async fn due_sync_uses_a_cached_schedule_until_the_actual_deadline() {
         .unwrap();
     assert_eq!(
         service.next_due_sync_delay(),
-        Some(Duration::from_secs(900))
+        Some(Duration::from_secs(crate::rss::model::RSS_SYNC_TICK_SECS))
     );
     assert_eq!(
         db.rss_schedule_cache

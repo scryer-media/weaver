@@ -172,7 +172,7 @@ async fn lanes_under_their_cap_are_reported_only_when_it_persists() {
     );
 
     // An underfill with no lane failure behind it is one of the ordinary
-    // kinds — a bandwidth cap, pressure, a job's tail — and stays quiet.
+    // kinds — a download quota, pressure, a job's tail — and stays quiet.
     pipeline.last_download_lanes_under_cap_log_at = None;
     pipeline.download_lanes_under_cap_since = None;
     pipeline.last_owned_lane_acquire_failure_at = Some(start - Duration::from_secs(60));
