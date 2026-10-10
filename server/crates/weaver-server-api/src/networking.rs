@@ -540,7 +540,20 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
             let Some(leg) = definitions.get(allocation.position) else {
                 continue;
             };
+            let rung_states: Vec<String> =
+                leg.rung_states().into_iter().map(str::to_owned).collect();
+            // A leg counts two failed dials before it cools, but its ladder
+            // cools each rung on the first. With no connection open and every
+            // rung cooling the leg has no path it may dial until one lapses,
+            // so it is down even while its own failure count reads healthy.
+            let ladder_cooling = allocation.open == 0
+                && allocation.opening == 0
+                && !rung_states.is_empty()
+                && rung_states.iter().all(|state| state == "COOLDOWN");
             let (state, reason) = match allocation.health {
+                core::LegHealthState::Up if ladder_cooling => {
+                    ("DOWN", Some("every rung is cooling down".to_owned()))
+                }
                 core::LegHealthState::Up => ("UP", None),
                 core::LegHealthState::Probing => ("PROBING", None),
                 core::LegHealthState::Down(reason) => ("DOWN", Some(reason)),
@@ -574,7 +587,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                     .path
                     .as_ref()
                     .and_then(|path| path.proxies.last().copied()),
-                rung_states: leg.rung_states().into_iter().map(str::to_owned).collect(),
+                rung_states,
                 failing_hops: leg
                     .failing_hops()
                     .into_iter()
