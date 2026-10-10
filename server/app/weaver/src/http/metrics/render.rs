@@ -1696,6 +1696,12 @@ pub(crate) fn render_script_runs(out: &mut Encoder, metrics: &ScriptRunMetricsSn
     if let Some(limit) = metrics.concurrency_limit {
         out.sample(&f::PP_CONCURRENCY_LIMIT, &[], limit);
     }
+    if let Some(running) = metrics.slots_in_use {
+        out.sample(&f::PP_SLOTS_IN_USE, &[], running);
+    }
+    if let Some(waiting) = metrics.slots_waiting {
+        out.sample(&f::PP_SLOTS_WAITING, &[], waiting);
+    }
     if let Some(backlog) = metrics.queue_event_backlog {
         out.sample(&f::PP_QUEUE_EVENT_BACKLOG, &[], backlog);
     }
@@ -1886,6 +1892,9 @@ pub(crate) fn render_schedules(out: &mut Encoder, metrics: &ScheduleMetricsSnaps
     }
 }
 
+// One per-leg gauge's value, or `None` to leave the leg's series out.
+type LegValue = fn(&LegMetrics) -> Option<f64>;
+
 pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot) {
     let legs: Vec<(String, String, &LegMetrics)> = metrics
         .legs
@@ -1906,7 +1915,7 @@ pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot
             );
         }
     }
-    let leg_families: [(&'static MetricFamily, fn(&LegMetrics) -> Option<f64>); 7] = [
+    let leg_families: [(&'static MetricFamily, LegValue); 7] = [
         (&f::NETWORK_LEG_STATE_SINCE, |l| {
             Some(l.state_since_epoch_ms as f64 / 1_000.0)
         }),

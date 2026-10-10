@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{PostProcessingSettings, PostProcessingSummary, ScriptResult};
+use super::model::{
+    PostProcessingResume, PostProcessingSettings, PostProcessingSummary, ScriptResult,
+    StartedScript,
+};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::persistence::{Database, StateError};
 
@@ -330,16 +333,120 @@ impl Database {
 
     /// Record that a job's scripts have started, so a crash is recoverable.
     pub fn mark_job_post_processing_running(&self, job_id: u64) -> Result<(), StateError> {
+        self.mark_job_post_processing_resumed(job_id, &PostProcessingResume::default())
+    }
+
+    // Record that a job's pass is under way again, carrying over the entries
+    // that had started and the results the earlier pass left. A fresh pass
+    // carries over nothing.
+    pub fn mark_job_post_processing_resumed(
+        &self,
+        job_id: u64,
+        resume: &PostProcessingResume,
+    ) -> Result<(), StateError> {
         let datastore = self.datastore();
         let job_id = job_id_i64(job_id)?;
+        let started = to_json(&resume.started)?;
+        let results = if resume.results.is_empty() {
+            None
+        } else {
+            Some(to_json(&resume.results)?)
+        };
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
                 datastore.read_exec(),
-                "UPDATE active_jobs SET post_processing_summary = 'running' WHERE job_id = {}",
-                &[SqlArg::I64(job_id)],
+                "UPDATE active_jobs SET post_processing_summary = 'running',
+                        post_processing_started = {},
+                        script_results_json = {}
+                  WHERE job_id = {}",
+                &[
+                    SqlArg::Text(started),
+                    SqlArg::OptText(results),
+                    SqlArg::I64(job_id),
+                ],
             )
             .await?;
             Ok(())
+        })
+    }
+
+    // Record the entries of a job's list that have started, written before
+    // the newest of them starts.
+    pub fn record_job_scripts_started(
+        &self,
+        job_id: u64,
+        started: &[StartedScript],
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let job_id = job_id_i64(job_id)?;
+        let started = to_json(&started)?;
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE active_jobs SET post_processing_started = {} WHERE job_id = {}",
+                &[SqlArg::Text(started), SqlArg::I64(job_id)],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    // Record the results a job's pass has so far, leaving its summary as
+    // `running`, so a restart keeps what already finished.
+    pub fn save_job_post_processing_progress(
+        &self,
+        job_id: u64,
+        results: &[ScriptResult],
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let job_id = job_id_i64(job_id)?;
+        let results = if results.is_empty() {
+            None
+        } else {
+            Some(to_json(&results)?)
+        };
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE active_jobs SET script_results_json = {} WHERE job_id = {}",
+                &[SqlArg::OptText(results), SqlArg::I64(job_id)],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    // What an interrupted pass left for a restored job, or `None` when the
+    // job has no record of which entries started, as a job whose pass began
+    // under an older weaver does not.
+    pub fn job_post_processing_resume(
+        &self,
+        job_id: u64,
+    ) -> Result<Option<PostProcessingResume>, StateError> {
+        let datastore = self.datastore();
+        let job_id = job_id_i64(job_id)?;
+        self.run_sql_blocking_read(async move {
+            let Some(row) = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT post_processing_started, script_results_json
+                   FROM active_jobs WHERE job_id = {}",
+                &[SqlArg::I64(job_id)],
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            let Some(started) = row.opt_text("post_processing_started")? else {
+                return Ok(None);
+            };
+            let results = match row.opt_text("script_results_json")? {
+                Some(json) => from_json::<Vec<ScriptResult>>(&json)?,
+                None => vec![],
+            };
+            Ok(Some(PostProcessingResume {
+                started: from_json::<Vec<StartedScript>>(&started)?,
+                results,
+            }))
         })
     }
 
@@ -434,8 +541,9 @@ mod tests {
             r#"{"eventScriptConcurrency":2,"eventScriptTimeoutSeconds":300,"fileDownloadedEventInterval":0,"scriptOutputCeilingBytes":1048576,"scriptOutputRunsPerJob":5,"scriptOutputRingBytes":67108864,"scriptOutputRunCapBytes":2097152,"executionEnabled":false,"concurrency":4,"terminationGraceSeconds":10,"pythonInterpreter":null,"powershellInterpreter":null,"batchInterpreter":null,"unacceptableExtensions":[],"globalScriptsRun":"always"}"#,
         )
         .unwrap();
+        // So is the event-script concurrency the one concurrency setting
+        // replaced.
         let settings = db.post_processing_settings().unwrap();
-        assert_eq!(settings.event_scripts.event_script_concurrency, 2);
         assert_eq!(settings.event_scripts.script_output_runs_per_job, 5);
         assert_eq!(settings.event_scripts.script_output_failed_runs_per_job, 8);
         db.save_post_processing_settings(&settings).unwrap();
@@ -443,6 +551,8 @@ mod tests {
         assert!(!stored.contains("scriptOutputCeilingBytes"));
         assert!(!stored.contains("scriptOutputRingBytes"));
         assert!(!stored.contains("scriptOutputRunCapBytes"));
+        assert!(!stored.contains("eventScriptConcurrency"));
+        assert!(stored.contains(r#""concurrency":4"#));
         assert!(stored.contains(r#""scriptOutputFailedRunsPerJob":8"#));
     }
 }

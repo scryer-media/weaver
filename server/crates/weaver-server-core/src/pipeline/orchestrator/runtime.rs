@@ -192,10 +192,6 @@ impl Pipeline {
         let (direct_rearm_done_tx, direct_rearm_done_rx) = mpsc::channel(32);
         let (repair_work_done_tx, repair_work_done_rx) = mpsc::channel(32);
         let (direct_demotion_done_tx, direct_demotion_done_rx) = mpsc::channel(32);
-        let post_processing_settings = db.post_processing_settings().unwrap_or_else(|error| {
-            warn!(error = %error, "failed to load post-processing settings; using disabled defaults");
-            crate::post_processing::model::PostProcessingSettings::default()
-        });
         let scripts_directory = db
             .initialize_post_processing_script_directory(
                 &std::path::PathBuf::from(&data_dir),
@@ -209,7 +205,6 @@ impl Pipeline {
             crate::post_processing::executor::PostProcessingExecutor::new(
                 db.clone(),
                 scripts_directory,
-                usize::from(post_processing_settings.concurrency),
             );
         if let Err(error) = terminal_post_processing_executor.recover_interrupted() {
             warn!(error = %error, "failed to mark interrupted post-processing jobs");

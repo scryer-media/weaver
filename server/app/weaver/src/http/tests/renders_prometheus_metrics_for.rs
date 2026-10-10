@@ -1406,6 +1406,8 @@ fn script_runs_render_per_script_state_sets_and_histograms() {
     ));
     assert!(rendered.contains("weaver_post_processing_concurrency_limit 32"));
     assert!(rendered.contains("weaver_post_processing_queue_event_backlog 4"));
+    assert!(rendered.contains("weaver_post_processing_slots_in_use 3"));
+    assert!(rendered.contains("weaver_post_processing_slots_waiting 5"));
     assert!(rendered.contains(
         "weaver_post_processing_script_pruned_runs_total{script=\"Notify\"} 6"
     ));

@@ -1150,6 +1150,8 @@ fn sample_script_runs() -> weaver_server_core::post_processing::run_metrics::Scr
         retained: RetentionAction::ALL.into_iter().zip(5..).collect(),
         concurrency_limit: Some(32),
         queue_event_backlog: Some(4),
+        slots_in_use: Some(3),
+        slots_waiting: Some(5),
         scripts: vec![ScriptMetrics {
             script: "Notify".into(),
             runs,

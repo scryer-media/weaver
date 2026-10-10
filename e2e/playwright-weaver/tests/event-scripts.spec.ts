@@ -379,35 +379,39 @@ test("Q08 nothing is admitted without an enabled subscriber or with execution of
   }
 });
 
-test("Q09 queue events run one at a time; scan scripts honour eventScriptConcurrency", async ({ request }) => {
-  note("discrepancy", "eventScriptConcurrency applies to scan, feed and scheduler runs; queue events always drain one at a time. The queue half asserts serial order, the scan half asserts the concurrency of 2.");
+test("Q09 queue events of different downloads and scan scripts share the one concurrency setting", async ({ request }) => {
+  note("discrepancy", "One concurrency setting bounds every script weaver runs. Queue events of different downloads run side by side up to it; a download's own events still run one at a time. Both halves assert the concurrency of 2.");
   const tag = `q09-${token()}`;
   const queueScript = writeFixtureScript(`${tag}-queue`, { kinds: ["QUEUE"], queueEvents: ["NZB_ADDED"], gate: true });
   const scanScript = writeFixtureScript(`${tag}-scan`, { kinds: ["SCAN"], gate: true });
-  const restore = await useScripts(request, { global: [{ script: queueScript }] }, { eventScriptConcurrency: 2 });
+  const restore = await useScripts(request, { global: [{ script: queueScript }] }, { concurrency: 2 });
   const jobs: number[] = [];
   await pauseAll(request);
   try {
     for (let index = 0; index < 5; index += 1) jobs.push(await job(request, `${tag}-${index}`));
     const rowsSql = `SELECT job_id, state, seq FROM script_event_queue WHERE event = 'NZB_ADDED' AND job_id IN (${jobs.map(literal).join(", ")}) ORDER BY seq`;
-    const released: number[] = [];
     let violation = "";
     await expect.poll(async () => {
       const started = (await query(rowsSql)).filter(row => row.state === "started");
       const waiting = gateKeys(queueScript);
-      if (started.length > 1 || waiting.length > 1) {
-        violation = `started ${JSON.stringify(started)}, waiting ${JSON.stringify(waiting)}`;
-        return true;
-      }
+      if (started.length > 2 || waiting.length > 2) violation = `started ${JSON.stringify(started)}, waiting ${JSON.stringify(waiting)}`;
+      return waiting.length >= 2;
+    }, { message: "two NZB_ADDED runs of different downloads at their gates", timeout: 0 }).toBe(true);
+    expect(violation).toBe("");
+    const released = new Set<string>();
+    await expect.poll(async () => {
+      const started = (await query(rowsSql)).filter(row => row.state === "started");
+      const waiting = gateKeys(queueScript);
+      if (started.length > 2 || waiting.length > 2) violation = `started ${JSON.stringify(started)}, waiting ${JSON.stringify(waiting)}`;
       for (const key of waiting) {
         await openGate(queueScript, key);
-        released.push(Number(key));
+        released.add(key);
       }
-      return released.length === jobs.length;
-    }, { message: "five NZB_ADDED runs released one at a time", timeout: 0 }).toBe(true);
+      return released.size === jobs.length;
+    }, { message: "five NZB_ADDED runs released, at most two at a time", timeout: 0 }).toBe(true);
     expect(violation).toBe("");
-    const rows = await waitRows(rowsSql, all => all.length === jobs.length && all.every(row => row.state === "done"), "every NZB_ADDED run done");
-    expect(released).toEqual(rows.map(row => Number(row.job_id)));
+    await waitRows(rowsSql, all => all.length === jobs.length && all.every(row => row.state === "done"), "every NZB_ADDED run done");
+    expect([...released].map(Number).sort((a, b) => a - b)).toEqual([...jobs].sort((a, b) => a - b));
 
     await setScriptLists(request, { global: [{ script: scanScript }] });
     const submissions = [0, 1, 2].map(index => {

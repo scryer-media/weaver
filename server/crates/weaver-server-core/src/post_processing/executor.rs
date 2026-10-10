@@ -1,10 +1,9 @@
-//! Bounded, sequential execution of a job's post-processing instances.
-//!
-//! This is the whole scheduler: a job runs its scripts one after another, and
-//! each script it waits for takes a turn from a semaphore sized by the
-//! concurrency setting. The semaphore's FIFO is the queue, so the setting is
-//! how many such scripts run at once across every job, and a job between two
-//! of its scripts holds no turn another job could use.
+// Bounded, sequential execution of a job's post-processing instances.
+//
+// A job runs its scripts one after another, and each script takes a slot
+// from the one pool every script weaver runs shares. The pool's queue is
+// first come, first served, and a job between two of its scripts holds no
+// slot another run could use.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,13 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio::sync::{oneshot, watch};
 
 use super::instances::ScriptInstance;
 use super::listing::{self, ListingError};
 use super::model::{
-    PostProcessingSummary, ScriptAdapter, ScriptEventLabel, ScriptResult, ScriptStatus,
-    merge_post_processing_summary,
+    PostProcessingResume, PostProcessingSummary, ScriptAdapter, ScriptEventLabel, ScriptResult,
+    ScriptStatus, StartedScript, merge_post_processing_summary,
 };
 use super::run_metrics::{self, RunKind};
 use super::runner::{
@@ -27,7 +26,6 @@ use super::runner::{
 };
 use crate::persistence::{Database, StateError};
 
-const MAX_CONCURRENCY: usize = 8;
 pub const SCRIPT_EVENT_KIND: &str = "PostProcessingScript";
 pub const SCRIPT_OUTPUT_EVENT_KIND: &str = "PostProcessingScriptOutput";
 
@@ -148,7 +146,6 @@ impl PostProcessingJobAdmission {
 pub struct PostProcessingExecutor {
     db: Database,
     scripts_directory: Arc<RwLock<PathBuf>>,
-    concurrency: Arc<Semaphore>,
     /// Admission gate for the NZBGet facade's `pausepost`/`resumepost`, which is
     /// the only reason a pause survives: it gates admission, never a running
     /// script, exactly as the RPC has always behaved.
@@ -189,15 +186,13 @@ impl Drop for CancellationRegistration {
 }
 
 impl PostProcessingExecutor {
-    /// `concurrency` is how many scripts that a job waits for may run at once.
-    /// It sizes the semaphore for the process lifetime; a changed setting takes
-    /// effect on the next restart, as it did before.
-    pub fn new(db: Database, scripts_directory: PathBuf, concurrency: usize) -> Self {
+    // How many scripts run at once is the concurrency setting, read each
+    // time a script waits for its slot, so a change applies to the next run.
+    pub fn new(db: Database, scripts_directory: PathBuf) -> Self {
         let (paused, _) = watch::channel(false);
         Self {
             db,
             scripts_directory: Arc::new(RwLock::new(scripts_directory)),
-            concurrency: Arc::new(Semaphore::new(concurrency.clamp(1, MAX_CONCURRENCY))),
             paused,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             supervisor_executable: None,
@@ -295,8 +290,8 @@ impl PostProcessingExecutor {
         Ok(self.db.post_processing_settings()?.execution_enabled)
     }
 
-    /// Run `scripts` for one job, sequentially, each on its own turn from the
-    /// concurrency semaphore.
+    // Run `scripts` for one job, sequentially, each on its own slot from the
+    // shared script pool.
     pub async fn execute_job(
         &self,
         job_id: u64,
@@ -348,9 +343,35 @@ impl PostProcessingExecutor {
         cancellation: Option<watch::Receiver<bool>>,
         started: Option<oneshot::Sender<()>>,
     ) -> Result<JobPostProcessingReport, PostProcessingExecutorError> {
-        self.run_job(job_id, admission, context, cancellation, started)
+        self.run_job(job_id, admission, context, cancellation, started, None)
             .await
             .inspect(|report| run_metrics::record_job_summary(report.summary))
+    }
+
+    // Finish a pass weaver stopped in the middle of. The entries that had
+    // started never run again: one that finished keeps its result, and a
+    // waited one that had not is reported as interrupted, because what it
+    // did before it was cut off is unknown. The rest of the list runs in its
+    // usual order, and the job ends with every result together.
+    pub async fn resume_admitted_job(
+        &self,
+        job_id: u64,
+        admission: PostProcessingJobAdmission,
+        context: JobExecutionContext,
+        cancellation: Option<watch::Receiver<bool>>,
+        started: Option<oneshot::Sender<()>>,
+        resume: PostProcessingResume,
+    ) -> Result<JobPostProcessingReport, PostProcessingExecutorError> {
+        self.run_job(
+            job_id,
+            admission,
+            context,
+            cancellation,
+            started,
+            Some(resume),
+        )
+        .await
+        .inspect(|report| run_metrics::record_job_summary(report.summary))
     }
 
     async fn run_job(
@@ -360,28 +381,68 @@ impl PostProcessingExecutor {
         mut context: JobExecutionContext,
         cancellation: Option<watch::Receiver<bool>>,
         started: Option<oneshot::Sender<()>>,
+        resume: Option<PostProcessingResume>,
     ) -> Result<JobPostProcessingReport, PostProcessingExecutorError> {
+        let resumed = resume.is_some();
+        let resume = resume.unwrap_or_default();
+        let (carried, cut_off) = resume.carried_results();
+        if resumed {
+            run_metrics::record_interrupted_recovered();
+            // Only the rows this restart made: a cut-off row carried over
+            // from an earlier restart was counted when it was made.
+            for result in carried.iter().filter(|result| {
+                result.error_message.as_deref() == Some(super::model::INTERRUPTED_SCRIPT_MESSAGE)
+                    && !resume
+                        .results
+                        .iter()
+                        .any(|kept| kept.instance_id == result.instance_id)
+            }) {
+                run_metrics::record_interrupted(result);
+            }
+        }
+        let mut carried_summary = carried
+            .iter()
+            .fold(PostProcessingSummary::NotRun, |summary, result| {
+                merge_post_processing_summary(summary, result.status.summary())
+            });
+        if cut_off {
+            carried_summary =
+                merge_post_processing_summary(carried_summary, PostProcessingSummary::Interrupted);
+        }
+        // How a resumed pass ends when nothing more runs: with what it carried
+        // over, recorded on the job as a finished pass is.
+        let ended_early = |summary: PostProcessingSummary| -> Result<JobPostProcessingReport, PostProcessingExecutorError> {
+            if carried.is_empty() {
+                return Ok(JobPostProcessingReport {
+                    summary,
+                    results: vec![],
+                });
+            }
+            let summary = merge_post_processing_summary(carried_summary, summary);
+            self.db
+                .save_job_post_processing_results(job_id, summary, &carried)?;
+            Ok(JobPostProcessingReport {
+                summary,
+                results: carried.clone(),
+            })
+        };
+
         let settings = self.db.post_processing_settings()?;
         if let Some(reason) = execution_refusal(&settings, strict_security_enabled()) {
             tracing::info!(job_id, reason, "post-processing did not run");
             run_metrics::record_refusal(RunKind::PostProcessing);
             self.record_job_event(job_id, SCRIPT_EVENT_KIND, reason);
-            return Ok(JobPostProcessingReport {
-                summary: PostProcessingSummary::NotRun,
-                results: vec![],
-            });
+            return ended_early(PostProcessingSummary::NotRun);
         }
         let entries = admission
             .scripts
             .iter()
             .filter(|instance| instance.enabled)
+            .filter(|instance| !resume.started.iter().any(|entry| entry.id == instance.id))
             .cloned()
             .collect::<Vec<_>>();
         if entries.is_empty() {
-            return Ok(JobPostProcessingReport {
-                summary: PostProcessingSummary::NotRun,
-                results: vec![],
-            });
+            return ended_early(PostProcessingSummary::NotRun);
         }
 
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
@@ -417,10 +478,7 @@ impl PostProcessingExecutor {
                         changed.map_err(|_| PostProcessingExecutorError::Shutdown)?;
                     }
                     _ = cancel_rx.changed() => {
-                        return Ok(JobPostProcessingReport {
-                            summary: PostProcessingSummary::Cancelled,
-                            results: vec![],
-                        });
+                        return ended_early(PostProcessingSummary::Cancelled);
                     }
                 }
             }
@@ -430,24 +488,24 @@ impl PostProcessingExecutor {
         // starts its scripts and moves on.
         let mut first_turn = if entries.iter().any(|entry| entry.blocking) {
             let Some(turn) = self.script_turn(&mut cancel_rx).await? else {
-                return Ok(JobPostProcessingReport {
-                    summary: PostProcessingSummary::Cancelled,
-                    results: vec![],
-                });
+                return ended_early(PostProcessingSummary::Cancelled);
             };
             Some(turn)
         } else {
             None
         };
         if *cancel_rx.borrow() {
-            return Ok(JobPostProcessingReport {
-                summary: PostProcessingSummary::Cancelled,
-                results: vec![],
-            });
+            return ended_early(PostProcessingSummary::Cancelled);
         }
         // Durable marker before the first script: if weaver dies now, the
-        // startup scan finds the job and reports it as interrupted.
-        self.db.mark_job_post_processing_running(job_id)?;
+        // startup scan finds the job, and the restart runs what had not
+        // started.
+        let resume = PostProcessingResume {
+            started: resume.started,
+            results: carried.clone(),
+        };
+        self.db.mark_job_post_processing_resumed(job_id, &resume)?;
+        let started_log = StartedLog::new(job_id, resume.started);
         if let Some(started) = started {
             let _ = started.send(());
         }
@@ -467,8 +525,14 @@ impl PostProcessingExecutor {
             "starting post-processing for job"
         );
 
-        let mut summary = PostProcessingSummary::Succeeded;
-        let mut results = Vec::with_capacity(entries.len());
+        let mut summary =
+            merge_post_processing_summary(PostProcessingSummary::Succeeded, carried_summary);
+        let mut results = Vec::with_capacity(carried.len() + entries.len());
+        for result in &carried {
+            context.compatibility.previous_script_status =
+                previous_script_status(context.compatibility.previous_script_status, result);
+        }
+        results.extend(carried);
         for entry in &entries {
             if *cancel_rx.borrow() {
                 summary = merge_post_processing_summary(summary, PostProcessingSummary::Cancelled);
@@ -481,6 +545,7 @@ impl PostProcessingExecutor {
                     &context,
                     &interpreters,
                     termination_grace,
+                    started_log.clone(),
                 );
                 continue;
             }
@@ -499,44 +564,42 @@ impl PostProcessingExecutor {
                     }
                 },
             };
-            let (result, started) = {
+            // Written before the script starts, so a restart never runs it
+            // a second time.
+            started_log.record(&self.db, entry, true)?;
+            let attempt = {
                 let _turn = turn;
                 let _active = GaugeGuard::enter(&counters::ACTIVE);
                 let _running = run_metrics::RunningGuard::enter(RunKind::PostProcessing);
-                match self
-                    .attempt(
-                        &admission,
-                        entry,
-                        &mut context,
-                        &interpreters,
-                        termination_grace,
-                        Some(cancel_rx.clone()),
-                        false,
-                    )
-                    .await
-                {
-                    Attempt::Ran(result) => (result, true),
-                    Attempt::NotStarted(result) => (result, false),
-                }
+                self.attempt(
+                    &admission,
+                    entry,
+                    &mut context,
+                    &interpreters,
+                    termination_grace,
+                    Some(cancel_rx.clone()),
+                    false,
+                )
+                .await
+            };
+            let (result, started) = match attempt {
+                Attempt::Ran(result) => (result, true),
+                // Kept in the list of the job's runs beside the ones that
+                // ran, under the same limits.
+                Attempt::NotStarted(result) => (self.keep_unstarted(job_id, result).await, false),
             };
             record_script_metrics(&result, started);
-            context.compatibility.previous_script_status = match result.status {
-                ScriptStatus::Skipped if result.exit_code.is_none() => {
-                    context.compatibility.previous_script_status
-                }
-                ScriptStatus::Succeeded | ScriptStatus::Skipped => {
-                    if context.compatibility.previous_script_status == NzbgetScriptStatus::Failure {
-                        NzbgetScriptStatus::Failure
-                    } else {
-                        NzbgetScriptStatus::Success
-                    }
-                }
-                _ => NzbgetScriptStatus::Failure,
-            };
+            context.compatibility.previous_script_status =
+                previous_script_status(context.compatibility.previous_script_status, &result);
             self.publish_script_events(job_id, &result);
             summary = merge_post_processing_summary(summary, result.status.summary());
             let cancelled = result.status == ScriptStatus::Cancelled;
             results.push(result);
+            // A result written now survives a restart; one lost here only
+            // leaves the script reported as interrupted, never run again.
+            if let Err(error) = self.db.save_job_post_processing_progress(job_id, &results) {
+                tracing::warn!(job_id, %error, "could not record a finished script before the pass ended");
+            }
             if cancelled {
                 break;
             }
@@ -547,6 +610,12 @@ impl PostProcessingExecutor {
         }
         self.db
             .save_job_post_processing_results(job_id, summary, &results)?;
+        if resumed {
+            tracing::info!(
+                job_id,
+                "resumed post-processing ran the scripts that had not started"
+            );
+        }
         tracing::info!(
             job_id,
             summary = summary.as_str(),
@@ -556,21 +625,15 @@ impl PostProcessingExecutor {
         Ok(JobPostProcessingReport { summary, results })
     }
 
-    /// A turn among the scripts jobs wait for, or `None` when the job was
-    /// cancelled while it waited for one.
+    // A slot in the shared script pool, or `None` when the job was
+    // cancelled while it waited for one.
     async fn script_turn(
         &self,
         cancel_rx: &mut watch::Receiver<bool>,
-    ) -> Result<Option<OwnedSemaphorePermit>, PostProcessingExecutorError> {
+    ) -> Result<Option<super::events::ScriptSlot>, PostProcessingExecutorError> {
         let _queued = GaugeGuard::enter(&counters::QUEUE_DEPTH);
         let _waiting = run_metrics::WaitingGuard::enter(RunKind::PostProcessing);
-        tokio::select! {
-            biased;
-            permit = self.concurrency.clone().acquire_owned() => {
-                Ok(Some(permit.map_err(|_| PostProcessingExecutorError::Shutdown)?))
-            }
-            _ = cancel_rx.changed() => Ok(None),
-        }
+        Ok(super::events::script_slot(&self.db, cancel_rx).await?)
     }
 
     /// Start an entry nothing waits for. It runs against the job as it stands
@@ -583,6 +646,7 @@ impl PostProcessingExecutor {
         context: &JobExecutionContext,
         interpreters: &InterpreterConfig,
         termination_grace: Duration,
+        started_log: StartedLog,
     ) {
         let registration = super::events::BackgroundRun::register(&self.db, Some(context.job_id));
         let executor = self.clone();
@@ -597,6 +661,9 @@ impl PostProcessingExecutor {
                 return;
             };
             let job_id = context.job_id;
+            if let Err(error) = started_log.record(&executor.db, &entry, false) {
+                tracing::warn!(job_id, %error, "could not record that a background script started");
+            }
             let attempt = {
                 let _active = GaugeGuard::enter(&counters::ACTIVE);
                 let _running = run_metrics::RunningGuard::enter(RunKind::Background);
@@ -884,6 +951,62 @@ impl PostProcessingExecutor {
 }
 
 /// Why execution is refused, or `None` when it may proceed.
+// How the next script sees the ones before it, in NZBGet's terms: a failure
+// anywhere stays a failure, and a script that never ran changes nothing.
+fn previous_script_status(
+    previous: NzbgetScriptStatus,
+    result: &ScriptResult,
+) -> NzbgetScriptStatus {
+    match result.status {
+        ScriptStatus::Skipped if result.exit_code.is_none() => previous,
+        ScriptStatus::Succeeded | ScriptStatus::Skipped => {
+            if previous == NzbgetScriptStatus::Failure {
+                NzbgetScriptStatus::Failure
+            } else {
+                NzbgetScriptStatus::Success
+            }
+        }
+        _ => NzbgetScriptStatus::Failure,
+    }
+}
+
+// The entries of one job's pass that have started, kept on the job row.
+// Waited and background entries add to it from different tasks, so each
+// write holds the lock and stores the whole list.
+#[derive(Clone)]
+struct StartedLog {
+    job_id: u64,
+    started: Arc<Mutex<Vec<StartedScript>>>,
+}
+
+impl StartedLog {
+    fn new(job_id: u64, started: Vec<StartedScript>) -> Self {
+        Self {
+            job_id,
+            started: Arc::new(Mutex::new(started)),
+        }
+    }
+
+    fn record(
+        &self,
+        db: &Database,
+        entry: &ScriptInstance,
+        waited: bool,
+    ) -> Result<(), StateError> {
+        let mut started = self
+            .started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        started.push(StartedScript {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            script: entry.script.clone(),
+            waited,
+        });
+        db.record_job_scripts_started(self.job_id, &started)
+    }
+}
+
 pub(crate) fn execution_refusal(
     settings: &super::model::PostProcessingSettings,
     strict_security: bool,

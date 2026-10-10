@@ -377,6 +377,10 @@ metric_families! {
         "Script runs that entered a slot wait, by run kind.");
     PP_CONCURRENCY_LIMIT = ("weaver_post_processing_concurrency_limit", Gauge, [],
         "Configured number of script runs that may hold a slot at once.");
+    PP_SLOTS_IN_USE = ("weaver_post_processing_slots_in_use", Gauge, [],
+        "Script runs holding a slot in the shared pool, as the pool counts them.");
+    PP_SLOTS_WAITING = ("weaver_post_processing_slots_waiting", Gauge, [],
+        "Script runs queued for a slot in the shared pool, as the pool counts them.");
     PP_QUEUE_EVENT_BACKLOG = ("weaver_post_processing_queue_event_backlog", Gauge, [],
         "Queue events recorded for scripts and not yet started.");
     PP_REFUSALS = ("weaver_post_processing_refusals_total", Counter, ["kind"],
