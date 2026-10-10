@@ -1424,13 +1424,43 @@ pub(super) mod sets {
             None
         }
 
+        fn failed_finalization_limit(self) -> usize {
+            self.set_count()
+        }
+
         fn par2(self) -> bool {
             matches!(self.recovery, Recovery::Par2(_))
         }
     }
 
+    impl SetsCell {
+        fn set_count(self) -> usize {
+            match self.layout {
+                Layout::TwoSets | Layout::TwoSetsFurniture | Layout::Sample => 2,
+                _ => 1,
+            }
+        }
+    }
+
     mod sets_smoke {
         use super::*;
+
+        #[tokio::test]
+        async fn failed_job_keeps_healthy_set_in_staging() {
+            let cell = SetsCell {
+                layout: Layout::TwoSets,
+                container: Container::Rar5,
+                recovery: Recovery::None,
+                stale_sfv: false,
+                volumes: 2,
+            };
+            for profile in PROFILES {
+                run_cell(cell, profile, vec![(0, (slot_arrivals(4), Interruption::Loss {
+                    mask: 8,
+                    index_first: true,
+                }))]).await;
+            }
+        }
 
         #[tokio::test]
         async fn furniture_par2() {

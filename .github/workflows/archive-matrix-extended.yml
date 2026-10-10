@@ -67,7 +67,7 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Archive compiled extended archive campaign tests
-        run: cargo nextest archive --locked -p weaver-server-core --lib --archive-file target/archive-matrix-extended.tar.zst
+        run: cargo nextest archive --locked --cargo-profile matrix -p weaver-server-core --lib --archive-file target/archive-matrix-extended.tar.zst
       - name: Upload compiled extended archive campaign tests
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

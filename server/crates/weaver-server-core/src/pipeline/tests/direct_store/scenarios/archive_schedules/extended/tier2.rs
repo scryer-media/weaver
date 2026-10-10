@@ -104,6 +104,11 @@ pub(super) trait Cell: Copy + std::fmt::Debug {
     /// Whether the cell's recovery set is PAR2: a defect there blocks a
     /// release.
     fn par2(self) -> bool;
+
+    // Independent healthy sets may finish in staging while the job fails.
+    fn failed_finalization_limit(self) -> usize {
+        0
+    }
 }
 
 /// A post and the recovery geometry its oracle counts in.
@@ -144,7 +149,7 @@ pub(super) async fn run_cell<C: Cell>(cell: C, profile: ExtractionProfile, cases
         );
         eprintln!("{context}");
         let ran = run::run(&fixture.post, profile, &order, interruption).await;
-        let check = || ran.assert(&fixture.post, profile, verdict, &context);
+        let check = || ran.assert(&fixture.post, profile, verdict, cell.failed_finalization_limit(), &context);
         match defect {
             Some(Defect::Diverges(why)) => {
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).is_err() {
