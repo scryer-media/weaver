@@ -104,6 +104,15 @@ fn script_status_maps_onto_the_job_summary() {
         ScriptStatus::Cancelled.summary(),
         PostProcessingSummary::Cancelled
     );
+    assert_eq!(
+        ScriptStatus::Interrupted.summary(),
+        PostProcessingSummary::Interrupted
+    );
+    assert_eq!(ScriptStatus::Interrupted.as_str(), "interrupted");
+    assert_eq!(
+        ScriptStatus::from_persisted("interrupted"),
+        Some(ScriptStatus::Interrupted)
+    );
 }
 
 #[test]

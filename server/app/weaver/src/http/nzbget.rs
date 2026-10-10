@@ -3311,7 +3311,8 @@ fn nzbget_script_status(
         ScriptStatus::Warning
         | ScriptStatus::Failed
         | ScriptStatus::TimedOut
-        | ScriptStatus::Cancelled => "FAILURE",
+        | ScriptStatus::Cancelled
+        | ScriptStatus::Interrupted => "FAILURE",
     }
 }
 

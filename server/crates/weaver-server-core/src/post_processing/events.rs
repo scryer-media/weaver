@@ -767,7 +767,10 @@ async fn run_entry(
     .await?;
     if matches!(
         result.status,
-        ScriptStatus::Failed | ScriptStatus::TimedOut | ScriptStatus::Cancelled
+        ScriptStatus::Failed
+            | ScriptStatus::TimedOut
+            | ScriptStatus::Cancelled
+            | ScriptStatus::Interrupted
     ) && let Some(job_id) = context.job_id
         && let Err(error) = db.insert_job_event(
             job_id,

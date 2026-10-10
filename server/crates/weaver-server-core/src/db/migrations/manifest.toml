@@ -610,3 +610,25 @@ kind = "sql"
 file = "migrations/0057_post_processing_started/schema.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 58
+description = "post-processing outcome kept for a resumed pass, and a saved script concurrency below 32 raised to 32"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0058_post_processing_outcome/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0058_post_processing_outcome/schema.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "raise_script_concurrency_v58"
+scope = "upgrade_only"

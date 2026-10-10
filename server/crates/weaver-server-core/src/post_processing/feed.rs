@@ -89,7 +89,10 @@ pub async fn transform_feed(
     if let Some(result) = results.iter().find(|result| {
         matches!(
             result.status,
-            ScriptStatus::Failed | ScriptStatus::TimedOut | ScriptStatus::Cancelled
+            ScriptStatus::Failed
+                | ScriptStatus::TimedOut
+                | ScriptStatus::Cancelled
+                | ScriptStatus::Interrupted
         )
     }) {
         return Err(format!(

@@ -1156,6 +1156,7 @@ export const nextIt: LocaleDictionary = {
   "next.scriptRuns.status.warning": "Con avviso",
   "next.scriptRuns.status.failed": "Fallite",
   "next.scriptRuns.status.timedOut": "Tempo scaduto",
+  "next.scriptRuns.status.interrupted": "Interrotte",
   "next.scriptRuns.status.skipped": "Saltate",
   "next.scriptRuns.status.cancelled": "Annullate",
   "next.scriptRuns.noneMatch": "Nessuna esecuzione corrisponde a questi filtri.",

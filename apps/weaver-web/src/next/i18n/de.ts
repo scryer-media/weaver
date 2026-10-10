@@ -1156,6 +1156,7 @@ export const nextDe: LocaleDictionary = {
   "next.scriptRuns.status.warning": "Warnung",
   "next.scriptRuns.status.failed": "Fehlgeschlagen",
   "next.scriptRuns.status.timedOut": "Zeitüberschreitung",
+  "next.scriptRuns.status.interrupted": "Unterbrochen",
   "next.scriptRuns.status.skipped": "Übersprungen",
   "next.scriptRuns.status.cancelled": "Abgebrochen",
   "next.scriptRuns.noneMatch": "Keine Läufe entsprechen diesen Filtern.",

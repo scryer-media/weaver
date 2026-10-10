@@ -200,7 +200,8 @@ mod tests {
     async fn a_list_cleared_after_the_upgrade_stays_cleared() {
         let pool = at_schema_56().await;
         upgrade_to_57(&pool).await;
-        let cleared = r#"{"executionEnabled":false,"concurrency":4,"terminationGraceSeconds":10,"pythonInterpreter":null,"powershellInterpreter":null,"batchInterpreter":null,"unacceptableExtensions":[]}"#;
+        // At the raised concurrency, so a later step leaves the document as it is.
+        let cleared = r#"{"executionEnabled":false,"concurrency":32,"terminationGraceSeconds":10,"pythonInterpreter":null,"powershellInterpreter":null,"batchInterpreter":null,"unacceptableExtensions":[]}"#;
         save(&pool, cleared).await;
 
         // Every later version replays over the cleared list without the step.

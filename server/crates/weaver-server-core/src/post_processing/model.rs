@@ -1105,6 +1105,9 @@ pub enum ScriptStatus {
     Failed,
     TimedOut,
     Cancelled,
+    // Weaver stopped while the script was running, so how it ended is
+    // unknown. It is never run again.
+    Interrupted,
 }
 
 impl ScriptStatus {
@@ -1116,6 +1119,7 @@ impl ScriptStatus {
             Self::Failed => "failed",
             Self::TimedOut => "timed_out",
             Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
         }
     }
 
@@ -1127,6 +1131,7 @@ impl ScriptStatus {
             "failed" => Some(Self::Failed),
             "timed_out" => Some(Self::TimedOut),
             "cancelled" => Some(Self::Cancelled),
+            "interrupted" => Some(Self::Interrupted),
             _ => None,
         }
     }
@@ -1137,6 +1142,7 @@ impl ScriptStatus {
             Self::Warning => PostProcessingSummary::Warning,
             Self::Failed | Self::TimedOut => PostProcessingSummary::Failed,
             Self::Cancelled => PostProcessingSummary::Cancelled,
+            Self::Interrupted => PostProcessingSummary::Interrupted,
         }
     }
 }
@@ -1193,6 +1199,28 @@ pub struct StartedScript {
     pub waited: bool,
 }
 
+// What a job's post-processing scripts are told about how its download
+// ended, kept on the job when the pass begins so a resumed pass tells the
+// rest of its scripts the same.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostProcessingFacts {
+    pub outcome: PipelineOutcome,
+    pub par_status: i32,
+    pub unpack_status: i32,
+}
+
+impl PostProcessingFacts {
+    // The failure the job is finished with after its scripts, when its
+    // download failed.
+    pub fn primary_failure(&self) -> Option<String> {
+        match &self.outcome {
+            PipelineOutcome::Failed { message, .. } => Some(message.clone()),
+            PipelineOutcome::Succeeded => None,
+        }
+    }
+}
+
 // What a job's interrupted pass left behind: the entries that had started,
 // in the order they started, and the results of the ones that finished.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -1207,26 +1235,19 @@ pub const INTERRUPTED_SCRIPT_MESSAGE: &str = "weaver stopped while the script wa
 
 impl PostProcessingResume {
     // The results the resumed pass starts from, in the order their entries
-    // started, and whether any of them stands for a script that was cut off.
-    // A finished entry keeps its result; a waited entry with none becomes an
-    // interrupted row; a background entry was never part of the results.
-    pub fn carried_results(&self) -> (Vec<ScriptResult>, bool) {
+    // started. A finished entry keeps its result; a waited entry with none
+    // becomes an interrupted row; a background entry was never part of the
+    // results.
+    pub fn carried_results(&self) -> Vec<ScriptResult> {
         let mut results = Vec::with_capacity(self.started.len());
-        let mut interrupted = false;
         for entry in &self.started {
             let kept = self
                 .results
                 .iter()
                 .find(|result| result.instance_id.as_deref() == Some(entry.id.as_str()));
             match kept {
-                Some(result) => {
-                    interrupted |= result.status == ScriptStatus::Failed
-                        && result.exit_code.is_none()
-                        && result.error_message.as_deref() == Some(INTERRUPTED_SCRIPT_MESSAGE);
-                    results.push(result.clone());
-                }
+                Some(result) => results.push(result.clone()),
                 None if entry.waited => {
-                    interrupted = true;
                     results.push(ScriptResult {
                         script: entry.script.clone(),
                         instance_id: Some(entry.id.clone()),
@@ -1235,7 +1256,7 @@ impl PostProcessingResume {
                         output_id: None,
                         background: false,
                         adapter: ScriptAdapter::Sabnzbd,
-                        status: ScriptStatus::Failed,
+                        status: ScriptStatus::Interrupted,
                         exit_code: None,
                         duration_ms: 0,
                         output_tail: String::new(),
@@ -1247,6 +1268,6 @@ impl PostProcessingResume {
                 None => {}
             }
         }
-        (results, interrupted)
+        results
     }
 }

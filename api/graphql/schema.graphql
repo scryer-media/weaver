@@ -3467,6 +3467,7 @@ enum ScriptStatusGql {
 	FAILED
 	TIMED_OUT
 	CANCELLED
+	INTERRUPTED
 }
 
 """

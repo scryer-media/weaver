@@ -298,7 +298,7 @@ fn scan_run_incomplete(result: &super::model::ScriptResult) -> bool {
     use super::model::ScriptStatus;
     matches!(
         result.status,
-        ScriptStatus::Cancelled | ScriptStatus::TimedOut
+        ScriptStatus::Cancelled | ScriptStatus::TimedOut | ScriptStatus::Interrupted
     ) || (result.status == ScriptStatus::Failed && result.exit_code.is_none())
 }
 

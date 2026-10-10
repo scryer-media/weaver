@@ -93,7 +93,10 @@ pub async fn retain_output(
 fn retained_as_failure(status: ScriptStatus) -> bool {
     matches!(
         status,
-        ScriptStatus::Failed | ScriptStatus::TimedOut | ScriptStatus::Cancelled
+        ScriptStatus::Failed
+            | ScriptStatus::TimedOut
+            | ScriptStatus::Cancelled
+            | ScriptStatus::Interrupted
     )
 }
 
@@ -160,13 +163,13 @@ async fn trim_all_tx(tx: &mut SqlTx<'_>, limits: &EventScriptSettings) -> Result
             FROM script_outputs
         ), overflow AS (
             SELECT id, status,
-                SUM(CASE WHEN status IN ('failed', 'timed_out', 'cancelled') THEN 1 ELSE 0 END)
+                SUM(CASE WHEN status IN ('failed', 'timed_out', 'cancelled', 'interrupted') THEN 1 ELSE 0 END)
                     OVER (PARTITION BY job_id, event_group ORDER BY seq DESC) AS failed_position
             FROM ranked WHERE position > {}
         )
         DELETE FROM script_outputs WHERE id IN (
             SELECT id FROM overflow
-            WHERE status NOT IN ('failed', 'timed_out', 'cancelled') OR failed_position > {}
+            WHERE status NOT IN ('failed', 'timed_out', 'cancelled', 'interrupted') OR failed_position > {}
         )",
             &[
                 SqlArg::I64(i64::from(limits.script_output_runs_per_job)),

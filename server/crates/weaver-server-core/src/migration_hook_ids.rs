@@ -9,6 +9,7 @@ pub(crate) fn is_known_migration_hook_id(hook_id: &str) -> bool {
             | "move_isp_cap_to_system_egress_v53"
             | "move_script_wiring_to_instances_v55"
             | "default_unwanted_extensions_v56"
+            | "raise_script_concurrency_v58"
     )
 }
 
