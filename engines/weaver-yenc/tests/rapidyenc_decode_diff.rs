@@ -713,6 +713,22 @@ fn fixed_cases() -> Vec<Vec<u8>> {
         b"AB\r\n.\rEF",
         b"AB\r\n.=nCD",
         b"AB\r\n..=nCD",
+        // The whole-buffer `=yend` divergence table, rows A to L: an escape
+        // before the trailer, escape runs, `=y` inside an escape, LF-only
+        // breaks, and inputs that end inside an escape.
+        b"kl=\r\n=yend size=2 part=1\r\n.\r\n",
+        b"kl=\r\n.=yend size=2 part=1\r\n.\r\n",
+        b"k===\r\n=yend size=2 part=1\r\n.\r\n",
+        b"k=\r\nl\r\n=yend size=2 part=1\r\n.\r\n",
+        b"k==\r\n=yend size=2 part=1\r\n.\r\n",
+        b"k==yl\r\n=yend size=2 part=1\r\n.\r\n",
+        b"kl\r\n==yl\r\n=yend size=2 part=1\r\n.\r\n",
+        b"kl=M\r\n=yend size=2 part=1\r\n.\r\n",
+        b"kl=\r\n.\r\n",
+        b"kl=\n=yend size=2 part=1\r\n.\r\n",
+        b"kl\r\n=yend size=2 part=1\r\n.\r\n",
+        b"kl=",
+        b"kl\r\n=",
     ]
     .into_iter()
     .map(<[u8]>::to_vec)

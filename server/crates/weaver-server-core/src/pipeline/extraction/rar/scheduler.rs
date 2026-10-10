@@ -1790,6 +1790,18 @@ impl Pipeline {
                         );
                         return;
                     }
+                    // A set with no first volume never opened, so nothing about
+                    // its bytes is known to be wrong: it is short a volume.
+                    // Parked as waiting on it, it takes the missing-volume
+                    // route — repair when recovery data can rebuild it, a
+                    // failure naming the volumes seen when nothing can.
+                    if crate::pipeline::archive::topology::is_missing_first_rar_volume_error(&e)
+                        && self.park_rar_set_waiting_for_first_volume(job_id, &set_name)
+                    {
+                        self.phase_end_extracting_if_idle(job_id);
+                        self.check_job_completion(job_id).await;
+                        return;
+                    }
                     self.purge_empty_rar_set_if_idle(job_id, &set_name);
                     // Asked first and whatever the error: a claim the failure
                     // contradicts is reopened even when the error is one the

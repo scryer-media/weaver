@@ -63,6 +63,23 @@ impl Pipeline {
             .get(&job_id)
             .cloned()
             .unwrap_or_default();
+
+        // A set that has never had a first volume would otherwise fall back to
+        // a full-set extraction, which cannot open it and used to end the job
+        // on the spot. Parked as waiting on volume 0 it is a missing volume,
+        // and the completion check that follows routes it to repair, or to a
+        // failure that names what was seen.
+        let mut parked_without_first_volume = false;
+        for set_name in &set_names {
+            if !extracted_archives.contains(set_name) {
+                parked_without_first_volume |=
+                    self.park_rar_set_waiting_for_first_volume(job_id, set_name);
+            }
+        }
+        if parked_without_first_volume {
+            self.schedule_job_completion_check(job_id);
+            return;
+        }
         let mut forced_recompute = false;
         let (fallback_sets, has_incomplete_sets, has_ready_incremental_work) = loop {
             let mut fallback_sets = Vec::new();
@@ -2744,6 +2761,14 @@ impl Pipeline {
                     }
                 }
                 if rar_waiting_for_missing_volumes {
+                    // The missing volume may be one an identity set holds
+                    // virtually. With every article in and no PAR2 verdict
+                    // coming, that set can never finish; handing its volumes
+                    // over is what the waiting set needs.
+                    if self.demote_stranded_identity_sets(job_id).await {
+                        self.schedule_job_completion_check(job_id);
+                        return;
+                    }
                     let reason = self.invalid_rar_retry_frontier_reason(job_id).unwrap_or_else(|| {
                         "RAR extraction stalled waiting for missing volumes after downloads finished"
                             .to_string()
@@ -2835,6 +2860,14 @@ impl Pipeline {
         //    use rather than arriving after the job is already filed.
         if let Some(error) = self.verify_par2_less_job_with_sfv(job_id).await {
             self.fail_job(job_id, error);
+            return;
+        }
+
+        // Every branch below dispatches the job onward, so an identity set
+        // still routing here would never finalize, and its volumes, held only
+        // virtually, would reach neither an extractor nor the output.
+        if self.demote_stranded_identity_sets(job_id).await {
+            self.schedule_job_completion_check(job_id);
             return;
         }
 

@@ -3489,6 +3489,24 @@ impl Pipeline {
                     continue;
                 }
             };
+            // As in the settle pass: a set placed anew by its volumes' headers
+            // while the chase was parked has a part count the coverage it armed
+            // with does not, so the chase stops and the set is read as it is.
+            let changed_shape = self
+                .direct_unpack
+                .armed
+                .get(&(job_id, set_name.clone()))
+                .is_some_and(|armed| armed.coverage.part_count() != paths.len());
+            if changed_shape {
+                self.direct_unpack_abort_set(
+                    job_id,
+                    &set_name,
+                    "the set's parts changed after the chase armed",
+                    AbortLatch::Retryable,
+                    DemotionReason::PartUnreadable,
+                );
+                continue;
+            }
             let Some(armed) = self.direct_unpack.armed.get(&(job_id, set_name.clone())) else {
                 // A finished chase has nothing to release: it was vouched for,
                 // so its outcome stands as it is.

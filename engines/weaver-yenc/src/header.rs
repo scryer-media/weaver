@@ -501,6 +501,29 @@ pub fn parse_headers_with_options(
     input: &[u8],
     options: DecodeOptions,
 ) -> Result<ParsedHeaders, YencError> {
+    let (metadata, data_start) = parse_leading_headers(input)?;
+
+    // Find the control line that ends the body, by the kernel's stop rule.
+    let (yend_fields, data_end) =
+        match find_body_control_line(input, data_start, options.dot_unstuffing) {
+            Some(control) => (
+                Some(parse_trailer_at(input, control.keyword_start)?),
+                control.data_end,
+            ),
+            None => (None, input.len()),
+        };
+
+    Ok(ParsedHeaders {
+        metadata,
+        data_start,
+        data_end,
+        yend: yend_fields,
+    })
+}
+
+/// Parse the `=ybegin` line and any `=ypart` line, returning the metadata and
+/// the offset of the first body byte.
+pub(crate) fn parse_leading_headers(input: &[u8]) -> Result<(YencMetadata, usize), YencError> {
     // Scan for the =ybegin line so leading junk (headers
     // left in the body, poster banners, blank lines) does not kill the article.
     //
@@ -533,34 +556,29 @@ pub fn parse_headers_with_options(
         after_ybegin
     };
 
-    // Find the control line that ends the body, by the kernel's stop rule.
-    let (yend_fields, data_end) =
-        match find_body_control_line(input, data_start, options.dot_unstuffing) {
-            Some(control) => {
-                let (line_end, _) = line_end(input, control.keyword_start);
-                let line = &input[control.keyword_start..line_end];
+    Ok((metadata, data_start))
+}
 
-                if !is_control_line(line, b"=yend") {
-                    // The kernel already stopped here, so there is no reading of
-                    // this article that keeps decoding. The streaming and fused
-                    // decoders reject it with this exact error.
-                    return Err(YencError::InvalidHeader {
-                        field: "=yend".to_string(),
-                        reason: "unexpected trailing line after yEnc body".to_string(),
-                    });
-                }
+/// Parse the control line that begins at `keyword_start`, the `=` of the `=y`
+/// the body stopped at. Only `=yend` may end a body.
+pub(crate) fn parse_trailer_at(
+    input: &[u8],
+    keyword_start: usize,
+) -> Result<YendFields, YencError> {
+    let (line_end, _) = line_end(input, keyword_start);
+    let line = &input[keyword_start..line_end];
 
-                (Some(parse_yend_line(line)?), control.data_end)
-            }
-            None => (None, input.len()),
-        };
+    if !is_control_line(line, b"=yend") {
+        // The kernel already stopped here, so there is no reading of this
+        // article that keeps decoding. The streaming and fused decoders reject
+        // it with this exact error.
+        return Err(YencError::InvalidHeader {
+            field: "=yend".to_string(),
+            reason: "unexpected trailing line after yEnc body".to_string(),
+        });
+    }
 
-    Ok(ParsedHeaders {
-        metadata,
-        data_start,
-        data_end,
-        yend: yend_fields,
-    })
+    parse_yend_line(line)
 }
 
 /// Extract a filename from a yEnc-style NNTP subject line.

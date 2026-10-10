@@ -1132,7 +1132,12 @@ impl Pipeline {
         }
 
         if has_incomplete_sets {
-            Some("no retryable work remains for incomplete RAR sets".to_string())
+            Some(
+                self.missing_first_rar_volume_report(job_id)
+                    .unwrap_or_else(|| {
+                        "no retryable work remains for incomplete RAR sets".to_string()
+                    }),
+            )
         } else {
             None
         }
