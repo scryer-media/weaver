@@ -1,9 +1,9 @@
 use super::*;
 use std::os::unix::fs::MetadataExt;
 
-/// One file the probe found, with the two numbers that answer everything:
-/// `dev` says which filesystem it is on, `ino` says whether a later file is
-/// the *same* file (a rename) or a new one (a copy).
+// One file the probe found, with the two numbers that answer everything:
+// `dev` says which filesystem it is on, `ino` says whether a later file is
+// the *same* file (a rename) or a new one (a copy).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Found {
     path: PathBuf,
@@ -24,7 +24,7 @@ fn dev_of(path: &Path) -> u64 {
         .dev()
 }
 
-/// Every regular file under `root`, deepest-first order irrelevant.
+// Every regular file under `root`, deepest-first order irrelevant.
 fn walk(root: &Path) -> Vec<Found> {
     let mut out = Vec::new();
     let mut queue = vec![root.to_path_buf()];
@@ -94,8 +94,8 @@ fn fresh(root: &Path, tag: &str) -> PathBuf {
     dir
 }
 
-/// The headline: where the payload is born, and whether the publish is a
-/// rename or a byte copy.
+// The headline: where the payload is born, and whether the publish is a
+// rename or a byte copy.
 #[tokio::test]
 async fn direct_store_payload_and_publish_across_two_filesystems() {
     let Some((intermediate_root, complete_root)) = roots() else {
@@ -299,8 +299,8 @@ async fn direct_store_payload_and_publish_across_two_filesystems() {
     );
 }
 
-/// The failure path: a cancelled job leaves nothing behind on the complete
-/// filesystem.
+// The failure path: a cancelled job leaves nothing behind on the complete
+// filesystem.
 #[tokio::test]
 async fn a_cancelled_job_cleans_what_it_wrote_on_the_complete_filesystem() {
     let Some((intermediate_root, complete_root)) = roots() else {

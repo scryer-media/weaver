@@ -1,21 +1,21 @@
-//! Background release checker.
-//!
-//! Polls the project's public GitHub releases API on a conservative cadence and
-//! publishes the result through a [`tokio::sync::watch`] channel so the GraphQL
-//! query and subscription can both read the same state without re-fetching.
-//!
-//! Design rules this module holds to:
-//!
-//! * The loop is hours-scale with a jittered startup delay. A deployment fleet
-//!   that all restarts at once must not turn into a synchronised burst against
-//!   the API, and a failing check must never degrade into a tight retry loop.
-//! * Conditional requests (`If-None-Match`) and `Retry-After` are honoured, so
-//!   the steady state costs an unmetered `304` rather than a rate-limit unit.
-//! * Errors never clear the last good result. A network blip sets `last_error`
-//!   and leaves the previously discovered release in place.
-//! * Only stable releases count. Drafts, prereleases, and semver-prerelease
-//!   tags are ignored, and `update_available` is set only when the discovered
-//!   version is strictly greater than the running one.
+// Background release checker.
+//
+// Polls the project's public GitHub releases API on a conservative cadence and
+// publishes the result through a [`tokio::sync::watch`] channel so the GraphQL
+// query and subscription can both read the same state without re-fetching.
+//
+// Design rules this module holds to:
+//
+// * The loop is hours-scale with a jittered startup delay. A deployment fleet
+//   that all restarts at once must not turn into a synchronised burst against
+//   the API, and a failing check must never degrade into a tight retry loop.
+// * Conditional requests (`If-None-Match`) and `Retry-After` are honoured, so
+//   the steady state costs an unmetered `304` rather than a rate-limit unit.
+// * Errors never clear the last good result. A network blip sets `last_error`
+//   and leaves the previously discovered release in place.
+// * Only stable releases count. Drafts, prereleases, and semver-prerelease
+//   tags are ignored, and `update_available` is set only when the discovered
+//   version is strictly greater than the running one.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -28,59 +28,59 @@ use tracing::{debug, warn};
 
 use crate::persistence::Database;
 
-/// Releases API for this project's public repository.
-///
-/// `.../releases/latest` is GitHub's "latest stable" resource: it already
-/// excludes drafts and prereleases. The draft/prerelease and semver-prerelease
-/// filters below are kept anyway so a hand-published release cannot surprise
-/// users of a stable build.
+// Releases API for this project's public repository.
+//
+// `.../releases/latest` is GitHub's "latest stable" resource: it already
+// excludes drafts and prereleases. The draft/prerelease and semver-prerelease
+// filters below are kept anyway so a hand-published release cannot surprise
+// users of a stable build.
 const GITHUB_LATEST_RELEASE_ENDPOINT: &str =
     "https://api.github.com/repos/scryer-media/weaver/releases/latest";
 
-/// Release tags are cut as `weaver-v{version}` by `cargo xtask release`.
+// Release tags are cut as `weaver-v{version}` by `cargo xtask release`.
 const RELEASE_TAG_PREFIX: &str = "weaver-v";
 
-/// Turns the release check off entirely when set to `0`.
+// Turns the release check off entirely when set to `0`.
 const ENV_UPDATE_CHECK: &str = "WEAVER_UPDATE_CHECK";
 
-/// What the status reports while the check is switched off, so a deployment
-/// that never polls is distinguishable from one whose polls keep failing.
+// What the status reports while the check is switched off, so a deployment
+// that never polls is distinguishable from one whose polls keep failing.
 const DISABLED_NOTICE: &str = "release checks are turned off by WEAVER_UPDATE_CHECK=0";
 
-/// Whether this process may poll for releases at all. Read once, at startup:
-/// an operator who turns the check off expects it to stay off for the run.
+// Whether this process may poll for releases at all. Read once, at startup:
+// an operator who turns the check off expects it to stay off for the run.
 fn release_checks_enabled() -> bool {
     !std::env::var(ENV_UPDATE_CHECK)
         .is_ok_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
 }
 
-/// Settings key holding the JSON-encoded [`PersistedUpdateState`].
+// Settings key holding the JSON-encoded [`PersistedUpdateState`].
 const UPDATE_CHECK_SETTING_KEY: &str = "update_check_state";
 
-/// Steady-state gap between checks.
+// Steady-state gap between checks.
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Floor applied to every computed wait. Guarantees that no combination of
-/// `Retry-After`, clock movement, or arithmetic can produce a tight loop.
+// Floor applied to every computed wait. Guarantees that no combination of
+// `Retry-After`, clock movement, or arithmetic can produce a tight loop.
 const MIN_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
-/// Ceiling applied to a server-provided `Retry-After`.
+// Ceiling applied to a server-provided `Retry-After`.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Delay before the first check, so startup is never blocked on the network and
-/// a fleet restart does not stampede the API.
+// Delay before the first check, so startup is never blocked on the network and
+// a fleet restart does not stampede the API.
 const STARTUP_DELAY: Duration = Duration::from_secs(30);
 
-/// Upper bound of the random jitter added to the startup delay.
+// Upper bound of the random jitter added to the startup delay.
 const STARTUP_JITTER: Duration = Duration::from_secs(4 * 60);
 
-/// Per-request timeout.
+// Per-request timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Cap on the response body we are willing to buffer from the API.
+// Cap on the response body we are willing to buffer from the API.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-/// Snapshot of what the checker currently knows about available releases.
+// Snapshot of what the checker currently knows about available releases.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateStatus {
     pub current_version: String,
@@ -116,13 +116,13 @@ pub enum UpdateCheckError {
     HttpClient(String),
 }
 
-/// The subset of [`UpdateStatus`] that survives a restart.
-///
-/// Transient fields (`checking`, `last_error`) are deliberately excluded, and
-/// `update_available` is recomputed against the running binary on load so an
-/// upgraded install does not come back up still advertising the version it now
-/// runs. The conditional-request validator rides along so a restart revalidates
-/// with a `304` instead of spending a fresh rate-limit unit.
+// The subset of [`UpdateStatus`] that survives a restart.
+//
+// Transient fields (`checking`, `last_error`) are deliberately excluded, and
+// `update_available` is recomputed against the running binary on load so an
+// upgraded install does not come back up still advertising the version it now
+// runs. The conditional-request validator rides along so a restart revalidates
+// with a `304` instead of spending a fresh rate-limit unit.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct PersistedUpdateState {
     #[serde(default)]
@@ -137,19 +137,21 @@ struct PersistedUpdateState {
     etag: Option<String>,
 }
 
-/// What a single fetch attempt produced.
+// What a single fetch attempt produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FetchOutcome {
-    /// The cached validator still matches; nothing about the release changed.
+    // The cached validator still matches; nothing about the release changed.
     NotModified,
-    /// A fresh representation. `release` is `None` when the repository has no
-    /// stable release yet, or the newest one is a draft/prerelease.
+    // A fresh representation. `release` is `None` when the repository has no
+    // stable release yet, or the newest one is a draft/prerelease.
     Fetched {
         release: Option<ReleaseInfo>,
         etag: Option<String>,
     },
-    /// The API asked us to back off.
-    RateLimited { retry_after: Option<Duration> },
+    // The API asked us to back off.
+    RateLimited {
+        retry_after: Option<Duration>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,8 +163,8 @@ pub(crate) struct ReleaseInfo {
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Indirection over the network call so tests can drive the state machine
-/// deterministically under a paused clock without touching the network.
+// Indirection over the network call so tests can drive the state machine
+// deterministically under a paused clock without touching the network.
 pub(crate) trait ReleaseFetcher: Send + Sync + 'static {
     fn fetch_latest<'a>(
         &'a self,
@@ -179,16 +181,16 @@ struct UpdateCheckInner {
     db: Database,
     fetcher: Arc<dyn ReleaseFetcher>,
     status: watch::Sender<UpdateStatus>,
-    /// Conditional-request validator from the last successful fetch.
+    // Conditional-request validator from the last successful fetch.
     etag: std::sync::Mutex<Option<String>>,
-    /// Whether this process polls at all.
+    // Whether this process polls at all.
     enabled: bool,
-    /// Held for the length of one check, so the background loop and an
-    /// operator's "check now" never fetch at the same time.
+    // Held for the length of one check, so the background loop and an
+    // operator's "check now" never fetch at the same time.
     check_lock: tokio::sync::Mutex<()>,
-    /// Until when the release API has asked us to back off. An operator's
-    /// check is refused inside this window; the background loop already
-    /// sleeps through it.
+    // Until when the release API has asked us to back off. An operator's
+    // check is refused inside this window; the background loop already
+    // sleeps through it.
     backoff_until: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
@@ -243,21 +245,21 @@ impl UpdateCheckService {
         }
     }
 
-    /// Current snapshot, as served by the `updateStatus` query.
+    // Current snapshot, as served by the `updateStatus` query.
     pub fn status(&self) -> UpdateStatus {
         self.inner.status.borrow().clone()
     }
 
-    /// Receiver seeded with the current snapshot, so a new subscriber sees the
-    /// state immediately instead of waiting for the next transition.
+    // Receiver seeded with the current snapshot, so a new subscriber sees the
+    // state immediately instead of waiting for the next transition.
     pub fn subscribe(&self) -> watch::Receiver<UpdateStatus> {
         self.inner.status.subscribe()
     }
 
-    /// Whether this process polls for releases at all.
-    ///
-    /// An operator who turned the check off gets nothing that exists only to
-    /// serve it — no release polling, and no upgrade-related network traffic.
+    // Whether this process polls for releases at all.
+    //
+    // An operator who turned the check off gets nothing that exists only to
+    // serve it — no release polling, and no upgrade-related network traffic.
     pub fn enabled(&self) -> bool {
         self.inner.enabled
     }
@@ -283,14 +285,14 @@ impl UpdateCheckService {
         })
     }
 
-    /// Check now, on an operator's request, and return what the check found.
-    ///
-    /// One extra check, not a reset of the cadence: the background loop keeps
-    /// its own schedule. It fetches nothing while the release API has asked us
-    /// to back off, and a request that arrives while a check is already
-    /// running waits for that check rather than starting a second one. Either
-    /// way the caller gets the current status, whose `last_error` says why
-    /// nothing new was learned.
+    // Check now, on an operator's request, and return what the check found.
+    //
+    // One extra check, not a reset of the cadence: the background loop keeps
+    // its own schedule. It fetches nothing while the release API has asked us
+    // to back off, and a request that arrives while a check is already
+    // running waits for that check rather than starting a second one. Either
+    // way the caller gets the current status, whose `last_error` says why
+    // nothing new was learned.
     pub async fn check_now(&self) -> UpdateStatus {
         if self.inner.enabled && !self.backing_off() {
             match self.inner.check_lock.try_lock() {
@@ -305,13 +307,13 @@ impl UpdateCheckService {
         self.status()
     }
 
-    /// Whether the release API's last answer asked us to wait, and that wait
-    /// has not run out yet.
+    // Whether the release API's last answer asked us to wait, and that wait
+    // has not run out yet.
     fn backing_off(&self) -> bool {
         self.backoff_remaining().is_some()
     }
 
-    /// How much of the release API's requested wait is left, if any.
+    // How much of the release API's requested wait is left, if any.
     fn backoff_remaining(&self) -> Option<Duration> {
         self.inner
             .backoff_until
@@ -321,14 +323,14 @@ impl UpdateCheckService {
             .filter(|remaining| !remaining.is_zero())
     }
 
-    /// Run one check. Returns the server-requested backoff, if any.
-    ///
-    /// While an earlier answer — from this loop or from an operator's check —
-    /// asked us to back off, nothing is fetched and the rest of that wait is
-    /// returned instead.
-    ///
-    /// The `Err` arm reports the fetch failure to the caller for logging; the
-    /// failure has already been folded into the published status by then.
+    // Run one check. Returns the server-requested backoff, if any.
+    //
+    // While an earlier answer — from this loop or from an operator's check —
+    // asked us to back off, nothing is fetched and the rest of that wait is
+    // returned instead.
+    //
+    // The `Err` arm reports the fetch failure to the caller for logging; the
+    // failure has already been folded into the published status by then.
     pub(crate) async fn run_check(&self) -> Result<Option<Duration>, String> {
         if !self.inner.enabled {
             return Ok(None);
@@ -340,8 +342,8 @@ impl UpdateCheckService {
         self.check_once().await
     }
 
-    /// One fetch and the status transition it produces. Callers hold
-    /// `check_lock`.
+    // One fetch and the status transition it produces. Callers hold
+    // `check_lock`.
     async fn check_once(&self) -> Result<Option<Duration>, String> {
         self.publish(|status| status.checking = true);
 
@@ -428,7 +430,7 @@ impl UpdateCheckService {
         }
     }
 
-    /// Apply a transition and publish it to every subscriber.
+    // Apply a transition and publish it to every subscriber.
     fn publish(&self, mutate: impl FnOnce(&mut UpdateStatus)) {
         self.inner.status.send_modify(mutate);
     }
@@ -479,8 +481,8 @@ fn load_persisted_state(db: &Database) -> Option<PersistedUpdateState> {
     }
 }
 
-/// Startup delay with jitter derived from the wall clock, so co-starting
-/// instances spread their first request instead of firing together.
+// Startup delay with jitter derived from the wall clock, so co-starting
+// instances spread their first request instead of firing together.
 fn startup_delay() -> Duration {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -497,19 +499,19 @@ fn epoch_ms_now() -> i64 {
         .as_millis() as i64
 }
 
-/// The release tag that carries `version`'s assets.
-///
-/// The in-application upgrade needs the tag, not just the version: every release
-/// asset URL is built from it. One function so the tag the upgrade asks for and
-/// the tag the release was cut as cannot drift apart.
+// The release tag that carries `version`'s assets.
+//
+// The in-application upgrade needs the tag, not just the version: every release
+// asset URL is built from it. One function so the tag the upgrade asks for and
+// the tag the release was cut as cannot drift apart.
 pub fn release_tag_for_version(version: &str) -> String {
     format!("{RELEASE_TAG_PREFIX}{version}")
 }
 
-/// Parse a release tag into a comparable stable version.
-///
-/// Returns `None` for tags that are not semver, and for semver prereleases
-/// (`0.9.0-rc.1`) — a stable build must never be nudged onto a prerelease.
+// Parse a release tag into a comparable stable version.
+//
+// Returns `None` for tags that are not semver, and for semver prereleases
+// (`0.9.0-rc.1`) — a stable build must never be nudged onto a prerelease.
 pub(crate) fn parse_stable_version(tag: &str) -> Option<semver::Version> {
     let trimmed = tag.trim();
     let stripped = trimmed
@@ -524,8 +526,8 @@ pub(crate) fn parse_stable_version(tag: &str) -> Option<semver::Version> {
     }
 }
 
-/// `true` only when `candidate` parses as a stable release strictly newer than
-/// the running build. An unparseable candidate is never "newer".
+// `true` only when `candidate` parses as a stable release strictly newer than
+// the running build. An unparseable candidate is never "newer".
 pub(crate) fn is_newer_than_current(candidate: Option<&str>, current_version: &str) -> bool {
     let Some(candidate) = candidate.and_then(parse_stable_version) else {
         return false;
@@ -536,7 +538,7 @@ pub(crate) fn is_newer_than_current(candidate: Option<&str>, current_version: &s
     candidate > current
 }
 
-/// Reqwest-backed [`ReleaseFetcher`] pointed at the public GitHub API.
+// Reqwest-backed [`ReleaseFetcher`] pointed at the public GitHub API.
 struct GithubReleaseFetcher {
     client: reqwest::Client,
     endpoint: String,
@@ -600,7 +602,7 @@ impl ReleaseFetcher for GithubReleaseFetcher {
     }
 }
 
-/// GitHub signals an exhausted quota as `403`/`429` with `x-ratelimit-remaining: 0`.
+// GitHub signals an exhausted quota as `403`/`429` with `x-ratelimit-remaining: 0`.
 fn is_rate_limited(response: &reqwest::Response) -> bool {
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return true;
@@ -614,8 +616,8 @@ fn is_rate_limited(response: &reqwest::Response) -> bool {
             .unwrap_or(false)
 }
 
-/// `Retry-After` is either delta-seconds or an HTTP-date; both forms are
-/// accepted, and GitHub's `x-ratelimit-reset` epoch is used as a fallback.
+// `Retry-After` is either delta-seconds or an HTTP-date; both forms are
+// accepted, and GitHub's `x-ratelimit-reset` epoch is used as a fallback.
 pub(crate) fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     if let Some(value) = headers
         .get(reqwest::header::RETRY_AFTER)
@@ -664,10 +666,10 @@ async fn read_body_with_limit(mut response: reqwest::Response) -> Result<Vec<u8>
     Ok(body)
 }
 
-/// Extract the stable release from a `releases/latest` payload.
-///
-/// `Ok(None)` means "the payload is valid but describes nothing we would offer"
-/// — a draft, a prerelease, or a tag that is not stable semver.
+// Extract the stable release from a `releases/latest` payload.
+//
+// `Ok(None)` means "the payload is valid but describes nothing we would offer"
+// — a draft, a prerelease, or a tag that is not stable semver.
 pub(crate) fn parse_release_payload(body: &[u8]) -> Result<Option<ReleaseInfo>, String> {
     let payload: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| format!("invalid release API response: {error}"))?;

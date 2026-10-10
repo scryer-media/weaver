@@ -1,9 +1,9 @@
-//! PAR2 as the field posts it: the slice sizes posters choose, their
-//! redundancy, recovery that is ample, exact or one block short, block counts
-//! in the hundreds and the thousands, articles that line up with slices and
-//! articles that straddle them, and the packet layouts the common tools write.
-//!
-//! Sizes are the field's at a thousandth: a 768,000-byte slice is 768 bytes.
+// PAR2 as the field posts it: the slice sizes posters choose, their
+// redundancy, recovery that is ample, exact or one block short, block counts
+// in the hundreds and the thousands, articles that line up with slices and
+// articles that straddle them, and the packet layouts the common tools write.
+//
+// Sizes are the field's at a thousandth: a 768,000-byte slice is 768 bytes.
 use super::damage::{PATTERNS, Pattern, place, with_recovery};
 use super::fixtures::{Container, payload};
 use super::post::{Damage, Post, Posted, Role, Wire};
@@ -13,8 +13,8 @@ use super::recovery::{
 };
 use super::*;
 
-/// 716,800; 768,000; 1 MiB; 1,536,000; 5 MiB, at a thousandth and rounded
-/// to the four-byte multiple PAR2 requires.
+// 716,800; 768,000; 1 MiB; 1,536,000; 5 MiB, at a thousandth and rounded
+// to the four-byte multiple PAR2 requires.
 const SLICES: [usize; 5] = [716, 768, 1048, 1536, 5240];
 const VOLUMES: usize = 4;
 const ARTICLES_PER_VOLUME: usize = 32;
@@ -24,8 +24,8 @@ pub(super) enum Redundancy {
     Eight,
     Ten,
     Twenty,
-    /// A hundred percent, and none of the data arrives: the job is rebuilt
-    /// from the recovery volumes alone.
+    // A hundred percent, and none of the data arrives: the job is rebuilt
+    // from the recovery volumes alone.
     ParsOnly,
 }
 
@@ -47,7 +47,7 @@ impl Redundancy {
     }
 }
 
-/// How many source blocks the set describes.
+// How many source blocks the set describes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Band {
     Hundreds,
@@ -65,7 +65,7 @@ impl Band {
     }
 }
 
-/// Whether article boundaries fall on slice boundaries.
+// Whether article boundaries fall on slice boundaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Alignment {
     Aligned,
@@ -74,27 +74,27 @@ pub(super) enum Alignment {
 
 const ALIGNMENTS: [Alignment; 2] = [Alignment::Aligned, Alignment::Straddling];
 
-/// How the set's packets are laid out, sampled across cells.
+// How the set's packets are laid out, sampled across cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Structure {
-    /// As the writer lays it out.
+    // As the writer lays it out.
     Plain,
-    /// Every article of the index damaged; the recovery volumes are intact,
-    /// so the file list must come from their packets.
+    // Every article of the index damaged; the recovery volumes are intact,
+    // so the file list must come from their packets.
     IndexDamaged,
-    /// No index at all: the recovery volumes alone.
+    // No index at all: the recovery volumes alone.
     IndexAbsent,
-    /// Volumes that double, named `vol00+01`, `vol01+02`, `vol03+04`.
+    // Volumes that double, named `vol00+01`, `vol01+02`, `vol03+04`.
     ExponentNaming,
-    /// Every FileDesc packet posted twice in the index.
+    // Every FileDesc packet posted twice in the index.
     DuplicateFileDesc,
-    /// Each file's description and checksums in exactly one file of the set.
+    // Each file's description and checksums in exactly one file of the set.
     SplitAcrossVolumes,
-    /// A Unicode name packet beside every description.
+    // A Unicode name packet beside every description.
     UnicodeNames,
-    /// A creator packet as other common tools write one.
+    // A creator packet as other common tools write one.
     Creator,
-    /// A set of two files: the archive in two volumes.
+    // A set of two files: the archive in two volumes.
     TwoFiles,
 }
 
@@ -118,7 +118,7 @@ const CONTAINERS: [Container; 5] = [
     Container::SevenZip,
 ];
 
-/// Neutral creator strings in the shapes common tools write.
+// Neutral creator strings in the shapes common tools write.
 const CREATORS: [&str; 3] = [
     "Parity Builder version 0.9.1",
     "Created by harbour-par v2.3.0 (lantern build)",
@@ -134,7 +134,7 @@ pub(super) struct Par2Cell {
     pub alignment: Alignment,
     pub pattern: Pattern,
     pub container: Container,
-    /// Sampled across cells by a fixed stride, not crossed.
+    // Sampled across cells by a fixed stride, not crossed.
     pub structure: Structure,
     pub creator: usize,
 }
@@ -170,11 +170,11 @@ pub(super) fn cells() -> Vec<Par2Cell> {
     cells
 }
 
-/// Schedules each (cell, profile) unit samples from the archive matrix's
-/// combined cases.
+// Schedules each (cell, profile) unit samples from the archive matrix's
+// combined cases.
 pub(super) const PER_UNIT: usize = 46;
 
-/// 8,000 cells under three profiles, 46 schedules each.
+// 8,000 cells under three profiles, 46 schedules each.
 pub(super) const TOTAL: usize = 1_104_000;
 
 pub(super) fn family() -> Family<Par2Cell> {
@@ -195,10 +195,14 @@ pub(super) fn family() -> Family<Par2Cell> {
 
 impl Par2Cell {
     fn volumes(self) -> usize {
-        if self.structure == Structure::TwoFiles { 2 } else { VOLUMES }
+        if self.structure == Structure::TwoFiles {
+            2
+        } else {
+            VOLUMES
+        }
     }
 
-    /// The article size: a whole number of slices, or that and half a slice.
+    // The article size: a whole number of slices, or that and half a slice.
     fn article(self) -> usize {
         let volume = self.band.blocks() * self.slice / self.volumes();
         let slices = (volume / ARTICLES_PER_VOLUME / self.slice).max(1);
@@ -224,8 +228,8 @@ impl Par2Cell {
         }
     }
 
-    /// Marks the cell's losses on the data, or on the recovery volumes when
-    /// no data arrives at all.
+    // Marks the cell's losses on the data, or on the recovery volumes when
+    // no data arrives at all.
     fn mark(self, post: &mut Post, recovery_files: bool) {
         let pars_only = self.redundancy == Redundancy::ParsOnly;
         if !recovery_files {
@@ -247,7 +251,9 @@ impl Par2Cell {
             Structure::IndexDamaged => {
                 for file in &index {
                     for article in 0..post.files[*file].articles() {
-                        post.files[*file].wire.insert(article, Wire::Damaged(Damage::CrcWrong));
+                        post.files[*file]
+                            .wire
+                            .insert(article, Wire::Damaged(Damage::CrcWrong));
                     }
                 }
             }
@@ -270,7 +276,7 @@ impl Par2Cell {
         }
     }
 
-    /// Rewrites the writer's set into the cell's packet layout.
+    // Rewrites the writer's set into the cell's packet layout.
     fn restructure(self, mut set: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
         let id = par2_set_id(&set[0].1);
         match self.structure {
@@ -303,7 +309,10 @@ impl Par2Cell {
                 // one file of the set in turn.
                 let mut pairs: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
                 for packet in moved {
-                    pairs.entry(packet[64..80].to_vec()).or_default().extend(packet);
+                    pairs
+                        .entry(packet[64..80].to_vec())
+                        .or_default()
+                        .extend(packet);
                 }
                 let files = set.len();
                 for (at, (_, packets)) in pairs.into_iter().enumerate() {
@@ -333,7 +342,8 @@ impl Par2Cell {
                 }
             }
             Structure::Creator => {
-                let creator = par2_packet(&id, par2_type::CREATOR, CREATORS[self.creator].as_bytes());
+                let creator =
+                    par2_packet(&id, par2_type::CREATOR, CREATORS[self.creator].as_bytes());
                 for (_, bytes) in &mut set {
                     let mut rebuilt = Vec::new();
                     let mut replaced = false;
@@ -361,8 +371,8 @@ impl Par2Cell {
     }
 }
 
-/// Loses a pattern's articles across `files`, starting a few articles into
-/// the second of them so a pattern crosses slice boundaries.
+// Loses a pattern's articles across `files`, starting a few articles into
+// the second of them so a pattern crosses slice boundaries.
 fn pattern(post: &mut Post, files: &[usize], pattern: Pattern) {
     let first = usize::from(files.len() > 1);
     let start = 3.min(post.files[files[first]].articles().saturating_sub(1));
@@ -431,8 +441,8 @@ impl Cell for Par2Cell {
     }
 }
 
-/// The defects each cell and profile is held open for. Every one blocks a
-/// release: these are PAR2 rows.
+// The defects each cell and profile is held open for. Every one blocks a
+// release: these are PAR2 rows.
 fn open_defect(cell: Par2Cell, profile: ExtractionProfile) -> Option<Defect> {
     if cell.structure == Structure::IndexDamaged && cell.margin != Margin::OneShort {
         return Some(Defect::Diverges(INDEX_DAMAGED_STRANDS_PROBED_VOLUMES));
@@ -441,18 +451,20 @@ fn open_defect(cell: Par2Cell, profile: ExtractionProfile) -> Option<Defect> {
         && profile == ExtractionProfile::DirectStore
         && cell.margin != Margin::OneShort
     {
-        return Some(Defect::Diverges(ENCRYPTED_HEADERS_REPAIRED_SET_HAS_NO_VOLUMES));
+        return Some(Defect::Diverges(
+            ENCRYPTED_HEADERS_REPAIRED_SET_HAS_NO_VOLUMES,
+        ));
     }
     None
 }
 
-/// A header-encrypted direct set repaired in place keeps its clean volumes
-/// virtual; extraction then finds no volume on disk and fails the job.
+// A header-encrypted direct set repaired in place keeps its clean volumes
+// virtual; extraction then finds no volume on disk and fails the job.
 const ENCRYPTED_HEADERS_REPAIRED_SET_HAS_NO_VOLUMES: &str = "encrypted headers: after an in-place PAR2 repair of a direct set, extraction fails with no on-disk RAR volumes";
 
-/// With every index article damaged, the recovery volumes probed by prefix
-/// for metadata are read back as volumes that cannot complete and are never
-/// promoted, so the job fails short of recovery it was posted with.
+// With every index article damaged, the recovery volumes probed by prefix
+// for metadata are read back as volumes that cannot complete and are never
+// promoted, so the job fails short of recovery it was posted with.
 const INDEX_DAMAGED_STRANDS_PROBED_VOLUMES: &str = "index damaged: prefix-probed recovery volumes are never promoted; the job fails with enough recovery posted";
 
 macro_rules! par2_smokes {
@@ -494,8 +506,8 @@ par2_smokes! {
     headers_encrypted_with 1048 Twenty With Hundreds Aligned TwelveAcrossThree Plain Rar5EncryptedHeaders;
 }
 
-/// The campaign: 2,200 shards of about 500 cases; half the cells carry a
-/// set of thousands of blocks, whose cases run several times longer.
+// The campaign: 2,200 shards of about 500 cases; half the cells carry a
+// set of thousands of blocks, whose cases run several times longer.
 mod combined_par2_realism {
     use super::*;
 

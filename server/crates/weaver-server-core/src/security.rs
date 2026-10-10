@@ -21,69 +21,69 @@ pub const ENV_RSS_ALLOW_PRIVATE_NETWORK: &str = "WEAVER_RSS_ALLOW_PRIVATE_NETWOR
 pub const ENV_STRICT_SECURITY: &str = "WEAVER_STRICT_SECURITY";
 pub const ENV_TRUSTED_CIDRS: &str = "WEAVER_TRUSTED_CIDRS";
 pub const ENV_TRUSTED_PROXIES: &str = "WEAVER_TRUSTED_PROXIES";
-/// Pins browser access to authenticated sessions. The legacy CIDR bypass is
-/// retained only for installations that have not opted into this policy.
+// Pins browser access to authenticated sessions. The legacy CIDR bypass is
+// retained only for installations that have not opted into this policy.
 pub const ENV_ACCESS_MODE: &str = "WEAVER_ACCESS_MODE";
 
 pub const DEFAULT_HTTP_BIND_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-/// Settings-table key holding the operator's chosen bind address.
-///
-/// The address has to be editable somewhere the operator can always reach,
-/// which the environment is not: a desktop install is launched by a shortcut
-/// and a service by a unit file, neither of which a user edits to answer "let
-/// my other machine see this". The loopback default makes the UI itself that
-/// place — it is always reachable from the machine Weaver runs on, so the
-/// setting that widens the binding can be changed from inside the thing it
-/// configures.
+// Settings-table key holding the operator's chosen bind address.
+//
+// The address has to be editable somewhere the operator can always reach,
+// which the environment is not: a desktop install is launched by a shortcut
+// and a service by a unit file, neither of which a user edits to answer "let
+// my other machine see this". The loopback default makes the UI itself that
+// place — it is always reachable from the machine Weaver runs on, so the
+// setting that widens the binding can be changed from inside the thing it
+// configures.
 pub const SETTING_HTTP_BIND_ADDRESS: &str = "http_bind_address";
 
-/// Where the running bind address came from, so the UI can explain itself
-/// rather than silently ignoring an edit.
+// Where the running bind address came from, so the UI can explain itself
+// rather than silently ignoring an edit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindAddressSource {
-    /// `WEAVER_HTTP_BIND_ADDRESS` was set. It wins outright: a container image
-    /// or a service unit that pins the address is describing its deployment,
-    /// and a stored setting must not quietly override the environment the
-    /// operator handed to the process.
+    // `WEAVER_HTTP_BIND_ADDRESS` was set. It wins outright: a container image
+    // or a service unit that pins the address is describing its deployment,
+    // and a stored setting must not quietly override the environment the
+    // operator handed to the process.
     Environment,
-    /// Persisted in the settings table, editable in the UI.
+    // Persisted in the settings table, editable in the UI.
     Setting,
-    /// Nothing configured anywhere; loopback.
+    // Nothing configured anywhere; loopback.
     Default,
 }
 
 impl BindAddressSource {
-    /// Whether the UI may offer this as an editable field.
+    // Whether the UI may offer this as an editable field.
     pub fn is_editable(self) -> bool {
         !matches!(self, BindAddressSource::Environment)
     }
 }
 
-/// Settings-table key holding the access mode the operator chose at setup.
+// Settings-table key holding the access mode the operator chose at setup.
 pub const SETTING_ACCESS_MODE: &str = "access_mode";
-/// Marks an install that has completed the authenticated browser-policy
-/// migration. Absence means the stored access mode retains legacy semantics.
+// Marks an install that has completed the authenticated browser-policy
+// migration. Absence means the stored access mode retains legacy semantics.
 pub const SETTING_SECURITY_POLICY_REVISION: &str = "security_policy_revision";
 pub const AUTHENTICATED_POLICY_REVISION: &str = "authenticated-v1";
-/// Settings-table key stamped when a database is created, naming the access
-/// model that release introduced. Absent on an install that predates it.
+// Settings-table key stamped when a database is created, naming the access
+// model that release introduced. Absent on an install that predates it.
 pub const SETTING_INSTALL_GENERATION: &str = "auth.installation_generation";
 pub const AUTHENTICATED_INSTALL_GENERATION: &str = "authenticated-v1";
-/// Settings-table key holding the trusted-network list (JSON array of CIDRs)
-/// backing [`AccessMode::LoginExceptLocal`].
+// Settings-table key holding the trusted-network list (JSON array of CIDRs)
+// backing [`AccessMode::LoginExceptLocal`].
 pub const SETTING_TRUSTED_NETWORKS: &str = "trusted_networks";
 pub const SETTING_TRUSTED_PROXIES: &str = "trusted_proxies";
 type NetworkPolicySnapshot = (Vec<IpNet>, Vec<IpNet>);
 
-/// How browsers are admitted, chosen in the first-run wizard and editable in
-/// Settings → Security afterwards.
-///
-/// The mode is sugar over one mechanism: a trusted-CIDR list consulted by
-/// [`RuntimeSecurityConfig::is_trusted_peer`]. `LoginRequired` trusts nothing,
-/// `LoginExceptLocal` trusts the stored network list, and `NoLogin` trusts
-/// loopback — which is what makes a credential-less install reach its own UI
-/// while remaining unreachable from anywhere else.
+// How browsers are admitted, chosen in the first-run wizard and editable in
+// Settings → Security afterwards.
+//
+// The mode is sugar over one mechanism: a trusted-CIDR list consulted by
+// [`RuntimeSecurityConfig::is_trusted_peer`]. `LoginRequired` trusts nothing,
+// `LoginExceptLocal` trusts the stored network list, and `NoLogin` trusts
+// loopback — which is what makes a credential-less install reach its own UI
+// while remaining unreachable from anywhere else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessMode {
     LoginRequired,
@@ -110,10 +110,10 @@ impl AccessMode {
     }
 }
 
-/// The private-network preset offered by the wizard for
-/// [`AccessMode::LoginExceptLocal`]: loopback, RFC 1918, link-local, and ULA.
-/// A preset rather than "everything", so trusting the local network never
-/// quietly extends to a routable address.
+// The private-network preset offered by the wizard for
+// [`AccessMode::LoginExceptLocal`]: loopback, RFC 1918, link-local, and ULA.
+// A preset rather than "everything", so trusting the local network never
+// quietly extends to a routable address.
 pub const LOCAL_NETWORK_PRESETS: [&str; 8] = [
     "127.0.0.0/8",
     "::1/128",
@@ -125,7 +125,7 @@ pub const LOCAL_NETWORK_PRESETS: [&str; 8] = [
     "fc00::/7",
 ];
 
-/// The trust list [`AccessMode::NoLogin`] resolves to.
+// The trust list [`AccessMode::NoLogin`] resolves to.
 pub const LOOPBACK_NETWORKS: [&str; 2] = ["127.0.0.0/8", "::1/128"];
 
 fn parse_cidr_list(values: &[&str]) -> Vec<IpNet> {
@@ -135,12 +135,12 @@ fn parse_cidr_list(values: &[&str]) -> Vec<IpNet> {
         .collect()
 }
 
-/// Parse one trust entry written either as a CIDR (`10.0.0.0/8`) or as a bare
-/// address (`10.0.0.1`), which widens to its single-host network.
-///
-/// The bare form exists because a reverse proxy is one machine, not a network,
-/// and that is what an operator reaches for first. Bare addresses are stored
-/// canonically so `::ffff:10.0.0.1` and `10.0.0.1` name the same host.
+// Parse one trust entry written either as a CIDR (`10.0.0.0/8`) or as a bare
+// address (`10.0.0.1`), which widens to its single-host network.
+//
+// The bare form exists because a reverse proxy is one machine, not a network,
+// and that is what an operator reaches for first. Bare addresses are stored
+// canonically so `::ffff:10.0.0.1` and `10.0.0.1` name the same host.
 pub fn parse_ip_or_cidr(value: &str) -> Option<IpNet> {
     let value = value.trim();
     if let Ok(network) = value.parse::<IpNet>() {
@@ -151,9 +151,9 @@ pub fn parse_ip_or_cidr(value: &str) -> Option<IpNet> {
     IpNet::new(ip, prefix).ok()
 }
 
-/// Parse the stored trusted-network list: a JSON array of CIDR strings.
-/// All-or-nothing — one bad entry rejects the list, because trust is the one
-/// place a partial parse must not quietly admit less (or more) than intended.
+// Parse the stored trusted-network list: a JSON array of CIDR strings.
+// All-or-nothing — one bad entry rejects the list, because trust is the one
+// place a partial parse must not quietly admit less (or more) than intended.
 pub fn parse_trusted_networks_json(json: &str) -> Result<Vec<IpNet>, SecurityConfigError> {
     let entries: Vec<String> = serde_json::from_str(json).map_err(|error| {
         SecurityConfigError::new(format!(
@@ -178,14 +178,14 @@ pub fn parse_trusted_networks_json(json: &str) -> Result<Vec<IpNet>, SecurityCon
         .collect()
 }
 
-/// Collapse an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to the IPv4 address
-/// it carries; every other address is returned unchanged.
-///
-/// A dual-stack listener reports IPv4 peers in the mapped form, and the mapped
-/// form answers `false` to every IPv4 classification predicate on `IpAddr` —
-/// `::ffff:127.0.0.1` is not `is_loopback()`. Classification must therefore
-/// happen on the canonical form, or the same host reads as loopback on one
-/// socket and as exposed on another.
+// Collapse an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to the IPv4 address
+// it carries; every other address is returned unchanged.
+//
+// A dual-stack listener reports IPv4 peers in the mapped form, and the mapped
+// form answers `false` to every IPv4 classification predicate on `IpAddr` —
+// `::ffff:127.0.0.1` is not `is_loopback()`. Classification must therefore
+// happen on the canonical form, or the same host reads as loopback on one
+// socket and as exposed on another.
 pub fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(ip) => ip
@@ -196,19 +196,19 @@ pub fn canonical_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Loopback test that sees through the IPv4-mapped form. Use this everywhere a
-/// decision turns on "is this address only reachable from this machine".
+// Loopback test that sees through the IPv4-mapped form. Use this everywhere a
+// decision turns on "is this address only reachable from this machine".
 pub fn ip_is_loopback(ip: IpAddr) -> bool {
     canonical_ip(ip).is_loopback()
 }
 
-/// Resolve the bind address from the environment value and the stored setting.
-///
-/// Pure so the precedence can be tested without touching process environment
-/// or a database. Precedence is environment, then setting, then loopback; an
-/// empty or whitespace-only value at either layer means "not configured"
-/// rather than an error, matching how the rest of the environment parsing
-/// treats blanks.
+// Resolve the bind address from the environment value and the stored setting.
+//
+// Pure so the precedence can be tested without touching process environment
+// or a database. Precedence is environment, then setting, then loopback; an
+// empty or whitespace-only value at either layer means "not configured"
+// rather than an error, matching how the rest of the environment parsing
+// treats blanks.
 pub fn resolve_bind_address(
     env_value: Option<&str>,
     setting_value: Option<&str>,
@@ -324,18 +324,18 @@ impl HttpAuthority {
         self.host == other.host && self.port == other.port
     }
 
-    /// The host alone, lowercased, with an IPv6 literal's brackets removed.
+    // The host alone, lowercased, with an IPv6 literal's brackets removed.
     pub fn host(&self) -> &str {
         &self.host
     }
 
-    /// The port the authority names, if it names one.
+    // The port the authority names, if it names one.
     pub fn port(&self) -> Option<u16> {
         self.port
     }
 
-    /// Whether the host is a literal address rather than a name, which is the
-    /// part a DNS answer cannot repoint at a different machine.
+    // Whether the host is a literal address rather than a name, which is the
+    // part a DNS answer cannot repoint at a different machine.
     pub fn is_ip_literal(&self) -> bool {
         self.ip_literal
     }
@@ -357,9 +357,9 @@ impl std::error::Error for HttpAuthorityError {}
 #[derive(Debug, Clone)]
 pub struct RuntimeSecurityConfig {
     pub http_bind_address: IpAddr,
-    /// Which layer supplied [`Self::http_bind_address`]. Starts as the
-    /// environment's answer and is settled by [`Self::apply_stored_bind_address`]
-    /// once the database is open.
+    // Which layer supplied [`Self::http_bind_address`]. Starts as the
+    // environment's answer and is settled by [`Self::apply_stored_bind_address`]
+    // once the database is open.
     pub bind_address_source: BindAddressSource,
     pub http_allowed_hosts: Vec<HttpAuthority>,
     pub metrics_auth_required: bool,
@@ -370,47 +370,47 @@ pub struct RuntimeSecurityConfig {
     pub nzb_decompressed_limit_bytes: u64,
     pub rss_allow_private_network: bool,
     pub strict_security: bool,
-    /// An explicit authenticated policy disables the legacy CIDR browser
-    /// administrator bypass. CIDRs may constrain remembered sessions, but do
-    /// not create authority on their own.
+    // An explicit authenticated policy disables the legacy CIDR browser
+    // administrator bypass. CIDRs may constrain remembered sessions, but do
+    // not create authority on their own.
     authenticated_access_mode: Arc<AtomicBool>,
     remembered_policy_valid: Arc<AtomicBool>,
     access_mode_env_pinned: bool,
-    /// Behind a shared lock so a setup or policy change grants (or revokes)
-    /// trust immediately in every clone spread through the router layers — a
-    /// wizard that picks "no login" must be able to admit the very next
-    /// request, not the next restart.
+    // Behind a shared lock so a setup or policy change grants (or revokes)
+    // trust immediately in every clone spread through the router layers — a
+    // wizard that picks "no login" must be able to admit the very next
+    // request, not the next restart.
     trusted_cidrs: Arc<RwLock<Vec<IpNet>>>,
     authenticated_network_policy: Arc<RwLock<Option<NetworkPolicySnapshot>>>,
     pub network_policy_update_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Wakes open browser sockets admitted through the trust list, so a
-    /// narrowed policy reaches them as well as the next request.
+    // Wakes open browser sockets admitted through the trust list, so a
+    // narrowed policy reaches them as well as the next request.
     trust_changes: Arc<tokio::sync::watch::Sender<()>>,
-    /// True once the operator's browser-access policy is settled, shared across
-    /// clones for the same reason the trust list is: the answer decides whether
-    /// a credential-less visitor is shown the first-run wizard, and a wizard
-    /// that just finished must stop being offered on the very next request.
-    ///
-    /// It is deliberately NOT "has trust" or "has credentials": a configured
-    /// no-login instance has neither from an outside browser's point of view,
-    /// and that is exactly the install that would otherwise be handed an
-    /// uncompletable wizard forever.
+    // True once the operator's browser-access policy is settled, shared across
+    // clones for the same reason the trust list is: the answer decides whether
+    // a credential-less visitor is shown the first-run wizard, and a wizard
+    // that just finished must stop being offered on the very next request.
+    //
+    // It is deliberately NOT "has trust" or "has credentials": a configured
+    // no-login instance has neither from an outside browser's point of view,
+    // and that is exactly the install that would otherwise be handed an
+    // uncompletable wizard forever.
     security_configured: Arc<AtomicBool>,
-    /// True when `WEAVER_TRUSTED_CIDRS` supplied the list, which pins it: the
-    /// stored access mode is ignored and the UI shows the policy read-only.
+    // True when `WEAVER_TRUSTED_CIDRS` supplied the list, which pins it: the
+    // stored access mode is ignored and the UI shows the policy read-only.
     pub trust_env_pinned: bool,
-    /// Socket peers whose forwarding headers are believed, from
-    /// `WEAVER_TRUSTED_PROXIES`.
-    ///
-    /// Empty by default, and that default is the whole safety argument: a
-    /// forwarded address is judged only where an operator named the box that
-    /// sends it, so a direct deployment behaves exactly as it did before this
-    /// list existed. Unlike the trust list it needs no lock — a reverse proxy
-    /// belongs to the deployment, not to something a wizard edits at runtime.
+    // Socket peers whose forwarding headers are believed, from
+    // `WEAVER_TRUSTED_PROXIES`.
+    //
+    // Empty by default, and that default is the whole safety argument: a
+    // forwarded address is judged only where an operator named the box that
+    // sends it, so a direct deployment behaves exactly as it did before this
+    // list existed. Unlike the trust list it needs no lock — a reverse proxy
+    // belongs to the deployment, not to something a wizard edits at runtime.
     pub trusted_proxies: Vec<IpNet>,
-    /// Set when the process could not honor the configured bind address and
-    /// fell back to loopback instead of refusing to start. Shown as a banner
-    /// so the deviation is impossible to miss from the UI that still works.
+    // Set when the process could not honor the configured bind address and
+    // fell back to loopback instead of refusing to start. Shown as a banner
+    // so the deviation is impossible to miss from the UI that still works.
     pub bind_fallback: Option<String>,
 }
 
@@ -472,19 +472,19 @@ impl RuntimeSecurityConfig {
         Self::from_env().unwrap_or_default()
     }
 
-    /// Settle the bind address against the stored setting, now that the
-    /// database is readable.
-    ///
-    /// A no-op when the environment supplied an address: that layer wins, and
-    /// the stored value is left untouched rather than reconciled, so removing
-    /// the environment variable later restores whatever the operator last
-    /// chose in the UI instead of silently inheriting the deployment's value.
-    ///
-    /// Infallible by design: an unparsable stored value — a hand-edited
-    /// database, a restore from a different version — must never cost the
-    /// operator their process, because the process is the only thing that can
-    /// fix the value. It falls back to loopback and records the deviation in
-    /// [`Self::bind_fallback`] for the UI banner.
+    // Settle the bind address against the stored setting, now that the
+    // database is readable.
+    //
+    // A no-op when the environment supplied an address: that layer wins, and
+    // the stored value is left untouched rather than reconciled, so removing
+    // the environment variable later restores whatever the operator last
+    // chose in the UI instead of silently inheriting the deployment's value.
+    //
+    // Infallible by design: an unparsable stored value — a hand-edited
+    // database, a restore from a different version — must never cost the
+    // operator their process, because the process is the only thing that can
+    // fix the value. It falls back to loopback and records the deviation in
+    // [`Self::bind_fallback`] for the UI banner.
     pub fn apply_stored_bind_address(&mut self, stored: Option<&str>) {
         if matches!(self.bind_address_source, BindAddressSource::Environment) {
             return;
@@ -505,16 +505,16 @@ impl RuntimeSecurityConfig {
         }
     }
 
-    /// Settle the trusted networks against the stored access mode, now that
-    /// the database is readable.
-    ///
-    /// `WEAVER_TRUSTED_CIDRS` pins the list exactly like the bind variable
-    /// pins the address. Otherwise the mode is sugar over the list: trust
-    /// nothing, trust the stored networks, or trust loopback. Trust fails
-    /// CLOSED — an unparsable mode or network list yields an empty list plus a
-    /// warning, never accidental admission — the deliberate opposite of the
-    /// bind address's fail-open-to-loopback, because a bad bind value costs
-    /// reachability while a bad trust value would cost authentication.
+    // Settle the trusted networks against the stored access mode, now that
+    // the database is readable.
+    //
+    // `WEAVER_TRUSTED_CIDRS` pins the list exactly like the bind variable
+    // pins the address. Otherwise the mode is sugar over the list: trust
+    // nothing, trust the stored networks, or trust loopback. Trust fails
+    // CLOSED — an unparsable mode or network list yields an empty list plus a
+    // warning, never accidental admission — the deliberate opposite of the
+    // bind address's fail-open-to-loopback, because a bad bind value costs
+    // reachability while a bad trust value would cost authentication.
     pub fn apply_stored_trust(&self, mode: Option<&str>, stored_networks: Option<&str>) {
         if self.trust_env_pinned {
             // An environment-managed deployment declared its policy in the
@@ -564,8 +564,8 @@ impl RuntimeSecurityConfig {
         self.set_trusted_cidrs(networks);
     }
 
-    /// Replace the live trusted-network list, visible to every clone of this
-    /// config immediately.
+    // Replace the live trusted-network list, visible to every clone of this
+    // config immediately.
     pub fn set_trusted_cidrs(&self, networks: Vec<IpNet>) {
         if let Some(policy) = self
             .authenticated_network_policy
@@ -661,21 +661,21 @@ impl RuntimeSecurityConfig {
         self.remembered_policy_valid.store(valid, Ordering::Relaxed);
     }
 
-    /// Whether the operator's browser-access policy has been settled — by a
-    /// stored access mode, or by an environment that pins the trust list.
-    ///
-    /// The gate that keeps a configured install from re-offering the first-run
-    /// wizard to browsers it does not trust. Without it, "no credentials and
-    /// not a trusted peer" reads identically for a never-configured instance
-    /// and for a configured no-login one, and the second is then stuck: the
-    /// wizard renders on every visit and its endpoint refuses every submit.
+    // Whether the operator's browser-access policy has been settled — by a
+    // stored access mode, or by an environment that pins the trust list.
+    //
+    // The gate that keeps a configured install from re-offering the first-run
+    // wizard to browsers it does not trust. Without it, "no credentials and
+    // not a trusted peer" reads identically for a never-configured instance
+    // and for a configured no-login one, and the second is then stuck: the
+    // wizard renders on every visit and its endpoint refuses every submit.
     pub fn security_configured(&self) -> bool {
         self.security_configured.load(Ordering::Relaxed)
     }
 
-    /// Record that the browser-access policy is settled, visible to every clone
-    /// of this config immediately. Called by the two writers that can settle it
-    /// at runtime: the first-run wizard and the access-policy mutation.
+    // Record that the browser-access policy is settled, visible to every clone
+    // of this config immediately. Called by the two writers that can settle it
+    // at runtime: the first-run wizard and the access-policy mutation.
     pub fn mark_security_configured(&self) {
         self.security_configured.store(true, Ordering::Relaxed);
     }
@@ -684,22 +684,22 @@ impl RuntimeSecurityConfig {
         !self.trusted_cidrs().is_empty()
     }
 
-    /// Whether this process requires credentials for every browser
-    /// administrator session.
+    // Whether this process requires credentials for every browser
+    // administrator session.
     pub fn authenticated_access_mode(&self) -> bool {
         self.authenticated_access_mode.load(Ordering::Relaxed)
     }
 
-    /// Whether the operator explicitly requested authenticated access at startup.
+    // Whether the operator explicitly requested authenticated access at startup.
     pub fn access_mode_env_pinned(&self) -> bool {
         self.access_mode_env_pinned
     }
 
-    /// Resolve the authenticated policy after the settings table is readable.
-    /// Environment has precedence; otherwise a missing legacy access setting
-    /// is a fresh authenticated install and an explicit revision preserves a
-    /// completed migration. Existing explicit access modes retain legacy
-    /// semantics until the operator migrates them.
+    // Resolve the authenticated policy after the settings table is readable.
+    // Environment has precedence; otherwise a missing legacy access setting
+    // is a fresh authenticated install and an explicit revision preserves a
+    // completed migration. Existing explicit access modes retain legacy
+    // semantics until the operator migrates them.
     pub fn apply_stored_access_policy_revision(
         &self,
         legacy_access_mode: Option<&str>,
@@ -716,8 +716,8 @@ impl RuntimeSecurityConfig {
         );
     }
 
-    /// Record that the configured address could not be bound and the process
-    /// is serving on loopback instead.
+    // Record that the configured address could not be bound and the process
+    // is serving on loopback instead.
     pub fn note_bind_fallback(&mut self, reason: String) {
         self.http_bind_address = DEFAULT_HTTP_BIND_ADDRESS;
         self.bind_fallback = Some(reason);
@@ -771,12 +771,12 @@ impl RuntimeSecurityConfig {
         None
     }
 
-    /// Returns whether the immediate socket peer is inside an explicitly
-    /// trusted network, ignoring forwarding headers entirely.
-    ///
-    /// The raw socket test. Browser admission goes through
-    /// [`Self::is_trusted_client`] instead, which asks the same question about
-    /// the address the request is actually attributed to.
+    // Returns whether the immediate socket peer is inside an explicitly
+    // trusted network, ignoring forwarding headers entirely.
+    //
+    // The raw socket test. Browser admission goes through
+    // [`Self::is_trusted_client`] instead, which asks the same question about
+    // the address the request is actually attributed to.
     pub fn is_trusted_peer(&self, peer: Option<SocketAddr>) -> bool {
         let Some(peer) = peer else {
             return false;
@@ -784,13 +784,13 @@ impl RuntimeSecurityConfig {
         self.trusts_ip(canonical_ip(peer.ip()))
     }
 
-    /// Returns whether the address this request is attributed to is inside an
-    /// explicitly trusted network.
-    ///
-    /// This is what an operator means when they configure a trusted CIDR: the
-    /// machine the browser is on. Behind no proxy the answer is identical to
-    /// [`Self::is_trusted_peer`], because resolution falls back to the socket
-    /// peer whenever there is nothing trustworthy to prefer over it.
+    // Returns whether the address this request is attributed to is inside an
+    // explicitly trusted network.
+    //
+    // This is what an operator means when they configure a trusted CIDR: the
+    // machine the browser is on. Behind no proxy the answer is identical to
+    // [`Self::is_trusted_peer`], because resolution falls back to the socket
+    // peer whenever there is nothing trustworthy to prefer over it.
     pub fn is_trusted_client(&self, peer: Option<SocketAddr>, headers: &HeaderMap) -> bool {
         let Some(ip) = self.resolve_client_ip(peer, headers) else {
             return false;
@@ -804,13 +804,13 @@ impl RuntimeSecurityConfig {
             .any(|network| network.contains(&ip))
     }
 
-    /// Whether a browser page at `origin` may open this server's GraphQL socket.
-    ///
-    /// Cookies ride along on a socket upgrade from any page on the same site,
-    /// so the initiating page has to be this application, which only ever
-    /// serves its own bundled UI: the host the request was addressed to, the
-    /// host a configured proxy says it was addressed to, or a host the operator
-    /// named for this server.
+    // Whether a browser page at `origin` may open this server's GraphQL socket.
+    //
+    // Cookies ride along on a socket upgrade from any page on the same site,
+    // so the initiating page has to be this application, which only ever
+    // serves its own bundled UI: the host the request was addressed to, the
+    // host a configured proxy says it was addressed to, or a host the operator
+    // named for this server.
     pub fn is_websocket_origin_allowed(
         &self,
         origin: &str,
@@ -837,8 +837,8 @@ impl RuntimeSecurityConfig {
         })
     }
 
-    /// Returns whether this address is a proxy the operator named in
-    /// `WEAVER_TRUSTED_PROXIES`.
+    // Returns whether this address is a proxy the operator named in
+    // `WEAVER_TRUSTED_PROXIES`.
     pub fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
         let ip = canonical_ip(ip);
         self.trusted_proxies()
@@ -846,17 +846,17 @@ impl RuntimeSecurityConfig {
             .any(|network| network.contains(&ip))
     }
 
-    /// The address a request is attributed to: the socket peer, unless that
-    /// peer is a configured proxy, in which case the client its forwarding
-    /// headers name.
-    ///
-    /// Trusted hops are peeled off the RIGHT of `X-Forwarded-For` — the end a
-    /// proxy appends to — so a browser that sends its own header cannot name
-    /// itself: whatever it invents sits to the left of the entry the proxy
-    /// recorded, and the rightmost untrusted hop wins. A chain that is
-    /// missing, malformed, or entirely trusted falls back to the socket peer
-    /// rather than guessing, which is the same answer this returned before
-    /// proxies were configurable at all.
+    // The address a request is attributed to: the socket peer, unless that
+    // peer is a configured proxy, in which case the client its forwarding
+    // headers name.
+    //
+    // Trusted hops are peeled off the RIGHT of `X-Forwarded-For` — the end a
+    // proxy appends to — so a browser that sends its own header cannot name
+    // itself: whatever it invents sits to the left of the entry the proxy
+    // recorded, and the rightmost untrusted hop wins. A chain that is
+    // missing, malformed, or entirely trusted falls back to the socket peer
+    // rather than guessing, which is the same answer this returned before
+    // proxies were configurable at all.
     pub fn resolve_client_ip(
         &self,
         peer: Option<SocketAddr>,
@@ -901,14 +901,14 @@ impl RuntimeSecurityConfig {
         }
     }
 
-    /// Returns whether this request carried forwarding headers that were
-    /// deliberately not believed, because its socket peer is not a configured
-    /// proxy.
-    ///
-    /// The one signal that separates "your proxy is not configured" from "your
-    /// address is genuinely outside the trust list". Both look like the same
-    /// refusal from the browser's side, and only the first has a fix the
-    /// operator can act on.
+    // Returns whether this request carried forwarding headers that were
+    // deliberately not believed, because its socket peer is not a configured
+    // proxy.
+    //
+    // The one signal that separates "your proxy is not configured" from "your
+    // address is genuinely outside the trust list". Both look like the same
+    // refusal from the browser's side, and only the first has a fix the
+    // operator can act on.
     pub fn forwarding_headers_ignored(
         &self,
         peer: Option<SocketAddr>,
@@ -922,17 +922,17 @@ impl RuntimeSecurityConfig {
 const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 const REAL_IP_HEADER: &str = "x-real-ip";
 
-/// Ceiling on hops read from one request's chain. Real deployments stack a
-/// handful; anything past this is a client behind a trusted proxy trying to
-/// make Weaver allocate on its behalf, and is discarded as malformed.
+// Ceiling on hops read from one request's chain. Real deployments stack a
+// handful; anything past this is a client behind a trusted proxy trying to
+// make Weaver allocate on its behalf, and is discarded as malformed.
 const MAX_FORWARDED_HOPS: usize = 32;
 
-/// Every hop named by every `X-Forwarded-For` header, left to right.
-///
-/// `Err` means the chain is malformed. Callers fall back to the socket peer on
-/// that, rather than using the entries they could parse: half a chain cannot
-/// be peeled from the right, and pretending otherwise is how a forged prefix
-/// would be believed.
+// Every hop named by every `X-Forwarded-For` header, left to right.
+//
+// `Err` means the chain is malformed. Callers fall back to the socket peer on
+// that, rather than using the entries they could parse: half a chain cannot
+// be peeled from the right, and pretending otherwise is how a forged prefix
+// would be believed.
 fn forwarded_for_chain(headers: &HeaderMap) -> Result<Vec<IpAddr>, ()> {
     let mut hops = Vec::new();
     for value in headers.get_all(FORWARDED_FOR_HEADER) {
@@ -950,8 +950,8 @@ fn forwarded_for_chain(headers: &HeaderMap) -> Result<Vec<IpAddr>, ()> {
     Ok(hops)
 }
 
-/// The client address from the single-hop forwarding headers, for proxies that
-/// send one of those and no `X-Forwarded-For`.
+// The client address from the single-hop forwarding headers, for proxies that
+// send one of those and no `X-Forwarded-For`.
 fn single_forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
     if let Some(ip) = headers
         .get(REAL_IP_HEADER)
@@ -976,9 +976,9 @@ fn single_forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
         })
 }
 
-/// A browser `Origin`, reduced to the authority it was served from.
+// A browser `Origin`, reduced to the authority it was served from.
 struct PageOrigin {
-    /// Always carries a port: the explicit one, or the scheme's default.
+    // Always carries a port: the explicit one, or the scheme's default.
     authority: HttpAuthority,
     default_port: u16,
 }
@@ -1002,16 +1002,16 @@ impl PageOrigin {
         })
     }
 
-    /// Whether a request addressed to `host` reached the server this page came
-    /// from. Browsers leave the scheme's default port out of `Host`.
+    // Whether a request addressed to `host` reached the server this page came
+    // from. Browsers leave the scheme's default port out of `Host`.
     fn is_served_at(&self, host: &HttpAuthority) -> bool {
         self.authority.host == host.host
             && self.authority.port == Some(host.port.unwrap_or(self.default_port))
     }
 }
 
-/// The host the client addressed, as the nearest proxy reported it: the first
-/// entry of the first `X-Forwarded-Host`.
+// The host the client addressed, as the nearest proxy reported it: the first
+// entry of the first `X-Forwarded-Host`.
 fn forwarded_host(headers: &HeaderMap) -> Option<HttpAuthority> {
     let mut values = headers.get_all("x-forwarded-host").iter();
     let value = values.next()?.to_str().ok()?;
@@ -1019,11 +1019,11 @@ fn forwarded_host(headers: &HeaderMap) -> Option<HttpAuthority> {
     HttpAuthority::parse(first).ok()
 }
 
-/// Whether anything in this request looks like it came through a proxy.
-///
-/// Wider than the headers resolution actually reads, because this only decides
-/// whether to tell an operator that a proxy is in the path — a proxy that sets
-/// nothing but `X-Forwarded-Proto` still leaves them stuck on the same page.
+// Whether anything in this request looks like it came through a proxy.
+//
+// Wider than the headers resolution actually reads, because this only decides
+// whether to tell an operator that a proxy is in the path — a proxy that sets
+// nothing but `X-Forwarded-Proto` still leaves them stuck on the same page.
 fn has_forwarding_headers(headers: &HeaderMap) -> bool {
     headers.contains_key(FORWARDED_FOR_HEADER)
         || headers.contains_key(REAL_IP_HEADER)
@@ -1032,10 +1032,10 @@ fn has_forwarding_headers(headers: &HeaderMap) -> bool {
         || headers.contains_key("x-forwarded-proto")
 }
 
-/// One forwarding-header address: bare, `host:port`, or bracketed IPv6, which
-/// are the three shapes RFC 7239 and the `X-` headers put in the field.
-/// Returned canonical so an IPv4-mapped hop compares equal to the same address
-/// written plainly.
+// One forwarding-header address: bare, `host:port`, or bracketed IPv6, which
+// are the three shapes RFC 7239 and the `X-` headers put in the field.
+// Returned canonical so an IPv4-mapped hop compares equal to the same address
+// written plainly.
 fn parse_forwarded_token(raw: &str) -> Option<IpAddr> {
     let token = raw.trim().trim_matches('"');
     if token.is_empty() || token.eq_ignore_ascii_case("unknown") {
@@ -1185,13 +1185,13 @@ fn parse_trusted_cidrs_env() -> Result<Vec<IpNet>, SecurityConfigError> {
         .collect()
 }
 
-/// Parse `WEAVER_TRUSTED_PROXIES`: a comma-separated list of addresses or
-/// CIDRs naming the proxies whose forwarding headers may be believed.
-///
-/// All-or-nothing like the trust list, and for a louder reason: a typo that
-/// was quietly skipped would leave the operator staring at the same refusal
-/// page with no sign that the variable they set was ignored. Refusing to start
-/// puts the bad entry in front of them instead.
+// Parse `WEAVER_TRUSTED_PROXIES`: a comma-separated list of addresses or
+// CIDRs naming the proxies whose forwarding headers may be believed.
+//
+// All-or-nothing like the trust list, and for a louder reason: a typo that
+// was quietly skipped would leave the operator staring at the same refusal
+// page with no sign that the variable they set was ignored. Refusing to start
+// puts the bad entry in front of them instead.
 fn parse_trusted_proxies_env() -> Result<Vec<IpNet>, SecurityConfigError> {
     let Ok(value) = env::var(ENV_TRUSTED_PROXIES) else {
         return Ok(Vec::new());
@@ -2039,8 +2039,8 @@ mod tests {
         Some(value.parse().unwrap())
     }
 
-    /// The default state, and the one that must not change: with no proxy
-    /// configured, a forwarding header is a string an attacker chose.
+    // The default state, and the one that must not change: with no proxy
+    // configured, a forwarding header is a string an attacker chose.
     #[test]
     fn forwarding_headers_are_ignored_without_a_configured_proxy() {
         let config = proxied(&["192.168.1.0/24"], &[]);
@@ -2054,8 +2054,8 @@ mod tests {
         assert!(config.forwarding_headers_ignored(peer("203.0.113.9:4000"), &headers));
     }
 
-    /// The case this exists for: an operator names their reverse proxy, and a
-    /// trusted CIDR then means the browser's machine rather than the proxy's.
+    // The case this exists for: an operator names their reverse proxy, and a
+    // trusted CIDR then means the browser's machine rather than the proxy's.
     #[test]
     fn a_configured_proxy_resolves_the_browser_address() {
         let config = proxied(&["192.168.1.0/24"], &["172.20.0.5"]);
@@ -2073,8 +2073,8 @@ mod tests {
         assert!(!config.forwarding_headers_ignored(proxy, &headers));
     }
 
-    /// Hops are peeled from the right, so a client that forges the header is
-    /// judged on the entry the proxy appended, never on the one it invented.
+    // Hops are peeled from the right, so a client that forges the header is
+    // judged on the entry the proxy appended, never on the one it invented.
     #[test]
     fn a_forged_prefix_cannot_name_the_client() {
         let config = proxied(&["192.168.1.0/24"], &["172.20.0.5"]);
@@ -2088,8 +2088,8 @@ mod tests {
         assert!(!config.is_trusted_client(proxy, &headers));
     }
 
-    /// A chain of configured proxies peels down to the first hop none of them
-    /// vouched for, across repeated headers as well as one comma list.
+    // A chain of configured proxies peels down to the first hop none of them
+    // vouched for, across repeated headers as well as one comma list.
     #[test]
     fn chained_proxies_peel_to_the_first_untrusted_hop() {
         let config = proxied(&["10.0.0.0/8"], &["172.20.0.0/16"]);
@@ -2104,8 +2104,8 @@ mod tests {
         );
     }
 
-    /// Missing, malformed, and all-trusted chains all fall back to the socket
-    /// peer — the answer this gave before proxies were configurable.
+    // Missing, malformed, and all-trusted chains all fall back to the socket
+    // peer — the answer this gave before proxies were configurable.
     #[test]
     fn unusable_chains_fall_back_to_the_socket_peer() {
         let config = proxied(&[], &["172.20.0.5"]);
@@ -2133,8 +2133,8 @@ mod tests {
         assert_eq!(config.resolve_client_ip(None, &HeaderMap::new()), None);
     }
 
-    /// Proxies that send one address instead of a chain are believed too, but
-    /// only in the absence of `X-Forwarded-For`, which stays authoritative.
+    // Proxies that send one address instead of a chain are believed too, but
+    // only in the absence of `X-Forwarded-For`, which stays authoritative.
     #[test]
     fn single_address_headers_serve_proxies_that_send_no_chain() {
         let config = proxied(&["192.168.1.0/24"], &["172.20.0.5"]);
@@ -2163,8 +2163,8 @@ mod tests {
         );
     }
 
-    /// Both sides of a comparison are canonicalised, so the dual-stack mapped
-    /// form of an address matches the plain form in either position.
+    // Both sides of a comparison are canonicalised, so the dual-stack mapped
+    // form of an address matches the plain form in either position.
     #[test]
     fn proxy_and_client_matching_see_through_the_ipv4_mapped_form() {
         let config = proxied(&["192.168.1.0/24"], &["172.20.0.5"]);

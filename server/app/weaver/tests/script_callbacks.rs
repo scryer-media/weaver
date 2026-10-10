@@ -1,9 +1,9 @@
-//! A running script calling weaver back: real scripts, the real supervisor,
-//! and the run's token played the way the API plays it.
-//!
-//! Each script stops at a gate once it has started, and while it waits there
-//! the test asks for things in its name, exactly as the GraphQL layer would
-//! with the token the script was handed.
+// A running script calling weaver back: real scripts, the real supervisor,
+// and the run's token played the way the API plays it.
+//
+// Each script stops at a gate once it has started, and while it waits there
+// the test asks for things in its name, exactly as the GraphQL layer would
+// with the token the script was handed.
 
 #![cfg(unix)]
 
@@ -30,12 +30,12 @@ use weaver_server_core::post_processing::test_run::start_script_test;
 use weaver_server_core::settings::{Config, SharedConfig};
 use weaver_server_core::{Database, JobId};
 
-/// Nothing listens here: the address is only handed to the script.
+// Nothing listens here: the address is only handed to the script.
 const API_URL: &str = "http://127.0.0.1:1/graphql";
 
 const DOWNLOADED: InstanceTrigger = InstanceTrigger::Queue(QueueEvent::NzbDownloaded);
 
-/// A database whose scripts may run, without an address to call back on.
+// A database whose scripts may run, without an address to call back on.
 fn setup_without_api() -> (Database, tempfile::TempDir) {
     let db = Database::open_in_memory().unwrap();
     let data = tempfile::tempdir().unwrap();
@@ -50,7 +50,7 @@ fn setup_without_api() -> (Database, tempfile::TempDir) {
     (db, data)
 }
 
-/// A database whose scripts may run and call back.
+// A database whose scripts may run and call back.
 fn setup() -> (Database, tempfile::TempDir) {
     let (db, data) = setup_without_api();
     db.set_script_api_url(API_URL);
@@ -64,7 +64,7 @@ fn script(db: &Database, name: &str, body: &str) -> ScriptName {
     ScriptName::new(name).unwrap()
 }
 
-/// Replaces the saved instances with one of each of `drafts`, in that order.
+// Replaces the saved instances with one of each of `drafts`, in that order.
 fn select(db: &Database, drafts: Vec<ScriptInstanceDraft>) -> Vec<ScriptInstance> {
     for instance in db.script_instances().unwrap() {
         assert!(db.delete_script_instance(&instance.id).unwrap());
@@ -79,7 +79,7 @@ fn on(trigger: InstanceTrigger, script: &ScriptName) -> ScriptInstanceDraft {
     ScriptInstanceDraft::new(script.clone(), trigger)
 }
 
-/// An active download 42 for commands to be applied to.
+// An active download 42 for commands to be applied to.
 fn job(db: &Database, directory: &Path) -> JobExecutionContext {
     db.create_active_job(&ActiveJob {
         job_id: JobId(42),
@@ -174,7 +174,7 @@ fn config(data: &Path) -> SharedConfig {
     }))
 }
 
-/// A pipe a test script stops at, so the test decides when the script goes on.
+// A pipe a test script stops at, so the test decides when the script goes on.
 fn gate(directory: &Path, name: &str) -> PathBuf {
     let path = directory.join(name);
     let made = std::process::Command::new("mkfifo")
@@ -185,22 +185,22 @@ fn gate(directory: &Path, name: &str) -> PathBuf {
     path
 }
 
-/// Lets the script stopped at `gate` go on. Returns once the script is there
-/// to be let through, however long it takes to arrive.
+// Lets the script stopped at `gate` go on. Returns once the script is there
+// to be let through, however long it takes to arrive.
 async fn open_gate(gate: PathBuf) {
     tokio::task::spawn_blocking(move || fs::write(gate, "go\n").unwrap())
         .await
         .unwrap();
 }
 
-/// What a script told the test about its run when it reached its first gate.
+// What a script told the test about its run when it reached its first gate.
 struct Started {
     run_id: String,
     token: String,
     api_url: String,
 }
 
-/// Returns once the script has written who it is to `gate`.
+// Returns once the script has written who it is to `gate`.
 async fn wait_at_gate(gate: PathBuf) -> Started {
     let written = tokio::task::spawn_blocking(move || fs::read_to_string(gate).unwrap())
         .await
@@ -214,7 +214,7 @@ async fn wait_at_gate(gate: PathBuf) -> Started {
     }
 }
 
-/// The lines a script writes to `started` before it stops at `release`.
+// The lines a script writes to `started` before it stops at `release`.
 fn announce_and_wait(started: &Path, release: &Path) -> String {
     format!(
         "printf '%s\\n%s\\n%s\\n' \"$WEAVER_RUN_ID\" \"${{WEAVER_RUN_TOKEN:-unset}}\" \"${{WEAVER_API_URL:-unset}}\" > '{}'\nread line < '{}'\n",

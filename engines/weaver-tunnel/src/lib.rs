@@ -1,10 +1,10 @@
-//! Weaver adapters for shared tunnels and consumer routing.
-//!
-//! SSH, WireGuard and HTTP/3 protocols live in the Git-pinned `proxy-tunnels` crate.
-//! This crate adapts persisted host-key trust and consumer outcomes, implements
-//! HTTP CONNECT/SOCKS5 upstream transports and routed DNS, and supplies owned
-//! revocable streams. NNTP uses direct in-process I/O; RSS uses authenticated
-//! loopback SOCKS bridges. The server owns policy, persistence and the runtime.
+// Weaver adapters for shared tunnels and consumer routing.
+//
+// SSH, WireGuard and HTTP/3 protocols live in the Git-pinned `proxy-tunnels` crate.
+// This crate adapts persisted host-key trust and consumer outcomes, implements
+// HTTP CONNECT/SOCKS5 upstream transports and routed DNS, and supplies owned
+// revocable streams. NNTP uses direct in-process I/O; RSS uses authenticated
+// loopback SOCKS bridges. The server owns policy, persistence and the runtime.
 
 pub mod bridge;
 pub mod direct;

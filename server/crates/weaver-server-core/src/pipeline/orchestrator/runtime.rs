@@ -22,26 +22,26 @@ fn compute_uu_spool_max_segments(write_buf_max_pending: usize) -> usize {
 
 impl Pipeline {
     const METRICS_SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-    /// The metrics tick while nothing is moving: often enough for the speed
-    /// gauges to decay and for a time-lifted dispatch gate to be noticed,
-    /// rare enough that an idle pipeline costs next to nothing.
+    // The metrics tick while nothing is moving: often enough for the speed
+    // gauges to decay and for a time-lifted dispatch gate to be noticed,
+    // rare enough that an idle pipeline costs next to nothing.
     pub(crate) const IDLE_SNAPSHOT_INTERVAL: std::time::Duration =
         std::time::Duration::from_secs(1);
     const STATE_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
     const SHUTDOWN_DRAIN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-    /// Bound on how long `drain` waits to join detached fire-and-forget writes.
+    // Bound on how long `drain` waits to join detached fire-and-forget writes.
     const FIRE_AND_FORGET_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const DOWNLOAD_COMPLETION_DRAIN_LIMIT: usize = 128;
-    /// Released results processed per orchestrator turn before the turn's
-    /// dispatch pass, barrier poll and chase reap run again. One result per
-    /// turn made every lane batch of 64 articles cost 64 full dispatch passes
-    /// that, with the lanes refilling themselves, almost never had a
-    /// connection to fill. Sixteen bounds the added dispatch latency to the
-    /// time it takes to ingest sixteen results while dividing the pass count
-    /// by the same factor.
+    // Released results processed per orchestrator turn before the turn's
+    // dispatch pass, barrier poll and chase reap run again. One result per
+    // turn made every lane batch of 64 articles cost 64 full dispatch passes
+    // that, with the lanes refilling themselves, almost never had a
+    // connection to fill. Sixteen bounds the added dispatch latency to the
+    // time it takes to ingest sixteen results while dividing the pass count
+    // by the same factor.
     const DOWNLOAD_RESULTS_PER_TURN: usize = 16;
 
-    /// Create a new pipeline.
+    // Create a new pipeline.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         cmd_rx: mpsc::Receiver<SchedulerCommand>,
@@ -616,10 +616,10 @@ impl Pipeline {
         crate::runtime::perf_probe::record("pipeline.db_fire_and_forget.submit", started.elapsed());
     }
 
-    /// Join all outstanding [`Self::db_fire_and_forget`] writes with a bounded
-    /// timeout so shutdown does not drop in-flight persistence. Called from
-    /// `drain` after the explicit awaited flushes. The JoinSet is moved out from
-    /// under the lock first so no lock is held across the await.
+    // Join all outstanding [`Self::db_fire_and_forget`] writes with a bounded
+    // timeout so shutdown does not drop in-flight persistence. Called from
+    // `drain` after the explicit awaited flushes. The JoinSet is moved out from
+    // under the lock first so no lock is held across the await.
     async fn join_fire_and_forget_tasks(&self) {
         let mut tasks = {
             let mut guard = self
@@ -648,20 +648,20 @@ impl Pipeline {
         self.nntp.pool().clone()
     }
 
-    /// The background free-space samplers for the data, intermediate and
-    /// complete roots, for readers outside the pipeline (metrics, the NZBGet
-    /// status). Reading them never touches the filesystem.
+    // The background free-space samplers for the data, intermediate and
+    // complete roots, for readers outside the pipeline (metrics, the NZBGet
+    // status). Reading them never touches the filesystem.
     pub fn storage_capacity(&self) -> Arc<crate::operations::StorageCapacity> {
         Arc::clone(&self.storage_capacity)
     }
 
-    /// Point the per-server metric counters at the servers of `nntp`.
-    ///
-    /// Called only when an NNTP runtime generation is activated (startup and
-    /// every `RebuildNntp`), never on an article path. The registry re-uses the
-    /// counters of any stable server id it has already seen, so a server that
-    /// survives a config reload keeps its lifetime totals even though its
-    /// runtime index may have moved.
+    // Point the per-server metric counters at the servers of `nntp`.
+    //
+    // Called only when an NNTP runtime generation is activated (startup and
+    // every `RebuildNntp`), never on an article path. The registry re-uses the
+    // counters of any stable server id it has already seen, so a server that
+    // survives a config reload keeps its lifetime totals even though its
+    // runtime index may have moved.
     pub(in crate::pipeline) fn activate_server_counters(
         metrics: &PipelineMetrics,
         nntp: &NntpClient,
@@ -894,16 +894,16 @@ impl Pipeline {
         self.retire_stalled_download_lanes(job_id)
     }
 
-    /// The periodic safety net for a completion check that no event
-    /// scheduled.
-    ///
-    /// Only a job that could be waiting on such a check is a candidate: one
-    /// queued or downloading whose queue has drained, one with parked runs
-    /// still to release, one with container sets in flight, or one in a phase
-    /// past the download. A queued or downloading candidate that looks
-    /// exactly as it did when this last checked it is skipped, and when
-    /// nothing at all has happened since the last pass the pass is skipped,
-    /// so an idle pipeline pays nothing here however many jobs it holds.
+    // The periodic safety net for a completion check that no event
+    // scheduled.
+    //
+    // Only a job that could be waiting on such a check is a candidate: one
+    // queued or downloading whose queue has drained, one with parked runs
+    // still to release, one with container sets in flight, or one in a phase
+    // past the download. A queued or downloading candidate that looks
+    // exactly as it did when this last checked it is skipped, and when
+    // nothing at all has happened since the last pass the pass is skipped,
+    // so an idle pipeline pays nothing here however many jobs it holds.
     pub(crate) async fn reconcile_candidate_jobs(&mut self) {
         if self.reconcile_clean && !self.pipeline_is_live() {
             return;
@@ -1018,10 +1018,10 @@ impl Pipeline {
         }
     }
 
-    /// Whether anything is moving: transfers, decodes, writes, phases past
-    /// the download, checks or container-set work in flight, or rate gauges
-    /// that have not yet settled to zero. Every term is a length or a flag,
-    /// so asking costs the same however many jobs and history rows exist.
+    // Whether anything is moving: transfers, decodes, writes, phases past
+    // the download, checks or container-set work in flight, or rate gauges
+    // that have not yet settled to zero. Every term is a length or a flag,
+    // so asking costs the same however many jobs and history rows exist.
     pub(crate) fn pipeline_is_live(&self) -> bool {
         self.active_downloads > 0
             || !self.active_download_connections_by_job.is_empty()
@@ -1459,13 +1459,13 @@ impl Pipeline {
         self.flush_pending_snapshot();
     }
 
-    /// Publish the download side's memory footprint.
-    ///
-    /// Both readings are walks — the dispatch reservations for the bytes, the
-    /// job order for the ranking — so they are taken on the snapshot tick and
-    /// never on an article path. The reservation map is the authoritative
-    /// record of articles handed to a lane and not yet reconciled, which is
-    /// exactly the raw bytes the lanes are holding.
+    // Publish the download side's memory footprint.
+    //
+    // Both readings are walks — the dispatch reservations for the bytes, the
+    // job order for the ranking — so they are taken on the snapshot tick and
+    // never on an article path. The reservation map is the authoritative
+    // record of articles handed to a lane and not yet reconciled, which is
+    // exactly the raw bytes the lanes are holding.
     fn publish_download_footprint_metrics(&self) {
         self.metrics.download_lane_inflight_bytes.store(
             self.rate_limit_reservations.values().sum::<u64>(),
@@ -1481,19 +1481,19 @@ impl Pipeline {
         );
     }
 
-    /// The pause demand, at the command seam.
-    ///
-    /// A paused job stops feeding the byte trigger and its sets go quiet, so
-    /// without this the last interval's coverage would sit uncheckpointed for
-    /// however long the pause lasts — and a pause is a common thing to do
-    /// *before* stopping the process. Demanded here rather than inside
-    /// `pause_job_runtime`, which is synchronous and is also the transition every
-    /// other pause path funnels through after the fact; the command is the point
-    /// where the intent is known and the job has not stopped yet.
-    /// Classified synchronously and by value: a `&SchedulerCommand` held across
-    /// the await below would make the whole pipeline future non-`Send`, because
-    /// the command carries reply channels whose payloads are `Send` but not
-    /// `Sync`.
+    // The pause demand, at the command seam.
+    //
+    // A paused job stops feeding the byte trigger and its sets go quiet, so
+    // without this the last interval's coverage would sit uncheckpointed for
+    // however long the pause lasts — and a pause is a common thing to do
+    // *before* stopping the process. Demanded here rather than inside
+    // `pause_job_runtime`, which is synchronous and is also the transition every
+    // other pause path funnels through after the fact; the command is the point
+    // where the intent is known and the job has not stopped yet.
+    // Classified synchronously and by value: a `&SchedulerCommand` held across
+    // the await below would make the whole pipeline future non-`Send`, because
+    // the command carries reply channels whose payloads are `Send` but not
+    // `Sync`.
     pub(crate) fn pause_barrier_scope(command: &SchedulerCommand) -> Option<Option<JobId>> {
         match command {
             SchedulerCommand::PauseJob { job_id, .. } => Some(Some(*job_id)),
@@ -1574,19 +1574,19 @@ impl Pipeline {
         }
     }
 
-    /// Publish the job snapshot unless one was already published inside the
-    /// debounce window; a suppressed publish is owed and caught up by the
-    /// metrics tick.
-    ///
-    /// The run loop turns once per pipeline event — every download result,
-    /// decode completion, and lane refill — and `list_jobs` rebuilds the whole
-    /// snapshot (per-job clones plus per-file walks) on each call, so an
-    /// unconditional per-turn publish scaled the orchestrator's overhead with
-    /// article rate. Bumping the revision also wakes every quota-parked retry
-    /// task, each of which re-reads its job from the published list; the same
-    /// window bounds that herd. Explicit callers — command handlers, status
-    /// transitions — keep the immediate `publish_snapshot` so user-visible
-    /// changes never wait on the window.
+    // Publish the job snapshot unless one was already published inside the
+    // debounce window; a suppressed publish is owed and caught up by the
+    // metrics tick.
+    //
+    // The run loop turns once per pipeline event — every download result,
+    // decode completion, and lane refill — and `list_jobs` rebuilds the whole
+    // snapshot (per-job clones plus per-file walks) on each call, so an
+    // unconditional per-turn publish scaled the orchestrator's overhead with
+    // article rate. Bumping the revision also wakes every quota-parked retry
+    // task, each of which re-reads its job from the published list; the same
+    // window bounds that herd. Explicit callers — command handlers, status
+    // transitions — keep the immediate `publish_snapshot` so user-visible
+    // changes never wait on the window.
     pub(crate) fn publish_snapshot_debounced(&mut self) {
         const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(100);
         if !self.snapshot_dirty && !self.snapshot_publish_pending {
@@ -1602,9 +1602,9 @@ impl Pipeline {
         self.publish_snapshot();
     }
 
-    /// The trailing edge of the debounce: publish a suppressed snapshot once
-    /// the periodic tick comes around, so the last event before a quiet spell
-    /// still reaches the UI.
+    // The trailing edge of the debounce: publish a suppressed snapshot once
+    // the periodic tick comes around, so the last event before a quiet spell
+    // still reaches the UI.
     pub(crate) fn flush_pending_snapshot(&mut self) {
         if self.snapshot_publish_pending {
             self.publish_snapshot();
@@ -1694,17 +1694,17 @@ impl Pipeline {
         }
     }
 
-    /// Re-enter a delayed retry into the download queue, dropping stale server
-    /// exclusions if the NNTP pool was rebuilt between scheduling and re-entry.
-    ///
-    /// `exclude_servers` holds pool indices computed under the generation the
-    /// retry was scheduled in. A `RebuildNntp` bumps `pool_generation` and can
-    /// reshape the pool (shrink/grow/reorder), so those indices may now point at
-    /// a different server — excluding the wrong one, or even falsely satisfying
-    /// the fill-servers-exhausted gate and spilling onto backfill. When the
-    /// generation no longer matches we discard the exclusions and let the retry
-    /// fall back to a clean attempt; retention excludes are recomputed fresh
-    /// from the new pool at order time, so nothing durable is lost.
+    // Re-enter a delayed retry into the download queue, dropping stale server
+    // exclusions if the NNTP pool was rebuilt between scheduling and re-entry.
+    //
+    // `exclude_servers` holds pool indices computed under the generation the
+    // retry was scheduled in. A `RebuildNntp` bumps `pool_generation` and can
+    // reshape the pool (shrink/grow/reorder), so those indices may now point at
+    // a different server — excluding the wrong one, or even falsely satisfying
+    // the fill-servers-exhausted gate and spilling onto backfill. When the
+    // generation no longer matches we discard the exclusions and let the retry
+    // fall back to a clean attempt; retention excludes are recomputed fresh
+    // from the new pool at order time, so nothing durable is lost.
     pub(in crate::pipeline) fn receive_retry_work(&mut self, retry: crate::pipeline::RetryWork) {
         let crate::pipeline::RetryWork {
             scheduled_pool_generation,
@@ -1733,19 +1733,19 @@ impl Pipeline {
         self.requeue_retry_work(work);
     }
 
-    /// Re-enters a retry that `note_retry_scheduled` booked, draining its
-    /// pending-retry counters before the work goes back on the queue.
+    // Re-enters a retry that `note_retry_scheduled` booked, draining its
+    // pending-retry counters before the work goes back on the queue.
     pub(crate) fn requeue_retry_work(&mut self, work: DownloadWork) {
         self.note_retry_requeued(work.segment_id);
         self.enqueue_download_work(work);
     }
 
-    /// Queues download work that no scheduled retry stands behind.
-    ///
-    /// Leaves the pending-retry counters alone: those count retries still in
-    /// flight, and the pass-end gates read the job-wide one. Draining it here
-    /// for fresh work would cancel some other segment's real pending retry and
-    /// let the download pass end before that retry fires.
+    // Queues download work that no scheduled retry stands behind.
+    //
+    // Leaves the pending-retry counters alone: those count retries still in
+    // flight, and the pass-end gates read the job-wide one. Draining it here
+    // for fresh work would cancel some other segment's real pending retry and
+    // let the download pass end before that retry fires.
     pub(crate) fn enqueue_download_work(&mut self, work: DownloadWork) {
         let job_id = work.segment_id.file_id.job_id;
         let segment_id = work.segment_id;
@@ -1978,31 +1978,31 @@ struct DiskWriteOwnerPool {
 }
 
 enum DiskSyncRequest {
-    /// One flush, off the owner thread. `file` is a duplicate of the owner's
-    /// cached handle, so the flush covers every byte written through the
-    /// original, and the owner's cache is untouched whether it succeeds or not.
+    // One flush, off the owner thread. `file` is a duplicate of the owner's
+    // cached handle, so the flush covers every byte written through the
+    // original, and the owner's cache is untouched whether it succeeds or not.
     Sync {
         path: std::path::PathBuf,
         file: std::fs::File,
         response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
     },
-    /// Answered once every sync queued before it has finished and dropped its
-    /// duplicate handle. A duplicate outliving the owner's close would keep
-    /// the file open past the close's acknowledgement — on Windows, a
-    /// delete-pending file whose path cannot be reused — so a close waits on
-    /// this after the owners have answered.
+    // Answered once every sync queued before it has finished and dropped its
+    // duplicate handle. A duplicate outliving the owner's close would keep
+    // the file open past the close's acknowledgement — on Windows, a
+    // delete-pending file whose path cannot be reused — so a close waits on
+    // this after the owners have answered.
     Fence(tokio::sync::oneshot::Sender<()>),
 }
 
-/// The flush a coverage barrier relies on.
-///
-/// `sync_data` everywhere, and on Apple platforms that is `fcntl(F_FULLFSYNC)`
-/// — the device barrier, which local volumes implement and which stays the
-/// call made. A mount that does not implement it — SMB is the common one —
-/// *refuses* it with `ENOTSUP`, and only that refusal is answered with the
-/// plain `fsync` such a mount does implement: the strongest promise it can
-/// make, and the same one every other platform's `sync_data` makes. Any other
-/// failure is a failed flush and is reported as one.
+// The flush a coverage barrier relies on.
+//
+// `sync_data` everywhere, and on Apple platforms that is `fcntl(F_FULLFSYNC)`
+// — the device barrier, which local volumes implement and which stays the
+// call made. A mount that does not implement it — SMB is the common one —
+// *refuses* it with `ENOTSUP`, and only that refusal is answered with the
+// plain `fsync` such a mount does implement: the strongest promise it can
+// make, and the same one every other platform's `sync_data` makes. Any other
+// failure is a failed flush and is reported as one.
 fn durable_sync(file: &std::fs::File) -> std::io::Result<()> {
     match file.sync_data() {
         #[cfg(target_vendor = "apple")]
@@ -2021,7 +2021,7 @@ fn durable_sync(file: &std::fs::File) -> std::io::Result<()> {
     }
 }
 
-/// The one path-to-thread mapping the owner and sync pools share.
+// The one path-to-thread mapping the owner and sync pools share.
 fn sync_index_for_path(path: &std::path::Path, threads: usize) -> usize {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -2029,9 +2029,9 @@ fn sync_index_for_path(path: &std::path::Path, threads: usize) -> usize {
     (hasher.finish() as usize) % threads
 }
 
-/// Sync threads, one per owner thread and routed by the same path hash, so
-/// two syncs of one file stay ordered while syncs of different files run in
-/// parallel — the same shape the writes have.
+// Sync threads, one per owner thread and routed by the same path hash, so
+// two syncs of one file stay ordered while syncs of different files run in
+// parallel — the same shape the writes have.
 fn disk_sync_senders() -> &'static [std::sync::mpsc::Sender<DiskSyncRequest>] {
     static SENDERS: std::sync::OnceLock<Vec<std::sync::mpsc::Sender<DiskSyncRequest>>> =
         std::sync::OnceLock::new();
@@ -2087,27 +2087,27 @@ enum DiskWriteCommand {
             Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError>,
         >,
     },
-    /// One direct-store destination's share of a routed article.
-    ///
-    /// Raw bytes rather than a `BufferedDecodedSegment`, because a routed run is
-    /// a *fragment* of an article: one decoded span is split across a member
-    /// partial and the set's envelope, and neither piece is a segment.
+    // One direct-store destination's share of a routed article.
+    //
+    // Raw bytes rather than a `BufferedDecodedSegment`, because a routed run is
+    // a *fragment* of an article: one decoded span is split across a member
+    // partial and the set's envelope, and neither piece is a segment.
     RawBatch {
         path: std::path::PathBuf,
         writes: Vec<(u64, Vec<bytes::Bytes>)>,
         queued_at: Instant,
         response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
     },
-    /// Durably syncs one destination. The owner thread only duplicates the
-    /// cached handle — no I/O — and hands the duplicate to a sync thread, so
-    /// the file's writes keep flowing while its dirty pages are flushed.
-    ///
-    /// Queued behind the batches submitted before it, which is all the
-    /// barrier needs: a coverage barrier only claims writes the owner has
-    /// already acknowledged, and a sync through any handle flushes the whole
-    /// inode. What it must **not** do is hold this thread for the flush's
-    /// duration: on a network share that is seconds per barrier, and every
-    /// write to the file — the download itself — would queue behind it.
+    // Durably syncs one destination. The owner thread only duplicates the
+    // cached handle — no I/O — and hands the duplicate to a sync thread, so
+    // the file's writes keep flowing while its dirty pages are flushed.
+    //
+    // Queued behind the batches submitted before it, which is all the
+    // barrier needs: a coverage barrier only claims writes the owner has
+    // already acknowledged, and a sync through any handle flushes the whole
+    // inode. What it must **not** do is hold this thread for the flush's
+    // duration: on a network share that is seconds per barrier, and every
+    // write to the file — the download itself — would queue behind it.
     SyncPath {
         path: std::path::PathBuf,
         response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
@@ -2116,9 +2116,11 @@ enum DiskWriteCommand {
         scope: CloseHandleScope,
         ack: Option<tokio::sync::oneshot::Sender<()>>,
     },
-    /// Close the cached handle for `path` and unlink the file, in that order
-    /// and on the closer thread, so the unlink never lands on an open file.
-    RemoveFile { path: std::path::PathBuf },
+    // Close the cached handle for `path` and unlink the file, in that order
+    // and on the closer thread, so the unlink never lands on an open file.
+    RemoveFile {
+        path: std::path::PathBuf,
+    },
 }
 
 #[derive(Clone)]
@@ -2203,9 +2205,9 @@ impl DiskWriteOwnerPool {
         })
     }
 
-    /// Queues one destination's sub-batch and hands back its completion. Split
-    /// from awaiting so a multi-path article submits every sub-batch first and
-    /// only then joins them — otherwise the fan-out would be a sequence.
+    // Queues one destination's sub-batch and hands back its completion. Split
+    // from awaiting so a multi-path article submits every sub-batch first and
+    // only then joins them — otherwise the fan-out would be a sequence.
     fn submit_raw_batch(
         &self,
         path: std::path::PathBuf,
@@ -2231,8 +2233,8 @@ impl DiskWriteOwnerPool {
         response_rx
     }
 
-    /// Queues one sync without waiting for it, so a caller with several
-    /// destinations can have them all in flight before it awaits any.
+    // Queues one sync without waiting for it, so a caller with several
+    // destinations can have them all in flight before it awaits any.
     fn submit_sync_path(
         &self,
         path: std::path::PathBuf,
@@ -2311,9 +2313,9 @@ fn disk_write_owner_pool() -> &'static DiskWriteOwnerPool {
     DISK_WRITE_OWNER_POOL.get_or_init(DiskWriteOwnerPool::new)
 }
 
-/// Drop the cached write handle for `path` on its owner thread, if any.
-/// Fire-and-forget: queued behind any in-flight batches for the path, so the
-/// handle closes only after those writes land.
+// Drop the cached write handle for `path` on its owner thread, if any.
+// Fire-and-forget: queued behind any in-flight batches for the path, so the
+// handle closes only after those writes land.
 pub(crate) fn release_cached_write_handle(path: &std::path::Path) {
     let Some(pool) = DISK_WRITE_OWNER_POOL.get() else {
         return;
@@ -2321,16 +2323,16 @@ pub(crate) fn release_cached_write_handle(path: &std::path::Path) {
     pool.release_handle(path);
 }
 
-/// Close the cached write handle for `path`, if any, then unlink the file,
-/// both on the closer thread in the order given. Fire-and-forget like
-/// [`release_cached_write_handle`], and queued behind it: a caller that
-/// released the path earlier gets the unlink after that close too.
-///
-/// This is the only way to delete a file the owner pool may still hold open.
-/// Unlinking it from the caller instead races the close, and on a network
-/// share the race is lost visibly: the file is renamed to a `.nfs…` sibling
-/// that refuses to be unlinked until the handle closes, and the directory
-/// it sits in cannot be removed until then.
+// Close the cached write handle for `path`, if any, then unlink the file,
+// both on the closer thread in the order given. Fire-and-forget like
+// [`release_cached_write_handle`], and queued behind it: a caller that
+// released the path earlier gets the unlink after that close too.
+//
+// This is the only way to delete a file the owner pool may still hold open.
+// Unlinking it from the caller instead races the close, and on a network
+// share the race is lost visibly: the file is renamed to a `.nfs…` sibling
+// that refuses to be unlinked until the handle closes, and the directory
+// it sits in cannot be removed until then.
 pub(crate) fn remove_file_after_cached_write_handle(path: &std::path::Path) {
     match DISK_WRITE_OWNER_POOL.get() {
         Some(pool) => pool.remove_file(path),
@@ -2338,11 +2340,11 @@ pub(crate) fn remove_file_after_cached_write_handle(path: &std::path::Path) {
     }
 }
 
-/// Close every cached write handle for paths under `dir` and wait until the
-/// owner threads acknowledge. Must be awaited before renaming, moving, or
-/// deleting a job's working files: working-dir paths are reused verbatim after
-/// deletion, and a stale cached handle would silently swallow a later job's
-/// writes into the old unlinked inode.
+// Close every cached write handle for paths under `dir` and wait until the
+// owner threads acknowledge. Must be awaited before renaming, moving, or
+// deleting a job's working files: working-dir paths are reused verbatim after
+// deletion, and a stale cached handle would silently swallow a later job's
+// writes into the old unlinked inode.
 pub(crate) async fn close_cached_write_handles_under(dir: &std::path::Path) {
     // A direct-store placement writing under `dir` right now would open its
     // destination again after the close, through a handle nothing then
@@ -2360,26 +2362,26 @@ struct CachedDiskWriteHandle {
     last_used: Instant,
 }
 
-/// Handles leaving an owner's cache, closed on the closer thread.
-///
-/// The last close of a freshly written file is where the kernel flushes its
-/// dirty pages (tens of milliseconds for a large file on macOS), and an owner
-/// thread serves every file that hashes to it. The owner hands the handle
-/// off so a completed file's
-/// flush never queues behind another file's writes. The closer is FIFO, so an
-/// `ack` is sent only once every close queued before it — including earlier
-/// fire-and-forget releases of the same path — has actually happened, which is
-/// what a rename or delete waiting on the ack needs on Windows.
+// Handles leaving an owner's cache, closed on the closer thread.
+//
+// The last close of a freshly written file is where the kernel flushes its
+// dirty pages (tens of milliseconds for a large file on macOS), and an owner
+// thread serves every file that hashes to it. The owner hands the handle
+// off so a completed file's
+// flush never queues behind another file's writes. The closer is FIFO, so an
+// `ack` is sent only once every close queued before it — including earlier
+// fire-and-forget releases of the same path — has actually happened, which is
+// what a rename or delete waiting on the ack needs on Windows.
 struct HandleCloseRequest {
     files: Vec<std::fs::File>,
     ack: Option<tokio::sync::oneshot::Sender<()>>,
-    /// A path to unlink once `files` are closed. An unlink that races the
-    /// close is not a delete on a network share: NFS renames a still-open
-    /// file to a `.nfs…` sibling and only removes that on the last close,
-    /// and the sibling refuses `unlink` with `EBUSY` until then — which is
-    /// how a job's staging directory outlives its own cleanup, empty. The
-    /// close and the unlink stay in FIFO order here, behind every earlier
-    /// close of the same path.
+    // A path to unlink once `files` are closed. An unlink that races the
+    // close is not a delete on a network share: NFS renames a still-open
+    // file to a `.nfs…` sibling and only removes that on the last close,
+    // and the sibling refuses `unlink` with `EBUSY` until then — which is
+    // how a job's staging directory outlives its own cleanup, empty. The
+    // close and the unlink stay in FIFO order here, behind every earlier
+    // close of the same path.
     remove: Option<std::path::PathBuf>,
 }
 
@@ -2403,10 +2405,10 @@ fn run_disk_handle_closer(rx: std::sync::mpsc::Receiver<HandleCloseRequest>) {
     }
 }
 
-/// Unlinks a scratch file whose cached handle is closed. One that is already
-/// gone is the outcome wanted; anything else is worth a line, since the file
-/// would otherwise sit in the job's staging directory until the job is
-/// removed.
+// Unlinks a scratch file whose cached handle is closed. One that is already
+// gone is the outcome wanted; anything else is worth a line, since the file
+// would otherwise sit in the job's staging directory until the job is
+// removed.
 fn remove_closed_file(path: &std::path::Path) {
     if let Err(error) = std::fs::remove_file(path)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -2422,7 +2424,7 @@ fn remove_closed_file(path: &std::path::Path) {
 #[derive(Default)]
 struct DiskWriteHandleCache {
     entries: std::collections::HashMap<std::path::PathBuf, CachedDiskWriteHandle>,
-    /// The closer thread's queue. `None` closes inline (tests).
+    // The closer thread's queue. `None` closes inline (tests).
     closer: Option<std::sync::mpsc::Sender<HandleCloseRequest>>,
 }
 
@@ -2460,9 +2462,9 @@ impl DiskWriteHandleCache {
         }
     }
 
-    /// Drop the handle for `path`, if any, and unlink the file once it is
-    /// closed. The request travels even with nothing cached: the unlink must
-    /// still queue behind an earlier fire-and-forget release of the path.
+    // Drop the handle for `path`, if any, and unlink the file once it is
+    // closed. The request travels even with nothing cached: the unlink must
+    // still queue behind an earlier fire-and-forget release of the path.
     fn close_and_remove(&mut self, path: &std::path::Path) {
         let files = self
             .entries
@@ -2472,8 +2474,8 @@ impl DiskWriteHandleCache {
         self.close_files(files, None, Some(path.to_path_buf()));
     }
 
-    /// Drop every handle `scope` matches. `ack` fires once they are closed,
-    /// and only after every close queued ahead of it.
+    // Drop every handle `scope` matches. `ack` fires once they are closed,
+    // and only after every close queued ahead of it.
     fn close_matching(
         &mut self,
         scope: &CloseHandleScope,
@@ -2500,10 +2502,10 @@ impl DiskWriteHandleCache {
         self.close_files(files, None, None);
     }
 
-    /// Hand `files` to the closer thread, or close them here when there is
-    /// none. An empty request still travels when it carries an ack or an
-    /// unlink: their promise is that earlier closes of the path have landed,
-    /// not that this call found something to close.
+    // Hand `files` to the closer thread, or close them here when there is
+    // none. An empty request still travels when it carries an ack or an
+    // unlink: their promise is that earlier closes of the path have landed,
+    // not that this call found something to close.
     fn close_files(
         &self,
         files: Vec<std::fs::File>,
@@ -2773,9 +2775,9 @@ fn write_segments_into_file(
     })
 }
 
-/// Writes every slice in order, retrying short and interrupted writes. On
-/// failure, reports how many bytes landed before the error so the caller can
-/// account for the fully-written prefix.
+// Writes every slice in order, retrying short and interrupted writes. On
+// failure, reports how many bytes landed before the error so the caller can
+// account for the fully-written prefix.
 fn write_all_vectored<W: std::io::Write>(
     file: &mut W,
     mut slices: &mut [std::io::IoSlice<'_>],
@@ -2804,20 +2806,20 @@ fn write_all_vectored<W: std::io::Write>(
     Ok(())
 }
 
-/// How many `IoSlice`s one `write_vectored` is given. `IOV_MAX` is 1024 on the
-/// platforms with a real vectored write, and a routed run can carry more pieces
-/// than that — one per decoded batch of every article in it. The budget keeps
-/// each syscall inside the limit, and the loop around it is what makes the
-/// count irrelevant: a run drains over as many calls as it takes.
+// How many `IoSlice`s one `write_vectored` is given. `IOV_MAX` is 1024 on the
+// platforms with a real vectored write, and a routed run can carry more pieces
+// than that — one per decoded batch of every article in it. The budget keeps
+// each syscall inside the limit, and the loop around it is what makes the
+// count irrelevant: a run drains over as many calls as it takes.
 const WRITE_IOV_BUDGET: usize = 256;
 
-/// One contiguous run, written in order at the current file position.
-///
-/// Chunked at [`WRITE_IOV_BUDGET`] and written in sequence, so the position
-/// carries from one chunk to the next and no chunk needs a seek of its own.
-/// `write_all_vectored` handles a short write inside a chunk, advancing across
-/// piece boundaries, so a writer that takes an arbitrary number of bytes per
-/// call still sees every byte exactly once and in order.
+// One contiguous run, written in order at the current file position.
+//
+// Chunked at [`WRITE_IOV_BUDGET`] and written in sequence, so the position
+// carries from one chunk to the next and no chunk needs a seek of its own.
+// `write_all_vectored` handles a short write inside a chunk, advancing across
+// piece boundaries, so a writer that takes an arbitrary number of bytes per
+// call still sees every byte exactly once and in order.
 fn write_run_vectored<W: std::io::Write>(
     file: &mut W,
     slices: &mut [std::io::IoSlice<'_>],
@@ -2885,32 +2887,32 @@ fn write_raw_batch_blocking(
     Ok(())
 }
 
-/// One routed article's fragments, grouped into one sub-batch per destination
-/// file: `(destination path, [(offset, pieces)])`.
-///
-/// A fragment's payload is a list of refcounted views of the decoder's own
-/// buffers rather than an owned copy, and the owner thread writes the views
-/// directly with a vectored write.
+// One routed article's fragments, grouped into one sub-batch per destination
+// file: `(destination path, [(offset, pieces)])`.
+//
+// A fragment's payload is a list of refcounted views of the decoder's own
+// buffers rather than an owned copy, and the owner thread writes the views
+// directly with a vectored write.
 pub(crate) type DirectWriteBatches = Vec<(std::path::PathBuf, Vec<(u64, Vec<bytes::Bytes>)>)>;
 
-/// The destinations each direct-store placement task is writing right now,
-/// keyed by a process-wide ticket number. A handle close waits on the ones
-/// under its root; see [`close_cached_write_handles_under`].
-///
-/// Process-wide rather than the pipeline's, because the closes that need it
-/// run on tasks of their own after the pipeline has let the job go.
+// The destinations each direct-store placement task is writing right now,
+// keyed by a process-wide ticket number. A handle close waits on the ones
+// under its root; see [`close_cached_write_handles_under`].
+//
+// Process-wide rather than the pipeline's, because the closes that need it
+// run on tasks of their own after the pipeline has let the job go.
 static DIRECT_PLACEMENTS_IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<PlacementsInFlight>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-/// Ticket number to the destinations a placement task claims and the watcher
-/// its ticket releases.
+// Ticket number to the destinations a placement task claims and the watcher
+// its ticket releases.
 type PlacementsInFlight = HashMap<u64, (Vec<std::path::PathBuf>, tokio::sync::watch::Receiver<()>)>;
 
 static NEXT_DIRECT_PLACEMENT_TICKET: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// A placement task's claim on its destinations. Dropped when the task's
-/// writes have all returned, which is what releases a close waiting on it.
+// A placement task's claim on its destinations. Dropped when the task's
+// writes have all returned, which is what releases a close waiting on it.
 pub(crate) struct DirectPlacementTicket {
     id: u64,
     _released: tokio::sync::watch::Sender<()>,
@@ -2924,9 +2926,9 @@ impl Drop for DirectPlacementTicket {
     }
 }
 
-/// Claims `paths` for a placement task about to write them. Taken on the
-/// pipeline task, before the writer is spawned, so a close the pipeline asks
-/// for afterwards always sees it.
+// Claims `paths` for a placement task about to write them. Taken on the
+// pipeline task, before the writer is spawned, so a close the pipeline asks
+// for afterwards always sees it.
 pub(crate) fn register_direct_placement(paths: Vec<std::path::PathBuf>) -> DirectPlacementTicket {
     let id = NEXT_DIRECT_PLACEMENT_TICKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (released, watcher) = tokio::sync::watch::channel(());
@@ -2939,7 +2941,7 @@ pub(crate) fn register_direct_placement(paths: Vec<std::path::PathBuf>) -> Direc
     }
 }
 
-/// Waits until no placement task is writing a destination under `dir`.
+// Waits until no placement task is writing a destination under `dir`.
 pub(crate) async fn wait_for_direct_placements_under(dir: &std::path::Path) {
     let mut watchers: Vec<tokio::sync::watch::Receiver<()>> =
         match DIRECT_PLACEMENTS_IN_FLIGHT.lock() {
@@ -2956,13 +2958,13 @@ pub(crate) async fn wait_for_direct_placements_under(dir: &std::path::Path) {
     }
 }
 
-/// Writes one routed article's fragments to **every** destination it touches,
-/// fanning the per-path sub-batches out to their owner threads and joining them
-/// all.
-///
-/// The article counts as placed only when every destination write returned;
-/// a partial failure is reported as an error and leaves orphan bytes, which is
-/// safe because the coverage map — not the bytes — is the truth.
+// Writes one routed article's fragments to **every** destination it touches,
+// fanning the per-path sub-batches out to their owner threads and joining them
+// all.
+//
+// The article counts as placed only when every destination write returned;
+// a partial failure is reported as an error and leaves orphan bytes, which is
+// safe because the coverage map — not the bytes — is the truth.
 pub(crate) async fn write_direct_batches(batches: DirectWriteBatches) -> std::io::Result<()> {
     if batches.is_empty() {
         return Ok(());
@@ -2992,18 +2994,18 @@ pub(crate) async fn write_direct_batches(batches: DirectWriteBatches) -> std::io
     }
 }
 
-/// Durably syncs every destination one coverage barrier touched, in parallel.
-///
-/// Same shape as [`write_direct_batches`], and for the same reason: every sync
-/// is queued to its owner thread before any of them is awaited. Envelope v2
-/// turned a barrier's sync set from two destinations into `members + volumes`,
-/// so awaiting them one at a time serialized `n` independent fsyncs behind each
-/// other on the pipeline task. The ordering guarantee is unchanged — the barrier
-/// still sees every sync's outcome before it persists anything.
-///
-/// The flush itself runs on a sync thread through a duplicate of the owner's
-/// handle (see [`DiskWriteCommand::SyncPath`]), so the destination keeps taking
-/// writes for as long as the flush lasts.
+// Durably syncs every destination one coverage barrier touched, in parallel.
+//
+// Same shape as [`write_direct_batches`], and for the same reason: every sync
+// is queued to its owner thread before any of them is awaited. Envelope v2
+// turned a barrier's sync set from two destinations into `members + volumes`,
+// so awaiting them one at a time serialized `n` independent fsyncs behind each
+// other on the pipeline task. The ordering guarantee is unchanged — the barrier
+// still sees every sync's outcome before it persists anything.
+//
+// The flush itself runs on a sync thread through a duplicate of the owner's
+// handle (see [`DiskWriteCommand::SyncPath`]), so the destination keeps taking
+// writes for as long as the flush lasts.
 pub(crate) async fn sync_direct_destinations(
     paths: Vec<std::path::PathBuf>,
 ) -> Vec<std::io::Result<()>> {
@@ -3086,8 +3088,8 @@ pub(crate) fn compute_decode_backlog_budget_bytes(
     target.min(memory_cap).max(1)
 }
 
-/// The memory both backlog budgets are carved from: available memory with a
-/// 256 MiB floor, capped by the container's limit when there is one.
+// The memory both backlog budgets are carved from: available memory with a
+// 256 MiB floor, capped by the container's limit when there is one.
 fn backlog_memory_ceiling_bytes(profile: &SystemProfile) -> usize {
     let available_bytes = profile.memory.available_bytes.max(256 * 1024 * 1024);
     match profile.memory.cgroup_limit {
@@ -3139,9 +3141,9 @@ mod disk_write_handle_cache_tests {
         assert!(under.as_mut().poll(&mut cx).is_ready());
     }
 
-    /// Accepts a fixed number of bytes per call, whatever it was offered, so a
-    /// write lands in the middle of an `IoSlice` and the next call has to
-    /// resume there.
+    // Accepts a fixed number of bytes per call, whatever it was offered, so a
+    // write lands in the middle of an `IoSlice` and the next call has to
+    // resume there.
     struct ShortWriter {
         per_call: usize,
         written: Vec<u8>,
@@ -3307,8 +3309,8 @@ mod disk_write_handle_cache_tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
     }
 
-    /// Contiguous articles, multi-batch ones included, land through one
-    /// vectored write per run; a gap starts a new run at its own offset.
+    // Contiguous articles, multi-batch ones included, land through one
+    // vectored write per run; a gap starts a new run at its own offset.
     #[test]
     fn contiguous_runs_and_gaps_write_the_exact_bytes() {
         let temp = tempfile::tempdir().unwrap();
@@ -3411,10 +3413,10 @@ mod disk_write_handle_cache_tests {
         assert!(cache.entries.contains_key(&newest));
     }
 
-    /// With a closer attached, a close leaves the owner's cache at once and
-    /// the ack fires from the closer only after the handle is really gone —
-    /// including an ack that found nothing left to close, which must still
-    /// queue behind the earlier fire-and-forget release of the same path.
+    // With a closer attached, a close leaves the owner's cache at once and
+    // the ack fires from the closer only after the handle is really gone —
+    // including an ack that found nothing left to close, which must still
+    // queue behind the earlier fire-and-forget release of the same path.
     #[test]
     fn close_matching_hands_handles_to_the_closer_and_acks_after_close() {
         let temp = tempfile::tempdir().unwrap();
@@ -3454,10 +3456,10 @@ mod disk_write_handle_cache_tests {
         assert!(ack_rx.try_recv().is_ok());
     }
 
-    /// A removal leaves the owner's cache at once and reaches the closer as
-    /// one request that closes first and unlinks second, queued behind an
-    /// earlier release of the same path; the file is on disk until the
-    /// closer runs that request, and gone once it has.
+    // A removal leaves the owner's cache at once and reaches the closer as
+    // one request that closes first and unlinks second, queued behind an
+    // earlier release of the same path; the file is on disk until the
+    // closer runs that request, and gone once it has.
     #[test]
     fn close_and_remove_unlinks_on_the_closer_after_the_close() {
         let temp = tempfile::tempdir().unwrap();
@@ -3493,8 +3495,8 @@ mod disk_write_handle_cache_tests {
         assert!(!path.exists(), "the closer must unlink after closing");
     }
 
-    /// Without a closer the removal is inline, and a path with no cached
-    /// handle is still unlinked.
+    // Without a closer the removal is inline, and a path with no cached
+    // handle is still unlinked.
     #[test]
     fn close_and_remove_without_a_closer_unlinks_inline() {
         let temp = tempfile::tempdir().unwrap();
@@ -3512,13 +3514,13 @@ mod disk_write_handle_cache_tests {
         assert!(!uncached.exists());
     }
 
-    /// What the final move relies on: a removal queued before it closes a
-    /// root's handles is **done** by the time that close returns, on every
-    /// owner and on the closer, so the walk that follows never meets the file.
-    ///
-    /// Through the real pool: the files are written by it, so each handle is
-    /// cached on whichever owner its path hashes to, and enough of them that
-    /// the removals land on more than one owner.
+    // What the final move relies on: a removal queued before it closes a
+    // root's handles is **done** by the time that close returns, on every
+    // owner and on the closer, so the walk that follows never meets the file.
+    //
+    // Through the real pool: the files are written by it, so each handle is
+    // cached on whichever owner its path hashes to, and enough of them that
+    // the removals land on more than one owner.
     #[tokio::test]
     async fn a_removal_queued_before_a_root_close_is_done_when_the_close_returns() {
         let temp = tempfile::tempdir().unwrap();

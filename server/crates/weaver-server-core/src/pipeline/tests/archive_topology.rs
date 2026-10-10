@@ -183,13 +183,13 @@ async fn split_files_register_topology_when_completed() {
     ));
 }
 
-/// A split suffix is a declaration the post makes, and the topology keeps it
-/// as declared: a hole the recovery data later fills must restore the true
-/// count, so the count is never clamped to the parts in hand. What the
-/// declaration must never buy is work proportional to itself. Every consumer
-/// of `expected_volume_count` and of a member's volume range walks it only
-/// until the first missing volume, and nothing materializes the range, so a
-/// suffix in the hundreds of millions costs the same as one in the tens.
+// A split suffix is a declaration the post makes, and the topology keeps it
+// as declared: a hole the recovery data later fills must restore the true
+// count, so the count is never clamped to the parts in hand. What the
+// declaration must never buy is work proportional to itself. Every consumer
+// of `expected_volume_count` and of a member's volume range walks it only
+// until the first missing volume, and nothing materializes the range, so a
+// suffix in the hundreds of millions costs the same as one in the tens.
 #[tokio::test]
 async fn sevenz_split_suffix_far_past_the_named_parts_is_cheap_to_hold() {
     let temp_dir = tempfile::tempdir().unwrap();

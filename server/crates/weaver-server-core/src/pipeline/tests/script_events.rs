@@ -383,9 +383,9 @@ async fn a_late_queue_event_leaves_a_job_that_moved_on_alone() {
     assert!(!pipeline.queue_scripts_completed.contains(&job_id));
 }
 
-/// The live path: a job's last article is decoded by the real decode seam, and
-/// the completion check that follows must hold the job at the NZB_DOWNLOADED
-/// barrier instead of moving it to the complete folder.
+// The live path: a job's last article is decoded by the real decode seam, and
+// the completion check that follows must hold the job at the NZB_DOWNLOADED
+// barrier instead of moving it to the complete folder.
 #[tokio::test]
 async fn the_last_decode_of_a_downloaded_job_holds_the_nzb_downloaded_barrier() {
     let temp = tempfile::tempdir().unwrap();
@@ -438,10 +438,10 @@ async fn the_last_decode_of_a_downloaded_job_holds_the_nzb_downloaded_barrier() 
     );
 }
 
-/// The streamed shape: the job's last article was decoded on its download lane,
-/// and the completion pass runs while that article's download result is still
-/// booked as pending. The barrier must hold here all the same; this is the pass
-/// that otherwise moves the job to the complete folder.
+// The streamed shape: the job's last article was decoded on its download lane,
+// and the completion pass runs while that article's download result is still
+// booked as pending. The barrier must hold here all the same; this is the pass
+// that otherwise moves the job to the complete folder.
 #[tokio::test]
 async fn the_streamed_last_decode_of_a_downloaded_job_holds_the_nzb_downloaded_barrier() {
     let temp = tempfile::tempdir().unwrap();
@@ -507,8 +507,8 @@ async fn the_streamed_last_decode_of_a_downloaded_job_holds_the_nzb_downloaded_b
     );
 }
 
-/// An instance that blocks on a job's arrival keeps the job from downloading
-/// until its run has ended.
+// An instance that blocks on a job's arrival keeps the job from downloading
+// until its run has ended.
 #[tokio::test]
 async fn a_new_job_waits_for_the_instances_that_block_on_its_arrival() {
     let temp = tempfile::tempdir().unwrap();
@@ -560,8 +560,8 @@ async fn a_new_job_waits_for_the_instances_that_block_on_its_arrival() {
     assert!(!pipeline.held_for_added_scripts(job_id));
 }
 
-/// What a blocking arrival script asked for is in force before the job is let
-/// go, so a job it marked bad never starts downloading.
+// What a blocking arrival script asked for is in force before the job is let
+// go, so a job it marked bad never starts downloading.
 #[tokio::test]
 async fn a_job_marked_bad_on_arrival_fails_when_its_hold_ends() {
     let temp = tempfile::tempdir().unwrap();
@@ -593,7 +593,7 @@ async fn a_job_marked_bad_on_arrival_fails_when_its_hold_ends() {
     );
 }
 
-/// Scripts that could not be run at all decide nothing, so the job goes on.
+// Scripts that could not be run at all decide nothing, so the job goes on.
 #[tokio::test]
 async fn arrival_scripts_that_cannot_run_let_the_job_go() {
     let temp = tempfile::tempdir().unwrap();
@@ -612,8 +612,8 @@ async fn arrival_scripts_that_cannot_run_let_the_job_go() {
     ));
 }
 
-/// Only an instance that blocks, on this event, for this job's category, holds
-/// the job.
+// Only an instance that blocks, on this event, for this job's category, holds
+// the job.
 #[tokio::test]
 async fn a_new_job_starts_at_once_when_nothing_blocks_on_its_arrival() {
     let temp = tempfile::tempdir().unwrap();

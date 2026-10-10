@@ -1,7 +1,7 @@
-//! Waiting for targeted recovery instead of demoting
-//! The config surface, and sparse marking
-//! Encrypted direct-store
-//! The machinery encryption changes nothing about, asserted rather than
+// Waiting for targeted recovery instead of demoting
+// The config surface, and sparse marking
+// Encrypted direct-store
+// The machinery encryption changes nothing about, asserted rather than
 
 use super::*;
 
@@ -1436,11 +1436,11 @@ async fn an_interior_hole_sizes_the_repair_by_the_slices_it_actually_touches() {
 // The config surface, and sparse marking
 // ---------------------------------------------------------------------------
 
-/// Every other test here reaches for `set_gate`. This one comes through
-/// configuration, which is what the operator surface exposes: the
-/// `[direct_store]` table turns routing on, and turning it **off** at startup
-/// makes a restart ignore and sweep the mid-flight direct state and redownload
-/// the job conventionally.
+// Every other test here reaches for `set_gate`. This one comes through
+// configuration, which is what the operator surface exposes: the
+// `[direct_store]` table turns routing on, and turning it **off** at startup
+// makes a restart ignore and sweep the mid-flight direct state and redownload
+// the job conventionally.
 #[tokio::test]
 async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads() {
     use crate::settings::DirectStoreOverrides;
@@ -1566,9 +1566,9 @@ async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads(
     );
 }
 
-/// A destination that cannot be marked sparse demotes the set, and the refusal
-/// happens before the file holds a hole — so nothing it created is left on
-/// disk.
+// A destination that cannot be marked sparse demotes the set, and the refusal
+// happens before the file holds a hole — so nothing it created is left on
+// disk.
 #[tokio::test]
 async fn a_destination_that_cannot_be_marked_sparse_demotes_before_it_holds_a_hole() {
     use crate::pipeline::direct_store::sparse::SparseMarking;
@@ -1675,8 +1675,8 @@ async fn failed_direct_repair_placement(sparse_failure: bool) {
     assert!(!working_dir.join(&volumes[0].0).exists());
 }
 
-/// The same rule for the holds scratch, which the router creates itself rather
-/// than through the destination-preparation seam.
+// The same rule for the holds scratch, which the router creates itself rather
+// than through the destination-preparation seam.
 #[tokio::test]
 async fn a_holds_scratch_that_cannot_be_marked_sparse_demotes_the_set() {
     use crate::pipeline::direct_store::sparse::SparseMarking;

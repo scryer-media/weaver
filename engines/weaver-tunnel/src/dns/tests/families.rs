@@ -152,8 +152,8 @@ async fn both_successful_families_are_retained() {
     assert!(result.iter().any(IpAddr::is_ipv6));
 }
 
-/// A route that cannot carry anything: every dial is refused, or never
-/// completes.
+// A route that cannot carry anything: every dial is refused, or never
+// completes.
 struct DeadRoute {
     hang: bool,
     dials: Arc<Mutex<Vec<String>>>,

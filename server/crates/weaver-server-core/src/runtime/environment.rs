@@ -1,4 +1,4 @@
-//! Safe runtime-environment facts for troubleshooting surfaces.
+// Safe runtime-environment facts for troubleshooting surfaces.
 
 const DEPLOYMENT_ENV: &str = "WEAVER_DEPLOYMENT_ENV";
 

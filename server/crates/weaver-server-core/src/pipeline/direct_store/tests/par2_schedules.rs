@@ -1,4 +1,4 @@
-//! Coverage withdrawal and replacement through the real direct-volume adapter.
+// Coverage withdrawal and replacement through the real direct-volume adapter.
 use super::*;
 use crate::pipeline::tests::build_repairable_par2_set_for_files;
 use par2_rs::{Par2RepairSession, Par2RepairSessionOptions, Par2RepairStatus};

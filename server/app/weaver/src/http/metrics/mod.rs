@@ -1,17 +1,17 @@
-//! The Prometheus `/metrics` endpoint.
-//!
-//! Layout:
-//! - [`encode`] owns the text-exposition writer. A sample can only be written
-//!   through a [`encode::MetricFamily`], which is what makes "sample with no
-//!   HELP/TYPE" impossible to express.
-//! - [`catalog`] is the catalogue of every family the exporter can emit. It is
-//!   data, not code.
-//! - [`render`] turns a runtime snapshot into exposition text.
-//!
-//! Everything here runs at scrape time. Nothing in this module may add work to
-//! a pipeline path, and the brief hold of the NNTP health lock in
-//! [`collect_server_health`] reads fields only — every allocation happens
-//! before the lock is taken.
+// The Prometheus `/metrics` endpoint.
+//
+// Layout:
+// - [`encode`] owns the text-exposition writer. A sample can only be written
+//   through a [`encode::MetricFamily`], which is what makes "sample with no
+//   HELP/TYPE" impossible to express.
+// - [`catalog`] is the catalogue of every family the exporter can emit. It is
+//   data, not code.
+// - [`render`] turns a runtime snapshot into exposition text.
+//
+// Everything here runs at scrape time. Nothing in this module may add work to
+// a pipeline path, and the brief hold of the NNTP health lock in
+// [`collect_server_health`] reads fields only — every allocation happens
+// before the lock is taken.
 
 pub(super) mod catalog;
 pub(super) mod encode;
@@ -40,8 +40,8 @@ pub(super) use render::{
     render_prometheus_metrics_input,
 };
 
-/// Reasons the extraction guardrails refuse an archive entry, in the order
-/// `SchedulerHandle::get_extraction_rejections` returns their counters.
+// Reasons the extraction guardrails refuse an archive entry, in the order
+// `SchedulerHandle::get_extraction_rejections` returns their counters.
 pub(super) const EXTRACTION_REJECTION_REASONS: [&str; 9] = [
     "unsafe_path",
     "unsupported_entry",
@@ -54,7 +54,7 @@ pub(super) const EXTRACTION_REJECTION_REASONS: [&str; 9] = [
     "disk_reserve",
 ];
 
-/// Process start, captured when the exporter is built during startup.
+// Process start, captured when the exporter is built during startup.
 static PROCESS_START_EPOCH_SECONDS: OnceLock<f64> = OnceLock::new();
 
 fn process_start_epoch_seconds() -> f64 {
@@ -68,13 +68,13 @@ fn unix_epoch_seconds_now() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// A single reading of both clocks, used to place monotonic deadlines on the
-/// unix timeline.
-///
-/// `Instant` has no epoch of its own, so the wall clock is anchored once and
-/// each deadline's remaining monotonic distance is added to it. Sampling once
-/// per scrape also keeps a many-server render from making one clock syscall per
-/// server.
+// A single reading of both clocks, used to place monotonic deadlines on the
+// unix timeline.
+//
+// `Instant` has no epoch of its own, so the wall clock is anchored once and
+// each deadline's remaining monotonic distance is added to it. Sampling once
+// per scrape also keeps a many-server render from making one clock syscall per
+// server.
 #[derive(Clone, Copy)]
 struct EpochClock {
     epoch_seconds: f64,
@@ -89,8 +89,8 @@ impl EpochClock {
         }
     }
 
-    /// Deadlines already in the past collapse to zero, which is also what "no
-    /// deadline" renders as.
+    // Deadlines already in the past collapse to zero, which is also what "no
+    // deadline" renders as.
     fn epoch_seconds_at(self, deadline: Option<Instant>) -> f64 {
         let Some(deadline) = deadline else {
             return 0.0;
@@ -102,7 +102,7 @@ impl EpochClock {
     }
 }
 
-/// Immutable facts about this binary, rendered as `weaver_build_info` labels.
+// Immutable facts about this binary, rendered as `weaver_build_info` labels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct BuildInfo {
     pub(super) version: &'static str,
@@ -304,7 +304,7 @@ pub(super) async fn metrics_handler(
     ))
 }
 
-/// Coarse server health state, as a state-set label rather than a boolean.
+// Coarse server health state, as a state-set label rather than a boolean.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ServerStateKind {
     Healthy,
@@ -331,8 +331,8 @@ impl ServerStateKind {
     }
 }
 
-/// Why a server left the healthy state. `None` covers healthy and degraded,
-/// where the state machine records no distinguishing cause.
+// Why a server left the healthy state. `None` covers healthy and degraded,
+// where the state machine records no distinguishing cause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ServerStateReason {
     None,
@@ -366,10 +366,10 @@ impl ServerStateReason {
 }
 
 pub(super) struct ServerHealthInfo {
-    /// `host:port`, kept as the `server` label for backwards compatibility.
+    // `host:port`, kept as the `server` label for backwards compatibility.
     pub(super) label: String,
-    /// Stable durable server id as a decimal string, matching the `server_id`
-    /// label the transfer-policy metrics already used.
+    // Stable durable server id as a decimal string, matching the `server_id`
+    // label the transfer-policy metrics already used.
     pub(super) server_id: String,
     pub(super) host: String,
     pub(super) port: u16,
@@ -378,7 +378,7 @@ pub(super) struct ServerHealthInfo {
     pub(super) backfill: bool,
     pub(super) state: ServerStateKind,
     pub(super) state_reason: ServerStateReason,
-    /// Unix timestamp when the current cooldown/disable lifts; 0 when neither.
+    // Unix timestamp when the current cooldown/disable lifts; 0 when neither.
     pub(super) state_until_epoch_seconds: f64,
     pub(super) disable_count: u32,
     pub(super) success_count: u64,
@@ -396,7 +396,7 @@ pub(super) struct ServerHealthInfo {
     pub(super) address_plan: weaver_nntp::AddressPlanSnapshot,
 }
 
-/// Per-server facts gathered before the health lock is taken.
+// Per-server facts gathered before the health lock is taken.
 struct ServerPreamble {
     label: String,
     server_id: String,
@@ -415,8 +415,8 @@ struct ServerPreamble {
     address_plan: weaver_nntp::AddressPlanSnapshot,
 }
 
-/// Per-server facts read under the health lock. Every field is `Copy`: the
-/// lock is on the NNTP hot path, so nothing inside it may allocate.
+// Per-server facts read under the health lock. Every field is `Copy`: the
+// lock is on the NNTP hot path, so nothing inside it may allocate.
 #[derive(Clone, Copy)]
 struct ServerHealthReading {
     state: ServerStateKind,
@@ -560,7 +560,7 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
         .collect()
 }
 
-/// Which jobs earn their own `weaver_job_*` series under the configured mode.
+// Which jobs earn their own `weaver_job_*` series under the configured mode.
 pub(super) fn job_is_exported(status: &weaver_server_core::JobStatus, mode: PerJobSeries) -> bool {
     match mode {
         PerJobSeries::Off => false,

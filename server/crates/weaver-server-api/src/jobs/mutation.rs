@@ -1230,11 +1230,11 @@ async fn submit_uploaded_nzb(
     .await
 }
 
-/// The full remaining history listing returned by the delete mutations.
-///
-/// This is the same read surface as the `historyItems` query, so it applies the
-/// same exclusion: a job the scheduler still owns is not history, however it
-/// came to have a row.
+// The full remaining history listing returned by the delete mutations.
+//
+// This is the same read surface as the `historyItems` query, so it applies the
+// same exclusion: a job the scheduler still owns is not history, however it
+// came to have a row.
 async fn history_items_from_db(db: Database, live_jobs: HashSet<u64>) -> Result<Vec<HistoryItem>> {
     tokio::task::spawn_blocking(move || {
         let rows = crate::history::query::exclude_live_rows(

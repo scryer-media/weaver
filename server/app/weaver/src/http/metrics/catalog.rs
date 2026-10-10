@@ -1,8 +1,8 @@
-//! The metric catalogue: every family `/metrics` can emit, as data.
-//!
-//! Nothing outside this file may invent a metric name. Because the encoder
-//! only accepts a [`MetricFamily`], adding a series means adding an entry here,
-//! which in turn means it gets a HELP, a TYPE and a declared label set.
+// The metric catalogue: every family `/metrics` can emit, as data.
+//
+// Nothing outside this file may invent a metric name. Because the encoder
+// only accepts a [`MetricFamily`], adding a series means adding an entry here,
+// which in turn means it gets a HELP, a TYPE and a declared label set.
 
 use super::encode::{MetricFamily, MetricKind};
 
@@ -26,7 +26,7 @@ macro_rules! metric_families {
         #[allow(dead_code)]
         static CATALOG: &[&MetricFamily] = &[$(&$ident),*];
 
-        /// Every family the exporter is capable of emitting.
+        // Every family the exporter is capable of emitting.
         #[allow(dead_code)]
         pub(crate) fn metric_catalog() -> &'static [&'static MetricFamily] {
             CATALOG

@@ -1,10 +1,10 @@
-//! Bounded, sequential execution of a job's post-processing instances.
-//!
-//! This is the whole scheduler: a job runs its scripts one after another, and
-//! each script it waits for takes a turn from a semaphore sized by the
-//! concurrency setting. The semaphore's FIFO is the queue, so the setting is
-//! how many such scripts run at once across every job, and a job between two
-//! of its scripts holds no turn another job could use.
+// Bounded, sequential execution of a job's post-processing instances.
+//
+// This is the whole scheduler: a job runs its scripts one after another, and
+// each script it waits for takes a turn from a semaphore sized by the
+// concurrency setting. The semaphore's FIFO is the queue, so the setting is
+// how many such scripts run at once across every job, and a job between two
+// of its scripts holds no turn another job could use.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,13 +32,13 @@ pub const SCRIPT_OUTPUT_EVENT_KIND: &str = "PostProcessingScriptOutput";
 
 type CancellationRegistry = Arc<Mutex<HashMap<u64, watch::Sender<bool>>>>;
 
-/// Process-local post-processing counters.
-///
-/// The run/attempt tables that used to answer the `/metrics` scrape are gone,
-/// so the same series are served from the executor itself — the same shape as
-/// the duplicate-admission counters elsewhere in this crate. Gauges are exact;
-/// counters reset with the process, which is what a Prometheus counter contract
-/// already expects.
+// Process-local post-processing counters.
+//
+// The run/attempt tables that used to answer the `/metrics` scrape are gone,
+// so the same series are served from the executor itself — the same shape as
+// the duplicate-admission counters elsewhere in this crate. Gauges are exact;
+// counters reset with the process, which is what a Prometheus counter contract
+// already expects.
 mod counters {
     use super::AtomicU64;
 
@@ -103,7 +103,7 @@ fn record_script_metrics(result: &ScriptResult) {
     }
 }
 
-/// Guard that keeps a gauge honest across every early return.
+// Guard that keeps a gauge honest across every early return.
 struct GaugeGuard(&'static AtomicU64);
 
 impl GaugeGuard {
@@ -127,15 +127,15 @@ pub enum PostProcessingExecutorError {
     Shutdown,
 }
 
-/// What the job's post-processing produced.
+// What the job's post-processing produced.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct JobPostProcessingReport {
     pub summary: PostProcessingSummary,
     pub results: Vec<ScriptResult>,
 }
 
-/// The scripts root and the instances captured when a job enters
-/// post-processing. An instance's inputs are read when its turn comes.
+// The scripts root and the instances captured when a job enters
+// post-processing. An instance's inputs are read when its turn comes.
 #[derive(Clone)]
 pub struct PostProcessingJobAdmission {
     scripts_directory: PathBuf,
@@ -153,24 +153,24 @@ pub struct PostProcessingExecutor {
     db: Database,
     scripts_directory: Arc<RwLock<PathBuf>>,
     concurrency: Arc<Semaphore>,
-    /// Admission gate for the NZBGet facade's `pausepost`/`resumepost`, which is
-    /// the only reason a pause survives: it gates admission, never a running
-    /// script, exactly as the RPC has always behaved.
+    // Admission gate for the NZBGet facade's `pausepost`/`resumepost`, which is
+    // the only reason a pause survives: it gates admission, never a running
+    // script, exactly as the RPC has always behaved.
     paused: watch::Sender<bool>,
     cancellations: CancellationRegistry,
-    /// Test hook: integration tests point this at the built `weaver` binary,
-    /// because a test harness cannot serve as its own process supervisor.
+    // Test hook: integration tests point this at the built `weaver` binary,
+    // because a test harness cannot serve as its own process supervisor.
     #[doc(hidden)]
     supervisor_executable: Option<PathBuf>,
 }
 
-/// What became of one entry of a job's list.
+// What became of one entry of a job's list.
 enum Attempt {
-    /// The script ran. Its result and output are already kept.
+    // The script ran. Its result and output are already kept.
     Ran(ScriptResult),
-    /// The script is not a post-processing script.
+    // The script is not a post-processing script.
 
-    /// The script could not be started.
+    // The script could not be started.
     NotStarted(ScriptResult),
 }
 
@@ -193,9 +193,9 @@ impl Drop for CancellationRegistration {
 }
 
 impl PostProcessingExecutor {
-    /// `concurrency` is how many scripts that a job waits for may run at once.
-    /// It sizes the semaphore for the process lifetime; a changed setting takes
-    /// effect on the next restart, as it did before.
+    // `concurrency` is how many scripts that a job waits for may run at once.
+    // It sizes the semaphore for the process lifetime; a changed setting takes
+    // effect on the next restart, as it did before.
     pub fn new(db: Database, scripts_directory: PathBuf, concurrency: usize) -> Self {
         let (paused, _) = watch::channel(false);
         Self {
@@ -226,8 +226,8 @@ impl PostProcessingExecutor {
         *self.paused.borrow()
     }
 
-    /// Future post-processing jobs use `directory`; jobs that already entered
-    /// execution retain their admission-time snapshot.
+    // Future post-processing jobs use `directory`; jobs that already entered
+    // execution retain their admission-time snapshot.
     pub fn set_script_directory(&self, directory: PathBuf) {
         *self
             .scripts_directory
@@ -235,7 +235,7 @@ impl PostProcessingExecutor {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = directory;
     }
 
-    /// Snapshot the configured root for a post-processing admission.
+    // Snapshot the configured root for a post-processing admission.
     pub fn script_directory(&self) -> PathBuf {
         self.scripts_directory
             .read()
@@ -243,8 +243,8 @@ impl PostProcessingExecutor {
             .clone()
     }
 
-    /// Signal every in-flight script for `job_id` to stop, the ones nothing
-    /// waits for included. Returns whether a pass was there to stop.
+    // Signal every in-flight script for `job_id` to stop, the ones nothing
+    // waits for included. Returns whether a pass was there to stop.
     pub fn cancel_job(&self, job_id: u64) -> bool {
         self.db.cancel_background_scripts(job_id);
         let sender = self
@@ -262,15 +262,15 @@ impl PostProcessingExecutor {
         }
     }
 
-    /// One statement marking jobs that were mid-post-processing when weaver stopped.
+    // One statement marking jobs that were mid-post-processing when weaver stopped.
     pub fn recover_interrupted(&self) -> Result<u64, StateError> {
         let interrupted = self.db.recover_interrupted_post_processing()?;
         counters::INTERRUPTED.fetch_add(interrupted, Ordering::Relaxed);
         Ok(interrupted)
     }
 
-    /// The instances a job in `category` should run, without executing
-    /// anything.
+    // The instances a job in `category` should run, without executing
+    // anything.
     pub fn resolve_job_scripts(
         &self,
         category: Option<&str>,
@@ -279,7 +279,7 @@ impl PostProcessingExecutor {
             .script_instances_for(&ScriptEventLabel::PostProcessing, category)
     }
 
-    /// Capture the root and the instances for a newly admitted job.
+    // Capture the root and the instances for a newly admitted job.
     pub fn admit_job_scripts(
         &self,
         category: Option<&str>,
@@ -298,8 +298,8 @@ impl PostProcessingExecutor {
         Ok(self.db.post_processing_settings()?.execution_enabled)
     }
 
-    /// Run `scripts` for one job, sequentially, each on its own turn from the
-    /// concurrency semaphore.
+    // Run `scripts` for one job, sequentially, each on its own turn from the
+    // concurrency semaphore.
     pub async fn execute_job(
         &self,
         job_id: u64,
@@ -319,7 +319,7 @@ impl PostProcessingExecutor {
         .await
     }
 
-    /// Execute one already-admitted job from its immutable scripts-root snapshot.
+    // Execute one already-admitted job from its immutable scripts-root snapshot.
     pub async fn execute_job_at_script_directory(
         &self,
         scripts_directory: PathBuf,
@@ -342,7 +342,7 @@ impl PostProcessingExecutor {
         .await
     }
 
-    /// Execute one already-admitted job from its immutable configuration snapshot.
+    // Execute one already-admitted job from its immutable configuration snapshot.
     pub async fn execute_admitted_job(
         &self,
         job_id: u64,
@@ -543,8 +543,8 @@ impl PostProcessingExecutor {
         Ok(JobPostProcessingReport { summary, results })
     }
 
-    /// A turn among the scripts jobs wait for, or `None` when the job was
-    /// cancelled while it waited for one.
+    // A turn among the scripts jobs wait for, or `None` when the job was
+    // cancelled while it waited for one.
     async fn script_turn(
         &self,
         cancel_rx: &mut watch::Receiver<bool>,
@@ -559,9 +559,9 @@ impl PostProcessingExecutor {
         }
     }
 
-    /// Start an entry nothing waits for. It runs against the job as it stands
-    /// when its turn comes, and what it returns has no part in how the job's
-    /// post-processing ends.
+    // Start an entry nothing waits for. It runs against the job as it stands
+    // when its turn comes, and what it returns has no part in how the job's
+    // post-processing ends.
     fn start_background(
         &self,
         admission: &PostProcessingJobAdmission,
@@ -780,8 +780,8 @@ impl PostProcessingExecutor {
         self.record_job_event(job_id, SCRIPT_EVENT_KIND, &message);
     }
 
-    /// Take what the script prints and what it asks for through the API until
-    /// it has ended. Both are applied here, one at a time.
+    // Take what the script prints and what it asks for through the API until
+    // it has ended. Both are applied here, one at a time.
     async fn consume_script_events(
         &self,
         context: &mut JobExecutionContext,
@@ -835,8 +835,8 @@ impl PostProcessingExecutor {
         }
     }
 
-    /// Apply one command to the download. The context is left as it was when
-    /// the command is refused.
+    // Apply one command to the download. The context is left as it was when
+    // the command is refused.
     async fn apply_to_job(
         &self,
         context: &mut JobExecutionContext,
@@ -864,7 +864,7 @@ impl PostProcessingExecutor {
     }
 }
 
-/// Why execution is refused, or `None` when it may proceed.
+// Why execution is refused, or `None` when it may proceed.
 pub(crate) fn execution_refusal(
     settings: &super::model::PostProcessingSettings,
     strict_security: bool,

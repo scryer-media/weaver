@@ -1,4 +1,4 @@
-//! TCP proxy adapters. Only the proxy endpoint is resolved on the host.
+// TCP proxy adapters. Only the proxy endpoint is resolved on the host.
 use crate::{TunnelError, TunnelProvider, TunnelStream};
 use base64::Engine;
 use std::net::{IpAddr, SocketAddr};
@@ -24,12 +24,12 @@ fn failure(message: &'static str) -> TunnelError {
     TunnelError::Engine(message.into())
 }
 
-/// Why a proxy that was asked for a destination did not open a stream to it.
+// Why a proxy that was asked for a destination did not open a stream to it.
 #[derive(Debug)]
 pub(crate) enum ConnectFailure {
-    /// The proxy failed, refused, or answered out of turn.
+    // The proxy failed, refused, or answered out of turn.
     Proxy(TunnelError),
-    /// The proxy answered that it could not reach the destination.
+    // The proxy answered that it could not reach the destination.
     Unreachable(&'static str),
 }
 impl From<TunnelError> for ConnectFailure {
@@ -44,7 +44,7 @@ fn destination_unreachable(proxy: &str, reason: &str) -> TunnelError {
     ))
 }
 
-/// Establish a SOCKS5 CONNECT without resolving the destination locally.
+// Establish a SOCKS5 CONNECT without resolving the destination locally.
 pub async fn socks_connect<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
     stream: &mut S,
     host: &str,
@@ -60,7 +60,7 @@ pub async fn socks_connect<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
         })
 }
 
-/// Agree a method with a SOCKS5 proxy and authenticate when it has credentials.
+// Agree a method with a SOCKS5 proxy and authenticate when it has credentials.
 async fn socks_greet<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
     stream: &mut S,
     credentials: Option<(&str, &str)>,
@@ -101,7 +101,7 @@ async fn socks_greet<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
     Ok(())
 }
 
-/// Ask a greeted SOCKS5 proxy for the destination.
+// Ask a greeted SOCKS5 proxy for the destination.
 async fn socks_open<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
     stream: &mut S,
     host: &str,
@@ -169,7 +169,7 @@ pub fn socks_request(host: &str, port: u16) -> Result<Vec<u8>, TunnelError> {
 }
 
 impl TransportProxy {
-    /// Negotiate over the inner stage's stream, preserving its egress binding.
+    // Negotiate over the inner stage's stream, preserving its egress binding.
     pub async fn negotiate<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
         &self,
         stream: &mut S,
@@ -185,7 +185,7 @@ impl TransportProxy {
             })
     }
 
-    /// The proxy's own failure to reach a destination it was asked for.
+    // The proxy's own failure to reach a destination it was asked for.
     pub(crate) fn destination_unreachable(&self, reason: &str) -> TunnelError {
         destination_unreachable(
             match self.kind {
@@ -196,7 +196,7 @@ impl TransportProxy {
         )
     }
 
-    /// Everything the proxy asks of a client before it takes a destination.
+    // Everything the proxy asks of a client before it takes a destination.
     pub(crate) async fn greet<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
         &self,
         stream: &mut S,
@@ -215,8 +215,8 @@ impl TransportProxy {
         }
     }
 
-    /// Ask a greeted proxy for the destination, telling apart the proxy
-    /// failing from the proxy reporting that the destination did not answer.
+    // Ask a greeted proxy for the destination, telling apart the proxy
+    // failing from the proxy reporting that the destination did not answer.
     pub(crate) async fn connect<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
         &self,
         stream: &mut S,

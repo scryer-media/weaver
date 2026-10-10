@@ -1,8 +1,8 @@
-//! Integration tests for 7z archive support.
-//!
-//! These tests create real 7z archives using the system `7z` command,
-//! then verify that our classification, split reader, and sevenz-rust2
-//! extraction all work correctly end-to-end.
+// Integration tests for 7z archive support.
+//
+// These tests create real 7z archives using the system `7z` command,
+// then verify that our classification, split reader, and sevenz-rust2
+// extraction all work correctly end-to-end.
 
 use std::collections::HashMap;
 use std::fs;
@@ -19,7 +19,7 @@ use weaver_server_core::pipeline::archive::split_reader::SplitFileReader;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Create a temp dir with test files of known content.
+// Create a temp dir with test files of known content.
 fn create_test_files(dir: &Path) -> HashMap<String, Vec<u8>> {
     let mut files = HashMap::new();
 
@@ -41,7 +41,7 @@ fn create_test_files(dir: &Path) -> HashMap<String, Vec<u8>> {
     files
 }
 
-/// Run 7z with args, panic on failure.
+// Run 7z with args, panic on failure.
 fn run_7z(args: &[&str]) {
     let output = Command::new("7z")
         .args(args)
@@ -54,7 +54,7 @@ fn run_7z(args: &[&str]) {
     }
 }
 
-/// Extract a 7z archive using sevenz-rust2 and return (name -> content) map.
+// Extract a 7z archive using sevenz-rust2 and return (name -> content) map.
 fn extract_with_sevenz(
     source: impl std::io::Read + std::io::Seek,
     dest: &Path,
@@ -63,7 +63,7 @@ fn extract_with_sevenz(
     read_dir_contents(dest)
 }
 
-/// Read all files in a directory recursively into a map.
+// Read all files in a directory recursively into a map.
 fn read_dir_contents(dir: &Path) -> HashMap<String, Vec<u8>> {
     let mut result = HashMap::new();
     read_dir_recursive(dir, dir, &mut result);

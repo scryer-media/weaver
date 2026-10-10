@@ -4,9 +4,9 @@ use weaver_server_core::post_processing::executor::strict_security_enabled;
 use weaver_server_core::post_processing::listing::list_scripts;
 use weaver_server_core::post_processing::output::ScriptRunFilter;
 
-/// The scripts directory as it is now. A directory that cannot be read is not
-/// an error here: it is the reason every script job reports for being unable to
-/// run.
+// The scripts directory as it is now. A directory that cannot be read is not
+// an error here: it is the reason every script job reports for being unable to
+// run.
 pub(crate) fn directory_view(db: &Database) -> ScriptDirectoryView {
     ScriptDirectoryView::new(
         db.post_processing_script_directory()

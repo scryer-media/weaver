@@ -1,17 +1,17 @@
-//! SFV verification for jobs with no PAR2 set.
-//!
-//! A job carrying recovery data is adjudicated by PAR2 and never reaches this
-//! module. A job without it completes on the strength of whatever the wire
-//! happened to prove, which for uuencode — no per-article checksum exists in
-//! that encoding at all — is nothing. Vintage posts, the ones uuencode support
-//! unlocks, habitually ship a `.sfv`: one line per posted file, naming it and
-//! its CRC32. That listing is the only independent statement of what the
-//! payload should be, so where nothing else can rule, it rules.
-//!
-//! Two properties bound what this can claim. The listing is the *poster's*
-//! declaration, not recovery data, so a mismatch is terminal — there is nothing
-//! to repair from. And it covers only what it names: a payload file absent from
-//! every `.sfv` is left unverified rather than treated as suspect.
+// SFV verification for jobs with no PAR2 set.
+//
+// A job carrying recovery data is adjudicated by PAR2 and never reaches this
+// module. A job without it completes on the strength of whatever the wire
+// happened to prove, which for uuencode — no per-article checksum exists in
+// that encoding at all — is nothing. Vintage posts, the ones uuencode support
+// unlocks, habitually ship a `.sfv`: one line per posted file, naming it and
+// its CRC32. That listing is the only independent statement of what the
+// payload should be, so where nothing else can rule, it rules.
+//
+// Two properties bound what this can claim. The listing is the *poster's*
+// declaration, not recovery data, so a mismatch is terminal — there is nothing
+// to repair from. And it covers only what it names: a payload file absent from
+// every `.sfv` is left unverified rather than treated as suspect.
 
 use super::*;
 
@@ -22,35 +22,35 @@ use std::path::Path;
 
 use tokio::io::AsyncReadExt;
 
-/// Ceiling on the decoded size of a file this module will read as a checksum
-/// listing. A real `.sfv` is a few kilobytes; anything past this is a
-/// misclassified payload file and reading it would cost more than the
-/// verification is worth.
+// Ceiling on the decoded size of a file this module will read as a checksum
+// listing. A real `.sfv` is a few kilobytes; anything past this is a
+// misclassified payload file and reading it would cost more than the
+// verification is worth.
 const MAX_SFV_BYTES: u64 = 1024 * 1024;
-/// Per-job ceiling for obfuscated files that can be sampled as possible SFV
-/// listings. Named `.sfv` files bypass this discovery arm.
+// Per-job ceiling for obfuscated files that can be sampled as possible SFV
+// listings. Named `.sfv` files bypass this discovery arm.
 const MAX_OBFUSCATED_SFV_PROBES: usize = 1024;
-/// A release can split its checksums across several listings, but more than a
-/// handful is not useful evidence and makes completion work unbounded.
+// A release can split its checksums across several listings, but more than a
+// handful is not useful evidence and makes completion work unbounded.
 const MAX_SFV_LISTINGS_PER_JOB: usize = 16;
-/// Aggregate listing bytes accepted for one job. This remains independent of
-/// the per-listing ceiling so future changes cannot accidentally unbound the
-/// total work.
+// Aggregate listing bytes accepted for one job. This remains independent of
+// the per-listing ceiling so future changes cannot accidentally unbound the
+// total work.
 const MAX_SFV_LISTING_BYTES_PER_JOB: u64 = 16 * 1024 * 1024;
 
-/// Bounded probe length for identifying an obfuscated SFV file.
+// Bounded probe length for identifying an obfuscated SFV file.
 const SFV_PROBE_BYTES: u64 = 10_000;
 
-/// Stop inspecting after this many valid entries: that is enough
-/// evidence that the sampled text is an SFV listing, without making malformed
-/// content later in a long sample relevant to the decision.
+// Stop inspecting after this many valid entries: that is enough
+// evidence that the sampled text is an SFV listing, without making malformed
+// content later in a long sample relevant to the decision.
 const SFV_PROBE_CONFIDENCE_ENTRIES: usize = 10;
 
-/// Read buffer for the disk arm. Matches the completed-file re-read in the
-/// decode worker, which streams the same shape of file for the same reason.
+// Read buffer for the disk arm. Matches the completed-file re-read in the
+// decode worker, which streams the same shape of file for the same reason.
 const SFV_READ_BUFFER_BYTES: usize = 256 * 1024;
 
-/// Result of reading an SFV listing with its hard content ceiling.
+// Result of reading an SFV listing with its hard content ceiling.
 enum SfvListingRead {
     Contents(Vec<u8>),
     Oversized,
@@ -105,9 +105,9 @@ impl SfvScanBudget {
     }
 }
 
-/// Read just enough of an arbitrary completed file to conservatively identify
-/// an obfuscated SFV listing. The `take` limit, rather than metadata, is the
-/// authoritative bound.
+// Read just enough of an arbitrary completed file to conservatively identify
+// an obfuscated SFV listing. The `take` limit, rather than metadata, is the
+// authoritative bound.
 async fn read_sfv_probe(path: &Path) -> std::io::Result<Vec<u8>> {
     let file = tokio::fs::File::open(path).await?;
     let mut reader = file.take(SFV_PROBE_BYTES);
@@ -116,9 +116,9 @@ async fn read_sfv_probe(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(contents)
 }
 
-/// Read a selected listing without ever consuming more than one byte past the
-/// accepted maximum. That extra byte distinguishes an exact-limit listing from
-/// an oversized candidate without trusting the assembly's byte accounting.
+// Read a selected listing without ever consuming more than one byte past the
+// accepted maximum. That extra byte distinguishes an exact-limit listing from
+// an oversized candidate without trusting the assembly's byte accounting.
 async fn read_sfv_listing(path: &Path, max_bytes: u64) -> std::io::Result<SfvListingRead> {
     let file = tokio::fs::File::open(path).await?;
     let mut reader = file.take(max_bytes.saturating_add(1));
@@ -131,15 +131,15 @@ async fn read_sfv_listing(path: &Path, max_bytes: u64) -> std::io::Result<SfvLis
     }
 }
 
-/// The byte allowlist applied before trying to interpret a probe as
-/// text: selected ASCII controls plus printable and extended text bytes, but
-/// never DEL or binary controls.
+// The byte allowlist applied before trying to interpret a probe as
+// text: selected ASCII controls plus printable and extended text bytes, but
+// never DEL or binary controls.
 fn is_sfv_text_byte(byte: u8) -> bool {
     matches!(byte, 7 | 8 | 9 | 10 | 12 | 13 | 27) || (byte >= b' ' && byte != 0x7f)
 }
 
-/// A conservative SFV signature. This is only a
-/// discovery check; selected candidates are still parsed by `SfvCatalog`.
+// A conservative SFV signature. This is only a
+// discovery check; selected candidates are still parsed by `SfvCatalog`.
 fn looks_like_sfv_probe(bytes: &[u8]) -> bool {
     if bytes.iter().any(|byte| !is_sfv_text_byte(*byte)) {
         return false;
@@ -175,28 +175,28 @@ fn looks_like_sfv_probe(bytes: &[u8]) -> bool {
     valid_entries > 0
 }
 
-/// The union of one job's `.sfv` listings, keyed by lower-cased basename.
-///
-/// Basenames because a listing is written relative to wherever the release was
-/// packed — often with DOS separators — while the job's files are flat in the
-/// working directory; lower-cased because the same listing is routinely
-/// produced on a case-insensitive filesystem and the case it records is not
-/// evidence of anything.
+// The union of one job's `.sfv` listings, keyed by lower-cased basename.
+//
+// Basenames because a listing is written relative to wherever the release was
+// packed — often with DOS separators — while the job's files are flat in the
+// working directory; lower-cased because the same listing is routinely
+// produced on a case-insensitive filesystem and the case it records is not
+// evidence of anything.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct SfvCatalog {
     entries: BTreeMap<String, u32>,
-    /// Basenames listed more than once with *disagreeing* CRCs. The listing
-    /// contradicts itself about these, so neither value is evidence: the entry
-    /// is withdrawn and the file stays unverified rather than being judged
-    /// against a coin flip.
+    // Basenames listed more than once with *disagreeing* CRCs. The listing
+    // contradicts itself about these, so neither value is evidence: the entry
+    // is withdrawn and the file stays unverified rather than being judged
+    // against a coin flip.
     conflicting: BTreeSet<String>,
-    /// Lines that were neither blank, a comment, nor a well-formed
-    /// `name checksum` pair. Counted rather than rejected: a stray line in a
-    /// listing says nothing about the files the rest of it names.
+    // Lines that were neither blank, a comment, nor a well-formed
+    // `name checksum` pair. Counted rather than rejected: a stray line in a
+    // listing says nothing about the files the rest of it names.
     unparsable_lines: usize,
-    /// Well-formed entries whose basenames are not present in this job. They
-    /// are evidence about another release, so count them without retaining
-    /// their keys in the catalog.
+    // Well-formed entries whose basenames are not present in this job. They
+    // are evidence about another release, so count them without retaining
+    // their keys in the catalog.
     unrelated_entries: usize,
 }
 
@@ -265,10 +265,10 @@ impl SfvCatalog {
         }
     }
 
-    /// Fold another listing in. A job may post several `.sfv` files covering
-    /// different parts of the release; disagreement *between* listings is the
-    /// same contradiction as disagreement inside one and is withdrawn the same
-    /// way.
+    // Fold another listing in. A job may post several `.sfv` files covering
+    // different parts of the release; disagreement *between* listings is the
+    // same contradiction as disagreement inside one and is withdrawn the same
+    // way.
     #[cfg(test)]
     pub(super) fn merge(&mut self, other: Self) {
         for (basename, crc32) in other.entries {
@@ -315,9 +315,9 @@ fn insert_entry(
     }
 }
 
-/// The last path component, lower-cased. Both separators are honoured because
-/// a listing packed on Windows records `subdir\file.rar` and the same release
-/// unpacked elsewhere records `subdir/file.rar`.
+// The last path component, lower-cased. Both separators are honoured because
+// a listing packed on Windows records `subdir\file.rar` and the same release
+// unpacked elsewhere records `subdir/file.rar`.
 fn sfv_basename(name: &str) -> String {
     name.rsplit(['/', '\\'])
         .next()
@@ -326,13 +326,13 @@ fn sfv_basename(name: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Which arm produced a file's whole-file CRC32.
+// Which arm produced a file's whole-file CRC32.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SfvFileCrc {
-    /// Composed from the per-article CRC32s the wire already verified. No
-    /// content read happened.
+    // Composed from the per-article CRC32s the wire already verified. No
+    // content read happened.
     Combined(u32),
-    /// Streamed from the assembled file on disk.
+    // Streamed from the assembled file on disk.
     Read(u32),
 }
 
@@ -344,7 +344,7 @@ impl SfvFileCrc {
     }
 }
 
-/// Streaming CRC32 of a whole file. The disk arm's only I/O.
+// Streaming CRC32 of a whole file. The disk arm's only I/O.
 fn stream_crc32(path: &Path) -> std::io::Result<u32> {
     let mut file = File::open(path)?;
     let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
@@ -359,7 +359,7 @@ fn stream_crc32(path: &Path) -> std::io::Result<u32> {
     Ok(digest.finalize() as u32)
 }
 
-/// One completed job file, as the SFV arm needs it.
+// One completed job file, as the SFV arm needs it.
 #[derive(Clone)]
 struct SfvJobFile {
     file_id: NzbFileId,
@@ -376,12 +376,12 @@ fn sort_obfuscated_sfv_candidates(candidates: &mut [SfvJobFile]) {
 }
 
 impl Pipeline {
-    /// Verify a PAR2-less job against whatever `.sfv` listings it downloaded.
-    ///
-    /// Returns the named cause when a listed file failed — the caller fails the
-    /// job with it. `None` means "nothing to say": no listing, no PAR2-less
-    /// job, or every listed file matched (in which case the verdict has already
-    /// been recorded through the same family PAR2 verdicts use).
+    // Verify a PAR2-less job against whatever `.sfv` listings it downloaded.
+    //
+    // Returns the named cause when a listed file failed — the caller fails the
+    // job with it. `None` means "nothing to say": no listing, no PAR2-less
+    // job, or every listed file matched (in which case the verdict has already
+    // been recorded through the same family PAR2 verdicts use).
     pub(super) async fn verify_par2_less_job_with_sfv(&mut self, job_id: JobId) -> Option<String> {
         // SCOPE. The same "does this job have PAR2" question the completion
         // gate asks of itself a few hundred lines above (`par2_loaded`), asked
@@ -731,14 +731,14 @@ impl Pipeline {
         None
     }
 
-    /// One file's whole-file CRC32, cheap arm first.
-    ///
-    /// `None` means the file could not be measured at all — the listing names
-    /// it but there are no bytes to read.
-    ///
-    /// `consumed_by_extraction` says the file is a RAR volume an incremental
-    /// extraction already deleted. It changes only which evidence arm (a) will
-    /// accept, never what a CRC32 means.
+    // One file's whole-file CRC32, cheap arm first.
+    //
+    // `None` means the file could not be measured at all — the listing names
+    // it but there are no bytes to read.
+    //
+    // `consumed_by_extraction` says the file is a RAR volume an incremental
+    // extraction already deleted. It changes only which evidence arm (a) will
+    // accept, never what a CRC32 means.
     async fn sfv_file_crc32(
         &self,
         job_id: JobId,
@@ -806,17 +806,17 @@ impl Pipeline {
         }
     }
 
-    /// The composed whole-file CRC32, when the retained assembly evidence is
-    /// strong enough to license it.
-    ///
-    /// The three conditions are exactly the ones the retained-PAR2-session
-    /// evidence path already requires before it will stand a composed CRC32 in
-    /// for a content read (`contiguous_assembly_proven`): every part CRC
-    /// verified against the wire, no duplicate article, and placements that
-    /// prove a gap-free tiling. Weakening any of them would let a file that was
-    /// rewritten mid-assembly, or one whose articles carried no checksum at
-    /// all, claim a verdict the download never earned — so a file that fails
-    /// them falls to the disk arm rather than being admitted on a softer test.
+    // The composed whole-file CRC32, when the retained assembly evidence is
+    // strong enough to license it.
+    //
+    // The three conditions are exactly the ones the retained-PAR2-session
+    // evidence path already requires before it will stand a composed CRC32 in
+    // for a content read (`contiguous_assembly_proven`): every part CRC
+    // verified against the wire, no duplicate article, and placements that
+    // prove a gap-free tiling. Weakening any of them would let a file that was
+    // rewritten mid-assembly, or one whose articles carried no checksum at
+    // all, claim a verdict the download never earned — so a file that fails
+    // them falls to the disk arm rather than being admitted on a softer test.
     fn sfv_crc32_from_wire_evidence(
         &self,
         job_id: JobId,

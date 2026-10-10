@@ -1,50 +1,50 @@
-//! Per-cohort recovery planning.
-//!
-//! An interleaved set's global recovery indices are partitioned by
-//! `index % cohorts`. A block from the wrong cohort cannot repair this one's
-//! losses, so a window that fetches "any recovery article" can spend the whole
-//! byte budget on parity that will never be used. Everything here works from
-//! the engine's own `RecoveryRequirement` values; nothing infers capacity from
-//! a name, and a name only ever orders carriers: one whose advertised span
-//! holds no admissible index is fetched after the rest, never dropped.
+// Per-cohort recovery planning.
+//
+// An interleaved set's global recovery indices are partitioned by
+// `index % cohorts`. A block from the wrong cohort cannot repair this one's
+// losses, so a window that fetches "any recovery article" can spend the whole
+// byte budget on parity that will never be used. Everything here works from
+// the engine's own `RecoveryRequirement` values; nothing infers capacity from
+// a name, and a name only ever orders carriers: one whose advertised span
+// holds no admissible index is fetched after the rest, never dropped.
 
 use super::outcome::CohortDeficit;
 use par3_rs::session::RecoveryRequirement;
 use std::ops::Range;
 
-/// One deficient cohort's admissible index span and the exact indices the
-/// engine says are still to be asked for. A cohort in surplus never appears
-/// here.
+// One deficient cohort's admissible index span and the exact indices the
+// engine says are still to be asked for. A cohort in surplus never appears
+// here.
 #[derive(Debug, Clone)]
 pub(in crate::pipeline) struct CohortWindow {
     pub deficit: CohortDeficit,
-    /// Admissible global recovery-index span for the whole cohort.
+    // Admissible global recovery-index span for the whole cohort.
     pub indices: Range<u64>,
-    /// Exactly the indices this cohort still has to fetch: neither already
-    /// available nor already declared in flight. The engine derives these, so
-    /// nothing here re-counts congruence or re-subtracts what is held.
+    // Exactly the indices this cohort still has to fetch: neither already
+    // available nor already declared in flight. The engine derives these, so
+    // nothing here re-counts congruence or re-subtracts what is held.
     next: Vec<u64>,
-    /// Distinct compatible indices already held, inside `indices`. Carrier
-    /// exclusion needs these because a carrier may publish any admissible
-    /// index, not only the lowest ones the engine would ask for next.
+    // Distinct compatible indices already held, inside `indices`. Carrier
+    // exclusion needs these because a carrier may publish any admissible
+    // index, not only the lowest ones the engine would ask for next.
     held: Vec<u64>,
-    /// What still has to be asked for, as the engine counts it. This is
-    /// `additional` less whatever acquisition has already declared in flight,
-    /// so a reassessment mid-fetch never asks for the same index twice.
+    // What still has to be asked for, as the engine counts it. This is
+    // `additional` less whatever acquisition has already declared in flight,
+    // so a reassessment mid-fetch never asks for the same index twice.
     outstanding: u64,
 }
 
 impl CohortWindow {
-    /// Whether a carrier advertising `span` could supply anything this cohort
-    /// still wants. The engine names the indices it would ask for next, but a
-    /// carrier is free to publish any admissible index, so this walks the
-    /// overlap by congruence and stops at the first one not already held.
-    /// A cohort whose whole deficit is in flight wants nothing.
-    ///
-    /// `span` is what the carrier's name advertises. An interleaved set's
-    /// name can count rows within a cohort rather than global indices, so
-    /// the carrier is weighed under every reading and admitted if any holds
-    /// something this cohort still wants.
+    // Whether a carrier advertising `span` could supply anything this cohort
+    // still wants. The engine names the indices it would ask for next, but a
+    // carrier is free to publish any admissible index, so this walks the
+    // overlap by congruence and stops at the first one not already held.
+    // A cohort whose whole deficit is in flight wants nothing.
+    //
+    // `span` is what the carrier's name advertises. An interleaved set's
+    // name can count rows within a cohort rather than global indices, so
+    // the carrier is weighed under every reading and admitted if any holds
+    // something this cohort still wants.
     pub fn admits_span(&self, span: &Range<u64>) -> bool {
         if self.outstanding == 0 || self.deficit.cohorts == 0 {
             return false;
@@ -74,37 +74,37 @@ impl CohortWindow {
         false
     }
 
-    /// Whether this cohort's own span can no longer supply what it still needs.
-    /// The engine stops generating indices at the end of the admissible span,
-    /// so a short list is its exhaustion signal.
+    // Whether this cohort's own span can no longer supply what it still needs.
+    // The engine stops generating indices at the end of the admissible span,
+    // so a short list is its exhaustion signal.
     pub fn is_exhausted(&self) -> bool {
         self.outstanding != 0 && self.remaining() < self.outstanding
     }
 
-    /// The indices this cohort still has to fetch, lowest first. The engine
-    /// derives these; the coordinator reads them straight off the requirement
-    /// when it declares a window, so this accessor exists for the tests that
-    /// pin the derivation.
+    // The indices this cohort still has to fetch, lowest first. The engine
+    // derives these; the coordinator reads them straight off the requirement
+    // when it declares a window, so this accessor exists for the tests that
+    // pin the derivation.
     #[cfg(test)]
     pub fn next_indices(&self) -> &[u64] {
         &self.next
     }
 
-    /// How many indices this cohort still has to fetch.
+    // How many indices this cohort still has to fetch.
     pub fn remaining(&self) -> u64 {
         self.next.len() as u64
     }
 }
 
-/// The deficient cohorts of every retained assessment, and what they need.
+// The deficient cohorts of every retained assessment, and what they need.
 #[derive(Debug, Default, Clone)]
 pub(in crate::pipeline) struct CohortPlan {
     pub windows: Vec<CohortWindow>,
-    /// Sum of `additional * block_size` over the deficient cohorts.
+    // Sum of `additional * block_size` over the deficient cohorts.
     pub needed_bytes: u64,
-    /// Whether any retained view still lacks authenticated metadata.
+    // Whether any retained view still lacks authenticated metadata.
     pub metadata_incomplete: bool,
-    /// Whether any retained view was seen at all.
+    // Whether any retained view was seen at all.
     pub views: usize,
 }
 
@@ -144,13 +144,13 @@ impl CohortPlan {
         self.windows.is_empty()
     }
 
-    /// True when no deficient cohort admits an index inside `span`, so a
-    /// carrier advertising exactly that span cannot help any of them.
+    // True when no deficient cohort admits an index inside `span`, so a
+    // carrier advertising exactly that span cannot help any of them.
     pub fn excludes_span(&self, span: &Range<u64>) -> bool {
         !self.is_empty() && !self.windows.iter().any(|window| window.admits_span(span))
     }
 
-    /// Deficits whose own admissible span is already spent.
+    // Deficits whose own admissible span is already spent.
     pub fn exhausted(&self) -> Vec<CohortDeficit> {
         self.windows
             .iter()
@@ -164,18 +164,18 @@ impl CohortPlan {
     }
 }
 
-/// The indices a window may declare in flight: for each selected carrier,
-/// the lowest `admitted` still-wanted indices inside its advertised span,
-/// where `admitted` is how many of that carrier's articles the window took.
-///
-/// A carrier's span is an upper bound on what it holds, never a promise of
-/// what one window fetches from it. Declaring the whole span for a 32-article
-/// window would tell the engine every remaining index is on its way, its
-/// `outstanding` would drop to zero, and the next reassessment would find
-/// nothing left to ask for while most of the span was never requested. The
-/// count may still overshoot by the carrier's non-recovery packets; the
-/// window retracts everything it declared when it drains, so an overshoot
-/// costs one reassessment, never a block.
+// The indices a window may declare in flight: for each selected carrier,
+// the lowest `admitted` still-wanted indices inside its advertised span,
+// where `admitted` is how many of that carrier's articles the window took.
+//
+// A carrier's span is an upper bound on what it holds, never a promise of
+// what one window fetches from it. Declaring the whole span for a 32-article
+// window would tell the engine every remaining index is on its way, its
+// `outstanding` would drop to zero, and the next reassessment would find
+// nothing left to ask for while most of the span was never requested. The
+// count may still overshoot by the carrier's non-recovery packets; the
+// window retracts everything it declared when it drains, so an overshoot
+// costs one reassessment, never a block.
 pub(in crate::pipeline) fn declarable_indices(
     next: &[u64],
     carriers: &[(Range<u64>, usize)],
@@ -198,18 +198,18 @@ pub(in crate::pipeline) fn declarable_indices(
     declared
 }
 
-/// The global index spans a volume name can stand for in a set of `cohorts`
-/// cohorts.
-///
-/// A creator that numbers volumes by global index advertises the span as
-/// written. The reference creator numbers an interleaved set's volumes by row
-/// within a cohort: its `vol0511+512` of a two-cohort set carries every
-/// cohort's rows 511..1023, which are global indices 1022..2046. Reading such
-/// a name as global indices finds every one of them already held from the
-/// previous volume and excludes the carrier that holds the rest of the set's
-/// recovery. A name is only ever used to exclude, so both readings are
-/// offered and a carrier is dropped only when neither can help. For a
-/// noninterleaved set the readings coincide.
+// The global index spans a volume name can stand for in a set of `cohorts`
+// cohorts.
+//
+// A creator that numbers volumes by global index advertises the span as
+// written. The reference creator numbers an interleaved set's volumes by row
+// within a cohort: its `vol0511+512` of a two-cohort set carries every
+// cohort's rows 511..1023, which are global indices 1022..2046. Reading such
+// a name as global indices finds every one of them already held from the
+// previous volume and excludes the carrier that holds the rest of the set's
+// recovery. A name is only ever used to exclude, so both readings are
+// offered and a carrier is dropped only when neither can help. For a
+// noninterleaved set the readings coincide.
 pub(in crate::pipeline) fn carrier_readings(span: &Range<u64>, cohorts: u64) -> [Range<u64>; 2] {
     let cohorts = cohorts.max(1);
     let by_row = span.start.saturating_mul(cohorts)..span.end.saturating_mul(cohorts);
@@ -222,7 +222,7 @@ fn intersect(left: &Range<u64>, right: &Range<u64>) -> Range<u64> {
     start..end.max(start)
 }
 
-/// The lowest index in `range` congruent to `cohort` modulo `cohorts`.
+// The lowest index in `range` congruent to `cohort` modulo `cohorts`.
 fn first_congruent(range: &Range<u64>, cohort: u64, cohorts: u64) -> Option<u64> {
     if cohorts == 0 || cohort >= cohorts || range.start >= range.end {
         return None;
@@ -237,11 +237,11 @@ fn first_congruent(range: &Range<u64>, cohort: u64, cohorts: u64) -> Option<u64>
     (index < range.end).then_some(index)
 }
 
-/// The global recovery-index span a PAR3 volume name advertises, when it
-/// follows the `<base>.vol<start>+<count>.par3` convention.
-///
-/// A name is a hint, never a proof: a parsed span may only exclude a carrier
-/// from a window, and an unparsable name always stays eligible.
+// The global recovery-index span a PAR3 volume name advertises, when it
+// follows the `<base>.vol<start>+<count>.par3` convention.
+//
+// A name is a hint, never a proof: a parsed span may only exclude a carrier
+// from a window, and an unparsable name always stays eligible.
 pub(in crate::pipeline) fn volume_span(name: &str) -> Option<Range<u64>> {
     let lower = name.to_ascii_lowercase();
     let (_, suffix) = lower.strip_suffix(".par3")?.rsplit_once(".vol")?;
@@ -266,9 +266,9 @@ mod tests {
         requirement_in_flight(cohort, cohorts, span, held, additional, &[])
     }
 
-    /// Mirrors what the engine derives: `outstanding` is the deficit less what
-    /// the host has declared in flight, and `next_indices` is exactly that
-    /// many admissible indices that are neither held nor in flight.
+    // Mirrors what the engine derives: `outstanding` is the deficit less what
+    // the host has declared in flight, and `next_indices` is exactly that
+    // many admissible indices that are neither held nor in flight.
     fn requirement_in_flight(
         cohort: u64,
         cohorts: u64,
@@ -322,9 +322,9 @@ mod tests {
         assert_eq!(first_congruent(&(0..10), 3, 2), None);
     }
 
-    /// Deliverable: a reassessment taken while articles are in flight asks for
-    /// nothing that was already requested. The engine subtracts what the host
-    /// declared, and the plan spends only what is left.
+    // Deliverable: a reassessment taken while articles are in flight asks for
+    // nothing that was already requested. The engine subtracts what the host
+    // declared, and the plan spends only what is left.
     #[test]
     fn indices_already_in_flight_are_never_requested_again() {
         const BLOCK: u64 = 1024;
@@ -407,10 +407,10 @@ mod tests {
         assert_eq!(plan.exhausted()[0].cohort, 1);
     }
 
-    /// Deliverable: a two-cohort set, one short by exactly one block and one
-    /// in surplus, requests only the deficient cohort's admissible indices,
-    /// asks for exactly that deficit in bytes, and — once that cohort has
-    /// outrun its own span — names the cohort in an `Unrecoverable` verdict.
+    // Deliverable: a two-cohort set, one short by exactly one block and one
+    // in surplus, requests only the deficient cohort's admissible indices,
+    // asks for exactly that deficit in bytes, and — once that cohort has
+    // outrun its own span — names the cohort in an `Unrecoverable` verdict.
     #[test]
     fn a_two_cohort_set_requests_only_the_short_cohorts_own_indices() {
         const BLOCK: u64 = 2048;
@@ -505,12 +505,12 @@ mod tests {
         assert!(declarable_indices(&next, &[(0..100, 0)], 1).is_empty());
     }
 
-    /// Deliverable: a two-cohort set numbered by row, the way the reference
-    /// creator writes it. Every volume up to `vol0511+512` is in hand, so
-    /// cohort 1 holds all of its indices below 2046 and is still short. The
-    /// last volume, `vol1023+798`, carries global indices 2046..3642; read
-    /// as global indices its name names only held indices, and it used to be
-    /// excluded, leaving the set unrecoverable with 798 rows unfetched.
+    // Deliverable: a two-cohort set numbered by row, the way the reference
+    // creator writes it. Every volume up to `vol0511+512` is in hand, so
+    // cohort 1 holds all of its indices below 2046 and is still short. The
+    // last volume, `vol1023+798`, carries global indices 2046..3642; read
+    // as global indices its name names only held indices, and it used to be
+    // excluded, leaving the set unrecoverable with 798 rows unfetched.
     #[test]
     fn a_volume_numbered_by_row_is_not_excluded_for_indices_it_does_not_carry() {
         const SPAN: Range<u64> = 0..4096;

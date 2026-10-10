@@ -110,7 +110,7 @@ pub fn compress_nzb_bytes(nzb_bytes: &[u8]) -> io::Result<Vec<u8>> {
     encoder.finish()
 }
 
-/// Migration-only helper for absorbing legacy file-backed NZBs into DB blobs.
+// Migration-only helper for absorbing legacy file-backed NZBs into DB blobs.
 pub fn load_persisted_nzb_storage_bytes(path: &Path) -> io::Result<Vec<u8>> {
     let bytes = std::fs::read(path)?;
     compress_nzb_bytes(&bytes)

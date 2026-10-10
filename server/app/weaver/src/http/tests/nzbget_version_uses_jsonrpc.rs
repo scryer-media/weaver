@@ -1,4 +1,4 @@
-//! `tests` tests, part of a mechanical split of the original file.
+// `tests` tests, part of a mechanical split of the original file.
 
 use super::*;
 

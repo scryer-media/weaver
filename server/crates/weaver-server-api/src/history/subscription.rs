@@ -6,9 +6,9 @@ pub(crate) struct HistorySubscription;
 const JOB_DETAIL_HEARTBEAT: Duration = Duration::from_millis(500);
 const JOB_DETAIL_THROTTLE: Duration = Duration::from_millis(250);
 const JOB_DETAIL_SETTLE_DELAY: Duration = Duration::from_millis(25);
-/// Slow cadence at which a terminal (archived) job's detail is still re-read, to
-/// pick up DB-only changes that emit no pipeline event (e.g. a background
-/// history-delete operation) without the fast per-tab heartbeat load.
+// Slow cadence at which a terminal (archived) job's detail is still re-read, to
+// pick up DB-only changes that emit no pipeline event (e.g. a background
+// history-delete operation) without the fast per-tab heartbeat load.
 const JOB_DETAIL_TERMINAL_HEARTBEAT: Duration = Duration::from_secs(5);
 
 #[Subscription]

@@ -377,9 +377,9 @@ fn db_runtime_metrics_track_in_flight_blocked_and_latency() {
     assert_eq!(metrics.snapshot().in_flight, 0);
 }
 
-/// An operation that bails out before it is answered (worker stopped, worker
-/// panicked) must still release its in-flight slot: the guard, not a manual
-/// call, owns the decrement.
+// An operation that bails out before it is answered (worker stopped, worker
+// panicked) must still release its in-flight slot: the guard, not a manual
+// call, owns the decrement.
 #[test]
 fn db_runtime_in_flight_is_released_when_the_guard_drops_early() {
     let metrics = DbRuntimeMetrics::new("sqlite", 1);

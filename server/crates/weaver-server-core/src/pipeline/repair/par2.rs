@@ -18,21 +18,21 @@ const PAR2_RECOVERY_PACKET_OVERHEAD: u64 = 68; // 64-byte header + 4-byte expone
 const PAR2_RETAINED_SESSION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const STATEFUL_PAR2_SESSION_ENV: &str = "WEAVER_STATEFUL_PAR2_SESSION";
 const PAR2_METADATA_PREFIX_CAP_BYTES: usize = PAR2_HASH_16K_BYTES;
-/// How many single-article prefix probes discovery keeps on the wire per job.
-///
-/// A prefix probe is one article. Sending them one at a time makes a posting
-/// whose recovery volumes are gone cost one full round trip through the
-/// download queue per volume, each answered by an article-not-found, while
-/// the job's data download waits on the verdict. Several probes in flight
-/// settle the same question in one round trip. Whole-volume metadata carriers
-/// still go alone: those are real downloads, not probes.
+// How many single-article prefix probes discovery keeps on the wire per job.
+//
+// A prefix probe is one article. Sending them one at a time makes a posting
+// whose recovery volumes are gone cost one full round trip through the
+// download queue per volume, each answered by an article-not-found, while
+// the job's data download waits on the verdict. Several probes in flight
+// settle the same question in one round trip. Whole-volume metadata carriers
+// still go alone: those are real downloads, not probes.
 const PAR2_DISCOVERY_PROBE_CONCURRENCY: usize = 4;
-/// After this many sibling volumes of one collection have probed to nothing —
-/// no article, no prefix bytes, no set identity — the collection's untouched
-/// volumes are retired without being asked. A posting that lost three of its
-/// recovery volumes has lost the rest; asking each one in turn only delays the
-/// job's own verdict. A collection with a single authenticated sighting is
-/// never retired this way.
+// After this many sibling volumes of one collection have probed to nothing —
+// no article, no prefix bytes, no set identity — the collection's untouched
+// volumes are retired without being asked. A posting that lost three of its
+// recovery volumes has lost the rest; asking each one in turn only delays the
+// job's own verdict. A collection with a single authenticated sighting is
+// never retired this way.
 const PAR2_DISCOVERY_DEAD_SIBLING_LIMIT: usize = 3;
 
 fn par2_prefix_set_ids(prefix: &[u8]) -> Vec<par2_rs::RecoverySetId> {
@@ -52,10 +52,10 @@ fn par2_prefix_set_ids(prefix: &[u8]) -> Vec<par2_rs::RecoverySetId> {
     set_ids
 }
 
-/// A cheap, non-authoritative admission check for a file whose NZB name did
-/// not identify it as PAR2. Packet hashes remain the authority: this only
-/// decides whether a completed file is worth passing to the authenticated
-/// packet scanner.
+// A cheap, non-authoritative admission check for a file whose NZB name did
+// not identify it as PAR2. Packet hashes remain the authority: this only
+// decides whether a completed file is worth passing to the authenticated
+// packet scanner.
 fn par2_header_looks_valid(prefix: &[u8], known_file_len: Option<u64>) -> bool {
     if prefix.len() < PAR2_PACKET_HEADER_BYTES || &prefix[..8] != PAR2_MAGIC {
         return false;
@@ -68,14 +68,14 @@ fn par2_header_looks_valid(prefix: &[u8], known_file_len: Option<u64>) -> bool {
         && known_file_len.is_none_or(|file_len| packet_len <= file_len)
 }
 
-/// Whether the retained repair session is in play, from the raw env value.
-///
-/// On by default, and the default is what makes evidence reachable at all: the
-/// one-shot repairer has no seat for evidence in the crate's published API, so
-/// a job that routes there re-reads every described file no matter how much the
-/// in-stream grid already proved. Only the retained session can be seeded, so
-/// only the retained session can make a damaged job read its damaged files and
-/// nothing else. The variable remains as an off switch.
+// Whether the retained repair session is in play, from the raw env value.
+//
+// On by default, and the default is what makes evidence reachable at all: the
+// one-shot repairer has no seat for evidence in the crate's published API, so
+// a job that routes there re-reads every described file no matter how much the
+// in-stream grid already proved. Only the retained session can be seeded, so
+// only the retained session can make a damaged job read its damaged files and
+// nothing else. The variable remains as an off switch.
 fn parse_stateful_par2_session_enabled(raw: Option<&str>) -> bool {
     !matches!(
         raw.map(str::trim),
@@ -137,7 +137,7 @@ struct RecoveryCandidate {
     source: RecoveryCountSource,
 }
 
-/// Packets from one recovery set found while parsing an index file.
+// Packets from one recovery set found while parsing an index file.
 struct ParsedPar2Set {
     set_id: par2_rs::RecoverySetId,
     packets: Vec<par2_rs::Packet>,
@@ -257,8 +257,8 @@ fn par2_resource_error(reason: &str) -> par2_rs::Par2Error {
     }
 }
 
-/// Admit declared geometry before constructing checkpoints, bindings, or repair
-/// targets. This runs when metadata changes, never for individual articles.
+// Admit declared geometry before constructing checkpoints, bindings, or repair
+// targets. This runs when metadata changes, never for individual articles.
 fn validate_par2_geometry(set: &Par2FileSet, output_limit: u64) -> par2_rs::Result<()> {
     if set.slice_size == 0 {
         return Err(par2_resource_error("zero slice size"));
@@ -296,9 +296,9 @@ fn validate_par2_geometry(set: &Par2FileSet, output_limit: u64) -> par2_rs::Resu
     Ok(())
 }
 
-/// Scan a completed PAR2 carrier into per-set packet groups. The packet scan
-/// authenticates metadata and recovery payloads before accepting their packet
-/// boundaries, so every caller receives only authenticated slices.
+// Scan a completed PAR2 carrier into per-set packet groups. The packet scan
+// authenticates metadata and recovery payloads before accepting their packet
+// boundaries, so every caller receives only authenticated slices.
 fn scan_completed_par2_packet_groups(
     path: &Path,
     budget: &SharedPar2ScanBudget,
@@ -326,10 +326,10 @@ fn scan_completed_par2_packet_groups(
     Ok(groups)
 }
 
-/// Everything a packet merge can add to a set: descriptions, slice checksums,
-/// recovery slices and the creator. Two identical readings across a merge mean
-/// the merge inserted nothing, so anything already built from the set — a
-/// retained repair session above all — still describes it exactly.
+// Everything a packet merge can add to a set: descriptions, slice checksums,
+// recovery slices and the creator. Two identical readings across a merge mean
+// the merge inserted nothing, so anything already built from the set — a
+// retained repair session above all — still describes it exactly.
 fn par2_set_merge_shape(set: &Par2FileSet) -> (usize, usize, usize, bool) {
     (
         set.files.len(),
@@ -349,13 +349,13 @@ fn par2_recovery_packet_size(slice_size: u64) -> u64 {
     }
 }
 
-/// How many recovery blocks a PAR2 file has proven it carries for one set.
-///
-/// A file that answers to several sets keeps a count per set, because no single
-/// number describes it; one that answers to a single set is described by its own
-/// validated total. Neither figure is ever derived from a name or a byte size —
-/// that is what makes it safe for the arithmetic that decides whether a repair
-/// can go ahead.
+// How many recovery blocks a PAR2 file has proven it carries for one set.
+//
+// A file that answers to several sets keeps a count per set, because no single
+// number describes it; one that answers to a single set is described by its own
+// validated total. Neither figure is ever derived from a name or a byte size —
+// that is what makes it safe for the arithmetic that decides whether a repair
+// can go ahead.
 fn validated_recovery_blocks_for_set(
     file: &Par2FileRuntime,
     set_id: par2_rs::RecoverySetId,
@@ -382,20 +382,20 @@ fn recovery_file_role(spec: &JobSpec, file_index: u32) -> Option<weaver_model::f
         .map(|file| file.role.clone())
 }
 
-/// The name a PAR2 file's whole collection shares: the filename with its
-/// `.par2` extension and any `.volNNN+CCC` part removed.
-///
-/// This is how a recovery volume is grouped onto a set when nothing has parsed
-/// its packets yet — `holiday.mkv.vol00+08.par2` and `holiday.mkv.par2` both
-/// reduce to `holiday.mkv`, so the volume is recognizably part of that
-/// collection before a byte of it has been read. Case is folded because the
-/// convention is not consistently cased on the wire, and the separator may be
-/// `+` or `-` for the same reason.
-///
-/// `None` means the name does not follow the convention at all, which callers
-/// read as "no opinion" rather than as "not this set" — an obfuscated posting
-/// names nothing recognizably, and refusing its volumes would cost it every
-/// recovery block it has.
+// The name a PAR2 file's whole collection shares: the filename with its
+// `.par2` extension and any `.volNNN+CCC` part removed.
+//
+// This is how a recovery volume is grouped onto a set when nothing has parsed
+// its packets yet — `holiday.mkv.vol00+08.par2` and `holiday.mkv.par2` both
+// reduce to `holiday.mkv`, so the volume is recognizably part of that
+// collection before a byte of it has been read. Case is folded because the
+// convention is not consistently cased on the wire, and the separator may be
+// `+` or `-` for the same reason.
+//
+// `None` means the name does not follow the convention at all, which callers
+// read as "no opinion" rather than as "not this set" — an obfuscated posting
+// names nothing recognizably, and refusing its volumes would cost it every
+// recovery block it has.
 fn par2_set_base_name(filename: &str) -> Option<String> {
     let lower = filename.trim().to_ascii_lowercase();
     let stem = lower.strip_suffix(".par2")?;
@@ -525,10 +525,10 @@ fn unique_par2_binding_candidate(candidates: &[par2_rs::FileId]) -> Option<par2_
     Some(*candidate)
 }
 
-/// The lowest byte offset covered by a block the recovery set found damaged.
-///
-/// Split out so the damage floor and the intact prefix can be read from one
-/// verdict map rather than two.
+// The lowest byte offset covered by a block the recovery set found damaged.
+//
+// Split out so the damage floor and the intact prefix can be read from one
+// verdict map rather than two.
 fn damage_floor_from_verdicts(
     verdicts: &std::collections::BTreeMap<u32, crate::pipeline::integrity::BlockVerdict>,
     slice_size: u64,
@@ -540,13 +540,13 @@ fn damage_floor_from_verdicts(
         .min()
 }
 
-/// The contiguous run of Intact blocks from block zero, in bytes.
-///
-/// Only blocks the grid actually claimed *and* found Intact count, and only
-/// while they are consecutive from zero: a block the grid never claimed stops
-/// the run, because unverified is not the same as intact. An arithmetic
-/// overflow ends the run for the same reason — a prefix that cannot be
-/// represented has not been proved.
+// The contiguous run of Intact blocks from block zero, in bytes.
+//
+// Only blocks the grid actually claimed *and* found Intact count, and only
+// while they are consecutive from zero: a block the grid never claimed stops
+// the run, because unverified is not the same as intact. An arithmetic
+// overflow ends the run for the same reason — a prefix that cannot be
+// represented has not been proved.
 fn intact_prefix_from_verdicts(
     verdicts: &std::collections::BTreeMap<u32, crate::pipeline::integrity::BlockVerdict>,
     slice_size: u64,
@@ -566,7 +566,7 @@ fn intact_prefix_from_verdicts(
     prefix
 }
 
-/// The one recovery-set description a pipeline file unambiguously identifies.
+// The one recovery-set description a pipeline file unambiguously identifies.
 #[derive(Debug, Clone)]
 pub(crate) struct Par2FileBinding {
     pub(crate) recovery_set_id: par2_rs::RecoverySetId,
@@ -658,18 +658,18 @@ impl Pipeline {
         }
     }
 
-    /// Whether a probed RAR volume whose headers state no volume number has
-    /// yet to show where it sits in its set.
-    ///
-    /// Old-style volume numbering puts no number in the headers, and an
-    /// obfuscated name puts none in the filename, so such a volume is
-    /// classified under a set named after itself and reads as volume 0. The
-    /// headers settle which it really is: a volume whose first member does not
-    /// continue from an earlier volume opens a set, and one whose first member
-    /// does is a later volume, number unknown, of a set that began somewhere
-    /// else. Only the first is placed: the role and the self-named set are
-    /// right for it and wrong for the second. Until the headers have been read
-    /// — a restart or a re-probe drops them — neither is evidence of anything.
+    // Whether a probed RAR volume whose headers state no volume number has
+    // yet to show where it sits in its set.
+    //
+    // Old-style volume numbering puts no number in the headers, and an
+    // obfuscated name puts none in the filename, so such a volume is
+    // classified under a set named after itself and reads as volume 0. The
+    // headers settle which it really is: a volume whose first member does not
+    // continue from an earlier volume opens a set, and one whose first member
+    // does is a later volume, number unknown, of a set that began somewhere
+    // else. Only the first is placed: the role and the self-named set are
+    // right for it and wrong for the second. Until the headers have been read
+    // — a restart or a re-probe drops them — neither is evidence of anything.
     fn numberless_rar_volume_position_unknown(
         &self,
         job_id: JobId,
@@ -1123,11 +1123,11 @@ impl Pipeline {
         )
     }
 
-    /// Records a structurally plausible PAR2 header from an obfuscated file.
-    ///
-    /// This is deliberately only admission evidence. A later whole-file packet
-    /// scan must authenticate every packet before metadata, recovery capacity,
-    /// or a canonical name becomes authoritative.
+    // Records a structurally plausible PAR2 header from an obfuscated file.
+    //
+    // This is deliberately only admission evidence. A later whole-file packet
+    // scan must authenticate every packet before metadata, recovery capacity,
+    // or a canonical name becomes authoritative.
     pub(crate) fn note_par2_metadata_signature(
         &mut self,
         file_id: NzbFileId,
@@ -1177,9 +1177,9 @@ impl Pipeline {
         };
     }
 
-    /// Restored jobs have no in-memory decode prefix. Probe only the fixed
-    /// PAR2 header for their already-complete eligible files, from the normal
-    /// completion path rather than startup recovery.
+    // Restored jobs have no in-memory decode prefix. Probe only the fixed
+    // PAR2 header for their already-complete eligible files, from the normal
+    // completion path rather than startup recovery.
     pub(crate) async fn probe_restored_par2_headers(&mut self, job_id: JobId) {
         let candidates = self
             .jobs
@@ -1245,12 +1245,12 @@ impl Pipeline {
         }
     }
 
-    /// Every name a file could be described under, sanitized.
-    ///
-    /// Sanitized on the way out, because these are matched against sanitized
-    /// descriptions. Comparing a raw posted name to a sanitized one silently
-    /// loses the binding — and with it in-stream verification for that file —
-    /// for every name that needed sanitizing at all.
+    // Every name a file could be described under, sanitized.
+    //
+    // Sanitized on the way out, because these are matched against sanitized
+    // descriptions. Comparing a raw posted name to a sanitized one silently
+    // loses the binding — and with it in-stream verification for that file —
+    // for every name that needed sanitizing at all.
     fn par2_binding_candidate_names(&self, file_id: NzbFileId) -> Option<HashSet<String>> {
         let state = self.jobs.get(&file_id.job_id)?;
         let file = state.assembly.file(file_id)?;
@@ -1268,10 +1268,10 @@ impl Pipeline {
         Some(names)
     }
 
-    /// Admit newly parsed PAR2 slice sizes and publish one immutable snapshot
-    /// for future leases. Existing grids never disappear mid-job: an older
-    /// batch may still carry evidence for them, while a newly learned grid is
-    /// safe only for later batches.
+    // Admit newly parsed PAR2 slice sizes and publish one immutable snapshot
+    // for future leases. Existing grids never disappear mid-job: an older
+    // batch may still carry evidence for them, while a newly learned grid is
+    // safe only for later batches.
     pub(crate) fn refresh_par2_checkpoint_plan(&mut self, job_id: JobId) {
         let Some(runtime) = self.par2_runtime(job_id) else {
             return;
@@ -1330,11 +1330,11 @@ impl Pipeline {
         }
     }
 
-    /// Whether a file is covered only by a set whose index never arrived.
-    ///
-    /// Parsed sets are all served by the completion gate.  The remaining case
-    /// is a set known from foreign packets but lacking descriptions and an
-    /// index, so no verifier or repairer can ever act on its claimed files.
+    // Whether a file is covered only by a set whose index never arrived.
+    //
+    // Parsed sets are all served by the completion gate.  The remaining case
+    // is a set known from foreign packets but lacking descriptions and an
+    // index, so no verifier or repairer can ever act on its claimed files.
     pub(in crate::pipeline) fn file_is_described_only_by_an_unservable_recovery_set(
         &self,
         file_id: NzbFileId,
@@ -1358,13 +1358,13 @@ impl Pipeline {
             })
     }
 
-    /// Bind one pipeline file to a description in one particular recovery set.
-    ///
-    /// This is the dual-CRC grid's name-to-description resolver: it is what
-    /// [`Self::block_crc_verdicts`] and [`Self::in_stream_verified_par2_match`]
-    /// use to decide which description a file's in-stream block verdicts are
-    /// measured against. Ambiguity inside the set is refused outright — a name
-    /// matching two descriptions yields no binding at all.
+    // Bind one pipeline file to a description in one particular recovery set.
+    //
+    // This is the dual-CRC grid's name-to-description resolver: it is what
+    // [`Self::block_crc_verdicts`] and [`Self::in_stream_verified_par2_match`]
+    // use to decide which description a file's in-stream block verdicts are
+    // measured against. Ambiguity inside the set is refused outright — a name
+    // matching two descriptions yields no binding at all.
     pub(crate) fn resolve_par2_file_binding_in_set(
         &self,
         file_id: NzbFileId,
@@ -1444,10 +1444,10 @@ impl Pipeline {
         })
     }
 
-    /// Bind one pipeline file to exactly one parsed recovery-set description.
-    ///
-    /// A description that answers from two recovery sets is ambiguous even when
-    /// each set resolves it uniquely on its own, so neither may claim it.
+    // Bind one pipeline file to exactly one parsed recovery-set description.
+    //
+    // A description that answers from two recovery sets is ambiguous even when
+    // each set resolves it uniquely on its own, so neither may claim it.
     pub(crate) fn resolve_par2_file_binding(&self, file_id: NzbFileId) -> Option<Par2FileBinding> {
         #[cfg(test)]
         self.par2_binding_resolver_calls
@@ -1482,8 +1482,8 @@ impl Pipeline {
             })
     }
 
-    /// Rebuild the positive-only MD5-substitution cache after a bounded
-    /// metadata or identity transition. Articles only read this result.
+    // Rebuild the positive-only MD5-substitution cache after a bounded
+    // metadata or identity transition. Articles only read this result.
     pub(crate) fn refresh_par2_md5_substitution_bindings(&mut self, job_id: JobId) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
@@ -1534,46 +1534,46 @@ impl Pipeline {
             })
     }
 
-    /// The one description whose `hash_16k` the file's captured prefix
-    /// reproduces, if exactly one does.
-    ///
-    /// # Why this exists
-    ///
-    /// Obfuscated posts lie about names and tell the truth about bytes. A set
-    /// posted as `a7f3e91c.part01.rar` binds to nothing by name, and a file that
-    /// binds to nothing has no description to measure its in-stream block
-    /// verdicts against — so the whole dual-CRC grid lapses for it and every
-    /// volume is read back from disk at completion. The recovery set already
-    /// carries the answer: `hash_16k` is content, and content is the thing the
-    /// obfuscation did not touch.
-    ///
-    /// # The window is the description's, not ours
-    ///
-    /// A description shorter than [`crate::pipeline::PAR2_HASH_16K_BYTES`]
-    /// hashes its whole file with no padding, so each candidate is matched over
-    /// `min(desc.length, 16 KiB)` of the prefix — its own window, not a fixed
-    /// one. A description whose window the capture does not cover is skipped
-    /// rather than guessed at.
-    ///
-    /// Lengths come from the descriptions only. The NZB's `<segment bytes>` are
-    /// yEnc-encoded and would put the window in the wrong place for yEnc and
-    /// wildly wrong for uuencode.
-    ///
-    /// # Fail-closed, on the same terms as the name path
-    ///
-    /// Zero matches and two matches both return `None`. Two descriptions
-    /// sharing a 16 KiB prefix is a real shape — think a set of volumes with
-    /// identical headers — and it is exactly the case where binding by content
-    /// would be a guess. The file is then unbound, which costs it in-stream
-    /// verification and nothing else: it is read at completion like every file
-    /// was before the grid existed.
-    ///
-    /// A file with no captured prefix but a fingerprint an identity roster
-    /// already proved (see
-    /// [`crate::pipeline::Pipeline::file_proven_par2_fingerprint`]) is matched
-    /// on that fingerprint and its proven length, under the same uniqueness
-    /// rule. A prefix captured again later is what the bytes are matched on,
-    /// but the length stays the proven one.
+    // The one description whose `hash_16k` the file's captured prefix
+    // reproduces, if exactly one does.
+    //
+    // # Why this exists
+    //
+    // Obfuscated posts lie about names and tell the truth about bytes. A set
+    // posted as `a7f3e91c.part01.rar` binds to nothing by name, and a file that
+    // binds to nothing has no description to measure its in-stream block
+    // verdicts against — so the whole dual-CRC grid lapses for it and every
+    // volume is read back from disk at completion. The recovery set already
+    // carries the answer: `hash_16k` is content, and content is the thing the
+    // obfuscation did not touch.
+    //
+    // # The window is the description's, not ours
+    //
+    // A description shorter than [`crate::pipeline::PAR2_HASH_16K_BYTES`]
+    // hashes its whole file with no padding, so each candidate is matched over
+    // `min(desc.length, 16 KiB)` of the prefix — its own window, not a fixed
+    // one. A description whose window the capture does not cover is skipped
+    // rather than guessed at.
+    //
+    // Lengths come from the descriptions only. The NZB's `<segment bytes>` are
+    // yEnc-encoded and would put the window in the wrong place for yEnc and
+    // wildly wrong for uuencode.
+    //
+    // # Fail-closed, on the same terms as the name path
+    //
+    // Zero matches and two matches both return `None`. Two descriptions
+    // sharing a 16 KiB prefix is a real shape — think a set of volumes with
+    // identical headers — and it is exactly the case where binding by content
+    // would be a guess. The file is then unbound, which costs it in-stream
+    // verification and nothing else: it is read at completion like every file
+    // was before the grid existed.
+    //
+    // A file with no captured prefix but a fingerprint an identity roster
+    // already proved (see
+    // [`crate::pipeline::Pipeline::file_proven_par2_fingerprint`]) is matched
+    // on that fingerprint and its proven length, under the same uniqueness
+    // rule. A prefix captured again later is what the bytes are matched on,
+    // but the length stays the proven one.
     fn content_bound_par2_file_id(
         &self,
         file_id: NzbFileId,
@@ -1641,29 +1641,29 @@ impl Pipeline {
         Some(bound)
     }
 
-    /// The recovery set's block size for a job, once its PAR2 packets have been
-    /// parsed. This is the checkpoint grid the decoder cuts CRC segments on.
+    // The recovery set's block size for a job, once its PAR2 packets have been
+    // parsed. This is the checkpoint grid the decoder cuts CRC segments on.
     #[cfg(test)]
     pub(crate) fn par2_block_size(&self, job_id: JobId) -> Option<std::num::NonZeroU64> {
         std::num::NonZeroU64::new(self.par2_set(job_id)?.slice_size)
     }
 
-    /// The common-refinement checkpoint geometry for every parsed set known
-    /// when a batch is leased. Served-set selection is a UI/repair view and
-    /// must not remove geometry needed by another file in the same job.
+    // The common-refinement checkpoint geometry for every parsed set known
+    // when a batch is leased. Served-set selection is a UI/repair view and
+    // must not remove geometry needed by another file in the same job.
     pub(crate) fn par2_checkpoint_plan(&self, job_id: JobId) -> weaver_yenc::CheckpointPlan {
         self.par2_runtime(job_id)
             .and_then(|runtime| runtime.checkpoint_plan.clone())
             .unwrap_or(weaver_yenc::CheckpointPlan::None)
     }
 
-    /// The block size of the recovery set that currently owns `file_id`.
-    ///
-    /// An unbound file deliberately records no grid evidence. Binding becomes
-    /// available when its name matches a description or when its captured 16
-    /// KiB prefix arrives, which is also the first moment a grid claim could be
-    /// useful. In particular, we must not cut an earlier article on the served
-    /// set's grid and later reinterpret it after the file binds elsewhere.
+    // The block size of the recovery set that currently owns `file_id`.
+    //
+    // An unbound file deliberately records no grid evidence. Binding becomes
+    // available when its name matches a description or when its captured 16
+    // KiB prefix arrives, which is also the first moment a grid claim could be
+    // useful. In particular, we must not cut an earlier article on the served
+    // set's grid and later reinterpret it after the file binds elsewhere.
     #[cfg(test)]
     pub(crate) fn par2_block_size_for_file(
         &self,
@@ -1676,13 +1676,13 @@ impl Pipeline {
         )
     }
 
-    /// Record a decoded article's block-aligned CRC segments against the file it
-    /// was placed in.
-    ///
-    /// `file_offset` and `decoded_len` are the pipeline's own placement, which
-    /// is authoritative over the poster's `=ypart begin`. Called on the
-    /// durability seam — after the write for this segment returned — so a block
-    /// claimed here describes content that is actually on disk.
+    // Record a decoded article's block-aligned CRC segments against the file it
+    // was placed in.
+    //
+    // `file_offset` and `decoded_len` are the pipeline's own placement, which
+    // is authoritative over the poster's `=ypart begin`. Called on the
+    // durability seam — after the write for this segment returned — so a block
+    // claimed here describes content that is actually on disk.
     #[allow(clippy::too_many_arguments)]
     #[cfg(test)]
     pub(crate) fn note_block_crc_segments(
@@ -1710,9 +1710,9 @@ impl Pipeline {
         );
     }
 
-    /// Record an article using exactly the checkpoint geometry that its decoder
-    /// applied. Evidence is offered independently of binding, so article
-    /// commits do not scan recovery-set metadata or hash a prefix.
+    // Record an article using exactly the checkpoint geometry that its decoder
+    // applied. Evidence is offered independently of binding, so article
+    // commits do not scan recovery-set metadata or hash a prefix.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn note_block_crc_segments_for_plan(
         &mut self,
@@ -1740,11 +1740,11 @@ impl Pipeline {
         );
     }
 
-    /// In-stream block verdicts for a completed file, if the recovery set binds
-    /// it and the collector closed any blocks.
-    ///
-    /// Blocks absent from the result are *unclaimed*: settle-time verification
-    /// owns them, and reads and hashes them exactly as it did before.
+    // In-stream block verdicts for a completed file, if the recovery set binds
+    // it and the collector closed any blocks.
+    //
+    // Blocks absent from the result are *unclaimed*: settle-time verification
+    // owns them, and reads and hashes them exactly as it did before.
     pub(crate) fn block_crc_verdicts(
         &self,
         file_id: NzbFileId,
@@ -1757,19 +1757,19 @@ impl Pipeline {
         (!verdicts.is_empty()).then_some(verdicts)
     }
 
-    /// Both in-stream facts a chased part needs, from a single verdict build.
-    ///
-    /// The damage floor and the intact prefix are read together on every commit
-    /// of a gated part, and each derives from the same `verdicts_against` map.
-    /// Asking for them separately built that map twice per commit; this builds
-    /// it once. `None` means the file has no binding or no parsed set, which is
-    /// the same "nothing vouches for this" the individual accessors report.
-    ///
-    /// The build itself remains O(closed blocks) per call, and the map is
-    /// rebuilt rather than cached because the grid is still accumulating — a
-    /// cached answer is exactly the stale one the gate must not act on. So the
-    /// honest bound over a gated part's life is O(articles x blocks). It is
-    /// paid only by sets already known to carry damage.
+    // Both in-stream facts a chased part needs, from a single verdict build.
+    //
+    // The damage floor and the intact prefix are read together on every commit
+    // of a gated part, and each derives from the same `verdicts_against` map.
+    // Asking for them separately built that map twice per commit; this builds
+    // it once. `None` means the file has no binding or no parsed set, which is
+    // the same "nothing vouches for this" the individual accessors report.
+    //
+    // The build itself remains O(closed blocks) per call, and the map is
+    // rebuilt rather than cached because the grid is still accumulating — a
+    // cached answer is exactly the stale one the gate must not act on. So the
+    // honest bound over a gated part's life is O(articles x blocks). It is
+    // paid only by sets already known to carry damage.
     pub(crate) fn in_stream_chase_evidence(
         &self,
         file_id: NzbFileId,
@@ -1786,21 +1786,21 @@ impl Pipeline {
         ))
     }
 
-    /// How many bytes from the start of a file the recovery set has positively
-    /// vouched for, as a contiguous run.
-    ///
-    /// Only blocks the grid actually claimed *and* found Intact count, and only
-    /// while they are consecutive from block zero. A block the grid never
-    /// claimed — `NoReference`, or simply absent because no article closed it —
-    /// stops the run: unverified is not the same as intact, and this number is
-    /// used to decide that repair cannot touch what the decoder already read.
-    ///
-    /// The basis is CRC32, from PAR2's IFSC. A block whose CRC32 matches but
-    /// whose MD5 does not would be rewritten by repair below this line, and the
-    /// chase would keep a decode of the pre-repair bytes. Downstream 7z entry
-    /// CRCs catch that for entries that carry one; entries without a CRC carry
-    /// the residual. Stated rather than defended against: closing it means
-    /// hashing the prefix, which is the read this whole path exists to avoid.
+    // How many bytes from the start of a file the recovery set has positively
+    // vouched for, as a contiguous run.
+    //
+    // Only blocks the grid actually claimed *and* found Intact count, and only
+    // while they are consecutive from block zero. A block the grid never
+    // claimed — `NoReference`, or simply absent because no article closed it —
+    // stops the run: unverified is not the same as intact, and this number is
+    // used to decide that repair cannot touch what the decoder already read.
+    //
+    // The basis is CRC32, from PAR2's IFSC. A block whose CRC32 matches but
+    // whose MD5 does not would be rewritten by repair below this line, and the
+    // chase would keep a decode of the pre-repair bytes. Downstream 7z entry
+    // CRCs catch that for entries that carry one; entries without a CRC carry
+    // the residual. Stated rather than defended against: closing it means
+    // hashing the prefix, which is the read this whole path exists to avoid.
     pub(crate) fn in_stream_intact_prefix(&self, file_id: NzbFileId) -> Option<u64> {
         let binding = self.resolve_par2_file_binding(file_id)?;
         let set = self.par2_set_for(file_id.job_id, binding.recovery_set_id)?;
@@ -1813,17 +1813,17 @@ impl Pipeline {
         ))
     }
 
-    /// A completed file's PAR2 identity, provable from the in-stream dual-CRC
-    /// grid alone.
-    ///
-    /// `Some` means: the file binds uniquely by name/identity within this
-    /// recovery set, its assembled length equals the described length exactly,
-    /// and every described slice closed `Intact` with independent (pCRC
-    /// verified) article coverage — the same bar `InStreamCrc32Proof`
-    /// enforces per slice, demanded here for all of them. Anything less —
-    /// a missing slice, an unclaimed block, `NoReference`, `Damaged`, a
-    /// length disagreement, an unverified contribution — returns `None`, and
-    /// the caller falls back to digests or the authoritative read.
+    // A completed file's PAR2 identity, provable from the in-stream dual-CRC
+    // grid alone.
+    //
+    // `Some` means: the file binds uniquely by name/identity within this
+    // recovery set, its assembled length equals the described length exactly,
+    // and every described slice closed `Intact` with independent (pCRC
+    // verified) article coverage — the same bar `InStreamCrc32Proof`
+    // enforces per slice, demanded here for all of them. Anything less —
+    // a missing slice, an unclaimed block, `NoReference`, `Damaged`, a
+    // length disagreement, an unverified contribution — returns `None`, and
+    // the caller falls back to digests or the authoritative read.
     pub(crate) fn in_stream_verified_par2_match(
         &self,
         file_id: NzbFileId,
@@ -1866,11 +1866,11 @@ impl Pipeline {
         ))
     }
 
-    /// Why [`Self::in_stream_verified_par2_match`] would refuse this file —
-    /// `None` when it would claim. Diagnostics only: the answer names the
-    /// FIRST failing rung of the same ladder the predicate walks, so a
-    /// production log can say why a healthy-looking job still paid a read
-    /// instead of leaving it a mystery gap in the timeline.
+    // Why [`Self::in_stream_verified_par2_match`] would refuse this file —
+    // `None` when it would claim. Diagnostics only: the answer names the
+    // FIRST failing rung of the same ladder the predicate walks, so a
+    // production log can say why a healthy-looking job still paid a read
+    // instead of leaving it a mystery gap in the timeline.
     pub(crate) fn in_stream_par2_claim_shortfall(
         &self,
         file_id: NzbFileId,
@@ -1929,20 +1929,20 @@ impl Pipeline {
         None
     }
 
-    /// Per-slice grid evidence for one bound file, in the shape
-    /// [`par2_rs::VerifyOptions`]'s `proven_slices` takes: one entry per slice
-    /// of the described file, `true` only for a slice the grid proved `Intact`
-    /// with independent (pCRC-verified) article coverage — the same bar
-    /// [`Self::in_stream_verified_par2_match`] demands of every slice, applied
-    /// per slice. The eligibility rungs are the match predicate's own: a
-    /// binding, a non-empty description, a complete binding at exactly the
-    /// described length. `None` when a rung fails or when no slice is proven —
-    /// to the verifier, absent and all-`false` are the same statement.
-    ///
-    /// This is what lets a file the grid could *not* claim whole — one damaged
-    /// or unverdicted slice vetoes the whole-file claim — still hand the
-    /// verify pass everything the grid did prove, so the pass reads only the
-    /// slices in question instead of the whole file.
+    // Per-slice grid evidence for one bound file, in the shape
+    // [`par2_rs::VerifyOptions`]'s `proven_slices` takes: one entry per slice
+    // of the described file, `true` only for a slice the grid proved `Intact`
+    // with independent (pCRC-verified) article coverage — the same bar
+    // [`Self::in_stream_verified_par2_match`] demands of every slice, applied
+    // per slice. The eligibility rungs are the match predicate's own: a
+    // binding, a non-empty description, a complete binding at exactly the
+    // described length. `None` when a rung fails or when no slice is proven —
+    // to the verifier, absent and all-`false` are the same statement.
+    //
+    // This is what lets a file the grid could *not* claim whole — one damaged
+    // or unverdicted slice vetoes the whole-file claim — still hand the
+    // verify pass everything the grid did prove, so the pass reads only the
+    // slices in question instead of the whole file.
     pub(crate) fn in_stream_proven_slices(
         &self,
         file_id: NzbFileId,
@@ -1979,24 +1979,24 @@ impl Pipeline {
         }
     }
 
-    /// Whether the dual-CRC grid adjudicated **every** described slice of
-    /// **every** described file in a job's recovery set.
-    ///
-    /// This is the bar an access-backed repair session has to clear before it
-    /// may stand in for the read-and-verify pass. That session reads no source
-    /// bytes — `analyze()` skips the scan, because the direct volumes are
-    /// absent from the directory by construction — so it reports only what its
-    /// evidence established. One unclaimed slice and it would call an unread
-    /// volume missing, so anything short of total coverage refuses and the
-    /// caller falls back to the pass, which can actually read a virtual volume.
-    ///
-    /// Total coverage here means *clean*:
-    /// [`Self::in_stream_verified_par2_match`] demands every slice `Intact`
-    /// with independent (pCRC-verified) article coverage at exactly the
-    /// described length. A set carrying a `Damaged` block is deliberately not
-    /// adjudicated — the grid withholds damaged slices from evidence, so a
-    /// session seeded from it would have nothing to say about the very blocks
-    /// that matter, and those need the real bytes read.
+    // Whether the dual-CRC grid adjudicated **every** described slice of
+    // **every** described file in a job's recovery set.
+    //
+    // This is the bar an access-backed repair session has to clear before it
+    // may stand in for the read-and-verify pass. That session reads no source
+    // bytes — `analyze()` skips the scan, because the direct volumes are
+    // absent from the directory by construction — so it reports only what its
+    // evidence established. One unclaimed slice and it would call an unread
+    // volume missing, so anything short of total coverage refuses and the
+    // caller falls back to the pass, which can actually read a virtual volume.
+    //
+    // Total coverage here means *clean*:
+    // [`Self::in_stream_verified_par2_match`] demands every slice `Intact`
+    // with independent (pCRC-verified) article coverage at exactly the
+    // described length. A set carrying a `Damaged` block is deliberately not
+    // adjudicated — the grid withholds damaged slices from evidence, so a
+    // session seeded from it would have nothing to say about the very blocks
+    // that matter, and those need the real bytes read.
     pub(crate) fn grid_adjudicated_par2_bindings(
         &self,
         job_id: JobId,
@@ -2016,22 +2016,22 @@ impl Pipeline {
             .all(|(par2_file_id, _)| adjudicated.contains(par2_file_id))
     }
 
-    /// The per-description half of [`Self::grid_adjudicated_par2_bindings`]:
-    /// which of a job's PAR2 descriptions the dual-CRC grid proved clean in
-    /// stream, at exactly the described length, with independent article
-    /// coverage on every slice.
-    ///
-    /// `None` is ambiguity — two pipeline files claiming one description — and
-    /// is not a smaller answer than the empty set: it means the name-to-
-    /// description resolution itself cannot be trusted, so no claim derived
-    /// from it may be acted on.
-    ///
-    /// Split out because the two callers want different shapes of the same
-    /// question. The access-backed session needs the all-or-nothing answer,
-    /// because it reads nothing and one unclaimed slice would have it call an
-    /// unread volume missing. The read-and-verify pass needs the per-file
-    /// answer: a file this proves clean is one it does not have to read, and
-    /// every other file is read exactly as before.
+    // The per-description half of [`Self::grid_adjudicated_par2_bindings`]:
+    // which of a job's PAR2 descriptions the dual-CRC grid proved clean in
+    // stream, at exactly the described length, with independent article
+    // coverage on every slice.
+    //
+    // `None` is ambiguity — two pipeline files claiming one description — and
+    // is not a smaller answer than the empty set: it means the name-to-
+    // description resolution itself cannot be trusted, so no claim derived
+    // from it may be acted on.
+    //
+    // Split out because the two callers want different shapes of the same
+    // question. The access-backed session needs the all-or-nothing answer,
+    // because it reads nothing and one unclaimed slice would have it call an
+    // unread volume missing. The read-and-verify pass needs the per-file
+    // answer: a file this proves clean is one it does not have to read, and
+    // every other file is read exactly as before.
     pub(crate) fn grid_adjudicated_par2_file_ids(
         &self,
         job_id: JobId,
@@ -2050,8 +2050,8 @@ impl Pipeline {
         Some(adjudicated)
     }
 
-    /// Every file's in-stream block verdicts for one recovery set, shaped as
-    /// PAR2 slice evidence a repair session can be seeded with.
+    // Every file's in-stream block verdicts for one recovery set, shaped as
+    // PAR2 slice evidence a repair session can be seeded with.
     pub(crate) fn in_stream_slice_evidence_for_set(
         &self,
         job_id: JobId,
@@ -2063,17 +2063,17 @@ impl Pipeline {
             .collect()
     }
 
-    /// [`Self::in_stream_slice_evidence_for_set`] keyed by the path each file
-    /// actually occupies, for a session that finds its sources in the directory
-    /// rather than through a handle.
-    ///
-    /// A path-backed session refuses the `FileId`-keyed seat outright, so the
-    /// conventional pass has to name a path — and the only path that names the
-    /// bytes is the file's *effective* identity. A file the deobfuscation or
-    /// reconciliation passes renamed is seeded under the name it now carries,
-    /// because that is the name the session will open; seeding the NZB's
-    /// original name would attach every verdict to a path that no longer
-    /// exists, and the file would be read in full after all.
+    // [`Self::in_stream_slice_evidence_for_set`] keyed by the path each file
+    // actually occupies, for a session that finds its sources in the directory
+    // rather than through a handle.
+    //
+    // A path-backed session refuses the `FileId`-keyed seat outright, so the
+    // conventional pass has to name a path — and the only path that names the
+    // bytes is the file's *effective* identity. A file the deobfuscation or
+    // reconciliation passes renamed is seeded under the name it now carries,
+    // because that is the name the session will open; seeding the NZB's
+    // original name would attach every verdict to a path that no longer
+    // exists, and the file would be read in full after all.
     pub(crate) fn in_stream_slice_evidence_paths_for_set(
         &self,
         job_id: JobId,
@@ -2107,7 +2107,7 @@ impl Pipeline {
             .collect()
     }
 
-    /// The per-file grouping both evidence shapes are built from.
+    // The per-file grouping both evidence shapes are built from.
     fn in_stream_slice_evidence_by_file(
         &self,
         job_id: JobId,
@@ -2154,9 +2154,9 @@ impl Pipeline {
         evidence
     }
 
-    /// Whether the retained session is in play. Reads the environment in a
-    /// real build; a test may force either arm so a differential can assert
-    /// the two agree.
+    // Whether the retained session is in play. Reads the environment in a
+    // real build; a test may force either arm so a differential can assert
+    // the two agree.
     fn stateful_par2_session_gate(&self) -> bool {
         #[cfg(test)]
         if let Some(forced) = self.stateful_par2_session_forced {
@@ -2165,44 +2165,44 @@ impl Pipeline {
         stateful_par2_session_enabled()
     }
 
-    /// The files under this job's working directory that the named recovery
-    /// set's extra scan must not read.
-    ///
-    /// An extra candidate is a file the set does not describe, rolling-scanned
-    /// window by window on the chance that it holds a copy of some slice.
-    /// Finding a renamed or concatenated source that way is the entire point,
-    /// so anything this cannot positively place elsewhere stays discoverable —
-    /// an obfuscated file with no binding at all is exactly what extras exist
-    /// for, and excluding it would be excluding the answer.
-    ///
-    /// Three things can be positively placed elsewhere:
-    ///
-    ///  - A file that binds to a *different* recovery set. The binding
-    ///    resolver refuses a name two sets both answer to, so a binding that
-    ///    names another set is unambiguous: those bytes are that set's
-    ///    payload, and a slice of this set cannot be inside them at any offset.
-    ///  - A complete volume of a RAR set other than the one this recovery set
-    ///    describes. Applied only when at least one file bound to this set
-    ///    carries a RAR classification, because that is what says which
-    ///    archive set the recovery set is for; with nothing to compare against,
-    ///    every volume stays discoverable. Incomplete volumes are left alone: a
-    ///    file still being written is not yet the archive its name claims, and
-    ///    its bytes may still be rearranged. So is a numberless volume whose
-    ///    headers have not shown it opening a set: the set it is classified
-    ///    under is named after the volume itself, and an obfuscated later
-    ///    volume of this very set looks exactly like that.
-    ///  - A file a repair left behind: it appeared in the directory after the
-    ///    pre-repair snapshot and neither the NZB nor any servable set names
-    ///    it, so it is the damaged original a repair moved aside. Named by
-    ///    difference, exactly as [`Self::purge_par2_repair_leftovers`] names
-    ///    what it removes once the whole job has settled — until then the
-    ///    copy stays on disk as evidence, and this keeps it out of every
-    ///    later scan. Its bytes are the pre-repair content of a file the set
-    ///    reads as a canonical source in its own right.
-    ///
-    /// Without this, a directory holding two recovery sets makes each set read
-    /// the other set's whole payload, once per scanning pass, and match nothing
-    /// both times.
+    // The files under this job's working directory that the named recovery
+    // set's extra scan must not read.
+    //
+    // An extra candidate is a file the set does not describe, rolling-scanned
+    // window by window on the chance that it holds a copy of some slice.
+    // Finding a renamed or concatenated source that way is the entire point,
+    // so anything this cannot positively place elsewhere stays discoverable —
+    // an obfuscated file with no binding at all is exactly what extras exist
+    // for, and excluding it would be excluding the answer.
+    //
+    // Three things can be positively placed elsewhere:
+    //
+    //  - A file that binds to a *different* recovery set. The binding
+    //    resolver refuses a name two sets both answer to, so a binding that
+    //    names another set is unambiguous: those bytes are that set's
+    //    payload, and a slice of this set cannot be inside them at any offset.
+    //  - A complete volume of a RAR set other than the one this recovery set
+    //    describes. Applied only when at least one file bound to this set
+    //    carries a RAR classification, because that is what says which
+    //    archive set the recovery set is for; with nothing to compare against,
+    //    every volume stays discoverable. Incomplete volumes are left alone: a
+    //    file still being written is not yet the archive its name claims, and
+    //    its bytes may still be rearranged. So is a numberless volume whose
+    //    headers have not shown it opening a set: the set it is classified
+    //    under is named after the volume itself, and an obfuscated later
+    //    volume of this very set looks exactly like that.
+    //  - A file a repair left behind: it appeared in the directory after the
+    //    pre-repair snapshot and neither the NZB nor any servable set names
+    //    it, so it is the damaged original a repair moved aside. Named by
+    //    difference, exactly as [`Self::purge_par2_repair_leftovers`] names
+    //    what it removes once the whole job has settled — until then the
+    //    copy stays on disk as evidence, and this keeps it out of every
+    //    later scan. Its bytes are the pre-repair content of a file the set
+    //    reads as a canonical source in its own right.
+    //
+    // Without this, a directory holding two recovery sets makes each set read
+    // the other set's whole payload, once per scanning pass, and match nothing
+    // both times.
     pub(crate) fn par2_extra_scan_exclusions(
         &self,
         job_id: JobId,
@@ -2416,24 +2416,24 @@ impl Pipeline {
         self.enforce_par2_retained_session_budget((job_id, set_id));
     }
 
-    /// Teach the retained session about a recovery volume that just landed,
-    /// instead of throwing the session away for being a set behind.
-    ///
-    /// Only for a set holding a parked damaged-path verdict — the one shape
-    /// where the session is carrying an analysis the job is about to repair on,
-    /// and where losing it means reading every damaged file a second time.
-    /// Everything else keeps the eviction: it is free, and a session rebuilt
-    /// from the merged set is always correct.
-    ///
-    /// par2-rs draws the same distinction internally. Recovery-only packets
-    /// leave the source scan standing, so the repair's analysis re-uses it and
-    /// reads nothing; a volume that turns out to carry *new* descriptions
-    /// rebuilds the source map and costs the scan anyway, which is the right
-    /// answer because the protected file set itself changed.
-    ///
-    /// Returns whether the session may stand. `false` means the caller must
-    /// evict, which is also what every refusal below leaves behind: the session
-    /// has already been taken out of the runtime by then.
+    // Teach the retained session about a recovery volume that just landed,
+    // instead of throwing the session away for being a set behind.
+    //
+    // Only for a set holding a parked damaged-path verdict — the one shape
+    // where the session is carrying an analysis the job is about to repair on,
+    // and where losing it means reading every damaged file a second time.
+    // Everything else keeps the eviction: it is free, and a session rebuilt
+    // from the merged set is always correct.
+    //
+    // par2-rs draws the same distinction internally. Recovery-only packets
+    // leave the source scan standing, so the repair's analysis re-uses it and
+    // reads nothing; a volume that turns out to carry *new* descriptions
+    // rebuilds the source map and costs the scan anyway, which is the right
+    // answer because the protected file set itself changed.
+    //
+    // Returns whether the session may stand. `false` means the caller must
+    // evict, which is also what every refusal below leaves behind: the session
+    // has already been taken out of the runtime by then.
     async fn merge_recovery_into_retained_par2_session(
         &mut self,
         job_id: JobId,
@@ -2501,8 +2501,8 @@ impl Pipeline {
         }
     }
 
-    /// The retained session owns a snapshot of the validated set. Packet
-    /// arrivals update that set first, then make the snapshot stale.
+    // The retained session owns a snapshot of the validated set. Packet
+    // arrivals update that set first, then make the snapshot stale.
     pub(in crate::pipeline) fn evict_par2_repair_session(
         &mut self,
         job_id: JobId,
@@ -2568,9 +2568,9 @@ impl Pipeline {
         }
     }
 
-    /// A decoded write can replace bytes that were previously committed to a
-    /// retained repair session. Drop source locations before that write is
-    /// allowed to become observable; parsed PAR2 packets remain reusable.
+    // A decoded write can replace bytes that were previously committed to a
+    // retained repair session. Drop source locations before that write is
+    // allowed to become observable; parsed PAR2 packets remain reusable.
     pub(crate) fn invalidate_par2_session_for_file_write(&mut self, file_id: NzbFileId) {
         self.invalidate_par3_source_write(file_id);
         // A damaged-path analysis reading right now is reading the bytes this
@@ -2589,9 +2589,9 @@ impl Pipeline {
         }
     }
 
-    /// Identity changes can rename or rebind a path without changing the
-    /// downloaded bytes. A retained location must nevertheless be discarded:
-    /// repair always derives a fresh location from the current identity.
+    // Identity changes can rename or rebind a path without changing the
+    // downloaded bytes. A retained location must nevertheless be discarded:
+    // repair always derives a fresh location from the current identity.
     pub(crate) fn invalidate_par2_session_for_identity_rebind(&mut self, job_id: JobId) {
         self.invalidate_par3_bindings(job_id);
         // Same reason a retained location is discarded here: an analysis in

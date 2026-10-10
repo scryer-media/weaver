@@ -1,4 +1,4 @@
-//! PAR3 recovery: deterministic verdicts, per-cohort acquisition, telemetry.
+// PAR3 recovery: deterministic verdicts, per-cohort acquisition, telemetry.
 
 use super::*;
 use crate::operations::metrics::Par3OutcomeClass;
@@ -10,8 +10,8 @@ use crate::pipeline::tests::direct_store::{
 const INDEX: &[u8] = include_bytes!("../repair/backend/fixtures/set.par3");
 const VOLUME: &[u8] = include_bytes!("../repair/backend/fixtures/set.vol0+1.par3");
 
-/// A set whose File packets name a Windows reserved device, kept as produced.
-/// Only the Unix test below can build the protected file it covers.
+// A set whose File packets name a Windows reserved device, kept as produced.
+// Only the Unix test below can build the protected file it covers.
 #[cfg(unix)]
 const RESERVED_NAME_SET: &[(&str, &[u8])] = &[
     (
@@ -32,8 +32,8 @@ const RESERVED_NAME_SET: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// The protected payload the fixture carriers were built over, with `damage`
-/// applied so more blocks are lost than the single recovery block can cover.
+// The protected payload the fixture carriers were built over, with `damage`
+// applied so more blocks are lost than the single recovery block can cover.
 fn damaged_payload(damage: &[usize]) -> Vec<(&'static str, Vec<u8>)> {
     let mut a: Vec<u8> = (0..5000u32).map(|i| (i * 7 + 3) as u8).collect();
     for &offset in damage {
@@ -49,21 +49,21 @@ fn damaged_payload(damage: &[usize]) -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-/// Publish a job whose carriers arrive in `carrier_order`, and drive it to
-/// whatever verdict PAR3 reaches. The payload files always arrive first; only
-/// the carriers — and so the packet bytes the engine ingests — are reordered.
-/// What a run reached: the job's own failure text, which is the verdict's
-/// `Display`, and the counter of verdict classes it passed through.
+// Publish a job whose carriers arrive in `carrier_order`, and drive it to
+// whatever verdict PAR3 reaches. The payload files always arrive first; only
+// the carriers — and so the packet bytes the engine ingests — are reordered.
+// What a run reached: the job's own failure text, which is the verdict's
+// `Display`, and the counter of verdict classes it passed through.
 #[derive(Debug)]
 struct Verdict {
     failure: Option<String>,
     classes: [u64; crate::operations::metrics::Par3OutcomeClass::COUNT],
-    /// What the carriers' own scans reported, captured as soon as every
-    /// carrier had been scanned and before completion could retire the job.
+    // What the carriers' own scans reported, captured as soon as every
+    // carrier had been scanned and before completion could retire the job.
     damage: Vec<String>,
-    /// Where the job's outputs would have been written.
+    // Where the job's outputs would have been written.
     working: PathBuf,
-    /// Whether the completion check stopped claiming another step on its own.
+    // Whether the completion check stopped claiming another step on its own.
     terminated: bool,
 }
 
@@ -85,8 +85,8 @@ async fn verdict_for_carrier_order(
     run_par3_job(&mut pipeline, job_id, &payload, &carriers).await
 }
 
-/// Publish a job whose protected files are `payload` and whose PAR3 carriers
-/// are `carriers`, and drive it to whatever verdict PAR3 reaches.
+// Publish a job whose protected files are `payload` and whose PAR3 carriers
+// are `carriers`, and drive it to whatever verdict PAR3 reaches.
 async fn run_par3_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -186,9 +186,9 @@ async fn settle_par3_recovery(pipeline: &mut Pipeline, job_id: JobId) {
     }
 }
 
-/// Deliverable: the same carrier bytes presented in two orders must reach the
-/// same outcome, with an identical cohort deficit list — not merely the same
-/// class, and not a list that happens to be sorted differently.
+// Deliverable: the same carrier bytes presented in two orders must reach the
+// same outcome, with an identical cohort deficit list — not merely the same
+// class, and not a list that happens to be sorted differently.
 #[tokio::test]
 async fn the_same_carrier_bytes_in_two_orders_reach_the_same_verdict() {
     // Two damaged blocks against one recovery block: the deficit is real and
@@ -237,8 +237,8 @@ async fn the_same_carrier_bytes_in_two_orders_reach_the_same_verdict() {
     );
 }
 
-/// Deliverable: withholding the recovery articles leaves the job in a wait,
-/// publishes what it is short by, and lets the slot's stall grow and clear.
+// Deliverable: withholding the recovery articles leaves the job in a wait,
+// publishes what it is short by, and lets the slot's stall grow and clear.
 #[tokio::test]
 async fn withheld_recovery_articles_show_as_a_wait_a_deficit_and_a_stall() {
     let root = TempDir::new().unwrap();
@@ -397,8 +397,8 @@ async fn withheld_recovery_articles_show_as_a_wait_a_deficit_and_a_stall() {
     assert_eq!(snapshot.par3.stalls_total, 1, "the stall is not recounted");
 }
 
-/// Deliverable: an admission refused over budget records the refusing budget
-/// and separates a collision with a peer from a set that can never fit.
+// Deliverable: an admission refused over budget records the refusing budget
+// and separates a collision with a peer from a set that can never fit.
 #[test]
 fn an_over_budget_admission_names_its_budget_and_its_class() {
     use crate::operations::metrics::{Par3AdmissionReason, Par3OutcomeClass};
@@ -457,10 +457,10 @@ fn an_over_budget_admission_names_its_budget_and_its_class() {
     }
 }
 
-/// A refused spill with a peer holding the budget parks instead of failing —
-/// and the peer's handback is what wakes it. The park is bounded by that peer:
-/// the second attempt runs with the slot free, so it reaches a terminal
-/// verdict rather than parking again.
+// A refused spill with a peer holding the budget parks instead of failing —
+// and the peer's handback is what wakes it. The park is bounded by that peer:
+// the second attempt runs with the slot free, so it reaches a terminal
+// verdict rather than parking again.
 #[tokio::test]
 async fn a_peer_handback_wakes_every_job_parked_on_par3_memory() {
     use crate::pipeline::direct_store::wiring::DirectStoreRuntime;
@@ -599,12 +599,12 @@ async fn a_peer_handback_wakes_every_job_parked_on_par3_memory() {
     }
 }
 
-/// The fixture index's Root packet, the one vital packet a test damages.
+// The fixture index's Root packet, the one vital packet a test damages.
 const ROOT_PACKET: std::ops::Range<usize> = 672..781;
 
-/// Damage a packet in place: past its 48-byte header, so the scanner still
-/// finds the packet and still reads its declared length, and only the hash it
-/// carries stops describing the body behind it.
+// Damage a packet in place: past its 48-byte header, so the scanner still
+// finds the packet and still reads its declared length, and only the hash it
+// carries stops describing the body behind it.
 fn with_damaged_packet(carrier: &[u8], packet: std::ops::Range<usize>) -> Vec<u8> {
     let mut bytes = carrier.to_vec();
     for byte in &mut bytes[packet.start + 48..packet.end] {
@@ -613,8 +613,8 @@ fn with_damaged_packet(carrier: &[u8], packet: std::ops::Range<usize>) -> Vec<u8
     bytes
 }
 
-/// Deliverable: every vital packet can be taken from the volume carriers, so a
-/// set whose index file never arrives still repairs.
+// Deliverable: every vital packet can be taken from the volume carriers, so a
+// set whose index file never arrives still repairs.
 #[tokio::test]
 async fn a_set_whose_index_never_arrives_still_repairs_from_its_volumes() {
     let root = TempDir::new().unwrap();
@@ -641,8 +641,8 @@ async fn a_set_whose_index_never_arrives_still_repairs_from_its_volumes() {
     );
 }
 
-/// Deliverable: a damaged copy of a vital packet in one carrier is summarised
-/// with its offset, and the surviving copy in another carrier still repairs.
+// Deliverable: a damaged copy of a vital packet in one carrier is summarised
+// with its offset, and the surviving copy in another carrier still repairs.
 #[tokio::test]
 async fn a_damaged_root_copy_is_summarised_and_the_surviving_copy_repairs() {
     let root = TempDir::new().unwrap();
@@ -684,8 +684,8 @@ async fn a_damaged_root_copy_is_summarised_and_the_surviving_copy_repairs() {
     );
 }
 
-/// Deliverable: with no authenticated Root copy in any carrier the job fails as
-/// incomplete metadata, and says which packet family it never saw.
+// Deliverable: with no authenticated Root copy in any carrier the job fails as
+// incomplete metadata, and says which packet family it never saw.
 #[tokio::test]
 async fn no_authenticated_root_anywhere_names_the_root_packet() {
     let root = TempDir::new().unwrap();
@@ -724,10 +724,10 @@ async fn no_authenticated_root_anywhere_names_the_root_packet() {
     );
 }
 
-/// Deliverable: a carrier whose own file is already whole never takes a slot
-/// or a byte of a recovery window's budget. Production leaves such a carrier's
-/// spent queue entries behind, and before this they were promoted again on
-/// every pass — which both wasted the window and kept it permanently active.
+// Deliverable: a carrier whose own file is already whole never takes a slot
+// or a byte of a recovery window's budget. Production leaves such a carrier's
+// spent queue entries behind, and before this they were promoted again on
+// every pass — which both wasted the window and kept it permanently active.
 #[tokio::test]
 async fn a_complete_carrier_never_spends_a_recovery_window_budget() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -833,9 +833,9 @@ async fn a_complete_carrier_never_spends_a_recovery_window_budget() {
     );
 }
 
-/// The fixture payload with only its smallest protected file damaged, so a
-/// repair rebuilds ten bytes while the five-thousand-byte file beside it is
-/// verified and never touched.
+// The fixture payload with only its smallest protected file damaged, so a
+// repair rebuilds ten bytes while the five-thousand-byte file beside it is
+// verified and never touched.
 fn payload_with_only_the_small_file_damaged() -> Vec<(String, Vec<u8>)> {
     let mut payload: Vec<(String, Vec<u8>)> = damaged_payload(&[])
         .into_iter()
@@ -845,7 +845,7 @@ fn payload_with_only_the_small_file_damaged() -> Vec<(String, Vec<u8>)> {
     payload
 }
 
-/// What the fixture set's carriers are, in the order a job announces them.
+// What the fixture set's carriers are, in the order a job announces them.
 fn fixture_carriers() -> Vec<(String, Vec<u8>)> {
     vec![
         ("set.par3".to_string(), INDEX.to_vec()),
@@ -853,13 +853,13 @@ fn fixture_carriers() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
-/// Deliverable: output planning refuses before the first output byte when the
-/// working directory cannot hold what the repair will write, and the verdict
-/// names the shortfall in bytes.
-///
-/// Only the ten-byte file is damaged, so the shortfall proves what was
-/// counted: ten bytes, the one rebuilt output staged once, with the nine
-/// thousand intact bytes beside it excluded and no second copy for the rename.
+// Deliverable: output planning refuses before the first output byte when the
+// working directory cannot hold what the repair will write, and the verdict
+// names the shortfall in bytes.
+//
+// Only the ten-byte file is damaged, so the shortfall proves what was
+// counted: ten bytes, the one rebuilt output staged once, with the nine
+// thousand intact bytes beside it excluded and no second copy for the rename.
 #[tokio::test]
 async fn output_planning_names_its_byte_shortfall_before_any_output_byte() {
     use crate::pipeline::direct_store::wiring::DirectStoreRuntime;
@@ -904,22 +904,22 @@ async fn output_planning_names_its_byte_shortfall_before_any_output_byte() {
     );
 }
 
-/// Deliverable: a file the repair will not rewrite never counts against the
-/// free space. An intact file larger than everything the disk will grant must
-/// not turn a ten-byte repair into a refusal.
-///
-/// The intact file is deliberately tens of megabytes: the window between "the
-/// bytes that will be written" and "every byte the set protects" has to be
-/// wide enough that the free space other work on the same volume consumes
-/// while this test runs cannot close it.
+// Deliverable: a file the repair will not rewrite never counts against the
+// free space. An intact file larger than everything the disk will grant must
+// not turn a ten-byte repair into a refusal.
+//
+// The intact file is deliberately tens of megabytes: the window between "the
+// bytes that will be written" and "every byte the set protects" has to be
+// wide enough that the free space other work on the same volume consumes
+// while this test runs cannot close it.
 #[tokio::test]
 async fn an_intact_file_larger_than_the_free_space_does_not_refuse_the_plan() {
     use crate::pipeline::direct_store::wiring::DirectStoreRuntime;
     use crate::pipeline::direct_store::{DirectStoreGate, DirectStoreSettings};
 
     const INTACT_BYTES: usize = 32 << 20;
-    /// Comfortably under the intact file, comfortably over the ten-byte
-    /// repair, and far wider than any plausible disk movement beside it.
+    // Comfortably under the intact file, comfortably over the ten-byte
+    // repair, and far wider than any plausible disk movement beside it.
     const GRANTED: u64 = 20 << 20;
 
     let root = TempDir::new().unwrap();
@@ -1010,11 +1010,11 @@ async fn an_intact_file_larger_than_the_free_space_does_not_refuse_the_plan() {
     );
 }
 
-/// Deliverable: a set that names a file weaver will not create fails the job
-/// before any output byte, and says which rule refused the name.
-///
-/// Unix only: the refused name is a Windows reserved device name, and the
-/// protected file has to exist on disk for a genuine set to be built over it.
+// Deliverable: a set that names a file weaver will not create fails the job
+// before any output byte, and says which rule refused the name.
+//
+// Unix only: the refused name is a Windows reserved device name, and the
+// protected file has to exist on disk for a genuine set to be built over it.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_set_naming_a_reserved_device_fails_before_any_output_byte() {
@@ -1069,8 +1069,8 @@ async fn a_set_naming_a_reserved_device_fails_before_any_output_byte() {
     );
 }
 
-/// Append a packet of the test's choosing to a carrier, built and hashed by the
-/// engine's own builder so it authenticates like every other packet in the set.
+// Append a packet of the test's choosing to a carrier, built and hashed by the
+// engine's own builder so it authenticates like every other packet in the set.
 fn carrier_with(carrier: &[u8], body: par3_rs::packet::PacketBody) -> Vec<u8> {
     let set_id = par3_rs::InputSetId(carrier[32..40].try_into().expect("packet header"));
     let mut bytes = carrier.to_vec();
@@ -1078,8 +1078,8 @@ fn carrier_with(carrier: &[u8], body: par3_rs::packet::PacketBody) -> Vec<u8> {
     bytes
 }
 
-/// Drive a job to the point where every carrier has been scanned, without
-/// running the completion check that would consume the option-packet report.
+// Drive a job to the point where every carrier has been scanned, without
+// running the completion check that would consume the option-packet report.
 async fn scan_carriers_only(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -1120,8 +1120,8 @@ async fn scan_carriers_only(
     }
 }
 
-/// Deliverable: a permission option packet is reported exactly once per job and
-/// never applied, and the set it rides along with still repairs.
+// Deliverable: a permission option packet is reported exactly once per job and
+// never applied, and the set it rides along with still repairs.
 #[tokio::test]
 async fn an_option_packet_is_reported_once_and_never_installed() {
     let root = TempDir::new().unwrap();
@@ -1180,8 +1180,8 @@ async fn an_option_packet_is_reported_once_and_never_installed() {
     );
 }
 
-/// Deliverable: an option packet a File packet points at but that nothing
-/// authenticated is counted as unresolved and does not block recovery.
+// Deliverable: an option packet a File packet points at but that nothing
+// authenticated is counted as unresolved and does not block recovery.
 #[tokio::test]
 async fn an_unresolved_option_reference_does_not_block_recovery() {
     let root = TempDir::new().unwrap();
@@ -1242,9 +1242,9 @@ async fn an_unresolved_option_reference_does_not_block_recovery() {
     );
 }
 
-/// Deliverable: metadata built to exhaust the host stops at a named ceiling
-/// instead, the verdict names that ceiling, and the completion check still
-/// reaches an answer and stops.
+// Deliverable: metadata built to exhaust the host stops at a named ceiling
+// instead, the verdict names that ceiling, and the completion check still
+// reaches an answer and stops.
 #[tokio::test]
 async fn hostile_metadata_fails_with_the_ceiling_it_reached() {
     let root = TempDir::new().unwrap();
@@ -1296,13 +1296,13 @@ async fn hostile_metadata_fails_with_the_ceiling_it_reached() {
     );
 }
 
-/// Build a job over `root` whose payload is damaged at `damage`, publish its
-/// carriers, and drive PAR3 until it stops asking for a next step. The
-/// pipeline is returned still live so a caller can keep driving it.
-///
-/// Calling this twice with the same `root` and `job_id` is a restart: the
-/// second pipeline is new, its coordinator holds nothing, and the sources it
-/// finds on disk are byte-for-byte the ones the first run left there.
+// Build a job over `root` whose payload is damaged at `damage`, publish its
+// carriers, and drive PAR3 until it stops asking for a next step. The
+// pipeline is returned still live so a caller can keep driving it.
+//
+// Calling this twice with the same `root` and `job_id` is a restart: the
+// second pipeline is new, its coordinator holds nothing, and the sources it
+// finds on disk are byte-for-byte the ones the first run left there.
 async fn settled_par3_job(
     root: &TempDir,
     job_id: JobId,
@@ -1380,7 +1380,7 @@ async fn settled_par3_job(
     (pipeline, files, working)
 }
 
-/// The engine's own source-read counters as weaver folds them in.
+// The engine's own source-read counters as weaver folds them in.
 fn source_reads(pipeline: &Pipeline) -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let par3 = &pipeline.metrics.par3;
@@ -1390,10 +1390,10 @@ fn source_reads(pipeline: &Pipeline) -> (u64, u64) {
     )
 }
 
-/// Deliverable: a job whose acquisition is interrupted and taken up again with
-/// unchanged sources reaches the same verdict class and the same rendered
-/// message, and resuming that acquisition reads no protected source bytes at
-/// all.
+// Deliverable: a job whose acquisition is interrupted and taken up again with
+// unchanged sources reaches the same verdict class and the same rendered
+// message, and resuming that acquisition reads no protected source bytes at
+// all.
 #[tokio::test]
 async fn a_restarted_acquisition_reaches_the_same_verdict_without_rereading_sources() {
     let root = TempDir::new().unwrap();
@@ -1445,8 +1445,8 @@ async fn a_restarted_acquisition_reaches_the_same_verdict_without_rereading_sour
     );
 }
 
-/// Deliverable: only a source whose bytes actually changed is verified again.
-/// An unchanged peer is not reread merely because something else was.
+// Deliverable: only a source whose bytes actually changed is verified again.
+// An unchanged peer is not reread merely because something else was.
 #[tokio::test]
 async fn only_a_source_whose_generation_changed_is_verified_again() {
     let root = TempDir::new().unwrap();
@@ -1491,7 +1491,7 @@ async fn only_a_source_whose_generation_changed_is_verified_again() {
     );
 }
 
-/// Every recovery requirement the retained assessments currently carry.
+// Every recovery requirement the retained assessments currently carry.
 fn requirements(pipeline: &Pipeline, job_id: JobId) -> Vec<par3_rs::session::RecoveryRequirement> {
     pipeline
         .par3_runtime
@@ -1506,10 +1506,10 @@ fn requirements(pipeline: &Pipeline, job_id: JobId) -> Vec<par3_rs::session::Rec
         .collect()
 }
 
-/// Deliverable: a recovery-only merge does not duplicate acquisition. Once a
-/// window declares the indices it is fetching, the reassessment that merge
-/// triggers asks for none of them a second time; abandoning the window puts
-/// them back in play.
+// Deliverable: a recovery-only merge does not duplicate acquisition. Once a
+// window declares the indices it is fetching, the reassessment that merge
+// triggers asks for none of them a second time; abandoning the window puts
+// them back in play.
 #[tokio::test]
 async fn a_recovery_only_merge_never_requests_an_index_twice() {
     let root = TempDir::new().unwrap();

@@ -1,4 +1,4 @@
-//! Content identity discovery. A match proposes a name; it is not repair evidence.
+// Content identity discovery. A match proposes a name; it is not repair evidence.
 
 use super::*;
 use par3_rs::layout::ExtentKind;
@@ -635,8 +635,8 @@ mod tests {
         assert_eq!(read, 0);
     }
 
-    /// The same packet stream with every External Data packet dropped, so the
-    /// set describes its files without authenticating any of their blocks.
+    // The same packet stream with every External Data packet dropped, so the
+    // set describes its files without authenticating any of their blocks.
     fn without_external_data(index: &[u8]) -> Vec<u8> {
         use par3_rs::packet::{HEADER_SIZE, PacketHeader, PacketType};
         let mut kept = Vec::with_capacity(index.len());

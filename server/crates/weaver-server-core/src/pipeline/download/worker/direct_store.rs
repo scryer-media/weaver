@@ -4,33 +4,33 @@ use crate::pipeline::direct_store::router::HeaderProbe as DirectHeaderProbe;
 pub(in crate::pipeline::download) struct DirectStoreAdmission {
     job_id: JobId,
     files: HashSet<u32>,
-    /// Room the set had when the handout began: its holds admission room
-    /// with every byte already on its way to it counted.
+    // Room the set had when the handout began: its holds admission room
+    // with every byte already on its way to it counted.
     room: u64,
-    /// The same room judged by the set's own limit alone.
+    // The same room judged by the set's own limit alone.
     own_room: u64,
-    /// What the handout being built has leased of the set so far.
+    // What the handout being built has leased of the set so far.
     leased: u64,
     available: u64,
-    /// `own_room` less what the handout has leased.
+    // `own_room` less what the handout has leased.
     own_available: u64,
     probes: Vec<SegmentId>,
     probe_lease: ProbeLease,
-    /// The article an idle set with a settled layout routes next: the
-    /// lowest queued article of its earliest unfinished volume. Judged by
-    /// the set's own room only, so what other sets hold can slow this set to
-    /// one article at a time but never stop it.
+    // The article an idle set with a settled layout routes next: the
+    // lowest queued article of its earliest unfinished volume. Judged by
+    // the set's own room only, so what other sets hold can slow this set to
+    // one article at a time but never stop it.
     frontier: Option<SegmentId>,
 }
 
-/// What leasing one of the set's articles does to its header probes.
+// What leasing one of the set's articles does to its header probes.
 #[derive(Clone, Copy)]
 enum ProbeLease {
-    /// The earliest-volume probe is only asked of an idle set; anything of
-    /// the set out on a lane closes it.
+    // The earliest-volume probe is only asked of an idle set; anything of
+    // the set out on a lane closes it.
     CloseAll,
-    /// A container probes each end until that end's volume has an article
-    /// in flight; leasing one closes only the probe of that volume.
+    // A container probes each end until that end's volume has an article
+    // in flight; leasing one closes only the probe of that volume.
     CloseFile,
 }
 
@@ -43,15 +43,15 @@ impl DirectStoreAdmission {
                 && work.byte_estimate as u64 <= self.own_available)
     }
 
-    /// Whether this set could admit *any* queued article of `file_index`,
-    /// given the smallest `byte_estimate` among them.
-    ///
-    /// [`Self::allows`] admits an article of one of the set's files only when
-    /// its estimate fits the room left or it is one of the set's probes. When
-    /// even the smallest article does not fit, no article of the file fits,
-    /// so only a probe or the set's frontier can get through; either in this
-    /// file keeps the answer `true`. Both are matched by file index alone,
-    /// which can only make the answer more permissive than [`Self::allows`].
+    // Whether this set could admit *any* queued article of `file_index`,
+    // given the smallest `byte_estimate` among them.
+    //
+    // [`Self::allows`] admits an article of one of the set's files only when
+    // its estimate fits the room left or it is one of the set's probes. When
+    // even the smallest article does not fit, no article of the file fits,
+    // so only a probe or the set's frontier can get through; either in this
+    // file keeps the answer `true`. Both are matched by file index alone,
+    // which can only make the answer more permissive than [`Self::allows`].
     pub(in crate::pipeline::download) fn may_admit_from_file(
         &self,
         file_index: u32,
@@ -68,8 +68,8 @@ impl DirectStoreAdmission {
                 .is_some_and(|frontier| frontier.file_id.file_index == file_index)
     }
 
-    /// Charge an article the handout being built has just taken, so the
-    /// next one is admitted against what the set will hold with it.
+    // Charge an article the handout being built has just taken, so the
+    // next one is admitted against what the set will hold with it.
     pub(in crate::pipeline::download) fn note_leased(&mut self, work: &DownloadWork) {
         let file = work.segment_id.file_id;
         if file.job_id != self.job_id || !self.files.contains(&file.file_index) {
@@ -96,10 +96,10 @@ impl DirectStoreAdmission {
 }
 
 impl Pipeline {
-    /// Per-set disk retention is separate from shared RAM pressure. Include
-    /// arrivals already committed to the wire/decode pipeline before allowing
-    /// another article to start; work leased by the handout being built is
-    /// charged as it is taken, through [`DirectStoreAdmission::note_leased`].
+    // Per-set disk retention is separate from shared RAM pressure. Include
+    // arrivals already committed to the wire/decode pipeline before allowing
+    // another article to start; work leased by the handout being built is
+    // charged as it is taken, through [`DirectStoreAdmission::note_leased`].
     pub(super) fn direct_store_admission(&self, job_id: JobId) -> Vec<DirectStoreAdmission> {
         let Some(state) = self.jobs.get(&job_id) else {
             return Vec::new();

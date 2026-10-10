@@ -231,8 +231,8 @@ exit {exit_code}
     assert!(pipeline.inflight_terminal_post_processing.is_empty());
 }
 
-/// Point `pipeline` at a script directory holding one script that records the
-/// directory it was handed and succeeds, run through the real supervisor.
+// Point `pipeline` at a script directory holding one script that records the
+// directory it was handed and succeeds, run through the real supervisor.
 async fn install_recording_script(pipeline: &mut Pipeline, temp: &tempfile::TempDir) -> PathBuf {
     let scripts = temp.path().join("scripts");
     tokio::fs::create_dir_all(&scripts).await.unwrap();
@@ -290,10 +290,10 @@ exit 93
     scripts
 }
 
-/// A restart after the final move but before the first script started must
-/// resume the scripts against the delivered output. The move already emptied
-/// the working directory, so finalizing the job again can only fail it with
-/// "no delivery source exists".
+// A restart after the final move but before the first script started must
+// resume the scripts against the delivered output. The move already emptied
+// the working directory, so finalizing the job again can only fail it with
+// "no delivery source exists".
 #[tokio::test]
 async fn restart_between_final_move_and_first_script_resumes_scripts_on_delivered_output() {
     let temp = tempfile::tempdir().unwrap();

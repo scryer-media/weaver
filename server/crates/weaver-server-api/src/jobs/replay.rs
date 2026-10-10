@@ -571,8 +571,8 @@ mod tests {
         }
     }
 
-    /// Seed the replay caches from a live finalizing job, then purge it from the
-    /// scheduler the way the pipeline does before its terminal event lands.
+    // Seed the replay caches from a live finalizing job, then purge it from the
+    // scheduler the way the pipeline does before its terminal event lands.
     fn purged_job_fixture() -> (SchedulerHandle, SharedConfig, QueueEventCaches) {
         let (cmd_tx, _cmd_rx) = mpsc::channel::<SchedulerCommand>(4);
         let (event_tx, _event_rx) = broadcast::channel(4);
@@ -637,10 +637,10 @@ mod tests {
         }
     }
 
-    /// The ordering production actually takes: `record_job_history` moves the
-    /// job into `finished_jobs` and republishes the snapshot *before* the
-    /// terminal event is released, so the job is still resolvable — the
-    /// evicted-cache path is only the fallback.
+    // The ordering production actually takes: `record_job_history` moves the
+    // job into `finished_jobs` and republishes the snapshot *before* the
+    // terminal event is released, so the job is still resolvable — the
+    // evicted-cache path is only the fallback.
     #[tokio::test]
     async fn completed_job_in_finished_snapshot_emits_item_completed() {
         let (cmd_tx, _cmd_rx) = mpsc::channel::<SchedulerCommand>(4);

@@ -430,9 +430,9 @@ pub(crate) fn normalize_uploaded_nzb_reader(
     )))
 }
 
-/// Read NZB bytes that arrived inline, decompressing them when their magic
-/// says gzip, zstd or xz. Inline bytes carry no filename or content type, so
-/// the bytes themselves are the only evidence; the upload limits still apply.
+// Read NZB bytes that arrived inline, decompressing them when their magic
+// says gzip, zstd or xz. Inline bytes carry no filename or content type, so
+// the bytes themselves are the only evidence; the upload limits still apply.
 pub(crate) fn read_inline_nzb_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, SubmitNzbError> {
     const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
     const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];

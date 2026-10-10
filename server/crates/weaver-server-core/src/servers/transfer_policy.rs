@@ -14,7 +14,7 @@ use crate::{Database, StateError};
 use super::ServerDownloadUsage;
 use super::model::{ServerConfig, ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod};
 
-/// Authoritative live download-policy state for one configured server.
+// Authoritative live download-policy state for one configured server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerDownloadQuotaSnapshot {
     pub server_id: u32,
@@ -56,14 +56,14 @@ struct ServerPolicyState {
     generation: u64,
 }
 
-/// One holder of a download policy: a server or an egress.
+// One holder of a download policy: a server or an egress.
 struct QuotaHolder<'a> {
     id: u32,
     rate_bytes_per_sec: u64,
     quota: &'a ServerDownloadQuotaConfig,
 }
 
-/// The policies and live controls for one kind of holder.
+// The policies and live controls for one kind of holder.
 struct PolicyBook {
     scope: TransferScope,
     transfers: Arc<ServerTransferRegistry>,
@@ -86,22 +86,22 @@ impl PolicyBook {
     }
 }
 
-/// Long-lived application policy registry shared by every NNTP client and
-/// network runtime rebuild. It holds the download policy of every server and
-/// of every egress.
+// Long-lived application policy registry shared by every NNTP client and
+// network runtime rebuild. It holds the download policy of every server and
+// of every egress.
 pub struct ServerTransferPolicyRegistry {
     db: Database,
     servers: PolicyBook,
     egresses: PolicyBook,
     maintenance_gate: Mutex<()>,
     last_flush: Mutex<Instant>,
-    /// The usage each control had when it was last written, so an idle
-    /// daemon's flush writes nothing.
+    // The usage each control had when it was last written, so an idle
+    // daemon's flush writes nothing.
     flushed_usage: Mutex<HashMap<(TransferScope, u32), FlushedUsage>>,
     policy_revision: tokio::sync::watch::Sender<u64>,
 }
 
-/// The parts of a stored usage row that change between flushes.
+// The parts of a stored usage row that change between flushes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FlushedUsage {
     lifetime_bytes: u64,
@@ -119,7 +119,7 @@ impl FlushedUsage {
     }
 }
 
-/// A quota window that rolled over in memory and still has to be written.
+// A quota window that rolled over in memory and still has to be written.
 struct WindowReset {
     scope: TransferScope,
     id: u32,
@@ -151,8 +151,8 @@ impl ServerTransferPolicyRegistry {
         Arc::clone(&self.servers.transfers)
     }
 
-    /// The controls every connection's egress is metered by. Network runtime
-    /// rebuilds share it, so an egress keeps its counters across them.
+    // The controls every connection's egress is metered by. Network runtime
+    // rebuilds share it, so an egress keeps its counters across them.
     pub fn egress_transfer_registry(&self) -> Arc<ServerTransferRegistry> {
         Arc::clone(&self.egresses.transfers)
     }
@@ -187,9 +187,9 @@ impl ServerTransferPolicyRegistry {
         }
     }
 
-    /// Drop live controls so the next reconfigure restores counters from the
-    /// database. Used after a stable-state import where persisted usage must
-    /// replace any pre-restore runtime state for overlapping IDs.
+    // Drop live controls so the next reconfigure restores counters from the
+    // database. Used after a stable-state import where persisted usage must
+    // replace any pre-restore runtime state for overlapping IDs.
     pub fn clear_runtime_state(&self) {
         for book in self.books() {
             book.policies().clear();
@@ -210,8 +210,8 @@ impl ServerTransferPolicyRegistry {
         self.policy_revision.subscribe()
     }
 
-    /// Whether the control that turned a request away, server or egress,
-    /// would still turn it away.
+    // Whether the control that turned a request away, server or egress,
+    // would still turn it away.
     pub(crate) fn quota_rejection_is_current(
         &self,
         rejection: &weaver_nntp::transfer::QuotaRejection,
@@ -224,8 +224,8 @@ impl ServerTransferPolicyRegistry {
                 .is_some_and(|current| current.capacity_revision == rejection.capacity_revision)
     }
 
-    /// Capacity changes for servers and egresses alike: the two registries
-    /// share one signal.
+    // Capacity changes for servers and egresses alike: the two registries
+    // share one signal.
     pub(crate) fn subscribe_capacity_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.servers.transfers.subscribe_capacity_changes()
     }
@@ -247,9 +247,9 @@ impl ServerTransferPolicyRegistry {
         self.reconfigure_book(TransferScope::Server, &holders)
     }
 
-    /// Apply every egress's speed limit and download quota. Counters carry
-    /// over for an egress that stays; one that is new is restored from its
-    /// stored usage.
+    // Apply every egress's speed limit and download quota. Counters carry
+    // over for an egress that stays; one that is new is restored from its
+    // stored usage.
     pub fn reconfigure_egresses(
         &self,
         egresses: &[crate::proxies::EgressInterface],
@@ -265,15 +265,15 @@ impl ServerTransferPolicyRegistry {
         self.reconfigure_book(TransferScope::Egress, &holders)
     }
 
-    /// Start or stop every egress quota counting bytes. Usage already counted
-    /// in a window is kept; while stopped no egress quota turns work away.
+    // Start or stop every egress quota counting bytes. Usage already counted
+    // in a window is kept; while stopped no egress quota turns work away.
     pub fn set_egress_quota_metering(&self, enabled: bool) {
         self.egresses.transfers.set_quota_metering(enabled);
         self.notify_changed();
     }
 
-    /// Start or stop one egress's quota counting bytes. It keeps that setting
-    /// whatever later happens to every egress's.
+    // Start or stop one egress's quota counting bytes. It keeps that setting
+    // whatever later happens to every egress's.
     pub fn set_one_egress_quota_metering(&self, egress_id: u32, enabled: bool) {
         self.egresses
             .transfers
@@ -281,7 +281,7 @@ impl ServerTransferPolicyRegistry {
         self.notify_changed();
     }
 
-    /// Hand one egress's quota counting back to every egress's setting.
+    // Hand one egress's quota counting back to every egress's setting.
     pub fn clear_one_egress_quota_metering(&self, egress_id: u32) {
         self.egresses
             .transfers
@@ -440,13 +440,13 @@ impl ServerTransferPolicyRegistry {
         self.snapshots_in(TransferScope::Server)
     }
 
-    /// The live usage of one egress; its id is carried in `server_id`.
+    // The live usage of one egress; its id is carried in `server_id`.
     pub fn egress_snapshot(&self, egress_id: u32) -> Option<ServerDownloadQuotaSnapshot> {
         self.snapshot_in(TransferScope::Egress, egress_id)
     }
 
-    /// The live usage of every egress, by id; each id is carried in
-    /// `server_id`.
+    // The live usage of every egress, by id; each id is carried in
+    // `server_id`.
     pub fn egress_snapshots(&self) -> Vec<ServerDownloadQuotaSnapshot> {
         self.snapshots_in(TransferScope::Egress)
     }
@@ -517,9 +517,9 @@ impl ServerTransferPolicyRegistry {
         self.persist_window_resets(resets)
     }
 
-    /// Roll every elapsed quota window over in memory. Cheap when nothing
-    /// elapsed, which is nearly every call; the returned resets still have to
-    /// be written with [`persist_window_resets`](Self::persist_window_resets).
+    // Roll every elapsed quota window over in memory. Cheap when nothing
+    // elapsed, which is nearly every call; the returned resets still have to
+    // be written with [`persist_window_resets`](Self::persist_window_resets).
     fn advance_windows(&self) -> Vec<WindowReset> {
         let now = crate::e2e_clock::local_now();
         let now_utc = now.with_timezone(&Utc);
@@ -588,8 +588,8 @@ impl ServerTransferPolicyRegistry {
             .insert((scope, usage.server_id), FlushedUsage::of(usage));
     }
 
-    /// The current usage of every control, with whether it differs from what
-    /// was last written.
+    // The current usage of every control, with whether it differs from what
+    // was last written.
     fn usage_rows(&self) -> Vec<(TransferScope, ServerDownloadUsage, bool)> {
         let flushed = self
             .flushed_usage
@@ -617,7 +617,7 @@ impl ServerTransferPolicyRegistry {
         rows
     }
 
-    /// Whether a flush now would write anything.
+    // Whether a flush now would write anything.
     fn usage_changed_since_flush(&self) -> bool {
         self.usage_rows().iter().any(|(_, _, changed)| *changed)
     }

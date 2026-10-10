@@ -1,11 +1,11 @@
 use super::*;
 
-/// End-of-chunk decoder state for a 64-byte window that contained no
-/// dot-stuffing (those chunks bail to scalar). Derived from the trailing two
-/// input bytes plus the escape mask, matching `final_state_after_block` +
-/// `x86_final_state_after_block` for the no-dot case: a decoded window ends
-/// mid-line (`None`) unless its final byte is an unescaped `\r` (`Cr`), an
-/// unescaped `=` (`Eq`), or the `\n` of a trailing `\r\n` (`CrLf`).
+// End-of-chunk decoder state for a 64-byte window that contained no
+// dot-stuffing (those chunks bail to scalar). Derived from the trailing two
+// input bytes plus the escape mask, matching `final_state_after_block` +
+// `x86_final_state_after_block` for the no-dot case: a decoded window ends
+// mid-line (`None`) unless its final byte is an unescaped `\r` (`Cr`), an
+// unescaped `=` (`Eq`), or the `\n` of a trailing `\r\n` (`CrLf`).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub(super) fn span_end_state(win: &[u8], fixed_eq: u64, dot_unstuffing: bool) -> DecoderState {
@@ -118,16 +118,16 @@ pub(super) fn x86_final_state_after_block(
     next_state
 }
 
-/// Head resolution for a `search_end` chunk entry — the x86 analogue of the
-/// NEON driver's head loop (`neon.rs`), itself the oracle's `_do_decode_simd`
-/// entry switch (decoder_common.h:52-121). A terminator/control sequence that
-/// straddles the chunk entry has its `\r\n` in the PREVIOUS chunk, so the flat
-/// raw loops — which only ever match raw bytes inside their own window — cannot
-/// see it. Those entry shapes are resolved with the verified scalar machine
-/// first; it runs once per chunk and costs a handful of steps at most.
-///
-/// Returns `true` when the head itself reached an end marker, in which case the
-/// caller must return immediately with `*src`/`*dst`.
+// Head resolution for a `search_end` chunk entry — the x86 analogue of the
+// NEON driver's head loop (`neon.rs`), itself the oracle's `_do_decode_simd`
+// entry switch (decoder_common.h:52-121). A terminator/control sequence that
+// straddles the chunk entry has its `\r\n` in the PREVIOUS chunk, so the flat
+// raw loops — which only ever match raw bytes inside their own window — cannot
+// see it. Those entry shapes are resolved with the verified scalar machine
+// first; it runs once per chunk and costs a handful of steps at most.
+//
+// Returns `true` when the head itself reached an end marker, in which case the
+// caller must return immediately with `*src`/`*dst`.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(super) fn x86_search_end_head(
@@ -162,10 +162,10 @@ pub(super) fn x86_search_end_head(
     Ok(state.end != DecodeEnd::None)
 }
 
-/// Fold a subsliced kernel's outcome back onto the head-resolved offsets.
-/// Offsets reported by the sliced kernel are slice-relative, so a
-/// `MalformedEscape` position has to be shifted by the head-consumed count
-/// (same rule as the NEON driver's `map_err`).
+// Fold a subsliced kernel's outcome back onto the head-resolved offsets.
+// Offsets reported by the sliced kernel are slice-relative, so a
+// `MalformedEscape` position has to be shifted by the head-consumed count
+// (same rule as the NEON driver's `map_err`).
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(super) fn x86_fold_head(
@@ -184,16 +184,16 @@ pub(super) fn x86_fold_head(
     }
 }
 
-/// Exit state for a window a `SEARCH_END` probe aborted, via the oracle's
-/// no-backtrack `decoder_set_nextMask` (decoder_common.h:190-199) plus the
-/// driver's `escFirst`-wins mapping (decoder_common.h:129-132). `esc_first` is
-/// the PRE-window carry: the aborted window is never consumed, so its own
-/// escape bookkeeping has not run yet.
-///
-/// Note the nested shape: a `.` at byte 0 whose mask bit is clear returns
-/// `None` WITHOUT consulting byte 1 — the oracle's `if(src[0]=='.') return mask
-/// & 1;` returns unconditionally. `src + 1 < input.len()` is guaranteed by every
-/// caller's loop bound.
+// Exit state for a window a `SEARCH_END` probe aborted, via the oracle's
+// no-backtrack `decoder_set_nextMask` (decoder_common.h:190-199) plus the
+// driver's `escFirst`-wins mapping (decoder_common.h:129-132). `esc_first` is
+// the PRE-window carry: the aborted window is never consumed, so its own
+// escape bookkeeping has not run yet.
+//
+// Note the nested shape: a `.` at byte 0 whose mask bit is clear returns
+// `None` WITHOUT consulting byte 1 — the oracle's `if(src[0]=='.') return mask
+// & 1;` returns unconditionally. `src + 1 < input.len()` is guaranteed by every
+// caller's loop bound.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(super) fn x86_break_state(input: &[u8], src: usize, mask: u64, esc_first: u64) -> DecoderState {

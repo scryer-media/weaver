@@ -1,23 +1,23 @@
-//! Ignorable "furniture" inside the recovery set
-//! Post-verdict re-entry
-//! Partial recovery volumes
-//! Postings carrying more than one recovery set
-//! A recovery set that describes the joined file, against a posting of parts
+// Ignorable "furniture" inside the recovery set
+// Post-verdict re-entry
+// Partial recovery volumes
+// Postings carrying more than one recovery set
+// A recovery set that describes the joined file, against a posting of parts
 
 use super::*;
 
-/// The repair's own leftovers must not fail the repair that produced them.
-///
-/// par2-rs installs a file at the name its description gives it and moves
-/// whatever held that name aside as `<name>.N`. After a swap that leaves the
-/// backup holding exactly the content of the file it was displaced by, so a
-/// directory scan — the only way a disk file is matched to a description —
-/// finds two files for one description and calls the pair a conflict. The
-/// settled-layout pass used to be that scan, and it refused accepted repairs
-/// over artefacts the repair had just written. It asks the narrower question
-/// now: are the recovery files and newly canonicalized descriptions intact at
-/// their canonical names. A leftover cannot answer that one, and it is swept
-/// with the rest once the aggregate settles.
+// The repair's own leftovers must not fail the repair that produced them.
+//
+// par2-rs installs a file at the name its description gives it and moves
+// whatever held that name aside as `<name>.N`. After a swap that leaves the
+// backup holding exactly the content of the file it was displaced by, so a
+// directory scan — the only way a disk file is matched to a description —
+// finds two files for one description and calls the pair a conflict. The
+// settled-layout pass used to be that scan, and it refused accepted repairs
+// over artefacts the repair had just written. It asks the narrower question
+// now: are the recovery files and newly canonicalized descriptions intact at
+// their canonical names. A leftover cannot answer that one, and it is swept
+// with the rest once the aggregate settles.
 #[tokio::test]
 async fn repair_leftovers_do_not_fail_the_pass_that_verifies_the_settled_layout() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -283,14 +283,14 @@ async fn repair_leftovers_do_not_fail_the_pass_that_verifies_the_settled_layout(
     }
 }
 
-/// Job 10000 whole: a repaired payload delivered alongside an unprotected file
-/// that stayed short of articles.
-///
-/// Removing the veto stopped this job failing, but a job that cannot fail and
-/// cannot finish just spins: the completion gate keeps `has_incomplete_data_files`
-/// true forever, re-runs a full authoritative PAR2 pass every couple of seconds,
-/// and never reaches finalization. Bounded here so that livelock reads as a
-/// failure rather than a hang.
+// Job 10000 whole: a repaired payload delivered alongside an unprotected file
+// that stayed short of articles.
+//
+// Removing the veto stopped this job failing, but a job that cannot fail and
+// cannot finish just spins: the completion gate keeps `has_incomplete_data_files`
+// true forever, re-runs a full authoritative PAR2 pass every couple of seconds,
+// and never reaches finalization. Bounded here so that livelock reads as a
+// failure rather than a hang.
 #[tokio::test]
 async fn job_with_repaired_payload_and_short_unprotected_file_completes() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -445,14 +445,14 @@ async fn job_with_repaired_payload_and_short_unprotected_file_completes() {
 // Ignorable "furniture" inside the recovery set
 // ---------------------------------------------------------------------------
 
-/// A par2-*protected* `.nfo` damaged past what the recovery blocks can rebuild
-/// is delivered, not failed.
-///
-/// Both reference downloaders ship this job: one never raises its
-/// "has damaged files" flag for such a file, so the set reports repair-not-
-/// needed even when the recovery data said repair was impossible; the other's
-/// quick check passes it outright. weaver used to fail the whole download for
-/// it, which is the protected sibling of the unprotected-`.nfo` failure.
+// A par2-*protected* `.nfo` damaged past what the recovery blocks can rebuild
+// is delivered, not failed.
+//
+// Both reference downloaders ship this job: one never raises its
+// "has damaged files" flag for such a file, so the set reports repair-not-
+// needed even when the recovery data said repair was impossible; the other's
+// quick check passes it outright. weaver used to fail the whole download for
+// it, which is the protected sibling of the unprotected-`.nfo` failure.
 #[tokio::test]
 async fn protected_damaged_ignorable_file_is_delivered_without_repair() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -493,12 +493,12 @@ async fn protected_damaged_ignorable_file_is_delivered_without_repair() {
     );
 }
 
-/// The same rule for a protected `.sfv` that never arrived at all, with no
-/// recovery to rebuild it from.
-///
-/// This is the shape that also has to survive the post-verdict completion gate:
-/// the file stays incomplete and bound to a description forever, so counting it
-/// as outstanding work would keep the job re-arming instead of finishing.
+// The same rule for a protected `.sfv` that never arrived at all, with no
+// recovery to rebuild it from.
+//
+// This is the shape that also has to survive the post-verdict completion gate:
+// the file stays incomplete and bound to a description forever, so counting it
+// as outstanding work would keep the job re-arming instead of finishing.
 #[tokio::test]
 async fn protected_missing_ignorable_file_is_delivered_without_repair() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -535,12 +535,12 @@ async fn protected_missing_ignorable_file_is_delivered_without_repair() {
     assert_eq!(pipeline.par2_repairer_execute_calls, 0);
 }
 
-/// When something that is *not* furniture is damaged too and the blocks are
-/// there, the repairer runs and heals the furniture in the same pass.
-///
-/// This is the row the spare rule must not swallow: the rebuild is free once
-/// the decode matrix is being built anyway, and all three reference behaviours
-/// agree on repairing here.
+// When something that is *not* furniture is damaged too and the blocks are
+// there, the repairer runs and heals the furniture in the same pass.
+//
+// This is the row the spare rule must not swallow: the rebuild is free once
+// the decode matrix is being built anyway, and all three reference behaviours
+// agree on repairing here.
 #[tokio::test]
 async fn mixed_damage_with_sufficient_blocks_repairs_the_furniture_too() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -649,12 +649,12 @@ async fn a_damaged_authoritative_verification_builds_a_carry_the_repairer_accept
     );
 }
 
-/// Mixed damage with the blocks short still fails.
-///
-/// The furniture's slices cannot be excused out of the solve: a payload file's
-/// missing slices are unknowns in every equation the recovery data can form, so
-/// sparing the `.nfo` buys the job nothing and delivering a holed payload under
-/// a verification that claims otherwise is the one thing that must not happen.
+// Mixed damage with the blocks short still fails.
+//
+// The furniture's slices cannot be excused out of the solve: a payload file's
+// missing slices are unknowns in every equation the recovery data can form, so
+// sparing the `.nfo` buys the job nothing and delivering a holed payload under
+// a verification that claims otherwise is the one thing that must not happen.
 #[tokio::test]
 async fn mixed_damage_with_short_blocks_still_fails() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -694,7 +694,7 @@ async fn mixed_damage_with_short_blocks_still_fails() {
     );
 }
 
-/// The override is the way back to the old rule, and it has to work.
+// The override is the way back to the old rule, and it has to work.
 #[tokio::test]
 async fn an_empty_ignore_extension_override_restores_the_old_failure() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -739,14 +739,14 @@ async fn an_empty_ignore_extension_override_restores_the_old_failure() {
 // Post-verdict re-entry
 // ---------------------------------------------------------------------------
 
-/// A settled PAR2 verdict is never re-derived, and a job that keeps coming back
-/// to the gate with a protected file outstanding is reported as the bug it is.
-///
-/// The state is reachable only through a reconciliation defect of ours — here a
-/// contested alias, where two assembly entries answer to one description and
-/// the binding is refused rather than guessed. The verified bytes are on disk,
-/// so nothing about the download is wrong; what used to happen is that the gate
-/// re-read the whole recovery set on every lap, forever, at seconds a lap.
+// A settled PAR2 verdict is never re-derived, and a job that keeps coming back
+// to the gate with a protected file outstanding is reported as the bug it is.
+//
+// The state is reachable only through a reconciliation defect of ours — here a
+// contested alias, where two assembly entries answer to one description and
+// the binding is refused rather than guessed. The verified bytes are on disk,
+// so nothing about the download is wrong; what used to happen is that the gate
+// re-read the whole recovery set on every lap, forever, at seconds a lap.
 #[tokio::test]
 async fn a_settled_par2_verdict_is_not_re_read_for_a_reconciliation_defect() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -871,14 +871,14 @@ async fn a_settled_par2_verdict_is_not_re_read_for_a_reconciliation_defect() {
 // Partial recovery volumes
 // ---------------------------------------------------------------------------
 
-/// A recovery volume that lost one article still contributes every block whose
-/// packet survived it.
-///
-/// Recovery merges on file *completion*, so a volume one article short counted
-/// zero blocks and the job was failed as unrepairable with its intact packets
-/// sitting on disk. Both reference downloaders load such a volume's packets
-/// individually — each recovery packet carries its own MD5, which is what makes
-/// reading past a hole safe.
+// A recovery volume that lost one article still contributes every block whose
+// packet survived it.
+//
+// Recovery merges on file *completion*, so a volume one article short counted
+// zero blocks and the job was failed as unrepairable with its intact packets
+// sitting on disk. Both reference downloaders load such a volume's packets
+// individually — each recovery packet carries its own MD5, which is what makes
+// reading past a hole safe.
 #[tokio::test]
 async fn a_partial_recovery_volume_contributes_its_surviving_blocks() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -941,8 +941,8 @@ async fn a_partial_recovery_volume_contributes_its_surviving_blocks() {
     );
 }
 
-/// A hole too wide to read past still fails — and the failure counts what was
-/// actually salvaged, not what the volume's name advertised.
+// A hole too wide to read past still fails — and the failure counts what was
+// actually salvaged, not what the volume's name advertised.
 #[tokio::test]
 async fn a_hole_too_wide_to_salvage_past_still_fails() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -983,12 +983,12 @@ async fn a_hole_too_wide_to_salvage_past_still_fails() {
     );
 }
 
-/// The salvage reads a short volume once per download generation.
-///
-/// Nothing about a volume that can no longer complete changes between gate
-/// entries, and the gate is entered many times over a job's post-processing —
-/// re-reading it on every lap is the shape that turns a slow path into a hot
-/// loop.
+// The salvage reads a short volume once per download generation.
+//
+// Nothing about a volume that can no longer complete changes between gate
+// entries, and the gate is entered many times over a job's post-processing —
+// re-reading it on every lap is the shape that turns a slow path into a hot
+// loop.
 #[tokio::test]
 async fn a_salvaged_recovery_volume_is_read_once_per_generation() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1034,11 +1034,11 @@ async fn a_salvaged_recovery_volume_is_read_once_per_generation() {
     );
 }
 
-/// A volume that completes after a partial salvage reports the whole volume's
-/// blocks, not just the ones the completion merge happened to add.
-///
-/// Regression guard for the accounting the salvage introduces: the completion
-/// merge reports *new* slices, which after a salvage is only the remainder.
+// A volume that completes after a partial salvage reports the whole volume's
+// blocks, not just the ones the completion merge happened to add.
+//
+// Regression guard for the accounting the salvage introduces: the completion
+// merge reports *new* slices, which after a salvage is only the remainder.
 #[tokio::test]
 async fn a_volume_that_completes_after_salvage_reports_its_whole_block_count() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1155,14 +1155,14 @@ async fn a_volume_that_completes_after_salvage_reports_its_whole_block_count() {
     );
 }
 
-/// A volume read back short keeps the count it proved when a later article of
-/// it names the whole volume's size.
-///
-/// Every decoded article registers what its yEnc name claims the volume carries,
-/// and for a volume that stranded holding a fraction of that, the claim is a
-/// promise nothing can keep. Letting it stand in for the read-back's count told
-/// the repair arithmetic the shortfall was already covered, so it asked for
-/// nothing further and waited on articles that had already run out.
+// A volume read back short keeps the count it proved when a later article of
+// it names the whole volume's size.
+//
+// Every decoded article registers what its yEnc name claims the volume carries,
+// and for a volume that stranded holding a fraction of that, the claim is a
+// promise nothing can keep. Letting it stand in for the read-back's count told
+// the repair arithmetic the shortfall was already covered, so it asked for
+// nothing further and waited on articles that had already run out.
 #[tokio::test]
 async fn a_later_articles_yenc_name_does_not_re_credit_a_salvaged_volume() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1219,12 +1219,12 @@ async fn a_later_articles_yenc_name_does_not_re_credit_a_salvaged_volume() {
     );
 }
 
-/// A promoted volume whose segments are parked is waiting, not stranded.
-///
-/// Parking is where a promoted file's work rests between the promotion and the
-/// completion gate that hands it back to the download queue. Reading "nothing in
-/// flight" as "cannot complete" makes that window look terminal, and the volume
-/// is read back for the fraction of itself that happens to be on disk.
+// A promoted volume whose segments are parked is waiting, not stranded.
+//
+// Parking is where a promoted file's work rests between the promotion and the
+// completion gate that hands it back to the download queue. Reading "nothing in
+// flight" as "cannot complete" makes that window look terminal, and the volume
+// is read back for the fraction of itself that happens to be on disk.
 #[tokio::test]
 async fn a_promoted_volume_whose_segments_are_parked_is_not_read_back() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1308,14 +1308,14 @@ async fn a_promoted_volume_whose_segments_are_parked_is_not_read_back() {
     );
 }
 
-/// A volume read back short is read again once more of it lands.
-///
-/// One read-back per *generation of bytes*, not one ever. A volume can strand,
-/// be read for what it holds, take another article and strand again — and the
-/// second stranding has more on disk than the first read saw. Latching the
-/// read-back to the file for good left those blocks unaccounted for the rest of
-/// the job, because the latch is only ever cleared by a completion the volume
-/// will never reach.
+// A volume read back short is read again once more of it lands.
+//
+// One read-back per *generation of bytes*, not one ever. A volume can strand,
+// be read for what it holds, take another article and strand again — and the
+// second stranding has more on disk than the first read saw. Latching the
+// read-back to the file for good left those blocks unaccounted for the rest of
+// the job, because the latch is only ever cleared by a completion the volume
+// will never reach.
 #[tokio::test]
 async fn a_volume_read_back_short_is_read_again_once_more_of_it_lands() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1384,14 +1384,14 @@ async fn a_volume_read_back_short_is_read_again_once_more_of_it_lands() {
     );
 }
 
-/// A repair short of blocks that nothing can still deliver is failed, not
-/// waited on.
-///
-/// The wait branch fails only when *capacity* is short. A job whose targeted
-/// total already covers the damage promotes nothing, and with nothing queued,
-/// active, retrying or decoding there is no arrival that could raise the
-/// available count — the one pass that could, the read-back, ran on the way in.
-/// The branch nonetheless moved the job to `Downloading` and returned, forever.
+// A repair short of blocks that nothing can still deliver is failed, not
+// waited on.
+//
+// The wait branch fails only when *capacity* is short. A job whose targeted
+// total already covers the damage promotes nothing, and with nothing queued,
+// active, retrying or decoding there is no arrival that could raise the
+// available count — the one pass that could, the read-back, ran on the way in.
+// The branch nonetheless moved the job to `Downloading` and returned, forever.
 #[tokio::test]
 async fn a_repair_waiting_on_recovery_that_cannot_arrive_is_failed() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1491,9 +1491,9 @@ async fn a_repair_waiting_on_recovery_that_cannot_arrive_is_failed() {
     );
 }
 
-/// The state the hung job reached, end to end: one volume complete, one
-/// stranded holding a fraction of what it advertises, and nothing left in
-/// flight.
+// The state the hung job reached, end to end: one volume complete, one
+// stranded holding a fraction of what it advertises, and nothing left in
+// flight.
 #[tokio::test]
 async fn a_stranded_volume_advertising_more_than_it_holds_fails_instead_of_waiting() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1537,11 +1537,11 @@ async fn a_stranded_volume_advertising_more_than_it_holds_fails_instead_of_waiti
     );
 }
 
-/// The same shape with the damage inside what the read-back recovered: the
-/// repair runs.
-///
-/// Guard for the failure above — counting a stranded volume honestly must not
-/// turn a job that can afford its damage into a failure.
+// The same shape with the damage inside what the read-back recovered: the
+// repair runs.
+//
+// Guard for the failure above — counting a stranded volume honestly must not
+// turn a job that can afford its damage into a failure.
 #[tokio::test]
 async fn a_stranded_volume_whose_read_back_covers_the_damage_still_repairs() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1661,8 +1661,8 @@ async fn metadata_discovery_bootstraps_one_indexless_carrier_per_collection() {
     assert!(pipeline.par2_metadata_discovery_closed(job_id));
 }
 
-/// Six indexless recovery volumes of one posting, one article each, and no
-/// index to bootstrap from.
+// Six indexless recovery volumes of one posting, one article each, and no
+// index to bootstrap from.
 async fn install_six_volume_posting(pipeline: &mut Pipeline, job_id: JobId) {
     let spec = JobSpec {
         name: "Batched PAR2 Discovery".to_string(),
@@ -1952,12 +1952,12 @@ async fn checkpoint_grid_admission_keeps_only_the_overflow_sentinel() {
     );
 }
 
-/// Whichever index lands first, the set protecting the most payload is served.
-///
-/// Before this, the last index to be parsed simply replaced the set — so a live
-/// job served whichever index finished downloading last, and the same job
-/// replayed from disk served whichever came last in the posting. The two need
-/// not be the same set, which makes a repair's outcome depend on arrival order.
+// Whichever index lands first, the set protecting the most payload is served.
+//
+// Before this, the last index to be parsed simply replaced the set — so a live
+// job served whichever index finished downloading last, and the same job
+// replayed from disk served whichever came last in the posting. The two need
+// not be the same set, which makes a repair's outcome depend on arrival order.
 #[tokio::test]
 async fn the_larger_recovery_set_is_served_whichever_index_lands_first() {
     let posting = TwoSetPosting::build();
@@ -2003,11 +2003,11 @@ async fn the_larger_recovery_set_is_served_whichever_index_lands_first() {
     );
 }
 
-/// The other set's recovery volumes are not this repair's recovery blocks.
-///
-/// They repair the other set's files, so counting them advertises capacity for
-/// a repair they can take no part in — and sends the fetcher after blocks that
-/// will never help.
+// The other set's recovery volumes are not this repair's recovery blocks.
+//
+// They repair the other set's files, so counting them advertises capacity for
+// a repair they can take no part in — and sends the fetcher after blocks that
+// will never help.
 #[tokio::test]
 async fn another_recovery_sets_volumes_do_not_count_toward_the_served_set() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2057,12 +2057,12 @@ async fn another_recovery_sets_volumes_do_not_count_toward_the_served_set() {
     );
 }
 
-/// A file can retain known coverage when its set's index never arrives.
-///
-/// A foreign packet identifies the recovery set, but without an index no pass
-/// can verify or repair its files. That remains distinct from an unprotected
-/// file: delivery is the same, while the diagnostic explains why no recovery
-/// action was possible.
+// A file can retain known coverage when its set's index never arrives.
+//
+// A foreign packet identifies the recovery set, but without an index no pass
+// can verify or repair its files. That remains distinct from an unprotected
+// file: delivery is the same, while the diagnostic explains why no recovery
+// action was possible.
 #[tokio::test]
 async fn a_file_of_an_unservable_recovery_set_is_not_reported_as_unprotected() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2158,10 +2158,10 @@ async fn a_file_of_an_unservable_recovery_set_is_not_reported_as_unprotected() {
     );
 }
 
-/// The announcement is worth exactly one line per job for indexless sets.
-///
-/// The completion gate is entered many times and no index appears between
-/// entries, so repeating the warning would add noise without new information.
+// The announcement is worth exactly one line per job for indexless sets.
+//
+// The completion gate is entered many times and no index appears between
+// entries, so repeating the warning would add noise without new information.
 #[tokio::test]
 async fn an_unservable_recovery_set_is_announced_once_per_job() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2203,7 +2203,7 @@ async fn an_unservable_recovery_set_is_announced_once_per_job() {
     );
 }
 
-/// The ordinary single-set posting is untouched by any of this.
+// The ordinary single-set posting is untouched by any of this.
 #[tokio::test]
 async fn a_single_recovery_set_job_announces_nothing_and_counts_every_volume() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2538,11 +2538,11 @@ async fn a_multi_set_recovery_file_feeds_both_sets_and_counts_for_each() {
     );
 }
 
-/// Every carrier keeps only the recovery slices it itself contributed.
-///
-/// A later metadata-only volume used to copy the set's accumulated total into
-/// its own entry, so one real recovery volume was advertised twice.  Its
-/// arrival also replaced the explicit index in the deterministic summary.
+// Every carrier keeps only the recovery slices it itself contributed.
+//
+// A later metadata-only volume used to copy the set's accumulated total into
+// its own entry, so one real recovery volume was advertised twice.  Its
+// arrival also replaced the explicit index in the deterministic summary.
 #[tokio::test]
 async fn metadata_only_and_duplicate_carriers_do_not_recount_or_replace_the_index() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2618,8 +2618,8 @@ async fn metadata_only_and_duplicate_carriers_do_not_recount_or_replace_the_inde
     );
 }
 
-/// A completed recovery carrier replaces the retained snapshot with the
-/// current validated set before the next filesystem session opens.
+// A completed recovery carrier replaces the retained snapshot with the
+// current validated set before the next filesystem session opens.
 #[tokio::test]
 async fn completed_recovery_carrier_reopens_the_filesystem_session_from_the_current_set() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2679,9 +2679,9 @@ async fn completed_recovery_carrier_reopens_the_filesystem_session_from_the_curr
     assert!(fresh);
 }
 
-/// A completed recovery volume whose packet headers survive but whose payloads
-/// do not validate is a final zero-capacity answer, not permission to trust
-/// the count encoded in its filename.
+// A completed recovery volume whose packet headers survive but whose payloads
+// do not validate is a final zero-capacity answer, not permission to trust
+// the count encoded in its filename.
 #[tokio::test]
 async fn completed_payload_corrupt_recovery_volume_contributes_zero_capacity() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3110,14 +3110,14 @@ async fn a_single_set_keeps_capacity_promotion_salvage_and_sessions_available() 
 // A recovery set that describes the joined file, against a posting of parts
 // ---------------------------------------------------------------------------
 
-/// A recovery set naming the joined file retires the split topology once it has
-/// vouched for the join.
-///
-/// The parts carry the payload, the recovery data speaks for the file they
-/// concatenate into, and the repair puts that file on disk from the parts
-/// themselves. Joining them a second time afterwards would write the damaged
-/// bytes back over the repaired ones, which is what shipped before: the
-/// concatenation lands in staging, and staging wins the name in the final move.
+// A recovery set naming the joined file retires the split topology once it has
+// vouched for the join.
+//
+// The parts carry the payload, the recovery data speaks for the file they
+// concatenate into, and the repair puts that file on disk from the parts
+// themselves. Joining them a second time afterwards would write the damaged
+// bytes back over the repaired ones, which is what shipped before: the
+// concatenation lands in staging, and staging wins the name in the final move.
 #[tokio::test]
 async fn a_recovery_set_naming_the_joined_file_retires_the_split_topology() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3209,13 +3209,13 @@ async fn a_recovery_set_naming_the_joined_file_retires_the_split_topology() {
     );
 }
 
-/// A part short of its articles must not fail a job whose payload PAR2 has
-/// already rebuilt.
-///
-/// With the joined file verified on disk, the split topology still wanted every
-/// part whole, reported "no volumes are complete yet", and the completion gate
-/// failed the job on that reason — after `RepairComplete` had already told the
-/// UI the repair held.
+// A part short of its articles must not fail a job whose payload PAR2 has
+// already rebuilt.
+//
+// With the joined file verified on disk, the split topology still wanted every
+// part whole, reported "no volumes are complete yet", and the completion gate
+// failed the job on that reason — after `RepairComplete` had already told the
+// UI the repair held.
 #[tokio::test]
 async fn a_split_part_short_of_articles_does_not_fail_a_rejoined_job() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3319,7 +3319,7 @@ async fn a_split_part_short_of_articles_does_not_fail_a_rejoined_job() {
     );
 }
 
-/// A split fragment is not PAR2-protected before any join verdict exists.
+// A split fragment is not PAR2-protected before any join verdict exists.
 #[tokio::test]
 async fn a_part_sharing_the_joined_files_first_16_kib_is_unprotected_before_join_verdict() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3380,14 +3380,14 @@ async fn a_part_sharing_the_joined_files_first_16_kib_is_unprotected_before_join
     );
 }
 
-/// A part sharing the joined file's first 16 KiB is not a hole in the payload.
-///
-/// The first part begins where the joined file begins, so its prefix matches
-/// the joined description. Content binding refuses the part because its name
-/// is a numeric split fragment of that description, and any declared yEnc size
-/// that disagrees with the joined length corroborates the refusal. Even without
-/// that refusal, the consumed-split exclusion after the join verdict shields
-/// the part; this test keeps both layers honest.
+// A part sharing the joined file's first 16 KiB is not a hole in the payload.
+//
+// The first part begins where the joined file begins, so its prefix matches
+// the joined description. Content binding refuses the part because its name
+// is a numeric split fragment of that description, and any declared yEnc size
+// that disagrees with the joined length corroborates the refusal. Even without
+// that refusal, the consumed-split exclusion after the join verdict shields
+// the part; this test keeps both layers honest.
 #[tokio::test]
 async fn a_part_sharing_the_joined_files_first_16_kib_is_not_reported_as_a_hole() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3466,12 +3466,12 @@ async fn a_part_sharing_the_joined_files_first_16_kib_is_not_reported_as_a_hole(
     );
 }
 
-/// A join PAR2 already installed is never rebuilt over.
-///
-/// The guard belongs at the joiner even though a retired topology means the
-/// gate does not normally dispatch it: an extraction spawned before the verdict
-/// landed, or a restart that rebuilt the topology first, both reach the joiner
-/// with the verified output already on disk.
+// A join PAR2 already installed is never rebuilt over.
+//
+// The guard belongs at the joiner even though a retired topology means the
+// gate does not normally dispatch it: an extraction spawned before the verdict
+// landed, or a restart that rebuilt the topology first, both reach the joiner
+// with the verified output already on disk.
 #[tokio::test]
 async fn a_joined_output_par2_installed_is_not_rebuilt_by_the_split_join() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3538,10 +3538,10 @@ async fn a_joined_output_par2_installed_is_not_rebuilt_by_the_split_join() {
     );
 }
 
-/// The ordinary split posting, where the recovery set protects the parts.
-///
-/// Nothing here may change: no topology is retired, the parts are joined
-/// exactly as they always were, and the join is the job's output.
+// The ordinary split posting, where the recovery set protects the parts.
+//
+// Nothing here may change: no topology is retired, the parts are joined
+// exactly as they always were, and the join is the job's output.
 #[tokio::test]
 async fn a_recovery_set_naming_the_parts_still_joins_them() {
     let temp_dir = tempfile::tempdir().unwrap();

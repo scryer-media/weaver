@@ -1,5 +1,5 @@
-//! Move the 0.14.7 shared pause/resume/speed track to independent tracks.
-//! Called only by the v55 upgrade hook and older logical-backup imports.
+// Move the 0.14.7 shared pause/resume/speed track to independent tracks.
+// Called only by the v55 upgrade hook and older logical-backup imports.
 use crate::persistence::sql_runtime::{SqlArg, SqlConn};
 use crate::{StateError, bandwidth::Weekday};
 use serde_json::{Value, json};
@@ -89,7 +89,7 @@ fn rule_enabled(row: &Value) -> bool {
     row.get("enabled").and_then(Value::as_bool).unwrap_or(true)
 }
 
-/// A rule's days. Empty is every day.
+// A rule's days. Empty is every day.
 fn rule_days(row: &Value) -> Vec<Weekday> {
     row.get("days")
         .and_then(Value::as_array)
@@ -100,18 +100,18 @@ fn rule_days(row: &Value) -> Vec<Weekday> {
         .collect()
 }
 
-/// `HH:MM` as minutes past midnight.
+// `HH:MM` as minutes past midnight.
 fn minute_of_day(time: &str) -> Option<u32> {
     let (hour, minute) = time.trim().split_once(':')?;
     let (hour, minute) = (hour.parse::<u32>().ok()?, minute.parse::<u32>().ok()?);
     (hour < 24 && minute < 60).then_some(hour * 60 + minute)
 }
 
-/// Earlier builds held pause, resume and speed rules on one track, so a pause
-/// or resume ended a scheduled speed limit and put the configured one back.
-/// Each now holds its own track, so for every day a pause or resume followed
-/// a speed rule, a speed rule setting the configured limit is added beside
-/// it. Returns those days by the rule's position.
+// Earlier builds held pause, resume and speed rules on one track, so a pause
+// or resume ended a scheduled speed limit and put the configured one back.
+// Each now holds its own track, so for every day a pause or resume followed
+// a speed rule, a speed rule setting the configured limit is added beside
+// it. Returns those days by the rule's position.
 fn legacy_speed_resets(rows: &[Value]) -> BTreeMap<usize, Vec<Weekday>> {
     const SHARED: [&str; 3] = ["pause", "resume", "speed_limit"];
     let on = |row: &Value, day: Weekday| {
@@ -166,7 +166,7 @@ fn legacy_speed_resets(rows: &[Value]) -> BTreeMap<usize, Vec<Weekday>> {
     resets
 }
 
-/// A speed rule for the global limit alone.
+// A speed rule for the global limit alone.
 fn global_speed(bytes_per_sec: u64) -> Value {
     json!({
         "type": "speed_limit",

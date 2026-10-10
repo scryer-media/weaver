@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-/// Build a dedicated rayon thread pool for post-processing work
-/// (extraction, PAR2 verify/repair). Threads are niced on Unix
-/// so the OS scheduler prefers download/decode threads when CPU
-/// is contended.
+// Build a dedicated rayon thread pool for post-processing work
+// (extraction, PAR2 verify/repair). Threads are niced on Unix
+// so the OS scheduler prefers download/decode threads when CPU
+// is contended.
 pub fn build_postprocess_pool(thread_count: usize) -> Arc<rayon::ThreadPool> {
     Arc::new(
         rayon::ThreadPoolBuilder::new()

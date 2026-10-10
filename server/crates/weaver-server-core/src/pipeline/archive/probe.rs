@@ -339,26 +339,26 @@ impl Pipeline {
         }
     }
 
-    /// Whether this archive file is a source volume of a finalized **7z**
-    /// direct set — one that has already put its members where the extractor
-    /// would have put them.
-    ///
-    /// A direct set never enters the archive topology: its volumes are never
-    /// written, so nothing ever probes one, and the completion hook that is
-    /// the topology's only writer returns early for them. Once the set has
-    /// finalized there is also nothing left to extract — the members are at
-    /// their destinations and the set is already in `extracted_archives`. So
-    /// counting its volumes as archives still waiting for a topology would
-    /// leave the job blocked on a description that will never be built, of
-    /// work that is already done.
-    ///
-    /// **RAR sets are excluded deliberately, in both states.** A job whose
-    /// archives are all RAR never reaches this readiness check at all — the
-    /// completion gate sends it to the RAR check instead — so a RAR direct set
-    /// has never needed the clause; and a mixed job's RAR sets reach it on a
-    /// path that has been answering for them since before there was a 7z
-    /// layout. Narrowing to the format that needs it is what keeps this from
-    /// being a change to how a RAR set completes.
+    // Whether this archive file is a source volume of a finalized **7z**
+    // direct set — one that has already put its members where the extractor
+    // would have put them.
+    //
+    // A direct set never enters the archive topology: its volumes are never
+    // written, so nothing ever probes one, and the completion hook that is
+    // the topology's only writer returns early for them. Once the set has
+    // finalized there is also nothing left to extract — the members are at
+    // their destinations and the set is already in `extracted_archives`. So
+    // counting its volumes as archives still waiting for a topology would
+    // leave the job blocked on a description that will never be built, of
+    // work that is already done.
+    //
+    // **RAR sets are excluded deliberately, in both states.** A job whose
+    // archives are all RAR never reaches this readiness check at all — the
+    // completion gate sends it to the RAR check instead — so a RAR direct set
+    // has never needed the clause; and a mixed job's RAR sets reach it on a
+    // path that has been answering for them since before there was a 7z
+    // layout. Narrowing to the format that needs it is what keeps this from
+    // being a change to how a RAR set completes.
     pub(in crate::pipeline) fn direct_set_already_installed(
         &self,
         job_id: JobId,
@@ -862,19 +862,19 @@ impl Pipeline {
     }
 }
 
-/// One complete RAR volume whose place in its set only its headers can give:
-/// its filename says nothing about the set (no `.rar`/`.partNN.rar`/`.rNN`
-/// shape and no numeric suffix, typical of a posting whose every volume
-/// carries its own obfuscated hex name), or its set's names contradict what
-/// the headers say.
+// One complete RAR volume whose place in its set only its headers can give:
+// its filename says nothing about the set (no `.rar`/`.partNN.rar`/`.rNN`
+// shape and no numeric suffix, typical of a posting whose every volume
+// carries its own obfuscated hex name), or its set's names contradict what
+// the headers say.
 struct NamelessRarVolume {
     file_id: NzbFileId,
     filename: String,
     classification: DetectedArchiveIdentity,
     facts: unrar_rs::RarVolumeFacts,
-    /// Whether the registry holds these facts under this volume's name. A
-    /// volume another took the key of is placed again even where its
-    /// identity already says the right thing.
+    // Whether the registry holds these facts under this volume's name. A
+    // volume another took the key of is placed again even where its
+    // identity already says the right thing.
     registered: bool,
 }
 
@@ -885,7 +885,7 @@ impl NamelessRarVolume {
         members
     }
 
-    /// The member this volume opens on, when it continues one begun earlier.
+    // The member this volume opens on, when it continues one begun earlier.
     fn continued_member(&self) -> Option<&unrar_rs::RarVolumeMemberFacts> {
         self.ordered_members()
             .first()
@@ -893,7 +893,7 @@ impl NamelessRarVolume {
             .filter(|member| member.split_before)
     }
 
-    /// The member this volume ends on, when it carries on into the next one.
+    // The member this volume ends on, when it carries on into the next one.
     fn continuing_member(&self) -> Option<&unrar_rs::RarVolumeMemberFacts> {
         self.ordered_members()
             .last()
@@ -901,9 +901,9 @@ impl NamelessRarVolume {
             .filter(|member| member.split_after)
     }
 
-    /// Whether the headers say this is a set's first volume: part of a
-    /// multi-volume set, stating no number other than 0, and opening on a
-    /// member of its own rather than the tail of an earlier one.
+    // Whether the headers say this is a set's first volume: part of a
+    // multi-volume set, stating no number other than 0, and opening on a
+    // member of its own rather than the tail of an earlier one.
     fn opens_set(&self) -> bool {
         self.facts.is_volume
             && matches!(self.facts.volume_number, None | Some(0))
@@ -913,8 +913,8 @@ impl NamelessRarVolume {
                 .is_some_and(|member| !member.split_before)
     }
 
-    /// Whether this volume can follow `previous` at index `index`, judged only
-    /// by what both volumes' headers state.
+    // Whether this volume can follow `previous` at index `index`, judged only
+    // by what both volumes' headers state.
     fn follows(&self, previous: &NamelessRarVolume, index: u32) -> bool {
         if self.facts.format != previous.facts.format
             || self.facts.is_encrypted != previous.facts.is_encrypted
@@ -941,8 +941,8 @@ impl NamelessRarVolume {
     }
 }
 
-/// Why a volume with these headers is not a set's first volume, in words an
-/// operator can check against the files.
+// Why a volume with these headers is not a set's first volume, in words an
+// operator can check against the files.
 fn not_first_volume_reason(facts: &unrar_rs::RarVolumeFacts) -> String {
     if let Some(stated) = facts.volume_number.filter(|stated| *stated != 0) {
         return format!("header states volume {stated}");
@@ -961,15 +961,15 @@ fn not_first_volume_reason(facts: &unrar_rs::RarVolumeFacts) -> String {
 }
 
 impl Pipeline {
-    /// The complete RAR volumes of a job whose place only their headers can
-    /// give, each with the header facts registered for it: volumes whose
-    /// names carry no set identity at all, and every volume of a set whose
-    /// names placed a volume at index 0 that its own headers say is not a
-    /// first volume (a misnumbered `.001`, a swapped `.rar`/`.r00`).
-    ///
-    /// Facts come from the registry, and from the file itself for a volume
-    /// the registry lost: two volumes whose names give them one key leave
-    /// only the later one registered.
+    // The complete RAR volumes of a job whose place only their headers can
+    // give, each with the header facts registered for it: volumes whose
+    // names carry no set identity at all, and every volume of a set whose
+    // names placed a volume at index 0 that its own headers say is not a
+    // first volume (a misnumbered `.001`, a swapped `.rar`/`.r00`).
+    //
+    // Facts come from the registry, and from the file itself for a volume
+    // the registry lost: two volumes whose names give them one key leave
+    // only the later one registered.
     async fn header_placed_rar_volumes(&self, job_id: JobId) -> Vec<NamelessRarVolume> {
         let Some(state) = self.jobs.get(&job_id) else {
             return Vec::new();
@@ -1069,10 +1069,10 @@ impl Pipeline {
             })
     }
 
-    /// Chains of nameless volumes, each starting at a first volume and
-    /// following the volume whose headers continue it. A link is taken only
-    /// when exactly one volume can be next; an ambiguous or missing link ends
-    /// the chain there, and the volumes past it stay where they were.
+    // Chains of nameless volumes, each starting at a first volume and
+    // following the volume whose headers continue it. A link is taken only
+    // when exactly one volume can be next; an ambiguous or missing link ends
+    // the chain there, and the volumes past it stay where they were.
     fn chain_nameless_rar_volumes(
         volumes: &[NamelessRarVolume],
         representatives: &[usize],
@@ -1133,24 +1133,24 @@ impl Pipeline {
         chains
     }
 
-    /// Group a job's nameless RAR volumes into sets by what their headers say.
-    ///
-    /// A filename that is only an obfuscated hex string puts every volume in
-    /// a set of its own, named after itself, and every set but the first then
-    /// has no volume 0 to open from. The headers do carry the set's shape: a
-    /// first volume opens on a member of its own, and each later one opens on
-    /// the tail of the member its predecessor ended on (and, for RAR5 and
-    /// numbered RAR4, states its number). Each chain becomes one set, named
-    /// after its first volume's set so the name never moves once that volume
-    /// has landed.
-    ///
-    /// A PAR2 binding that gave a volume a real archive name has already
-    /// taken it out of this group; only names that still say nothing are
-    /// placed here, along with every volume of a set whose names put at index
-    /// 0 a volume its own headers say is not first. A name's suffix is a fast
-    /// path, never a verdict the headers cannot overrule. Volumes no chain
-    /// reaches are left as they are, and a set that still has no first volume
-    /// waits for one through the ordinary missing-volume path.
+    // Group a job's nameless RAR volumes into sets by what their headers say.
+    //
+    // A filename that is only an obfuscated hex string puts every volume in
+    // a set of its own, named after itself, and every set but the first then
+    // has no volume 0 to open from. The headers do carry the set's shape: a
+    // first volume opens on a member of its own, and each later one opens on
+    // the tail of the member its predecessor ended on (and, for RAR5 and
+    // numbered RAR4, states its number). Each chain becomes one set, named
+    // after its first volume's set so the name never moves once that volume
+    // has landed.
+    //
+    // A PAR2 binding that gave a volume a real archive name has already
+    // taken it out of this group; only names that still say nothing are
+    // placed here, along with every volume of a set whose names put at index
+    // 0 a volume its own headers say is not first. A name's suffix is a fast
+    // path, never a verdict the headers cannot overrule. Volumes no chain
+    // reaches are left as they are, and a set that still has no first volume
+    // waits for one through the ordinary missing-volume path.
     pub(crate) async fn group_nameless_rar_volumes(&mut self, job_id: JobId) {
         let volumes = self.header_placed_rar_volumes(job_id).await;
         if volumes.is_empty() {
@@ -1310,8 +1310,8 @@ impl Pipeline {
                 .is_some_and(|sets| sets.contains(set_name))
     }
 
-    /// Report an interior numbered hole only after recovery has placed its
-    /// outputs. A repaired part on disk can fill a hole the NZB never listed.
+    // Report an interior numbered hole only after recovery has placed its
+    // outputs. A repaired part on disk can fill a hole the NZB never listed.
     pub(crate) fn missing_numbered_archive_part(&self, job_id: JobId) -> Option<String> {
         let state = self.jobs.get(&job_id)?;
         let mut groups: BTreeMap<String, BTreeMap<u32, (String, usize, usize)>> = BTreeMap::new();
@@ -1378,8 +1378,8 @@ impl Pipeline {
         None
     }
 
-    /// For every RAR set of the job that has never had a first volume, which
-    /// volumes were seen and why none of them is volume 0.
+    // For every RAR set of the job that has never had a first volume, which
+    // volumes were seen and why none of them is volume 0.
     pub(crate) fn missing_first_rar_volume_report(&self, job_id: JobId) -> Option<String> {
         let mut sets: Vec<&String> = self
             .rar_sets

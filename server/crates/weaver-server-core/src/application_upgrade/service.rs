@@ -1,16 +1,16 @@
-//! Orchestration for one in-application upgrade run.
-//!
-//! The mechanics all live in the shared `application-updater` crate. What is
-//! here is the part that belongs to Weaver: admission (is this deployment
-//! allowed to upgrade itself, and is the asked-for release the one the release
-//! checker actually found), the single run of state the UI watches, its
-//! persistence across a restart, and the journal recovery that decides on the
-//! next boot whether the upgrade took.
-//!
-//! State lives in a [`tokio::sync::watch`] channel plus one settings row, the
-//! same shape [`crate::update_check`] uses, so the GraphQL query and the
-//! subscription read one source and a restart does not lose the run that caused
-//! it.
+// Orchestration for one in-application upgrade run.
+//
+// The mechanics all live in the shared `application-updater` crate. What is
+// here is the part that belongs to Weaver: admission (is this deployment
+// allowed to upgrade itself, and is the asked-for release the one the release
+// checker actually found), the single run of state the UI watches, its
+// persistence across a restart, and the journal recovery that decides on the
+// next boot whether the upgrade took.
+//
+// State lives in a [`tokio::sync::watch`] channel plus one settings row, the
+// same shape [`crate::update_check`] uses, so the GraphQL query and the
+// subscription read one source and a restart does not lose the run that caused
+// it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,23 +40,23 @@ use crate::persistence::Database;
 use crate::runtime::restart::RestartController;
 use crate::update_check::{UpdateCheckService, release_tag_for_version};
 
-/// Stable progress phase names the upgrade UI reads.
+// Stable progress phase names the upgrade UI reads.
 pub use application_updater::phases;
 
-/// The running version, as the manifest's `version` field spells it.
+// The running version, as the manifest's `version` field spells it.
 const WEAVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// What a run is failed with when the boot after its promotion is not the
-/// build, or not the program file, its journal named.
+// What a run is failed with when the boot after its promotion is not the
+// build, or not the program file, its journal named.
 const UNEXPECTED_BOOT_ERROR: &str = "upgrade did not boot the expected version; backups preserved";
 
-/// Settings key holding the JSON-encoded latest [`ApplicationUpgradeRun`].
+// Settings key holding the JSON-encoded latest [`ApplicationUpgradeRun`].
 const APPLICATION_UPGRADE_RUN_SETTING_KEY: &str = "application_upgrade_run";
 
-/// Where an upgrade keeps its working state, under the profile directory.
+// Where an upgrade keeps its working state, under the profile directory.
 const UPGRADE_DIR_NAME: &str = "application-upgrade";
 
-/// Terminal state of an upgrade run.
+// Terminal state of an upgrade run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplicationUpgradeRunStatus {
@@ -79,7 +79,7 @@ impl ApplicationUpgradeRunStatus {
     }
 }
 
-/// One upgrade attempt, as the UI sees it and as it survives a restart.
+// One upgrade attempt, as the UI sees it and as it survives a restart.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ApplicationUpgradeRun {
     pub run_id: String,
@@ -87,11 +87,11 @@ pub struct ApplicationUpgradeRun {
     pub phase: String,
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
-    /// The version this run installs.
+    // The version this run installs.
     pub target_version: String,
-    /// The release tag this run installs.
+    // The release tag this run installs.
     pub target_tag: String,
-    /// The version the run started from, for the completion summary.
+    // The version the run started from, for the completion summary.
     pub from_version: String,
     pub error: Option<String>,
     pub started_at_epoch_ms: i64,
@@ -115,9 +115,9 @@ impl ApplicationUpgradeRun {
         }
     }
 
-    /// The run a journal describes, for a boot that finds one with no persisted
-    /// run to match it — an upgrade applied by a build that crashed before it
-    /// could write the row.
+    // The run a journal describes, for a boot that finds one with no persisted
+    // run to match it — an upgrade applied by a build that crashed before it
+    // could write the row.
     fn from_journal(journal: &ApplicationUpgradeJournal) -> Self {
         Self {
             run_id: journal.run_id.clone(),
@@ -137,7 +137,7 @@ impl ApplicationUpgradeRun {
     }
 }
 
-/// Everything the upgrade surface answers in one read.
+// Everything the upgrade surface answers in one read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplicationUpgradeSnapshot {
     pub current_version: String,
@@ -148,39 +148,39 @@ pub struct ApplicationUpgradeSnapshot {
     pub management_owner: ManagementOwner,
     pub eligible: bool,
     pub eligibility_reason: EligibilityReason,
-    /// The run in flight, if one is.
+    // The run in flight, if one is.
     pub active_run: Option<ApplicationUpgradeRun>,
-    /// The newest run, in flight or finished.
+    // The newest run, in flight or finished.
     pub latest_run: Option<ApplicationUpgradeRun>,
 }
 
-/// What the API asks for when the operator presses Install.
+// What the API asks for when the operator presses Install.
 #[derive(Clone, Debug)]
 pub struct ApplicationUpgradeStartRequest {
     pub expected_tag: String,
     pub expected_version: String,
 }
 
-/// The admitted request, with the installation facts the pipeline needs.
+// The admitted request, with the installation facts the pipeline needs.
 #[derive(Clone, Debug)]
 struct UpgradeJobRequest {
     expected_tag: String,
     expected_version: String,
     installation_kind: InstallationKind,
-    /// Tests and nonstandard hosts provide the startup evidence path directly.
+    // Tests and nonstandard hosts provide the startup evidence path directly.
     executable_path: Option<PathBuf>,
-    /// Whether the desktop wrapper owns and supervises this process. Read by the
-    /// Windows helper handoff, which is the only promotion that has to hand the
-    /// shutdown and relaunch to the wrapper.
+    // Whether the desktop wrapper owns and supervises this process. Read by the
+    // Windows helper handoff, which is the only promotion that has to hand the
+    // shutdown and relaunch to the wrapper.
     #[cfg_attr(not(windows), allow(dead_code))]
     tray_supervised: bool,
 }
 
-/// The host-owned free-space admission check, injectable so tests can drive the
-/// insufficient-space path without filling a filesystem.
+// The host-owned free-space admission check, injectable so tests can drive the
+// insufficient-space path without filling a filesystem.
 type UpgradeSpaceCheck = fn(&Path, u64) -> ApplicationUpgradeResult<()>;
-/// The rename primitive, injectable so tests can drive promotion and rollback
-/// failures.
+// The rename primitive, injectable so tests can drive promotion and rollback
+// failures.
 type UpgradeRename = fn(&Path, &Path) -> std::io::Result<()>;
 
 struct UpgradePipelineDependencies<'a> {
@@ -198,33 +198,33 @@ pub struct ApplicationUpgradeService {
 
 struct Inner {
     db: Database,
-    /// The release checker is the only source of "what is available": an upgrade
-    /// may only install the release it has already found and published.
+    // The release checker is the only source of "what is available": an upgrade
+    // may only install the release it has already found and published.
     update_check: UpdateCheckService,
-    /// Root of the upgrade's own working state, under the profile directory.
+    // Root of the upgrade's own working state, under the profile directory.
     root: PathBuf,
-    /// Startup classification. Captured once, at startup, from the real process.
+    // Startup classification. Captured once, at startup, from the real process.
     assessment: InstallationAssessment,
-    /// The running program file as startup evidence saw it.
+    // The running program file as startup evidence saw it.
     executable_path: Option<PathBuf>,
     state: watch::Sender<Option<ApplicationUpgradeRun>>,
-    /// Single-flight: held for the whole run, so a second start is refused
-    /// rather than queued.
+    // Single-flight: held for the whole run, so a second start is refused
+    // rather than queued.
     admission: Arc<Mutex<()>>,
     restart: RwLock<Option<RestartController>>,
-    /// The staged-bundle signature check. A seam so the promotion tests never
-    /// need a signing identity; the shipped build always runs `codesign`.
+    // The staged-bundle signature check. A seam so the promotion tests never
+    // need a signing identity; the shipped build always runs `codesign`.
     bundle_signature_check: RwLock<Option<application_updater::macos_bundle::BundleSignatureCheck>>,
-    /// Monotonic suffix so two runs in the same millisecond cannot share an id.
+    // Monotonic suffix so two runs in the same millisecond cannot share an id.
     run_sequence: AtomicU64,
 }
 
 impl ApplicationUpgradeService {
-    /// The service a running server holds.
-    ///
-    /// `profile_dir` is the directory Weaver keeps its own state in; the upgrade
-    /// works entirely inside a subdirectory of it, so nothing it writes can
-    /// land beside the operator's downloads.
+    // The service a running server holds.
+    //
+    // `profile_dir` is the directory Weaver keeps its own state in; the upgrade
+    // works entirely inside a subdirectory of it, so nothing it writes can
+    // land beside the operator's downloads.
     pub fn new(
         db: Database,
         update_check: UpdateCheckService,
@@ -250,15 +250,15 @@ impl ApplicationUpgradeService {
         }
     }
 
-    /// Wire the serve loop's restart controller in.
-    ///
-    /// Separate from construction because the controller is built after the
-    /// schema that holds this service: the run needs it only at the very end.
+    // Wire the serve loop's restart controller in.
+    //
+    // Separate from construction because the controller is built after the
+    // schema that holds this service: the run needs it only at the very end.
     pub async fn set_restart_controller(&self, restart: RestartController) {
         *self.inner.restart.write().await = Some(restart);
     }
 
-    /// Replace the staged-bundle signature check. Tests only.
+    // Replace the staged-bundle signature check. Tests only.
     pub async fn set_bundle_signature_check(
         &self,
         check: application_updater::macos_bundle::BundleSignatureCheck,
@@ -266,7 +266,7 @@ impl ApplicationUpgradeService {
         *self.inner.bundle_signature_check.write().await = Some(check);
     }
 
-    /// Everything the `applicationUpgradeStatus` query answers.
+    // Everything the `applicationUpgradeStatus` query answers.
     pub fn snapshot(&self) -> ApplicationUpgradeSnapshot {
         let update = self.inner.update_check.status();
         let latest_run = self.inner.state.borrow().clone();
@@ -288,18 +288,18 @@ impl ApplicationUpgradeService {
         }
     }
 
-    /// Receiver seeded with the current run, so a new subscriber sees the state
-    /// immediately instead of waiting for the next transition.
+    // Receiver seeded with the current run, so a new subscriber sees the state
+    // immediately instead of waiting for the next transition.
     pub fn subscribe(&self) -> watch::Receiver<Option<ApplicationUpgradeRun>> {
         self.inner.state.subscribe()
     }
 
-    /// Admit and begin an upgrade. Returns the accepted run.
-    ///
-    /// Every refusal happens here, before anything is downloaded: an empty
-    /// field, a tag or version the release checker has not published, a version
-    /// that is not strictly newer than the running one, an installation this
-    /// build must not replace, and a run already in flight.
+    // Admit and begin an upgrade. Returns the accepted run.
+    //
+    // Every refusal happens here, before anything is downloaded: an empty
+    // field, a tag or version the release checker has not published, a version
+    // that is not strictly newer than the running one, an installation this
+    // build must not replace, and a run already in flight.
     pub async fn start(
         &self,
         request: ApplicationUpgradeStartRequest,
@@ -587,16 +587,16 @@ impl ApplicationUpgradeService {
         }
     }
 
-    /// Swap a freshly extracted `Weaver.app` over the installed one.
-    ///
-    /// What is left by the time this runs is the part that must not be got
-    /// wrong: prove the staged bundle would actually launch, write the durable
-    /// journal before anything moves, promote by two renames inside one
-    /// directory, and put the previous bundle back on any failure.
-    ///
-    /// The relaunch is the wrapper's, not this process's: the executable this
-    /// server runs from has just been replaced, so re-executing it is not an
-    /// option.
+    // Swap a freshly extracted `Weaver.app` over the installed one.
+    //
+    // What is left by the time this runs is the part that must not be got
+    // wrong: prove the staged bundle would actually launch, write the durable
+    // journal before anything moves, promote by two renames inside one
+    // directory, and put the previous bundle back on any failure.
+    //
+    // The relaunch is the wrapper's, not this process's: the executable this
+    // server runs from has just been replaced, so re-executing it is not an
+    // option.
     #[cfg(not(windows))]
     async fn promote_macos_bundle_upgrade(
         &self,
@@ -744,7 +744,7 @@ impl ApplicationUpgradeService {
         format!("upgrade-{}-{sequence}", epoch_ms_now())
     }
 
-    /// Publish a phase transition and persist it.
+    // Publish a phase transition and persist it.
     fn advance(
         &self,
         run: &ApplicationUpgradeRun,
@@ -759,10 +759,10 @@ impl ApplicationUpgradeService {
         self.publish(next);
     }
 
-    /// Publish download byte counts without a settings write.
-    ///
-    /// Progress arrives per chunk; a settings row written that often would cost
-    /// far more than the number is worth. Phase transitions are what persist.
+    // Publish download byte counts without a settings write.
+    //
+    // Progress arrives per chunk; a settings row written that often would cost
+    // far more than the number is worth. Phase transitions are what persist.
     fn report_download_progress(
         &self,
         run: &ApplicationUpgradeRun,
@@ -853,11 +853,11 @@ impl ApplicationUpgradeService {
         }
     }
 
-    /// A bundle upgrade stages beside the installed bundle rather than under
-    /// the profile directory, so a failure before promotion would otherwise
-    /// leave a full staged copy next to the application. Once promotion has
-    /// begun the backup exists, the path computation refuses, and the journal
-    /// owns whatever is left.
+    // A bundle upgrade stages beside the installed bundle rather than under
+    // the profile directory, so a failure before promotion would otherwise
+    // leave a full staged copy next to the application. Once promotion has
+    // begun the backup exists, the path computation refuses, and the journal
+    // owns whatever is left.
     fn cleanup_bundle_staging(&self, request: &UpgradeJobRequest) {
         if request.installation_kind != InstallationKind::MacosAppBundle {
             return;
@@ -879,12 +879,12 @@ impl ApplicationUpgradeService {
         }
     }
 
-    /// Fail a run this process inherited as `running` but has no journal for.
-    ///
-    /// Such a run never reached promotion: the process it ran in went away
-    /// while it was still downloading, verifying or staging, and nothing was
-    /// replaced. Left alone it would sit in the UI as running forever and,
-    /// through [`Self::start`], refuse every later attempt.
+    // Fail a run this process inherited as `running` but has no journal for.
+    //
+    // Such a run never reached promotion: the process it ran in went away
+    // while it was still downloading, verifying or staging, and nothing was
+    // replaced. Left alone it would sit in the UI as running forever and,
+    // through [`Self::start`], refuse every later attempt.
     fn fail_interrupted_run(&self, journaled_run_id: Option<&str>) {
         let interrupted = self.inner.state.borrow().clone().filter(|run| {
             !run.status.is_terminal() && journaled_run_id != Some(run.run_id.as_str())
@@ -906,17 +906,17 @@ impl ApplicationUpgradeService {
 
     // -- journal recovery ---------------------------------------------------
 
-    /// Finalize the journal an upgrade wrote before it restarted this process.
-    ///
-    /// Returns the run ids that must stay running because an operating-system
-    /// reboot is still outstanding. Called once, early in startup, before the
-    /// upgrade surface can accept anything new.
+    // Finalize the journal an upgrade wrote before it restarted this process.
+    //
+    // Returns the run ids that must stay running because an operating-system
+    // reboot is still outstanding. Called once, early in startup, before the
+    // upgrade surface can accept anything new.
     pub fn finalize_journal(&self) -> ApplicationUpgradeResult<Vec<String>> {
         self.finalize_journal_with_boot_time(super::operating_system_boot_time())
     }
 
-    /// [`Self::finalize_journal`] with an injectable operating-system boot time.
-    /// Windows hosts supply this from `GetTickCount64`; tests inject a fixed value.
+    // [`Self::finalize_journal`] with an injectable operating-system boot time.
+    // Windows hosts supply this from `GetTickCount64`; tests inject a fixed value.
     pub fn finalize_journal_with_boot_time(
         &self,
         boot_time: Option<SystemTime>,
@@ -1000,13 +1000,13 @@ impl ApplicationUpgradeService {
         Ok(Vec::new())
     }
 
-    /// Complete the latest run when all that failed it was a boot of the wrong
-    /// build, its journal is gone, and this build is the one it was installing
-    /// or a later one.
-    ///
-    /// The build that was started after the wrong boot removed the journal
-    /// and the backup and left the run failed, so there is nothing left to
-    /// judge the run by but the version that is running.
+    // Complete the latest run when all that failed it was a boot of the wrong
+    // build, its journal is gone, and this build is the one it was installing
+    // or a later one.
+    //
+    // The build that was started after the wrong boot removed the journal
+    // and the backup and left the run failed, so there is nothing left to
+    // judge the run by but the version that is running.
     fn complete_run_failed_by_the_wrong_boot(&self) {
         let Some(mut run) = self.inner.state.borrow().clone().filter(|run| {
             run.status == ApplicationUpgradeRunStatus::Failed
@@ -1065,10 +1065,10 @@ impl ApplicationUpgradeService {
         Ok(())
     }
 
-    /// Write the journal's outcome onto the persisted run.
-    ///
-    /// A run that already reached a terminal status was finalized by the
-    /// pipeline itself; re-finalizing would rewrite its outcome.
+    // Write the journal's outcome onto the persisted run.
+    //
+    // A run that already reached a terminal status was finalized by the
+    // pipeline itself; re-finalizing would rewrite its outcome.
     fn finish_journal_run(
         &self,
         journal: &ApplicationUpgradeJournal,
@@ -1104,7 +1104,7 @@ impl ApplicationUpgradeService {
         self.publish(run);
     }
 
-    /// Put a run that survived the restart back into the published state.
+    // Put a run that survived the restart back into the published state.
     fn rehydrate_running_run(&self, journal: &ApplicationUpgradeJournal) {
         if self
             .inner
@@ -1119,7 +1119,7 @@ impl ApplicationUpgradeService {
     }
 }
 
-/// Which layouts this build replaces in place.
+// Which layouts this build replaces in place.
 fn eligible_installation_kind(kind: InstallationKind) -> bool {
     matches!(
         kind,
@@ -1127,7 +1127,7 @@ fn eligible_installation_kind(kind: InstallationKind) -> bool {
     )
 }
 
-/// Reports download progress into the published run.
+// Reports download progress into the published run.
 struct RunDownloadProgress<'a> {
     service: &'a ApplicationUpgradeService,
     run: &'a ApplicationUpgradeRun,
@@ -1180,11 +1180,11 @@ fn application_upgrade_http_client() -> ApplicationUpgradeResult<reqwest::Client
         .map_err(map_updater_error)
 }
 
-/// Fetch, verify and validate this release's manifest, preferring v2.
-///
-/// The generation choice, the 404-only fallback and the refusal to downgrade on
-/// any other v2 failure all live in the shared core: none of it is
-/// Weaver-specific.
+// Fetch, verify and validate this release's manifest, preferring v2.
+//
+// The generation choice, the 404-only fallback and the refusal to downgrade on
+// any other v2 failure all live in the shared core: none of it is
+// Weaver-specific.
 async fn fetch_upgrade_manifest(
     client: &reqwest::Client,
     release_tag: &str,
@@ -1291,7 +1291,7 @@ fn roll_back_portable_promotion(
     ))
 }
 
-/// Remove a directory this upgrade owns, by the shared crate's name guard.
+// Remove a directory this upgrade owns, by the shared crate's name guard.
 fn remove_upgrade_owned_directory(path: &Path) -> ApplicationUpgradeResult<()> {
     application_updater::macos_bundle::remove_upgrade_owned_directory(&WEAVER_PRODUCT, path)
         .map_err(map_updater_error)
@@ -1390,7 +1390,7 @@ fn staging_space_requirement(artifact: &UpgradeArtifact) -> u64 {
     application_updater::pipeline::staging_space_requirement(artifact)
 }
 
-/// The free-space admission check, over Weaver's own disk probe.
+// The free-space admission check, over Weaver's own disk probe.
 fn ensure_available_space(path: &Path, required_bytes: u64) -> ApplicationUpgradeResult<()> {
     let space = crate::operations::disk::probe_nearest_disk_space(path).map_err(|error| {
         ApplicationUpgradeError::Repository(format!(
@@ -1414,7 +1414,7 @@ fn load_journal(path: &Path) -> ApplicationUpgradeResult<Option<ApplicationUpgra
     application_updater::journal::load_journal(path).map_err(map_updater_error)
 }
 
-/// Persist a terminal status observed by the temporary upgrade helper.
+// Persist a terminal status observed by the temporary upgrade helper.
 pub fn application_upgrade_helper_update_journal(
     path: &Path,
     phase: &str,
@@ -1436,14 +1436,14 @@ fn remove_dir_if_exists(path: &Path) -> ApplicationUpgradeResult<()> {
     application_updater::journal::remove_dir_if_exists(path).map_err(map_updater_error)
 }
 
-/// Resolve a path through symlinks, falling back to the path as given.
+// Resolve a path through symlinks, falling back to the path as given.
 fn canonical_path(path: &Path) -> PathBuf {
     application_updater::pipeline::canonical_path(path)
 }
 
-/// [`fetch_upgrade_manifest`] against a local server with signature
-/// verification stubbed, so the fetch order can be exercised without a genuine
-/// signed release for every case.
+// [`fetch_upgrade_manifest`] against a local server with signature
+// verification stubbed, so the fetch order can be exercised without a genuine
+// signed release for every case.
 #[cfg(test)]
 async fn fetch_upgrade_manifest_with_overrides(
     client: &reqwest::Client,
@@ -1477,7 +1477,7 @@ mod tests {
 
     // -- fixtures -----------------------------------------------------------
 
-    /// A release checker that has already found `version`, without a network.
+    // A release checker that has already found `version`, without a network.
     struct StubReleaseFetcher {
         version: Option<String>,
     }
@@ -1597,8 +1597,8 @@ mod tests {
         }
     }
 
-    /// A one-route local server, so the download path is exercised over real
-    /// HTTP without reaching the network.
+    // A one-route local server, so the download path is exercised over real
+    // HTTP without reaching the network.
     async fn local_server(router: axum::Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1610,9 +1610,9 @@ mod tests {
         format!("http://{address}")
     }
 
-    /// The upgrade client is `https_only`, which a local test server is not, so
-    /// the tests drive the shared pipeline with a plain client — exactly the
-    /// client the shipped code would build minus the TLS requirement.
+    // The upgrade client is `https_only`, which a local test server is not, so
+    // the tests drive the shared pipeline with a plain client — exactly the
+    // client the shipped code would build minus the TLS requirement.
     fn test_http_client() -> reqwest::Client {
         reqwest::Client::new()
     }
@@ -1639,9 +1639,9 @@ mod tests {
         }
     }
 
-    /// The release checker is the only source of what may be installed: a tag or
-    /// version the operator asks for that it has not published is refused, so a
-    /// crafted mutation cannot point the upgrade at an arbitrary release.
+    // The release checker is the only source of what may be installed: a tag or
+    // version the operator asks for that it has not published is refused, so a
+    // crafted mutation cannot point the upgrade at an arbitrary release.
     #[tokio::test]
     async fn only_the_release_the_checker_found_may_be_installed() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1687,8 +1687,8 @@ mod tests {
         assert_eq!(error.to_string(), "no application update is available");
     }
 
-    /// An installation the classifier says is managed by someone else — Docker,
-    /// Homebrew, winget, a Windows service — never replaces its own files.
+    // An installation the classifier says is managed by someone else — Docker,
+    // Homebrew, winget, a Windows service — never replaces its own files.
     #[tokio::test]
     async fn an_ineligible_installation_never_upgrades_itself() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1713,9 +1713,9 @@ mod tests {
         );
     }
 
-    /// Eligible by the classifier but a layout this build does not replace in
-    /// place: the kind check is separate so a future eligible-but-unsupported
-    /// layout cannot slip through.
+    // Eligible by the classifier but a layout this build does not replace in
+    // place: the kind check is separate so a future eligible-but-unsupported
+    // layout cannot slip through.
     #[tokio::test]
     async fn an_eligible_but_unsupported_layout_is_still_refused() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1740,8 +1740,8 @@ mod tests {
         );
     }
 
-    /// The published snapshot carries the tag the mutation must echo back, so the
-    /// UI never has to build a release tag itself.
+    // The published snapshot carries the tag the mutation must echo back, so the
+    // UI never has to build a release tag itself.
     #[tokio::test]
     async fn the_snapshot_names_the_release_tag_for_the_available_version() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1846,9 +1846,9 @@ mod tests {
         );
     }
 
-    /// Trust-root priming talks to the Sigstore TUF repository, so it may never
-    /// finish on an offline host. The upgrade must not wait for it: verification
-    /// falls back to the trust snapshot the build embeds.
+    // Trust-root priming talks to the Sigstore TUF repository, so it may never
+    // finish on an offline host. The upgrade must not wait for it: verification
+    // falls back to the trust snapshot the build embeds.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_pipeline_does_not_wait_for_sigstore_trust_root_priming() {
@@ -1922,9 +1922,9 @@ mod tests {
         priming.abort();
     }
 
-    /// A pipeline whose manifest disagrees with the admitted request stops before
-    /// anything is downloaded: the signed manifest and the request must name the
-    /// same release.
+    // A pipeline whose manifest disagrees with the admitted request stops before
+    // anything is downloaded: the signed manifest and the request must name the
+    // same release.
     #[tokio::test]
     async fn a_manifest_that_disagrees_with_the_request_is_refused() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1986,7 +1986,7 @@ mod tests {
 
     // -- manifest fetch order -----------------------------------------------
 
-    /// v2 is preferred, and v1 is read only when the v2 asset is *absent*.
+    // v2 is preferred, and v1 is read only when the v2 asset is *absent*.
     #[tokio::test]
     async fn the_v2_manifest_is_preferred_over_v1() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2024,9 +2024,9 @@ mod tests {
         assert_eq!(fetched.generation, UpgradeManifestGeneration::V1);
     }
 
-    /// A v2 manifest that exists but does not validate is fatal. Falling back to
-    /// v1 on anything but a missing asset would hand an attacker a downgrade
-    /// oracle: break v2 and the client reads the older document instead.
+    // A v2 manifest that exists but does not validate is fatal. Falling back to
+    // v1 on anything but a missing asset would hand an attacker a downgrade
+    // oracle: break v2 and the client reads the older document instead.
     #[tokio::test]
     async fn a_broken_v2_manifest_never_falls_back_to_v1() {
         let v1 = manifest_document(super::super::UPGRADE_MANIFEST_SCHEMA_VERSION, "portable");
@@ -2054,7 +2054,7 @@ mod tests {
         Ok(())
     }
 
-    /// A minimal, valid manifest document for `schema`.
+    // A minimal, valid manifest document for `schema`.
     fn manifest_document(schema: &str, channel: &str) -> String {
         let asset = "weaver-linux-x86_64-portable.tar.gz";
         serde_json::json!({
@@ -2078,9 +2078,9 @@ mod tests {
         .to_string()
     }
 
-    /// A release-asset server that serves whichever manifests are present and
-    /// answers 404 for the rest — which is exactly what a release published
-    /// before v2 existed looks like.
+    // A release-asset server that serves whichever manifests are present and
+    // answers 404 for the rest — which is exactly what a release published
+    // before v2 existed looks like.
     async fn manifest_server(v2: Option<String>, v1: Option<String>) -> url::Url {
         let mut router = axum::Router::new();
         for (asset, body) in [
@@ -2134,9 +2134,9 @@ mod tests {
         }
     }
 
-    /// The boot that follows a promotion is what decides the upgrade took: the
-    /// running version and the running program file must both be the ones the
-    /// journal named. When they are, the backup and the journal go away.
+    // The boot that follows a promotion is what decides the upgrade took: the
+    // running version and the running program file must both be the ones the
+    // journal named. When they are, the backup and the journal go away.
     #[tokio::test]
     async fn a_boot_of_the_expected_build_completes_the_run_and_drops_the_backup() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2173,8 +2173,8 @@ mod tests {
         );
     }
 
-    /// A boot that is not the expected build fails the run and keeps the backup:
-    /// the operator's way back must survive a failed upgrade.
+    // A boot that is not the expected build fails the run and keeps the backup:
+    // the operator's way back must survive a failed upgrade.
     #[tokio::test]
     async fn a_boot_of_a_different_build_fails_the_run_and_keeps_the_backup() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2201,9 +2201,9 @@ mod tests {
         assert!(backup_path.exists(), "the way back is preserved");
     }
 
-    /// A restart that started the previous build fails the run, and the start
-    /// after it finds the build the journal named. That boot is the upgrade
-    /// having taken: the run completes and the backup and journal go away.
+    // A restart that started the previous build fails the run, and the start
+    // after it finds the build the journal named. That boot is the upgrade
+    // having taken: the run completes and the backup and journal go away.
     #[tokio::test]
     async fn a_later_boot_of_the_expected_build_completes_a_run_failed_by_the_wrong_boot() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2241,9 +2241,9 @@ mod tests {
         assert!(!service.journal_path().exists());
     }
 
-    /// The build started after the wrong boot removed the journal and left the
-    /// run failed. With no journal, a build at or past the run's target
-    /// completes it; an older build and any other failure leave it alone.
+    // The build started after the wrong boot removed the journal and left the
+    // run failed. With no journal, a build at or past the run's target
+    // completes it; an older build and any other failure leave it alone.
     #[tokio::test]
     async fn a_run_failed_by_the_wrong_boot_completes_without_its_journal() {
         let failed = |target: &str, error: &str| ApplicationUpgradeRun {
@@ -2287,7 +2287,7 @@ mod tests {
         assert_eq!(run.error.as_deref(), Some("the download was refused"));
     }
 
-    /// A run that failed for any other reason stays failed whatever boots.
+    // A run that failed for any other reason stays failed whatever boots.
     #[tokio::test]
     async fn a_boot_of_the_expected_build_leaves_a_helper_failure_failed() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2314,8 +2314,8 @@ mod tests {
         assert_eq!(run.error.as_deref(), Some("the installer refused to run"));
     }
 
-    /// A helper that recorded a failure fails the run on the next boot and clears
-    /// the recovery state it left behind.
+    // A helper that recorded a failure fails the run on the next boot and clears
+    // the recovery state it left behind.
     #[tokio::test]
     async fn a_helper_failure_recorded_in_the_journal_fails_the_run() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2338,8 +2338,8 @@ mod tests {
         assert!(!service.journal_path().exists());
     }
 
-    /// A run waiting on an operating-system reboot stays running across the
-    /// restart, and is republished so a second upgrade cannot start behind it.
+    // A run waiting on an operating-system reboot stays running across the
+    // restart, and is republished so a second upgrade cannot start behind it.
     #[tokio::test]
     async fn a_run_awaiting_a_reboot_stays_running_and_is_republished() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2368,8 +2368,8 @@ mod tests {
         );
     }
 
-    /// A journal from a schema this build does not know is a refusal, not a
-    /// silent skip: something else wrote it and this build must not act on it.
+    // A journal from a schema this build does not know is a refusal, not a
+    // silent skip: something else wrote it and this build must not act on it.
     #[tokio::test]
     async fn an_unknown_journal_schema_is_refused() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2394,7 +2394,7 @@ mod tests {
         );
     }
 
-    /// No journal is the ordinary case, and it must be silent.
+    // No journal is the ordinary case, and it must be silent.
     #[tokio::test]
     async fn a_boot_with_no_journal_finalizes_nothing() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2404,9 +2404,9 @@ mod tests {
         assert!(service.snapshot().latest_run.is_none());
     }
 
-    /// A run that was still downloading when the process went away has no
-    /// journal, because nothing was promoted. The next boot fails it outright:
-    /// it must neither show as running forever nor block the next attempt.
+    // A run that was still downloading when the process went away has no
+    // journal, because nothing was promoted. The next boot fails it outright:
+    // it must neither show as running forever nor block the next attempt.
     #[tokio::test]
     async fn a_running_run_with_no_journal_is_failed_on_the_next_boot() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2437,9 +2437,9 @@ mod tests {
         assert!(!staging.exists(), "the partial download is removed");
     }
 
-    /// A run carried over from the previous process — rehydrated from a journal
-    /// that is waiting on a reboot — holds no admission lock here, so the
-    /// single-flight rule has to come from the published state.
+    // A run carried over from the previous process — rehydrated from a journal
+    // that is waiting on a reboot — holds no admission lock here, so the
+    // single-flight rule has to come from the published state.
     #[tokio::test]
     async fn a_second_upgrade_is_refused_while_a_carried_over_run_is_still_running() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2463,9 +2463,9 @@ mod tests {
         );
     }
 
-    /// The run survives a restart through the settings row, so the UI that
-    /// triggered the upgrade still sees its outcome after the process it
-    /// replaced has gone.
+    // The run survives a restart through the settings row, so the UI that
+    // triggered the upgrade still sees its outcome after the process it
+    // replaced has gone.
     #[tokio::test]
     async fn a_published_run_is_restored_from_settings_on_the_next_start() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2503,8 +2503,8 @@ mod tests {
         );
     }
 
-    /// A failure after the pipeline advanced reports where it stopped, not
-    /// the `checking` snapshot the upgrade task was started with.
+    // A failure after the pipeline advanced reports where it stopped, not
+    // the `checking` snapshot the upgrade task was started with.
     #[tokio::test]
     async fn a_late_failure_keeps_the_phase_and_bytes_it_reached() {
         let temp = tempfile::tempdir().expect("tempdir");

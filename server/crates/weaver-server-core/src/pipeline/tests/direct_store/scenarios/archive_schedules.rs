@@ -1,7 +1,7 @@
-//! Bounded exhaustive schedules over four articles: one, two or four volumes,
-//! every arrival permutation, loss subset and single duplicate/interruption.
-//! This enumerates delivery boundaries, not background worker or filesystem
-//! interleavings; those require separate tests that force the competing events.
+// Bounded exhaustive schedules over four articles: one, two or four volumes,
+// every arrival permutation, loss subset and single duplicate/interruption.
+// This enumerates delivery boundaries, not background worker or filesystem
+// interleavings; those require separate tests that force the competing events.
 use super::*;
 use crate::pipeline::direct_store::router::MemberIneligibility;
 use crate::pipeline::direct_store::router::sevenz::SevenZipRefusal;
@@ -79,8 +79,8 @@ pub(super) fn duplicate_orders() -> Vec<Vec<(u32, u32)>> {
     result
 }
 
-/// Articles per volume for `slots` article slots over `volumes` volumes: four
-/// split evenly, and a fifth carried by the first volume.
+// Articles per volume for `slots` article slots over `volumes` volumes: four
+// split evenly, and a fifth carried by the first volume.
 fn slot_layout(volumes: usize, slots: usize) -> Vec<usize> {
     assert!(
         4 % volumes == 0 && matches!(slots, 4 | 5),
@@ -91,8 +91,8 @@ fn slot_layout(volumes: usize, slots: usize) -> Vec<usize> {
     layout
 }
 
-/// A schedule names slot `file * 2 + article` whatever the volumes' own
-/// article counts; slots number the volumes' articles in file order.
+// A schedule names slot `file * 2 + article` whatever the volumes' own
+// article counts; slots number the volumes' articles in file order.
 fn slot_article(layout: &[usize], slot: u32) -> (u32, u32) {
     let mut first = 0;
     for (file, &articles) in layout.iter().enumerate() {
@@ -108,7 +108,7 @@ fn article_slot(layout: &[usize], file: u32, article: u32) -> u32 {
     layout[..file as usize].iter().sum::<usize>() as u32 + article
 }
 
-/// Every slot once, in order, as a schedule names it.
+// Every slot once, in order, as a schedule names it.
 fn slot_arrivals(slots: usize) -> Vec<(u32, u32)> {
     (0..slots as u32).map(|slot| (slot / 2, slot % 2)).collect()
 }
@@ -117,59 +117,59 @@ pub(super) struct Outcome {
     pub status: Option<JobStatus>,
     pub files: BTreeMap<String, Option<Vec<u8>>>,
     pub trace: Vec<String>,
-    /// Sets finalized from their own partials, over every incarnation.
+    // Sets finalized from their own partials, over every incarnation.
     pub finalized: usize,
     pub chase_armed: u64,
     pub chase_consumed: u64,
-    /// Every direct-store demotion any incarnation of the pipeline recorded.
+    // Every direct-store demotion any incarnation of the pipeline recorded.
     pub demotions: Vec<DemotionReason>,
-    /// The reason the schedule's own demote action claimed a live set under.
+    // The reason the schedule's own demote action claimed a live set under.
     pub schedule_demoted: Option<DemotionReason>,
-    /// Every file under the job's output directory, by relative path.
+    // Every file under the job's output directory, by relative path.
     pub published: BTreeSet<String>,
-    /// Everything the job left outside its output directory.
+    // Everything the job left outside its output directory.
     pub leftovers: BTreeSet<String>,
-    /// Volume articles the pipeline asked for again after it was handed them.
+    // Volume articles the pipeline asked for again after it was handed them.
     pub rerequested: BTreeSet<(u32, u32)>,
-    /// Delivered articles a direct set has no reason to ask for again.
-    ///
-    /// Without a restart that is every one of them. A shutdown barrier keeps
-    /// what its checkpoint names: each complete volume, and each partial
-    /// volume's articles under the floor short of the last, because the floor
-    /// counts decoded bytes against encoded article sizes and so stops one
-    /// article early. A crash promises nothing.
+    // Delivered articles a direct set has no reason to ask for again.
+    //
+    // Without a restart that is every one of them. A shutdown barrier keeps
+    // what its checkpoint names: each complete volume, and each partial
+    // volume's articles under the floor short of the last, because the floor
+    // counts decoded bytes against encoded article sizes and so stops one
+    // article early. A crash promises nothing.
     pub durable: BTreeSet<(u32, u32)>,
 }
 
-/// What a schedule may do to a direct set besides finalize it.
+// What a schedule may do to a direct set besides finalize it.
 #[derive(Clone, Copy)]
 pub(super) struct Route {
-    /// The set this archive forms routes direct from first article to last.
+    // The set this archive forms routes direct from first article to last.
     pub direct: bool,
-    /// Independent sets in the job. The schedule's own demotion claims the
-    /// first one only; every other set finalizes on its own.
+    // Independent sets in the job. The schedule's own demotion claims the
+    // first one only; every other set finalizes on its own.
     pub sets: usize,
-    /// The demotions the archive's own shape earns, whatever the schedule.
+    // The demotions the archive's own shape earns, whatever the schedule.
     pub shape_demotion: fn(DemotionReason) -> bool,
-    /// Loss masks that leave the set without a layout to route by.
-    ///
-    /// A set whose layout lives in articles of its own has no destination
-    /// for any byte while those articles are missing; only a repair of the
-    /// whole payload brings them back, and by then nothing is left to route.
+    // Loss masks that leave the set without a layout to route by.
+    //
+    // A set whose layout lives in articles of its own has no destination
+    // for any byte while those articles are missing; only a repair of the
+    // whole payload brings them back, and by then nothing is left to route.
     pub unmapped_loss: fn(u8) -> bool,
-    /// Loss masks that leave a volume with nothing to say which volume it is.
-    ///
-    /// A set admitted by content knows a file by its offset-zero article
-    /// alone. A file that never receives one cannot be bound to its volume, and
-    /// its set cannot be made whole.
+    // Loss masks that leave a volume with nothing to say which volume it is.
+    //
+    // A set admitted by content knows a file by its offset-zero article
+    // alone. A file that never receives one cannot be bound to its volume, and
+    // its set cannot be made whole.
     pub unnamed_loss: fn(u8) -> bool,
-    /// Only the recovery set's descriptions can name the volumes, so an index
-    /// that arrives after the body names nothing in time and the set goes
-    /// conventional.
+    // Only the recovery set's descriptions can name the volumes, so an index
+    // that arrives after the body names nothing in time and the set goes
+    // conventional.
     pub named_by_early_index: bool,
-    /// Each set is admitted from its own volumes and either finishes direct
-    /// or leaves on its own, so a schedule may finish any number of them,
-    /// all included. The campaign states the exact count where it is known.
+    // Each set is admitted from its own volumes and either finishes direct
+    // or leaves on its own, so a schedule may finish any number of them,
+    // all included. The campaign states the exact count where it is known.
     pub sets_finish_independently: bool,
 }
 
@@ -184,8 +184,8 @@ impl Route {
         sets_finish_independently: false,
     };
 
-    /// A set the layout refuses to route: it demotes for its shape and
-    /// nothing it does afterwards is a direct-store decision.
+    // A set the layout refuses to route: it demotes for its shape and
+    // nothing it does afterwards is a direct-store decision.
     pub(super) const fn refused(shape_demotion: fn(DemotionReason) -> bool) -> Self {
         Self {
             direct: false,
@@ -272,8 +272,8 @@ impl ExtractionProfile {
             )
     }
 
-    /// Holds a schedule that cannot succeed to failing cleanly: a failed job,
-    /// no set finalized, and none of the archive's members published.
+    // Holds a schedule that cannot succeed to failing cleanly: a failed job,
+    // no set finalized, and none of the archive's members published.
     pub(super) fn assert_rejected(self, outcome: &Outcome, expected: &[&str]) {
         self.assert_route(outcome);
         let trace = &outcome.trace;
@@ -293,9 +293,9 @@ impl ExtractionProfile {
         );
     }
 
-    /// Holds a finished schedule to the route its profile and archive shape
-    /// allow: which sets may leave direct store, what reaches the output
-    /// directory, and what the job may leave behind or ask for twice.
+    // Holds a finished schedule to the route its profile and archive shape
+    // allow: which sets may leave direct store, what reaches the output
+    // directory, and what the job may leave behind or ask for twice.
     pub(super) fn assert_delivery(
         self,
         outcome: &Outcome,
@@ -401,8 +401,8 @@ pub(super) enum BoundaryAction {
     None,
     Restart,
     Demote,
-    /// The process dies: no shutdown barrier, so the restart finds whatever
-    /// coverage the last barrier of its own happened to publish.
+    // The process dies: no shutdown barrier, so the restart finds whatever
+    // coverage the last barrier of its own happened to publish.
     Crash,
 }
 
@@ -422,13 +422,13 @@ pub(super) enum Interruption {
         action: BoundaryAction,
         at: usize,
     },
-    /// Loss with a recovery set that describes the damage and cannot mend it.
+    // Loss with a recovery set that describes the damage and cannot mend it.
     Starved {
         mask: u8,
     },
-    /// Two boundary actions in one run, the first never after the second.
-    /// At a shared boundary both happen before that boundary's arrival, in
-    /// order. An empty mask loses nothing and posts no recovery set.
+    // Two boundary actions in one run, the first never after the second.
+    // At a shared boundary both happen before that boundary's arrival, in
+    // order. An empty mask loses nothing and posts no recovery set.
     Twice {
         mask: u8,
         index_first: bool,
@@ -439,31 +439,31 @@ pub(super) enum Interruption {
     },
 }
 
-/// Which slice of a campaign one test runs.
+// Which slice of a campaign one test runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Selection {
-    /// The default suite's bounded sample.
+    // The default suite's bounded sample.
     Smoke,
-    /// One shard of the combined matrix.
+    // One shard of the combined matrix.
     Shard(usize),
-    /// One of [`FINE_SHARDS`] shards of the combined matrix, for a layout
-    /// whose cases run long enough that a shard of the usual size outruns the
-    /// per-test limit.
+    // One of [`FINE_SHARDS`] shards of the combined matrix, for a layout
+    // whose cases run long enough that a shard of the usual size outruns the
+    // per-test limit.
     FineShard(usize),
-    /// A wrong password across every arrival order and interruption boundary.
+    // A wrong password across every arrival order and interruption boundary.
     WrongPassword,
-    /// One of [`WRONG_PASSWORD_PARTS`] parts of the wrong password's
-    /// schedules, for the same layouts.
+    // One of [`WRONG_PASSWORD_PARTS`] parts of the wrong password's
+    // schedules, for the same layouts.
     WrongPasswordPart(usize),
 }
 
-/// Shards the combined matrix is cut into, each its own test.
+// Shards the combined matrix is cut into, each its own test.
 pub(super) const SHARDS: usize = 64;
 
-/// Shards a slow layout's combined matrix is cut into instead.
+// Shards a slow layout's combined matrix is cut into instead.
 pub(super) const FINE_SHARDS: usize = 2 * SHARDS;
 
-/// Parts a slow layout's wrong password schedules are cut into.
+// Parts a slow layout's wrong password schedules are cut into.
 pub(super) const WRONG_PASSWORD_PARTS: usize = 2;
 
 impl Interruption {
@@ -481,7 +481,7 @@ impl Interruption {
         }
     }
 
-    /// The job cannot finish: what was lost is beyond the recovery it has.
+    // The job cannot finish: what was lost is beyond the recovery it has.
     pub(super) fn fails(self) -> bool {
         matches!(self, Self::Starved { .. })
     }
@@ -496,9 +496,9 @@ impl Interruption {
         }
     }
 
-    /// Each boundary of a run over `arrivals` articles, with the action taken
-    /// there and whether that boundary's arrival follows it. A boundary with
-    /// two actions appears twice, and its arrival follows only the second.
+    // Each boundary of a run over `arrivals` articles, with the action taken
+    // there and whether that boundary's arrival follows it. A boundary with
+    // two actions appears twice, and its arrival follows only the second.
     fn boundaries(self, arrivals: usize) -> Vec<(usize, BoundaryAction, bool)> {
         let mut boundaries = Vec::new();
         for step in 0..=arrivals {
@@ -537,7 +537,7 @@ pub(super) fn combined_schedules(shard: usize, shards: usize) -> Vec<(usize, Sch
         .collect()
 }
 
-/// A campaign's cases for one selection, by replay index.
+// A campaign's cases for one selection, by replay index.
 pub(super) fn selected_schedules(selection: Selection) -> Vec<(usize, Schedule)> {
     match selection {
         Selection::Smoke => schedules().into_iter().enumerate().collect(),
@@ -547,9 +547,9 @@ pub(super) fn selected_schedules(selection: Selection) -> Vec<(usize, Schedule)>
     }
 }
 
-/// A wrong password's schedules: every arrival order, uninterrupted and
-/// interrupted at every boundary. The default suite keeps the uninterrupted
-/// orders; the matrix runs them all as a test of its own.
+// A wrong password's schedules: every arrival order, uninterrupted and
+// interrupted at every boundary. The default suite keeps the uninterrupted
+// orders; the matrix runs them all as a test of its own.
 pub(super) fn wrong_password_schedules(selection: Selection) -> Vec<Schedule> {
     let mut result = Vec::new();
     let every = matches!(
@@ -845,7 +845,7 @@ async fn deliver_schedule_refetches(
     }
 }
 
-/// A recovery file whose bytes the schedule holds, to hand over when due.
+// A recovery file whose bytes the schedule holds, to hand over when due.
 struct ScheduleRecovery {
     index: u32,
     name: String,
@@ -899,9 +899,9 @@ async fn submit_schedule_recovery(
     }
 }
 
-/// What a schedule's demote action claims: which of the job's sets, and why.
-/// Both follow from the schedule, so across the arrival orders every boundary
-/// sees a budget demotion and a source-damage one against each set.
+// What a schedule's demote action claims: which of the job's sets, and why.
+// Both follow from the schedule, so across the arrival orders every boundary
+// sees a budget demotion and a source-damage one against each set.
 fn scheduled_demotion(order: &[(u32, u32)], step: usize, sets: usize) -> (usize, DemotionReason) {
     // A schedule that lost every article has no set to claim and nothing to
     // seed from.
@@ -915,29 +915,29 @@ fn scheduled_demotion(order: &[(u32, u32)], step: usize, sets: usize) -> (usize,
     ((seed / 2) % sets.max(1), reason)
 }
 
-/// What a schedule's recovery set is authored as.
+// What a schedule's recovery set is authored as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RecoveryFormat {
-    /// One PAR2 file carrying the descriptions and every recovery block.
+    // One PAR2 file carrying the descriptions and every recovery block.
     Par2,
-    /// A PAR3 index and its recovery volumes. The index arrives where the
-    /// PAR2 file would; a recovery volume arrives when the pipeline asks.
+    // A PAR3 index and its recovery volumes. The index arrives where the
+    // PAR2 file would; a recovery volume arrives when the pipeline asks.
     Par3,
-    /// The volumes carry their own recovery set and nothing else is posted.
+    // The volumes carry their own recovery set and nothing else is posted.
     Embedded,
-    /// Nothing is posted besides the volumes: no index names them and no
-    /// recovery block can mend a loss.
+    // Nothing is posted besides the volumes: no index names them and no
+    // recovery block can mend a loss.
     Absent,
 }
 
-/// Who a schedule's demote action claims, and why.
+// Who a schedule's demote action claims, and why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DemotionChoice {
-    /// [`scheduled_demotion`] picks the set and the reason; speculative
-    /// extraction is withdrawn for good, as yielded memory.
+    // [`scheduled_demotion`] picks the set and the reason; speculative
+    // extraction is withdrawn for good, as yielded memory.
     Scheduled,
-    /// Every demote action claims `set` under `reason` and withdraws
-    /// speculative extraction under `chase`, latched by `latch`.
+    // Every demote action claims `set` under `reason` and withdraws
+    // speculative extraction under `chase`, latched by `latch`.
     Fixed {
         set: usize,
         reason: DemotionReason,
@@ -962,25 +962,25 @@ impl DemotionChoice {
     }
 }
 
-/// How a schedule is driven besides its arrivals and its interruption.
+// How a schedule is driven besides its arrivals and its interruption.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ScheduleOptions {
     pub recovery: RecoveryFormat,
     pub demotion: DemotionChoice,
-    /// The recovery index arrives after every volume article, whatever the
-    /// schedule's loss would otherwise lead with: too late to name a volume
-    /// before its bytes land.
+    // The recovery index arrives after every volume article, whatever the
+    // schedule's loss would otherwise lead with: too late to name a volume
+    // before its bytes land.
     pub index_last: bool,
-    /// The recovery index arrives ahead of every volume article, whatever the
-    /// schedule's loss would otherwise lead with.
+    // The recovery index arrives ahead of every volume article, whatever the
+    // schedule's loss would otherwise lead with.
     pub index_first: bool,
-    /// An `.sfv` listing the described names (the posted ones when nothing is
-    /// described) is posted too, and arrives where the index would.
+    // An `.sfv` listing the described names (the posted ones when nothing is
+    // described) is posted too, and arrives where the index would.
     pub sfv: bool,
 }
 
 impl ScheduleOptions {
-    /// What every campaign of the archive matrix proper runs under.
+    // What every campaign of the archive matrix proper runs under.
     pub(super) const MATRIX: Self = Self {
         recovery: RecoveryFormat::Par2,
         demotion: DemotionChoice::Scheduled,
@@ -1001,10 +1001,10 @@ pub(super) async fn run_profile_schedule(
     run_described_schedule(profile, spec, volumes, None, order, wanted, interruption).await
 }
 
-/// A schedule whose recovery set describes the volumes under `described`
-/// names rather than the posted ones, the way an obfuscated post's PAR2
-/// carries the real names. Such a job always carries its index: without a
-/// loss it arrives first and holds no recovery blocks.
+// A schedule whose recovery set describes the volumes under `described`
+// names rather than the posted ones, the way an obfuscated post's PAR2
+// carries the real names. Such a job always carries its index: without a
+// loss it arrives first and holds no recovery blocks.
 pub(super) async fn run_described_schedule(
     profile: ExtractionProfile,
     spec: JobSpec,
@@ -1027,7 +1027,7 @@ pub(super) async fn run_described_schedule(
     .await
 }
 
-/// [`run_described_schedule`] under `options`.
+// [`run_described_schedule`] under `options`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_schedule_with(
     options: ScheduleOptions,
@@ -1492,8 +1492,8 @@ pub(super) async fn run_schedule_with(
     }
 }
 
-/// Records every volume article sitting in the download queue that the
-/// schedule has already handed over: the pipeline is asking for it twice.
+// Records every volume article sitting in the download queue that the
+// schedule has already handed over: the pipeline is asking for it twice.
 fn note_rerequests(
     pipeline: &mut Pipeline,
     job: JobId,
@@ -1603,43 +1603,43 @@ enum Format {
     Rar5UncheckedHeaders,
     QuickOpen,
     Blake2,
-    /// Four single-article volumes, so two of the volumes are middle volumes
-    /// that both continue and are continued.
+    // Four single-article volumes, so two of the volumes are middle volumes
+    // that both continue and are continued.
     Rar4FourVolumes,
     Rar5FourVolumes,
     Rar4EncryptedFourVolumes,
-    /// Volume names that say nothing. The recovery set carries the real
-    /// names, as an obfuscated post's does, and the set is admitted by them.
+    // Volume names that say nothing. The recovery set carries the real
+    // names, as an obfuscated post's does, and the set is admitted by them.
     Rar5Obfuscated,
     Rar4Obfuscated,
     // The rest take that crutch away: nothing in a volume's name, and nothing
     // a recovery set says in time, groups the volumes or orders them. Only
     // the archive headers can.
-    /// 32-hex extensionless volumes and nothing else posted: no index names
-    /// them and nothing can mend a loss.
+    // 32-hex extensionless volumes and nothing else posted: no index names
+    // them and nothing can mend a loss.
     Rar5HexBare,
     Rar4HexBare,
-    /// The recovery set describes the volumes under the same hex names they
-    /// are posted under, so binding them to it changes nothing.
+    // The recovery set describes the volumes under the same hex names they
+    // are posted under, so binding them to it changes nothing.
     Rar5HexSelfDescribed,
     Rar4HexSelfDescribed,
-    /// The recovery set carries the real names but arrives after every
-    /// volume article, too late to name a volume before its bytes land.
+    // The recovery set carries the real names but arrives after every
+    // volume article, too late to name a volume before its bytes land.
     Rar5HexLateIndex,
     Rar4HexLateIndex,
-    /// A hex stem with numeric extensions that misstate the order: the first
-    /// volume is `.002` and the second `.001`.
+    // A hex stem with numeric extensions that misstate the order: the first
+    // volume is `.002` and the second `.001`.
     Rar5HexMisnumbered,
     Rar4HexMisnumbered,
-    /// A hex stem whose `.rar` and `.r00` are swapped: the first volume is
-    /// the `.r00`.
+    // A hex stem whose `.rar` and `.r00` are swapped: the first volume is
+    // the `.r00`.
     Rar5HexSwappedRar,
     Rar4HexSwappedRar,
-    /// Four volumes, each under an unrelated hex name with no shared stem,
-    /// in an order their names do not sort to.
+    // Four volumes, each under an unrelated hex name with no shared stem,
+    // in an order their names do not sort to.
     Rar5HexScattered,
     Rar4HexScattered,
-    /// A single-volume archive under a hex name.
+    // A single-volume archive under a hex name.
     Rar5HexSingle,
     Rar4HexSingle,
 }
@@ -1657,8 +1657,8 @@ impl Format {
         }
     }
 
-    /// A layout whose volume names carry nothing the pipeline can group or
-    /// order them by, so the archive headers have to.
+    // A layout whose volume names carry nothing the pipeline can group or
+    // order them by, so the archive headers have to.
     fn name_blind(self) -> bool {
         matches!(
             self,
@@ -1693,7 +1693,7 @@ impl Format {
         }
     }
 
-    /// The names the volumes are posted under, given their real ones.
+    // The names the volumes are posted under, given their real ones.
     fn posted_names(self, volumes: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
         let stem = "5f0c9e2ab1d74c6e8a3f1b0d9c2e7a41";
         match self {
@@ -1733,7 +1733,7 @@ impl Format {
         }
     }
 
-    /// The grouping cell this layout is, whose ruling gives its route.
+    // The grouping cell this layout is, whose ruling gives its route.
     fn cell(self) -> grouping::Cell {
         use grouping::{Binding, Container, Naming};
         let (container, naming, binding) = match self {
@@ -1838,13 +1838,13 @@ impl Format {
         }
     }
 
-    /// The direct-store route the layout's grouping cell is ruled to take.
+    // The direct-store route the layout's grouping cell is ruled to take.
     fn route(self) -> Route {
         grouping::alias_route(self.cell())
     }
 }
 
-/// Every hand-named layout keeps the route it had before it became a cell.
+// Every hand-named layout keeps the route it had before it became a cell.
 #[test]
 fn hand_named_formats_alias_their_routes() {
     fn route_by_hand(format: Format) -> Route {
@@ -1987,7 +1987,7 @@ fn hand_named_formats_alias_their_routes() {
     }
 }
 
-/// The generator emits a campaign for exactly the cells the ruling allows.
+// The generator emits a campaign for exactly the cells the ruling allows.
 #[test]
 fn grouping_generator_covers_every_possible_cell() {
     grouping::assert_generated(GENERATED_CELLS);
@@ -2117,13 +2117,13 @@ async fn profile_campaign(format: Format, selection: Selection, profile: Extract
     .await;
 }
 
-/// Adjusts a case's outcome for a product defect the campaign holds open,
-/// before the case's rules see it. True holds the whole case open: none of
-/// its rules apply.
+// Adjusts a case's outcome for a product defect the campaign holds open,
+// before the case's rules see it. True holds the whole case open: none of
+// its rules apply.
 type KnownDefect = fn(Format, &[(u32, u32)], Interruption, &mut Outcome) -> bool;
 
-/// A format's campaign over `slots` article slots (see [`slot_layout`]): the
-/// given wrong-password schedules, then each case held to the same rules.
+// A format's campaign over `slots` article slots (see [`slot_layout`]): the
+// given wrong-password schedules, then each case held to the same rules.
 async fn slot_campaign(
     format: Format,
     selection: Selection,
@@ -2514,9 +2514,9 @@ async fn rar4_hex_single_arrival_schedules() {
     campaign(Format::Rar4HexSingle, Selection::Smoke).await;
 }
 
-/// Two single-volume stored sets in one job, two articles each. A demotion,
-/// a restart or a loss in one set is not a reason for the other to leave
-/// direct store.
+// Two single-volume stored sets in one job, two articles each. A demotion,
+// a restart or a loss in one set is not a reason for the other to leave
+// direct store.
 async fn two_set_campaign(profile: ExtractionProfile, selection: Selection) {
     let members = ["alpha.mkv", "nested/beta.mkv"];
     let payloads: Vec<Vec<u8>> = [(6001, 7), (4093, 11)]
@@ -2622,10 +2622,10 @@ async fn two_set_arrival_schedules() {
     two_set_campaign(ExtractionProfile::DirectStore, Selection::Smoke).await;
 }
 
-/// Two two-volume stored sets in one job, one article a volume, every volume
-/// under an unrelated hex name and the two sets' volumes posted interleaved.
-/// No name says which set a volume belongs to or where in it, so only the
-/// volumes' own headers can keep the sets apart; merged, neither extracts.
+// Two two-volume stored sets in one job, one article a volume, every volume
+// under an unrelated hex name and the two sets' volumes posted interleaved.
+// No name says which set a volume belongs to or where in it, so only the
+// volumes' own headers can keep the sets apart; merged, neither extracts.
 #[derive(Clone, Copy, Debug)]
 enum HexTwoSets {
     Rar5,
@@ -2633,8 +2633,8 @@ enum HexTwoSets {
 }
 
 impl HexTwoSets {
-    /// Posted order: the first set's volumes in slots 0 and 2, the second's
-    /// in slots 1 and 3.
+    // Posted order: the first set's volumes in slots 0 and 2, the second's
+    // in slots 1 and 3.
     const NAMES: [&'static str; 4] = [
         "d3b07384d113edec49eaa6238ad5ff00",
         "0f2c6e9a4b8d1e3f5a7c9b0d2e4f6a81",
@@ -2642,16 +2642,16 @@ impl HexTwoSets {
         "26f9b0e3c7a14d58b2e6f0a9c3d7e1b4",
     ];
 
-    /// How many sets direct store finishes in an uninterrupted arrival order.
-    ///
-    /// Direct store admits one header volume set per job, from the first
-    /// RAR5 volume to arrive. When the next distinct volume is the same
-    /// archive's, the set is whole and finishes direct, and the other
-    /// archive's volumes go the conventional way. When it is the other
-    /// archive's, its position collides or its first member does not
-    /// continue the open set's member, so the set demotes as unfillable and
-    /// both archives extract conventionally. RAR4 states no position, so no
-    /// set is admitted at all.
+    // How many sets direct store finishes in an uninterrupted arrival order.
+    //
+    // Direct store admits one header volume set per job, from the first
+    // RAR5 volume to arrive. When the next distinct volume is the same
+    // archive's, the set is whole and finishes direct, and the other
+    // archive's volumes go the conventional way. When it is the other
+    // archive's, its position collides or its first member does not
+    // continue the open set's member, so the set demotes as unfillable and
+    // both archives extract conventionally. RAR4 states no position, so no
+    // set is admitted at all.
     fn direct_finalized(self, order: &[(u32, u32)]) -> usize {
         if matches!(self, Self::Rar4) {
             return 0;
@@ -2707,8 +2707,8 @@ async fn hex_two_set_conventional_campaign(format: HexTwoSets, selection: Select
     hex_two_set_profile(format, selection, ExtractionProfile::Conventional).await;
 }
 
-/// The members, their payloads, the posted volumes and the job of the
-/// two-set fixture.
+// The members, their payloads, the posted volumes and the job of the
+// two-set fixture.
 type HexTwoSetFixture = (
     [&'static str; 2],
     Vec<Vec<u8>>,
@@ -2746,8 +2746,8 @@ fn hex_two_set_fixture(format: HexTwoSets) -> HexTwoSetFixture {
     (members, payloads, volumes, spec)
 }
 
-/// Holds one finished two-set schedule to its route and to both members'
-/// exact bytes.
+// Holds one finished two-set schedule to its route and to both members'
+// exact bytes.
 fn assert_hex_two_set_delivery(
     format: HexTwoSets,
     profile: ExtractionProfile,
@@ -2772,7 +2772,7 @@ fn assert_hex_two_set_delivery(
     }
 }
 
-/// Runs one named arrival order of the two-set fixture in every profile.
+// Runs one named arrival order of the two-set fixture in every profile.
 async fn hex_two_set_order(format: HexTwoSets, order: &[(u32, u32)], finalized: usize) {
     assert_eq!(format.direct_finalized(order), finalized);
     let (members, _, volumes, spec) = hex_two_set_fixture(format);
@@ -2909,17 +2909,17 @@ async fn rar5_hex_two_set_arrival_schedules() {
     hex_two_set_campaign(HexTwoSets::Rar5, Selection::Smoke).await;
 }
 
-/// The first archive's second volume, then the second archive's first, then
-/// the rest: the order that once bound one volume of each archive into a
-/// single set and completed the job with that set's partials as output.
+// The first archive's second volume, then the second archive's first, then
+// the rest: the order that once bound one volume of each archive into a
+// single set and completed the job with that set's partials as output.
 #[tokio::test]
 async fn rar5_hex_two_sets_interleaved_across_positions_never_merge() {
     // Slots 2, 1, 0, 3: A1, B0, A0, B1.
     hex_two_set_order(HexTwoSets::Rar5, &[(1, 0), (0, 1), (0, 0), (1, 1)], 0).await;
 }
 
-/// Each archive's later volume ahead of its first, as a `.r00` posted before
-/// its `.rar` arrives: the first archive is whole before the second appears.
+// Each archive's later volume ahead of its first, as a `.r00` posted before
+// its `.rar` arrives: the first archive is whole before the second appears.
 #[tokio::test]
 async fn rar5_hex_two_sets_with_each_later_volume_first_never_merge() {
     // Slots 2, 0, 3, 1: A1, A0, B1, B0.
@@ -2975,8 +2975,8 @@ enum CompressedFormat {
 }
 
 impl CompressedFormat {
-    /// The posted volumes of a multi-volume set and its oracle key. Every
-    /// other format posts its one fixture archive whole.
+    // The posted volumes of a multi-volume set and its oracle key. Every
+    // other format posts its one fixture archive whole.
     fn volumes(self) -> Option<(&'static str, Vec<&'static [u8]>)> {
         macro_rules! volumes {
             ($set:literal, $($part:literal),+) => {
@@ -3023,9 +3023,9 @@ impl CompressedFormat {
         }
     }
 
-    /// The archive the expected members are decoded from. A multi-volume set
-    /// packs the member its single-volume counterpart does, and the oracle
-    /// pins the bytes for the set under its own key.
+    // The archive the expected members are decoded from. A multi-volume set
+    // packs the member its single-volume counterpart does, and the oracle
+    // pins the bytes for the set under its own key.
     fn fixture(self) -> (&'static str, &'static [u8], Option<&'static str>) {
         // Real RAR encoders produced these archives. Embed them so the compiled
         // nextest archive remains self-contained on a matrix runner.
@@ -3103,9 +3103,9 @@ impl CompressedFormat {
 }
 
 impl CompressedFormat {
-    /// Each refusal names what the archive itself puts beyond a byte copy:
-    /// a compressed, solid or encrypted member has no bytes of its own to
-    /// place, and encrypted headers hide the layout altogether.
+    // Each refusal names what the archive itself puts beyond a byte copy:
+    // a compressed, solid or encrypted member has no bytes of its own to
+    // place, and encrypted headers hide the layout altogether.
     fn route(self) -> Route {
         use DemotionReason::{HeaderEncryptedRefused, MemberIneligible};
         use MemberIneligibility::{Compressed, Encrypted, Solid};

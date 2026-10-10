@@ -1167,8 +1167,8 @@ async fn record_job_history_retains_complete_job_nzb() {
     assert_eq!(nzb_zstd.unwrap(), sample_nzb_zstd());
 }
 
-/// Park the serialized database writer until the returned sender is dropped, so
-/// a queued archive cannot commit while the test inspects the event stream.
+// Park the serialized database writer until the returned sender is dropped, so
+// a queued archive cannot commit while the test inspects the event stream.
 fn hold_database_writer(pipeline: &Pipeline) -> std::sync::mpsc::Sender<()> {
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     pipeline

@@ -1,6 +1,6 @@
-//! Continuation of the `impl Pipeline` block from `repair/par2.rs`.
-//! Split out mechanically to keep the parent file readable; no behavior lives here
-//! that is not simply a method of the same type.
+// Continuation of the `impl Pipeline` block from `repair/par2.rs`.
+// Split out mechanically to keep the parent file readable; no behavior lives here
+// that is not simply a method of the same type.
 
 use super::*;
 
@@ -142,18 +142,18 @@ impl Pipeline {
             || write_buffered
     }
 
-    /// Whether a discovery candidate's article could still turn up.
-    ///
-    /// The terminal ledger is the authority, not
-    /// `unavailable_promoted_recovery_segments`. That set records only the
-    /// failures booked while the file was *already* a promoted carrier or a
-    /// queued candidate — the guard on the marking seam says as much — so a
-    /// candidate whose articles were retired during the ordinary pass is
-    /// absent from it entirely. A posting whose every recovery volume is gone
-    /// retires all of them that way, long before discovery picks two of them
-    /// to ask about; discovery then waits on articles that reached a terminal
-    /// state before it ever queued them, `work_is_queued` never clears, and
-    /// the job waits on a bounded discovery that cannot close.
+    // Whether a discovery candidate's article could still turn up.
+    //
+    // The terminal ledger is the authority, not
+    // `unavailable_promoted_recovery_segments`. That set records only the
+    // failures booked while the file was *already* a promoted carrier or a
+    // queued candidate — the guard on the marking seam says as much — so a
+    // candidate whose articles were retired during the ordinary pass is
+    // absent from it entirely. A posting whose every recovery volume is gone
+    // retires all of them that way, long before discovery picks two of them
+    // to ask about; discovery then waits on articles that reached a terminal
+    // state before it ever queued them, `work_is_queued` never clears, and
+    // the job waits on a bounded discovery that cannot close.
     pub(in crate::pipeline) fn par2_discovery_article_may_arrive(
         &self,
         segment_id: SegmentId,
@@ -258,12 +258,12 @@ impl Pipeline {
             .unwrap_or_default()
     }
 
-    /// Volumes that will never complete but whose surviving recovery packets
-    /// were read back off disk and merged.
-    ///
-    /// They are counted apart from the two sets above because both of those
-    /// bypass the runtime entry for exactly this file: the loaded set requires
-    /// a complete assembly, and the targeted set requires work still in flight.
+    // Volumes that will never complete but whose surviving recovery packets
+    // were read back off disk and merged.
+    //
+    // They are counted apart from the two sets above because both of those
+    // bypass the runtime entry for exactly this file: the loaded set requires
+    // a complete assembly, and the targeted set requires work still in flight.
     pub(super) fn salvaged_recovery_file_indices(&self, job_id: JobId) -> HashSet<u32> {
         self.par2_runtime(job_id)
             .map(|runtime| {
@@ -284,17 +284,17 @@ impl Pipeline {
         self.recovery_block_capacity_where(job_id, set_id, |_| true)
     }
 
-    /// The set's block capacity counted over the recovery files that could
-    /// still be read.
-    ///
-    /// [`Self::total_recovery_block_capacity`] credits an unread volume with
-    /// the blocks its filename advertises, which is the right answer for
-    /// repair arithmetic that will read the volume before it banks on it. A
-    /// health deferral banks on it first: it waits *because* of that capacity.
-    /// A volume whose every article is already retired advertises exactly what
-    /// an intact one does and can never deliver a block of it, so here it
-    /// counts for nothing. A file with an article delivered, or one still on
-    /// its way, keeps its count.
+    // The set's block capacity counted over the recovery files that could
+    // still be read.
+    //
+    // [`Self::total_recovery_block_capacity`] credits an unread volume with
+    // the blocks its filename advertises, which is the right answer for
+    // repair arithmetic that will read the volume before it banks on it. A
+    // health deferral banks on it first: it waits *because* of that capacity.
+    // A volume whose every article is already retired advertises exactly what
+    // an intact one does and can never deliver a block of it, so here it
+    // counts for nothing. A file with an article delivered, or one still on
+    // its way, keeps its count.
     pub(in crate::pipeline) fn obtainable_recovery_block_capacity(
         &self,
         job_id: JobId,
@@ -305,8 +305,8 @@ impl Pipeline {
         })
     }
 
-    /// Whether any article of a recovery file has arrived or could still
-    /// arrive.
+    // Whether any article of a recovery file has arrived or could still
+    // arrive.
     fn recovery_file_could_still_be_read(&self, job_id: JobId, file_index: u32) -> bool {
         let file_id = NzbFileId { job_id, file_index };
         let Some(state) = self.jobs.get(&job_id) else {
@@ -364,19 +364,19 @@ impl Pipeline {
             .sum()
     }
 
-    /// How much recovery this repair can count on: what has arrived, what is on
-    /// its way, and what was read back off a volume that will never arrive.
-    ///
-    /// The three groups are counted through [`Self::recovery_block_count_for`],
-    /// which answers with a validated count wherever there is one and only falls
-    /// back to what a file advertises while nothing of it has been read. That
-    /// ordering is what keeps a volume stranded holding three of its
-    /// twenty-four blocks from being credited with the other twenty-one — a
-    /// promise nothing can keep, which reads here as a shortfall already
-    /// covered, so no further recovery is promoted and the job waits for an
-    /// arrival that has no source. A volume still on its way has proved nothing
-    /// yet and rightly contributes what it advertises: that is what "targeted"
-    /// means.
+    // How much recovery this repair can count on: what has arrived, what is on
+    // its way, and what was read back off a volume that will never arrive.
+    //
+    // The three groups are counted through [`Self::recovery_block_count_for`],
+    // which answers with a validated count wherever there is one and only falls
+    // back to what a file advertises while nothing of it has been read. That
+    // ordering is what keeps a volume stranded holding three of its
+    // twenty-four blocks from being credited with the other twenty-one — a
+    // promise nothing can keep, which reads here as a shortfall already
+    // covered, so no further recovery is promoted and the job waits for an
+    // arrival that has no source. A volume still on its way has proved nothing
+    // yet and rightly contributes what it advertises: that is what "targeted"
+    // means.
     pub(crate) fn recovery_blocks_available_or_targeted(
         &self,
         job_id: JobId,
@@ -472,9 +472,9 @@ impl Pipeline {
         }
     }
 
-    /// Move finished probe/carrier attempts to a state that can make the next
-    /// deterministic discovery decision. The prefix scanner validates packet
-    /// headers and hashes through par2-rs before any SetID becomes authority.
+    // Move finished probe/carrier attempts to a state that can make the next
+    // deterministic discovery decision. The prefix scanner validates packet
+    // headers and hashes through par2-rs before any SetID becomes authority.
     pub(super) fn refresh_par2_metadata_discovery(&mut self, job_id: JobId) {
         let candidates = self.par2_metadata_candidate_indices(job_id);
         for (file_index, _is_index, _) in candidates {
@@ -595,11 +595,11 @@ impl Pipeline {
         self.retire_dead_par2_collections(job_id);
     }
 
-    /// Group the discovery candidates by the posting they belong to.
-    ///
-    /// Obfuscated names do not identify siblings, so a candidate without a
-    /// recognisable set base name is a collection of one until authenticated
-    /// metadata says otherwise.
+    // Group the discovery candidates by the posting they belong to.
+    //
+    // Obfuscated names do not identify siblings, so a candidate without a
+    // recognisable set base name is a collection of one until authenticated
+    // metadata says otherwise.
     fn par2_metadata_collections(&self, job_id: JobId) -> HashMap<String, Vec<(u32, bool, u64)>> {
         let mut collections = HashMap::<String, Vec<(u32, bool, u64)>>::new();
         for candidate in self.par2_metadata_candidate_indices(job_id) {
@@ -615,10 +615,10 @@ impl Pipeline {
         collections
     }
 
-    /// A candidate whose probe came back with nothing at all: it is exhausted,
-    /// it identified no set, and not one prefix byte of it ever arrived. That
-    /// is what a volume whose leading article is gone looks like; a carrier
-    /// that answered but turned out not to be PAR2 leaves prefix bytes behind.
+    // A candidate whose probe came back with nothing at all: it is exhausted,
+    // it identified no set, and not one prefix byte of it ever arrived. That
+    // is what a volume whose leading article is gone looks like; a carrier
+    // that answered but turned out not to be PAR2 leaves prefix bytes behind.
     fn par2_candidate_probe_found_nothing(&self, job_id: JobId, file_index: u32) -> bool {
         let exhausted_empty = matches!(
             self.par2_discovery_state_for_candidate(job_id, file_index),
@@ -631,10 +631,10 @@ impl Pipeline {
                 .is_none_or(Vec::is_empty)
     }
 
-    /// Retire the untouched candidates of every collection whose probed
-    /// siblings all came back with nothing, so the job stops walking a dead
-    /// posting one volume at a time. A collection with any sighting of a set
-    /// keeps its remaining candidates: something of it is still on the wire.
+    // Retire the untouched candidates of every collection whose probed
+    // siblings all came back with nothing, so the job stops walking a dead
+    // posting one volume at a time. A collection with any sighting of a set
+    // keeps its remaining candidates: something of it is still on the wire.
     fn retire_dead_par2_collections(&mut self, job_id: JobId) {
         let mut retire = Vec::new();
         for members in self.par2_metadata_collections(job_id).values() {
@@ -690,8 +690,8 @@ impl Pipeline {
         }
     }
 
-    /// Select the next bounded discovery action as
-    /// `(file_index, prefix_only, target_set_id)`.
+    // Select the next bounded discovery action as
+    // `(file_index, prefix_only, target_set_id)`.
     pub(in crate::pipeline) fn next_par2_metadata_action(
         &self,
         job_id: JobId,
@@ -1023,12 +1023,12 @@ impl Pipeline {
         true
     }
 
-    /// Put the next finite metadata probes or set-specific carrier on the
-    /// wire. Discovery continues even after one usable set exists.
-    ///
-    /// Up to `PAR2_DISCOVERY_PROBE_CONCURRENCY` single-article prefix probes
-    /// ride together; a whole-volume carrier goes alone, and only once no probe
-    /// is outstanding, so its selection can use what the probes found.
+    // Put the next finite metadata probes or set-specific carrier on the
+    // wire. Discovery continues even after one usable set exists.
+    //
+    // Up to `PAR2_DISCOVERY_PROBE_CONCURRENCY` single-article prefix probes
+    // ride together; a whole-volume carrier goes alone, and only once no probe
+    // is outstanding, so its selection can use what the probes found.
     pub(crate) fn promote_par2_metadata(&mut self, job_id: JobId) -> bool {
         if self.rearm_prefix_probe_from_recovery_queue(job_id) {
             return true;
@@ -1107,9 +1107,9 @@ impl Pipeline {
         false
     }
 
-    /// Promote the smallest byte set of recovery files needed to cover the requested block count.
-    ///
-    /// Returns the number of recovery blocks newly promoted by this call.
+    // Promote the smallest byte set of recovery files needed to cover the requested block count.
+    //
+    // Returns the number of recovery blocks newly promoted by this call.
     pub(crate) fn promote_recovery_targeted(
         &mut self,
         job_id: JobId,
@@ -1338,7 +1338,7 @@ impl Pipeline {
         moved_segments
     }
 
-    /// List the jobs still in the pipeline, without history.
+    // List the jobs still in the pipeline, without history.
     pub(crate) fn list_live_jobs(&self) -> Vec<JobInfo> {
         let mut list = Vec::with_capacity(self.jobs.len());
         let mut seen = HashSet::with_capacity(self.jobs.len());
@@ -1484,7 +1484,7 @@ impl Pipeline {
         list
     }
 
-    /// List all jobs: the live ones, then history.
+    // List all jobs: the live ones, then history.
     #[cfg(test)]
     pub(crate) fn list_jobs(&self) -> Vec<JobInfo> {
         let mut list = self.list_live_jobs();

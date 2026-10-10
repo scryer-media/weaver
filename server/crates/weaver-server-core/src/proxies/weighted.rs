@@ -21,7 +21,7 @@ pub enum LegHealthState {
     Blocked(String),
 }
 impl LegHealthState {
-    /// The health a leg has from its egress alone, before any dial evidence.
+    // The health a leg has from its egress alone, before any dial evidence.
     pub fn of_egress(health: EgressHealth) -> Self {
         match health {
             EgressHealth::Up => Self::Up,
@@ -31,16 +31,16 @@ impl LegHealthState {
     }
 }
 
-/// How many one-second windows a leg's reported rate spans.
+// How many one-second windows a leg's reported rate spans.
 const THROUGHPUT_WINDOWS: usize = 4;
 
-/// The bytes a leg carried over its most recent one-second windows.
-///
-/// A single second is a noisy reading: bytes are counted as reads land while
-/// the egress limiter paces them afterwards in short bursts, so one second
-/// can land well over the limit and the next well under it even though the
-/// limiter holds the rate exactly. The rate over the last few windows is
-/// what the leg sustains, and that is what the flow reports.
+// The bytes a leg carried over its most recent one-second windows.
+//
+// A single second is a noisy reading: bytes are counted as reads land while
+// the egress limiter paces them afterwards in short bursts, so one second
+// can land well over the limit and the next well under it even though the
+// limiter holds the rate exactly. The rate over the last few windows is
+// what the leg sustains, and that is what the flow reports.
 struct Throughput {
     windows: VecDeque<(u64, f64)>,
     sampled_at: Instant,
@@ -52,12 +52,12 @@ impl Throughput {
             sampled_at: now,
         }
     }
-    /// Whether a full second has passed since the last window closed.
+    // Whether a full second has passed since the last window closed.
     fn due(&self, now: Instant) -> bool {
         now.duration_since(self.sampled_at).as_secs_f64() >= 1.0
     }
-    /// Restart the open window at `now` without recording one. A quiet leg
-    /// whose windows are all empty gains nothing from another empty window.
+    // Restart the open window at `now` without recording one. A quiet leg
+    // whose windows are all empty gains nothing from another empty window.
     fn restart(&mut self, now: Instant) {
         self.sampled_at = now;
     }
@@ -142,7 +142,7 @@ impl LegState {
             None => LegHealthState::Up,
         }
     }
-    /// `health(now) == Probing` without building the state or its reason.
+    // `health(now) == Probing` without building the state or its reason.
     fn is_probing(&self, now: Instant) -> bool {
         self.blocked.is_none()
             && matches!(self.egress, EgressHealth::Up)
@@ -240,25 +240,25 @@ struct Shared {
     changed: Arc<Notify>,
     targets: watch::Sender<Vec<LegAllocation>>,
     socket_targets: watch::Sender<Vec<u16>>,
-    /// Set while the rate timer sleeps with no bytes moving. The first read
-    /// on any leg, and any publish, wake it through `timer_wake`.
+    // Set while the rate timer sleeps with no bytes moving. The first read
+    // on any leg, and any publish, wake it through `timer_wake`.
     timer_parked: AtomicBool,
     timer_wake: Notify,
     #[cfg(test)]
     timer_snapshots: AtomicU64,
 }
 impl Shared {
-    /// Wake a parked rate timer so it re-plans its next wake: a publish may
-    /// have set or cleared a leg's cooldown.
+    // Wake a parked rate timer so it re-plans its next wake: a publish may
+    // have set or cleared a leg's cooldown.
     fn wake_timer(&self) {
         if self.timer_parked.load(Ordering::SeqCst) {
             self.timer_wake.notify_one();
         }
     }
-    /// One pass of the rate timer: close due throughput windows, publish
-    /// what changed, and say when the next pass is due. `None` means no
-    /// bytes are moving and no cooldown is pending, so only a read or a
-    /// publish can make a pass worth running.
+    // One pass of the rate timer: close due throughput windows, publish
+    // what changed, and say when the next pass is due. `None` means no
+    // bytes are moving and no cooldown is pending, so only a read or a
+    // publish can make a pass worth running.
     fn sample(&self, state: &mut AllocationState, last_pass: Instant) -> Option<Instant> {
         let now = Instant::now();
         if self.timer_parked.swap(false, Ordering::SeqCst) {
@@ -345,7 +345,7 @@ impl Shared {
     }
 }
 
-/// Per-consumer allocation; NNTP knows only the dialer and its target-change signal.
+// Per-consumer allocation; NNTP knows only the dialer and its target-change signal.
 pub struct Weighted {
     legs: RwLock<Vec<Arc<dyn Dialer>>>,
     shared: Arc<Shared>,

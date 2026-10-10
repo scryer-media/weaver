@@ -1,9 +1,9 @@
-//! How far a database schema upgrade has got.
-//!
-//! Migrations run before Weaver can serve anything, so a long upgrade looks,
-//! from a browser, exactly like a Weaver that failed to start. Publishing its
-//! progress lets the binary put a page up in the meantime. Only an upgrade
-//! publishes: a fresh install has nobody waiting on it.
+// How far a database schema upgrade has got.
+//
+// Migrations run before Weaver can serve anything, so a long upgrade looks,
+// from a browser, exactly like a Weaver that failed to start. Publishing its
+// progress lets the binary put a page up in the meantime. Only an upgrade
+// publishes: a fresh install has nobody waiting on it.
 
 use std::sync::LazyLock;
 
@@ -11,22 +11,22 @@ use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaUpgrade {
-    /// No upgrade is being applied.
+    // No upgrade is being applied.
     Idle,
-    /// `applied` of the `total` pending migrations are in.
+    // `applied` of the `total` pending migrations are in.
     Running { applied: usize, total: usize },
 }
 
 static PROGRESS: LazyLock<watch::Sender<SchemaUpgrade>> =
     LazyLock::new(|| watch::Sender::new(SchemaUpgrade::Idle));
 
-/// Follow schema upgrades in this process, starting from the current state.
+// Follow schema upgrades in this process, starting from the current state.
 pub fn subscribe() -> watch::Receiver<SchemaUpgrade> {
     PROGRESS.subscribe()
 }
 
-/// One upgrade being published. Dropping it returns the state to idle, so an
-/// upgrade that fails part way still ends.
+// One upgrade being published. Dropping it returns the state to idle, so an
+// upgrade that fails part way still ends.
 pub(crate) struct UpgradeProgress {
     sender: &'static watch::Sender<SchemaUpgrade>,
     applied: usize,

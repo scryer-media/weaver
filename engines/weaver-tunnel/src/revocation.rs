@@ -1,4 +1,4 @@
-//! Explicit socket ownership for revoking a consumer's current route.
+// Explicit socket ownership for revoking a consumer's current route.
 use socket2::{SockRef, Socket};
 use std::{
     io,

@@ -17,12 +17,12 @@ struct FrontendAssets;
 #[derive(Clone)]
 pub(super) struct BaseUrl(pub(super) Arc<String>);
 
-/// A built asset found by its source name, for a page that is not the web
-/// app and so cannot learn the content hash the build put in the file name.
-///
-/// Vite names a file `<stem>-<hash>.<extension>` with an eight-character
-/// hash; matching on the hash's length keeps `weaver-loading` from finding
-/// `weaver-loading-still`.
+// A built asset found by its source name, for a page that is not the web
+// app and so cannot learn the content hash the build put in the file name.
+//
+// Vite names a file `<stem>-<hash>.<extension>` with an eight-character
+// hash; matching on the hash's length keeps `weaver-loading` from finding
+// `weaver-loading-still`.
 pub(super) fn built_asset(stem: &str, extension: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
     FrontendAssets::iter()
         .find(|path| is_built_asset(path, stem, extension))
@@ -39,11 +39,11 @@ fn is_built_asset(path: &str, stem: &str, extension: &str) -> bool {
         .is_some_and(|hash| hash.len() == 8)
 }
 
-/// Rewrite `index.html` to inject the optional base URL.
-///
-/// When `base_url` is non-empty (e.g. "/weaver"):
-/// 1. Replaces `<base href="/">` with `<base href="/weaver/">`
-/// 2. Injects `window.__WEAVER_BASE__` so the frontend knows its prefix
+// Rewrite `index.html` to inject the optional base URL.
+//
+// When `base_url` is non-empty (e.g. "/weaver"):
+// 1. Replaces `<base href="/">` with `<base href="/weaver/">`
+// 2. Injects `window.__WEAVER_BASE__` so the frontend knows its prefix
 fn rewrite_index_html(raw: &[u8], base_url: &str) -> Vec<u8> {
     let html = String::from_utf8_lossy(raw);
     let html = if base_url.is_empty() {
@@ -163,10 +163,10 @@ pub(super) async fn static_handler(
     )
 }
 
-/// The entry decision, split out from [`static_handler`] so the deployment
-/// shape can be supplied rather than detected: a test that asserts the native
-/// page would otherwise pass or fail depending on whether the suite itself is
-/// running inside a container.
+// The entry decision, split out from [`static_handler`] so the deployment
+// shape can be supplied rather than detected: a test that asserts the native
+// page would otherwise pass or fail depending on whether the suite itself is
+// running inside a container.
 fn entry_response(
     headers: &HeaderMap,
     base_url: &str,
@@ -254,9 +254,9 @@ fn spa_entry_response(
     }
 }
 
-/// Shared styling for the three static pages an untrusted, credential-less
-/// browser can land on. Kept as one constant rather than repeated per page so
-/// they cannot drift apart from each other.
+// Shared styling for the three static pages an untrusted, credential-less
+// browser can land on. Kept as one constant rather than repeated per page so
+// they cannot drift apart from each other.
 const NOTICE_PAGE_STYLE: &str = r#"<style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
@@ -278,16 +278,16 @@ const NOTICE_PAGE_STYLE: &str = r#"<style>
     color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 </style>"#;
 
-/// Case (b): a container install with no provisioning. The wizard cannot be
-/// the answer here — inside a container namespace an outside browser arrives
-/// from the bridge or the gateway, never loopback — so the page names the two
-/// deployment-level ways in instead of showing a form nobody can submit.
-///
-/// The login comes first because it admits every route into the container.
-/// Trusted networks are judged on the address Weaver sees inside its own
-/// namespace, which is the Docker network for another container and Docker's
-/// gateway for a published port — so a LAN range copied from the operator's
-/// router covers neither, and the page says which address it actually saw.
+// Case (b): a container install with no provisioning. The wizard cannot be
+// the answer here — inside a container namespace an outside browser arrives
+// from the bridge or the gateway, never loopback — so the page names the two
+// deployment-level ways in instead of showing a form nobody can submit.
+//
+// The login comes first because it admits every route into the container.
+// Trusted networks are judged on the address Weaver sees inside its own
+// namespace, which is the Docker network for another container and Docker's
+// gateway for a published port — so a LAN range copied from the operator's
+// router covers neither, and the page says which address it actually saw.
 const CONTAINER_SETUP_PAGE: NoticePage = NoticePage {
     title: "Set up Weaver",
     subtitle: "First Run",
@@ -322,9 +322,9 @@ WEAVER_BOOTSTRAP_LOGIN_PASSWORD=choose-a-password</code>
   </p>"#,
 };
 
-/// Case (c): a native install reached from somewhere other than its own
-/// machine. The wizard works — it just refuses this peer on submit — so the
-/// page says where to run it rather than leaving a form that always 403s.
+// Case (c): a native install reached from somewhere other than its own
+// machine. The wizard works — it just refuses this peer on submit — so the
+// page says where to run it rather than leaving a form that always 403s.
 const COMPLETE_SETUP_ON_MACHINE_PAGE: NoticePage = NoticePage {
     title: "Set up Weaver",
     subtitle: "First Run",
@@ -339,9 +339,9 @@ const COMPLETE_SETUP_ON_MACHINE_PAGE: NoticePage = NoticePage {
   </p>"#,
 };
 
-/// Case (d): a configured no-login install answering network-wide. Nothing is
-/// pending and nothing is broken — this browser is simply outside the policy
-/// the operator chose — so the page says so and names where to change it.
+// Case (d): a configured no-login install answering network-wide. Nothing is
+// pending and nothing is broken — this browser is simply outside the policy
+// the operator chose — so the page says so and names where to change it.
 const BROWSER_ACCESS_RESTRICTED_PAGE: NoticePage = NoticePage {
     title: "Weaver",
     subtitle: "Browser Access Restricted",
@@ -367,12 +367,12 @@ const SETUP_RECOVERY_REQUIRED_PAGE: NoticePage = NoticePage {
   </p>"#,
 };
 
-/// One of the static pages an untrusted, credential-less browser can land on.
-///
-/// Assembled at response time rather than stored as three finished constants
-/// only because [`NOTICE_PAGE_STYLE`] cannot be spliced into a `const` — these
-/// are cold paths (one page load for a visitor who is being turned away), and
-/// one shared style is worth more than three copies that drift.
+// One of the static pages an untrusted, credential-less browser can land on.
+//
+// Assembled at response time rather than stored as three finished constants
+// only because [`NOTICE_PAGE_STYLE`] cannot be spliced into a `const` — these
+// are cold paths (one page load for a visitor who is being turned away), and
+// one shared style is worth more than three copies that drift.
 struct NoticePage {
     title: &'static str,
     subtitle: &'static str,
@@ -424,19 +424,19 @@ impl NoticePage {
     }
 }
 
-/// The one fact every notice page's reader is missing: the address Weaver
-/// judged. Trust is decided on this address and nothing else, so it is the
-/// value to put in `WEAVER_TRUSTED_CIDRS` or to recognise as a proxy or
-/// gateway. Canonicalised so a dual-stack listener shows `172.22.0.3`, not
-/// `::ffff:172.22.0.3`. An IP address renders as digits, dots, colons, and hex
-/// only, so it needs no HTML escaping.
-///
-/// A request that arrived with forwarding headers from a peer Weaver was not
-/// told to trust gets a second line. That is the case where the judged address
-/// belongs to a proxy rather than to the reader, and it is otherwise
-/// indistinguishable from simply being outside the trust list — the operator
-/// would go on widening `WEAVER_TRUSTED_CIDRS` at an address that was never
-/// their browser's.
+// The one fact every notice page's reader is missing: the address Weaver
+// judged. Trust is decided on this address and nothing else, so it is the
+// value to put in `WEAVER_TRUSTED_CIDRS` or to recognise as a proxy or
+// gateway. Canonicalised so a dual-stack listener shows `172.22.0.3`, not
+// `::ffff:172.22.0.3`. An IP address renders as digits, dots, colons, and hex
+// only, so it needs no HTML escaping.
+//
+// A request that arrived with forwarding headers from a peer Weaver was not
+// told to trust gets a second line. That is the case where the judged address
+// belongs to a proxy rather than to the reader, and it is otherwise
+// indistinguishable from simply being outside the trust list — the operator
+// would go on widening `WEAVER_TRUSTED_CIDRS` at an address that was never
+// their browser's.
 fn peer_note(
     security: &RuntimeSecurityConfig,
     peer: Option<SocketAddr>,
@@ -511,9 +511,9 @@ mod tests {
         .into_response()
     }
 
-    /// The entry decision with the deployment supplied instead of detected, so
-    /// the native cases do not depend on whether the test suite itself happens
-    /// to be running inside a container.
+    // The entry decision with the deployment supplied instead of detected, so
+    // the native cases do not depend on whether the test suite itself happens
+    // to be running inside a container.
     fn untrusted_entry(
         security: &RuntimeSecurityConfig,
         deployment: DeploymentEnvironment,
@@ -815,9 +815,9 @@ mod tests {
         }
     }
 
-    /// The deployment this was built for: Weaver in a container behind a
-    /// reverse proxy, where every socket peer is the proxy and a trusted CIDR
-    /// would otherwise never match anything.
+    // The deployment this was built for: Weaver in a container behind a
+    // reverse proxy, where every socket peer is the proxy and a trusted CIDR
+    // would otherwise never match anything.
     #[tokio::test]
     async fn a_configured_proxy_admits_the_browser_it_forwards_for() {
         let mut security = no_login_configured();
@@ -848,9 +848,9 @@ mod tests {
         assert!(body.contains("203.0.113.9"), "{body}");
     }
 
-    /// The refusal an operator with an unconfigured proxy actually sees. It
-    /// has to say that the address shown is not their browser's, or they will
-    /// keep widening the trust list at a proxy that was never the client.
+    // The refusal an operator with an unconfigured proxy actually sees. It
+    // has to say that the address shown is not their browser's, or they will
+    // keep widening the trust list at a proxy that was never the client.
     #[tokio::test]
     async fn an_unconfigured_proxy_is_named_on_the_refusal_page() {
         let security = no_login_configured();
@@ -875,10 +875,10 @@ mod tests {
         assert!(!body.contains("WEAVER_TRUSTED_PROXIES"), "{body}");
     }
 
-    /// Under Docker's userland proxy every browser arrives as the bridge
-    /// gateway with no header naming it, so the refusal page cannot say which
-    /// browser this is — only how to find out, before the operator trusts an
-    /// address that is really every address.
+    // Under Docker's userland proxy every browser arrives as the bridge
+    // gateway with no header naming it, so the refusal page cannot say which
+    // browser this is — only how to find out, before the operator trusts an
+    // address that is really every address.
     #[tokio::test]
     async fn a_container_refusal_names_the_collapsed_source_case() {
         let response = untrusted_entry(&no_login_configured(), DeploymentEnvironment::Docker);

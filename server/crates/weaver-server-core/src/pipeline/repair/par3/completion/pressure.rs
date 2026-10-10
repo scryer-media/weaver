@@ -1,4 +1,4 @@
-//! Cleanup of native-owned staging outputs before a bounded disk retry.
+// Cleanup of native-owned staging outputs before a bounded disk retry.
 
 use std::path::{Path, PathBuf};
 

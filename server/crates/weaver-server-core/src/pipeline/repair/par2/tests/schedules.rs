@@ -1,5 +1,5 @@
-//! Replayable source/recovery schedules, checked against fresh native sessions.
-//! Fixtures contain real GF(2^16) recovery, never placeholder recovery bytes.
+// Replayable source/recovery schedules, checked against fresh native sessions.
+// Fixtures contain real GF(2^16) recovery, never placeholder recovery bytes.
 use crate::pipeline::repair::backend::RepairBackend;
 use crate::pipeline::tests::{
     build_repairable_par2_set_for_files, build_test_par2_index_for_files,
@@ -545,8 +545,8 @@ fn beyond_quick_hash_schedules() {
     campaign(Shape::BeyondQuickHash);
 }
 
-/// Every order in which the chains' heads can be taken, each chain keeping
-/// its own order.
+// Every order in which the chains' heads can be taken, each chain keeping
+// its own order.
 fn interleavings(chains: &mut [Vec<Event>], prefix: &mut Vec<Event>, output: &mut Vec<Vec<Event>>) {
     if chains.iter().all(Vec::is_empty) {
         output.push(prefix.clone());
@@ -564,13 +564,13 @@ fn interleavings(chains: &mut [Vec<Event>], prefix: &mut Vec<Event>, output: &mu
     }
 }
 
-/// The seeded campaigns sample a large event space. This one is exhaustive
-/// over a small one: one source's partial and final publication, one
-/// carrier's malformed, valid and repeated publication, and an invalidation
-/// followed by a reopen, in every one of their 210 interleavings, under every
-/// damage and access mode. The rest of the recovery the final repair needs
-/// arrives after the interleaving, in a fixed order, so each damage finishes
-/// against the same recovery whichever order came first.
+// The seeded campaigns sample a large event space. This one is exhaustive
+// over a small one: one source's partial and final publication, one
+// carrier's malformed, valid and repeated publication, and an invalidation
+// followed by a reopen, in every one of their 210 interleavings, under every
+// damage and access mode. The rest of the recovery the final repair needs
+// arrives after the interleaving, in a fixed order, so each damage finishes
+// against the same recovery whichever order came first.
 fn exhaustive_campaign(access: Access) {
     let fixture = Fixture::with_recovery(Shape::ShortTail, 0x45584841, 4);
     let mut orders = Vec::new();

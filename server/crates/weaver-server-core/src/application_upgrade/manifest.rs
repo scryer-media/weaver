@@ -1,8 +1,8 @@
-//! Signed release-manifest validation for in-application upgrades.
-//!
-//! The schema and its validation live in the shared `application-updater`
-//! crate; this module binds them to Weaver's product identity and maps the
-//! shared error type onto [`ApplicationUpgradeError`].
+// Signed release-manifest validation for in-application upgrades.
+//
+// The schema and its validation live in the shared `application-updater`
+// crate; this module binds them to Weaver's product identity and maps the
+// shared error type onto [`ApplicationUpgradeError`].
 
 use artifact_trust::RequiredSigner;
 
@@ -17,7 +17,7 @@ pub use application_updater::manifest::{
 
 pub use super::product::{UPGRADE_MANIFEST_SCHEMA_VERSION, UPGRADE_MANIFEST_V2_SCHEMA_VERSION};
 
-/// Parses and validates a signed upgrade manifest payload.
+// Parses and validates a signed upgrade manifest payload.
 pub fn parse_and_validate_upgrade_manifest(
     raw: &[u8],
 ) -> ApplicationUpgradeResult<UpgradeManifest> {
@@ -25,12 +25,12 @@ pub fn parse_and_validate_upgrade_manifest(
         .map_err(map_updater_error)
 }
 
-/// Parses and validates a signed v2 upgrade manifest payload.
-///
-/// v2 is forward-tolerant: artifacts naming a platform, architecture, channel
-/// or archive this build has never heard of are retained but never selected,
-/// and unknown JSON fields are ignored. Everything this build *does* understand
-/// is validated exactly as strictly as v1.
+// Parses and validates a signed v2 upgrade manifest payload.
+//
+// v2 is forward-tolerant: artifacts naming a platform, architecture, channel
+// or archive this build has never heard of are retained but never selected,
+// and unknown JSON fields are ignored. Everything this build *does* understand
+// is validated exactly as strictly as v1.
 pub fn parse_and_validate_upgrade_manifest_v2(
     raw: &[u8],
 ) -> ApplicationUpgradeResult<ValidatedUpgradeManifestV2> {
@@ -38,7 +38,7 @@ pub fn parse_and_validate_upgrade_manifest_v2(
         .map_err(map_updater_error)
 }
 
-/// The Sigstore identity required of Weaver's release workflow for a tag.
+// The Sigstore identity required of Weaver's release workflow for a tag.
 pub fn weaver_release_required_signer(release_tag: &str) -> RequiredSigner {
     WEAVER_PRODUCT.release_required_signer(release_tag)
 }
@@ -47,8 +47,8 @@ pub fn weaver_release_required_signer(release_tag: &str) -> RequiredSigner {
 mod tests {
     use super::*;
 
-    /// The published example is the fixture: a change that makes the shipped
-    /// example unparseable is a release break, not a test break.
+    // The published example is the fixture: a change that makes the shipped
+    // example unparseable is a release break, not a test break.
     #[test]
     fn accepts_the_published_v1_example() {
         let raw = include_bytes!(concat!(
@@ -74,8 +74,8 @@ mod tests {
         assert!(!validated.understood.artifacts.is_empty());
     }
 
-    /// A v1 parser must refuse a v2 document outright rather than read the part
-    /// of it that happens to look familiar.
+    // A v1 parser must refuse a v2 document outright rather than read the part
+    // of it that happens to look familiar.
     #[test]
     fn the_v1_parser_refuses_a_v2_manifest() {
         let raw = include_bytes!(concat!(

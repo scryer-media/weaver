@@ -1,4 +1,4 @@
-//! Native verification accounting, independent of recovery availability.
+// Native verification accounting, independent of recovery availability.
 
 use super::*;
 use crate::operations::instrumentation::{JobStageKind, VerificationOutcomeKind};

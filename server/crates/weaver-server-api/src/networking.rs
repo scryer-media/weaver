@@ -1129,11 +1129,11 @@ impl NetworkingSubscription {
     }
 }
 
-/// The longest a `networkFlow` client waits for a frame while nothing
-/// changes; it still learns the stream is alive.
+// The longest a `networkFlow` client waits for a frame while nothing
+// changes; it still learns the stream is alive.
 const NETWORK_FLOW_HEARTBEAT: Duration = Duration::from_secs(10);
 
-/// Whether two flows differ only in when they were sampled.
+// Whether two flows differ only in when they were sampled.
 fn same_flow(a: &NetworkFlow, b: &NetworkFlow) -> bool {
     a.consumers == b.consumers
         && a.legs == b.legs

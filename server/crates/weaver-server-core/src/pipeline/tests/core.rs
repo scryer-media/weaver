@@ -15,13 +15,13 @@ fn capacity_test_client(port: u16, connections: usize) -> NntpClient {
     ))
 }
 
-/// A fake provider that is deliberately **strict** about the BODY argument.
-///
-/// Per RFC 3977 §6.2 a message-id argument must be enclosed in angle brackets;
-/// an unbracketed argument is an article-number reference, which real providers
-/// answer with 430 for every article. A lenient harness hid exactly that
-/// regression, so this one answers 430 for anything unbracketed and records the
-/// raw command lines so tests can assert on the wire frame directly.
+// A fake provider that is deliberately **strict** about the BODY argument.
+//
+// Per RFC 3977 §6.2 a message-id argument must be enclosed in angle brackets;
+// an unbracketed argument is an article-number reference, which real providers
+// answer with 430 for every article. A lenient harness hid exactly that
+// regression, so this one answers 430 for anything unbracketed and records the
+// raw command lines so tests can assert on the wire frame directly.
 async fn spawn_capacity_limited_body_server(
     connection_limit: usize,
     payload: Vec<u8>,
@@ -1530,14 +1530,14 @@ async fn restored_post_processing_that_already_finished_archives_as_complete() {
     ));
 }
 
-/// The wire frame regression guard: BODY must carry the **bracketed**
-/// message-id.
-///
-/// `DownloadWork::message_id` stores the bare id (the NZB parser strips the
-/// brackets), so a lane that borrows it directly emits `BODY segment-0@…`.
-/// That is a legal article-*number* reference, and every real provider answers
-/// 430 to it — a total, silent download failure. The fake provider here is
-/// strict about brackets, so this test fails outright on a regression.
+// The wire frame regression guard: BODY must carry the **bracketed**
+// message-id.
+//
+// `DownloadWork::message_id` stores the bare id (the NZB parser strips the
+// brackets), so a lane that borrows it directly emits `BODY segment-0@…`.
+// That is a legal article-*number* reference, and every real provider answers
+// 430 to it — a total, silent download failure. The fake provider here is
+// strict about brackets, so this test fails outright on a regression.
 #[tokio::test]
 async fn download_lanes_send_bracketed_message_ids_on_the_wire() {
     const TOTAL_SEGMENTS: usize = 4;

@@ -1,41 +1,41 @@
-//! In-stream PAR2 block verification from the decode pass's CRC segments.
-//!
-//! # Verification policy
-//!
-//! Payload integrity on the download path is established by two independent,
-//! differently aligned CRC32 passes over the same bytes, both produced by the
-//! single CRC pass the decoder already runs:
-//!
-//! - the yEnc `pcrc32`, aligned to article boundaries and compared against the
-//!   value the poster wrote into `=yend`; and
-//! - the PAR2 IFSC block CRC32, aligned to the recovery set's block grid and
-//!   compared against the value the recovery set's creator wrote into the IFSC
-//!   packet.
-//!
-//! The two grids are cut by unrelated parties at unrelated offsets, so a span
-//! that satisfies both was seen intact by both. Spans that satisfy only one —
-//! blocks straddling an article that arrived before the block size was known,
-//! blocks whose segments never tiled — get no in-stream verdict and are
-//! *unclaimed*: they fall through to settle-time verification, which reads them
-//! back and hashes them exactly as before, MD5 included. Repair, when it runs,
-//! recomputes everything from scratch regardless of what was claimed here.
-//!
-//! CRC32 is not a cryptographic hash and a determined poster could forge one.
-//! That is not a property this policy relies on or claims: NNTP articles carry
-//! no authenticity of any kind, so a poster who wants to serve chosen bytes
-//! simply serves them and writes matching checksums in the headers they also
-//! author. What in-stream verification detects is corruption — truncation,
-//! substitution and transport damage — which is what the checksums exist for.
-//!
-//! # Mechanism
-//!
-//! The decoder emits [`weaver_yenc::Segment`] records cut at block boundaries
-//! (see `weaver_yenc::segment`). This module assembles the segments tiling each
-//! block — which may come from several articles — into that block's CRC32, and
-//! compares it against the recovery set's IFSC entry. Segment composition uses
-//! [`weaver_yenc::crc32_combine`], the same combine the decoder's checkpoint
-//! pass and the pipeline's part-CRC to file-CRC composition already run, so
-//! segment, block and file CRCs are derived by one implementation.
+// In-stream PAR2 block verification from the decode pass's CRC segments.
+//
+// # Verification policy
+//
+// Payload integrity on the download path is established by two independent,
+// differently aligned CRC32 passes over the same bytes, both produced by the
+// single CRC pass the decoder already runs:
+//
+// - the yEnc `pcrc32`, aligned to article boundaries and compared against the
+//   value the poster wrote into `=yend`; and
+// - the PAR2 IFSC block CRC32, aligned to the recovery set's block grid and
+//   compared against the value the recovery set's creator wrote into the IFSC
+//   packet.
+//
+// The two grids are cut by unrelated parties at unrelated offsets, so a span
+// that satisfies both was seen intact by both. Spans that satisfy only one —
+// blocks straddling an article that arrived before the block size was known,
+// blocks whose segments never tiled — get no in-stream verdict and are
+// *unclaimed*: they fall through to settle-time verification, which reads them
+// back and hashes them exactly as before, MD5 included. Repair, when it runs,
+// recomputes everything from scratch regardless of what was claimed here.
+//
+// CRC32 is not a cryptographic hash and a determined poster could forge one.
+// That is not a property this policy relies on or claims: NNTP articles carry
+// no authenticity of any kind, so a poster who wants to serve chosen bytes
+// simply serves them and writes matching checksums in the headers they also
+// author. What in-stream verification detects is corruption — truncation,
+// substitution and transport damage — which is what the checksums exist for.
+//
+// # Mechanism
+//
+// The decoder emits [`weaver_yenc::Segment`] records cut at block boundaries
+// (see `weaver_yenc::segment`). This module assembles the segments tiling each
+// block — which may come from several articles — into that block's CRC32, and
+// compares it against the recovery set's IFSC entry. Segment composition uses
+// [`weaver_yenc::crc32_combine`], the same combine the decoder's checkpoint
+// pass and the pipeline's part-CRC to file-CRC composition already run, so
+// segment, block and file CRCs are derived by one implementation.
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
@@ -44,47 +44,47 @@ use weaver_yenc::Segment;
 
 use crate::jobs::ids::NzbFileId;
 
-/// Maximum incomplete per-grid runs retained for one file.
-///
-/// A run is eagerly folded inside one PAR2 block, so normal ordered traffic
-/// needs at most one entry per grid even when a fine checkpoint plan produces
-/// many cuts in the block.
+// Maximum incomplete per-grid runs retained for one file.
+//
+// A run is eagerly folded inside one PAR2 block, so normal ordered traffic
+// needs at most one entry per grid even when a fine checkpoint plan produces
+// many cuts in the block.
 const MAX_PENDING_RUNS_PER_FILE: usize = 4096;
-/// Maximum closed block claims retained for one file across all PAR2 grids.
+// Maximum closed block claims retained for one file across all PAR2 grids.
 const MAX_DERIVED_BLOCKS_PER_FILE: usize = 16_384;
-/// Maximum incomplete per-grid runs retained for one job.
+// Maximum incomplete per-grid runs retained for one job.
 const MAX_PENDING_RUNS_PER_JOB: usize = 16_384;
-/// Maximum closed block claims retained for one job across all files/grids.
+// Maximum closed block claims retained for one job across all files/grids.
 const MAX_DERIVED_BLOCKS_PER_JOB: usize = 65_536;
 
-/// What in-stream verification concluded about one PAR2 block.
+// What in-stream verification concluded about one PAR2 block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockVerdict {
-    /// The derived block CRC32 matched the recovery set's IFSC entry.
-    ///
-    /// `independently_covered` is true only when every article that
-    /// contributed bytes to this block also verified its declared yEnc
-    /// `pcrc32` — the second, article-aligned grid. A block assembled from
-    /// articles without declared (or with unverified) part CRCs still has a
-    /// correct derived CRC32, but it was seen intact by one grid, not two,
-    /// and must not mint an [`par2_rs::InStreamCrc32Proof`] claiming
-    /// independent coverage.
+    // The derived block CRC32 matched the recovery set's IFSC entry.
+    //
+    // `independently_covered` is true only when every article that
+    // contributed bytes to this block also verified its declared yEnc
+    // `pcrc32` — the second, article-aligned grid. A block assembled from
+    // articles without declared (or with unverified) part CRCs still has a
+    // correct derived CRC32, but it was seen intact by one grid, not two,
+    // and must not mint an [`par2_rs::InStreamCrc32Proof`] claiming
+    // independent coverage.
     Intact { independently_covered: bool },
-    /// The derived block CRC32 contradicted the IFSC entry: these bytes are
-    /// damaged, and no read-back is needed to know it.
+    // The derived block CRC32 contradicted the IFSC entry: these bytes are
+    // damaged, and no read-back is needed to know it.
     Damaged,
-    /// A block CRC was derived but the recovery set has no IFSC entry to
-    /// compare it against, so nothing was verified.
+    // A block CRC was derived but the recovery set has no IFSC entry to
+    // compare it against, so nothing was verified.
     NoReference,
 }
 
-/// CRC32 of `len` zero bytes, by repeated doubling of the combine operator.
-///
-/// PAR2 computes the IFSC checksum of a short final slice over the slice
-/// zero-padded up to the full block size, so a derived CRC over the file's real
-/// bytes has to be padded the same way before the two can be compared. Doing it
-/// by combining rather than by hashing keeps the cost logarithmic in the
-/// padding length instead of linear.
+// CRC32 of `len` zero bytes, by repeated doubling of the combine operator.
+//
+// PAR2 computes the IFSC checksum of a short final slice over the slice
+// zero-padded up to the full block size, so a derived CRC over the file's real
+// bytes has to be padded the same way before the two can be compared. Doing it
+// by combining rather than by hashing keeps the cost logarithmic in the
+// padding length instead of linear.
 pub(crate) fn crc32_of_zeros(len: u64) -> u32 {
     if len == 0 {
         return par2_rs::checksum::crc32(&[]);
@@ -114,14 +114,14 @@ pub(crate) fn crc32_of_zeros(len: u64) -> u32 {
     acc.expect("len > 0 sets at least one bit").0
 }
 
-/// Fold segments that tile a contiguous range into that range's CRC32.
-///
-/// Returns `None` when the segments do not form a gapless, non-overlapping,
-/// ascending tiling of `[start, end)` — the unclaimed-block signal. A
-/// zero-length segment is never synthesised to bridge a gap: the composition
-/// operator's zero-length case is the identity on its first argument, which
-/// would silently absorb the second and turn a broken tiling into a confident
-/// wrong answer.
+// Fold segments that tile a contiguous range into that range's CRC32.
+//
+// Returns `None` when the segments do not form a gapless, non-overlapping,
+// ascending tiling of `[start, end)` — the unclaimed-block signal. A
+// zero-length segment is never synthesised to bridge a gap: the composition
+// operator's zero-length case is the identity on its first argument, which
+// would silently absorb the second and turn a broken tiling into a confident
+// wrong answer.
 fn fold_tiling(segments: &[Segment], start: u64, end: u64) -> Option<u32> {
     let mut cursor = start;
     let mut crc: Option<u32> = None;
@@ -141,8 +141,8 @@ fn fold_tiling(segments: &[Segment], start: u64, end: u64) -> Option<u32> {
     (cursor == end).then_some(crc).flatten()
 }
 
-/// One contiguous, in-block run plus the attestation of every article that
-/// contributed to it.
+// One contiguous, in-block run plus the attestation of every article that
+// contributed to it.
 #[derive(Debug, Clone, Copy)]
 struct PendingRun {
     file_offset: u64,
@@ -157,15 +157,15 @@ impl PendingRun {
     }
 }
 
-/// One closed block: the derived CRC32 plus whether every contributing
-/// article carried a verified `pcrc32` (see [`BlockVerdict::Intact`]).
+// One closed block: the derived CRC32 plus whether every contributing
+// article carried a verified `pcrc32` (see [`BlockVerdict::Intact`]).
 #[derive(Debug, Clone, Copy)]
 struct DerivedBlock {
     crc32: u32,
     independently_covered: bool,
 }
 
-/// The change in retained incomplete runs after adding one observation.
+// The change in retained incomplete runs after adding one observation.
 #[derive(Debug, Clone, Copy, Default)]
 struct PendingMutation {
     added: usize,
@@ -173,17 +173,17 @@ struct PendingMutation {
     adjacent_merges: usize,
 }
 
-/// One target PAR2 grid's incomplete and closed evidence for a file.
+// One target PAR2 grid's incomplete and closed evidence for a file.
 #[derive(Debug)]
 struct GridAccumulator {
     block_size: NonZeroU64,
-    /// Eagerly combined, non-overlapping runs, keyed by their file offset.
-    ///
-    /// A PAR2 block may accumulate several islands while articles arrive out
-    /// of order. Keeping every island is required to derive the block when a
-    /// later article bridges them; only adjacency lets us combine CRCs.
+    // Eagerly combined, non-overlapping runs, keyed by their file offset.
+    //
+    // A PAR2 block may accumulate several islands while articles arrive out
+    // of order. Keeping every island is required to derive the block when a
+    // later article bridges them; only adjacency lets us combine CRCs.
     pending: BTreeMap<u64, PendingRun>,
-    /// Derived CRC32 (+ attestation) per zero-based block index.
+    // Derived CRC32 (+ attestation) per zero-based block index.
     derived: BTreeMap<u32, DerivedBlock>,
 }
 
@@ -206,9 +206,9 @@ impl GridAccumulator {
         }
     }
 
-    /// Add one segment when it stays inside this grid's one target block.
-    /// Segments crossing a grid boundary cannot be split from their CRC alone,
-    /// so they remain deliberately unclaimed for this grid.
+    // Add one segment when it stays inside this grid's one target block.
+    // Segments crossing a grid boundary cannot be split from their CRC alone,
+    // so they remain deliberately unclaimed for this grid.
     fn offer_segment(
         &mut self,
         segment: Segment,
@@ -296,7 +296,7 @@ impl GridAccumulator {
         })
     }
 
-    /// Retire one exact in-block run into a derived block, if it closes now.
+    // Retire one exact in-block run into a derived block, if it closes now.
     fn take_closed_block(
         &mut self,
         block_index: u32,
@@ -322,9 +322,9 @@ impl GridAccumulator {
         count
     }
 
-    /// Close the ordinary one-segment block without first round-tripping it
-    /// through the pending-run map. Existing partial evidence deliberately
-    /// takes the general path, which reconciles its accounting and attestation.
+    // Close the ordinary one-segment block without first round-tripping it
+    // through the pending-run map. Existing partial evidence deliberately
+    // takes the general path, which reconciles its accounting and attestation.
     fn take_direct_block(
         &mut self,
         segment: Segment,
@@ -347,7 +347,7 @@ impl GridAccumulator {
     }
 }
 
-/// Per-file evidence for every grid the decoded batch actually knew about.
+// Per-file evidence for every grid the decoded batch actually knew about.
 #[derive(Debug, Default)]
 struct FileBlockCrcs {
     grids: BTreeMap<u64, GridAccumulator>,
@@ -362,10 +362,10 @@ struct EntryCounts {
     derived: usize,
 }
 
-/// Completion-side accounting for one article's collector work. The counters
-/// are plain integers in the collector, then emitted only when the existing
-/// hot-path profiler is enabled; normal article processing takes no metric
-/// locks or clock reads.
+// Completion-side accounting for one article's collector work. The counters
+// are plain integers in the collector, then emitted only when the existing
+// hot-path profiler is enabled; normal article processing takes no metric
+// locks or clock reads.
 #[derive(Debug, Default)]
 struct CollectorArticleAccounting {
     adjacent_merges: u64,
@@ -435,22 +435,22 @@ impl FileBlockCrcs {
     }
 }
 
-/// Turn one file's in-stream block verdicts into PAR2 slice evidence a repair
-/// session can be seeded with.
-///
-/// Only *intact* verdicts become evidence, and the omission is load-bearing.
-/// Seeding a contradiction invalidates the *source* the verdict names, and a
-/// source served by a handle is named only by file identity — so one damaged
-/// block would retire that file's other seeds along with it. A damaged block is
-/// instead left unclaimed, exactly as a block with no verdict is: settle-time
-/// verification reads it back, and the authoritative pass sees the evidence it
-/// always did about bytes that are actually wrong.
-///
-/// The attestation attached to each verdict is what makes a CRC32-only verdict
-/// admissible at all. It asserts that the block CRC32 covered the block's whole
-/// extent, over bytes already made durable, and that the same span carries the
-/// article-aligned yEnc `pcrc32` on an unrelated grid. It does not assert slice
-/// identity: repair still re-derives CRC32 and MD5 over every byte it consumes.
+// Turn one file's in-stream block verdicts into PAR2 slice evidence a repair
+// session can be seeded with.
+//
+// Only *intact* verdicts become evidence, and the omission is load-bearing.
+// Seeding a contradiction invalidates the *source* the verdict names, and a
+// source served by a handle is named only by file identity — so one damaged
+// block would retire that file's other seeds along with it. A damaged block is
+// instead left unclaimed, exactly as a block with no verdict is: settle-time
+// verification reads it back, and the authoritative pass sees the evidence it
+// always did about bytes that are actually wrong.
+//
+// The attestation attached to each verdict is what makes a CRC32-only verdict
+// admissible at all. It asserts that the block CRC32 covered the block's whole
+// extent, over bytes already made durable, and that the same span carries the
+// article-aligned yEnc `pcrc32` on an unrelated grid. It does not assert slice
+// identity: repair still re-derives CRC32 and MD5 over every byte it consumes.
 pub(crate) fn slice_evidence_from_verdicts(
     recovery_set_id: par2_rs::RecoverySetId,
     par2_file_id: par2_rs::FileId,
@@ -493,17 +493,17 @@ pub(crate) fn slice_evidence_from_verdicts(
         .collect()
 }
 
-/// Assembles PAR2 block CRC32s per file from the decode pass's segments.
+// Assembles PAR2 block CRC32s per file from the decode pass's segments.
 #[derive(Debug, Default)]
 pub(crate) struct BlockCrcCollector {
     files: HashMap<NzbFileId, FileBlockCrcs>,
-    /// Exact entry counts across each job. These are maintained on every
-    /// insert/removal so limits never need a map walk in the article path.
+    // Exact entry counts across each job. These are maintained on every
+    // insert/removal so limits never need a map walk in the article path.
     job_entries: HashMap<crate::jobs::ids::JobId, EntryCounts>,
-    /// Blocks closed with a derived CRC, for observability.
+    // Blocks closed with a derived CRC, for observability.
     blocks_derived: u64,
-    /// Articles whose segments did not describe the range the pipeline placed
-    /// them at, and were reduced to a single whole-article record.
+    // Articles whose segments did not describe the range the pipeline placed
+    // them at, and were reduced to a single whole-article record.
     rebased_articles: u64,
 }
 
@@ -512,15 +512,15 @@ impl BlockCrcCollector {
         Self::default()
     }
 
-    /// Record one decoded article's segments against the file it belongs to.
-    ///
-    /// `file_offset` and `len` are the pipeline's own placement of the article,
-    /// which is authoritative over the poster's `=ypart begin`; `part_crc` is
-    /// the article's verified CRC32. Segments that do not tile exactly the range
-    /// the pipeline placed are discarded in favour of one whole-article record,
-    /// which is always true even when the poster's offsets are not — the article
-    /// then composes only where its own boundaries tile a block, which is the
-    /// same position an article decoded before the block size was known is in.
+    // Record one decoded article's segments against the file it belongs to.
+    //
+    // `file_offset` and `len` are the pipeline's own placement of the article,
+    // which is authoritative over the poster's `=ypart begin`; `part_crc` is
+    // the article's verified CRC32. Segments that do not tile exactly the range
+    // the pipeline placed are discarded in favour of one whole-article record,
+    // which is always true even when the poster's offsets are not — the article
+    // then composes only where its own boundaries tile a block, which is the
+    // same position an article decoded before the block size was known is in.
     // One argument per fact of the wire observation (placement, length, pCRC
     // value + whether it was verified, whether the assembly already held this
     // ordinal, checkpoint segments); bundling them into a struct would only
@@ -550,10 +550,10 @@ impl BlockCrcCollector {
         );
     }
 
-    /// Offer one decoded article to every grid in the immutable checkpoint-plan
-    /// snapshot captured before that article was decoded. A grid learned later
-    /// cannot consume these segments; claiming it would imply cuts the decoder
-    /// never emitted.
+    // Offer one decoded article to every grid in the immutable checkpoint-plan
+    // snapshot captured before that article was decoded. A grid learned later
+    // cannot consume these segments; claiming it would imply cuts the decoder
+    // never emitted.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn note_article_on_grids(
         &mut self,
@@ -757,9 +757,9 @@ impl BlockCrcCollector {
         1
     }
 
-    /// Declare the file's final length, which is what lets the short final block
-    /// close. Repeating the same length is idempotent; a conflicting extent
-    /// invalidates the file's retained evidence so the read paths can decide.
+    // Declare the file's final length, which is what lets the short final block
+    // close. Repeating the same length is idempotent; a conflicting extent
+    // invalidates the file's retained evidence so the read paths can decide.
     pub(crate) fn note_file_len(&mut self, file_id: NzbFileId, file_len: u64) {
         let known_len = self.files.get(&file_id).and_then(|entry| entry.file_len);
         if file_len == 0 || known_len.is_some_and(|known| known != file_len) {
@@ -822,10 +822,10 @@ impl BlockCrcCollector {
         self.blocks_derived = self.blocks_derived.saturating_add(derived);
     }
 
-    /// Derived CRC32 for one block, if in-stream evidence closed it.
-    ///
-    /// Production code compares verdicts, not raw CRCs; this is how the tests
-    /// pin a derived value against a direct hash of the block's bytes.
+    // Derived CRC32 for one block, if in-stream evidence closed it.
+    //
+    // Production code compares verdicts, not raw CRCs; this is how the tests
+    // pin a derived value against a direct hash of the block's bytes.
     #[cfg(test)]
     pub(crate) fn derived_block_crc(&self, file_id: NzbFileId, block_index: u32) -> Option<u32> {
         self.files
@@ -838,7 +838,7 @@ impl BlockCrcCollector {
             .map(|block| block.crc32)
     }
 
-    /// Every block this file has an in-stream CRC for, ascending.
+    // Every block this file has an in-stream CRC for, ascending.
     #[cfg(test)]
     pub(crate) fn derived_blocks(&self, file_id: NzbFileId) -> impl Iterator<Item = (u32, u32)> {
         self.files.get(&file_id).into_iter().flat_map(|entry| {
@@ -857,13 +857,13 @@ impl BlockCrcCollector {
         self.job_entries.get(&job_id).copied().unwrap_or_default()
     }
 
-    /// Compare this file's derived block CRC32s against a recovery set's IFSC
-    /// entries, block by block.
-    ///
-    /// The short final block is zero-padded to the full block size before the
-    /// comparison, because that is what PAR2 checksums. Blocks with no derived
-    /// CRC are absent from the result: they are unclaimed, and settle-time
-    /// verification owns them.
+    // Compare this file's derived block CRC32s against a recovery set's IFSC
+    // entries, block by block.
+    //
+    // The short final block is zero-padded to the full block size before the
+    // comparison, because that is what PAR2 checksums. Blocks with no derived
+    // CRC are absent from the result: they are unclaimed, and settle-time
+    // verification owns them.
     pub(crate) fn verdicts_against(
         &self,
         file_id: NzbFileId,
@@ -938,22 +938,22 @@ impl BlockCrcCollector {
         verdicts
     }
 
-    /// Drop everything retained for every file of a job.
+    // Drop everything retained for every file of a job.
     pub(crate) fn forget_job(&mut self, job_id: crate::jobs::ids::JobId) {
         self.files.retain(|file_id, _| file_id.job_id != job_id);
         self.job_entries.remove(&job_id);
     }
 
-    /// Drop everything retained for **one** file.
-    ///
-    /// The narrow twin of [`Self::forget_job`], for the transitions that retire
-    /// a single file's evidence while the rest of the job's stands: a direct
-    /// set's source volumes handed back to the conventional download path, whose
-    /// bytes are about to be written again from scratch. Whatever the direct
-    /// phase derived described a virtual volume assembled from member partials
-    /// and envelopes; the conventional feeds that follow describe a real file,
-    /// and merging the two would let evidence from one image adjudicate blocks
-    /// of another.
+    // Drop everything retained for **one** file.
+    //
+    // The narrow twin of [`Self::forget_job`], for the transitions that retire
+    // a single file's evidence while the rest of the job's stands: a direct
+    // set's source volumes handed back to the conventional download path, whose
+    // bytes are about to be written again from scratch. Whatever the direct
+    // phase derived described a virtual volume assembled from member partials
+    // and envelopes; the conventional feeds that follow describe a real file,
+    // and merging the two would let evidence from one image adjudicate blocks
+    // of another.
     pub(crate) fn forget_file(&mut self, file_id: NzbFileId) {
         let Some(entry) = self.files.remove(&file_id) else {
             return;

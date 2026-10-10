@@ -990,9 +990,9 @@ async fn import_postgres(
     tx.commit().await.map_err(db_err)
 }
 
-/// A bundle written before egresses kept download quotas can carry the
-/// bandwidth cap they replaced. No migration runs over a restore, so the step
-/// that moves the cap onto the System egress on an upgrade is run here instead.
+// A bundle written before egresses kept download quotas can carry the
+// bandwidth cap they replaced. No migration runs over a restore, so the step
+// that moves the cap onto the System egress on an upgrade is run here instead.
 async fn move_older_bandwidth_cap(
     conn: &mut SqlConn<'_>,
     source_schema_version: i64,
@@ -1006,9 +1006,9 @@ async fn move_older_bandwidth_cap(
     egress_quotas_v53::move_isp_cap_to_system_egress(conn).await
 }
 
-/// A bundle written before there were script instances carries the wiring
-/// they replaced. No migration runs over a restore, so the step that moves
-/// that wiring across on an upgrade is run here instead.
+// A bundle written before there were script instances carries the wiring
+// they replaced. No migration runs over a restore, so the step that moves
+// that wiring across on an upgrade is run here instead.
 async fn move_older_script_wiring(
     conn: &mut SqlConn<'_>,
     source_schema_version: i64,
@@ -1022,9 +1022,9 @@ async fn move_older_script_wiring(
     script_instances_v55::move_script_wiring_to_instances(conn).await
 }
 
-/// A bundle written before builds shipped a default unwanted extension list
-/// can carry the empty list that turned the check off. No migration runs over
-/// a restore, so the step that fills it on an upgrade is run here instead.
+// A bundle written before builds shipped a default unwanted extension list
+// can carry the empty list that turned the check off. No migration runs over
+// a restore, so the step that fills it on an upgrade is run here instead.
 async fn fill_older_unwanted_extensions(
     conn: &mut SqlConn<'_>,
     source_schema_version: i64,
@@ -1038,10 +1038,10 @@ async fn fill_older_unwanted_extensions(
 const EGRESS_CATALOG_SCHEMA_VERSION: i64 = 53;
 const SYSTEM_EGRESS_SEED: &str = "INSERT INTO egress_interfaces (id, name, binding_kind, binding_value, enabled, max_download_speed, created_at, updated_at) VALUES (0, 'System', 'system', NULL, TRUE, 0, 0, 0)";
 
-/// Chooses the tables to restore, in dependency order. A bundle from the
-/// current schema must carry exactly the export catalog. A bundle from an older
-/// schema restores the tables both sides know: tables it predates stay empty,
-/// and tables retired since it was written are left out.
+// Chooses the tables to restore, in dependency order. A bundle from the
+// current schema must carry exactly the export catalog. A bundle from an older
+// schema restores the tables both sides know: tables it predates stay empty,
+// and tables retired since it was written are left out.
 fn import_table_order(
     expected: &BTreeMap<String, TablePartMetadata>,
     export: &[String],
@@ -1731,7 +1731,7 @@ pub(crate) async fn validate_legacy_encryption_key(
     Ok(())
 }
 
-/// Export an existing schema before opening the application database or running migrations.
+// Export an existing schema before opening the application database or running migrations.
 #[cfg(test)]
 pub(super) async fn export_before_migrations(
     target: &crate::persistence::database_target::DatabaseTarget,

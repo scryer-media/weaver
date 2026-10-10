@@ -42,9 +42,9 @@ fn db_err(error: impl std::fmt::Display) -> StateError {
     StateError::Database(error.to_string())
 }
 
-/// Session-level advisory lock key serializing concurrent Postgres migrators
-/// (ASCII "weaver"). A session lock is connection-bound, so it is held on a
-/// dedicated pinned connection for the whole migration sequence.
+// Session-level advisory lock key serializing concurrent Postgres migrators
+// (ASCII "weaver"). A session lock is connection-bound, so it is held on a
+// dedicated pinned connection for the whole migration sequence.
 const WEAVER_MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x7765_6176_6572;
 
 pub(crate) async fn replay_catalog_into_fresh_db(
@@ -130,9 +130,9 @@ pub(crate) async fn run_migrations(pool: &PgPool, mode: MigrationMode) -> Result
     result
 }
 
-/// The mutating migration sequence, run while holding the advisory lock. The
-/// ledger is re-read here (after the lock is acquired) so a migrator that waited
-/// on the lock observes the winner's completed work and no-ops.
+// The mutating migration sequence, run while holding the advisory lock. The
+// ledger is re-read here (after the lock is acquired) so a migrator that waited
+// on the lock observes the winner's completed work and no-ops.
 async fn run_migrations_locked(
     pool: &PgPool,
     catalog: &CompiledMigrationCatalog,
@@ -237,9 +237,9 @@ async fn migration_table_exists(pool: &PgPool) -> Result<bool, StateError> {
     .map_err(db_err)
 }
 
-/// PostgreSQL twin of [`crate::schema_migrations::max_recorded_migration_version`],
-/// with the same contract: `None` when no ledger exists yet, otherwise the
-/// highest version any row records regardless of success.
+// PostgreSQL twin of [`crate::schema_migrations::max_recorded_migration_version`],
+// with the same contract: `None` when no ledger exists yet, otherwise the
+// highest version any row records regardless of success.
 pub(crate) async fn max_recorded_migration_version(
     pool: &PgPool,
 ) -> Result<Option<i64>, StateError> {
@@ -337,10 +337,10 @@ fn list_pending_migrations_from_applied(
     )
 }
 
-/// Checks the ledger against the embedded catalog and returns the versions
-/// whose recorded checksum is a legacy line-ending variant of the embedded one.
-/// Those rows are valid but stale: callers that may write should heal them with
-/// [`heal_line_ending_checksums`].
+// Checks the ledger against the embedded catalog and returns the versions
+// whose recorded checksum is a legacy line-ending variant of the embedded one.
+// Those rows are valid but stale: callers that may write should heal them with
+// [`heal_line_ending_checksums`].
 fn validate_known_migrations(
     applied: &[MigrationLedgerRow],
     catalog: &CompiledMigrationCatalog,
@@ -402,11 +402,11 @@ fn validate_known_migrations(
     Ok(stale_line_endings)
 }
 
-/// Rewrites the ledger checksum of `versions` to the embedded canonical value.
-///
-/// These rows were written by a build whose checkout carried the other line
-/// ending (GitHub's Windows runner checks out with `core.autocrlf=true`), so
-/// they hash the same SQL in a different form.
+// Rewrites the ledger checksum of `versions` to the embedded canonical value.
+//
+// These rows were written by a build whose checkout carried the other line
+// ending (GitHub's Windows runner checks out with `core.autocrlf=true`), so
+// they hash the same SQL in a different form.
 async fn heal_line_ending_checksums(
     pool: &PgPool,
     catalog: &CompiledMigrationCatalog,
@@ -761,10 +761,10 @@ mod tests {
         );
     }
 
-    /// Provisions an isolated schema on the server named by WEAVER_TEST_POSTGRES_URL
-    /// and returns an admin pool, the schema name, and a pool whose search_path is
-    /// pinned to that schema. Returns None (test skips) when the env var is unset or
-    /// empty, mirroring the pattern in persistence/connection/tests.rs.
+    // Provisions an isolated schema on the server named by WEAVER_TEST_POSTGRES_URL
+    // and returns an admin pool, the schema name, and a pool whose search_path is
+    // pinned to that schema. Returns None (test skips) when the env var is unset or
+    // empty, mirroring the pattern in persistence/connection/tests.rs.
     async fn create_scoped_pool() -> Option<(PgPool, String, PgPool)> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -819,11 +819,11 @@ mod tests {
         .unwrap();
     }
 
-    /// A Postgres install upgrading from schema <= 26 that carries a corrupt
-    /// job_history.metadata row (unparseable text or valid-but-non-array JSON)
-    /// must not hard-fail on the 0027/0030 backfills. Corrupt rows contribute no
-    /// attributes and are left untouched; a well-formed array row backfills and
-    /// has its diagnostic-only keys stripped by 0030.
+    // A Postgres install upgrading from schema <= 26 that carries a corrupt
+    // job_history.metadata row (unparseable text or valid-but-non-array JSON)
+    // must not hard-fail on the 0027/0030 backfills. Corrupt rows contribute no
+    // attributes and are left untouched; a well-formed array row backfills and
+    // has its diagnostic-only keys stripped by 0030.
     #[tokio::test]
     async fn postgres_upgrade_from_v26_tolerates_corrupt_metadata_when_configured() {
         let Some((admin_pool, schema, pool)) = create_scoped_pool().await else {
@@ -936,11 +936,11 @@ mod tests {
         admin_pool.close().await;
     }
 
-    /// A weaver-v0.6.9 Postgres install already applied migration 27 and stored
-    /// its pre-edit checksum. After 0027's payload is edited in place the embedded
-    /// checksum differs, so without the supersede amnesty startup validation would
-    /// hard-fail with "checksum mismatch". This proves the amnesty lets such an
-    /// install continue and no-op cleanly.
+    // A weaver-v0.6.9 Postgres install already applied migration 27 and stored
+    // its pre-edit checksum. After 0027's payload is edited in place the embedded
+    // checksum differs, so without the supersede amnesty startup validation would
+    // hard-fail with "checksum mismatch". This proves the amnesty lets such an
+    // install continue and no-op cleanly.
     #[tokio::test]
     async fn postgres_supersede_amnesty_accepts_pre_edit_v27_ledger_when_configured() {
         let Some((admin_pool, schema, pool)) = create_scoped_pool().await else {

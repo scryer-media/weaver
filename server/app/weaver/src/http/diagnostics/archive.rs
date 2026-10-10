@@ -1,20 +1,20 @@
-//! The tar + zstd writer and the manifest that describes what went in.
-//!
-//! Components are collected before the archive is written, each one carrying
-//! either its bytes or the error that stopped it. A component that failed is
-//! still *named* in the manifest with its error, because "the pipeline snapshot
-//! is missing" and "the pipeline snapshot was never asked for" are different
-//! bug reports, and the archive is the only place that difference survives.
+// The tar + zstd writer and the manifest that describes what went in.
+//
+// Components are collected before the archive is written, each one carrying
+// either its bytes or the error that stopped it. A component that failed is
+// still *named* in the manifest with its error, because "the pipeline snapshot
+// is missing" and "the pipeline snapshot was never asked for" are different
+// bug reports, and the archive is the only place that difference survives.
 
 use std::io::Write;
 
 use serde::{Deserialize, Serialize};
 
-/// zstd level 10: roughly an order of magnitude smaller than the raw log text
-/// for a few hundred milliseconds of CPU on the sizes this package carries.
+// zstd level 10: roughly an order of magnitude smaller than the raw log text
+// for a few hundred milliseconds of CPU on the sizes this package carries.
 const ZSTD_LEVEL: i32 = 10;
 
-/// One collected file, or the reason there is no file.
+// One collected file, or the reason there is no file.
 pub(super) struct Component {
     pub(super) name: String,
     pub(super) outcome: Result<Vec<u8>, String>,
@@ -39,8 +39,8 @@ impl Component {
         }
     }
 
-    /// Serializes a value, turning a serialization failure into the component's
-    /// error rather than into a failure of the whole package.
+    // Serializes a value, turning a serialization failure into the component's
+    // error rather than into a failure of the whole package.
     pub(super) fn json<T: Serialize>(name: impl Into<String>, value: &T) -> Self {
         let name = name.into();
         match serde_json::to_vec_pretty(value) {
@@ -50,7 +50,7 @@ impl Component {
     }
 }
 
-/// What the archive says about itself.
+// What the archive says about itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct Manifest {
     pub(super) weaver_version: String,
@@ -71,7 +71,7 @@ pub(super) struct ManifestError {
     pub(super) error: String,
 }
 
-/// The archive name, which is also the download filename.
+// The archive name, which is also the download filename.
 pub(super) fn archive_filename(generated_at_utc: &str) -> String {
     // `:` is not a legal filename character on Windows, and the desktop
     // wrapper's save dialog is the primary destination for this download.
@@ -79,11 +79,11 @@ pub(super) fn archive_filename(generated_at_utc: &str) -> String {
     format!("weaver-diagnostics-{stamp}.tar.zst")
 }
 
-/// Writes every component into one zstd-compressed tar stream, appending a
-/// manifest that lists what made it in and what did not.
-///
-/// The manifest is written last and describes itself as well, so a reader can
-/// check the listing against the entries without knowing the write order.
+// Writes every component into one zstd-compressed tar stream, appending a
+// manifest that lists what made it in and what did not.
+//
+// The manifest is written last and describes itself as well, so a reader can
+// check the listing against the entries without knowing the write order.
 pub(super) fn build_archive(
     components: Vec<Component>,
     weaver_version: &str,

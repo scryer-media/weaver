@@ -21,8 +21,8 @@ pub struct ActiveJob {
     pub paused_resume_status: Option<&'static str>,
     pub paused_resume_download_state: Option<&'static str>,
     pub paused_resume_post_state: Option<&'static str>,
-    /// Effective unpack password for restore. Database writes encrypt this
-    /// value; `None` keeps the NZB password and an empty string explicitly clears it.
+    // Effective unpack password for restore. Database writes encrypt this
+    // value; `None` keeps the NZB password and an empty string explicitly clears it.
     pub password_override: Option<String>,
 }
 
@@ -32,7 +32,7 @@ pub enum FileIdentitySource {
     Probe,
     Par2,
     Par3,
-    /// A durable move intent: current_filename is the old path and canonical_filename the target.
+    // A durable move intent: current_filename is the old path and canonical_filename the target.
     Par3Pending,
     Nested,
 }
@@ -97,10 +97,10 @@ pub struct RecoveredJob {
     pub paused_resume_post_state: Option<String>,
     pub category: Option<String>,
     pub metadata: Vec<(String, String)>,
-    /// Manual queue-order position; `None` falls back to job-id order.
+    // Manual queue-order position; `None` falls back to job-id order.
     pub queue_position: Option<i64>,
-    /// Unpack password override: `None` = keep the NZB-derived password,
-    /// `Some("")` = explicitly no password, otherwise the override itself.
+    // Unpack password override: `None` = keep the NZB-derived password,
+    // `Some("")` = explicitly no password, otherwise the override itself.
     pub password_override: Option<String>,
 }
 

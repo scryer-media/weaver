@@ -1,4 +1,4 @@
-//! Embedded carrier discovery and explicit staged container self-repair.
+// Embedded carrier discovery and explicit staged container self-repair.
 
 use super::*;
 use par3_rs::inside::{ContainerLimits, SelfRepairPlan};
@@ -27,9 +27,9 @@ impl Probes {
     }
 }
 
-/// Container framing supplies a scan hint, never authentication. Ordinary
-/// archives require only bounded framing reads; admitted packets are hashed by
-/// the retained scanner using committed source ranges.
+// Container framing supplies a scan hint, never authentication. Ordinary
+// archives require only bounded framing reads; admitted packets are hashed by
+// the retained scanner using committed source ranges.
 pub(super) fn probe(path: PathBuf) -> EngineResult<Option<u64>> {
     let options = execution_options();
     let _reservation = assessment::ViewReservation::acquire(66 << 10)?;

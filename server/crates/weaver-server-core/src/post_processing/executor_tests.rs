@@ -26,7 +26,7 @@ fn names(instances: &[ScriptInstance]) -> Vec<&str> {
         .collect()
 }
 
-/// The stored value of one input, exactly as the row holds it.
+// The stored value of one input, exactly as the row holds it.
 fn stored_input(db: &Database, instance: &str, name: &str) -> Option<String> {
     let datastore = db.datastore();
     let (instance, name) = (instance.to_string(), name.to_string());
@@ -96,8 +96,8 @@ fn settings_round_trip_through_the_settings_kv() {
     assert_eq!(db.post_processing_settings().unwrap(), settings);
 }
 
-/// What each input of an instance shows: its name, its plain value, and the
-/// name of the secret it links.
+// What each input of an instance shows: its name, its plain value, and the
+// name of the secret it links.
 fn shown(instance: &ScriptInstance) -> Vec<(&str, &str, Option<&str>)> {
     instance
         .inputs
@@ -112,7 +112,7 @@ fn shown(instance: &ScriptInstance) -> Vec<(&str, &str, Option<&str>)> {
         .collect()
 }
 
-/// The value a run of `instance` is handed for input `name`, secrets included.
+// The value a run of `instance` is handed for input `name`, secrets included.
 fn run_value(db: &Database, instance: &str, name: &str) -> String {
     let inputs = db.script_instance_run_inputs(instance).unwrap().unwrap();
     match inputs
@@ -127,7 +127,7 @@ fn run_value(db: &Database, instance: &str, name: &str) -> String {
     }
 }
 
-/// The stored value of one secret, exactly as the row holds it.
+// The stored value of one secret, exactly as the row holds it.
 fn stored_secret(db: &Database, id: &str) -> String {
     let datastore = db.datastore();
     let id = id.to_string();
@@ -330,8 +330,8 @@ fn a_linked_secret_stays_with_the_instance_and_a_run_resolves_its_current_value(
     assert_eq!(run_value(&db, &saved.id, "Token"), "hunter3");
 }
 
-/// The sealed value of one input, exactly as the row holds it. `None` when
-/// there is no such row, `Some(None)` when the row holds no sealed value.
+// The sealed value of one input, exactly as the row holds it. `None` when
+// there is no such row, `Some(None)` when the row holds no sealed value.
 fn stored_sealed(db: &Database, instance: &str, name: &str) -> Option<Option<String>> {
     let datastore = db.datastore();
     let (instance, name) = (instance.to_string(), name.to_string());
@@ -349,8 +349,8 @@ fn stored_sealed(db: &Database, instance: &str, name: &str) -> Option<Option<Str
     .unwrap()
 }
 
-/// What each input of an instance shows, with whether it is a secret of the
-/// instance's own.
+// What each input of an instance shows, with whether it is a secret of the
+// instance's own.
 fn shown_sealed(instance: &ScriptInstance) -> Vec<(&str, &str, Option<&str>, bool)> {
     instance
         .inputs

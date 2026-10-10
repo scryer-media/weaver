@@ -1,5 +1,5 @@
-//! Exhaust every publication subset around a placement's write and actor
-//! commit. Semaphores control I/O; receipt application is a separate event.
+// Exhaust every publication subset around a placement's write and actor
+// commit. Semaphores control I/O; receipt application is a separate event.
 use super::*;
 use crate::pipeline::repair::par3::work::Coordinator;
 use par3_rs::source::SourceId;

@@ -1,26 +1,26 @@
-//! SSH and WireGuard endpoints for the Weaver advanced-networking e2e flows.
-//!
-//! The doubles come from proxy-tunnels' `test-support` feature at the exact
-//! revision Weaver pins, so the protocol on the far side of every tunnel is the
-//! one Weaver's own engine tests run against. Those doubles bind loopback
-//! only. Each one is published on a fixed port of this container through a
-//! relay that this binary owns, and the relays are what make the doubles
-//! controllable from a test: an endpoint can be taken down (listener closed,
-//! live sessions cut), brought back, or switched to a double presenting a
-//! different host key, and every session it carries is recorded with the
-//! client address it came from.
-//!
-//! The control API listens on 8095:
-//!
-//! - `GET /` the endpoints, SSH evidence, WireGuard evidence and credentials.
-//!
-//! wg2 is also reachable inside wg1, as [`CARRIED_NAME`] on [`CARRIED_PORT`]:
-//! wg1 relays UDP arriving there to wg2, so a WireGuard tunnel to wg2 can
-//! ride inside a tunnel to wg1. wg1's `udpForwarded` evidence records every
-//! datagram it relayed, by source inside wg1, and how many were WireGuard.
-//! - `GET /events?after=N` events with a sequence above `N`.
-//! - `POST /` `{endpoint, up}` | `{endpoint, cut: true}` |
-//!   `{endpoint: "ssh-switch", hostKey: "primary" | "other"}`.
+// SSH and WireGuard endpoints for the Weaver advanced-networking e2e flows.
+//
+// The doubles come from proxy-tunnels' `test-support` feature at the exact
+// revision Weaver pins, so the protocol on the far side of every tunnel is the
+// one Weaver's own engine tests run against. Those doubles bind loopback
+// only. Each one is published on a fixed port of this container through a
+// relay that this binary owns, and the relays are what make the doubles
+// controllable from a test: an endpoint can be taken down (listener closed,
+// live sessions cut), brought back, or switched to a double presenting a
+// different host key, and every session it carries is recorded with the
+// client address it came from.
+//
+// The control API listens on 8095:
+//
+// - `GET /` the endpoints, SSH evidence, WireGuard evidence and credentials.
+//
+// wg2 is also reachable inside wg1, as [`CARRIED_NAME`] on [`CARRIED_PORT`]:
+// wg1 relays UDP arriving there to wg2, so a WireGuard tunnel to wg2 can
+// ride inside a tunnel to wg1. wg1's `udpForwarded` evidence records every
+// datagram it relayed, by source inside wg1, and how many were WireGuard.
+// - `GET /events?after=N` events with a sequence above `N`.
+// - `POST /` `{endpoint, up}` | `{endpoint, cut: true}` |
+//   `{endpoint: "ssh-switch", hostKey: "primary" | "other"}`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -47,8 +47,8 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-/// Events kept for watermark reads. Older ones are dropped in one block so a
-/// long run cannot grow without bound; sequences never repeat.
+// Events kept for watermark reads. Older ones are dropped in one block so a
+// long run cannot grow without bound; sequences never repeat.
 const EVENT_LIMIT: usize = 50_000;
 
 #[derive(Default)]
@@ -95,12 +95,12 @@ enum Transport {
     Udp,
 }
 
-/// One published port and the double behind it.
+// One published port and the double behind it.
 struct Endpoint {
     name: String,
     transport: Transport,
     bind: SocketAddr,
-    /// The port actually bound; equals `bind`'s port unless that was 0.
+    // The port actually bound; equals `bind`'s port unless that was 0.
     port: AtomicU64,
     up: watch::Sender<bool>,
     cut: watch::Sender<u64>,
@@ -149,8 +149,8 @@ impl Endpoint {
     }
 }
 
-/// Counts a session in `active` and records its end however the task ends,
-/// including when a cut or a down aborts it.
+// Counts a session in `active` and records its end however the task ends,
+// including when a cut or a down aborts it.
 struct SessionGuard {
     log: SharedLog,
     endpoint: Arc<Endpoint>,
@@ -204,8 +204,8 @@ async fn relay_tcp(
     }
 }
 
-/// Serve a TCP endpoint: listen while up, close the listener and every live
-/// session while down, and rebind the same port when it comes back.
+// Serve a TCP endpoint: listen while up, close the listener and every live
+// session while down, and rebind the same port when it comes back.
 async fn serve_tcp(
     endpoint: Arc<Endpoint>,
     log: SharedLog,
@@ -265,9 +265,9 @@ async fn serve_tcp(
     }
 }
 
-/// Serve a UDP endpoint: one loopback socket per client address, so the
-/// double sees each client as its own peer. Down closes the public socket,
-/// which is what an unreachable WireGuard endpoint looks like to a client.
+// Serve a UDP endpoint: one loopback socket per client address, so the
+// double sees each client as its own peer. Down closes the public socket,
+// which is what an unreachable WireGuard endpoint looks like to a client.
 async fn serve_udp(
     endpoint: Arc<Endpoint>,
     log: SharedLog,
@@ -357,7 +357,7 @@ async fn udp_return(flow: Arc<UdpSocket>, public: Arc<UdpSocket>, peer: SocketAd
     }
 }
 
-/// Start an endpoint and return the port it bound, once it is listening.
+// Start an endpoint and return the port it bound, once it is listening.
 async fn start_endpoint(endpoint: &Arc<Endpoint>, log: &SharedLog) -> u16 {
     let (ready, bound) = tokio::sync::oneshot::channel();
     match endpoint.transport {
@@ -394,7 +394,7 @@ struct Fixture {
     wireguard: Vec<WireGuardDouble>,
 }
 
-/// Fixed public ports. Toxiproxy fronts the SSH ones as ssh1..ssh3.
+// Fixed public ports. Toxiproxy fronts the SSH ones as ssh1..ssh3.
 const SSH_ENDPOINTS: &[(&str, u16)] = &[
     ("ssh1", 2221),
     ("ssh2", 2222),
@@ -402,24 +402,24 @@ const SSH_ENDPOINTS: &[(&str, u16)] = &[
     ("ssh-switch", 2224),
     ("ssh-refuse", 2225),
 ];
-/// wg2 starts before wg1, because wg1 relays to it.
+// wg2 starts before wg1, because wg1 relays to it.
 const WIREGUARD_ENDPOINTS: &[(&str, u16)] = &[("wg2", 51822), ("wg1", 51821), ("wg-rss", 51823)];
 
-/// The name wg1's resolver gives wg2 inside wg1, and the port wg1 relays to
-/// wg2 there.
+// The name wg1's resolver gives wg2 inside wg1, and the port wg1 relays to
+// wg2 there.
 const CARRIED_NAME: &str = "wg2.proxy.test";
 const CARRIED_PORT: u16 = 51822;
 
-/// A name every WireGuard peer answers and no test asks for. The fixture
-/// resolves it through a real tunnel before it publishes the peer, so a
-/// client can never reach a peer whose resolver is not yet serving, and the
-/// query it leaves in the peer's evidence cannot satisfy a test's assertion.
+// A name every WireGuard peer answers and no test asks for. The fixture
+// resolves it through a real tunnel before it publishes the peer, so a
+// client can never reach a peer whose resolver is not yet serving, and the
+// query it leaves in the peer's evidence cannot satisfy a test's assertion.
 const READY_NAME: &str = "ready.tunnel-fixture.test";
 
-/// Resolve [`READY_NAME`] through a tunnel to `peer` until its DNS server
-/// answers with the peer's own address. Each attempt is bounded by the
-/// client's request timeout; the wait ends on the answer, never on time, and
-/// a peer that never answers keeps the fixture from reporting ready.
+// Resolve [`READY_NAME`] through a tunnel to `peer` until its DNS server
+// answers with the peer's own address. Each attempt is bounded by the
+// client's request timeout; the wait ends on the answer, never on time, and
+// a peer that never answers keeps the fixture from reporting ready.
 async fn dns_serving(peer: &WireGuardTestPeer, name: &str) -> u32 {
     let mut attempts = 0;
     loop {
@@ -447,8 +447,8 @@ fn env_or(name: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// `listen` maps each published port to the one actually bound; the binary
-/// keeps them, and a test binds ephemeral ports instead.
+// `listen` maps each published port to the one actually bound; the binary
+// keeps them, and a test binds ephemeral ports instead.
 async fn build_fixture(
     public_ip: IpAddr,
     listen: fn(u16) -> u16,
@@ -946,8 +946,8 @@ mod tests {
         assert_eq!(peer.dns_queries(), vec![READY_NAME.to_string()]);
     }
 
-    /// The fixture's own wiring lets a tunnel to wg2 ride inside a tunnel to
-    /// wg1: wg1 names wg2 and relays to it. Dropping either breaks this test.
+    // The fixture's own wiring lets a tunnel to wg2 ride inside a tunnel to
+    // wg1: wg1 names wg2 and relays to it. Dropping either breaks this test.
     #[tokio::test]
     async fn wg2_is_reachable_inside_wg1() {
         let fixture = build_fixture(

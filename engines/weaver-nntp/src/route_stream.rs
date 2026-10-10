@@ -1,4 +1,4 @@
-//! Socket-compatible access to a direct TCP connection or an in-process route.
+// Socket-compatible access to a direct TCP connection or an in-process route.
 use std::{
     io::{self, Read, Write},
     pin::Pin,
@@ -14,8 +14,8 @@ pub enum RouteStream {
         stream: DirectStream,
         peeked: Option<Option<u8>>,
     },
-    /// Installed only during a synchronous idle TLS inspection. Limits the
-    /// ciphertext consumed by backends that drive several reads per poll.
+    // Installed only during a synchronous idle TLS inspection. Limits the
+    // ciphertext consumed by backends that drive several reads per poll.
     Inspecting {
         inner: Option<Box<RouteStream>>,
         remaining: usize,
@@ -171,7 +171,7 @@ impl AsyncWrite for RouteStream {
 pub(crate) enum BlockingSocket {
     Tcp(std::net::TcpStream),
     Tunnel {
-        /// Dropped by hand inside the runtime; see the `Drop` impl.
+        // Dropped by hand inside the runtime; see the `Drop` impl.
         stream: std::mem::ManuallyDrop<DirectStream>,
         runtime: tokio::runtime::Handle,
         read_timeout: std::cell::Cell<Option<Duration>>,

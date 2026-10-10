@@ -1,20 +1,20 @@
-//! searchEnd (end-detection) tax decomposition harness.
-//!
-//! Same protocol as `decode_timing` (min of 2000 iters, in-process A/B against
-//! the real rapidyenc when `WEAVER_RAPIDYENC_SRC` is set), but it times FOUR
-//! lanes on the same fixture in the same run so the searchEnd tax can be
-//! attributed:
-//!
-//!   decode_only   weaver `decode_rapidyenc`              (kernel, SEARCH_END=false, no CRC)
-//!   until_end     weaver `decode_rapidyenc_incremental`  (kernel, SEARCH_END=true,  no CRC)
-//!   bench_shape   weaver `decode_body_chunk_until_control` x3 chunks + finalize_crc
-//!                 (exactly what benches/decode_simd.rs `bench_until_control` does)
-//!   crc_only      `Crc32::update` over the decoded output, nothing else
-//!
-//! and, when linked, the rapidyenc equivalents of the first two lanes
-//! (`decode` vs `decode_end`).
-//!
-//!   cargo run --release --example searchend_timing
+// searchEnd (end-detection) tax decomposition harness.
+//
+// Same protocol as `decode_timing` (min of 2000 iters, in-process A/B against
+// the real rapidyenc when `WEAVER_RAPIDYENC_SRC` is set), but it times FOUR
+// lanes on the same fixture in the same run so the searchEnd tax can be
+// attributed:
+//
+//   decode_only   weaver `decode_rapidyenc`              (kernel, SEARCH_END=false, no CRC)
+//   until_end     weaver `decode_rapidyenc_incremental`  (kernel, SEARCH_END=true,  no CRC)
+//   bench_shape   weaver `decode_body_chunk_until_control` x3 chunks + finalize_crc
+//                 (exactly what benches/decode_simd.rs `bench_until_control` does)
+//   crc_only      `Crc32::update` over the decoded output, nothing else
+//
+// and, when linked, the rapidyenc equivalents of the first two lanes
+// (`decode` vs `decode_end`).
+//
+//   cargo run --release --example searchend_timing
 
 use std::time::Instant;
 

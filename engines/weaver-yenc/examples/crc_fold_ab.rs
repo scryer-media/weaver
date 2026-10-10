@@ -1,27 +1,27 @@
-//! Interleaved A/B harness for the yEnc decode CRC32 path.
-//!
-//! Measurement only: nothing here changes a production path. It compares, in
-//! one process and on the same bytes, the CRC32 weaver ships (the `Crc32`
-//! wrapper, which takes the 256-bit carry-less fold where the CPU selects it),
-//! `crc-fast` called directly (what the wrapper falls back to), and
-//! rapidyenc's own CRC as the oracle, alone and fused behind a decode of the
-//! 128-column article fixture the parity bench uses.
-//!
-//!   WEAVER_RAPIDYENC_LIB=/path/to/librapidyenc.so \
-//!     cargo run --locked --release -p weaver-yenc --example crc_fold_ab
-//!
-//! Without `WEAVER_RAPIDYENC_LIB` the rapidyenc lanes are skipped.
-//!
-//! Single-thread mode (no arguments) runs every lane once per round, rotating
-//! the lane order each round, and reports the median and minimum time per
-//! iteration. Before timing it asserts decoded-byte parity and CRC parity
-//! between every lane.
-//!
-//! Multi-thread mode, `mt <lane> <threads> <iterations-per-thread>`, runs one
-//! decode+CRC lane on that many threads at once and prints the wall time and
-//! aggregate throughput. Time it from the shell to get the process CPU time.
-//!
-//! Optional env: `CRC_AB_ROUNDS` (default 7), `CRC_AB_SAMPLE_MS` (default 150).
+// Interleaved A/B harness for the yEnc decode CRC32 path.
+//
+// Measurement only: nothing here changes a production path. It compares, in
+// one process and on the same bytes, the CRC32 weaver ships (the `Crc32`
+// wrapper, which takes the 256-bit carry-less fold where the CPU selects it),
+// `crc-fast` called directly (what the wrapper falls back to), and
+// rapidyenc's own CRC as the oracle, alone and fused behind a decode of the
+// 128-column article fixture the parity bench uses.
+//
+//   WEAVER_RAPIDYENC_LIB=/path/to/librapidyenc.so \
+//     cargo run --locked --release -p weaver-yenc --example crc_fold_ab
+//
+// Without `WEAVER_RAPIDYENC_LIB` the rapidyenc lanes are skipped.
+//
+// Single-thread mode (no arguments) runs every lane once per round, rotating
+// the lane order each round, and reports the median and minimum time per
+// iteration. Before timing it asserts decoded-byte parity and CRC parity
+// between every lane.
+//
+// Multi-thread mode, `mt <lane> <threads> <iterations-per-thread>`, runs one
+// decode+CRC lane on that many threads at once and prints the wall time and
+// aggregate throughput. Time it from the shell to get the process CPU time.
+//
+// Optional env: `CRC_AB_ROUNDS` (default 7), `CRC_AB_SAMPLE_MS` (default 150).
 
 use std::ffi::c_void;
 use std::hint::black_box;
@@ -82,7 +82,7 @@ impl Rapidyenc {
     }
 }
 
-/// The parity bench's 128-column article body (768 000 decoded bytes).
+// The parity bench's 128-column article body (768 000 decoded bytes).
 fn real_yenc_128col_body() -> Vec<u8> {
     let mut body = Vec::with_capacity(800 * 1024);
     let mut col = 0usize;
@@ -174,8 +174,8 @@ impl Lane {
     }
 }
 
-/// Per-thread working set: the encoded article, the decoded bytes and an
-/// output buffer, so threads never share a cache line they write.
+// Per-thread working set: the encoded article, the decoded bytes and an
+// output buffer, so threads never share a cache line they write.
 struct Work {
     encoded: Vec<u8>,
     decoded: Vec<u8>,
@@ -246,8 +246,8 @@ fn reference_crc(data: &[u8], init: u32) -> u32 {
     !crc
 }
 
-/// Byte and CRC parity between every lane, plus an adversarial sweep of the
-/// CRC implementations against the bitwise reference.
+// Byte and CRC parity between every lane, plus an adversarial sweep of the
+// CRC implementations against the bitwise reference.
 fn parity(encoded: &[u8], decoded: &[u8], rapid: Option<&Rapidyenc>) -> u32 {
     let expected = reference_crc(decoded, 0);
     let mut out = vec![0u8; encoded.len() + 64];

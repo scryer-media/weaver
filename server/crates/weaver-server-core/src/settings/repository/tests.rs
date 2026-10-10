@@ -238,10 +238,10 @@ fn loading_the_config_removes_settings_no_release_reads() {
     );
 }
 
-/// An install that never touched direct unpack loads no table at all, which is
-/// "every default" — and must not be confused with a table that explicitly says
-/// `false`, since the resolved gate is off either way but the config surface is
-/// not.
+// An install that never touched direct unpack loads no table at all, which is
+// "every default" — and must not be confused with a table that explicitly says
+// `false`, since the resolved gate is off either way but the config surface is
+// not.
 #[test]
 fn an_unconfigured_direct_unpack_loads_as_absent() {
     let db = Database::open_in_memory().unwrap();
@@ -252,8 +252,8 @@ fn an_unconfigured_direct_unpack_loads_as_absent() {
     assert!(loaded.direct_unpack.is_none());
 }
 
-/// A table that explicitly disables direct unpack round-trips as `Some(false)`,
-/// not as an absent table.
+// A table that explicitly disables direct unpack round-trips as `Some(false)`,
+// not as an absent table.
 #[test]
 fn an_explicitly_disabled_direct_unpack_round_trips() {
     let db = Database::open_in_memory().unwrap();
@@ -271,8 +271,8 @@ fn an_explicitly_disabled_direct_unpack_round_trips() {
     );
 }
 
-/// An install that never touched delivery naming loads no table at all, so the
-/// accessors answer with the shipped defaults: rename on, srrdb off.
+// An install that never touched delivery naming loads no table at all, so the
+// accessors answer with the shipped defaults: rename on, srrdb off.
 #[test]
 fn an_unconfigured_delivery_naming_table_loads_as_absent_defaults() {
     let db = Database::open_in_memory().unwrap();
@@ -285,9 +285,9 @@ fn an_unconfigured_delivery_naming_table_loads_as_absent_defaults() {
     assert!(!loaded.enable_srrdb_lookup());
 }
 
-/// An install that never touched direct-store loads no table at all, which is
-/// what "every default" looks like — and it must not be confused with a table
-/// that explicitly says `false`.
+// An install that never touched direct-store loads no table at all, which is
+// what "every default" looks like — and it must not be confused with a table
+// that explicitly says `false`.
 #[test]
 fn an_unconfigured_direct_store_loads_as_absent() {
     let db = Database::open_in_memory().unwrap();

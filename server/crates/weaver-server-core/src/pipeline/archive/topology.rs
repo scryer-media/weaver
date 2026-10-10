@@ -13,16 +13,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
 
-/// Split-7z parts sitting in the working directory that `numbered` (the
-/// volume numbers the assembly declares for `set_name`) does not account for.
-///
-/// The directory is enumerated once and each entry is matched against the
-/// exact `<set>.NNN` spelling, so the cost is bounded by what the directory
-/// holds. Probing candidate names by number instead would make the cost
-/// proportional to the largest declared volume number, and that number is
-/// parsed straight out of an NZB subject: a single part named
-/// `payload.7z.1000000000` would cost a billion metadata lookups on the
-/// orchestration task before this topology could be built.
+// Split-7z parts sitting in the working directory that `numbered` (the
+// volume numbers the assembly declares for `set_name`) does not account for.
+//
+// The directory is enumerated once and each entry is matched against the
+// exact `<set>.NNN` spelling, so the cost is bounded by what the directory
+// holds. Probing candidate names by number instead would make the cost
+// proportional to the largest declared volume number, and that number is
+// parsed straight out of an NZB subject: a single part named
+// `payload.7z.1000000000` would cost a billion metadata lookups on the
+// orchestration task before this topology could be built.
 fn recovered_7z_parts_on_disk(
     working_dir: &Path,
     set_name: &str,
@@ -169,9 +169,9 @@ mod tests {
             .collect()
     }
 
-    /// Volumes 0-2 and 5 of a six-volume set, all covered by a matching cached
-    /// snapshot. The gap at 3-4 leaves volume 5 waiting no matter which source
-    /// the plan is rebuilt from, so it must not be read as snapshot staleness.
+    // Volumes 0-2 and 5 of a six-volume set, all covered by a matching cached
+    // snapshot. The gap at 3-4 leaves volume 5 waiting no matter which source
+    // the plan is rebuilt from, so it must not be read as snapshot staleness.
     fn holey_cached_rebuild_input(temp_dir: &tempfile::TempDir) -> RarSetComputeInput {
         let files = build_many_volume_rar_set(6);
         let present = [0usize, 1, 2, 5];
@@ -255,14 +255,14 @@ mod tests {
         );
     }
 
-    /// The same six volumes as [`holey_cached_rebuild_input`] — files for 0-2
-    /// and 5, a cached snapshot over those four — except volumes 3 and 4 now
-    /// have facts without files: the shape eager deletion leaves behind, since
-    /// it removes the volume file and keeps the per-volume facts. `volume_paths`
-    /// drops a deleted volume (it is built from paths that still exist) while
-    /// `state.facts` carries it forever, so the header chain stays reachable
-    /// across the hole and the waited-on volume 5 sits *inside* the facts ∪
-    /// paths prefix instead of past a true gap.
+    // The same six volumes as [`holey_cached_rebuild_input`] — files for 0-2
+    // and 5, a cached snapshot over those four — except volumes 3 and 4 now
+    // have facts without files: the shape eager deletion leaves behind, since
+    // it removes the volume file and keeps the per-volume facts. `volume_paths`
+    // drops a deleted volume (it is built from paths that still exist) while
+    // `state.facts` carries it forever, so the header chain stays reachable
+    // across the hole and the waited-on volume 5 sits *inside* the facts ∪
+    // paths prefix instead of past a true gap.
     fn facts_bridged_gap_rebuild_input(temp_dir: &tempfile::TempDir) -> RarSetComputeInput {
         let mut input = holey_cached_rebuild_input(temp_dir);
         let files = build_many_volume_rar_set(6);
@@ -373,11 +373,11 @@ mod tests {
         assert_eq!(cached.plan.phase.as_str(), live.plan.phase.as_str());
     }
 
-    /// Five volumes of one split member that arrived out of order: the cached
-    /// snapshot holds 0-1 and 3-4 as the two halves of a broken chain, the
-    /// late-arriving volume 2 is on disk, and volumes 3-4 are the ones whose
-    /// facts have not landed yet — so a single rebuild pass both closes the
-    /// chain (adding 2) and then re-reads 3 and 4.
+    // Five volumes of one split member that arrived out of order: the cached
+    // snapshot holds 0-1 and 3-4 as the two halves of a broken chain, the
+    // late-arriving volume 2 is on disk, and volumes 3-4 are the ones whose
+    // facts have not landed yet — so a single rebuild pass both closes the
+    // chain (adding 2) and then re-reads 3 and 4.
     fn late_middle_volume_rebuild_input(temp_dir: &tempfile::TempDir) -> RarSetComputeInput {
         let files = build_many_volume_rar_set(5);
 
@@ -428,13 +428,13 @@ mod tests {
         }
     }
 
-    /// Re-reading a held volume in place drops that volume's segments from the
-    /// member chain, and the head half keeps the cleared `split_after` the
-    /// terminal continuation gave it — so the re-parsed tail can never
-    /// reattach and the member silently loses its trailing volumes. A rebuild
-    /// pass that both closes a chain and re-reads volumes above the closing
-    /// point hits exactly that, and the truncated span is what the extractor
-    /// then decodes: the RAR4 solid stream runs out of ciphertext mid-member.
+    // Re-reading a held volume in place drops that volume's segments from the
+    // member chain, and the head half keeps the cleared `split_after` the
+    // terminal continuation gave it — so the re-parsed tail can never
+    // reattach and the member silently loses its trailing volumes. A rebuild
+    // pass that both closes a chain and re-reads volumes above the closing
+    // point hits exactly that, and the truncated span is what the extractor
+    // then decodes: the RAR4 solid stream runs out of ciphertext mid-member.
     #[test]
     fn rar_plan_rebuild_keeps_the_whole_member_span_when_late_volumes_are_re_read() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -484,9 +484,9 @@ mod tests {
         );
     }
 
-    /// A rebuild input for the ordinary in-order arrival: the snapshot holds
-    /// volumes `0..held`, every volume below `present` has facts and a file,
-    /// and the volumes in `held..present` are the ones this pass integrates.
+    // A rebuild input for the ordinary in-order arrival: the snapshot holds
+    // volumes `0..held`, every volume below `present` has facts and a file,
+    // and the volumes in `held..present` are the ones this pass integrates.
     fn in_order_growth_rebuild_input(
         temp_dir: &tempfile::TempDir,
         volume_count: usize,
@@ -535,10 +535,10 @@ mod tests {
         }
     }
 
-    /// The pass every in-order download runs on each volume completion: the
-    /// snapshot holds everything below the new volume, with facts for all of
-    /// it, and the member is still growing. The live-volume rebuild guard must
-    /// stay out of the way — the new volume is the only file this pass opens.
+    // The pass every in-order download runs on each volume completion: the
+    // snapshot holds everything below the new volume, with facts for all of
+    // it, and the member is still growing. The live-volume rebuild guard must
+    // stay out of the way — the new volume is the only file this pass opens.
     #[test]
     fn in_order_volume_arrival_extends_cached_headers_and_opens_only_the_new_volume() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -556,12 +556,12 @@ mod tests {
         assert_eq!(computed.plan.topology.complete_volumes.len(), 5);
     }
 
-    /// The pass that closes a member — its last volume just completed — is the
-    /// one whose cached snapshot lags a completed span. Before the live-volume
-    /// rebuild replaced it, that pass already re-read every held volume in
-    /// place, so the replacement must not parse more than that did: every
-    /// volume's headers are read exactly once. Volume 0 is parsed by the
-    /// rebuild's own open and then opened once more only to attach its reader.
+    // The pass that closes a member — its last volume just completed — is the
+    // one whose cached snapshot lags a completed span. Before the live-volume
+    // rebuild replaced it, that pass already re-read every held volume in
+    // place, so the replacement must not parse more than that did: every
+    // volume's headers are read exactly once. Volume 0 is parsed by the
+    // rebuild's own open and then opened once more only to attach its reader.
     #[test]
     fn member_completion_pass_reads_each_volume_once_from_live_volumes() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -870,22 +870,22 @@ fn cached_rar_plan_is_incoherent(
         })
 }
 
-/// Volumes whose plan decision claims no owner while `facts` still show a named
-/// member on them.
-///
-/// This only says anything when `plan` and `facts` come from different
-/// generations, which is why its one call site is the live check in
-/// `ownerless_live_rar_plan_error_for_set`: there the plan is whatever was last
-/// applied to the set and the facts are the set's current ones, so a volume
-/// that gained named members after the plan was built shows up as ownerless.
-///
-/// Measured against the same facts a plan was built from it is vacuous by
-/// construction: `rar_state::build_plan` backfills empty `owners` from
-/// `fact_owner_claims`, which accepts a member under exactly the predicate
-/// below — non-directory-or-nonempty and a non-empty sanitized name. Callers on
-/// the compute path would therefore always get an empty vector back. Narrowing
-/// that fallback in `build_plan` is what would make a compute-path check
-/// meaningful again.
+// Volumes whose plan decision claims no owner while `facts` still show a named
+// member on them.
+//
+// This only says anything when `plan` and `facts` come from different
+// generations, which is why its one call site is the live check in
+// `ownerless_live_rar_plan_error_for_set`: there the plan is whatever was last
+// applied to the set and the facts are the set's current ones, so a volume
+// that gained named members after the plan was built shows up as ownerless.
+//
+// Measured against the same facts a plan was built from it is vacuous by
+// construction: `rar_state::build_plan` backfills empty `owners` from
+// `fact_owner_claims`, which accepts a member under exactly the predicate
+// below — non-directory-or-nonempty and a non-empty sanitized name. Callers on
+// the compute path would therefore always get an empty vector back. Narrowing
+// that fallback in `build_plan` is what would make a compute-path check
+// meaningful again.
 pub(in crate::pipeline) fn ownerless_present_member_volumes(
     plan: &RarDerivedPlan,
     facts: &BTreeMap<u32, unrar_rs::RarVolumeFacts>,
@@ -938,9 +938,9 @@ pub(in crate::pipeline) fn present_waiting_rar_volumes(
     volumes
 }
 
-/// The text every "this set has no volume 0 to open from" refusal carries, so
-/// the scheduler can route it to the missing-volume path instead of failing
-/// the job outright.
+// The text every "this set has no volume 0 to open from" refusal carries, so
+// the scheduler can route it to the missing-volume path instead of failing
+// the job outright.
 pub(in crate::pipeline) const MISSING_FIRST_RAR_VOLUME_ERROR_MARKER: &str =
     "has no first volume (volume 0) to open from";
 
@@ -975,10 +975,10 @@ pub(in crate::pipeline) fn is_incoherent_rar_waiting_state_error(error: &str) ->
     error.contains(INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER)
 }
 
-/// Formats the error `ownerless_live_rar_plan_error_for_set` fails a job with.
-/// Nothing matches on the marker any more: the compute path cannot produce this
-/// error, and the live path returns it straight to the caller that fails the
-/// job.
+// Formats the error `ownerless_live_rar_plan_error_for_set` fails a job with.
+// Nothing matches on the marker any more: the compute path cannot produce this
+// error, and the live path returns it straight to the caller that fails the
+// job.
 pub(in crate::pipeline) fn ownerless_rar_plan_error(set_name: &str, volumes: &[u32]) -> String {
     format!("RAR set '{set_name}' {OWNERLESS_RAR_PLAN_ERROR_MARKER}: {volumes:?}")
 }
@@ -1020,21 +1020,21 @@ impl Pipeline {
         .map_err(|e| format!("RAR facts parser task panicked: {e}"))?
     }
 
-    /// The ledger key for one parsed volume.
-    ///
-    /// The header's stated number when the format states one — a swapped or
-    /// misnamed arrival registers as what its bytes are, not what the filename
-    /// claims — and the layout-derived volume otherwise. RAR5 states a number
-    /// in the main header of every volume past the first and a numbered RAR4
-    /// set states one in its end record; an old-numbering RAR4 set (.rar/.rNN)
-    /// states none anywhere, and treating an unstated number as an identity
-    /// collapses the whole set onto one key. `None` is the format staying
-    /// silent; a stated `Some(0)` wins like any other stated number.
-    ///
-    /// RAR5 is the exception to that silence: it writes the number in every
-    /// volume but the first, so a RAR5 volume that states none *is* the first
-    /// one, whatever its name says. Taking the layout there puts a misnamed
-    /// first volume on the same key as the volume its name belongs to.
+    // The ledger key for one parsed volume.
+    //
+    // The header's stated number when the format states one — a swapped or
+    // misnamed arrival registers as what its bytes are, not what the filename
+    // claims — and the layout-derived volume otherwise. RAR5 states a number
+    // in the main header of every volume past the first and a numbered RAR4
+    // set states one in its end record; an old-numbering RAR4 set (.rar/.rNN)
+    // states none anywhere, and treating an unstated number as an identity
+    // collapses the whole set onto one key. `None` is the format staying
+    // silent; a stated `Some(0)` wins like any other stated number.
+    //
+    // RAR5 is the exception to that silence: it writes the number in every
+    // volume but the first, so a RAR5 volume that states none *is* the first
+    // one, whatever its name says. Taking the layout there puts a misnamed
+    // first volume on the same key as the volume its name belongs to.
     pub(in crate::pipeline) fn rar_registration_volume(
         observed_volume: Option<u32>,
         facts: &unrar_rs::RarVolumeFacts,
@@ -1706,10 +1706,10 @@ impl Pipeline {
         Err(error)
     }
 
-    /// Whether a set has volumes registered but has never had a first volume:
-    /// no volume 0 among its facts, its files or on disk, and no header
-    /// snapshot that could stand in for one. Such a set cannot be opened at
-    /// all, and a full-set extraction of it fails before reading a byte.
+    // Whether a set has volumes registered but has never had a first volume:
+    // no volume 0 among its facts, its files or on disk, and no header
+    // snapshot that could stand in for one. Such a set cannot be opened at
+    // all, and a full-set extraction of it fails before reading a byte.
     pub(in crate::pipeline) fn rar_set_lacks_first_volume(
         &self,
         job_id: JobId,
@@ -1728,14 +1728,14 @@ impl Pipeline {
                 .contains_key(&0)
     }
 
-    /// Park a set that has no first volume as waiting for it, rather than
-    /// letting it fall back to a full-set extraction that can only fail.
-    ///
-    /// The plan names every volume below the lowest one present as missing,
-    /// which is what puts the set on the ordinary missing-volume route: a
-    /// PAR2 repair when recovery data can rebuild it, and a failure that says
-    /// which volumes were seen when nothing can. Returns whether it changed
-    /// the set's plan.
+    // Park a set that has no first volume as waiting for it, rather than
+    // letting it fall back to a full-set extraction that can only fail.
+    //
+    // The plan names every volume below the lowest one present as missing,
+    // which is what puts the set on the ordinary missing-volume route: a
+    // PAR2 repair when recovery data can rebuild it, and a failure that says
+    // which volumes were seen when nothing can. Returns whether it changed
+    // the set's plan.
     pub(in crate::pipeline) fn park_rar_set_waiting_for_first_volume(
         &mut self,
         job_id: JobId,
@@ -2313,17 +2313,17 @@ impl Pipeline {
             })
     }
 
-    /// Forget a set's header snapshot — the in-memory copy and the persisted
-    /// one — without touching its topology, so the next recompute rebuilds
-    /// from volume 0 instead of a view that no longer describes the files on
-    /// disk.
-    ///
-    /// Both copies have to go: `load_rar_snapshot` falls back to the database
-    /// when the in-memory copy is gone, so clearing only `cached_headers` is
-    /// not an invalidation at all. That is exactly how a recovery-volume
-    /// restore used to lose its restored volume — the recompute after it
-    /// "rebuilt" from the pre-restore snapshot, whose member spans still
-    /// described the set with the hole in it.
+    // Forget a set's header snapshot — the in-memory copy and the persisted
+    // one — without touching its topology, so the next recompute rebuilds
+    // from volume 0 instead of a view that no longer describes the files on
+    // disk.
+    //
+    // Both copies have to go: `load_rar_snapshot` falls back to the database
+    // when the in-memory copy is gone, so clearing only `cached_headers` is
+    // not an invalidation at all. That is exactly how a recovery-volume
+    // restore used to lose its restored volume — the recompute after it
+    // "rebuilt" from the pre-restore snapshot, whose member spans still
+    // described the set with the hole in it.
     pub(in crate::pipeline) fn invalidate_rar_snapshot(&mut self, job_id: JobId, set_name: &str) {
         if let Some(state) = self.rar_sets.get_mut(&(job_id, set_name.to_string())) {
             state.cached_headers = None;
@@ -2677,8 +2677,8 @@ impl Pipeline {
         }
     }
 
-    /// When a RAR volume file completes, rebuild topology from the persistent
-    /// multi-volume header snapshot instead of inferring spans by volume order.
+    // When a RAR volume file completes, rebuild topology from the persistent
+    // multi-volume header snapshot instead of inferring spans by volume order.
     pub(crate) async fn try_update_archive_topology(&mut self, job_id: JobId, file_id: NzbFileId) {
         let (observed_volume, filename, set_name, path, password_candidates) = {
             let Some(state) = self.jobs.get(&job_id) else {
@@ -2775,11 +2775,11 @@ impl Pipeline {
         }
     }
 
-    /// When a non-RAR archive file completes, build or update the archive topology.
-    ///
-    /// Handles 7z, zip, tar, tar.gz, gz, and plain split files.
-    /// Groups files by base name so that multiple independent archive sets
-    /// within a single job are tracked separately.
+    // When a non-RAR archive file completes, build or update the archive topology.
+    //
+    // Handles 7z, zip, tar, tar.gz, gz, and plain split files.
+    // Groups files by base name so that multiple independent archive sets
+    // within a single job are tracked separately.
     pub(crate) fn try_update_7z_topology(&mut self, job_id: JobId, file_id: NzbFileId) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;

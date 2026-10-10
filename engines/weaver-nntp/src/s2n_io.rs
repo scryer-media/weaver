@@ -1,4 +1,4 @@
-//! s2n's synchronous callback boundary for a userspace route.
+// s2n's synchronous callback boundary for a userspace route.
 use crate::route_stream::BlockingSocket;
 use std::io::{self, Read, Write};
 

@@ -1,20 +1,20 @@
-//! Continuation of the `impl Pipeline` block from `finalize/check.rs`.
-//! Split out mechanically to keep the parent file readable; no behavior lives here
-//! that is not simply a method of the same type.
+// Continuation of the `impl Pipeline` block from `finalize/check.rs`.
+// Split out mechanically to keep the parent file readable; no behavior lives here
+// that is not simply a method of the same type.
 
 use super::*;
 use crate::pipeline::repair::backend::AlternateRepairReason;
 
 impl Pipeline {
-    /// Whether the job has archive extraction to run once its PAR2 verdict
-    /// lands.
-    ///
-    /// Asked again after a clean verdict's deobfuscation rather than read from
-    /// the start of the pass: an obfuscated volume the repair completed was
-    /// never classified by its content, so until the verdict names it the job
-    /// looks like it has no archive at all. Answering from that stale view
-    /// sends a job whose only archive was just named to reconciliation instead
-    /// of extraction, and leaves it verifying with nothing left to verify.
+    // Whether the job has archive extraction to run once its PAR2 verdict
+    // lands.
+    //
+    // Asked again after a clean verdict's deobfuscation rather than read from
+    // the start of the pass: an obfuscated volume the repair completed was
+    // never classified by its content, so until the verdict names it the job
+    // looks like it has no archive at all. Answering from that stale view
+    // sends a job whose only archive was just named to reconciliation instead
+    // of extraction, and leaves it verifying with nothing left to verify.
     fn archive_extraction_applicable(&self, job_id: JobId) -> bool {
         self.extraction_readiness_for_job(job_id) != ExtractionReadiness::NotApplicable
             || self.job_has_only_rar_archives(job_id)
@@ -310,12 +310,12 @@ impl Pipeline {
         saw_incomplete
     }
 
-    /// Check if all data files in a job are complete, and trigger post-processing.
-    ///
-    /// PAR2 is treated as a repair tool only — damage is detected via yEnc CRC
-    /// (per-segment) and RAR CRC (per-member extraction). If
-    /// CRC failures occur, recovery files are promoted for download and repair
-    /// runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
+    // Check if all data files in a job are complete, and trigger post-processing.
+    //
+    // PAR2 is treated as a repair tool only — damage is detected via yEnc CRC
+    // (per-segment) and RAR CRC (per-member extraction). If
+    // CRC failures occur, recovery files are promoted for download and repair
+    // runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
     pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
         if self.shared_state.is_post_processing_paused() {
             self.deferred_post_processing.insert(job_id);

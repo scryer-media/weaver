@@ -1,4 +1,4 @@
-//! Socket construction at the bottom of an outbound route.
+// Socket construction at the bottom of an outbound route.
 
 use std::{
     io,
@@ -8,7 +8,7 @@ use std::{
 
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 
-/// Binding is exclusive: choosing a device leaves source selection to the kernel.
+// Binding is exclusive: choosing a device leaves source selection to the kernel.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum SocketEgress {
     #[default]
@@ -26,7 +26,7 @@ struct InterfaceFamilies {
 static INTERFACE_FAMILIES: std::sync::OnceLock<std::sync::RwLock<InterfaceFamilies>> =
     std::sync::OnceLock::new();
 
-/// Publish the health monitor's already validated address families for socket filtering.
+// Publish the health monitor's already validated address families for socket filtering.
 pub fn cache_interface_families(families: impl IntoIterator<Item = (String, bool)>) {
     let cache = INTERFACE_FAMILIES.get_or_init(Default::default);
     *cache.write().expect("interface families") = InterfaceFamilies {
@@ -135,7 +135,7 @@ impl SocketEgress {
         Ok(socket.into())
     }
 
-    /// Dropping the connect future closes the bound socket without a detached dial.
+    // Dropping the connect future closes the bound socket without a detached dial.
     pub async fn connect(&self, target: SocketAddr) -> io::Result<tokio::net::TcpStream> {
         let socket = self.tcp_socket(target)?;
         socket.set_nonblocking(true)?;
@@ -144,7 +144,7 @@ impl SocketEgress {
             .await
     }
 
-    /// Bind a datagram socket for a tunnel peer of the supplied address family.
+    // Bind a datagram socket for a tunnel peer of the supplied address family.
     pub fn bind_udp(&self, peer: SocketAddr) -> io::Result<UdpSocket> {
         let socket = self.socket(peer, Type::DGRAM, Protocol::UDP)?;
         if !matches!(self, Self::SourceAddress(_)) {
@@ -206,8 +206,8 @@ fn bind_interface(socket: &Socket, name: &str, ipv6: bool) -> io::Result<()> {
     }
 }
 
-/// Address flags used both by health discovery and address-race family filtering.
-/// Unknown IPv6 flags fail closed; IPv4 has no duplicate-address detection state.
+// Address flags used both by health discovery and address-race family filtering.
+// Unknown IPv6 flags fail closed; IPv4 has no duplicate-address detection state.
 pub fn address_flags(name: &str, address: IpAddr) -> (bool, bool) {
     if address.is_ipv4() {
         return (false, false);
@@ -215,9 +215,9 @@ pub fn address_flags(name: &str, address: IpAddr) -> (bool, bool) {
     NativeFlags::open().flags(name, address)
 }
 
-/// [`address_flags`] for every `(interface, address)` pair, in order, from one
-/// read of the platform's address state: one parse of `/proc/net/if_inet6` on
-/// Linux and one ioctl socket on macOS, instead of one per address.
+// [`address_flags`] for every `(interface, address)` pair, in order, from one
+// read of the platform's address state: one parse of `/proc/net/if_inet6` on
+// Linux and one ioctl socket on macOS, instead of one per address.
 pub fn address_flags_many(addresses: &[(&str, IpAddr)]) -> Vec<(bool, bool)> {
     if addresses.iter().all(|(_, address)| address.is_ipv4()) {
         return vec![(false, false); addresses.len()];
@@ -235,8 +235,8 @@ pub fn address_flags_many(addresses: &[(&str, IpAddr)]) -> Vec<(bool, bool)> {
         .collect()
 }
 
-/// The platform's IPv6 address state, opened once and asked per address.
-/// Unknown flags fail closed as tentative.
+// The platform's IPv6 address state, opened once and asked per address.
+// Unknown flags fail closed as tentative.
 struct NativeFlags {
     #[cfg(target_os = "linux")]
     table: Option<std::collections::HashMap<(String, u128), (bool, bool)>>,
@@ -282,8 +282,8 @@ impl NativeFlags {
     }
 }
 
-/// `/proc/net/if_inet6` rows keyed by interface and address, mapped to
-/// (deprecated, tentative). The first row for a pair wins.
+// `/proc/net/if_inet6` rows keyed by interface and address, mapped to
+// (deprecated, tentative). The first row for a pair wins.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_if_inet6(text: &str) -> std::collections::HashMap<(String, u128), (bool, bool)> {
     let mut table = std::collections::HashMap::new();

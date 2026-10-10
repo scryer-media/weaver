@@ -202,11 +202,11 @@ pub(super) async fn graphql_handler(
     Ok(schema.execute(request).await.into())
 }
 
-/// Whether the page that opened this socket is this application.
-///
-/// Browsers always send `Origin` on a socket upgrade and page scripts cannot
-/// forge it; a request without one is a machine client, which carries its own
-/// credential rather than riding on a browser's cookies.
+// Whether the page that opened this socket is this application.
+//
+// Browsers always send `Origin` on a socket upgrade and page scripts cannot
+// forge it; a request without one is a machine client, which carries its own
+// credential rather than riding on a browser's cookies.
 fn upgrade_origin_allowed(
     auth: &super::RequestAuthContext,
     peer: Option<SocketAddr>,
@@ -239,8 +239,8 @@ fn upgrade_origin_allowed(
     allowed
 }
 
-/// Everything that can take a credential away, subscribed before the upgrade
-/// is authenticated so no change can slip between the check and the watch.
+// Everything that can take a credential away, subscribed before the upgrade
+// is authenticated so no change can slip between the check and the watch.
 struct RevocationWatch {
     login: watch::Receiver<()>,
     api_keys: watch::Receiver<()>,

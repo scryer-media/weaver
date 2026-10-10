@@ -83,7 +83,7 @@ fn find_active_on_track(
     .map(|(entry, _, _)| entry)
 }
 
-/// A rule setting the global speed limit alone.
+// A rule setting the global speed limit alone.
 fn global_speed(bytes_per_sec: u64) -> ScheduleAction {
     ScheduleAction::SpeedLimit {
         limits: vec![crate::bandwidth::SpeedLimitChange {
@@ -93,7 +93,7 @@ fn global_speed(bytes_per_sec: u64) -> ScheduleAction {
     }
 }
 
-/// The one action that fires once rather than holding a track.
+// The one action that fires once rather than holding a track.
 fn prune() -> ScheduleAction {
     ScheduleAction::PruneHistory {
         failed: None,

@@ -34,11 +34,11 @@ fn record_member_crc32_value(
     }
 }
 
-/// Folds one volume's member headers into the checksum map. A member spanning
-/// volumes states its checksum on the header that ends it, so earlier volumes
-/// simply contribute nothing. Conflicting checksums for the same normalized
-/// delivery path make that path unusable instead of picking an iteration-order
-/// winner.
+// Folds one volume's member headers into the checksum map. A member spanning
+// volumes states its checksum on the header that ends it, so earlier volumes
+// simply contribute nothing. Conflicting checksums for the same normalized
+// delivery path make that path unusable instead of picking an iteration-order
+// winner.
 fn record_member_crc32(
     by_path: &mut HashMap<String, u32>,
     ambiguous_paths: &mut HashSet<String>,
@@ -57,8 +57,8 @@ fn record_member_crc32(
 
 #[derive(Debug)]
 struct UnacceptableExtensionMatch {
-    /// Relative to the delivery, `/`-separated: the path the file would have
-    /// been published under.
+    // Relative to the delivery, `/`-separated: the path the file would have
+    // been published under.
     relative_path: String,
 }
 
@@ -74,9 +74,9 @@ enum DeliveryPolicySource {
     Fixed(PostProcessingSettings),
 }
 
-/// Inspect exactly the entries the final move can publish, without following
-/// links. This one iterative walk both enforces the extension policy and
-/// supplies the byte totals used by move progress.
+// Inspect exactly the entries the final move can publish, without following
+// links. This one iterative walk both enforces the extension policy and
+// supplies the byte totals used by move progress.
 fn validate_delivery_sources(
     working_dir: &Path,
     staging_dir: Option<&Path>,
@@ -920,13 +920,13 @@ impl Pipeline {
             })
     }
 
-    /// Resolves everything the delivery rename pass needs, on this task, before
-    /// the move worker is spawned.
-    ///
-    /// `None` disables the pass. The worker gets an owned plan rather than a
-    /// handle to pipeline state so the pass cannot reach back into the
-    /// orchestrator, and so the outbound lookup — the one step that can take
-    /// seconds — never runs on the orchestrator's own task.
+    // Resolves everything the delivery rename pass needs, on this task, before
+    // the move worker is spawned.
+    //
+    // `None` disables the pass. The worker gets an owned plan rather than a
+    // handle to pipeline state so the pass cannot reach back into the
+    // orchestrator, and so the outbound lookup — the one step that can take
+    // seconds — never runs on the orchestrator's own task.
     async fn delivery_naming_plan(
         &self,
         job_id: JobId,
@@ -962,15 +962,15 @@ impl Pipeline {
         })
     }
 
-    /// The CRC32 each archive header stated for its member, keyed by its
-    /// normalized, lowercased delivery-relative path.
-    ///
-    /// Read from two places because the two delivery routes keep the same facts
-    /// in different homes: extraction keeps a set's parsed headers in memory
-    /// until the job leaves the pipeline, while direct-store only ever writes
-    /// them to the durable facts table. Reading both makes the map route-blind.
-    /// A member the headers never stated a checksum for is simply absent, and
-    /// the lookup falls back to the job name for it.
+    // The CRC32 each archive header stated for its member, keyed by its
+    // normalized, lowercased delivery-relative path.
+    //
+    // Read from two places because the two delivery routes keep the same facts
+    // in different homes: extraction keeps a set's parsed headers in memory
+    // until the job leaves the pipeline, while direct-store only ever writes
+    // them to the durable facts table. Reading both makes the map route-blind.
+    // A member the headers never stated a checksum for is simply absent, and
+    // the lookup falls back to the job name for it.
     async fn member_crc32_by_path(&self, job_id: JobId) -> HashMap<String, u32> {
         let mut by_path = HashMap::new();
         let mut ambiguous_paths = HashSet::new();
@@ -1006,15 +1006,15 @@ impl Pipeline {
         by_path
     }
 
-    /// Move extracted/completed files from the intermediate working directory
-    /// to the complete directory, organized by category.
-    ///
-    /// Layout: `{complete_dir}/[{category}/]{release title}/`, the title as
-    /// posted rather than the display name (see
-    /// [`crate::ingest::completed_folder_name`]).
-    /// On collision, appends `.#<job_id>` (and a numeric suffix if needed).
-    ///
-    /// Uses rename() for same-filesystem moves, falls back to copy+delete for cross-FS.
+    // Move extracted/completed files from the intermediate working directory
+    // to the complete directory, organized by category.
+    //
+    // Layout: `{complete_dir}/[{category}/]{release title}/`, the title as
+    // posted rather than the display name (see
+    // [`crate::ingest::completed_folder_name`]).
+    // On collision, appends `.#<job_id>` (and a numeric suffix if needed).
+    //
+    // Uses rename() for same-filesystem moves, falls back to copy+delete for cross-FS.
     pub(crate) async fn start_move_to_complete(&mut self, job_id: JobId) -> Result<(), String> {
         if self.inflight_moves.contains(&job_id) {
             return Ok(());
@@ -1215,11 +1215,11 @@ impl Pipeline {
         );
     }
 
-    /// Resolve the job's script list and, when it is non-empty, run it.
-    ///
-    /// Resolution happens here rather than at submission time: the list a job
-    /// runs is the one configured when it finishes, which is what both oracles
-    /// do and what removes the "edited while queued" race entirely.
+    // Resolve the job's script list and, when it is non-empty, run it.
+    //
+    // Resolution happens here rather than at submission time: the list a job
+    // runs is the one configured when it finishes, which is what both oracles
+    // do and what removes the "edited while queued" race entirely.
     pub(crate) fn start_terminal_post_processing_with_outcome(
         &mut self,
         job_id: JobId,
@@ -1474,12 +1474,12 @@ impl Pipeline {
         });
     }
 
-    /// Finish a job that was restored while it sat in post-processing.
-    ///
-    /// The startup recovery scan already stamped `interrupted` on every such
-    /// job, so nothing is rerun here: a script that was mid-flight when weaver
-    /// stopped has unknown side effects, and running it again is worse than
-    /// reporting that it was interrupted.
+    // Finish a job that was restored while it sat in post-processing.
+    //
+    // The startup recovery scan already stamped `interrupted` on every such
+    // job, so nothing is rerun here: a script that was mid-flight when weaver
+    // stopped has unknown side effects, and running it again is worse than
+    // reporting that it was interrupted.
     pub(crate) fn recover_restored_terminal_post_processing(&mut self, job_id: JobId) -> bool {
         let is_terminal_post_processing = self.jobs.get(&job_id).is_some_and(|state| {
             matches!(

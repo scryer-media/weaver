@@ -111,13 +111,13 @@ impl Database {
         })
     }
 
-    /// How many history rows each category holds, as `(category, count)`.
-    ///
-    /// A row with no category comes back under the empty string, which is what
-    /// the column holds for it. The aggregate runs in SQL so the caller can put
-    /// a number beside a facet without reading the table it is counting: the
-    /// whole point of the facet list is that it describes rows no page is
-    /// showing.
+    // How many history rows each category holds, as `(category, count)`.
+    //
+    // A row with no category comes back under the empty string, which is what
+    // the column holds for it. The aggregate runs in SQL so the caller can put
+    // a number beside a facet without reading the table it is counting: the
+    // whole point of the facet list is that it describes rows no page is
+    // showing.
     pub fn count_job_history_by_category(
         &self,
         filter: &HistoryFilter,

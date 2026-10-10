@@ -1,14 +1,14 @@
 use super::{FileRole, role_filename_view};
 
-/// Extract the archive set base name from a filename and its role.
-///
-/// Groups files that belong to the same archive set. For example:
-/// - `Show.S01E01.7z.003` (SevenZipSplit) -> `"show.s01e01.7z"`
-/// - `archive.7z` (SevenZipArchive) -> `"archive.7z"`
-/// - `movie.part01.rar` (RarVolume) -> `"movie"`
-///
-/// RAR and 7z keys fold ASCII case; the original filenames remain unchanged.
-/// Returns `None` for non-archive roles.
+// Extract the archive set base name from a filename and its role.
+//
+// Groups files that belong to the same archive set. For example:
+// - `Show.S01E01.7z.003` (SevenZipSplit) -> `"show.s01e01.7z"`
+// - `archive.7z` (SevenZipArchive) -> `"archive.7z"`
+// - `movie.part01.rar` (RarVolume) -> `"movie"`
+//
+// RAR and 7z keys fold ASCII case; the original filenames remain unchanged.
+// Returns `None` for non-archive roles.
 pub fn archive_base_name(filename: &str, role: &FileRole) -> Option<String> {
     let filename = role_filename_view(filename);
     match role {

@@ -224,7 +224,7 @@ pub(super) fn decode_normal_run_riscv64(
     decode_normal_run_scalar(input, start, output, dst_start)
 }
 
-/// Scalar fallback: process one byte at a time.
+// Scalar fallback: process one byte at a time.
 #[inline]
 pub(super) fn decode_normal_run_scalar(
     input: &[u8],

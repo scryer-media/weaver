@@ -6,9 +6,9 @@ use std::io::Read;
 
 const SOURCE: SourceId = SourceId(7);
 
-/// Handles a freshness check holds while it runs. On Windows it opens the
-/// backing file to read its fence, so an idle reader can keep only what leaves
-/// the check room.
+// Handles a freshness check holds while it runs. On Windows it opens the
+// backing file to read its fence, so an idle reader can keep only what leaves
+// the check room.
 const SNAPSHOT_CHECK_HANDLES: usize = if cfg!(windows) { 1 } else { 0 };
 
 fn access(

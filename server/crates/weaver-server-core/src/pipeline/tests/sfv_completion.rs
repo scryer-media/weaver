@@ -1,15 +1,15 @@
-//! SFV verification fallback: the completion-gate arm that rules on a job with
-//! no PAR2 set.
-//!
-//! The read split (`sfv_verify_read_splits`) is `(files composed from verified
-//! article CRCs, files streamed off disk)` for each pass, and it is what
-//! distinguishes "the zero-I/O arm answered" from "the arm refused and the disk
-//! was read" — two outcomes that are otherwise indistinguishable from the
-//! verdict alone.
+// SFV verification fallback: the completion-gate arm that rules on a job with
+// no PAR2 set.
+//
+// The read split (`sfv_verify_read_splits`) is `(files composed from verified
+// article CRCs, files streamed off disk)` for each pass, and it is what
+// distinguishes "the zero-I/O arm answered" from "the arm refused and the disk
+// was read" — two outcomes that are otherwise indistinguishable from the
+// verdict alone.
 
 use super::*;
 
-/// One classic `.sfv` line: name, then the file's CRC32 as eight hex digits.
+// One classic `.sfv` line: name, then the file's CRC32 as eight hex digits.
 fn sfv_line(name: &str, bytes: &[u8]) -> String {
     format!("{name} {:08x}\n", par2_rs::checksum::crc32(bytes))
 }
@@ -18,8 +18,8 @@ fn sfv_line_with_crc(name: &str, crc32: u32) -> String {
     format!("{name} {crc32:08x}\n")
 }
 
-/// Puts the job in the shape the completion gate sees once the download pass is
-/// over: nothing queued, status back to `Downloading`.
+// Puts the job in the shape the completion gate sees once the download pass is
+// over: nothing queued, status back to `Downloading`.
 fn settle_download_state(pipeline: &mut Pipeline, job_id: JobId) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     state.download_queue = DownloadQueue::new();
@@ -41,9 +41,9 @@ fn failure_error(pipeline: &Pipeline, job_id: JobId) -> String {
     }
 }
 
-/// A file whose every article arrived with a wire-verified CRC32 over a proven
-/// contiguous tiling is verified by *composing* those CRCs — the file is never
-/// read back. The split is what witnesses it: `(1, 0)`.
+// A file whose every article arrived with a wire-verified CRC32 over a proven
+// contiguous tiling is verified by *composing* those CRCs — the file is never
+// read back. The split is what witnesses it: `(1, 0)`.
 #[tokio::test]
 async fn sfv_verifies_a_wire_proven_file_without_reading_it_back() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -118,9 +118,9 @@ async fn sfv_verifies_a_wire_proven_file_without_reading_it_back() {
     assert!(pipeline.jobs_with_verification_outcome.contains(&job_id));
 }
 
-/// A uuencode file has no wire checksum at all — every one of its segments
-/// commits with `part_crc_verified: false` — so the zero-I/O arm must refuse it
-/// and the disk arm must answer. The split witnesses the refusal: `(0, 1)`.
+// A uuencode file has no wire checksum at all — every one of its segments
+// commits with `part_crc_verified: false` — so the zero-I/O arm must refuse it
+// and the disk arm must answer. The split witnesses the refusal: `(0, 1)`.
 #[tokio::test]
 async fn sfv_reads_back_a_file_the_wire_could_not_vouch_for() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -195,8 +195,8 @@ async fn sfv_reads_back_a_file_the_wire_could_not_vouch_for() {
     assert!(pipeline.jobs_with_verification_outcome.contains(&job_id));
 }
 
-/// A listing that disagrees with the bytes is terminal: no PAR2 set means no
-/// repair path, so the job fails and says which file.
+// A listing that disagrees with the bytes is terminal: no PAR2 set means no
+// repair path, so the job fails and says which file.
 #[tokio::test]
 async fn sfv_mismatch_fails_the_job_with_a_named_cause() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -234,9 +234,9 @@ async fn sfv_mismatch_fails_the_job_with_a_named_cause() {
     );
 }
 
-/// A file the listing names, that the job holds, and that is not on disk when
-/// the gate asks for it. There is nothing to measure, so the job fails and
-/// names it.
+// A file the listing names, that the job holds, and that is not on disk when
+// the gate asks for it. There is nothing to measure, so the job fails and
+// names it.
 #[tokio::test]
 async fn sfv_missing_file_fails_the_job_with_a_named_cause() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -277,9 +277,9 @@ async fn sfv_missing_file_fails_the_job_with_a_named_cause() {
     );
 }
 
-/// Recovery data outranks a poster's checksum listing. A job with a parsed PAR2
-/// set never consults the `.sfv` at all — here the listing is deliberately
-/// wrong about a file PAR2 finds intact, and the job still passes.
+// Recovery data outranks a poster's checksum listing. A job with a parsed PAR2
+// set never consults the `.sfv` at all — here the listing is deliberately
+// wrong about a file PAR2 finds intact, and the job still passes.
 #[tokio::test]
 async fn a_par2_covered_job_never_consults_a_disagreeing_sfv() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -332,8 +332,8 @@ async fn a_par2_covered_job_never_consults_a_disagreeing_sfv() {
     );
 }
 
-/// The behaviour every PAR2-less job without a listing keeps: nothing runs, and
-/// the job's route to completion is untouched.
+// The behaviour every PAR2-less job without a listing keeps: nothing runs, and
+// the job's route to completion is untouched.
 #[tokio::test]
 async fn a_par2_less_job_with_no_sfv_is_unchanged() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -363,9 +363,9 @@ async fn a_par2_less_job_with_no_sfv_is_unchanged() {
     );
 }
 
-/// A named listing is not necessary when its content is unobfuscated. The
-/// content probe recognises this completed file as a listing, then the normal SFV
-/// path verifies the payload without inventing a new name or file identity.
+// A named listing is not necessary when its content is unobfuscated. The
+// content probe recognises this completed file as a listing, then the normal SFV
+// path verifies the payload without inventing a new name or file identity.
 #[tokio::test]
 async fn an_obfuscated_sfv_listing_with_comments_and_blank_lines_is_used() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -405,9 +405,9 @@ async fn an_obfuscated_sfv_listing_with_comments_and_blank_lines_is_used() {
     assert!(pipeline.jobs_with_verification_outcome.contains(&job_id));
 }
 
-/// Discovery is not limited to the first matching obfuscated listing: a
-/// release can publish independent listing files without retaining `.sfv`
-/// extensions on either of them.
+// Discovery is not limited to the first matching obfuscated listing: a
+// release can publish independent listing files without retaining `.sfv`
+// extensions on either of them.
 #[tokio::test]
 async fn multiple_obfuscated_sfv_listings_are_combined() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -485,9 +485,9 @@ async fn multiple_obfuscated_sfv_listings_are_combined() {
     assert!(pipeline.jobs_with_verification_outcome.contains(&job_id));
 }
 
-/// A conventional `.sfv` deliberately suppresses fallback probing. The hidden
-/// candidate is valid but wrong; if it were added to the named listing, the
-/// conflicting entry would be withdrawn and no verification result recorded.
+// A conventional `.sfv` deliberately suppresses fallback probing. The hidden
+// candidate is valid but wrong; if it were added to the named listing, the
+// conflicting entry would be withdrawn and no verification result recorded.
 #[tokio::test]
 async fn a_named_sfv_suppresses_obfuscated_discovery() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -541,9 +541,9 @@ async fn a_named_sfv_suppresses_obfuscated_discovery() {
     assert!(pipeline.jobs_with_verification_outcome.contains(&job_id));
 }
 
-/// A listing routinely covers a wider release than the NZB fetched. Entries
-/// naming nothing this job holds are noted and skipped; the entries that do
-/// match are still verified.
+// A listing routinely covers a wider release than the NZB fetched. Entries
+// naming nothing this job holds are noted and skipped; the entries that do
+// match are still verified.
 #[tokio::test]
 async fn sfv_entries_naming_no_job_file_do_not_fail_the_job() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -588,8 +588,8 @@ async fn sfv_entries_naming_no_job_file_do_not_fail_the_job() {
     assert!(pipeline.jobs_with_verification_outcome.contains(&job_id));
 }
 
-/// The converse: a payload file no listing names is left unverified, and the
-/// job still completes. A `.sfv` covers what it covers.
+// The converse: a payload file no listing names is left unverified, and the
+// job still completes. A `.sfv` covers what it covers.
 #[tokio::test]
 async fn job_files_absent_from_the_sfv_stay_unverified_and_complete() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -649,9 +649,9 @@ async fn job_files_absent_from_the_sfv_stay_unverified_and_complete() {
     assert!(pipeline.jobs_with_verification_outcome.contains(&job_id));
 }
 
-/// Two listings disagreeing about one name are a contradiction, not evidence.
-/// That name is withdrawn — even though one of the two values is the wrong one
-/// and would fail the job — while the name they agree on is still verified.
+// Two listings disagreeing about one name are a contradiction, not evidence.
+// That name is withdrawn — even though one of the two values is the wrong one
+// and would fail the job — while the name they agree on is still verified.
 #[tokio::test]
 async fn conflicting_sfv_entries_leave_that_file_unverified() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -724,8 +724,8 @@ async fn conflicting_sfv_entries_leave_that_file_unverified() {
     assert!(pipeline.jobs_with_verification_outcome.contains(&job_id));
 }
 
-/// The gate is re-entered many times per job. The fallback runs once — a second
-/// pass must not re-read the payload.
+// The gate is re-entered many times per job. The fallback runs once — a second
+// pass must not re-read the payload.
 #[tokio::test]
 async fn the_sfv_arm_runs_once_per_job() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -769,11 +769,11 @@ async fn the_sfv_arm_runs_once_per_job() {
     );
 }
 
-/// Incremental RAR extraction deletes a volume as soon as it owns every member
-/// that reads from it, which happens long before the completion gate runs. The
-/// listing still names that volume, and the download still holds a whole-file
-/// CRC32 composed from its verified article CRCs — so the zero-I/O arm answers
-/// for a file that no longer exists.
+// Incremental RAR extraction deletes a volume as soon as it owns every member
+// that reads from it, which happens long before the completion gate runs. The
+// listing still names that volume, and the download still holds a whole-file
+// CRC32 composed from its verified article CRCs — so the zero-I/O arm answers
+// for a file that no longer exists.
 #[tokio::test]
 async fn a_volume_extraction_already_consumed_is_verified_from_its_wire_crcs() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -849,9 +849,9 @@ async fn a_volume_extraction_already_consumed_is_verified_from_its_wire_crcs() {
     assert!(pipeline.jobs_with_verification_outcome.contains(&job_id));
 }
 
-/// The same absence with no retained CRC to compose from. Neither arm can
-/// measure the file, but weaver deleted it — that is not the listing finding a
-/// hole in the download, so the job is left unverified rather than failed.
+// The same absence with no retained CRC to compose from. Neither arm can
+// measure the file, but weaver deleted it — that is not the listing finding a
+// hole in the download, so the job is left unverified rather than failed.
 #[tokio::test]
 async fn a_consumed_volume_without_wire_evidence_is_left_unverified_not_failed() {
     let temp_dir = tempfile::tempdir().unwrap();

@@ -1,4 +1,4 @@
-//! Process-wide PAR3 admission, resolved once outside the download loop.
+// Process-wide PAR3 admission, resolved once outside the download loop.
 
 use super::*;
 use crate::runtime::MemoryShare;
@@ -6,25 +6,25 @@ use par3_rs::runtime::{MemoryBudget, ResourceLimit};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, Weak};
 
-/// A ceiling weaver's own admission enforced, in the vocabulary the engine
-/// refuses in.
-///
-/// The engine's `ResourceLimit` is `#[non_exhaustive]` and both its
-/// constructors are crate-private, so only par3-rs can build one. Weaver's own
-/// budgets — carrier counts, retained payload, assessment views, disk fallback
-/// — still have to refuse in the same terms, so they carry the same four fields
-/// and travel inside the engine's error type the way [`SourcePressure`] below
-/// already does. Everything that reads a refusal goes through [`limit_label`]
-/// and sees both kinds alike.
+// A ceiling weaver's own admission enforced, in the vocabulary the engine
+// refuses in.
+//
+// The engine's `ResourceLimit` is `#[non_exhaustive]` and both its
+// constructors are crate-private, so only par3-rs can build one. Weaver's own
+// budgets — carrier counts, retained payload, assessment views, disk fallback
+// — still have to refuse in the same terms, so they carry the same four fields
+// and travel inside the engine's error type the way [`SourcePressure`] below
+// already does. Everything that reads a refusal goes through [`limit_label`]
+// and sees both kinds alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::pipeline) struct HostLimit {
-    /// Name of the budget that refused, in the same style as the engine's.
+    // Name of the budget that refused, in the same style as the engine's.
     pub what: &'static str,
-    /// Bytes the refused request needed, when the refusal was measured.
+    // Bytes the refused request needed, when the refusal was measured.
     pub need: u64,
-    /// Configured ceiling for `what`, when the refusal was measured.
+    // Configured ceiling for `what`, when the refusal was measured.
     pub limit: u64,
-    /// Bytes still available under that ceiling when the request was refused.
+    // Bytes still available under that ceiling when the request was refused.
     pub available: u64,
 }
 
@@ -51,8 +51,8 @@ impl std::fmt::Display for HostLimit {
 
 impl std::error::Error for HostLimit {}
 
-/// A weaver-side refusal whose ceiling is a count or a structural bound rather
-/// than a byte budget.
+// A weaver-side refusal whose ceiling is a count or a structural bound rather
+// than a byte budget.
 pub(in crate::pipeline) fn host_limit(what: &'static str) -> EngineError {
     EngineError::Io(std::io::Error::other(HostLimit {
         what,
@@ -62,7 +62,7 @@ pub(in crate::pipeline) fn host_limit(what: &'static str) -> EngineError {
     }))
 }
 
-/// A weaver-side refusal measured against a byte ceiling.
+// A weaver-side refusal measured against a byte ceiling.
 pub(in crate::pipeline) fn host_budget_limit(
     what: &'static str,
     need: u64,
@@ -77,8 +77,8 @@ pub(in crate::pipeline) fn host_budget_limit(
     }))
 }
 
-/// The budget a refusal names, whether the engine or weaver refused. Anything
-/// that is not a refusal answers `None`.
+// The budget a refusal names, whether the engine or weaver refused. Anything
+// that is not a refusal answers `None`.
 pub(in crate::pipeline) fn limit_label(error: &EngineError) -> Option<&'static str> {
     match error {
         EngineError::ResourceLimit(limit) => Some(limit.what),
@@ -93,14 +93,14 @@ pub(in crate::pipeline) fn limit_label(error: &EngineError) -> Option<&'static s
     }
 }
 
-/// Whether this error is a refused reservation at all.
+// Whether this error is a refused reservation at all.
 pub(in crate::pipeline) fn is_limit(error: &EngineError) -> bool {
     limit_label(error).is_some()
 }
 
-/// The engine's own measured refusal, when the engine is the one that refused.
-/// A weaver-side [`HostLimit`] is deliberately not reported here: the outcome
-/// that depends on `LimitCause` is about the engine's native budget.
+// The engine's own measured refusal, when the engine is the one that refused.
+// A weaver-side [`HostLimit`] is deliberately not reported here: the outcome
+// that depends on `LimitCause` is about the engine's native budget.
 pub(in crate::pipeline) fn engine_limit(error: &EngineError) -> Option<ResourceLimit> {
     match error {
         EngineError::ResourceLimit(limit) => Some(*limit),
@@ -120,18 +120,18 @@ struct Limits {
     payload: usize,
 }
 
-/// The whole PAR3 allowance when the host cannot say how much memory it has.
+// The whole PAR3 allowance when the host cannot say how much memory it has.
 const UNKNOWN_MEMORY_TOTAL: u64 = 256 << 20;
 
-/// The least a profile leaves PAR3 on a host that says how much memory it has:
-/// an eighth of it, up to this. A smaller profile trims a large machine's
-/// allowance, but on a small one it would push the allowance below what the
-/// sets it can download need, and a refusal there demotes the set.
+// The least a profile leaves PAR3 on a host that says how much memory it has:
+// an eighth of it, up to this. A smaller profile trims a large machine's
+// allowance, but on a small one it would push the allowance below what the
+// sets it can download need, and a refusal there demotes the set.
 const SMALL_HOST_FLOOR: u64 = 128 << 20;
 
-/// The widest profile's share, in force until a pipeline puts its profile's
-/// share in place, so a process that never chose a profile sizes PAR3 as the
-/// widest profile does.
+// The widest profile's share, in force until a pipeline puts its profile's
+// share in place, so a process that never chose a profile sizes PAR3 as the
+// widest profile does.
 const DEFAULT_SHARE: MemoryShare = MemoryShare {
     divisor: 8,
     cap_bytes: 2 << 30,
@@ -139,11 +139,11 @@ const DEFAULT_SHARE: MemoryShare = MemoryShare {
 
 static MEMORY_SHARE: Mutex<MemoryShare> = Mutex::new(DEFAULT_SHARE);
 
-/// Put the hardware profile in force's PAR3 share behind the budgets.
-///
-/// The budgets are built once, on first PAR3 use, from whatever share is in
-/// place at that moment; the engine's budget cannot be resized under the work
-/// already charged to it, so a later change only matters until then.
+// Put the hardware profile in force's PAR3 share behind the budgets.
+//
+// The budgets are built once, on first PAR3 use, from whatever share is in
+// place at that moment; the engine's budget cannot be resized under the work
+// already charged to it, so a later change only matters until then.
 pub(in crate::pipeline) fn set_memory_share(share: MemoryShare) {
     *MEMORY_SHARE
         .lock()
@@ -178,7 +178,7 @@ pub(super) struct Budget {
 }
 
 impl Budget {
-    /// Bytes currently held by live reservations against this budget.
+    // Bytes currently held by live reservations against this budget.
     fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
     }
@@ -274,8 +274,8 @@ impl Budgets {
         }
     }
 
-    /// Host-side bytes currently reserved across both weaver-owned budgets.
-    /// The engine's own reservations are reported separately by its budget.
+    // Host-side bytes currently reserved across both weaver-owned budgets.
+    // The engine's own reservations are reported separately by its budget.
     pub fn host_used(&self) -> u64 {
         (self.metadata.used() as u64).saturating_add(self.payload.used() as u64)
     }
@@ -320,14 +320,14 @@ pub(super) fn budgets() -> &'static Budgets {
     })
 }
 
-/// Whether the engine's own native budget is what refused.
-///
-/// A charge against that budget now names the memory category it pays for, so
-/// the label is one of the engine's category names rather than the single
-/// `memory budget` string every charge used to report. `Uncategorized` still
-/// carries that string, so nothing that refused before stops being recognised;
-/// the two labels beside the categories are refusals the budget raises without
-/// charging a category.
+// Whether the engine's own native budget is what refused.
+//
+// A charge against that budget now names the memory category it pays for, so
+// the label is one of the engine's category names rather than the single
+// `memory budget` string every charge used to report. `Uncategorized` still
+// carries that string, so nothing that refused before stops being recognised;
+// the two labels beside the categories are refusals the budget raises without
+// charging a category.
 pub(super) fn is_native_pressure(error: &EngineError) -> bool {
     limit_label(error).is_some_and(|label| {
         matches!(label, "minimum repair stripe" | "open handles")
@@ -368,8 +368,8 @@ pub(super) fn pressure_source(error: &std::io::Error) -> Option<SourceId> {
         .and_then(error_pressure_source)
 }
 
-/// Native repair wraps source errors after staging or installing output.
-/// The caller must reconcile those installations before acting on the source.
+// Native repair wraps source errors after staging or installing output.
+// The caller must reconcile those installations before acting on the source.
 pub(super) fn error_pressure_source(error: &EngineError) -> Option<SourceId> {
     match error {
         EngineError::Io(error) => pressure_source(error),
@@ -378,14 +378,14 @@ pub(super) fn error_pressure_source(error: &EngineError) -> Option<SourceId> {
     }
 }
 
-/// A real engine refusal of the requested cause, for tests that have to hand a
-/// `ResourceLimit` to code that classifies one.
-///
-/// par3-rs is the only crate that can build one: the struct is
-/// `#[non_exhaustive]` and both its constructors are crate-private. Rather than
-/// model what a refusal would look like, this provokes the engine into
-/// producing one through its published APIs, so the numbers and the `cause()`
-/// are the engine's own.
+// A real engine refusal of the requested cause, for tests that have to hand a
+// `ResourceLimit` to code that classifies one.
+//
+// par3-rs is the only crate that can build one: the struct is
+// `#[non_exhaustive]` and both its constructors are crate-private. Rather than
+// model what a refusal would look like, this provokes the engine into
+// producing one through its published APIs, so the numbers and the `cause()`
+// are the engine's own.
 #[cfg(test)]
 pub(in crate::pipeline) fn engine_refusal(cause: par3_rs::runtime::LimitCause) -> ResourceLimit {
     use par3_rs::runtime::{ExecutionOptions, HandleBudget, LimitCause};

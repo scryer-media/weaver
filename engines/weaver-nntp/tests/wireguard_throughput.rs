@@ -1,4 +1,4 @@
-//! Opt-in encrypted download measurements using only loopback fixtures.
+// Opt-in encrypted download measurements using only loopback fixtures.
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

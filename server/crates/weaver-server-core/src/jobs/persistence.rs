@@ -15,8 +15,8 @@ use crate::persistence::sql_runtime::{
 };
 use sqlx::{Postgres, QueryBuilder, Sqlite};
 
-/// Submission values are always plaintext, even when they resemble our stored
-/// envelope prefix. Encrypt them once at the database boundary.
+// Submission values are always plaintext, even when they resemble our stored
+// envelope prefix. Encrypt them once at the database boundary.
 pub(super) fn encrypt_archive_password(
     key: Option<&crate::persistence::encryption::EncryptionKey>,
     password: Option<&str>,
@@ -390,13 +390,13 @@ async fn bulk_upsert_file_identities_tx(
     Ok(())
 }
 
-/// Update `active_files.filename` for each identity's `current_filename`, the
-/// sibling write [`Database::save_file_identity`] performs alongside the
-/// identity upsert. Rows whose `active_files` entry does not yet exist (file
-/// not completed) are simply not matched, exactly as the single-row path. Runs
-/// inside the caller's transaction: Postgres batches with `UPDATE ... FROM
-/// (VALUES ...)`, SQLite issues per-row updates (local to the serialized
-/// writer, so the extra statements are cheap).
+// Update `active_files.filename` for each identity's `current_filename`, the
+// sibling write [`Database::save_file_identity`] performs alongside the
+// identity upsert. Rows whose `active_files` entry does not yet exist (file
+// not completed) are simply not matched, exactly as the single-row path. Runs
+// inside the caller's transaction: Postgres batches with `UPDATE ... FROM
+// (VALUES ...)`, SQLite issues per-row updates (local to the serialized
+// writer, so the extra statements are cheap).
 async fn bulk_update_active_files_filenames_tx(
     tx: &mut SqlTx<'_>,
     job_id: JobId,
@@ -445,11 +445,11 @@ async fn bulk_update_active_files_filenames_tx(
     Ok(())
 }
 
-/// Build the Postgres autocommit statement that inserts `row_count` extracted
-/// members guarded by a `FOR KEY SHARE` lock on the owning job. `$1` is the
-/// guard `job_id`; each row then binds `(job_id, member_name, output_path,
-/// output_size)`. Explicit casts on the first VALUES row give Postgres the
-/// column types it cannot infer from all-parameter rows.
+// Build the Postgres autocommit statement that inserts `row_count` extracted
+// members guarded by a `FOR KEY SHARE` lock on the owning job. `$1` is the
+// guard `job_id`; each row then binds `(job_id, member_name, output_path,
+// output_size)`. Explicit casts on the first VALUES row give Postgres the
+// column types it cannot infer from all-parameter rows.
 fn build_extracted_members_pg_sql(row_count: usize) -> String {
     let mut values = String::new();
     for row in 0..row_count {
@@ -474,14 +474,14 @@ fn build_extracted_members_pg_sql(row_count: usize) -> String {
     )
 }
 
-/// How a persisted completed-file MD5 was obtained. Legacy rows predate this
-/// distinction (NULL in `active_files.md5_provenance`) and are never trusted
-/// for quick verification — they can identify a file, not certify it.
+// How a persisted completed-file MD5 was obtained. Legacy rows predate this
+// distinction (NULL in `active_files.md5_provenance`) and are never trusted
+// for quick verification — they can identify a file, not certify it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletedHashProvenance {
-    /// Folded from the decode pass over the downloaded bytes themselves.
+    // Folded from the decode pass over the downloaded bytes themselves.
     Streamed,
-    /// Confirmed by an actual PAR2 verification pass over the file.
+    // Confirmed by an actual PAR2 verification pass over the file.
     Verified,
 }
 
@@ -494,10 +494,10 @@ impl CompletedHashProvenance {
     }
 }
 
-/// Build the Postgres autocommit statement that upserts `row_count` completed
-/// files guarded by a `FOR KEY SHARE` lock on the owning job, mirroring the
-/// single-row [`Database::complete_file_with_optional_hash`] shape. `$1` is the
-/// guard `job_id`; each row then binds `(job_id, file_index, filename, md5)`.
+// Build the Postgres autocommit statement that upserts `row_count` completed
+// files guarded by a `FOR KEY SHARE` lock on the owning job, mirroring the
+// single-row [`Database::complete_file_with_optional_hash`] shape. `$1` is the
+// guard `job_id`; each row then binds `(job_id, file_index, filename, md5)`.
 fn build_complete_files_pg_sql(row_count: usize) -> String {
     let mut values = String::new();
     for row in 0..row_count {
@@ -621,9 +621,9 @@ impl Database {
         })
     }
 
-    /// Performs the inexpensive first half of SCORE materialization before a
-    /// pipeline creates a work directory. The transactional check below remains
-    /// authoritative; this keeps a known-stale submit from allocating anything.
+    // Performs the inexpensive first half of SCORE materialization before a
+    // pipeline creates a work directory. The transactional check below remains
+    // authoritative; this keeps a known-stale submit from allocating anything.
     pub(crate) fn semantic_materialization_is_current(
         &self,
         job_id: JobId,
@@ -646,8 +646,8 @@ impl Database {
         })
     }
 
-    /// Checks an owned promotion lease before the scheduler allocates a
-    /// working directory. The materialization transaction repeats this CAS.
+    // Checks an owned promotion lease before the scheduler allocates a
+    // working directory. The materialization transaction repeats this CAS.
     pub(crate) fn semantic_promotion_materialization_is_current(
         &self,
         job_id: JobId,
@@ -675,10 +675,10 @@ impl Database {
         })
     }
 
-    /// Atomically turns a reserved duplicate admission into an active job. A
-    /// SCORE caller supplies the generation it received at admission; parking
-    /// or superseding that candidate invalidates the generation before any
-    /// stale request can create scheduler work.
+    // Atomically turns a reserved duplicate admission into an active job. A
+    // SCORE caller supplies the generation it received at admission; parking
+    // or superseding that candidate invalidates the generation before any
+    // stale request can create scheduler work.
     pub(crate) fn materialize_active_job_with_file_identities(
         &self,
         job: &ActiveJob,
@@ -960,9 +960,9 @@ impl Database {
         Ok(())
     }
 
-    /// Persist the manual queue order as one transaction. Positions are the
-    /// full current order (small: one row per queued job) so restores sort by
-    /// `queue_position` and land in the exact user-arranged sequence.
+    // Persist the manual queue order as one transaction. Positions are the
+    // full current order (small: one row per queued job) so restores sort by
+    // `queue_position` and land in the exact user-arranged sequence.
     pub fn update_active_job_queue_positions(
         &self,
         positions: &[(JobId, i64)],
@@ -1043,10 +1043,10 @@ impl Database {
         )
     }
 
-    /// [`Self::set_active_job_runtime`] that also moves the job's recorded
-    /// output directory in the same statement, so a restart can never read the
-    /// new runtime against the old location or the other way round. `None`
-    /// keeps the directory already recorded.
+    // [`Self::set_active_job_runtime`] that also moves the job's recorded
+    // output directory in the same statement, so a restart can never read the
+    // new runtime against the old location or the other way round. `None`
+    // keeps the directory already recorded.
     #[expect(
         clippy::too_many_arguments,
         reason = "active job runtime is persisted as one atomic SQL update"
@@ -1326,12 +1326,12 @@ impl Database {
         })
     }
 
-    /// Complete a batch of files for a single job, the bulk counterpart to
-    /// [`Self::complete_file_with_optional_hash`]. Each entry is
-    /// `(file_index, filename, optional md5)`; the guard semantics match the
-    /// single-file path (an absent `active_jobs` row inserts nothing). Postgres
-    /// runs one autocommit `FOR KEY SHARE`-guarded multi-row upsert per chunk;
-    /// SQLite guards once inside a transaction then bulk-upserts in chunks.
+    // Complete a batch of files for a single job, the bulk counterpart to
+    // [`Self::complete_file_with_optional_hash`]. Each entry is
+    // `(file_index, filename, optional md5)`; the guard semantics match the
+    // single-file path (an absent `active_jobs` row inserts nothing). Postgres
+    // runs one autocommit `FOR KEY SHARE`-guarded multi-row upsert per chunk;
+    // SQLite guards once inside a transaction then bulk-upserts in chunks.
     pub fn complete_files(
         &self,
         job_id: JobId,
@@ -1639,15 +1639,15 @@ impl Database {
         })
     }
 
-    /// Persist a batch of file identities for a single job in ONE transaction.
-    ///
-    /// This is the bulk counterpart to [`Self::save_file_identity`]: it upserts
-    /// every `active_file_identities` row via [`bulk_upsert_file_identities_tx`]
-    /// AND performs the sibling `active_files.filename` update that the bulk tx
-    /// helper omits, so callers converting a per-identity loop keep identical
-    /// semantics. Postgres runs one `UPDATE ... FROM (VALUES ...)` per chunk;
-    /// SQLite issues per-row `UPDATE`s inside the same transaction (cheap and
-    /// local to the serialized writer).
+    // Persist a batch of file identities for a single job in ONE transaction.
+    //
+    // This is the bulk counterpart to [`Self::save_file_identity`]: it upserts
+    // every `active_file_identities` row via [`bulk_upsert_file_identities_tx`]
+    // AND performs the sibling `active_files.filename` update that the bulk tx
+    // helper omits, so callers converting a per-identity loop keep identical
+    // semantics. Postgres runs one `UPDATE ... FROM (VALUES ...)` per chunk;
+    // SQLite issues per-row `UPDATE`s inside the same transaction (cheap and
+    // local to the serialized writer).
     pub fn save_file_identities(
         &self,
         job_id: JobId,
@@ -2112,16 +2112,16 @@ impl Database {
         )
     }
 
-    /// Persist a batch of extracted archive members for a single job.
-    ///
-    /// Each `output_path` is stat'd (blocking IO — callers run this via
-    /// `spawn_blocking`) to record its on-disk size; an entry whose stat fails
-    /// is skipped and logged rather than failing the whole batch, matching the
-    /// per-member error tolerance of the RAR extraction scheduler. Surviving
-    /// rows are inserted multi-row in bind-budget-sized chunks: Postgres runs
-    /// one autocommit statement per chunk guarded by a `FOR KEY SHARE` CTE on
-    /// `active_jobs`; SQLite guards once inside a transaction then bulk-inserts,
-    /// mirroring [`Self::save_rar_volume_facts`].
+    // Persist a batch of extracted archive members for a single job.
+    //
+    // Each `output_path` is stat'd (blocking IO — callers run this via
+    // `spawn_blocking`) to record its on-disk size; an entry whose stat fails
+    // is skipped and logged rather than failing the whole batch, matching the
+    // per-member error tolerance of the RAR extraction scheduler. Surviving
+    // rows are inserted multi-row in bind-budget-sized chunks: Postgres runs
+    // one autocommit statement per chunk guarded by a `FOR KEY SHARE` CTE on
+    // `active_jobs`; SQLite guards once inside a transaction then bulk-inserts,
+    // mirroring [`Self::save_rar_volume_facts`].
     pub fn add_extracted_members(
         &self,
         job_id: JobId,
@@ -2800,19 +2800,19 @@ impl Database {
         })
     }
 
-    /// Replaces the direct-store coverage checkpoint for one archive set.
-    ///
-    /// One statement, one row, one encoded blob — the whole checkpoint,
-    /// including every per-volume floor. A barrier must cost the same number of
-    /// round trips on a 2 000-volume set as on a single-volume one, which is
-    /// why nothing here is normalized per volume.
-    ///
-    /// **Single writer per (job, set).** This is an unconditional replace: the
-    /// generation counter lives inside the blob, not in the predicate, so a
-    /// stale writer would overwrite a newer checkpoint with older floors and
-    /// nothing would notice. Exactly one pipeline owns a job's archive sets,
-    /// which is what makes that unreachable; a second concurrent writer would
-    /// need a generation guard in this statement first.
+    // Replaces the direct-store coverage checkpoint for one archive set.
+    //
+    // One statement, one row, one encoded blob — the whole checkpoint,
+    // including every per-volume floor. A barrier must cost the same number of
+    // round trips on a 2 000-volume set as on a single-volume one, which is
+    // why nothing here is normalized per volume.
+    //
+    // **Single writer per (job, set).** This is an unconditional replace: the
+    // generation counter lives inside the blob, not in the predicate, so a
+    // stale writer would overwrite a newer checkpoint with older floors and
+    // nothing would notice. Exactly one pipeline owns a job's archive sets,
+    // which is what makes that unreachable; a second concurrent writer would
+    // need a generation guard in this statement first.
     pub fn save_direct_coverage(
         &self,
         job_id: JobId,
@@ -2865,9 +2865,9 @@ impl Database {
         })
     }
 
-    /// Retires one archive set's direct-store coverage checkpoint. Repair over
-    /// checkpoint-covered output deletes the row and lets the next barrier
-    /// recreate coverage from scratch.
+    // Retires one archive set's direct-store coverage checkpoint. Repair over
+    // checkpoint-covered output deletes the row and lets the next barrier
+    // recreate coverage from scratch.
     pub fn delete_direct_coverage(&self, job_id: JobId, set_name: &str) -> Result<(), StateError> {
         let datastore = self.datastore();
         let set_name = set_name.to_string();

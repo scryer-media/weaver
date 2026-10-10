@@ -1,4 +1,4 @@
-//! `tests` tests, part of a mechanical split of the original file.
+// `tests` tests, part of a mechanical split of the original file.
 
 use super::*;
 
@@ -468,10 +468,10 @@ fn escapes_prometheus_label_values() {
     );
 }
 
-/// The regression that motivated the descriptor rewrite: label sets were
-/// restated by hand next to the enum they mirrored, so `Scheduled`,
-/// `queued_post_processing` and `post_processing` were all collected by the
-/// runtime and then dropped on the floor at scrape time.
+// The regression that motivated the descriptor rewrite: label sets were
+// restated by hand next to the enum they mirrored, so `Scheduled`,
+// `queued_post_processing` and `post_processing` were all collected by the
+// runtime and then dropped on the floor at scrape time.
 #[test]
 fn rendered_label_sets_cover_every_enum_variant() {
     let snapshot = populated_metrics_snapshot();
@@ -555,9 +555,9 @@ fn rendered_label_sets_cover_every_enum_variant() {
     );
 }
 
-/// Label sets backed by a group of snapshot counters rather than an enum. The
-/// exporter derives these from exhaustive `match`/tuple lists; this pins the
-/// three that had drifted.
+// Label sets backed by a group of snapshot counters rather than an enum. The
+// exporter derives these from exhaustive `match`/tuple lists; this pins the
+// three that had drifted.
 #[test]
 fn rendered_label_sets_cover_every_snapshot_counter() {
     let snapshot = populated_metrics_snapshot();
@@ -656,8 +656,8 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
     );
 }
 
-/// Every `JobStatus` variant must land on a label the aggregate gauge also
-/// emits, or a job silently stops being counted anywhere.
+// Every `JobStatus` variant must land on a label the aggregate gauge also
+// emits, or a job silently stops being counted anywhere.
 #[test]
 fn job_status_labels_cover_every_variant() {
     let statuses = [
@@ -781,9 +781,9 @@ fn server_state_renders_as_a_state_set_with_reasons() {
     ));
 }
 
-/// The collection API's snapshots must reach the exposition intact: the right
-/// labels, and — for the six histogram families — cumulative `le` buckets with
-/// a matching `_sum`/`_count`.
+// The collection API's snapshots must reach the exposition intact: the right
+// labels, and — for the six histogram families — cumulative `le` buckets with
+// a matching `_sum`/`_count`.
 #[test]
 fn renders_collected_instrumentation_snapshots() {
     let rendered = fully_populated_render();
@@ -931,9 +931,9 @@ fn renders_collected_instrumentation_snapshots() {
     assert!(rendered.contains("weaver_http_request_duration_seconds_count{route=\"/graphql\"} 6"));
 }
 
-/// Collection surfaces that have not measured anything must be absent, not
-/// zero: "this stage was never timed" and "this stage always took no time" are
-/// different facts and must not render identically.
+// Collection surfaces that have not measured anything must be absent, not
+// zero: "this stage was never timed" and "this stage always took no time" are
+// different facts and must not render identically.
 #[test]
 fn absent_instrumentation_omits_its_families() {
     let snapshot = populated_metrics_snapshot();
@@ -992,10 +992,10 @@ fn absent_instrumentation_omits_its_families() {
     assert!(partial.contains("process_start_time_seconds 1700000000"));
 }
 
-/// The catalogue and the renderer must describe the same set of families in
-/// both directions: a family in the catalogue that nothing emits is dead
-/// documentation, and a family emitted without a catalogue entry has escaped
-/// the descriptor discipline entirely.
+// The catalogue and the renderer must describe the same set of families in
+// both directions: a family in the catalogue that nothing emits is dead
+// documentation, and a family emitted without a catalogue entry has escaped
+// the descriptor discipline entirely.
 #[test]
 fn metric_catalog_matches_rendered_families() {
     let rendered = fully_populated_render();
@@ -1019,13 +1019,13 @@ fn metric_catalog_matches_rendered_families() {
     );
 }
 
-/// Print the catalogue as the markdown table the published metric reference
-/// carries.
-///
-/// Ignored by default because it produces output rather than checking
-/// anything; run it with
-/// `cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture`
-/// and paste the result over that table when families change.
+// Print the catalogue as the markdown table the published metric reference
+// carries.
+//
+// Ignored by default because it produces output rather than checking
+// anything; run it with
+// `cargo test -p weaver regenerate_docs_metrics_table -- --ignored --nocapture`
+// and paste the result over that table when families change.
 #[test]
 #[ignore = "documentation generator; produces output instead of assertions"]
 fn regenerate_docs_metrics_table() {
@@ -1082,15 +1082,15 @@ fn metric_catalog_uses_exporter_namespaces() {
     );
 }
 
-/// The first family in `rendered` whose lines are not one contiguous group,
-/// or `None` when every family is emitted once, start to finish.
-///
-/// A family owns its `# HELP`, its `# TYPE` and every sample that follows,
-/// and the exposition format requires all of them together. Nothing else here
-/// checks that: the duplicate-HELP gate catches a second descriptor, but a
-/// renderer that emits one descriptor and then alternates two families'
-/// samples passes every naming, typing and duplication rule while producing
-/// text a scraper is entitled to reject.
+// The first family in `rendered` whose lines are not one contiguous group,
+// or `None` when every family is emitted once, start to finish.
+//
+// A family owns its `# HELP`, its `# TYPE` and every sample that follows,
+// and the exposition format requires all of them together. Nothing else here
+// checks that: the duplicate-HELP gate catches a second descriptor, but a
+// renderer that emits one descriptor and then alternates two families'
+// samples passes every naming, typing and duplication rule while producing
+// text a scraper is entitled to reject.
 fn interleaved_family(rendered: &str) -> Option<String> {
     // Only summaries and histograms own suffixed series, and only once their
     // base family has declared a TYPE, so a sample is attributed by stripping
@@ -1135,7 +1135,7 @@ fn interleaved_family(rendered: &str) -> Option<String> {
     None
 }
 
-/// Every family the exporter renders arrives as one uninterrupted group.
+// Every family the exporter renders arrives as one uninterrupted group.
 #[test]
 fn rendered_families_are_emitted_as_contiguous_groups() {
     // The detector itself has to be able to see the fault, or its silence
@@ -1168,9 +1168,9 @@ weaver_example_peak_bytes{slot=\"b\"} 2
     );
 }
 
-/// The encoder's histogram helper is the surface the pipeline's bucketed
-/// latency snapshots will render through, so pin its cumulative-`le` output
-/// before anything depends on it.
+// The encoder's histogram helper is the surface the pipeline's bucketed
+// latency snapshots will render through, so pin its cumulative-`le` output
+// before anything depends on it.
 #[test]
 fn encoder_renders_cumulative_histogram_buckets() {
     static SAMPLE_HISTOGRAM: metrics::encode::MetricFamily = metrics::encode::MetricFamily {
@@ -1281,11 +1281,11 @@ async fn response_compression_supports_deflate() {
     );
 }
 
-/// The pool the article buffers are carved from, and the process total they
-/// are part of.
-///
-/// Reported in bytes rather than in buffers: the three tiers hold different
-/// buffer sizes, so only bytes add up to a share of the resident set.
+// The pool the article buffers are carved from, and the process total they
+// are part of.
+//
+// Reported in bytes rather than in buffers: the three tiers hold different
+// buffer sizes, so only bytes add up to a share of the resident set.
 #[test]
 fn renders_the_buffer_pool_and_the_process_resident_set() {
     use weaver_server_core::runtime::buffers::BufferPoolMetrics;

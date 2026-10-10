@@ -1,44 +1,44 @@
-//! The controller: deciding which archive sets to chase, feeding the chase, and
-//! ending it.
-//!
-//! # Where a chase begins
-//!
-//! A **split** set arms off its topology, which is built when one of its parts
-//! finishes downloading. That is the earliest moment the *ordered part list*
-//! exists, and the gated reader is nothing without it: the archive stream is
-//! the concatenation of those parts in that order. The topology names every
-//! part, complete or not, so the chase starts with parts still arriving.
-//!
-//! A **single** `.7z` has no order to discover, so it does not wait for a
-//! topology at all — it arms as a one-part set the moment its first 32 bytes
-//! are committed, which is the earliest anything can be known about it. Its
-//! length is the header's word until the file finishes; completion settles it,
-//! and a disagreement aborts the set rather than feeding the decoder a stream
-//! that is not the archive the header described.
-//!
-//! A single ZIP (including ZIP64) arms from its committed final article's
-//! extent. Its central directory can be read through committed tail ranges
-//! while the decoder parks on missing payload ranges. Completion and PAR2
-//! still decide whether the staged output can be installed.
-//!
-//! TAR and single-stream compression start with committed opening bytes and
-//! discover EOF from part completion. Plain split files use the same sequential
-//! reader once topology supplies their ordered part list.
-//!
-//! RAR4/RAR5 open physical header prefixes and follow each member's packed
-//! stream across volume boundaries. Mixed direct-store sets publish committed
-//! virtual-volume views; their chaser writes only the tolerated members.
-//! Stored member output remains owned by the direct router.
-//!
-//! Admission is retried, not latched, while the answer is merely "not yet" — no
-//! bytes on part one, no topology. It latches permanently on a real refusal, so
-//! a malformed archive is examined once and never again.
-//!
-//! # What the chase costs when it is off
-//!
-//! The watermark hook sits on the download's commit path, so its cost when the
-//! feature is dark has to be indistinguishable from zero: one `is_empty` on a
-//! map, and nothing else — no hashing, no allocation, no lock.
+// The controller: deciding which archive sets to chase, feeding the chase, and
+// ending it.
+//
+// # Where a chase begins
+//
+// A **split** set arms off its topology, which is built when one of its parts
+// finishes downloading. That is the earliest moment the *ordered part list*
+// exists, and the gated reader is nothing without it: the archive stream is
+// the concatenation of those parts in that order. The topology names every
+// part, complete or not, so the chase starts with parts still arriving.
+//
+// A **single** `.7z` has no order to discover, so it does not wait for a
+// topology at all — it arms as a one-part set the moment its first 32 bytes
+// are committed, which is the earliest anything can be known about it. Its
+// length is the header's word until the file finishes; completion settles it,
+// and a disagreement aborts the set rather than feeding the decoder a stream
+// that is not the archive the header described.
+//
+// A single ZIP (including ZIP64) arms from its committed final article's
+// extent. Its central directory can be read through committed tail ranges
+// while the decoder parks on missing payload ranges. Completion and PAR2
+// still decide whether the staged output can be installed.
+//
+// TAR and single-stream compression start with committed opening bytes and
+// discover EOF from part completion. Plain split files use the same sequential
+// reader once topology supplies their ordered part list.
+//
+// RAR4/RAR5 open physical header prefixes and follow each member's packed
+// stream across volume boundaries. Mixed direct-store sets publish committed
+// virtual-volume views; their chaser writes only the tolerated members.
+// Stored member output remains owned by the direct router.
+//
+// Admission is retried, not latched, while the answer is merely "not yet" — no
+// bytes on part one, no topology. It latches permanently on a real refusal, so
+// a malformed archive is examined once and never again.
+//
+// # What the chase costs when it is off
+//
+// The watermark hook sits on the download's commit path, so its cost when the
+// feature is dark has to be indistinguishable from zero: one `is_empty` on a
+// map, and nothing else — no hashing, no allocation, no lock.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -60,12 +60,12 @@ use crate::pipeline::completion::finalize::extract::{
 };
 use crate::pipeline::extraction::ExtractionRoot;
 
-/// Buffer between the decoder and the gated reader.
-///
-/// The gated reader returns short reads at the download frontier — it serves
-/// what is committed and no more — and an unbuffered decoder would turn that
-/// into a syscall per fragment. 128 KiB is large enough to amortise that and
-/// small enough that a park never sits on a mostly-empty buffer.
+// Buffer between the decoder and the gated reader.
+//
+// The gated reader returns short reads at the download frontier — it serves
+// what is committed and no more — and an unbuffered decoder would turn that
+// into a syscall per fragment. 128 KiB is large enough to amortise that and
+// small enough that a park never sits on a mostly-empty buffer.
 const CHASE_BUFFER_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Copy)]
@@ -77,32 +77,32 @@ enum ChaseFormat {
     Sequential(crate::pipeline::completion::finalize::SimpleArchiveKind),
 }
 
-/// Why a set will never be chased.
-///
-/// Every variant is permanent for that set: the conventional path still
-/// extracts it, so a refusal costs nothing but the chase.
+// Why a set will never be chased.
+//
+// Every variant is permanent for that set: the conventional path still
+// extracts it, so a refusal costs nothing but the chase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusalReason {
-    /// The first part's opening bytes could not be read.
+    // The first part's opening bytes could not be read.
     HeaderUnreadable,
-    /// The bytes are not a valid 7z signature header (bad magic, bad CRC).
+    // The bytes are not a valid 7z signature header (bad magic, bad CRC).
     HeaderMalformed,
-    /// The header declares no end header, so there is no entry table to decode.
+    // The header declares no end header, so there is no entry table to decode.
     EmptyEndHeader,
-    /// The declared end header is larger than the extraction memory budget
-    /// would allow the decoder to buffer.
+    // The declared end header is larger than the extraction memory budget
+    // would allow the decoder to buffer.
     EndHeaderTooLarge,
-    /// The declared lengths do not describe a coherent archive.
+    // The declared lengths do not describe a coherent archive.
     LengthOverflow,
-    /// The chase could not get an extraction budget.
+    // The chase could not get an extraction budget.
     BudgetUnavailable,
-    /// Every chase worker is already occupied. Admitting another would arm a
-    /// chase that cannot start, and extraction awaits a started chase without a
-    /// deadline.
+    // Every chase worker is already occupied. Admitting another would arm a
+    // chase that cannot start, and extraction awaits a started chase without a
+    // deadline.
     NoChaseCapacity,
-    /// Another job currently outranks this one for article dispatch. This job
-    /// is only being served the scraps the hot job leaves, so its chase would
-    /// hold a worker and a staging tree for a download that is not moving.
+    // Another job currently outranks this one for article dispatch. This job
+    // is only being served the scraps the hot job leaves, so its chase would
+    // hold a worker and a staging tree for a download that is not moving.
     JobNotHot,
 }
 
@@ -121,61 +121,61 @@ impl RefusalReason {
     }
 }
 
-/// Prefix on a worker error that means the chase never got a staging tree, so
-/// the reap can tell it apart from a decode failure.
+// Prefix on a worker error that means the chase never got a staging tree, so
+// the reap can tell it apart from a decode failure.
 const STAGING_UNAVAILABLE: &str = "direct-unpack staging directory unavailable";
 
-/// How long a worker may keep running after its set was aborted before the drain
-/// reap says so. Generous: a decode that is mid-member finishes on its own.
+// How long a worker may keep running after its set was aborted before the drain
+// reap says so. Generous: a decode that is mid-member finishes on its own.
 const DRAINING_WORKER_WARN_AFTER: Duration = Duration::from_secs(30);
 
-/// Which half of the end-of-download settle is running.
-///
-/// The two passes differ only in what they do about a part the assembly cannot
-/// yet describe: the lenient one leaves it for the completion commit still in
-/// flight, and the strict one — which runs only once decode has drained — ends
-/// the chase, because no such commit is coming.
+// Which half of the end-of-download settle is running.
+//
+// The two passes differ only in what they do about a part the assembly cannot
+// yet describe: the lenient one leaves it for the completion commit still in
+// flight, and the strict one — which runs only once decode has drained — ends
+// the chase, because no such commit is coming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettlePass {
     Lenient,
     Strict,
 }
 
-/// Whether an aborted set may ever be chased again.
+// Whether an aborted set may ever be chased again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbortLatch {
-    /// Never re-arm: the archive, the topology, or the job is gone.
+    // Never re-arm: the archive, the topology, or the job is gone.
     Permanent,
-    /// May re-arm later. The bytes stopped for a reason that says nothing about
-    /// the archive — a pause, say — so a later part completion can try again.
+    // May re-arm later. The bytes stopped for a reason that says nothing about
+    // the archive — a pause, say — so a later part completion can try again.
     Retryable,
 }
 
-/// Why an armed set stopped being chased.
+// Why an armed set stopped being chased.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DemotionReason {
-    /// The download ended before the chase could finish.
+    // The download ended before the chase could finish.
     DownloadEnded,
-    /// A part file could not be opened or read — usually a rename that raced
-    /// the chase.
+    // A part file could not be opened or read — usually a rename that raced
+    // the chase.
     PartUnreadable,
-    /// The decoder rejected the archive.
+    // The decoder rejected the archive.
     DecodeFailed,
-    /// The chase was parked holding decoder memory that a waiting extraction
-    /// needed, and gave it up. Nothing is wrong with the archive.
+    // The chase was parked holding decoder memory that a waiting extraction
+    // needed, and gave it up. Nothing is wrong with the archive.
     MemoryYielded,
-    /// PAR2 repair replaced bytes the chase had already read.
+    // PAR2 repair replaced bytes the chase had already read.
     RepairRewrote,
-    /// The chase was parked through a PAR2 repair, and the repair did not
-    /// finish. Distinct from [`Self::RepairRewrote`]: a failed repair rewrote
-    /// nothing, and the chase dies because the success that was going to lift
-    /// its damage caps never came.
+    // The chase was parked through a PAR2 repair, and the repair did not
+    // finish. Distinct from [`Self::RepairRewrote`]: a failed repair rewrote
+    // nothing, and the chase dies because the success that was going to lift
+    // its damage caps never came.
     RepairFailed,
-    /// The set was gated on recovery-set evidence that never arrived, and the
-    /// repair has concluded, so nothing will unpark it.
+    // The set was gated on recovery-set evidence that never arrived, and the
+    // repair has concluded, so nothing will unpark it.
     GatedStall,
-    /// The worker could not create or open its staging directory. Nothing is
-    /// wrong with the archive; the chase had nowhere to write.
+    // The worker could not create or open its staging directory. Nothing is
+    // wrong with the archive; the chase had nowhere to write.
     StagingUnavailable,
 }
 
@@ -194,45 +194,45 @@ impl DemotionReason {
     }
 }
 
-/// What a finished chase produced.
-///
-/// Consumption installs these members instead of decoding the set a second
-/// time, so the whole record is kept rather than reduced to a boolean: the
-/// member list, the byte totals the Extracting phase needs, and the directory
-/// to move from.
+// What a finished chase produced.
+//
+// Consumption installs these members instead of decoding the set a second
+// time, so the whole record is kept rather than reduced to a boolean: the
+// member list, the byte totals the Extracting phase needs, and the directory
+// to move from.
 pub struct ChaseOutcome {
     pub result: Result<FullSetExtractionOutcome, String>,
     pub elapsed: Duration,
     pub staging_dir: PathBuf,
-    /// Bytes the chase declared and wrote. Consumption attributes these to the
-    /// job's Extracting phase, which is otherwise never told about work that
-    /// happened before the phase began.
+    // Bytes the chase declared and wrote. Consumption attributes these to the
+    // job's Extracting phase, which is otherwise never told about work that
+    // happened before the phase began.
     pub total_bytes: u64,
     pub completed_bytes: u64,
-    /// Repair rewrote a source file after this chase read it.
+    // Repair rewrote a source file after this chase read it.
     pub tainted: bool,
-    /// The recovery data had reported damage in this set when the chase
-    /// finished, and no repair had lifted the report.
-    ///
-    /// A gated reader is only ever served vouched bytes, so a chase that
-    /// finishes under a standing report read the damaged range *before* the
-    /// report arrived — a short set decodes in the gap between its last commit
-    /// and the verdict for it. Its members are built on bytes the recovery data
-    /// calls wrong, and the report is still evidence finalize has to weigh once
-    /// the worker is gone.
-    ///
-    /// A chase that failed on those bytes carries the report the same way. Its
-    /// failure says the decoder could not use them, not that the set has been
-    /// answered for, and without the report the conventional extraction that
-    /// follows a demotion would read the same damage unrepaired.
+    // The recovery data had reported damage in this set when the chase
+    // finished, and no repair had lifted the report.
+    //
+    // A gated reader is only ever served vouched bytes, so a chase that
+    // finishes under a standing report read the damaged range *before* the
+    // report arrived — a short set decodes in the gap between its last commit
+    // and the verdict for it. Its members are built on bytes the recovery data
+    // calls wrong, and the report is still evidence finalize has to weigh once
+    // the worker is gone.
+    //
+    // A chase that failed on those bytes carries the report the same way. Its
+    // failure says the decoder could not use them, not that the set has been
+    // answered for, and without the report the conventional extraction that
+    // follows a demotion would read the same damage unrepaired.
     pub damage_reported: bool,
 }
 
 impl ChaseOutcome {
-    /// Break a usable outcome into the pieces consumption installs from.
-    ///
-    /// Only called on an outcome already known to be `Ok`, which is what
-    /// [`ChaseDisposition::Ready`] means.
+    // Break a usable outcome into the pieces consumption installs from.
+    //
+    // Only called on an outcome already known to be `Ok`, which is what
+    // [`ChaseDisposition::Ready`] means.
     pub(in crate::pipeline) fn into_installable(
         self,
     ) -> (FullSetExtractionOutcome, PathBuf, u64, u64) {
@@ -248,7 +248,7 @@ impl ChaseOutcome {
     }
 }
 
-/// Counters for the chase, by outcome.
+// Counters for the chase, by outcome.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DirectUnpackCounters {
     pub armed: u64,
@@ -269,18 +269,18 @@ pub struct DirectUnpackCounters {
     pub demoted_repair_failed: u64,
     pub demoted_gated_stall: u64,
     pub demoted_staging_unavailable: u64,
-    /// Chases whose members were installed instead of re-extracting.
+    // Chases whose members were installed instead of re-extracting.
     pub consumed: u64,
-    /// Chases whose output was thrown away in favour of conventional extraction.
+    // Chases whose output was thrown away in favour of conventional extraction.
     pub discarded: u64,
 }
 
-/// Publish one direct-unpack event.
-///
-/// Every call site is a per-*set* decision — arming, refusing, finishing,
-/// demoting, consuming — never a per-commit one. The watermark hook on the
-/// download path deliberately records nothing: the standing rule is that
-/// metrics never touch the hot path, and a counter there would be exactly that.
+// Publish one direct-unpack event.
+//
+// Every call site is a per-*set* decision — arming, refusing, finishing,
+// demoting, consuming — never a per-commit one. The watermark hook on the
+// download path deliberately records nothing: the standing rule is that
+// metrics never touch the hot path, and a counter there would be exactly that.
 fn record_event(name: &str) {
     crate::runtime::perf_probe::record_owned(
         format!("direct_unpack.{name}"),
@@ -318,7 +318,7 @@ impl DirectUnpackCounters {
     }
 }
 
-/// One set currently being chased.
+// One set currently being chased.
 struct ArmedSet {
     coverage: Arc<SetCoverage>,
     paths: Vec<PathBuf>,
@@ -328,19 +328,19 @@ struct ArmedSet {
     staging_dir: PathBuf,
     handle: tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>>,
     started_at: Instant,
-    /// When this set was aborted, for the zombie check in the drain reap.
+    // When this set was aborted, for the zombie check in the drain reap.
     aborted_at: Option<Instant>,
-    /// Whether the zombie warning has already been emitted for this worker, so
-    /// a worker that never exits says so once rather than every loop turn.
+    // Whether the zombie warning has already been emitted for this worker, so
+    // a worker that never exits says so once rather than every loop turn.
     zombie_announced: bool,
-    /// The chase's own byte counters, detached from the job's phase display.
-    /// Consumption copies these into the real phase so the Extracting bar shows
-    /// the work that actually happened, attributed exactly once.
+    // The chase's own byte counters, detached from the job's phase display.
+    // Consumption copies these into the real phase so the Extracting bar shows
+    // the work that actually happened, attributed exactly once.
     counters: Arc<crate::jobs::PhaseCounters>,
 }
 
-/// A chase that has not finished yet, handed to the extraction context so it
-/// can be awaited there rather than on the orchestrator loop.
+// A chase that has not finished yet, handed to the extraction context so it
+// can be awaited there rather than on the orchestrator loop.
 pub(in crate::pipeline) struct PendingChase {
     _cancel_on_drop: PendingChaseCancellation,
     pub(in crate::pipeline) budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
@@ -348,8 +348,8 @@ pub(in crate::pipeline) struct PendingChase {
         tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>>,
     pub(in crate::pipeline) staging_dir: PathBuf,
     pub(in crate::pipeline) counters: Arc<crate::jobs::PhaseCounters>,
-    /// The set's coverage, so the awaiting side can end the chase if it does not
-    /// finish in time rather than waiting on it forever.
+    // The set's coverage, so the awaiting side can end the chase if it does not
+    // finish in time rather than waiting on it forever.
     pub(in crate::pipeline) coverage: Arc<SetCoverage>,
     pub(in crate::pipeline) set_name: String,
 }
@@ -368,18 +368,18 @@ impl Drop for PendingChaseCancellation {
     }
 }
 
-/// How long consumption waits for a chase that has not finished.
-///
-/// Minutes, not seconds: every part is complete by the time this is reached, so
-/// the chase is finishing at disk speed, and a legitimate park through a large
-/// repair is normal. This is not a performance bound — it is the difference
-/// between a wedged job and a warning line, because the await used to have no
-/// deadline at all and a chase that never exits made extraction never return.
+// How long consumption waits for a chase that has not finished.
+//
+// Minutes, not seconds: every part is complete by the time this is reached, so
+// the chase is finishing at disk speed, and a legitimate park through a large
+// repair is normal. This is not a performance bound — it is the difference
+// between a wedged job and a warning line, because the await used to have no
+// deadline at all and a chase that never exits made extraction never return.
 pub(in crate::pipeline) const PENDING_CHASE_DEADLINE: Duration = Duration::from_secs(300);
 
-/// The deadline actually applied, so a test can drive the timeout path without
-/// waiting five minutes for it. Production always reads
-/// [`PENDING_CHASE_DEADLINE`].
+// The deadline actually applied, so a test can drive the timeout path without
+// waiting five minutes for it. Production always reads
+// [`PENDING_CHASE_DEADLINE`].
 #[cfg(test)]
 pub(in crate::pipeline) static PENDING_CHASE_DEADLINE_OVERRIDE: std::sync::Mutex<Option<Duration>> =
     std::sync::Mutex::new(None);
@@ -395,81 +395,81 @@ pub(in crate::pipeline) fn pending_chase_deadline() -> Duration {
     PENDING_CHASE_DEADLINE
 }
 
-/// What extraction should do about a set's chase.
+// What extraction should do about a set's chase.
 pub(in crate::pipeline) enum ChaseDisposition {
-    /// No usable chase; extract conventionally.
+    // No usable chase; extract conventionally.
     None,
-    /// A finished, untainted chase whose members are ready to install.
+    // A finished, untainted chase whose members are ready to install.
     Ready(Box<ChaseOutcome>),
-    /// A chase still running. Every part is complete by now, so it is finishing
-    /// at disk speed.
+    // A chase still running. Every part is complete by now, so it is finishing
+    // at disk speed.
     Pending(PendingChase),
 }
 
-/// Per-pipeline direct-unpack state.
+// Per-pipeline direct-unpack state.
 #[derive(Default)]
 pub(crate) struct DirectUnpackRuntime {
-    /// Resolved once at pipeline construction and never re-read, so a set
-    /// admitted under an enabled gate cannot find it disabled mid-chase.
-    /// `None` in tests that build a runtime by hand, where the gate falls back
-    /// to the all-defaults resolution: off.
+    // Resolved once at pipeline construction and never re-read, so a set
+    // admitted under an enabled gate cannot find it disabled mid-chase.
+    // `None` in tests that build a runtime by hand, where the gate falls back
+    // to the all-defaults resolution: off.
     settings: Option<DirectUnpackSettings>,
-    /// Sets currently being chased.
+    // Sets currently being chased.
     armed: HashMap<(JobId, String), ArmedSet>,
-    /// Single-file archives that have not been offered to arming yet.
-    ///
-    /// A split set arms off its topology, which appears when a part completes.
-    /// A single file has no topology until the whole thing has landed, so its
-    /// arming has to ride the commit path instead — and this set is what keeps
-    /// that ride free: when it is empty, which is every job that carries no
-    /// supported single-file archives, the hot path's added cost is one `is_empty`.
+    // Single-file archives that have not been offered to arming yet.
+    //
+    // A split set arms off its topology, which appears when a part completes.
+    // A single file has no topology until the whole thing has landed, so its
+    // arming has to ride the commit path instead — and this set is what keeps
+    // that ride free: when it is empty, which is every job that carries no
+    // supported single-file archives, the hot path's added cost is one `is_empty`.
     pending_single_arm: HashSet<crate::jobs::ids::NzbFileId>,
-    /// Coalesce article commits into bounded-frequency virtual source snapshots.
+    // Coalesce article commits into bounded-frequency virtual source snapshots.
     pending_virtual_refresh: HashSet<(JobId, usize)>,
     last_virtual_refresh: Option<Instant>,
-    /// Sets held parked through a PAR2 repair rather than tainted, because
-    /// every byte their decoder had already consumed was vouched for by the
-    /// recovery set. Released when the repair reports success.
+    // Sets held parked through a PAR2 repair rather than tainted, because
+    // every byte their decoder had already consumed was vouched for by the
+    // recovery set. Released when the repair reports success.
     parked_through_repair: HashSet<(JobId, String)>,
-    /// New chases cannot join after the repair vouching snapshot was taken.
+    // New chases cannot join after the repair vouching snapshot was taken.
     repairing_jobs: HashSet<JobId>,
-    /// Chases that have been woken with an abort and are awaiting a join. Kept
-    /// apart from `armed` so an abort can be signalled synchronously from the
-    /// paths that end a download, and joined later from the run loop.
+    // Chases that have been woken with an abort and are awaiting a join. Kept
+    // apart from `armed` so an abort can be signalled synchronously from the
+    // paths that end a download, and joined later from the run loop.
     draining: Vec<((JobId, String), ArmedSet)>,
-    /// Sets that will never arm again, with the reason they were refused.
+    // Sets that will never arm again, with the reason they were refused.
     latched: HashMap<(JobId, String), &'static str>,
-    /// Jobs whose download has drained at least once, so the strict settle pass
-    /// is entitled to run for them.
-    ///
-    /// Without this the strict pass would have no way to tell "the assembly does
-    /// not describe this part yet" from "the assembly will never describe this
-    /// part", and would end chases in the middle of a healthy download.
+    // Jobs whose download has drained at least once, so the strict settle pass
+    // is entitled to run for them.
+    //
+    // Without this the strict pass would have no way to tell "the assembly does
+    // not describe this part yet" from "the assembly will never describe this
+    // part", and would end chases in the middle of a healthy download.
     download_settled: HashSet<JobId>,
-    /// `filename -> (set name, part index)` per job, for the watermark hook.
-    /// Keyed so the hot path can look up by borrowed `&str` without allocating.
+    // `filename -> (set name, part index)` per job, for the watermark hook.
+    // Keyed so the hot path can look up by borrowed `&str` without allocating.
     watermark_targets: HashMap<JobId, HashMap<String, (String, usize)>>,
-    /// Finished chases, awaiting a consumer.
+    // Finished chases, awaiting a consumer.
     outcomes: HashMap<(JobId, String), ChaseOutcome>,
     counters: DirectUnpackCounters,
-    /// The generation the next arm stages into.
-    ///
-    /// Every arm gets a directory of its own, so a retired chase's tree can be
-    /// deleted while the set's next chase writes a disjoint one: there is no
-    /// ordering between the two and nothing to rename. Pipeline-wide rather
-    /// than per set, and never reset, because a job keeps its id through a
-    /// reprocess or a nested rebuild that forgets its chases — a per-job
-    /// counter restarted there would hand a new arm a path whose delete may
-    /// still be running.
+    // The generation the next arm stages into.
+    //
+    // Every arm gets a directory of its own, so a retired chase's tree can be
+    // deleted while the set's next chase writes a disjoint one: there is no
+    // ordering between the two and nothing to rename. Pipeline-wide rather
+    // than per set, and never reset, because a job keeps its id through a
+    // reprocess or a nested rebuild that forgets its chases — a per-job
+    // counter restarted there would hand a new arm a path whose delete may
+    // still be running.
     next_staging_generation: u64,
-    /// The staging directory each set's most recent arm was given, so a test
-    /// can find a chase's output after the chase has left every map.
+    // The staging directory each set's most recent arm was given, so a test
+    // can find a chase's output after the chase has left every map.
     #[cfg(test)]
     last_staging: HashMap<(JobId, String), PathBuf>,
-    /// Deletions of retired chases' staging trees that may still be running.
+    // Deletions of retired chases' staging trees that may still be running.
     staging_cleanups: Vec<tokio::task::JoinHandle<()>>,
-    /// Holds every staging deletion before it starts until a permit is
-    /// added, so a test can see the pipeline carry on while one is pending.
+    // Holds every staging deletion before it starts until a permit is
+    // added, so a test can see the pipeline carry on while one is pending.
     #[cfg(test)]
     pub(crate) staging_cleanup_hold: Option<Arc<tokio::sync::Semaphore>>,
 }
@@ -506,33 +506,33 @@ impl DirectUnpackRuntime {
         self.settings().gate
     }
 
-    /// Whether a chase is armed, draining or owed a refresh: the state the
-    /// reaper polls on every pipeline turn.
+    // Whether a chase is armed, draining or owed a refresh: the state the
+    // reaper polls on every pipeline turn.
     pub(crate) fn has_work_in_flight(&self) -> bool {
         !self.armed.is_empty()
             || !self.draining.is_empty()
             || !self.pending_virtual_refresh.is_empty()
     }
 
-    /// Outcome counters, as a snapshot.
-    ///
-    /// The exported metric surface is the per-event `direct_unpack.*` records
-    /// emitted at each decision; this snapshot exists so tests can assert on
-    /// the same numbers without scraping them back out.
+    // Outcome counters, as a snapshot.
+    //
+    // The exported metric surface is the per-event `direct_unpack.*` records
+    // emitted at each decision; this snapshot exists so tests can assert on
+    // the same numbers without scraping them back out.
     #[cfg(test)]
     pub(crate) fn counters(&self) -> DirectUnpackCounters {
         self.counters
     }
 
-    /// How many chase workers are actually spoken for.
-    ///
-    /// Not `armed.len()`. An aborted set leaves `armed` immediately and moves to
-    /// `draining`, but its worker keeps its `chase_pool` slot until it actually
-    /// returns — and a worker still queued inside `install` cannot even see the
-    /// abort, because the abort only pokes a coverage the closure has not
-    /// touched yet. Counting `armed` alone made those workers invisible and let
-    /// new sets arm past true capacity, which is how the pool filled with
-    /// chases that could never start.
+    // How many chase workers are actually spoken for.
+    //
+    // Not `armed.len()`. An aborted set leaves `armed` immediately and moves to
+    // `draining`, but its worker keeps its `chase_pool` slot until it actually
+    // returns — and a worker still queued inside `install` cannot even see the
+    // abort, because the abort only pokes a coverage the closure has not
+    // touched yet. Counting `armed` alone made those workers invisible and let
+    // new sets arm past true capacity, which is how the pool filled with
+    // chases that could never start.
     fn occupied_chase_workers(&self) -> usize {
         let draining = self
             .draining
@@ -542,14 +542,14 @@ impl DirectUnpackRuntime {
         self.armed.len() + draining
     }
 
-    /// Delete a retired chase's staging tree on a task of its own.
-    ///
-    /// The tree can hold a partially extracted multi-gigabyte member, and on a
-    /// network mount a recursive unlink of it is as slow as the mount is.
-    /// Nothing waits for it: the tree is one arm's generation, so no later
-    /// chase writes into it, and the set's next arm stages somewhere else.
-    /// Only shutdown joins what is still running, so the process does not exit
-    /// with a delete half done.
+    // Delete a retired chase's staging tree on a task of its own.
+    //
+    // The tree can hold a partially extracted multi-gigabyte member, and on a
+    // network mount a recursive unlink of it is as slow as the mount is.
+    // Nothing waits for it: the tree is one arm's generation, so no later
+    // chase writes into it, and the set's next arm stages somewhere else.
+    // Only shutdown joins what is still running, so the process does not exit
+    // with a delete half done.
     fn retire_staging(&mut self, key: &(JobId, String), staging_dir: PathBuf) {
         self.staging_cleanups
             .retain(|cleanup| !cleanup.is_finished());
@@ -565,20 +565,20 @@ impl DirectUnpackRuntime {
         }));
     }
 
-    /// Wait for every staging deletion still running.
+    // Wait for every staging deletion still running.
     async fn settle_staging_cleanups(&mut self) {
         for cleanup in std::mem::take(&mut self.staging_cleanups) {
             let _ = cleanup.await;
         }
     }
 
-    /// Whether the commit hook has nothing at all to do: nothing being chased,
-    /// and no bare `.7z` waiting to arm.
+    // Whether the commit hook has nothing at all to do: nothing being chased,
+    // and no bare `.7z` waiting to arm.
     fn idle(&self) -> bool {
         self.armed.is_empty() && self.pending_single_arm.is_empty()
     }
 
-    /// Whether the commit hook has any bare `.7z` waiting to arm.
+    // Whether the commit hook has any bare `.7z` waiting to arm.
     #[cfg(test)]
     pub(crate) fn no_pending_single_arm(&self) -> bool {
         self.pending_single_arm.is_empty()
@@ -594,7 +594,7 @@ impl DirectUnpackRuntime {
         self.latched.get(&(job_id, set_name.to_string())).copied()
     }
 
-    /// Whether an armed chase's worker has returned but not yet been reaped.
+    // Whether an armed chase's worker has returned but not yet been reaped.
     #[cfg(test)]
     pub(crate) fn armed_worker_finished(&self, job_id: JobId, set_name: &str) -> bool {
         self.armed
@@ -602,7 +602,7 @@ impl DirectUnpackRuntime {
             .is_some_and(|armed| armed.handle.is_finished())
     }
 
-    /// Whether an aborted chase is still waiting to be joined by the reap.
+    // Whether an aborted chase is still waiting to be joined by the reap.
     #[cfg(test)]
     pub(crate) fn is_draining(&self, job_id: JobId, set_name: &str) -> bool {
         self.draining
@@ -610,7 +610,7 @@ impl DirectUnpackRuntime {
             .any(|((job, set), _)| *job == job_id && set == set_name)
     }
 
-    /// Whether an aborted chase's worker has returned but not yet been reaped.
+    // Whether an aborted chase's worker has returned but not yet been reaped.
     #[cfg(test)]
     pub(crate) fn draining_worker_finished(&self, job_id: JobId, set_name: &str) -> bool {
         self.draining.iter().any(|((job, set), armed)| {
@@ -630,7 +630,7 @@ impl DirectUnpackRuntime {
             .map(|set| Arc::clone(&set.coverage))
     }
 
-    /// Swap an armed set's coverage, returning the one the worker still holds.
+    // Swap an armed set's coverage, returning the one the worker still holds.
     #[cfg(test)]
     pub(crate) fn replace_armed_coverage(
         &mut self,
@@ -645,11 +645,11 @@ impl DirectUnpackRuntime {
 }
 
 impl Pipeline {
-    /// Try to admit a 7z set to the chase.
-    ///
-    /// Called whenever a 7z topology is built or updated. Returns without
-    /// latching when the answer is only "not yet" — no bytes on part one — so a
-    /// later part's completion can try again.
+    // Try to admit a 7z set to the chase.
+    //
+    // Called whenever a 7z topology is built or updated. Returns without
+    // latching when the answer is only "not yet" — no bytes on part one — so a
+    // later part's completion can try again.
     pub(in crate::pipeline) fn try_arm_direct_unpack(&mut self, job_id: JobId, set_name: &str) {
         if self.direct_unpack.gate() != DirectUnpackGate::Enabled {
             return;
@@ -899,8 +899,8 @@ impl Pipeline {
         self.arm_prepared_direct_unpack(job_id, set_name, paths, None, ChaseFormat::Rar);
     }
 
-    /// Use the same complete roster when arming and settling. A RAR topology
-    /// refresh only describes volumes registered so far, not all declared input.
+    // Use the same complete roster when arming and settling. A RAR topology
+    // refresh only describes volumes registered so far, not all declared input.
     fn rar_chase_part_paths(&self, job_id: JobId, set_name: &str) -> Result<Vec<PathBuf>, String> {
         let state = self.jobs.get(&job_id).ok_or("RAR job disappeared")?;
         let mut filenames = std::collections::HashMap::new();
@@ -976,15 +976,15 @@ impl Pipeline {
         Ok(parts.into_values().collect())
     }
 
-    /// Arm a set over an explicit ordered part list.
-    ///
-    /// Split sets reach this through the topology, which is the only thing that
-    /// knows their order. A bare `.7z` reaches it directly with a one-element
-    /// list, because there is no order to discover and waiting for a topology
-    /// would mean waiting for the whole file — which is the entire overlap.
-    ///
-    /// Callers are responsible for the gate and the already-armed checks; by
-    /// here the decision to try is made.
+    // Arm a set over an explicit ordered part list.
+    //
+    // Split sets reach this through the topology, which is the only thing that
+    // knows their order. A bare `.7z` reaches it directly with a one-element
+    // list, because there is no order to discover and waiting for a topology
+    // would mean waiting for the whole file — which is the entire overlap.
+    //
+    // Callers are responsible for the gate and the already-armed checks; by
+    // here the decision to try is made.
     fn arm_direct_unpack_with_paths(&mut self, job_id: JobId, set_name: &str, paths: Vec<PathBuf>) {
         // The signature header lives in the first 32 bytes of part one. Read it
         // from the file rather than from any in-memory view: the file is what
@@ -1042,11 +1042,11 @@ impl Pipeline {
         );
     }
 
-    /// Whether another job currently outranks this one for article dispatch.
-    ///
-    /// A job the scheduler does not list at all — nothing left to download, or
-    /// a queue that has already drained — is not outranked by anybody: the
-    /// question only has an answer while the job is competing for articles.
+    // Whether another job currently outranks this one for article dispatch.
+    //
+    // A job the scheduler does not list at all — nothing left to download, or
+    // a queue that has already drained — is not outranked by anybody: the
+    // question only has an answer while the job is competing for articles.
     fn direct_unpack_job_is_outranked(&self, job_id: JobId) -> bool {
         let eligible = self.download_scheduler_eligible_jobs();
         let Some(hot_job) = eligible.first() else {
@@ -1334,30 +1334,30 @@ impl Pipeline {
         }
     }
 
-    /// Pull the archive's tail forward in the download queue.
-    ///
-    /// The decoder cannot list anything until it has the end header, which sits
-    /// at the very end of the last part, so until those bytes land the chase is
-    /// parked and the overlap has not begun. The birth-time boost covers the
-    /// common case; this covers a slow job whose queue is still deep when the
-    /// set arms.
-    ///
-    /// The window is `[total − W, total)` with `W = min(2·next_header_size +
-    /// 1 MiB, 16 MiB)`: twice the declared end header, because a compressed or
-    /// encrypted header is itself a packed stream sitting just before it, plus
-    /// a megabyte of slack, capped so a preposterous declaration cannot boost
-    /// the whole archive.
-    ///
-    /// Parts are mapped by their **NZB-declared** sizes — allowed here and
-    /// nowhere else in this module, because this only reorders a queue. A
-    /// declared size that turns out to be wrong boosts the wrong segments,
-    /// which costs a little overlap and cannot cost correctness: the gated
-    /// reader is driven by verified watermarks, never by anything computed
-    /// here.
-    ///
-    /// Work already leased to a connection is unreachable by reprioritization.
-    /// That is the same contract the identity head wave lives with, and the
-    /// birth-time boost is what covers it.
+    // Pull the archive's tail forward in the download queue.
+    //
+    // The decoder cannot list anything until it has the end header, which sits
+    // at the very end of the last part, so until those bytes land the chase is
+    // parked and the overlap has not begun. The birth-time boost covers the
+    // common case; this covers a slow job whose queue is still deep when the
+    // set arms.
+    //
+    // The window is `[total − W, total)` with `W = min(2·next_header_size +
+    // 1 MiB, 16 MiB)`: twice the declared end header, because a compressed or
+    // encrypted header is itself a packed stream sitting just before it, plus
+    // a megabyte of slack, capped so a preposterous declaration cannot boost
+    // the whole archive.
+    //
+    // Parts are mapped by their **NZB-declared** sizes — allowed here and
+    // nowhere else in this module, because this only reorders a queue. A
+    // declared size that turns out to be wrong boosts the wrong segments,
+    // which costs a little overlap and cannot cost correctness: the gated
+    // reader is driven by verified watermarks, never by anything computed
+    // here.
+    //
+    // Work already leased to a connection is unreachable by reprioritization.
+    // That is the same contract the identity head wave lives with, and the
+    // birth-time boost is what covers it.
     fn boost_direct_unpack_tail_window(
         &mut self,
         job_id: JobId,
@@ -1425,11 +1425,11 @@ impl Pipeline {
         }
     }
 
-    /// Publish a just-completed part to its chase, then try to arm the set.
-    ///
-    /// Completion is what supplies a part's exact length — the only moment the
-    /// download knows it for certain — so this is where a chase learns where
-    /// the next part begins.
+    // Publish a just-completed part to its chase, then try to arm the set.
+    //
+    // Completion is what supplies a part's exact length — the only moment the
+    // download knows it for certain — so this is where a chase learns where
+    // the next part begins.
     pub(in crate::pipeline) fn try_arm_direct_unpack_for_file(
         &mut self,
         job_id: JobId,
@@ -1492,11 +1492,11 @@ impl Pipeline {
         self.try_arm_direct_unpack(job_id, &set_name);
     }
 
-    /// Register a job's single 7z and ZIP files as arming candidates.
-    ///
-    /// Called once at admission. Nothing is registered when the gate is off, so
-    /// a dark pipeline keeps an empty set and the commit hook keeps costing one
-    /// `is_empty`.
+    // Register a job's single 7z and ZIP files as arming candidates.
+    //
+    // Called once at admission. Nothing is registered when the gate is off, so
+    // a dark pipeline keeps an empty set and the commit hook keeps costing one
+    // `is_empty`.
     pub(crate) fn register_direct_unpack_singles(&mut self, job_id: JobId, spec: &crate::JobSpec) {
         if self.direct_unpack.gate() != DirectUnpackGate::Enabled {
             return;
@@ -1520,12 +1520,12 @@ impl Pipeline {
         }
     }
 
-    /// Try to arm a single 7z or ZIP from its committed metadata.
-    ///
-    /// Rides the commit path rather than the completion path: waiting for
-    /// completion would mean waiting for the whole archive, which is exactly the
-    /// overlap this exists to win. The candidate is retired from the pending set
-    /// on any outcome that settles it — armed, refused, or no longer supported.
+    // Try to arm a single 7z or ZIP from its committed metadata.
+    //
+    // Rides the commit path rather than the completion path: waiting for
+    // completion would mean waiting for the whole archive, which is exactly the
+    // overlap this exists to win. The candidate is retired from the pending set
+    // on any outcome that settles it — armed, refused, or no longer supported.
     fn try_arm_single_archive(&mut self, file_id: crate::jobs::ids::NzbFileId, floor: u64) {
         if floor < SIGNATURE_HEADER_LEN {
             return;
@@ -1644,17 +1644,17 @@ impl Pipeline {
         self.direct_unpack.counters.record_refusal(reason);
     }
 
-    /// Where one arm of a chased set lands its members.
-    ///
-    /// Deliberately not the conventional staging dir and not inside it: the
-    /// conventional extractor's own output and the delivery scan both live
-    /// there, and a demotion has to be able to `remove_dir_all` this without
-    /// touching anything the conventional path will look at.
-    ///
-    /// The generation is the last dot-separated component and never contains
-    /// a dot itself, so two `(set, generation)` pairs cannot name the same
-    /// directory. The job level stays a bare number: the maintenance sweep
-    /// keys on it.
+    // Where one arm of a chased set lands its members.
+    //
+    // Deliberately not the conventional staging dir and not inside it: the
+    // conventional extractor's own output and the delivery scan both live
+    // there, and a demotion has to be able to `remove_dir_all` this without
+    // touching anything the conventional path will look at.
+    //
+    // The generation is the last dot-separated component and never contains
+    // a dot itself, so two `(set, generation)` pairs cannot name the same
+    // directory. The job level stays a bare number: the maintenance sweep
+    // keys on it.
     pub(in crate::pipeline) fn direct_unpack_generation_dir(
         &self,
         job_id: JobId,
@@ -1667,8 +1667,8 @@ impl Pipeline {
             .join(format!("{}.{generation}", sanitize_set_dir_name(set_name)))
     }
 
-    /// The staging directory of the set's most recent arm, or the job's
-    /// staging level when the set never armed.
+    // The staging directory of the set's most recent arm, or the job's
+    // staging level when the set never armed.
     #[cfg(test)]
     pub(in crate::pipeline) fn direct_unpack_staging_dir(
         &self,
@@ -1686,17 +1686,17 @@ impl Pipeline {
             })
     }
 
-    /// An extraction budget for the chase, rooted at its own staging dir.
-    ///
-    /// Deliberately **not** [`Pipeline::extraction_budget`]. That one memoizes
-    /// one budget per job and bakes the caller's staging path into it, so
-    /// whichever caller arrives first decides where every later caller thinks
-    /// the staging tree is. A chase that armed before conventional extraction
-    /// ran would hand the conventional extractor a budget pointed at the
-    /// chase's directory — a behaviour change to the path this feature is not
-    /// allowed to touch. So the chase builds its own and keeps it to itself.
-    /// The process-wide memory budget is still shared, which is what actually
-    /// bounds concurrent decoders.
+    // An extraction budget for the chase, rooted at its own staging dir.
+    //
+    // Deliberately **not** [`Pipeline::extraction_budget`]. That one memoizes
+    // one budget per job and bakes the caller's staging path into it, so
+    // whichever caller arrives first decides where every later caller thinks
+    // the staging tree is. A chase that armed before conventional extraction
+    // ran would hand the conventional extractor a budget pointed at the
+    // chase's directory — a behaviour change to the path this feature is not
+    // allowed to touch. So the chase builds its own and keeps it to itself.
+    // The process-wide memory budget is still shared, which is what actually
+    // bounds concurrent decoders.
     fn direct_unpack_budget(
         &self,
         job_id: JobId,
@@ -1741,11 +1741,11 @@ impl Pipeline {
         )
     }
 
-    /// The contiguous, verified prefix the download has committed for a part.
-    ///
-    /// The same value [`Pipeline::note_file_progress_floor`] maintains: the
-    /// in-memory floor if there is one, else the persisted floor a restart
-    /// would resume from.
+    // The contiguous, verified prefix the download has committed for a part.
+    //
+    // The same value [`Pipeline::note_file_progress_floor`] maintains: the
+    // in-memory floor if there is one, else the persisted floor a restart
+    // would resume from.
     fn direct_unpack_progress_floor(&self, job_id: JobId, path: &std::path::Path) -> Option<u64> {
         let file_id = self.direct_unpack_file_id_for_part(job_id, path)?;
         Some(
@@ -1757,12 +1757,12 @@ impl Pipeline {
         )
     }
 
-    /// Whether a part's first `len` bytes are committed.
-    ///
-    /// The progress floor answers this while the part downloads, but file
-    /// completion retires the floor, so a complete part — or one completed
-    /// again by a duplicate article — reads as floor zero. Its committed
-    /// opening segments still answer the question.
+    // Whether a part's first `len` bytes are committed.
+    //
+    // The progress floor answers this while the part downloads, but file
+    // completion retires the floor, so a complete part — or one completed
+    // again by a duplicate article — reads as floor zero. Its committed
+    // opening segments still answer the question.
     fn direct_unpack_part_opens_with(
         &self,
         job_id: JobId,
@@ -1781,7 +1781,7 @@ impl Pipeline {
             .is_some_and(|file| committed_opening_len(file, len) >= len)
     }
 
-    /// The job file a part path belongs to, by its current name.
+    // The job file a part path belongs to, by its current name.
     fn direct_unpack_file_id_for_part(
         &self,
         job_id: JobId,
@@ -1796,15 +1796,15 @@ impl Pipeline {
             .map(|file| file.file_id())
     }
 
-    /// A part's exact decoded length, if it is already known for certain.
-    ///
-    /// Only a finished file has one: `received_bytes` is the sum of what was
-    /// actually decoded and committed. The yEnc `=ybegin size=` header is
-    /// available far earlier but is a *declaration* — the codebase treats it as
-    /// evidence rather than truth, and posters misstate it — and a wrong length
-    /// here would not merely be inaccurate, it would place every later part at
-    /// the wrong archive offset. So an unfinished part gets no length, the
-    /// reader parks at its boundary, and completion supplies the real one.
+    // A part's exact decoded length, if it is already known for certain.
+    //
+    // Only a finished file has one: `received_bytes` is the sum of what was
+    // actually decoded and committed. The yEnc `=ybegin size=` header is
+    // available far earlier but is a *declaration* — the codebase treats it as
+    // evidence rather than truth, and posters misstate it — and a wrong length
+    // here would not merely be inaccurate, it would place every later part at
+    // the wrong archive offset. So an unfinished part gets no length, the
+    // reader parks at its boundary, and completion supplies the real one.
     fn direct_unpack_known_part_len(&self, job_id: JobId, path: &std::path::Path) -> Option<u64> {
         let filename = path.file_name()?.to_str()?;
         let state = self.jobs.get(&job_id)?;
@@ -1818,9 +1818,9 @@ impl Pipeline {
         file.is_complete().then(|| file.received_bytes())
     }
 
-    /// The length of a part no posted file owns: one the recovery set wrote
-    /// under its described name and a verdict then proved complete. It has no
-    /// download to finish, so the file on disk is the whole of it.
+    // The length of a part no posted file owns: one the recovery set wrote
+    // under its described name and a verdict then proved complete. It has no
+    // download to finish, so the file on disk is the whole of it.
     fn direct_unpack_rebuilt_part_len(&self, job_id: JobId, path: &std::path::Path) -> Option<u64> {
         let filename = path.file_name()?.to_str()?;
         self.recovery_unposted_outputs
@@ -2156,10 +2156,10 @@ impl Pipeline {
         }
     }
 
-    /// Publish a part's committed watermark to any chase that wants it.
-    ///
-    /// On the download's commit path. When nothing is being chased this is a
-    /// single `is_empty` and a return.
+    // Publish a part's committed watermark to any chase that wants it.
+    //
+    // On the download's commit path. When nothing is being chased this is a
+    // single `is_empty` and a return.
     pub(in crate::pipeline) fn direct_unpack_note_commit(
         &mut self,
         file_id: crate::jobs::ids::NzbFileId,
@@ -2202,18 +2202,18 @@ impl Pipeline {
         }
     }
 
-    /// End every chase belonging to `job_id`.
-    ///
-    /// Every path that ends a download reaches this: without it a worker parks
-    /// on bytes that are never coming and the thread leaks for the life of the
-    /// process.
-    /// End every chase belonging to `job_id`.
-    ///
-    /// Synchronous on purpose. Most of the paths that end a download are
-    /// themselves synchronous — the job-removal seam, the per-file breaker —
-    /// and an abort that needed `.await` could not be called from them. So this
-    /// only *signals*: it wakes the worker and moves it to the draining list,
-    /// and [`Self::reap_direct_unpack`] joins it from the run loop.
+    // End every chase belonging to `job_id`.
+    //
+    // Every path that ends a download reaches this: without it a worker parks
+    // on bytes that are never coming and the thread leaks for the life of the
+    // process.
+    // End every chase belonging to `job_id`.
+    //
+    // Synchronous on purpose. Most of the paths that end a download are
+    // themselves synchronous — the job-removal seam, the per-file breaker —
+    // and an abort that needed `.await` could not be called from them. So this
+    // only *signals*: it wakes the worker and moves it to the draining list,
+    // and [`Self::reap_direct_unpack`] joins it from the run loop.
     pub(in crate::pipeline) fn direct_unpack_abort_job(
         &mut self,
         job_id: JobId,
@@ -2238,18 +2238,18 @@ impl Pipeline {
         }
     }
 
-    /// End one chase: wake its worker and queue it for reaping.
-    ///
-    /// `latch` decides whether the set may ever be chased again. A pause is
-    /// [`AbortLatch::Retryable`] — the bytes stopped for a reason that says
-    /// nothing about the archive, and holding a blocking thread parked for the
-    /// length of an indefinite pause is worse than starting over on resume.
-    ///
-    /// `demotion` is the single place this abort is counted and latched. It used
-    /// to be hard-coded to [`DemotionReason::DownloadEnded`], which meant a
-    /// caller that had already recorded its own reason produced two counter
-    /// increments for one demotion and latched the set under a string naming
-    /// something that had not happened. One abort, one count, one name.
+    // End one chase: wake its worker and queue it for reaping.
+    //
+    // `latch` decides whether the set may ever be chased again. A pause is
+    // [`AbortLatch::Retryable`] — the bytes stopped for a reason that says
+    // nothing about the archive, and holding a blocking thread parked for the
+    // length of an indefinite pause is worse than starting over on resume.
+    //
+    // `demotion` is the single place this abort is counted and latched. It used
+    // to be hard-coded to [`DemotionReason::DownloadEnded`], which meant a
+    // caller that had already recorded its own reason produced two counter
+    // increments for one demotion and latched the set under a string naming
+    // something that had not happened. One abort, one count, one name.
     pub(in crate::pipeline) fn direct_unpack_abort_set(
         &mut self,
         job_id: JobId,
@@ -2297,9 +2297,9 @@ impl Pipeline {
             .push(((job_id, set_name.to_string()), armed));
     }
 
-    /// Abort every chase in the pipeline, then join them all. The shutdown and
-    /// drain path, where leaving a blocking thread parked would hold the
-    /// process open.
+    // Abort every chase in the pipeline, then join them all. The shutdown and
+    // drain path, where leaving a blocking thread parked would hold the
+    // process open.
     pub(in crate::pipeline) async fn direct_unpack_shutdown(&mut self, reason: &str) {
         self.direct_unpack.repairing_jobs.clear();
         let jobs: Vec<JobId> = self
@@ -2328,17 +2328,17 @@ impl Pipeline {
         self.direct_unpack.settle_staging_cleanups().await;
     }
 
-    /// Wait for every retired chase's staging deletion to finish.
+    // Wait for every retired chase's staging deletion to finish.
     #[cfg(test)]
     pub(in crate::pipeline) async fn settle_direct_unpack_staging_cleanups(&mut self) {
         self.direct_unpack.settle_staging_cleanups().await;
     }
 
-    /// Abort any chase whose set contains `filename`.
-    ///
-    /// The rename seam: a part renamed out from under the reader would become a
-    /// `NotFound` on its next lazy open, so the chase is ended deliberately
-    /// rather than failing obscurely later.
+    // Abort any chase whose set contains `filename`.
+    //
+    // The rename seam: a part renamed out from under the reader would become a
+    // `NotFound` on its next lazy open, so the chase is ended deliberately
+    // rather than failing obscurely later.
     pub(in crate::pipeline) fn direct_unpack_abort_sets_containing(
         &mut self,
         job_id: JobId,
@@ -2369,63 +2369,63 @@ impl Pipeline {
         );
     }
 
-    /// Settle every chase for a job whose download has stopped producing bytes.
-    ///
-    /// # Why this runs in two passes
-    ///
-    /// The download draining and a part's bytes being *committed* are different
-    /// moments. `maybe_finish_download_pass` fires when no article is in flight,
-    /// but the decode results for the last articles are processed after that —
-    /// so this pass routinely runs while a part's final writes are still moving
-    /// through the decode and commit stages.
-    ///
-    /// That is why neither pass may take a length from `std::fs::metadata`. The
-    /// file's size on disk at this instant is not the part's final length: a
-    /// part mid-flush measures short, and `persist_out_of_order_segments` leaves
-    /// sparse holes, so a file can also measure *long* over bytes nothing has
-    /// verified. Declaring either as the part length is how a chase was handed a
-    /// 12,288,000-byte length for a 21,097,033-byte part, and the real
-    /// completion commit that followed had no truthful move left to make. The
-    /// arming path already carries this rule — seed from the progress floor,
-    /// never from the file's length on disk — and settle is now held to it too.
-    ///
-    /// So the lenient pass settles only what the assembly *knows*
-    /// (`is_complete` → `received_bytes`, the sum of what was actually decoded
-    /// and committed) and leaves everything else alone: those parts have
-    /// completion commits in flight that will settle them correctly a moment
-    /// later. The strict pass — [`Self::settle_direct_unpack_at_completion`],
-    /// run from the completion check once decode has drained — is what ends a
-    /// chase whose parts genuinely never arrived.
-    ///
-    /// The window between the two passes is not a wedge risk: a decode that dies
-    /// takes the job with it, and the job-failed, paused and removed seams all
-    /// abort every chase.
+    // Settle every chase for a job whose download has stopped producing bytes.
+    //
+    // # Why this runs in two passes
+    //
+    // The download draining and a part's bytes being *committed* are different
+    // moments. `maybe_finish_download_pass` fires when no article is in flight,
+    // but the decode results for the last articles are processed after that —
+    // so this pass routinely runs while a part's final writes are still moving
+    // through the decode and commit stages.
+    //
+    // That is why neither pass may take a length from `std::fs::metadata`. The
+    // file's size on disk at this instant is not the part's final length: a
+    // part mid-flush measures short, and `persist_out_of_order_segments` leaves
+    // sparse holes, so a file can also measure *long* over bytes nothing has
+    // verified. Declaring either as the part length is how a chase was handed a
+    // 12,288,000-byte length for a 21,097,033-byte part, and the real
+    // completion commit that followed had no truthful move left to make. The
+    // arming path already carries this rule — seed from the progress floor,
+    // never from the file's length on disk — and settle is now held to it too.
+    //
+    // So the lenient pass settles only what the assembly *knows*
+    // (`is_complete` → `received_bytes`, the sum of what was actually decoded
+    // and committed) and leaves everything else alone: those parts have
+    // completion commits in flight that will settle them correctly a moment
+    // later. The strict pass — [`Self::settle_direct_unpack_at_completion`],
+    // run from the completion check once decode has drained — is what ends a
+    // chase whose parts genuinely never arrived.
+    //
+    // The window between the two passes is not a wedge risk: a decode that dies
+    // takes the job with it, and the job-failed, paused and removed seams all
+    // abort every chase.
     pub(in crate::pipeline) fn settle_direct_unpack_after_download(&mut self, job_id: JobId) {
         self.direct_unpack.download_settled.insert(job_id);
         self.settle_direct_unpack_parts(job_id, SettlePass::Lenient);
     }
 
-    /// The strict half of the settle: parts the assembly still cannot describe
-    /// are never going to be described, so their chases end by name.
-    ///
-    /// Runs from the completion check. It ends a chase, so it may only run when
-    /// the download is *currently* finished — and that takes two conditions,
-    /// because neither is sufficient alone.
-    ///
-    /// `download_settled` says a download pass has drained at least once. That
-    /// is a historical fact, not a present one: `maybe_finish_download_pass`
-    /// fires at *every* pass boundary, and a job with 60 MB still to fetch
-    /// crosses several. Gating on it alone let a completion check milliseconds
-    /// later end a chase mid-download, which is exactly what happened to two
-    /// jobs 5 ms and 14 ms after they armed.
-    ///
-    /// So it is paired with the pipeline's own "is anything still moving for
-    /// this job" predicate, which counts queued work, in-flight downloads,
-    /// in-flight decodes, delayed retries and released-but-unprocessed results.
-    /// Only when the stamp is set *and* nothing is in flight is a part without
-    /// an assembly length genuinely one that will never have one. Finding work
-    /// in flight also drops the stamp, so a job that went back to fetching has
-    /// to earn it again from a later drain.
+    // The strict half of the settle: parts the assembly still cannot describe
+    // are never going to be described, so their chases end by name.
+    //
+    // Runs from the completion check. It ends a chase, so it may only run when
+    // the download is *currently* finished — and that takes two conditions,
+    // because neither is sufficient alone.
+    //
+    // `download_settled` says a download pass has drained at least once. That
+    // is a historical fact, not a present one: `maybe_finish_download_pass`
+    // fires at *every* pass boundary, and a job with 60 MB still to fetch
+    // crosses several. Gating on it alone let a completion check milliseconds
+    // later end a chase mid-download, which is exactly what happened to two
+    // jobs 5 ms and 14 ms after they armed.
+    //
+    // So it is paired with the pipeline's own "is anything still moving for
+    // this job" predicate, which counts queued work, in-flight downloads,
+    // in-flight decodes, delayed retries and released-but-unprocessed results.
+    // Only when the stamp is set *and* nothing is in flight is a part without
+    // an assembly length genuinely one that will never have one. Finding work
+    // in flight also drops the stamp, so a job that went back to fetching has
+    // to earn it again from a later drain.
     pub(in crate::pipeline) fn settle_direct_unpack_at_completion(&mut self, job_id: JobId) {
         if !self.direct_unpack.download_settled.contains(&job_id) {
             return;
@@ -2586,10 +2586,10 @@ impl Pipeline {
         }
     }
 
-    /// Reap any chase that has finished on its own, recording the outcome.
-    ///
-    /// Polled rather than awaited: the controller must not block the
-    /// orchestrator on a decode that is still chasing a live download.
+    // Reap any chase that has finished on its own, recording the outcome.
+    //
+    // Polled rather than awaited: the controller must not block the
+    // orchestrator on a decode that is still chasing a live download.
     pub(in crate::pipeline) async fn reap_direct_unpack(&mut self) {
         if !self.direct_unpack.pending_virtual_refresh.is_empty()
             && self
@@ -2751,12 +2751,12 @@ impl Pipeline {
         }
     }
 
-    /// Decide what extraction should do with this set's chase, taking
-    /// ownership of whatever it finds.
-    ///
-    /// Called from the extraction dispatch, which by then is downstream of PAR2
-    /// verify and repair — so a chase that survived to here read the same bytes
-    /// the conventional extractor would.
+    // Decide what extraction should do with this set's chase, taking
+    // ownership of whatever it finds.
+    //
+    // Called from the extraction dispatch, which by then is downstream of PAR2
+    // verify and repair — so a chase that survived to here read the same bytes
+    // the conventional extractor would.
     pub(in crate::pipeline) fn take_direct_unpack_disposition(
         &mut self,
         job_id: JobId,
@@ -2834,22 +2834,22 @@ impl Pipeline {
         })
     }
 
-    /// Tell an armed chase about every one of its parts that has finished.
-    ///
-    /// Extraction can take a chase before the chase hears that its last part
-    /// finished: the segment commit that completes a part can start extraction
-    /// before the part's completion seam has published its floor. A worker
-    /// that misses that notice parks on bytes that are already on disk until
-    /// the consumption deadline.
-    ///
-    /// Watermark and completion only — never evidence. The set leaves `armed`
-    /// the moment this returns, and every reader of a gate — the completion
-    /// check that forces the authoritative PAR2 pass, the release after a
-    /// clean verdict, the release after repair — looks only at armed sets. A
-    /// gate raised here has nobody to lift it, and the worker parks on a
-    /// vouched prefix of zero until the deadline. Damage is published where it
-    /// can still be seen: at part completion, by
-    /// [`Self::publish_completed_part_to_chase`].
+    // Tell an armed chase about every one of its parts that has finished.
+    //
+    // Extraction can take a chase before the chase hears that its last part
+    // finished: the segment commit that completes a part can start extraction
+    // before the part's completion seam has published its floor. A worker
+    // that misses that notice parks on bytes that are already on disk until
+    // the consumption deadline.
+    //
+    // Watermark and completion only — never evidence. The set leaves `armed`
+    // the moment this returns, and every reader of a gate — the completion
+    // check that forces the authoritative PAR2 pass, the release after a
+    // clean verdict, the release after repair — looks only at armed sets. A
+    // gate raised here has nobody to lift it, and the worker parks on a
+    // vouched prefix of zero until the deadline. Damage is published where it
+    // can still be seen: at part completion, by
+    // [`Self::publish_completed_part_to_chase`].
     fn publish_finished_parts_before_handoff(&mut self, job_id: JobId, set_name: &str) {
         let Some(targets) = self.direct_unpack.watermark_targets.get(&job_id) else {
             return;
@@ -2881,23 +2881,23 @@ impl Pipeline {
         }
     }
 
-    /// Publish a completed part to the chase that owns it: its final
-    /// watermark, its completion, and what the recovery data says about it.
-    ///
-    /// Every chased format's completion seam ends here. The part's grid
-    /// verdicts are final now, so this is when damage becomes knowable — and
-    /// when the frontier has to stop short of it. It has to happen while the
-    /// set is still armed and before the archive's topology can declare
-    /// extraction ready: the completion check reads the gate from armed sets
-    /// only, and a gate it sees is what turns a clean strong-decode claim into
-    /// the authoritative PAR2 pass that repairs the part and resumes the chase.
-    ///
-    /// The damage is also put on record against the set itself, where the
-    /// completion check finds it whatever becomes of the chase: a worker that
-    /// fails, is reaped or is demoted takes its gate with it, and the bytes it
-    /// was gated on are just as wrong for the conventional extraction that
-    /// follows. So a part of a chased set is published even when nothing is
-    /// armed any more.
+    // Publish a completed part to the chase that owns it: its final
+    // watermark, its completion, and what the recovery data says about it.
+    //
+    // Every chased format's completion seam ends here. The part's grid
+    // verdicts are final now, so this is when damage becomes knowable — and
+    // when the frontier has to stop short of it. It has to happen while the
+    // set is still armed and before the archive's topology can declare
+    // extraction ready: the completion check reads the gate from armed sets
+    // only, and a gate it sees is what turns a clean strong-decode claim into
+    // the authoritative PAR2 pass that repairs the part and resumes the chase.
+    //
+    // The damage is also put on record against the set itself, where the
+    // completion check finds it whatever becomes of the chase: a worker that
+    // fails, is reaped or is demoted takes its gate with it, and the bytes it
+    // was gated on are just as wrong for the conventional extraction that
+    // follows. So a part of a chased set is published even when nothing is
+    // armed any more.
     pub(in crate::pipeline) fn publish_completed_part_to_chase(
         &mut self,
         job_id: JobId,
@@ -2938,13 +2938,13 @@ impl Pipeline {
         }
     }
 
-    /// Record recovery-reported damage in `filename` against a chase that has
-    /// already been reaped.
-    ///
-    /// A worker that returns in the gap between a part's last commit and its
-    /// completion can be reaped inside that gap too. The report then finds no
-    /// armed set to gate, and the outcome would stand as if no damage had
-    /// been reported at all.
+    // Record recovery-reported damage in `filename` against a chase that has
+    // already been reaped.
+    //
+    // A worker that returns in the gap between a part's last commit and its
+    // completion can be reaped inside that gap too. The report then finds no
+    // armed set to gate, and the outcome would stand as if no damage had
+    // been reported at all.
     pub(in crate::pipeline) fn note_damage_on_reaped_chase(
         &mut self,
         job_id: JobId,
@@ -2974,7 +2974,7 @@ impl Pipeline {
         );
     }
 
-    /// A changed container classification invalidates even a successful join.
+    // A changed container classification invalidates even a successful join.
     pub(in crate::pipeline) fn invalidate_reclassified_chase(
         &mut self,
         job_id: JobId,
@@ -2996,10 +2996,10 @@ impl Pipeline {
         );
     }
 
-    /// Mark a set's chase unusable because repair replaced bytes it read.
-    ///
-    /// A running chase is aborted outright; a finished one is flagged so
-    /// consumption throws it away. Called from every repair install site.
+    // Mark a set's chase unusable because repair replaced bytes it read.
+    //
+    // A running chase is aborted outright; a finished one is flagged so
+    // consumption throws it away. Called from every repair install site.
     pub(in crate::pipeline) fn taint_direct_unpack_set(&mut self, job_id: JobId, set_name: &str) {
         let key = (job_id, set_name.to_string());
         if let Some(outcome) = self.direct_unpack.outcomes.get_mut(&key) {
@@ -3049,24 +3049,24 @@ impl Pipeline {
         }
     }
 
-    /// Feed one part's recovery-set evidence into its coverage.
-    ///
-    /// Two facts come out of the same verdict map, so they are taken together:
-    /// the lowest damaged byte, which caps the part and gates the set; and how
-    /// far the set has positively vouched for it, which is what a gated set is
-    /// allowed to serve.
-    ///
-    /// Cost lands where the damage is. An ungated set pays this once per part,
-    /// at completion, exactly as before — one map build per chased file. A
-    /// gated set pays it per commit, because a gated frontier that only moved
-    /// at completion would park a chase for the whole of a part it is entitled
-    /// to be reading. Gated sets are the damaged minority; clean ones never
-    /// reach the per-commit path at all.
-    ///
-    /// The prefix is banked even while the set is ungated. It costs nothing to
-    /// serve then, but a part that completes clean *before* the gate flips gets
-    /// no later refresh — its commits are over — and a banked prefix is what
-    /// lets it keep serving fully once damage elsewhere gates the set.
+    // Feed one part's recovery-set evidence into its coverage.
+    //
+    // Two facts come out of the same verdict map, so they are taken together:
+    // the lowest damaged byte, which caps the part and gates the set; and how
+    // far the set has positively vouched for it, which is what a gated set is
+    // allowed to serve.
+    //
+    // Cost lands where the damage is. An ungated set pays this once per part,
+    // at completion, exactly as before — one map build per chased file. A
+    // gated set pays it per commit, because a gated frontier that only moved
+    // at completion would park a chase for the whole of a part it is entitled
+    // to be reading. Gated sets are the damaged minority; clean ones never
+    // reach the per-commit path at all.
+    //
+    // The prefix is banked even while the set is ungated. It costs nothing to
+    // serve then, but a part that completes clean *before* the gate flips gets
+    // no later refresh — its commits are over — and a banked prefix is what
+    // lets it keep serving fully once damage elsewhere gates the set.
     fn refresh_chased_part_evidence(
         &self,
         file_id: crate::jobs::ids::NzbFileId,
@@ -3095,10 +3095,10 @@ impl Pipeline {
         coverage.note_vouched_prefix(index, prefix);
     }
 
-    /// Refresh evidence for a chased part named by its filename.
-    ///
-    /// Called when a part completes, and — once the set is gated — on every
-    /// commit, so a vouched prefix can advance while the part is still arriving.
+    // Refresh evidence for a chased part named by its filename.
+    //
+    // Called when a part completes, and — once the set is gated — on every
+    // commit, so a vouched prefix can advance while the part is still arriving.
     fn refresh_chased_part_by_filename(
         &self,
         file_id: crate::jobs::ids::NzbFileId,
@@ -3128,20 +3128,20 @@ impl Pipeline {
         self.refresh_chased_part_evidence(file_id, &set_name, index, &coverage);
     }
 
-    /// Decide, per chased set, whether a repair about to run can coexist with
-    /// what the chase has already read.
-    ///
-    /// The vouching rule: every byte the decoder consumed must lie inside the
-    /// contiguous run of blocks the recovery set positively found Intact. If it
-    /// does, repair cannot rewrite anything the chase has folded into its
-    /// output, so the chase is parked through the repair instead of thrown
-    /// away. Anything less — a consumed byte past the vouched prefix, a file
-    /// with no binding, a set whose parts cannot be resolved — falls back to
-    /// the unconditional taint this replaced.
-    ///
-    /// `verification` is the analysis pass's own file-level result, which runs
-    /// immediately before this and is the second source of vouching evidence.
-    /// See [`Self::direct_unpack_set_is_vouched`] for why it is needed.
+    // Decide, per chased set, whether a repair about to run can coexist with
+    // what the chase has already read.
+    //
+    // The vouching rule: every byte the decoder consumed must lie inside the
+    // contiguous run of blocks the recovery set positively found Intact. If it
+    // does, repair cannot rewrite anything the chase has folded into its
+    // output, so the chase is parked through the repair instead of thrown
+    // away. Anything less — a consumed byte past the vouched prefix, a file
+    // with no binding, a set whose parts cannot be resolved — falls back to
+    // the unconditional taint this replaced.
+    //
+    // `verification` is the analysis pass's own file-level result, which runs
+    // immediately before this and is the second source of vouching evidence.
+    // See [`Self::direct_unpack_set_is_vouched`] for why it is needed.
     pub(in crate::pipeline) fn decide_direct_unpack_before_repair(
         &mut self,
         job_id: JobId,
@@ -3200,33 +3200,33 @@ impl Pipeline {
         }
     }
 
-    /// Whether the recovery set positively vouches for every byte this set's
-    /// chase has consumed.
-    ///
-    /// # Two sources of evidence, and why one is not enough
-    ///
-    /// The in-stream grid is the cheap source: verdicts accumulated as articles
-    /// landed, costing no reads. But a grid only exists for articles that were
-    /// cut on it, and the decoder cuts an article on the checkpoint geometry it
-    /// had *at the time* — a grid learned later cannot consume those segments,
-    /// because claiming them would imply cuts the decoder never emitted. A
-    /// recovery set's `.par2` articles are tiny and race the data volumes they
-    /// describe, so on a fast link the first stretch of a part routinely decodes
-    /// before the slice size is known. Those blocks are unclaimed for good, the
-    /// intact prefix walks to zero, and a chase that read a single byte is
-    /// refused — intermittently, depending on who won the race.
-    ///
-    /// So a part with no grid claim falls back to `verification`, the analysis
-    /// pass's own file-level result, which ran immediately before this and read
-    /// the files from disk. `FileStatus::Complete` there means the file's full
-    /// MD5 matched — a strictly stronger statement than any prefix of CRC32
-    /// block claims — and a file the analysis found complete is not one the
-    /// repair is going to rewrite. That vouches the whole part.
-    ///
-    /// Every other status is a refusal, not a fallback: `Damaged` and `Missing`
-    /// are files the repair intends to rewrite, and `Renamed` means the path
-    /// this chase is reading is not the one the analysis judged. A part the
-    /// analysis did not classify at all stays unvouched.
+    // Whether the recovery set positively vouches for every byte this set's
+    // chase has consumed.
+    //
+    // # Two sources of evidence, and why one is not enough
+    //
+    // The in-stream grid is the cheap source: verdicts accumulated as articles
+    // landed, costing no reads. But a grid only exists for articles that were
+    // cut on it, and the decoder cuts an article on the checkpoint geometry it
+    // had *at the time* — a grid learned later cannot consume those segments,
+    // because claiming them would imply cuts the decoder never emitted. A
+    // recovery set's `.par2` articles are tiny and race the data volumes they
+    // describe, so on a fast link the first stretch of a part routinely decodes
+    // before the slice size is known. Those blocks are unclaimed for good, the
+    // intact prefix walks to zero, and a chase that read a single byte is
+    // refused — intermittently, depending on who won the race.
+    //
+    // So a part with no grid claim falls back to `verification`, the analysis
+    // pass's own file-level result, which ran immediately before this and read
+    // the files from disk. `FileStatus::Complete` there means the file's full
+    // MD5 matched — a strictly stronger statement than any prefix of CRC32
+    // block claims — and a file the analysis found complete is not one the
+    // repair is going to rewrite. That vouches the whole part.
+    //
+    // Every other status is a refusal, not a fallback: `Damaged` and `Missing`
+    // are files the repair intends to rewrite, and `Renamed` means the path
+    // this chase is reading is not the one the analysis judged. A part the
+    // analysis did not classify at all stays unvouched.
     fn direct_unpack_set_is_vouched(
         &self,
         job_id: JobId,
@@ -3334,19 +3334,19 @@ impl Pipeline {
         true
     }
 
-    /// Whether the analysis pass found this part's file complete on disk.
-    ///
-    /// Matched on the recovery set's own file id rather than on a filename: the
-    /// binding already resolved which description this part is, and a filename
-    /// comparison would have to re-derive that against renames and obfuscation.
-    /// In a job carrying more than one recovery set, a part bound to a set other
-    /// than the one being repaired simply finds no matching id and is not
-    /// vouched — the safe direction, and the same answer as no evidence.
-    ///
-    /// Only `Complete` answers true. It is the one status that means the repair
-    /// has nothing to write to this file, which is the whole question being
-    /// asked — `Damaged` and `Missing` are files it will rewrite, and `Renamed`
-    /// says the analysis judged some other path.
+    // Whether the analysis pass found this part's file complete on disk.
+    //
+    // Matched on the recovery set's own file id rather than on a filename: the
+    // binding already resolved which description this part is, and a filename
+    // comparison would have to re-derive that against renames and obfuscation.
+    // In a job carrying more than one recovery set, a part bound to a set other
+    // than the one being repaired simply finds no matching id and is not
+    // vouched — the safe direction, and the same answer as no evidence.
+    //
+    // Only `Complete` answers true. It is the one status that means the repair
+    // has nothing to write to this file, which is the whole question being
+    // asked — `Damaged` and `Missing` are files it will rewrite, and `Renamed`
+    // says the analysis judged some other path.
     fn par2_analysis_found_part_complete(
         &self,
         file_id: crate::jobs::ids::NzbFileId,
@@ -3365,25 +3365,25 @@ impl Pipeline {
             .is_some_and(|file| matches!(file.status, par2_rs::verify::FileStatus::Complete))
     }
 
-    /// The armed sets of `job_id` that are gated on recovery-reported damage.
-    ///
-    /// Finalize asks this before it lets a type-derived strong-decode claim
-    /// stand in for the authoritative PAR2 pass. A gated chase is parked on a
-    /// slice the recovery data has already called damaged, waiting for the
-    /// repair that pass would summon; skipping the pass on the strength of the
-    /// claim would leave it waiting for nothing.
-    ///
-    /// A draining set does not count. It has been aborted and will be
-    /// materialized and decoded conventionally, where damage surfaces as a
-    /// failed extraction and takes the repair path finalize already has for
-    /// that.
-    ///
-    /// A *finished* set counts until a repair or a clean verdict retires its
-    /// outcome: one that completed under a standing report decoded the damaged
-    /// range, and dropping the report with the worker would let those members
-    /// be installed on the strength of the archive's type alone. One that
-    /// failed under it would hand the same damage to the conventional
-    /// extraction unrepaired.
+    // The armed sets of `job_id` that are gated on recovery-reported damage.
+    //
+    // Finalize asks this before it lets a type-derived strong-decode claim
+    // stand in for the authoritative PAR2 pass. A gated chase is parked on a
+    // slice the recovery data has already called damaged, waiting for the
+    // repair that pass would summon; skipping the pass on the strength of the
+    // claim would leave it waiting for nothing.
+    //
+    // A draining set does not count. It has been aborted and will be
+    // materialized and decoded conventionally, where damage surfaces as a
+    // failed extraction and takes the repair path finalize already has for
+    // that.
+    //
+    // A *finished* set counts until a repair or a clean verdict retires its
+    // outcome: one that completed under a standing report decoded the damaged
+    // range, and dropping the report with the worker would let those members
+    // be installed on the strength of the archive's type alone. One that
+    // failed under it would hand the same damage to the conventional
+    // extraction unrepaired.
     pub(in crate::pipeline) fn direct_unpack_gated_sets(&self, job_id: JobId) -> Vec<String> {
         if self.direct_unpack.armed.is_empty() && self.direct_unpack.outcomes.is_empty() {
             return Vec::new();
@@ -3408,9 +3408,9 @@ impl Pipeline {
         armed.chain(finished).collect()
     }
 
-    /// Mark a set as parked through a repair, without going through the
-    /// vouching decision. Lets a test exercise the release and failure paths
-    /// without standing up a PAR2 binding and a populated grid.
+    // Mark a set as parked through a repair, without going through the
+    // vouching decision. Lets a test exercise the release and failure paths
+    // without standing up a PAR2 binding and a populated grid.
     #[cfg(test)]
     pub(in crate::pipeline) fn park_direct_unpack_through_repair_for_test(
         &mut self,
@@ -3422,16 +3422,16 @@ impl Pipeline {
             .insert((job_id, set_name.to_string()));
     }
 
-    /// End any gated chase the repair left behind still holding its frontier.
-    ///
-    /// Gating parks a chase on evidence it expects to arrive. Usually it does —
-    /// more articles land, prefixes advance, or repair rewrites the part and
-    /// releases it. But a set whose claims never come (articles that straddle
-    /// every slice boundary claim no block at all) is parked on evidence that
-    /// will never exist, and by this point the download has drained and the
-    /// repair has concluded: nothing left in the system will move it. Waiting
-    /// forever is the one outcome a blocking thread must never have, so it
-    /// demotes here, by name.
+    // End any gated chase the repair left behind still holding its frontier.
+    //
+    // Gating parks a chase on evidence it expects to arrive. Usually it does —
+    // more articles land, prefixes advance, or repair rewrites the part and
+    // releases it. But a set whose claims never come (articles that straddle
+    // every slice boundary claim no block at all) is parked on evidence that
+    // will never exist, and by this point the download has drained and the
+    // repair has concluded: nothing left in the system will move it. Waiting
+    // forever is the one outcome a blocking thread must never have, so it
+    // demotes here, by name.
     fn demote_stalled_gated_chases(&mut self, job_id: JobId) {
         if self.direct_unpack.armed.is_empty() {
             return;
@@ -3464,16 +3464,16 @@ impl Pipeline {
         }
     }
 
-    /// Settle the chases a repair was parked over, whichever way the repair
-    /// ended.
-    ///
-    /// The single seam every exit from the repairer uses, so that adding an
-    /// early return there cannot silently strand a parked chase: a set held
-    /// under a damage cap is waiting on a frontier only this call advances, and
-    /// nothing else in the pipeline will notice it is waiting.
-    ///
-    /// A no-op unless this was an actual repair — an analysis pass rewrites
-    /// nothing, so it parks nothing.
+    // Settle the chases a repair was parked over, whichever way the repair
+    // ended.
+    //
+    // The single seam every exit from the repairer uses, so that adding an
+    // early return there cannot silently strand a parked chase: a set held
+    // under a damage cap is waiting on a frontier only this call advances, and
+    // nothing else in the pipeline will notice it is waiting.
+    //
+    // A no-op unless this was an actual repair — an analysis pass rewrites
+    // nothing, so it parks nothing.
     pub(in crate::pipeline) fn settle_direct_unpack_after_repair(
         &mut self,
         job_id: JobId,
@@ -3492,16 +3492,16 @@ impl Pipeline {
         self.demote_stalled_gated_chases(job_id);
     }
 
-    /// End the chases a repair was allowed to run underneath, because the
-    /// repair did not finish.
-    ///
-    /// The symmetric half of [`Self::release_direct_unpack_after_repair`]. A
-    /// set parked through a repair is parked at its damage cap, and only the
-    /// repair's success was ever going to lift it — so a repair that fails
-    /// leaves a blocking thread waiting on bytes nothing will now write. The
-    /// job may well fail terminally straight after, which would abort it
-    /// anyway, but it may also not: the failure could be one set's among
-    /// several. This closes that gap without depending on what happens next.
+    // End the chases a repair was allowed to run underneath, because the
+    // repair did not finish.
+    //
+    // The symmetric half of [`Self::release_direct_unpack_after_repair`]. A
+    // set parked through a repair is parked at its damage cap, and only the
+    // repair's success was ever going to lift it — so a repair that fails
+    // leaves a blocking thread waiting on bytes nothing will now write. The
+    // job may well fail terminally straight after, which would abort it
+    // anyway, but it may also not: the failure could be one set's among
+    // several. This closes that gap without depending on what happens next.
     pub(in crate::pipeline) fn fail_direct_unpack_after_repair(
         &mut self,
         job_id: JobId,
@@ -3533,11 +3533,11 @@ impl Pipeline {
         }
     }
 
-    /// Reopen the chases a repair was allowed to run underneath.
-    ///
-    /// The parts on disk are now the repaired ones and the recovery set has
-    /// vouched for everything already consumed, so the frontier opens to the
-    /// whole file and the decoder finishes at disk speed.
+    // Reopen the chases a repair was allowed to run underneath.
+    //
+    // The parts on disk are now the repaired ones and the recovery set has
+    // vouched for everything already consumed, so the frontier opens to the
+    // whole file and the decoder finishes at disk speed.
     pub(in crate::pipeline) fn release_direct_unpack_after_repair(&mut self, job_id: JobId) {
         self.direct_unpack.repairing_jobs.remove(&job_id);
         if self.direct_unpack.parked_through_repair.is_empty() {
@@ -3613,19 +3613,19 @@ impl Pipeline {
         }
     }
 
-    /// Lift the damage gates a clean verdict from `set_id` has contradicted.
-    ///
-    /// A chase gates on the in-stream grid's word that a slice is damaged. The
-    /// recovery set has now been verified clean — every file it describes
-    /// read back and matched, a whole-file statement stronger than any block
-    /// verdict — so the damage the gate was holding for is not there, and the
-    /// bytes under the cap are the verified ones. A gate left standing here
-    /// would park the chase on a repair that is never coming, and extraction
-    /// behind it with no deadline.
-    ///
-    /// Only sets whose every part this recovery set describes are released. A
-    /// verdict about one set's files says nothing about another's, and a gate
-    /// raised on evidence from a different set stays up until that set rules.
+    // Lift the damage gates a clean verdict from `set_id` has contradicted.
+    //
+    // A chase gates on the in-stream grid's word that a slice is damaged. The
+    // recovery set has now been verified clean — every file it describes
+    // read back and matched, a whole-file statement stronger than any block
+    // verdict — so the damage the gate was holding for is not there, and the
+    // bytes under the cap are the verified ones. A gate left standing here
+    // would park the chase on a repair that is never coming, and extraction
+    // behind it with no deadline.
+    //
+    // Only sets whose every part this recovery set describes are released. A
+    // verdict about one set's files says nothing about another's, and a gate
+    // raised on evidence from a different set stays up until that set rules.
     pub(in crate::pipeline) fn release_direct_unpack_after_clean_verification(
         &mut self,
         job_id: JobId,
@@ -3727,9 +3727,9 @@ impl Pipeline {
         }
     }
 
-    /// Keep a reader's input alias when content identity confirms the same
-    /// container and position. Renaming these bytes adds no verification and
-    /// would invalidate an otherwise usable chase.
+    // Keep a reader's input alias when content identity confirms the same
+    // container and position. Renaming these bytes adds no verification and
+    // would invalidate an otherwise usable chase.
     pub(in crate::pipeline) fn chase_keeps_archive_alias(
         &self,
         job_id: JobId,
@@ -3784,10 +3784,10 @@ impl Pipeline {
                     .is_some_and(|outcome| !outcome.tainted && outcome.result.is_ok()))
     }
 
-    /// Taint every chase whose set contains `filename`.
-    ///
-    /// Repair identifies its work by file, not by archive set, so this is the
-    /// shape every repair site calls.
+    // Taint every chase whose set contains `filename`.
+    //
+    // Repair identifies its work by file, not by archive set, so this is the
+    // shape every repair site calls.
     pub(in crate::pipeline) fn taint_direct_unpack_for_file(
         &mut self,
         job_id: JobId,
@@ -3808,7 +3808,7 @@ impl Pipeline {
         self.taint_direct_unpack_set(job_id, &set_name);
     }
 
-    /// Drop every trace of a job, aborting anything still running.
+    // Drop every trace of a job, aborting anything still running.
     pub(crate) fn direct_unpack_forget_job(&mut self, job_id: JobId) {
         self.direct_unpack_abort_job(
             job_id,
@@ -3850,14 +3850,14 @@ impl Pipeline {
     }
 }
 
-/// Move a finished chase's members into the conventional extraction staging
-/// directory, preserving relative paths.
-///
-/// A rename when the two trees share a filesystem — which they do, both being
-/// under `complete_dir` — and a copy when they do not, so an operator who has
-/// mounted something unusual gets correct behaviour rather than an error. The
-/// source tree is removed either way: after this the chase's directory has no
-/// reason to exist.
+// Move a finished chase's members into the conventional extraction staging
+// directory, preserving relative paths.
+//
+// A rename when the two trees share a filesystem — which they do, both being
+// under `complete_dir` — and a copy when they do not, so an operator who has
+// mounted something unusual gets correct behaviour rather than an error. The
+// source tree is removed either way: after this the chase's directory has no
+// reason to exist.
 pub(in crate::pipeline) fn install_chased_members(
     from: &std::path::Path,
     to: &std::path::Path,
@@ -3895,10 +3895,10 @@ pub(in crate::pipeline) fn install_chased_members(
     Ok(())
 }
 
-/// Delete a chase's staging tree, and say so if it cannot be deleted.
-///
-/// `tokio::fs` runs the recursive unlink on a blocking thread, so an awaiting
-/// task does not pin a runtime worker for as long as the tree takes to go.
+// Delete a chase's staging tree, and say so if it cannot be deleted.
+//
+// `tokio::fs` runs the recursive unlink on a blocking thread, so an awaiting
+// task does not pin a runtime worker for as long as the tree takes to go.
 pub(in crate::pipeline) async fn remove_chase_staging(
     job_id: JobId,
     set_name: &str,
@@ -3917,8 +3917,8 @@ pub(in crate::pipeline) async fn remove_chase_staging(
     }
 }
 
-/// Delete a chase's staging tree on a task of its own, for a caller that
-/// has nothing more to do with it and should not wait for it to go.
+// Delete a chase's staging tree on a task of its own, for a caller that
+// has nothing more to do with it and should not wait for it to go.
 pub(in crate::pipeline) fn spawn_chase_staging_removal(
     job_id: JobId,
     set_name: &str,
@@ -3930,12 +3930,12 @@ pub(in crate::pipeline) fn spawn_chase_staging_removal(
     });
 }
 
-/// Every path [`read_signature_header`] was asked to open, so a test can
-/// tell whether arming touched a part's file.
+// Every path [`read_signature_header`] was asked to open, so a test can
+// tell whether arming touched a part's file.
 #[cfg(test)]
 static SIGNATURE_HEADER_READS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
-/// How many times arming has opened `path` for its signature header.
+// How many times arming has opened `path` for its signature header.
 #[cfg(test)]
 pub(in crate::pipeline) fn signature_header_reads_of(path: &std::path::Path) -> usize {
     SIGNATURE_HEADER_READS
@@ -3946,8 +3946,8 @@ pub(in crate::pipeline) fn signature_header_reads_of(path: &std::path::Path) -> 
         .count()
 }
 
-/// Read the 32-byte signature header, or `Ok(None)` if the file is still
-/// shorter than that.
+// Read the 32-byte signature header, or `Ok(None)` if the file is still
+// shorter than that.
 fn read_signature_header(path: &std::path::Path) -> std::io::Result<Option<[u8; 32]>> {
     use std::io::Read;
 
@@ -3970,7 +3970,7 @@ fn read_signature_header(path: &std::path::Path) -> std::io::Result<Option<[u8; 
     Ok(Some(bytes))
 }
 
-/// A set name is archive-derived, so it is not trusted as a path component.
+// A set name is archive-derived, so it is not trusted as a path component.
 fn sanitize_set_dir_name(set_name: &str) -> String {
     let cleaned: String = set_name
         .chars()
@@ -3990,10 +3990,10 @@ fn sanitize_set_dir_name(set_name: &str) -> String {
     }
 }
 
-/// How many of a file's opening bytes its committed articles cover, walking
-/// ordinals from zero while each placement starts where the last one ended.
-/// An opening article can be shorter than a header the next one completes.
-/// Stops once `wanted` bytes are covered.
+// How many of a file's opening bytes its committed articles cover, walking
+// ordinals from zero while each placement starts where the last one ended.
+// An opening article can be shorter than a header the next one completes.
+// Stops once `wanted` bytes are covered.
 fn committed_opening_len(file: &crate::jobs::assembly::FileAssembly, wanted: u64) -> u64 {
     let mut end = 0u64;
     for segment in 0..file.total_segments() {

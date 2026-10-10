@@ -17,15 +17,15 @@ mod idle;
 
 enum TestArticle {
     Body(Vec<u8>),
-    /// Only the s2n socket-slice test, which does not build on Windows.
+    // Only the s2n socket-slice test, which does not build on Windows.
     #[cfg(not(windows))]
     DelayedInitial {
         data: Vec<u8>,
         delay: Duration,
     },
-    /// Never answers the BODY: only the client's own budget ends the read.
+    // Never answers the BODY: only the client's own budget ends the read.
     Silent,
-    /// Sends the article a line at a time and never terminates it.
+    // Sends the article a line at a time and never terminates it.
     Trickle {
         data: Vec<u8>,
         line_delay: Duration,
@@ -78,8 +78,8 @@ fn unique_ca_path(label: &str) -> std::path::PathBuf {
     ))
 }
 
-/// Whether a fixture server's failed write means only that the client had
-/// already closed its end.
+// Whether a fixture server's failed write means only that the client had
+// already closed its end.
 fn client_hung_up(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -100,9 +100,9 @@ fn spawn_tls_nntp_server(
     spawn_tls_nntp_server_with_upgrade(articles, false)
 }
 
-/// The same fixture reached the other way round: the greeting arrives in
-/// plaintext, the client asks for `STARTTLS`, and the handshake runs on the
-/// socket that already carried the greeting.
+// The same fixture reached the other way round: the greeting arrives in
+// plaintext, the client asks for `STARTTLS`, and the handshake runs on the
+// socket that already carried the greeting.
 fn spawn_starttls_nntp_server(
     articles: Vec<(&'static str, TestArticle)>,
 ) -> (
@@ -344,9 +344,9 @@ fn spawn_tls_nntp_server_with_upgrade(
 }
 
 #[cfg(not(windows))]
-/// Forwards the session until the first large TLS record, sends half of it,
-/// and then holds the connection open until the client closes it: only the
-/// client's own budget can end its read of that record.
+// Forwards the session until the first large TLS record, sends half of it,
+// and then holds the connection open until the client closes it: only the
+// client's own budget can end its read of that record.
 fn spawn_partial_tls_record_proxy(upstream_port: u16) -> (u16, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -423,9 +423,9 @@ fn connect_with_backend(config: &ServerConfig, backend: NntpTlsBackend) -> Block
     BlockingNntpConnection::connect_with_backend(config, None, Some(backend), None).unwrap()
 }
 
-/// A plain server that answers each AUTHINFO line as it arrives, then
-/// answers nothing until every pipelined line has arrived — so a client
-/// that pipelined AUTHINFO, or serialized the rest of the setup, fails.
+// A plain server that answers each AUTHINFO line as it arrives, then
+// answers nothing until every pipelined line has arrived — so a client
+// that pipelined AUTHINFO, or serialized the rest of the setup, fails.
 fn spawn_blocking_pipelined_setup_server(
     auth: Vec<(&'static str, &'static [u8])>,
     expected: Vec<&'static str>,
@@ -487,12 +487,12 @@ fn blocking_pipelined_setup_config(port: u16) -> ServerConfig {
     }
 }
 
-/// A plain server that answers probe commands from a fixed spool, recording
-/// every command line it received so a test can assert what was asked.
-///
-/// `stat_reply` and `head_reply` stand in for the status line a server sends
-/// for an article it does not hold, so a test can make either command look
-/// unimplemented.
+// A plain server that answers probe commands from a fixed spool, recording
+// every command line it received so a test can assert what was asked.
+//
+// `stat_reply` and `head_reply` stand in for the status line a server sends
+// for an article it does not hold, so a test can make either command look
+// unimplemented.
 fn spawn_blocking_probe_server(
     held: &'static [&'static str],
     stat_reply: &'static [u8],
@@ -582,8 +582,8 @@ fn probe_server_lane(config: &ServerConfig, groups: &[&str]) -> BlockingBodyLane
     .expect("lane connects to the probe server")
 }
 
-/// On a server that has never demanded a selected group, moving a lane to
-/// another job's newsgroups sends nothing: BODY by message-id needs no group.
+// On a server that has never demanded a selected group, moving a lane to
+// another job's newsgroups sends nothing: BODY by message-id needs no group.
 #[test]
 fn adopting_groups_on_an_ordinary_server_sends_nothing() {
     let (port, seen, handle) =
@@ -604,9 +604,9 @@ fn adopting_groups_on_an_ordinary_server_sends_nothing() {
     );
 }
 
-/// On a server that insists on a selected group, the lane walks the next
-/// job's candidates on the socket it already holds, the same way a fresh
-/// connect would, and skips the round trip when the group is unchanged.
+// On a server that insists on a selected group, the lane walks the next
+// job's candidates on the socket it already holds, the same way a fresh
+// connect would, and skips the round trip when the group is unchanged.
 #[test]
 fn adopting_groups_on_a_group_requiring_server_selects_them_in_place() {
     let (port, seen, handle) =
@@ -653,8 +653,8 @@ fn probe_config(port: u16) -> ServerConfig {
     config
 }
 
-/// The probe asks STAT for the whole batch and HEAD only for what STAT could
-/// not find, because a provider's STAT index can lag its spool.
+// The probe asks STAT for the whole batch and HEAD only for what STAT could
+// not find, because a provider's STAT index can lag its spool.
 #[test]
 fn a_probe_batch_heads_only_the_articles_stat_missed() {
     const HELD: &[&str] = &["<HELD@SILVER.HORIZON>"];
@@ -687,8 +687,8 @@ fn a_probe_batch_heads_only_the_articles_stat_missed() {
     assert!(heads[0].contains("gone@silver.horizon"));
 }
 
-/// A 500 to STAT means the server does not implement it. The batch is settled
-/// with HEAD instead, the fact is remembered, and the connection is untouched.
+// A 500 to STAT means the server does not implement it. The batch is settled
+// with HEAD instead, the fact is remembered, and the connection is untouched.
 #[test]
 fn a_server_without_stat_is_probed_with_head_and_stays_healthy() {
     const HELD: &[&str] = &["<HELD@SILVER.HORIZON>"];
@@ -733,8 +733,8 @@ fn a_server_without_stat_is_probed_with_head_and_stays_healthy() {
     crate::server_caps::forget(&config.host, config.port);
 }
 
-/// Where HEAD is the missing command, STAT's verdict is the final one: the
-/// batch settles rather than reporting itself unanswerable.
+// Where HEAD is the missing command, STAT's verdict is the final one: the
+// batch settles rather than reporting itself unanswerable.
 #[test]
 fn a_server_without_head_settles_on_the_stat_verdict() {
     const HELD: &[&str] = &["<HELD@SILVER.HORIZON>"];
@@ -764,9 +764,9 @@ fn a_server_without_head_settles_on_the_stat_verdict() {
     crate::server_caps::forget(&config.host, config.port);
 }
 
-/// A server that has proven it needs a selected group gets the GROUP in the
-/// same write, after the serial AUTHINFO exchange. Nothing else joins it —
-/// MODE READER is never sent to anyone.
+// A server that has proven it needs a selected group gets the GROUP in the
+// same write, after the serial AUTHINFO exchange. Nothing else joins it —
+// MODE READER is never sent to anyone.
 #[test]
 fn blocking_known_pipelining_servers_authenticate_then_get_the_group_in_one_write() {
     let (port, handle) = spawn_blocking_pipelined_setup_server(
@@ -794,8 +794,8 @@ fn blocking_known_pipelining_servers_authenticate_then_get_the_group_in_one_writ
     crate::server_caps::forget("127.0.0.1", port);
 }
 
-/// Session setup is authentication and nothing else, so the first line after
-/// the last AUTHINFO answer is the caller's own command.
+// Session setup is authentication and nothing else, so the first line after
+// the last AUTHINFO answer is the caller's own command.
 #[test]
 fn blocking_unproven_server_gets_no_mode_reader_and_no_group() {
     let (port, handle) = spawn_blocking_pipelined_setup_server(
@@ -828,8 +828,8 @@ fn blocking_unproven_server_gets_no_mode_reader_and_no_group() {
     crate::server_caps::forget("127.0.0.1", port);
 }
 
-/// A 500 to BODY is the server refusing that command and nothing more: the
-/// connection stays usable and no future connection changes its behaviour.
+// A 500 to BODY is the server refusing that command and nothing more: the
+// connection stays usable and no future connection changes its behaviour.
 #[test]
 fn blocking_500_after_setup_leaves_the_connection_alone() {
     let (port, handle) = spawn_blocking_pipelined_setup_server(
@@ -864,8 +864,8 @@ fn blocking_500_after_setup_leaves_the_connection_alone() {
     crate::server_caps::forget("127.0.0.1", port);
 }
 
-/// A 412 for a message-id fetch is the server insisting on a selected
-/// group, which RFC 3977 does not require of it.
+// A 412 for a message-id fetch is the server insisting on a selected
+// group, which RFC 3977 does not require of it.
 #[test]
 fn blocking_412_after_setup_records_the_group_requirement() {
     let (port, handle) = spawn_blocking_pipelined_setup_server(
@@ -943,10 +943,10 @@ fn tls_lane_reads_single_body_response(backend: NntpTlsBackend) {
     let _ = std::fs::remove_file(ca_path);
 }
 
-/// E12: the blocking article reader had no chunk callback at all, so every
-/// caller buffered the whole article and `output_callback_cpu` was
-/// permanently zero. Decoded batches must now reach the callback as they
-/// are produced, in order, and concatenate to the buffered article.
+// E12: the blocking article reader had no chunk callback at all, so every
+// caller buffered the whole article and `output_callback_cpu` was
+// permanently zero. Decoded batches must now reach the callback as they
+// are produced, in order, and concatenate to the buffered article.
 fn tls_lane_delivers_decoded_batches_to_chunk_callback(backend: NntpTlsBackend) {
     // Two full 512 KiB batches plus a remainder.
     let original: Vec<u8> = (0..(2 * 512 * 1024 + 123))
@@ -1227,9 +1227,9 @@ fn starttls_lane_reads_a_body_after_the_upgrade(backend: NntpTlsBackend) {
     let _ = std::fs::remove_file(ca_path);
 }
 
-/// A STARTTLS server is lane-served like any other: the greeting arrives in
-/// plaintext, the upgrade runs in band, and the rest of the session — group
-/// selection and BODY included — is encrypted on the same socket.
+// A STARTTLS server is lane-served like any other: the greeting arrives in
+// plaintext, the upgrade runs in band, and the rest of the session — group
+// selection and BODY included — is encrypted on the same socket.
 #[test]
 fn blocking_starttls_rustls_reads_a_body_after_the_upgrade() {
     starttls_lane_reads_a_body_after_the_upgrade(NntpTlsBackend::ManualRustls);
@@ -1242,9 +1242,9 @@ fn blocking_starttls_s2n_reads_a_body_after_the_upgrade() {
     starttls_lane_reads_a_body_after_the_upgrade(NntpTlsBackend::S2n);
 }
 
-/// A server that refuses the upgrade must fail the connect rather than carry
-/// on in plaintext: the credentials and the article both come after this
-/// point, and the config asked for them to be encrypted.
+// A server that refuses the upgrade must fail the connect rather than carry
+// on in plaintext: the credentials and the article both come after this
+// point, and the config asked for them to be encrypted.
 #[test]
 fn blocking_starttls_refusal_fails_the_connect() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1739,7 +1739,7 @@ fn blocking_decoder_preserves_pipelined_leftover() {
     assert!(std::str::from_utf8(&input).unwrap().starts_with("222 "));
 }
 
-/// A lane bound to the test server, with its own permit.
+// A lane bound to the test server, with its own permit.
 fn test_body_lane(config: &ServerConfig) -> BlockingBodyLane {
     BlockingBodyLane::connect(
         ServerId(0),
@@ -1765,9 +1765,9 @@ fn ring_payload(trace: &DecodedBodyTrace) -> Vec<u8> {
         .collect()
 }
 
-/// Responses come back in issue order, and the judging window closes once per
-/// depth so a caller that never lets the ring drain still gets the same rung
-/// verdicts the batch API produced per batch.
+// Responses come back in issue order, and the judging window closes once per
+// depth so a caller that never lets the ring drain still gets the same rung
+// verdicts the batch API produced per batch.
 #[test]
 fn ring_reads_responses_in_issue_order_and_closes_a_window_per_depth() {
     let payloads = [
@@ -1819,10 +1819,10 @@ fn ring_reads_responses_in_issue_order_and_closes_a_window_per_depth() {
     let _ = std::fs::remove_file(ca_path);
 }
 
-/// The point of the ring: a request goes out while responses are still
-/// arriving, so the pipe never empties at a batch boundary. Under the batch
-/// API the last response of a batch was read before the next batch's first
-/// command was written, costing a round trip every time.
+// The point of the ring: a request goes out while responses are still
+// arriving, so the pipe never empties at a batch boundary. Under the batch
+// API the last response of a batch was read before the next batch's first
+// command was written, costing a round trip every time.
 #[test]
 fn ring_never_drains_between_batches() {
     let payloads = [
@@ -1885,9 +1885,9 @@ fn ring_never_drains_between_batches() {
     let _ = std::fs::remove_file(ca_path);
 }
 
-/// Abandoning the ring must poison the connection: the responses to the
-/// commands that were dropped are still in the socket, so it can never go back
-/// to the pool.
+// Abandoning the ring must poison the connection: the responses to the
+// commands that were dropped are still in the socket, so it can never go back
+// to the pool.
 #[test]
 fn ring_abandon_reports_the_dropped_requests_and_poisons_the_lane() {
     let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
@@ -1949,9 +1949,9 @@ fn tcp_peer_closed_sees_a_server_side_close_on_an_idle_socket() {
     assert_eq!((&client).read(&mut byte).unwrap(), 0);
 }
 
-/// A server that authenticates, serves the first BODY it is asked for, and
-/// answers every later one with 480 — a session that expired part-way through
-/// a pipelined batch. Records the command lines it saw.
+// A server that authenticates, serves the first BODY it is asked for, and
+// answers every later one with 480 — a session that expired part-way through
+// a pipelined batch. Records the command lines it saw.
 fn spawn_session_expiry_server(
     body: Vec<u8>,
 ) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
@@ -2003,12 +2003,12 @@ fn spawn_session_expiry_server(
     (port, seen, handle)
 }
 
-/// A 480 arriving in the middle of a pipelined batch means the session
-/// expired, not that the credentials are wrong: the same credentials were
-/// accepted when this connection was set up, and are about to be accepted
-/// again by the next one. Booking it as an auth failure disabled the server
-/// for the whole auth backoff and unlocked the backfill tier behind it, over
-/// a session that a redial fixes.
+// A 480 arriving in the middle of a pipelined batch means the session
+// expired, not that the credentials are wrong: the same credentials were
+// accepted when this connection was set up, and are about to be accepted
+// again by the next one. Booking it as an auth failure disabled the server
+// for the whole auth backoff and unlocked the backfill tier behind it, over
+// a session that a redial fixes.
 #[test]
 fn a_480_mid_batch_is_a_session_expiry_not_an_auth_failure() {
     let (port, seen, handle) = spawn_session_expiry_server(yenc_body(&[0x55; 256]));

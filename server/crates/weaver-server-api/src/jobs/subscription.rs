@@ -285,8 +285,8 @@ async fn attach_duplicate_summaries(db: Database, items: &mut [QueueItem]) -> Re
     Ok(())
 }
 
-/// What a heartbeat compares against the last snapshot it sent: a tick that
-/// finds all of it unchanged has nothing new to tell the client.
+// What a heartbeat compares against the last snapshot it sent: a tick that
+// finds all of it unchanged has nothing new to tell the client.
 #[derive(Clone, PartialEq)]
 struct SnapshotState {
     revision: u64,

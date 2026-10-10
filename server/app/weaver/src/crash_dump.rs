@@ -1,28 +1,28 @@
-//! Minidump capture for Windows structured exceptions.
-//!
-//! The panic hook covers Rust panics only. A structured exception — an access
-//! violation, a stack overflow, a fault raised inside a native archive or
-//! crypto library — never reaches it: the OS terminates the process, and the
-//! log ends mid-line with nothing to say why. Installing a top-level exception
-//! filter buys two artefacts from that moment: a minidump with the faulting
-//! thread's stack and the modules loaded, which a debugger can open later
-//! against the matching build, and one line in the log naming the exception
-//! and where the dump went.
-//!
-//! The filter is not a catch-all. A Rust panic under `panic = "abort"`, an
-//! allocation failure and `std::process::abort` all end in a fast-fail, which
-//! the kernel terminates without consulting user-mode exception filters. Those
-//! paths write their last words to stderr first, so the desktop wrapper keeps
-//! the server's stderr on disk for them. A stack overflow does arrive here:
-//! the runtime's vectored handler reports it on stderr and passes it on, on a
-//! thread with a few kilobytes of stack left. That is why the dump is written
-//! from a fresh thread rather than the faulting one.
-//!
-//! Everything the filter touches is prepared at install time. By the time it
-//! runs the process is faulting, possibly with the allocator's locks held by
-//! the faulting thread, so the filter neither allocates nor takes the tracing
-//! subscriber's log lock: the log line is assembled in a stack buffer and
-//! appended through a second handle on the log file.
+// Minidump capture for Windows structured exceptions.
+//
+// The panic hook covers Rust panics only. A structured exception — an access
+// violation, a stack overflow, a fault raised inside a native archive or
+// crypto library — never reaches it: the OS terminates the process, and the
+// log ends mid-line with nothing to say why. Installing a top-level exception
+// filter buys two artefacts from that moment: a minidump with the faulting
+// thread's stack and the modules loaded, which a debugger can open later
+// against the matching build, and one line in the log naming the exception
+// and where the dump went.
+//
+// The filter is not a catch-all. A Rust panic under `panic = "abort"`, an
+// allocation failure and `std::process::abort` all end in a fast-fail, which
+// the kernel terminates without consulting user-mode exception filters. Those
+// paths write their last words to stderr first, so the desktop wrapper keeps
+// the server's stderr on disk for them. A stack overflow does arrive here:
+// the runtime's vectored handler reports it on stderr and passes it on, on a
+// thread with a few kilobytes of stack left. That is why the dump is written
+// from a fresh thread rather than the faulting one.
+//
+// Everything the filter touches is prepared at install time. By the time it
+// runs the process is faulting, possibly with the allocator's locks held by
+// the faulting thread, so the filter neither allocates nor takes the tracing
+// subscriber's log lock: the log line is assembled in a stack buffer and
+// appended through a second handle on the log file.
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
@@ -49,35 +49,35 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-/// How long the faulting thread waits for the dump thread before giving up
-/// and letting the process die. A dump of this process takes seconds; a wait
-/// this long only ends when the dump thread itself is stuck, and then the
-/// process is better off terminated than hung.
+// How long the faulting thread waits for the dump thread before giving up
+// and letting the process die. A dump of this process takes seconds; a wait
+// this long only ends when the dump thread itself is stuck, and then the
+// process is better off terminated than hung.
 const DUMP_WAIT_MS: u32 = 120_000;
 
-/// The dump destination for this process, resolved once at install time.
+// The dump destination for this process, resolved once at install time.
 static DUMP_TARGET: OnceLock<DumpTarget> = OnceLock::new();
 
-/// Whether a thread is already inside the filter. Only the first faulting
-/// thread dumps; any other that faults meanwhile must not return, because
-/// returning ends the process under the first thread's dump.
+// Whether a thread is already inside the filter. Only the first faulting
+// thread dumps; any other that faults meanwhile must not return, because
+// returning ends the process under the first thread's dump.
 static FILTER_ENTERED: AtomicBool = AtomicBool::new(false);
 
 struct DumpTarget {
-    /// NUL-terminated UTF-16, ready to hand to `CreateFileW` as-is.
+    // NUL-terminated UTF-16, ready to hand to `CreateFileW` as-is.
     dump_wide_path: Vec<u16>,
-    /// The same path as bytes, for the log line.
+    // The same path as bytes, for the log line.
     dump_display_path: String,
-    /// The log file, NUL-terminated UTF-16, when this process writes one.
+    // The log file, NUL-terminated UTF-16, when this process writes one.
     log_wide_path: Option<Vec<u16>>,
 }
 
-/// Installs the top-level exception filter, writing dumps next to the log
-/// files so a user collecting logs picks the dump up with them.
-///
-/// The name carries the process start time and id rather than the crash time:
-/// the filter cannot safely format a path, and one process can crash at most
-/// once, so a per-run name is already unique.
+// Installs the top-level exception filter, writing dumps next to the log
+// files so a user collecting logs picks the dump up with them.
+//
+// The name carries the process start time and id rather than the crash time:
+// the filter cannot safely format a path, and one process can crash at most
+// once, so a per-run name is already unique.
 pub(crate) fn install_unhandled_exception_filter() {
     let log_file = weaver_server_core::runtime::log_buffer::log_file_path();
     let Some(directory) = dump_directory(log_file) else {
@@ -114,8 +114,8 @@ fn wide_path(path: &Path) -> Vec<u16> {
         .collect()
 }
 
-/// The directory the log files live in, falling back to the system temporary
-/// directory when this process writes no log file.
+// The directory the log files live in, falling back to the system temporary
+// directory when this process writes no log file.
 fn dump_directory(log_file: Option<&Path>) -> Option<PathBuf> {
     let log_dir = log_file
         .and_then(Path::parent)
@@ -127,15 +127,15 @@ fn dump_directory(log_file: Option<&Path>) -> Option<PathBuf> {
     })
 }
 
-/// What the dump thread needs from the faulting thread, and its answer.
-///
-/// Process-static rather than a local of the filter. The dump thread reads it
-/// for as long as it runs, and a wait that ends early — a timeout, or a wait
-/// that fails outright — leaves that thread running: a request on the faulting
-/// thread's stack would then be read out of a frame that had already gone.
-/// Static is also the allocation-free way to own it, which matters in a filter
-/// that must not allocate. Only the first faulting thread ever reaches it, so
-/// there is exactly one writer.
+// What the dump thread needs from the faulting thread, and its answer.
+//
+// Process-static rather than a local of the filter. The dump thread reads it
+// for as long as it runs, and a wait that ends early — a timeout, or a wait
+// that fails outright — leaves that thread running: a request on the faulting
+// thread's stack would then be read out of a frame that had already gone.
+// Static is also the allocation-free way to own it, which matters in a filter
+// that must not allocate. Only the first faulting thread ever reaches it, so
+// there is exactly one writer.
 struct DumpRequest {
     exception_info: AtomicPtr<EXCEPTION_POINTERS>,
     faulting_thread_id: AtomicU32,
@@ -148,7 +148,7 @@ static DUMP_REQUEST: DumpRequest = DumpRequest {
     written: AtomicBool::new(false),
 };
 
-/// The top-level exception filter itself.
+// The top-level exception filter itself.
 unsafe extern "system" fn write_minidump(exception_info: *const EXCEPTION_POINTERS) -> i32 {
     if FILTER_ENTERED.swap(true, Ordering::SeqCst) {
         loop {
@@ -191,18 +191,18 @@ unsafe extern "system" fn write_minidump(exception_info: *const EXCEPTION_POINTE
     EXCEPTION_CONTINUE_SEARCH
 }
 
-/// Runs the dump on a new thread with a full stack and waits for it. Returns
-/// `false` when no thread could be started — and only then, so the inline
-/// fallback never runs beside a live dump thread.
-///
-/// The wait has three outcomes and each is taken for what it is. Signalled:
-/// the dump is finished and its answer is in the request. Timed out, or the
-/// wait itself failed: the dump thread may still be running and still reading
-/// the request, so nothing may be freed on its account — which is why the
-/// request is static — and the caller writes its log line from an answer that
-/// is simply not there yet, then returns to let the process die as it was
-/// going to. Either way the process is already terminating; this function's
-/// job is only to make sure the worker never outlives what it reads.
+// Runs the dump on a new thread with a full stack and waits for it. Returns
+// `false` when no thread could be started — and only then, so the inline
+// fallback never runs beside a live dump thread.
+//
+// The wait has three outcomes and each is taken for what it is. Signalled:
+// the dump is finished and its answer is in the request. Timed out, or the
+// wait itself failed: the dump thread may still be running and still reading
+// the request, so nothing may be freed on its account — which is why the
+// request is static — and the caller writes its log line from an answer that
+// is simply not there yet, then returns to let the process die as it was
+// going to. Either way the process is already terminating; this function's
+// job is only to make sure the worker never outlives what it reads.
 unsafe fn dump_on_fresh_thread(request: &'static DumpRequest) -> bool {
     // SAFETY: the start routine has the required ABI, and the parameter is a
     // pointer to process-static state, valid for as long as the thread runs.
@@ -233,7 +233,7 @@ unsafe fn dump_on_fresh_thread(request: &'static DumpRequest) -> bool {
     true
 }
 
-/// The dump thread's body; also the inline fallback.
+// The dump thread's body; also the inline fallback.
 unsafe extern "system" fn dump_thread_main(parameter: *mut c_void) -> u32 {
     let Some(target) = DUMP_TARGET.get() else {
         return 0;
@@ -248,9 +248,9 @@ unsafe extern "system" fn dump_thread_main(parameter: *mut c_void) -> u32 {
     0
 }
 
-/// Writes the dump and reports whether the write succeeded. Every failure is
-/// otherwise swallowed: the process is already dying and there is nothing
-/// useful left to do about a failed diagnostic.
+// Writes the dump and reports whether the write succeeded. Every failure is
+// otherwise swallowed: the process is already dying and there is nothing
+// useful left to do about a failed diagnostic.
 unsafe fn write_dump(target: &DumpTarget, request: &DumpRequest) -> bool {
     // SAFETY: `dump_wide_path` is NUL-terminated UTF-16 built at install time.
     let file = unsafe {
@@ -297,9 +297,9 @@ unsafe fn write_dump(target: &DumpTarget, request: &DumpRequest) -> bool {
     written != 0
 }
 
-/// Appends one ERROR line to the log file, in the logger's own line shape so
-/// the wrapper's start-failure report finds it like any other error, without
-/// allocating or touching the logger.
+// Appends one ERROR line to the log file, in the logger's own line shape so
+// the wrapper's start-failure report finds it like any other error, without
+// allocating or touching the logger.
 unsafe fn record_in_log(
     target: &DumpTarget,
     exception_info: *const EXCEPTION_POINTERS,
@@ -371,7 +371,7 @@ unsafe fn record_in_log(
     }
 }
 
-/// A human name for the exception codes a Rust process is likely to die of.
+// A human name for the exception codes a Rust process is likely to die of.
 fn describe_exception(code: u32) -> &'static [u8] {
     match code {
         0xC000_0005 => b"access violation",
@@ -388,9 +388,9 @@ fn describe_exception(code: u32) -> &'static [u8] {
     }
 }
 
-/// Writes the local time to the millisecond, in the log timer's shape minus
-/// its zone suffix: a fixed string of digits that still sorts with the lines
-/// around it.
+// Writes the local time to the millisecond, in the log timer's shape minus
+// its zone suffix: a fixed string of digits that still sorts with the lines
+// around it.
 fn push_local_timestamp(line: &mut LineBuffer) {
     let mut now = SYSTEMTIME {
         wYear: 0,
@@ -419,8 +419,8 @@ fn push_local_timestamp(line: &mut LineBuffer) {
     line.push_decimal(now.wMilliseconds, 3);
 }
 
-/// A fixed-size line assembled without allocating. Content past the capacity
-/// is dropped; the terminating newline always fits.
+// A fixed-size line assembled without allocating. Content past the capacity
+// is dropped; the terminating newline always fits.
 struct LineBuffer {
     bytes: [u8; 2048],
     len: usize,
@@ -448,7 +448,7 @@ impl LineBuffer {
         }
     }
 
-    /// Zero-padded decimal, at most five digits.
+    // Zero-padded decimal, at most five digits.
     fn push_decimal(&mut self, value: u16, digits: usize) {
         let mut rendered = [b'0'; 5];
         let mut remaining = value;

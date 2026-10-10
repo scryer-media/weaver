@@ -3,9 +3,9 @@ use super::*;
 use crate::HardwareProfileInForce;
 use crate::runtime::HardwareProfile;
 
-/// Twelve cores and 8 GiB. Balanced is recommended; efficient differs from it
-/// in every limit, pool size included; performance is out of reach for want
-/// of memory.
+// Twelve cores and 8 GiB. Balanced is recommended; efficient differs from it
+// in every limit, pool size included; performance is out of reach for want
+// of memory.
 fn twelve_core_machine() -> SystemProfile {
     SystemProfile {
         cpu: CpuProfile {
@@ -64,7 +64,7 @@ async fn schedule(pipeline: &mut Pipeline, profile: Option<HardwareProfile>) {
     received.await.unwrap();
 }
 
-/// Everything a profile decides, as the next activity would find it.
+// Everything a profile decides, as the next activity would find it.
 fn assert_limits_of(pipeline: &Pipeline, profile: HardwareProfile) {
     let tuning = profile.tuning(pipeline.tuner.system_profile());
     assert_eq!(pipeline.tuner.profile_tuning(), tuning);

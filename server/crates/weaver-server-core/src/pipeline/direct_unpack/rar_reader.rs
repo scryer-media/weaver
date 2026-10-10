@@ -1,4 +1,4 @@
-//! Volume-addressed RAR input over the existing chase coverage lifecycle.
+// Volume-addressed RAR input over the existing chase coverage lifecycle.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use super::coverage::SetCoverage;
 
-/// Each open has an independent file cursor. Coverage and repair generations
-/// are shared with the actor; a sparse file's length never admits its holes.
+// Each open has an independent file cursor. Coverage and repair generations
+// are shared with the actor; a sparse file's length never admits its holes.
 pub(crate) struct RarVolumeProvider {
     pub paths: Vec<PathBuf>,
     pub coverage: Arc<SetCoverage>,

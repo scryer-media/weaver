@@ -1,34 +1,34 @@
-//! Continuation of the `impl DirectSetRouter` block from `direct_store/router.rs`.
-//! Split out mechanically to keep the parent file readable; no behavior lives here
-//! that is not simply a method of the same type.
+// Continuation of the `impl DirectSetRouter` block from `direct_store/router.rs`.
+// Split out mechanically to keep the parent file readable; no behavior lives here
+// that is not simply a method of the same type.
 
 use super::*;
 
-/// One decrypted run of an encrypted member, ready to route.
-///
-/// The ciphertext is deliberately absent. Layer 1 hashes cipher bytes and the
-/// envelope keeps the tail padding's ciphertext, and both are taken here, at
-/// construction, so nothing downstream needs the buffer the transform is about
-/// to overwrite. A span's plaintext can then live in the very buffer staging
-/// produced, which is what keeps an encrypted member's per-article cost at the
-/// one allocation and the one pass a plain member already pays.
+// One decrypted run of an encrypted member, ready to route.
+//
+// The ciphertext is deliberately absent. Layer 1 hashes cipher bytes and the
+// envelope keeps the tail padding's ciphertext, and both are taken here, at
+// construction, so nothing downstream needs the buffer the transform is about
+// to overwrite. A span's plaintext can then live in the very buffer staging
+// produced, which is what keeps an encrypted member's per-article cost at the
+// one allocation and the one pass a plain member already pays.
 struct DecryptedPiece {
-    /// Member-logical (== cipher) offset of the run's first byte.
+    // Member-logical (== cipher) offset of the run's first byte.
     start: u64,
-    /// Layer 1's value over the run's ciphertext.
+    // Layer 1's value over the run's ciphertext.
     cipher_crc: u32,
-    /// The run's length in both byte spaces; plaintext is the same size.
+    // The run's length in both byte spaces; plaintext is the same size.
     cipher_len: u64,
-    /// Ciphertext of the bytes at or past the declared size — the tail
-    /// padding, under one AES block, and empty for every other run.
+    // Ciphertext of the bytes at or past the declared size — the tail
+    // padding, under one AES block, and empty for every other run.
     padding_cipher: Vec<u8>,
-    /// The run's plaintext, and the span's buffer once the gates have read it.
+    // The run's plaintext, and the span's buffer once the gates have read it.
     plain: Vec<u8>,
 }
 
 impl DecryptedPiece {
-    /// A run whose plaintext was resolved elsewhere — an edge block held by
-    /// the member's retained plaintext, at most one AES block wide.
+    // A run whose plaintext was resolved elsewhere — an edge block held by
+    // the member's retained plaintext, at most one AES block wide.
     fn new(start: u64, cipher: &[u8], plain: Vec<u8>, unpacked_size: u64) -> Self {
         debug_assert_eq!(cipher.len(), plain.len());
         Self {
@@ -40,8 +40,8 @@ impl DecryptedPiece {
         }
     }
 
-    /// A run still holding its ciphertext, for a caller that will decrypt
-    /// [`Self::plain`] in place.
+    // A run still holding its ciphertext, for a caller that will decrypt
+    // [`Self::plain`] in place.
     fn from_cipher(start: u64, cipher: Vec<u8>, unpacked_size: u64) -> Self {
         Self {
             start,
@@ -53,7 +53,7 @@ impl DecryptedPiece {
     }
 }
 
-/// The ciphertext of `cipher`'s bytes at or past `unpacked_size`.
+// The ciphertext of `cipher`'s bytes at or past `unpacked_size`.
 fn padding_cipher(start: u64, cipher: &[u8], unpacked_size: u64) -> Vec<u8> {
     let destination_len = unpacked_size.saturating_sub(start).min(cipher.len() as u64) as usize;
     cipher[destination_len..].to_vec()
@@ -62,45 +62,45 @@ fn padding_cipher(start: u64, cipher: &[u8], unpacked_size: u64) -> Vec<u8> {
 impl DirectSetRouter {
     // ---- Encrypted members: decrypt at write -------------------------------
 
-    /// Routes one encrypted member slice, decrypting on the way in.
-    ///
-    /// CBC's structure makes this nearly stateless: decrypting cipher block
-    /// *N* needs only cipher block *N−1*, so a router holding spans out of order
-    /// can decrypt each one the moment its predecessor has landed. There is no
-    /// chain checkpoint to maintain and no forward-only constraint.
-    ///
-    /// What is left is arithmetic on three pieces, because a slice's edges are
-    /// article- and volume-shaped while AES is block-shaped:
-    ///
-    /// - a **head** partial block, when the slice does not start on a 16-byte
-    ///   boundary — its first bytes belong to the previous article or the
-    ///   previous *volume*, since a split member's parts are not individually
-    ///   block-aligned;
-    /// - the **aligned middle**, which is all of the slice for an aligned span
-    ///   and is decrypted in one pass;
-    /// - a **tail** partial block, symmetric with the head.
-    ///
-    /// Each edge block is resolved once, by whichever side reaches it first, and
-    /// its plaintext is kept in [`MemberCrypt::edge_plain`] for the other side.
-    /// That is what stops the two halves of a straddling block from deadlocking:
-    /// a drain emits spans **only for the volume it is draining**, so without
-    /// the shared plaintext each side would sit holding its half waiting for the
-    /// other to route bytes it is not allowed to route.
-    ///
-    /// Anything that cannot be resolved is simply **not routed**: it stays
-    /// `pending` in this volume's staging and rides the existing holds
-    /// machinery, bounded by one article per member per gap.
-    ///
-    /// No new re-drain trigger is needed for that, and it is worth saying why,
-    /// because the obvious reading is that a volume whose articles have all
-    /// arrived would never be revisited. [`Self::route`] and
-    /// [`Self::note_volume_complete`] both stage first and then drain **every**
-    /// volume in the set, in ascending order, precisely so a header landing in
-    /// one volume can release another's holds. A straddling block therefore
-    /// resolves in whichever call brings its missing half: the earlier volume's
-    /// drain reads the later one's freshly staged bytes through
-    /// [`Self::member_cipher`], and the later volume's own drain — later in the
-    /// same loop — finds the plaintext waiting for it.
+    // Routes one encrypted member slice, decrypting on the way in.
+    //
+    // CBC's structure makes this nearly stateless: decrypting cipher block
+    // *N* needs only cipher block *N−1*, so a router holding spans out of order
+    // can decrypt each one the moment its predecessor has landed. There is no
+    // chain checkpoint to maintain and no forward-only constraint.
+    //
+    // What is left is arithmetic on three pieces, because a slice's edges are
+    // article- and volume-shaped while AES is block-shaped:
+    //
+    // - a **head** partial block, when the slice does not start on a 16-byte
+    //   boundary — its first bytes belong to the previous article or the
+    //   previous *volume*, since a split member's parts are not individually
+    //   block-aligned;
+    // - the **aligned middle**, which is all of the slice for an aligned span
+    //   and is decrypted in one pass;
+    // - a **tail** partial block, symmetric with the head.
+    //
+    // Each edge block is resolved once, by whichever side reaches it first, and
+    // its plaintext is kept in [`MemberCrypt::edge_plain`] for the other side.
+    // That is what stops the two halves of a straddling block from deadlocking:
+    // a drain emits spans **only for the volume it is draining**, so without
+    // the shared plaintext each side would sit holding its half waiting for the
+    // other to route bytes it is not allowed to route.
+    //
+    // Anything that cannot be resolved is simply **not routed**: it stays
+    // `pending` in this volume's staging and rides the existing holds
+    // machinery, bounded by one article per member per gap.
+    //
+    // No new re-drain trigger is needed for that, and it is worth saying why,
+    // because the obvious reading is that a volume whose articles have all
+    // arrived would never be revisited. [`Self::route`] and
+    // [`Self::note_volume_complete`] both stage first and then drain **every**
+    // volume in the set, in ascending order, precisely so a header landing in
+    // one volume can release another's holds. A straddling block therefore
+    // resolves in whichever call brings its missing half: the earlier volume's
+    // drain reads the later one's freshly staged bytes through
+    // [`Self::member_cipher`], and the later volume's own drain — later in the
+    // same loop — finds the plaintext waiting for it.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn route_encrypted_slice(
         &mut self,
@@ -327,12 +327,12 @@ impl DirectSetRouter {
         Ok(())
     }
 
-    /// The plaintext of one whole cipher block of an encrypted member.
-    ///
-    /// Answered from [`MemberCrypt::edge_plain`] when another volume's drain has
-    /// already decrypted it, and otherwise assembled: the block's 16 cipher
-    /// bytes — which may span two source volumes — plus its CBC predecessor.
-    /// `None` means one of those is not here yet, which is a hold, not an error.
+    // The plaintext of one whole cipher block of an encrypted member.
+    //
+    // Answered from [`MemberCrypt::edge_plain`] when another volume's drain has
+    // already decrypted it, and otherwise assembled: the block's 16 cipher
+    // bytes — which may span two source volumes — plus its CBC predecessor.
+    // `None` means one of those is not here yet, which is a hold, not an error.
     pub(super) fn encrypted_block_plain(
         &mut self,
         member_id: u32,
@@ -362,9 +362,9 @@ impl DirectSetRouter {
         Some(block)
     }
 
-    /// The 16 cipher bytes immediately before `block_start`: the member's IV at
-    /// offset 0, a retained checkpoint at a decrypted run's frontier, or — for a
-    /// block whose predecessor is still staged — the staged bytes themselves.
+    // The 16 cipher bytes immediately before `block_start`: the member's IV at
+    // offset 0, a retained checkpoint at a decrypted run's frontier, or — for a
+    // block whose predecessor is still staged — the staged bytes themselves.
     pub(super) fn member_preceding_block(
         &self,
         member_id: u32,
@@ -384,19 +384,19 @@ impl DirectSetRouter {
             .ok()
     }
 
-    /// Whether this slice of an encrypted member is still waiting on a CBC
-    /// predecessor that has not arrived.
-    ///
-    /// The drain of a set runs over every staged volume on every article that
-    /// lands, so a run sitting behind a gap would otherwise be re-resolved —
-    /// and, before the ordering fix above, re-copied — once per arrival
-    /// anywhere in the set. The question is asked of *this* run and no other:
-    /// a member can have one run blocked and another perfectly routable, and a
-    /// repaired span landing past a gap is exactly that case.
-    ///
-    /// The member-wide marker is only a short-circuit, so a set with no gap at
-    /// all pays nothing for this. The check behind it is a checkpoint lookup
-    /// and a staged-range membership test, and reads no bytes.
+    // Whether this slice of an encrypted member is still waiting on a CBC
+    // predecessor that has not arrived.
+    //
+    // The drain of a set runs over every staged volume on every article that
+    // lands, so a run sitting behind a gap would otherwise be re-resolved —
+    // and, before the ordering fix above, re-copied — once per arrival
+    // anywhere in the set. The question is asked of *this* run and no other:
+    // a member can have one run blocked and another perfectly routable, and a
+    // repaired span landing past a gap is exactly that case.
+    //
+    // The member-wide marker is only a short-circuit, so a set with no gap at
+    // all pays nothing for this. The check behind it is a checkpoint lookup
+    // and a staged-range membership test, and reads no bytes.
     pub(super) fn encrypted_slice_is_blocked(
         &self,
         member_index: usize,
@@ -423,9 +423,9 @@ impl DirectSetRouter {
         mid_start < mid_end && !self.member_preceding_block_is_available(member_id, mid_start)
     }
 
-    /// [`Self::member_preceding_block`]'s question without its answer: whether
-    /// the sixteen cipher bytes before `block_start` are in hand, decided
-    /// without copying them.
+    // [`Self::member_preceding_block`]'s question without its answer: whether
+    // the sixteen cipher bytes before `block_start` are in hand, decided
+    // without copying them.
     fn member_preceding_block_is_available(&self, member_id: u32, block_start: u64) -> bool {
         if self
             .members
@@ -442,8 +442,8 @@ impl DirectSetRouter {
         self.member_cipher_is_staged(member_id, previous, AES_BLOCK)
     }
 
-    /// [`Self::member_cipher`]'s walk over the part table, asking each source
-    /// volume whether it holds the bytes instead of taking them.
+    // [`Self::member_cipher`]'s walk over the part table, asking each source
+    // volume whether it holds the bytes instead of taking them.
     fn member_cipher_is_staged(&self, member_id: u32, logical_offset: u64, len: u64) -> bool {
         let Some(member) = self
             .layout_index_for_member(member_id)
@@ -483,12 +483,12 @@ impl DirectSetRouter {
         true
     }
 
-    /// Whether an encrypted part in `volume` has no place in its member yet.
-    ///
-    /// That happens when an earlier volume's header never arrived: the
-    /// member's stream cannot be measured up to this part, so its edges have
-    /// no coordinates. A caller replacing that earlier volume as well plans
-    /// this volume's edges after the earlier image has been routed.
+    // Whether an encrypted part in `volume` has no place in its member yet.
+    //
+    // That happens when an earlier volume's header never arrived: the
+    // member's stream cannot be measured up to this part, so its edges have
+    // no coordinates. A caller replacing that earlier volume as well plans
+    // this volume's edges after the earlier image has been routed.
     pub(crate) fn cipher_part_unplaced(&self, volume: u32) -> bool {
         self.layout_members()
             .iter()
@@ -502,20 +502,20 @@ impl DirectSetRouter {
             .any(|part| part.volume == volume && part.logical_offset.is_none())
     }
 
-    /// CBC neighbours for complete replacement images, including part bytes
-    /// that never arrived. The layout supplies coordinates; the caller must
-    /// read them from verified outputs or generation-checked source coverage.
-    /// Refuse incomplete geometry or requests beyond the reserved limit.
-    ///
-    /// One gap in the geometry is not a refusal: an edge that falls in the
-    /// adjacent volume when that volume's part is not mapped and `replaced`
-    /// says the volume is itself being replaced. Its header never arrived, so
-    /// the layout has no coordinates for it — and none are needed, because the
-    /// whole replacement image is about to be routed in order and brings those
-    /// bytes with it, exactly as the volume would have on first arrival.
-    ///
-    /// A part with no offset of its own is still a refusal here; see
-    /// [`Self::cipher_part_unplaced`] for the caller's way around it.
+    // CBC neighbours for complete replacement images, including part bytes
+    // that never arrived. The layout supplies coordinates; the caller must
+    // read them from verified outputs or generation-checked source coverage.
+    // Refuse incomplete geometry or requests beyond the reserved limit.
+    //
+    // One gap in the geometry is not a refusal: an edge that falls in the
+    // adjacent volume when that volume's part is not mapped and `replaced`
+    // says the volume is itself being replaced. Its header never arrived, so
+    // the layout has no coordinates for it — and none are needed, because the
+    // whole replacement image is about to be routed in order and brings those
+    // bytes with it, exactly as the volume would have on first arrival.
+    //
+    // A part with no offset of its own is still a refusal here; see
+    // [`Self::cipher_part_unplaced`] for the caller's way around it.
     pub(crate) fn cipher_replacement_edge_reads_bounded(
         &self,
         volume: u32,
@@ -582,15 +582,15 @@ impl DirectSetRouter {
         Some(reads)
     }
 
-    /// Reads a member-logical (== cipher) range out of whatever source volumes
-    /// hold it, through the layout's part table.
-    ///
-    /// Cross-volume by construction: the 16 bytes before a part's first byte are
-    /// the tail of the previous volume's part, and that is the ordinary case for
-    /// a split encrypted member. `None` when any byte of the range is not
-    /// staged — routed bytes are gone from staging, which is exactly why
-    /// [`MemberCrypt`] retains checkpoints and edge plaintext rather than
-    /// re-reading them here.
+    // Reads a member-logical (== cipher) range out of whatever source volumes
+    // hold it, through the layout's part table.
+    //
+    // Cross-volume by construction: the 16 bytes before a part's first byte are
+    // the tail of the previous volume's part, and that is the ordinary case for
+    // a split encrypted member. `None` when any byte of the range is not
+    // staged — routed bytes are gone from staging, which is exactly why
+    // [`MemberCrypt`] retains checkpoints and edge plaintext rather than
+    // re-reading them here.
     pub(super) fn member_cipher(
         &self,
         member_id: u32,
@@ -622,7 +622,7 @@ impl DirectSetRouter {
         Some(out)
     }
 
-    /// One volume's staged bytes, or `None` when the range is not wholly staged.
+    // One volume's staged bytes, or `None` when the range is not wholly staged.
     pub(super) fn staged_bytes_at(
         &self,
         volume_index: u32,
@@ -644,19 +644,19 @@ impl DirectSetRouter {
         bytes
     }
 
-    /// Feeds one decrypted run into the integrity gates.
-    ///
-    /// Two layers, two byte spaces, and that split is the whole point:
-    ///
-    /// - **Layer 1** composes the part's packed hash over **cipher** bytes,
-    ///   before decryption. RARLAB `rar` leaves a split member's non-final
-    ///   packed checksums *plain* even when it keys the whole-member one, so
-    ///   this layer passes over ciphertext whatever the password was: it is a
-    ///   wire-integrity check and **not** a wrong-password detector.
-    /// - **Layer 2** composes plain CRC32 over the **plaintext** runs and folds
-    ///   the result with the KDF hash key when the header keys it. That is the
-    ///   real wrong-password backstop, and for a member whose header carries no
-    ///   password check it is the *only* one.
+    // Feeds one decrypted run into the integrity gates.
+    //
+    // Two layers, two byte spaces, and that split is the whole point:
+    //
+    // - **Layer 1** composes the part's packed hash over **cipher** bytes,
+    //   before decryption. RARLAB `rar` leaves a split member's non-final
+    //   packed checksums *plain* even when it keys the whole-member one, so
+    //   this layer passes over ciphertext whatever the password was: it is a
+    //   wire-integrity check and **not** a wrong-password detector.
+    // - **Layer 2** composes plain CRC32 over the **plaintext** runs and folds
+    //   the result with the KDF hash key when the header keys it. That is the
+    //   real wrong-password backstop, and for a member whose header carries no
+    //   password check it is the *only* one.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn note_encrypted_member_bytes(
         &mut self,
@@ -744,22 +744,22 @@ impl DirectSetRouter {
         self.try_verify_member(member_id)
     }
 
-    /// Layer 1 for the part of `member_id` that lives in `volume_index`: the
-    /// part's packed CRC32, composed from the runs the part was fed, the moment
-    /// the part is complete.
-    ///
-    /// Completeness is asked in the space the part's runs live in. An encrypted
-    /// member's runs are cipher and cover the tail padding, which the
-    /// destination coverage map cannot name, so they are asked of the emitted
-    /// cipher coverage; a plain member's runs are its destination bytes, so the
-    /// coverage map answers. A part that is not complete, or whose runs do not
-    /// tile it — a repair's stale gaps, a hole an article never filled — has no
-    /// value yet and is not judged.
-    ///
-    /// Guarded by that completeness rather than attempted on every run: the
-    /// composition walks the runs it was fed instead of reading one merged
-    /// value, so asking before the part is whole would be a scan per span for
-    /// an answer that cannot exist yet.
+    // Layer 1 for the part of `member_id` that lives in `volume_index`: the
+    // part's packed CRC32, composed from the runs the part was fed, the moment
+    // the part is complete.
+    //
+    // Completeness is asked in the space the part's runs live in. An encrypted
+    // member's runs are cipher and cover the tail padding, which the
+    // destination coverage map cannot name, so they are asked of the emitted
+    // cipher coverage; a plain member's runs are its destination bytes, so the
+    // coverage map answers. A part that is not complete, or whose runs do not
+    // tile it — a repair's stale gaps, a hole an article never filled — has no
+    // value yet and is not judged.
+    //
+    // Guarded by that completeness rather than attempted on every run: the
+    // composition walks the runs it was fed instead of reading one merged
+    // value, so asking before the part is whole would be a scan per span for
+    // an answer that cannot exist yet.
     pub(super) fn gate_part(
         &mut self,
         member_id: u32,
@@ -816,13 +816,13 @@ impl DirectSetRouter {
         Ok(())
     }
 
-    /// Runs every gate a repair's drain deferred, over the finished rewrite.
-    ///
-    /// Every member is visited, not only the ones the rewrite touched: the
-    /// drain that carried the rewrite also drained every other staged volume,
-    /// and a hold it released may have completed a part anywhere in the set.
-    /// A part already judged is skipped; a member already verified returns
-    /// from its own gate at once.
+    // Runs every gate a repair's drain deferred, over the finished rewrite.
+    //
+    // Every member is visited, not only the ones the rewrite touched: the
+    // drain that carried the rewrite also drained every other staged volume,
+    // and a hold it released may have completed a part anywhere in the set.
+    // A part already judged is skipped; a member already verified returns
+    // from its own gate at once.
     pub(super) fn settle_repair_gates(&mut self) -> Result<(), DemotionReason> {
         let member_ids: Vec<u32> = self.members.keys().copied().collect();
         for member_id in member_ids {
@@ -871,8 +871,8 @@ impl DirectSetRouter {
         Ok(())
     }
 
-    /// `(position in chain, logical offset, packed length, packed CRC32)` for
-    /// the part of the layout member at `layout_index` living in `volume_index`.
+    // `(position in chain, logical offset, packed length, packed CRC32)` for
+    // the part of the layout member at `layout_index` living in `volume_index`.
     pub(super) fn part_for(
         &self,
         layout_index: usize,
@@ -894,8 +894,8 @@ impl DirectSetRouter {
             })
     }
 
-    /// Layer 2: the whole-member CRC32, composed from the parts in logical
-    /// order once every part is complete and the chain has closed.
+    // Layer 2: the whole-member CRC32, composed from the parts in logical
+    // order once every part is complete and the chain has closed.
     pub(super) fn try_verify_member(&mut self, member_id: u32) -> Result<(), DemotionReason> {
         let Some(layout_index) = self.layout_index_for_member(member_id) else {
             return Ok(());

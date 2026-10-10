@@ -1,4 +1,4 @@
-//! `par2_completion` tests, part of a mechanical split of the original file.
+// `par2_completion` tests, part of a mechanical split of the original file.
 
 use super::*;
 
@@ -24,8 +24,8 @@ fn bounded_repair_reconstructs_a_missing_payload() {
     );
 }
 
-/// Admission, authenticated metadata ingestion, the normal repair worker, and
-/// final output reconciliation must all tolerate a payload with no disk inode.
+// Admission, authenticated metadata ingestion, the normal repair worker, and
+// final output reconciliation must all tolerate a payload with no disk inode.
 #[tokio::test]
 async fn admitted_job_reconstructs_an_entirely_missing_payload() {
     use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
@@ -2352,7 +2352,7 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
     assert_eq!(completed_payload, original_payload);
 }
 
-/// The post-repair pass reads the file the repair rewrote and nothing else.
+// The post-repair pass reads the file the repair rewrote and nothing else.
 #[tokio::test]
 async fn post_repair_verification_reads_only_the_files_the_repair_rewrote() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2409,15 +2409,15 @@ async fn post_repair_verification_reads_only_the_files_the_repair_rewrote() {
     );
 }
 
-/// The trade this seam accepts, pinned honestly rather than left implicit.
-///
-/// A file the repair did not touch is vouched by the pre-repair pass, which
-/// read its bytes. If something outside this job rewrites that file in the
-/// minutes between the two passes, the post-repair pass will not notice — it
-/// is not asked to. This is the documented residual, not a bug: it is the same
-/// window, and the same trust class, as an in-stream claim relied on across the
-/// same interval. The test exists so the day someone changes it, they change it
-/// deliberately.
+// The trade this seam accepts, pinned honestly rather than left implicit.
+//
+// A file the repair did not touch is vouched by the pre-repair pass, which
+// read its bytes. If something outside this job rewrites that file in the
+// minutes between the two passes, the post-repair pass will not notice — it
+// is not asked to. This is the documented residual, not a bug: it is the same
+// window, and the same trust class, as an in-stream claim relied on across the
+// same interval. The test exists so the day someone changes it, they change it
+// deliberately.
 #[tokio::test]
 async fn post_repair_verification_accepts_a_file_corrupted_after_the_pre_repair_read() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2509,15 +2509,15 @@ async fn post_repair_verification_accepts_a_file_corrupted_after_the_pre_repair_
     assert!(plan.swaps.is_empty() && plan.renames.is_empty());
 }
 
-/// A file the pre-repair verdict called `Renamed` is read back at its canonical
-/// name, not carried.
-///
-/// The repairer treats a misplaced file as work: it is not complete at the path
-/// its description names, so the repair copies the bytes onto that path and
-/// moves whatever held the name aside. Carrying the pre-repair entry through
-/// that would report a file as still misplaced after the repair had already
-/// placed it, and hand the placement step a rename onto a name the repair had
-/// just filled.
+// A file the pre-repair verdict called `Renamed` is read back at its canonical
+// name, not carried.
+//
+// The repairer treats a misplaced file as work: it is not complete at the path
+// its description names, so the repair copies the bytes onto that path and
+// moves whatever held the name aside. Carrying the pre-repair entry through
+// that would report a file as still misplaced after the repair had already
+// placed it, and hand the placement step a rename onto a name the repair had
+// just filled.
 #[tokio::test]
 async fn post_repair_verification_reads_back_a_renamed_file_at_its_canonical_name() {
     let temp_dir = tempfile::tempdir().unwrap();

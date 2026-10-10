@@ -1,21 +1,21 @@
-//! Replacing the running Weaver process with a fresh one.
-//!
-//! Every mechanism here runs AFTER the serve loop's graceful teardown: the
-//! Unix path replaces the process image, which runs no destructors, and both
-//! Windows paths hand the listening port to a process that is about to bind
-//! it. The capability rules themselves live in `weaver-server-core` so the
-//! REST and GraphQL surfaces answer from the same function this does.
+// Replacing the running Weaver process with a fresh one.
+//
+// Every mechanism here runs AFTER the serve loop's graceful teardown: the
+// Unix path replaces the process image, which runs no destructors, and both
+// Windows paths hand the listening port to a process that is about to bind
+// it. The capability rules themselves live in `weaver-server-core` so the
+// REST and GraphQL surfaces answer from the same function this does.
 
 use std::path::Path;
 
 use tracing::{error, info};
 use weaver_server_core::runtime::restart::{current_restart_capability, resolvable_executable};
 
-/// Restart this process, or explain why the restart was refused.
-///
-/// The capability is settled again here rather than trusted from whenever the
-/// button was rendered: the deployment cannot change under a running process,
-/// but the program file can — an upgrade may have replaced or removed it.
+// Restart this process, or explain why the restart was refused.
+//
+// The capability is settled again here rather than trusted from whenever the
+// button was rendered: the deployment cannot change under a running process,
+// but the program file can — an upgrade may have replaced or removed it.
 pub(crate) fn restart_now() -> Result<(), String> {
     let capability = current_restart_capability();
     if !capability.supported {
@@ -33,10 +33,10 @@ pub(crate) fn restart_now() -> Result<(), String> {
     restart_process(&executable)
 }
 
-/// Re-exec in place. The PID is preserved, so a systemd unit or a launchd job
-/// sees no exit and cannot race a second copy into existence — which is why
-/// this is the right primitive for every native Unix install, service-managed
-/// or not. Returns only on failure.
+// Re-exec in place. The PID is preserved, so a systemd unit or a launchd job
+// sees no exit and cannot race a second copy into existence — which is why
+// this is the right primitive for every native Unix install, service-managed
+// or not. Returns only on failure.
 #[cfg(unix)]
 fn restart_process(executable: &Path) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
@@ -59,8 +59,8 @@ fn restart_process(executable: &Path) -> Result<(), String> {
     ))
 }
 
-/// Windows has no exec. Either the tray supervises this process and owns the
-/// relaunch, or nothing does and the process starts its own replacement.
+// Windows has no exec. Either the tray supervises this process and owns the
+// relaunch, or nothing does and the process starts its own replacement.
 #[cfg(windows)]
 fn restart_process(executable: &Path) -> Result<(), String> {
     if post_tray_restart() {
@@ -70,9 +70,9 @@ fn restart_process(executable: &Path) -> Result<(), String> {
     spawn_replacement(executable)
 }
 
-/// Ask the tray to restart the server it owns. False when no tray is running
-/// in this session, or when the message could not be delivered — either way
-/// the caller falls back to starting the replacement itself.
+// Ask the tray to restart the server it owns. False when no tray is running
+// in this session, or when the message could not be delivered — either way
+// the caller falls back to starting the replacement itself.
 #[cfg(windows)]
 fn post_tray_restart() -> bool {
     use std::os::windows::ffi::OsStrExt;
@@ -98,9 +98,9 @@ fn post_tray_restart() -> bool {
     true
 }
 
-/// Start a detached replacement that outlives this process. The teardown that
-/// ran before this released the listening socket, so the replacement can bind
-/// the same port while this process is still exiting.
+// Start a detached replacement that outlives this process. The teardown that
+// ran before this released the listening socket, so the replacement can bind
+// the same port while this process is still exiting.
 #[cfg(windows)]
 fn spawn_replacement(executable: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;

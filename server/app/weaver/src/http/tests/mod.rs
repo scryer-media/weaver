@@ -44,22 +44,22 @@ fn auth_test_router(db: Database, auth_cache: LoginAuthCache) -> Router {
         .layer(Extension(auth_cache))
 }
 
-/// Password checks share one two-permit budget for the whole process, and a
-/// login that finds it busy is refused with 429 rather than queued. Tests that
-/// post a password take turns here so a neighbour's Argon2 work can never be
-/// the reason one of them is refused.
+// Password checks share one two-permit budget for the whole process, and a
+// login that finds it busy is refused with 429 rather than queued. Tests that
+// post a password take turns here so a neighbour's Argon2 work can never be
+// the reason one of them is refused.
 async fn login_turn() -> tokio::sync::MutexGuard<'static, ()> {
     static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     TURN.lock().await
 }
 
-/// The password these tests authenticate with, assembled at runtime instead of
-/// written as a literal.
-///
-/// Test-only credential, and deterministic — every caller below gets the same
-/// bytes. It is built rather than spelled so no password literal flows into a
-/// hashing or login sink, which is what a secret scanner reads as a hard-coded
-/// credential.
+// The password these tests authenticate with, assembled at runtime instead of
+// written as a literal.
+//
+// Test-only credential, and deterministic — every caller below gets the same
+// bytes. It is built rather than spelled so no password literal flows into a
+// hashing or login sink, which is what a secret scanner reads as a hard-coded
+// credential.
 fn test_password() -> String {
     String::from_utf8(vec![
         b'h',
@@ -78,8 +78,8 @@ fn test_password() -> String {
     .expect("the test credential is ASCII by construction")
 }
 
-/// A `/api/login` request body carrying a runtime-built credential, so the
-/// password never appears as a literal in a login payload either.
+// A `/api/login` request body carrying a runtime-built credential, so the
+// password never appears as a literal in a login payload either.
 fn login_body(username: &str, password: &str) -> Body {
     Body::from(serde_json::json!({ "username": username, "password": password }).to_string())
 }
@@ -665,8 +665,8 @@ async fn listgroups_ids(app: Router) -> Vec<u64> {
         .collect()
 }
 
-/// `/api/auth/status` is unauthenticated, so it describes the deployment only
-/// to a browser that is about to run the first-run wizard.
+// `/api/auth/status` is unauthenticated, so it describes the deployment only
+// to a browser that is about to run the first-run wizard.
 fn auth_status_test_router(
     db: Database,
     auth_cache: LoginAuthCache,
@@ -710,15 +710,15 @@ async fn auth_status_payload(app: Router) -> serde_json::Value {
     serde_json::from_slice(&body).unwrap()
 }
 
-/// One parsed exposition sample.
+// One parsed exposition sample.
 struct ParsedSample {
     name: String,
     labels: Vec<(String, String)>,
 }
 
-/// Metric names that break today's naming rules and are kept anyway, because
-/// removing them would break existing dashboards. The list is derived from the
-/// catalogue's own deprecation markers, so it cannot drift from the exporter.
+// Metric names that break today's naming rules and are kept anyway, because
+// removing them would break existing dashboards. The list is derived from the
+// catalogue's own deprecation markers, so it cannot drift from the exporter.
 fn deprecated_metric_names() -> std::collections::BTreeSet<&'static str> {
     metrics::catalog::metric_catalog()
         .iter()
@@ -727,12 +727,12 @@ fn deprecated_metric_names() -> std::collections::BTreeSet<&'static str> {
         .collect()
 }
 
-/// Split a sample line into its metric name, label set, and value.
-///
-/// This is deliberately a hand parser rather than a `contains` check: the bug
-/// it replaces (a literal `\n` in a HELP line swallowing the TYPE line and the
-/// first sample) produced output that still *contained* every expected
-/// substring while being unparseable by Prometheus.
+// Split a sample line into its metric name, label set, and value.
+//
+// This is deliberately a hand parser rather than a `contains` check: the bug
+// it replaces (a literal `\n` in a HELP line swallowing the TYPE line and the
+// first sample) produced output that still *contained* every expected
+// substring while being unparseable by Prometheus.
 fn parse_prometheus_sample(line: &str) -> Result<ParsedSample, String> {
     let mut chars = line.char_indices().peekable();
     let mut name_end = 0;
@@ -837,10 +837,10 @@ fn parse_prometheus_sample(line: &str) -> Result<ParsedSample, String> {
     Ok(ParsedSample { name, labels })
 }
 
-/// Structural gate every render test runs. Replaces the old
-/// `(length, hash)` golden, which pinned bugs in place instead of catching
-/// them: a broken HELP line changed the hash exactly as much as a legitimate
-/// new metric did, so the fix and the regression were indistinguishable.
+// Structural gate every render test runs. Replaces the old
+// `(length, hash)` golden, which pinned bugs in place instead of catching
+// them: a broken HELP line changed the hash exactly as much as a legitimate
+// new metric did, so the fix and the regression were indistinguishable.
 fn assert_valid_prometheus_exposition(rendered: &str) {
     let deprecated = deprecated_metric_names();
     println!(
@@ -1169,7 +1169,7 @@ fn manual_pause_block() -> DownloadBlockState {
     }
 }
 
-/// Every distinct value of `label` that `family` emitted, in rendered order.
+// Every distinct value of `label` that `family` emitted, in rendered order.
 fn rendered_label_values(rendered: &str, family: &str, label: &str) -> Vec<String> {
     let mut values = Vec::new();
     for line in rendered.lines() {
@@ -1226,12 +1226,12 @@ fn sample_transfer_snapshot() -> weaver_nntp::transfer::ServerTransferSnapshot {
     }
 }
 
-/// Bounds shared by the collection-side fixtures below. The exact values do not
-/// matter to the exporter — it renders whatever bounds the snapshot carries —
-/// but a two-bound histogram keeps the expected `le` lines readable.
+// Bounds shared by the collection-side fixtures below. The exact values do not
+// matter to the exporter — it renders whatever bounds the snapshot carries —
+// but a two-bound histogram keeps the expected `le` lines readable.
 const TEST_BOUNDS: &[f64] = &[0.1, 1.0];
 
-/// A histogram with per-bucket counts 2/3/1, i.e. cumulative 2/5/6.
+// A histogram with per-bucket counts 2/3/1, i.e. cumulative 2/5/6.
 fn sample_histogram() -> instr::HistogramSnapshot {
     instr::HistogramSnapshot {
         bounds: TEST_BOUNDS,
@@ -1371,9 +1371,9 @@ fn sample_http_metrics() -> instr::HttpMetricsSnapshot {
     }
 }
 
-/// Every collection-side input, so callers can populate a render without
-/// restating the fixtures. Held as a struct because the render input borrows
-/// each of them.
+// Every collection-side input, so callers can populate a render without
+// restating the fixtures. Held as a struct because the render input borrows
+// each of them.
 struct CollectionFixtures {
     server_metrics: Vec<instr::ServerMetricsSnapshot>,
     job_lifecycle: instr::JobLifecycleMetricsSnapshot,
@@ -1407,8 +1407,8 @@ impl CollectionFixtures {
         }
     }
 
-    /// The fixtures must outlive the render input, which is why they live in
-    /// one struct rather than as a pile of temporaries at each call site.
+    // The fixtures must outlive the render input, which is why they live in
+    // one struct rather than as a pile of temporaries at each call site.
     fn apply<'a>(&'a self, input: &mut metrics::PrometheusRenderInput<'a>) {
         input.server_metrics = &self.server_metrics;
         input.job_lifecycle = Some(&self.job_lifecycle);
@@ -1421,8 +1421,8 @@ impl CollectionFixtures {
     }
 }
 
-/// Build the most complete render the exporter can produce, so the catalogue
-/// comparison sees every family.
+// Build the most complete render the exporter can produce, so the catalogue
+// comparison sees every family.
 fn fully_populated_render() -> String {
     let snapshot = populated_metrics_snapshot();
     let block = manual_pause_block();

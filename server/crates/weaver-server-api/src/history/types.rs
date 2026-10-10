@@ -438,8 +438,8 @@ pub fn history_item_from_row(
     )
 }
 
-/// Projects only the fields rendered by the paginated History table. Full
-/// release parsing remains available to detail and compatibility facades.
+// Projects only the fields rendered by the paginated History table. Full
+// release parsing remains available to detail and compatibility facades.
 pub(crate) fn history_table_item_from_row(
     row: &JobHistoryRow,
     delete_operation: Option<HistoryDeleteRowState>,

@@ -1,15 +1,15 @@
-//! Typed contracts for post-processing scripts.
-//!
-//! A script has no identity beyond its name in the configured scripts directory:
-//! there are no revisions, digests, or trust states, so nothing here models
-//! package identity.
+// Typed contracts for post-processing scripts.
+//
+// A script has no identity beyond its name in the configured scripts directory:
+// there are no revisions, digests, or trust states, so nothing here models
+// package identity.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Validation failure for a post-processing contract.
+// Validation failure for a post-processing contract.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum PostProcessingValidationError {
     InvalidName(&'static str),
@@ -85,7 +85,7 @@ fn validate_bounded_metadata(
     .ok_or(PostProcessingValidationError::InvalidName(field))
 }
 
-/// Option key declared by a manifest and supplied by the operator.
+// Option key declared by a manifest and supplied by the operator.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 #[serde(transparent)]
 pub struct OptionName(String);
@@ -111,9 +111,9 @@ impl<'de> Deserialize<'de> for OptionName {
     }
 }
 
-/// The name of a file or manifest package directory directly under the configured scripts root.
-///
-/// This is the script's whole identity — the same one SABnzbd and NZBGet use.
+// The name of a file or manifest package directory directly under the configured scripts root.
+//
+// This is the script's whole identity — the same one SABnzbd and NZBGet use.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ScriptName(String);
@@ -155,7 +155,7 @@ impl<'de> Deserialize<'de> for ScriptName {
     }
 }
 
-/// Exact NZBGet manifest name, retained because its legacy environment contract uses it verbatim.
+// Exact NZBGet manifest name, retained because its legacy environment contract uses it verbatim.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 #[serde(transparent)]
 pub struct NzbgetCompatibilityName(String);
@@ -191,7 +191,7 @@ impl<'de> Deserialize<'de> for NzbgetCompatibilityName {
     }
 }
 
-/// Environment contract a script is executed under.
+// Environment contract a script is executed under.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScriptAdapter {
@@ -208,7 +208,7 @@ impl ScriptAdapter {
     }
 }
 
-/// Typed built-in pipeline failure stage.
+// Typed built-in pipeline failure stage.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PipelineFailureStage {
@@ -219,7 +219,7 @@ pub enum PipelineFailureStage {
     Move,
 }
 
-/// Pipeline result, which stays independent of the post-processing result.
+// Pipeline result, which stays independent of the post-processing result.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum PipelineOutcome {
@@ -231,7 +231,7 @@ pub enum PipelineOutcome {
     },
 }
 
-/// Value type accepted by a script option declaration.
+// Value type accepted by a script option declaration.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScriptOptionType {
@@ -242,12 +242,12 @@ pub enum ScriptOptionType {
     Secret,
 }
 
-/// Secret option value that is deliberately impossible to deserialize through generic serde.
+// Secret option value that is deliberately impossible to deserialize through generic serde.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SecretOptionValue(String);
 
 impl SecretOptionValue {
-    /// Construct a secret at an authenticated administrative input boundary.
+    // Construct a secret at an authenticated administrative input boundary.
     pub fn from_admin_input(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -287,7 +287,7 @@ impl<'de> Deserialize<'de> for SecretOptionValue {
     }
 }
 
-/// Concrete resolved option value. Decimal JSON numbers retain their original JSON number form.
+// Concrete resolved option value. Decimal JSON numbers retain their original JSON number form.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum OptionValue {
@@ -315,7 +315,7 @@ impl OptionValue {
     }
 }
 
-/// NZBGet select entry, preserving documented string or numeric values.
+// NZBGet select entry, preserving documented string or numeric values.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ScriptSelectValue {
@@ -323,7 +323,7 @@ pub enum ScriptSelectValue {
     Number(serde_json::Number),
 }
 
-/// Resolved option with a validated name.
+// Resolved option with a validated name.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct ResolvedOption {
     name: OptionName,
@@ -360,7 +360,7 @@ impl<'de> Deserialize<'de> for ResolvedOption {
     }
 }
 
-/// Named NZBGet section metadata retained from a v2 manifest.
+// Named NZBGet section metadata retained from a v2 manifest.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct NzbgetSection {
     name: String,
@@ -416,7 +416,7 @@ impl<'de> Deserialize<'de> for NzbgetSection {
     }
 }
 
-/// Validated script option declaration.
+// Validated script option declaration.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct ScriptOption {
     section: Option<String>,
@@ -551,10 +551,10 @@ impl<'de> Deserialize<'de> for ScriptOption {
 mod script_events;
 pub use script_events::{QueueEvent, ScriptEventLabel, ScriptKind, ScriptTaskTime};
 
-/// Validated internal representation of a discovered script manifest.
-///
-/// A bare executable synthesizes one of these with no options and the file name
-/// as both display name and entrypoint.
+// Validated internal representation of a discovered script manifest.
+//
+// A bare executable synthesizes one of these with no options and the file name
+// as both display name and entrypoint.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct ScriptManifest {
     adapter: ScriptAdapter,
@@ -625,12 +625,12 @@ impl ScriptManifest {
         self
     }
 
-    /// Recognised kinds; unknown-only declarations are listed with a problem and cannot run.
+    // Recognised kinds; unknown-only declarations are listed with a problem and cannot run.
     pub fn kinds(&self) -> &BTreeSet<ScriptKind> {
         &self.kinds
     }
 
-    /// Explicit subscriptions. An empty NZBGet declaration is expanded to every event on parse.
+    // Explicit subscriptions. An empty NZBGet declaration is expanded to every event on parse.
     pub fn queue_events(&self) -> &BTreeSet<QueueEvent> {
         &self.queue_events
     }
@@ -667,7 +667,7 @@ impl ScriptManifest {
         &self.options
     }
 
-    /// Merge operator-supplied values over manifest defaults, rejecting undeclared or mistyped keys.
+    // Merge operator-supplied values over manifest defaults, rejecting undeclared or mistyped keys.
     pub fn resolve_options(
         &self,
         supplied: &[ResolvedOption],
@@ -837,15 +837,15 @@ fn validate_sections(sections: &[NzbgetSection]) -> Result<(), PostProcessingVal
     }
 }
 
-/// Whether the instances that run for every category still run for a
-/// download whose category has instances of its own.
+// Whether the instances that run for every category still run for a
+// download whose category has instances of its own.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GlobalScriptsRun {
-    /// Unscoped instances first, then the category's own.
+    // Unscoped instances first, then the category's own.
     #[default]
     Always,
-    /// A category with instances of its own runs only those.
+    // A category with instances of its own runs only those.
     OnlyWithoutCategoryScripts,
 }
 
@@ -861,15 +861,15 @@ impl GlobalScriptsRun {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct EventScriptSettings {
-    /// Scan, feed and scheduler runs allowed at once. Queue events drain one
-    /// at a time regardless.
+    // Scan, feed and scheduler runs allowed at once. Queue events drain one
+    // at a time regardless.
     pub event_script_concurrency: u8,
     pub event_script_timeout_seconds: u64,
     pub file_downloaded_event_interval: i64,
-    /// The newest runs kept for each download (or each scan, schedule or feed
-    /// for runs that belong to no download).
+    // The newest runs kept for each download (or each scan, schedule or feed
+    // for runs that belong to no download).
     pub script_output_runs_per_job: u32,
-    /// Failed runs kept beyond `script_output_runs_per_job`, newest first.
+    // Failed runs kept beyond `script_output_runs_per_job`, newest first.
     pub script_output_failed_runs_per_job: u32,
 }
 
@@ -899,25 +899,25 @@ impl EventScriptSettings {
     }
 }
 
-/// Settings the operator controls. Execution is off until it is explicitly turned on.
+// Settings the operator controls. Execution is off until it is explicitly turned on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostProcessingSettings {
     #[serde(flatten)]
     pub event_scripts: EventScriptSettings,
     pub execution_enabled: bool,
-    /// Scripts that a job waits for allowed to run at once, across every job.
+    // Scripts that a job waits for allowed to run at once, across every job.
     pub concurrency: u8,
     pub termination_grace_seconds: u64,
     pub python_interpreter: Option<String>,
     pub powershell_interpreter: Option<String>,
     pub batch_interpreter: Option<String>,
-    /// The `go` command that runs `.go` scripts.
+    // The `go` command that runs `.go` scripts.
     #[serde(default)]
     pub go_interpreter: Option<String>,
-    /// Extension-token patterns that reject a job only after Weaver has a
-    /// trustworthy output name. An empty list disables the policy. A saved
-    /// document without the field predates the default list and reads it.
+    // Extension-token patterns that reject a job only after Weaver has a
+    // trustworthy output name. An empty list disables the policy. A saved
+    // document without the field predates the default list and reads it.
     #[serde(default = "default_unacceptable_extensions")]
     pub unacceptable_extensions: Vec<String>,
     #[serde(default)]
@@ -942,7 +942,7 @@ impl Default for PostProcessingSettings {
 }
 
 impl PostProcessingSettings {
-    /// Return a canonical settings value suitable for persistence.
+    // Return a canonical settings value suitable for persistence.
     pub fn normalized(mut self) -> Result<Self, PostProcessingValidationError> {
         self.unacceptable_extensions = self
             .unacceptable_extensions
@@ -973,9 +973,9 @@ impl PostProcessingSettings {
         Ok(())
     }
 
-    /// Return the matching configured extension-token pattern for `filename`.
-    /// Paths and leading-dot files without a basename are not treated as having
-    /// an extension, matching SABnzbd's extension semantics.
+    // Return the matching configured extension-token pattern for `filename`.
+    // Paths and leading-dot files without a basename are not treated as having
+    // an extension, matching SABnzbd's extension semantics.
     pub fn unacceptable_extension_match<'a>(&'a self, filename: &str) -> Option<&'a str> {
         let basename = filename.rsplit(['/', '\\']).next()?;
         let (stem, extension) = basename.rsplit_once('.')?;
@@ -989,8 +989,8 @@ impl PostProcessingSettings {
     }
 }
 
-/// The unwanted extension list a new install starts with, sorted as a saved
-/// list is normalized. An empty list turns the check off.
+// The unwanted extension list a new install starts with, sorted as a saved
+// list is normalized. An empty list turns the check off.
 pub const DEFAULT_UNACCEPTABLE_EXTENSIONS: [&str; 10] = [
     "bat", "cmd", "com", "exe", "js", "lnk", "msi", "ps1", "scr", "vbs",
 ];
@@ -1002,9 +1002,9 @@ fn default_unacceptable_extensions() -> Vec<String> {
         .collect()
 }
 
-/// The reason a job fails with when the unwanted extension policy refuses
-/// `relative_path`: the file's extension and the file that carried it, as
-/// the consumer app and the Jobs screen show it.
+// The reason a job fails with when the unwanted extension policy refuses
+// `relative_path`: the file's extension and the file that carried it, as
+// the consumer app and the Jobs screen show it.
 pub fn unwanted_extension_reason(relative_path: &str) -> String {
     let relative_path = relative_path.replace('\\', "/");
     let extension = relative_path
@@ -1029,14 +1029,14 @@ fn normalize_unacceptable_extension(value: &str) -> Result<String, PostProcessin
         .ok_or(PostProcessingValidationError::InvalidUnacceptableExtension)
 }
 
-/// Job-level rollup of every script that ran.
+// Job-level rollup of every script that ran.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PostProcessingSummary {
     NotRun,
-    /// Durable marker that a job entered post-processing. It is only ever
-    /// observed after a crash, where the startup scan turns it into
-    /// `Interrupted`; a clean pass always overwrites it with its own rollup.
+    // Durable marker that a job entered post-processing. It is only ever
+    // observed after a crash, where the startup scan turns it into
+    // `Interrupted`; a clean pass always overwrites it with its own rollup.
     Running,
     Succeeded,
     Warning,
@@ -1072,7 +1072,7 @@ impl PostProcessingSummary {
     }
 }
 
-/// Worst-of merge: the job rollup reports the most severe script outcome.
+// Worst-of merge: the job rollup reports the most severe script outcome.
 pub fn merge_post_processing_summary(
     current: PostProcessingSummary,
     incoming: PostProcessingSummary,
@@ -1094,12 +1094,12 @@ pub fn merge_post_processing_summary(
     }
 }
 
-/// Terminal state of one script execution.
+// Terminal state of one script execution.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScriptStatus {
     Succeeded,
-    /// NZBGet exit 95 (`NONE`): the script decided it had nothing to do.
+    // NZBGet exit 95 (`NONE`): the script decided it had nothing to do.
     Skipped,
     Warning,
     Failed,
@@ -1141,13 +1141,13 @@ impl ScriptStatus {
     }
 }
 
-/// What one script did, appended to the job's events and stored on the job row.
+// What one script did, appended to the job's events and stored on the job row.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScriptResult {
     pub script: ScriptName,
-    /// The instance that ran, when the run came from one. Its name is kept as
-    /// it was at the time, so a result still reads right after a rename.
+    // The instance that ran, when the run came from one. Its name is kept as
+    // it was at the time, so a result still reads right after a rename.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1156,7 +1156,7 @@ pub struct ScriptResult {
     pub event: ScriptEventLabel,
     #[serde(default)]
     pub output_id: Option<String>,
-    /// The run was started without anything waiting for it.
+    // The run was started without anything waiting for it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub background: bool,
     pub adapter: ScriptAdapter,
@@ -1173,8 +1173,8 @@ pub struct ScriptResult {
 }
 
 impl ScriptResult {
-    /// What the run is called wherever it is shown: the instance's name, or
-    /// the script's for a result recorded before there were instances.
+    // What the run is called wherever it is shown: the instance's name, or
+    // the script's for a result recorded before there were instances.
     pub fn label(&self) -> &str {
         self.instance_name
             .as_deref()

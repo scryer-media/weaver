@@ -15,8 +15,8 @@ use weaver_server_core::post_processing::preset::ScriptPreset;
 use weaver_server_core::post_processing::secrets::{Secret, SecretRef};
 use weaver_server_core::post_processing::test_run::ScriptTestSnapshot;
 
-/// Placeholder shown instead of a stored secret. Secrets leave the process only
-/// as environment values for the script that declared them.
+// Placeholder shown instead of a stored secret. Secrets leave the process only
+// as environment values for the script that declared them.
 pub const MASKED_SECRET: &str = "[REDACTED]";
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -517,7 +517,7 @@ impl TryFrom<ScriptInstanceScheduleGql>
     }
 }
 
-/// The scripts directory as it is now, for judging saved script jobs against.
+// The scripts directory as it is now, for judging saved script jobs against.
 pub(crate) struct ScriptDirectoryView {
     listing: Result<ScriptListing, String>,
 }
@@ -604,7 +604,7 @@ pub struct ScriptInstanceValueInput {
     pub secret: Option<bool>,
 }
 
-/// A value sent to be kept as a secret is not printed.
+// A value sent to be kept as a secret is not printed.
 impl std::fmt::Debug for ScriptInstanceValueInput {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match &self.value {

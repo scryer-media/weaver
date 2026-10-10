@@ -1,8 +1,8 @@
 use super::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// A refill has been booked by the actor, but the socket dies before the
-/// worker can adopt its answer. The final park must release the new booking.
+// A refill has been booked by the actor, but the socket dies before the
+// worker can adopt its answer. The final park must release the new booking.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transport_fault_after_prefetch_releases_the_granted_connection_class() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -104,14 +104,14 @@ async fn transport_fault_after_prefetch_releases_the_granted_connection_class() 
     );
 }
 
-/// A lane that parks with articles still in hand returns them before it
-/// waits on its outstanding refill.
-///
-/// The actor holds a saturated lane's refill until the lane's holdings fall
-/// below its share, and a lane parking on a transport fault with a full
-/// pending tail only gets there by returning that tail. Waiting first would
-/// leave the two sides each waiting on the other: the refill never answered,
-/// the articles never requeued, the connection slot never released.
+// A lane that parks with articles still in hand returns them before it
+// waits on its outstanding refill.
+//
+// The actor holds a saturated lane's refill until the lane's holdings fall
+// below its share, and a lane parking on a transport fault with a full
+// pending tail only gets there by returning that tail. Waiting first would
+// leave the two sides each waiting on the other: the refill never answered,
+// the articles never requeued, the connection slot never released.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_parking_lane_returns_its_tail_before_waiting_on_its_refill() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -226,13 +226,13 @@ async fn a_parking_lane_returns_its_tail_before_waiting_on_its_refill() {
     server.await.unwrap();
 }
 
-/// A probe reaching a lane mid-lease is answered once the ring drains.
-///
-/// The lane has three BODY responses outstanding when the probe arrives. The
-/// worker takes the probe up, stops issuing, reads the three responses, and
-/// only then writes the STAT: on the wire every BODY precedes it, so the STAT
-/// never reads an article payload as its status line. The answer is the
-/// server's, not an inconclusive shrug, and the lease still parks normally.
+// A probe reaching a lane mid-lease is answered once the ring drains.
+//
+// The lane has three BODY responses outstanding when the probe arrives. The
+// worker takes the probe up, stops issuing, reads the three responses, and
+// only then writes the STAT: on the wire every BODY precedes it, so the STAT
+// never reads an article payload as its status line. The answer is the
+// server's, not an inconclusive shrug, and the lease still parks normally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -401,14 +401,14 @@ async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
     );
 }
 
-/// A parking lane asks the allocator to release its idle memory, exactly once.
-///
-/// The lane thread allocates the article buffers that the decode and writer
-/// threads free, so with a per-thread-heap allocator the freed pages pile up
-/// on a lane that has gone idle. The release is the lane's own last act before
-/// it reports itself parked, and it must not fire more than once per park:
-/// doing it per article or per refill would put a full heap collection on the
-/// hot path.
+// A parking lane asks the allocator to release its idle memory, exactly once.
+//
+// The lane thread allocates the article buffers that the decode and writer
+// threads free, so with a per-thread-heap allocator the freed pages pile up
+// on a lane that has gone idle. The release is the lane's own last act before
+// it reports itself parked, and it must not fire more than once per park:
+// doing it per article or per refill would put a full heap collection on the
+// hot path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_parking_lane_releases_its_idle_thread_memory_once() {
     static RELEASES: AtomicUsize = AtomicUsize::new(0);

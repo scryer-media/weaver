@@ -41,7 +41,7 @@ fn local_agent_key_generation_uses_weaver_key_shape() {
     assert_eq!(key.len(), 36);
 }
 
-/// Provisioning shells out to the `sqlite3` CLI, which not every host has.
+// Provisioning shells out to the `sqlite3` CLI, which not every host has.
 fn sqlite3_cli_available() -> bool {
     Command::new("sqlite3")
         .arg("-version")
@@ -897,8 +897,8 @@ fn the_linux_clippy_image_follows_the_pinned_toolchain() {
     assert!(format!("{error:#}").contains("failed to read"));
 }
 
-/// A host as the engine probe sees it: which CLIs are on PATH and what each
-/// command answers.
+// A host as the engine probe sees it: which CLIs are on PATH and what each
+// command answers.
 struct ScriptedHost {
     on_path: &'static [&'static str],
     answers: &'static [(

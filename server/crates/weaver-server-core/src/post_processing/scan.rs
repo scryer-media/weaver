@@ -41,7 +41,7 @@ fn context(category: Option<String>, parameters: Vec<(String, String)>) -> Event
     }
 }
 
-/// Whether a scan instance would run for an incoming NZB.
+// Whether a scan instance would run for an incoming NZB.
 pub async fn enabled(
     db: &Database,
     category: Option<&str>,
@@ -63,9 +63,9 @@ pub struct ScannedSubmission {
     pub options: SubmissionOptions,
 }
 
-/// The directory a scan works in. It goes, and another scan is admitted, once
-/// the import and every script still reading it have let go, including on
-/// cancellation.
+// The directory a scan works in. It goes, and another scan is admitted, once
+// the import and every script still reading it have let go, including on
+// cancellation.
 #[derive(Clone)]
 pub struct ScanScratch(Arc<ScanScratchFiles>);
 

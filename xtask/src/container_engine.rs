@@ -1,9 +1,9 @@
-//! The container engine the tooling runs its Linux checks in.
-//!
-//! Docker and Podman take the same `run` arguments for what the tooling
-//! does, so the engine is a choice of binary plus the two places they differ:
-//! how an image without a registry is named, and what a bind mount needs on a
-//! host that labels files.
+// The container engine the tooling runs its Linux checks in.
+//
+// Docker and Podman take the same `run` arguments for what the tooling
+// does, so the engine is a choice of binary plus the two places they differ:
+// how an image without a registry is named, and what a bind mount needs on a
+// host that labels files.
 
 use anyhow::{Result, anyhow, bail};
 use std::process::{Command, Stdio};
@@ -29,11 +29,11 @@ impl ContainerEngine {
         }
     }
 
-    /// `image` as this engine can pull it without being asked anything.
-    ///
-    /// Docker reads a name without a registry as one on Docker Hub. Podman
-    /// looks it up in the host's list of registries, and with more than one
-    /// listed it asks which, which a run without a terminal cannot answer.
+    // `image` as this engine can pull it without being asked anything.
+    //
+    // Docker reads a name without a registry as one on Docker Hub. Podman
+    // looks it up in the host's list of registries, and with more than one
+    // listed it asks which, which a run without a terminal cannot answer.
     pub(crate) fn image_reference(self, image: &str) -> String {
         if self == ContainerEngine::Docker {
             return image.to_string();
@@ -47,12 +47,12 @@ impl ContainerEngine {
         }
     }
 
-    /// Arguments a `run` that bind-mounts the checkout needs beyond Docker's.
-    ///
-    /// Podman on a host that labels files refuses a container access to a
-    /// mount that does not carry the container's label. Relabelling the
-    /// checkout would change the operator's files, so the container runs
-    /// unconfined by labels instead.
+    // Arguments a `run` that bind-mounts the checkout needs beyond Docker's.
+    //
+    // Podman on a host that labels files refuses a container access to a
+    // mount that does not carry the container's label. Relabelling the
+    // checkout would change the operator's files, so the container runs
+    // unconfined by labels instead.
     pub(crate) fn bind_mount_run_args(self) -> &'static [&'static str] {
         match self {
             ContainerEngine::Docker => &[],
@@ -61,16 +61,16 @@ impl ContainerEngine {
     }
 }
 
-/// What resolution asks of the host.
+// What resolution asks of the host.
 pub(crate) trait EngineProbe {
     fn on_path(&self, program: &str) -> bool;
 
-    /// The command's standard output when it succeeds, and why it did not
-    /// otherwise.
+    // The command's standard output when it succeeds, and why it did not
+    // otherwise.
     fn output(&self, program: &str, args: &[&str]) -> std::result::Result<String, String>;
 }
 
-/// The real PATH and processes.
+// The real PATH and processes.
 pub(crate) struct HostProbe;
 
 impl EngineProbe for HostProbe {
@@ -97,9 +97,9 @@ impl EngineProbe for HostProbe {
     }
 }
 
-/// The engine that is running: Docker when its daemon answers, otherwise
-/// Podman when it does. An installed engine that is not running is passed
-/// over, and the error says what each one lacked.
+// The engine that is running: Docker when its daemon answers, otherwise
+// Podman when it does. An installed engine that is not running is passed
+// over, and the error says what each one lacked.
 pub(crate) fn running_engine(probe: &dyn EngineProbe) -> Result<ContainerEngine> {
     let docker = match running_docker(probe) {
         Ok(engine) => return Ok(engine),

@@ -1,9 +1,9 @@
-//! What an idle pipeline costs: no job snapshot publishes, a slow metrics
-//! tick, and no completion checks for jobs that cannot have changed.
-//!
-//! Every test runs on the paused clock. Sleeping on it advances virtual time
-//! only once every task is parked, so each periodic tick runs to completion
-//! before the next one fires.
+// What an idle pipeline costs: no job snapshot publishes, a slow metrics
+// tick, and no completion checks for jobs that cannot have changed.
+//
+// Every test runs on the paused clock. Sleeping on it advances virtual time
+// only once every task is parked, so each periodic tick runs to completion
+// before the next one fires.
 
 use super::*;
 
@@ -14,8 +14,8 @@ struct IdlePipeline {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// A pipeline holding `paused_jobs` paused jobs and `history` finished rows,
-/// with `prepare` applied before it starts running.
+// A pipeline holding `paused_jobs` paused jobs and `history` finished rows,
+// with `prepare` applied before it starts running.
 async fn idle_pipeline(
     paused_jobs: u64,
     history: Vec<JobInfo>,
@@ -122,8 +122,8 @@ async fn idle_pipeline(
 }
 
 impl IdlePipeline {
-    /// Wait until the startup publish has happened, so later revisions
-    /// count only what the test causes.
+    // Wait until the startup publish has happened, so later revisions
+    // count only what the test causes.
     async fn settled_revisions(&self) -> tokio::sync::watch::Receiver<u64> {
         let mut revisions = self.handle.subscribe_job_changes();
         revisions.wait_for(|revision| *revision > 0).await.unwrap();
@@ -133,7 +133,7 @@ impl IdlePipeline {
         revisions
     }
 
-    /// Observe the completed turn containing the next metrics refresh.
+    // Observe the completed turn containing the next metrics refresh.
     async fn next_refresh(&self) -> crate::jobs::handle::PipelineTurnObservation {
         let before = self.shared_state.metrics_refresh_count();
         let mut turns = self.shared_state.turn_observation.subscribe();

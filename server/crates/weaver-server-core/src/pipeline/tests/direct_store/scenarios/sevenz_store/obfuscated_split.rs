@@ -1,11 +1,11 @@
-//! An obfuscated split 7z: hex names, and parts that carry nothing saying
-//! which part they are.
-//!
-//! Only the recovery set's descriptions name the parts, so the set is admitted
-//! from them and holds every byte until each part is bound to its real name
-//! and number. Only then is the container whole, its map readable, and the
-//! held bytes routed. Every way that naming can fail leaves the set
-//! conventional.
+// An obfuscated split 7z: hex names, and parts that carry nothing saying
+// which part they are.
+//
+// Only the recovery set's descriptions name the parts, so the set is admitted
+// from them and holds every byte until each part is bound to its real name
+// and number. Only then is the container whole, its map readable, and the
+// held bytes routed. Every way that naming can fail leaves the set
+// conventional.
 
 use super::*;
 
@@ -22,7 +22,7 @@ fn obfuscated_split_volumes(seed: u8) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
     (member, split_volumes(&archive, VOLUMES))
 }
 
-/// One obfuscated split job with its index parsed, before any part arrives.
+// One obfuscated split job with its index parsed, before any part arrives.
 struct HeldSplit {
     _temp: tempfile::TempDir,
     pipeline: Pipeline,
@@ -79,8 +79,8 @@ impl HeldSplit {
         format!("{:?}", self.pipeline.direct_store.sets_for(self.job_id))
     }
 
-    /// A source volume file under either name: the conventional path writes
-    /// one, a routed set never does.
+    // A source volume file under either name: the conventional path writes
+    // one, a routed set never does.
     fn volume_file_seen(&self) -> bool {
         self.obfuscated
             .iter()
@@ -88,7 +88,7 @@ impl HeldSplit {
             .any(|(filename, _)| self.working_dir.join(filename).exists())
     }
 
-    /// Runs the job to its end and returns the member it produced.
+    // Runs the job to its end and returns the member it produced.
     async fn finish(&mut self) -> (Option<Vec<u8>>, Option<JobStatus>, String) {
         if let Some(state) = self.pipeline.jobs.get_mut(&self.job_id) {
             state.download_queue = crate::DownloadQueue::new();
@@ -224,9 +224,9 @@ async fn an_obfuscated_split_sevenz_set_admits_from_par2_and_matches_the_convent
     );
 }
 
-/// An obfuscated split with no recovery set at all, run under `gate`: whether
-/// a set was admitted, whether every part landed under its hex name, and what
-/// the job produced.
+// An obfuscated split with no recovery set at all, run under `gate`: whether
+// a set was admitted, whether every part landed under its hex name, and what
+// the job produced.
 async fn run_unnamed_split(
     gate: DirectStoreGate,
     job_id: JobId,

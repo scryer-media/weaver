@@ -10,8 +10,8 @@ use super::runner::CompatibilityFacts;
 use crate::settings::SharedConfig;
 use crate::{Database, RssFeedRow};
 
-/// Hand a fetched feed to the instances attached to it and return what they
-/// leave of it.
+// Hand a fetched feed to the instances attached to it and return what they
+// leave of it.
 pub async fn transform_feed(
     db: &Database,
     config: &SharedConfig,
@@ -117,7 +117,7 @@ pub async fn transform_feed(
     .map_err(|error| error.to_string())
 }
 
-/// Refuse a feed's attachments unless each is a feed instance, named once.
+// Refuse a feed's attachments unless each is a feed instance, named once.
 pub fn validate_feed_script_selection(
     db: &Database,
     ids: &[String],
@@ -150,8 +150,8 @@ pub fn validate_feed_script_selection(
     Ok(())
 }
 
-/// The feed instances behind `ids`, in that order. One that has since been
-/// deleted or given another trigger is left out.
+// The feed instances behind `ids`, in that order. One that has since been
+// deleted or given another trigger is left out.
 fn attached_instances(
     db: &Database,
     ids: &[String],

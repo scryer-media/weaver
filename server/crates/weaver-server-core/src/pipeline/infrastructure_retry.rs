@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-/// Pipeline-owned storage for infrastructure retries.
-///
-/// Timed work is ordered by deadline without rescanning every parked item on
-/// insertion. Work without a deadline remains parked until an explicit wake.
+// Pipeline-owned storage for infrastructure retries.
+//
+// Timed work is ordered by deadline without rescanning every parked item on
+// insertion. Work without a deadline remains parked until an explicit wake.
 pub(super) struct InfrastructureRetryQueue<T> {
     timed: BTreeMap<Instant, VecDeque<T>>,
     indefinite: VecDeque<T>,
@@ -44,7 +44,7 @@ impl<T> InfrastructureRetryQueue<T> {
         self.timed.first_key_value().map(|(deadline, _)| *deadline)
     }
 
-    /// Inspect deadlines without waking, rescheduling, or copying retry work.
+    // Inspect deadlines without waking, rescheduling, or copying retry work.
     pub(super) fn iter_with_deadlines(&self) -> impl Iterator<Item = (Option<Instant>, &T)> {
         self.timed
             .iter()

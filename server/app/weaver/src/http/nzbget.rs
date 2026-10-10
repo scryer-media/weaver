@@ -40,18 +40,18 @@ pub(super) struct NzbgetFacadeContext {
     scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
     rss: weaver_server_api::RssService,
     watch_folder: weaver_server_core::watch_folder::WatchFolderService,
-    /// The complete root's latest free-space reading, from the pipeline's
-    /// background sampler. `status()` reads it and never stats the
-    /// filesystem, so a stalled mount cannot hold a poll.
+    // The complete root's latest free-space reading, from the pipeline's
+    // background sampler. `status()` reads it and never stats the
+    // filesystem, so a stalled mount cannot hold a poll.
     complete_capacity: weaver_server_core::operations::CapacityReader,
-    /// Memoized PARSE of DB-row (immutable) history, keyed by job id ->
-    /// `(completed_at, HistoryItem)`. A history row's `completed_at` never
-    /// changes once written, so a cache hit reuses the parsed item instead of
-    /// re-running `history_item_from_row` (metadata parse + release-name parse)
-    /// for up to 1000 rows every poll. Only the PARSE is cached — the final
-    /// NZBGet entry (which folds in per-poll stage-timing fields derived from
-    /// `job_events`, a separate mutable source) is rebuilt fresh each call, so
-    /// a reprocess that appends new stage events is reflected immediately.
+    // Memoized PARSE of DB-row (immutable) history, keyed by job id ->
+    // `(completed_at, HistoryItem)`. A history row's `completed_at` never
+    // changes once written, so a cache hit reuses the parsed item instead of
+    // re-running `history_item_from_row` (metadata parse + release-name parse)
+    // for up to 1000 rows every poll. Only the PARSE is cached — the final
+    // NZBGet entry (which folds in per-poll stage-timing fields derived from
+    // `job_events`, a separate mutable source) is rebuilt fresh each call, so
+    // a reprocess that appends new stage events is reflected immediately.
     history_cache: Arc<
         tokio::sync::Mutex<std::collections::HashMap<u64, (i64, weaver_server_api::HistoryItem)>>,
     >,
@@ -96,8 +96,8 @@ impl NzbgetFacadeContext {
         }
     }
 
-    /// Free bytes on the complete root from the sampler's last reading, or 0
-    /// before its first reading arrives.
+    // Free bytes on the complete root from the sampler's last reading, or 0
+    // before its first reading arrives.
     fn free_disk_space_bytes(&self) -> u64 {
         self.complete_capacity
             .current()
@@ -531,7 +531,7 @@ fn read_xml_text_until_end(
     }
 }
 
-/// Parse one XML-RPC `<value>`; the opening tag has already been consumed.
+// Parse one XML-RPC `<value>`; the opening tag has already been consumed.
 fn parse_xmlrpc_value(
     reader: &mut quick_xml::Reader<&[u8]>,
     depth: usize,
@@ -997,8 +997,8 @@ async fn raise_url_completed(
     }
 }
 
-/// Logs an append the facade refused before it reached submission. The
-/// release is named by its file name only: a fetch URL can carry credentials.
+// Logs an append the facade refused before it reached submission. The
+// release is named by its file name only: a fetch URL can carry credentials.
 fn append_refused(release: &str, error: RpcError) -> RpcError {
     tracing::warn!(
         target: "weaver::nzbget_facade",
@@ -1243,11 +1243,11 @@ fn append_parameter_index(params: &[Value]) -> usize {
     }
 }
 
-/// Legacy (pre-v13) `appendurl(NZBFilename, Category, Priority, AddToTop,
-/// URL)` returning bool. nzb360 still submits URL adds through this shape;
-/// note the category/priority positions differ from `append` and the URL sits
-/// last. Clients that instead mirror append's ordering (URL in the content
-/// slot) are handled by delegating verbatim.
+// Legacy (pre-v13) `appendurl(NZBFilename, Category, Priority, AddToTop,
+// URL)` returning bool. nzb360 still submits URL adds through this shape;
+// note the category/priority positions differ from `append` and the URL sits
+// last. Clients that instead mirror append's ordering (URL in the content
+// slot) are handled by delegating verbatim.
 async fn append_url(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
     let params = positional_params(params)?;
     let url_at = |index: usize| {
@@ -1414,9 +1414,9 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     }))
 }
 
-/// `status()` iterates `SchedulerHandle::list_jobs()` directly (avoiding a
-/// per-job `QueueItem` deep-clone) and classifies each job with
-/// `queue_item_state_from_job_info`, so it needs the check on a bare state.
+// `status()` iterates `SchedulerHandle::list_jobs()` directly (avoiding a
+// per-job `QueueItem` deep-clone) and classifies each job with
+// `queue_item_state_from_job_info`, so it needs the check on a bare state.
 fn queue_item_state_in_post_processing(state: QueueItemState) -> bool {
     matches!(
         state,
@@ -1531,8 +1531,8 @@ fn nzbget_group(item: &QueueItem) -> Value {
     group
 }
 
-/// Merge `extension`'s top-level keys into `base`. Both arguments come from
-/// `json!` object literals split to stay under the macro recursion limit.
+// Merge `extension`'s top-level keys into `base`. Both arguments come from
+// `json!` object literals split to stay under the macro recursion limit.
 fn merge_json_objects(base: &mut Value, extension: Value) {
     if let (Value::Object(base), Value::Object(extension)) = (base, extension) {
         base.extend(extension);
@@ -1541,14 +1541,14 @@ fn merge_json_objects(base: &mut Value, extension: Value) {
 
 struct PostProgressInfo {
     text: String,
-    /// 0..1000 like NZBGet's PostStageProgress.
+    // 0..1000 like NZBGet's PostStageProgress.
     stage_progress: u64,
     total_time_sec: u64,
     stage_time_sec: u64,
 }
 
-/// Derive NZBGet-style post-processing progress from weaver's phase progress
-/// entries. Returns "NONE" text when the job is not in a post stage.
+// Derive NZBGet-style post-processing progress from weaver's phase progress
+// entries. Returns "NONE" text when the job is not in a post stage.
 fn post_progress_info(item: &QueueItem) -> PostProgressInfo {
     let phase = match item.state {
         QueueItemState::Repairing => Some(QueuePhase::Repairing),
@@ -1598,8 +1598,8 @@ fn post_progress_info(item: &QueueItem) -> PostProgressInfo {
     }
 }
 
-/// NZBGet's CriticalHealth: the health floor below which the download cannot
-/// be repaired. Approximated from the recovery volume share of the job.
+// NZBGet's CriticalHealth: the health floor below which the download cannot
+// be repaired. Approximated from the recovery volume share of the job.
 fn critical_health(item: &QueueItem) -> u64 {
     if item.total_bytes == 0 {
         return 1000;
@@ -1736,7 +1736,7 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     Ok(Value::Array(items))
 }
 
-/// Stage-boundary event kinds consulted for history duration fields.
+// Stage-boundary event kinds consulted for history duration fields.
 const HISTORY_STAGE_KINDS: &[&str] = &[
     "DownloadStarted",
     "DownloadFinished",
@@ -1763,8 +1763,8 @@ struct HistoryTimings {
     post_total_sec: u64,
 }
 
-/// Derive NZBGet-style stage durations from per-kind (min,max) event
-/// timestamp bounds. Bounds are epoch milliseconds; results are seconds.
+// Derive NZBGet-style stage durations from per-kind (min,max) event
+// timestamp bounds. Bounds are epoch milliseconds; results are seconds.
 fn history_timings(bounds: Option<&Vec<(String, i64, i64)>>) -> HistoryTimings {
     let Some(bounds) = bounds else {
         return HistoryTimings::default();
@@ -1815,9 +1815,9 @@ struct HistoryStatuses {
     mv: &'static str,
     script: &'static str,
     delete: &'static str,
-    /// Compound NZBGet v13+ status like "SUCCESS/ALL" or "DELETED/MANUAL".
-    /// Sonarr/Radarr ignore this and use the granular fields; nzb360 renders
-    /// the compound form.
+    // Compound NZBGet v13+ status like "SUCCESS/ALL" or "DELETED/MANUAL".
+    // Sonarr/Radarr ignore this and use the granular fields; nzb360 renders
+    // the compound form.
     status: &'static str,
 }
 
@@ -2095,17 +2095,17 @@ fn push_nzbget_config_category(
 struct EditQueueRequest {
     command: String,
     param: String,
-    /// Legacy 4-arg shape's integer Offset argument (nzb360 puts the
-    /// GroupMoveOffset delta here); 0 when absent.
+    // Legacy 4-arg shape's integer Offset argument (nzb360 puts the
+    // GroupMoveOffset delta here); 0 when absent.
     offset: i64,
     ids: Vec<JobId>,
 }
 
-/// Parse both editqueue signatures:
-/// - pre-v13 (Sonarr/Radarr): `[Command, Offset, Param, ID, ID, ...]`
-/// - v13+ (nzb360 and modern clients): `[Command, Param, [IDs]]`
-///
-/// IDs may arrive as trailing scalars, one array, or a mix; all are flattened.
+// Parse both editqueue signatures:
+// - pre-v13 (Sonarr/Radarr): `[Command, Offset, Param, ID, ID, ...]`
+// - v13+ (nzb360 and modern clients): `[Command, Param, [IDs]]`
+//
+// IDs may arrive as trailing scalars, one array, or a mix; all are flattened.
 fn parse_editqueue_params(params: Option<Value>) -> Result<EditQueueRequest, RpcError> {
     let params = positional_params(params)?;
     if params.len() < 2 {
@@ -2178,10 +2178,10 @@ fn parse_editqueue_params(params: Option<Value>) -> Result<EditQueueRequest, Rpc
     })
 }
 
-/// Commands weaver recognizes but has no backing capability for. NZBGet's
-/// editqueue reports per-call success as a bool; answering `false` (instead of
-/// an "Invalid action" fault) tells clients the action failed without breaking
-/// their RPC plumbing.
+// Commands weaver recognizes but has no backing capability for. NZBGet's
+// editqueue reports per-call success as a bool; answering `false` (instead of
+// an "Invalid action" fault) tells clients the action failed without breaking
+// their RPC plumbing.
 fn is_unsupported_editqueue_command(command: &str) -> bool {
     matches!(
         command,
@@ -2289,8 +2289,8 @@ async fn group_final_delete(
     ctx.handle.delete_history(job_id, false).await.map(|_| ())
 }
 
-/// GroupMoveTop / GroupMoveBottom / GroupMoveOffset. The move delta arrives in
-/// the legacy Offset argument (nzb360) or as the v13+ Param string.
+// GroupMoveTop / GroupMoveBottom / GroupMoveOffset. The move delta arrives in
+// the legacy Offset argument (nzb360) or as the v13+ Param string.
 async fn reorder_groups(
     ctx: &NzbgetFacadeContext,
     request: &EditQueueRequest,
@@ -2412,8 +2412,8 @@ async fn set_job_parameter(
     upsert_job_metadata(ctx, job_id, key, update).await
 }
 
-/// Replace (or remove, when `value` is None) one metadata entry on a job,
-/// preserving the rest. Mirrors the GraphQL update_jobs upsert semantics.
+// Replace (or remove, when `value` is None) one metadata entry on a job,
+// preserving the rest. Mirrors the GraphQL update_jobs upsert semantics.
 async fn upsert_job_metadata(
     ctx: &NzbgetFacadeContext,
     job_id: JobId,
@@ -2445,19 +2445,19 @@ async fn mark_history_good(ctx: &NzbgetFacadeContext, job_id: JobId) -> Result<(
     Ok(())
 }
 
-/// Synthetic per-file IDs live above the NZBID range so they never collide
-/// with job ids in clients that mix both in one numeric space.
+// Synthetic per-file IDs live above the NZBID range so they never collide
+// with job ids in clients that mix both in one numeric space.
 const LISTFILES_ID_STRIDE: u64 = 100_000;
 
-/// Build a synthetic listfiles file ID that always fits a positive `i32`.
-///
-/// The raw `job_id * STRIDE + index` scheme overflows `i32::MAX` from job 21_475
-/// onward (job ids only ever grow), yet weaver emits it as XML-RPC `<i4>`, which
-/// strict clients parse as signed 32-bit and then choke on. We fold the value
-/// into the top quarter of the positive i32 range: still above any realistic
-/// NZBID, still distinct per file within a job, and always parseable. These IDs
-/// are display-only — weaver exposes no File* operations — so the cross-job
-/// aliasing the fold can introduce is harmless.
+// Build a synthetic listfiles file ID that always fits a positive `i32`.
+//
+// The raw `job_id * STRIDE + index` scheme overflows `i32::MAX` from job 21_475
+// onward (job ids only ever grow), yet weaver emits it as XML-RPC `<i4>`, which
+// strict clients parse as signed 32-bit and then choke on. We fold the value
+// into the top quarter of the positive i32 range: still above any realistic
+// NZBID, still distinct per file within a job, and always parseable. These IDs
+// are display-only — weaver exposes no File* operations — so the cross-job
+// aliasing the fold can introduce is harmless.
 fn listfiles_file_id(job_id: JobId, index: usize) -> u64 {
     let raw = job_id
         .0
@@ -2621,9 +2621,9 @@ async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     Ok(Value::Array(entries))
 }
 
-/// NZBGet feed listing backed by weaver's RSS seen-item store. Items weaver's
-/// filter rules grabbed report FETCHED; everything else the poller has
-/// already evaluated is BACKLOG.
+// NZBGet feed listing backed by weaver's RSS seen-item store. Items weaver's
+// filter rules grabbed report FETCHED; everything else the poller has
+// already evaluated is BACKLOG.
 async fn viewfeed(
     ctx: &NzbgetFacadeContext,
     params: Option<Value>,
@@ -2700,20 +2700,20 @@ async fn viewfeed(
     Ok(Value::Array(entries))
 }
 
-/// Kick a refresh of every enabled RSS feed. NZBGet's fetchfeeds returns
-/// immediately; the sync itself runs in the background. Coalesced: a poll
-/// storm of fetchfeeds calls collapses into a single in-flight sync instead
-/// of spawning a new one (and a new local `tokio::spawn`) per call.
+// Kick a refresh of every enabled RSS feed. NZBGet's fetchfeeds returns
+// immediately; the sync itself runs in the background. Coalesced: a poll
+// storm of fetchfeeds calls collapses into a single in-flight sync instead
+// of spawning a new one (and a new local `tokio::spawn`) per call.
 fn fetch_feeds(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     ctx.rss.request_background_sync();
     Ok(json!(true))
 }
 
-/// Per-server volume statistics backed by weaver's download-quota usage
-/// tracking. TotalSize is lifetime bytes per server; CustomSize is the
-/// current quota window (CustomTime = window start), matching how NZBGet
-/// clients use the custom counter. Rolling per-second/minute/hour histograms
-/// are not tracked and are reported as zeroed series.
+// Per-server volume statistics backed by weaver's download-quota usage
+// tracking. TotalSize is lifetime bytes per server; CustomSize is the
+// current quota window (CustomTime = window start), matching how NZBGet
+// clients use the custom counter. Rolling per-second/minute/hour histograms
+// are not tracked and are reported as zeroed series.
 async fn servervolumes(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let db = ctx.db.clone();
     let usage = tokio::task::spawn_blocking(move || db.list_server_download_usage())
@@ -2834,7 +2834,7 @@ fn job_events_to_log_entries(
     entries
 }
 
-/// Global message log assembled from the event tails of current queue jobs.
+// Global message log assembled from the event tails of current queue jobs.
 async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
     let params = positional_params(params)?;
     let id_from = optional_i64_param(&params, 0)?.unwrap_or(0).max(0) as u64;
@@ -2869,8 +2869,8 @@ async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result
     )))
 }
 
-/// Per-download log (NZBGet keeps one per NZB; weaver's job event timeline is
-/// the equivalent).
+// Per-download log (NZBGet keeps one per NZB; weaver's job event timeline is
+// the equivalent).
 async fn loadlog(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
     let params = positional_params(params)?;
     if params.is_empty() {
@@ -2953,7 +2953,7 @@ async fn resume_post_processing(ctx: &NzbgetFacadeContext) -> Result<Value, RpcE
     Ok(json!(true))
 }
 
-/// Return the live NZBGet extension declarations, including every supported kind.
+// Return the live NZBGet extension declarations, including every supported kind.
 async fn loadextensions(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let db = ctx.db.clone();
     let listing = tokio::task::spawn_blocking(move || {
@@ -3005,8 +3005,8 @@ async fn set_scan_paused(ctx: &NzbgetFacadeContext, paused: bool) -> Result<Valu
     Ok(json!(true))
 }
 
-/// Longest accepted `scheduleresume` delay. NZBGet clamps similarly; this
-/// keeps hostile inputs from arming year-long timers.
+// Longest accepted `scheduleresume` delay. NZBGet clamps similarly; this
+// keeps hostile inputs from arming year-long timers.
 const MAX_SCHEDULE_RESUME_SECS: i64 = 60 * 60 * 24 * 30;
 
 async fn scheduleresume(
@@ -3282,13 +3282,13 @@ fn nzbget_queue_status(state: QueueItemState) -> &'static str {
     }
 }
 
-/// Group status for listgroups. Downloads that finished transfer but wait for
-/// a repair/extraction slot report NZBGet's PP_QUEUED instead of QUEUED so
-/// clients render them as post-processing, not "not started".
-/// The runs NZBGet would list under ScriptStatuses: its post-processing
-/// scripts run in the job's post-processing stage and nowhere else. Event
-/// scripts and fire-and-forget runs have no counterpart there, and a FAILURE
-/// from one would make Sonarr and Radarr reject a good download.
+// Group status for listgroups. Downloads that finished transfer but wait for
+// a repair/extraction slot report NZBGet's PP_QUEUED instead of QUEUED so
+// clients render them as post-processing, not "not started".
+// The runs NZBGet would list under ScriptStatuses: its post-processing
+// scripts run in the job's post-processing stage and nowhere else. Event
+// scripts and fire-and-forget runs have no counterpart there, and a FAILURE
+// from one would make Sonarr and Radarr reject a good download.
 fn nzbget_post_processing_scripts(
     scripts: &[weaver_server_core::post_processing::model::ScriptResult],
 ) -> impl Iterator<Item = &weaver_server_core::post_processing::model::ScriptResult> {
@@ -3298,9 +3298,9 @@ fn nzbget_post_processing_scripts(
         .filter(|script| script.event == ScriptEventLabel::PostProcessing && !script.background)
 }
 
-/// NZBGet's per-script status: SUCCESS for exit 93, NONE for exit 95
-/// (skipped), FAILURE for everything else including a script that could not
-/// start. A warning is a failure there, so it is one here too.
+// NZBGet's per-script status: SUCCESS for exit 93, NONE for exit 95
+// (skipped), FAILURE for everything else including a script that could not
+// start. A warning is a failure there, so it is one here too.
 fn nzbget_script_status(
     status: weaver_server_core::post_processing::model::ScriptStatus,
 ) -> &'static str {
@@ -3315,9 +3315,9 @@ fn nzbget_script_status(
     }
 }
 
-/// The job-level ScriptStatus that Sonarr and Radarr act on, derived from the
-/// per-script statuses the way NZBGet derives it: any FAILURE makes the job a
-/// FAILURE, otherwise any SUCCESS makes it a SUCCESS, otherwise NONE.
+// The job-level ScriptStatus that Sonarr and Radarr act on, derived from the
+// per-script statuses the way NZBGet derives it: any FAILURE makes the job a
+// FAILURE, otherwise any SUCCESS makes it a SUCCESS, otherwise NONE.
 fn nzbget_script_rollup(
     scripts: &[weaver_server_core::post_processing::model::ScriptResult],
 ) -> &'static str {

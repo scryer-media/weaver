@@ -4,10 +4,10 @@ use common::{TestHarness, assert_has_errors, assert_no_errors, response_data};
 use serde_json::{Value, json};
 use weaver_server_api::auth::CallerScope;
 
-/// Every field of a saved instance.
+// Every field of a saved instance.
 const INSTANCE: &str = "id name script trigger queueEvent inputs { name value secret { id name } sealed } categories enabled blocking timeoutSeconds runOrder scriptProblem headerDrift";
 
-/// Write a bare script into the harness's `data_dir/scripts`.
+// Write a bare script into the harness's `data_dir/scripts`.
 async fn write_script(harness: &TestHarness, name: &str, body: &str) {
     let data_dir = std::path::PathBuf::from(harness.config.read().await.data_dir.clone());
     let scripts = data_dir.join("scripts");
@@ -15,7 +15,7 @@ async fn write_script(harness: &TestHarness, name: &str, body: &str) {
     std::fs::write(scripts.join(name), body).unwrap();
 }
 
-/// Create an instance from the fields of a `ScriptInstanceInput`.
+// Create an instance from the fields of a `ScriptInstanceInput`.
 async fn create_instance(harness: &TestHarness, input: &str) -> Value {
     let response = harness
         .execute(&format!(
@@ -26,7 +26,7 @@ async fn create_instance(harness: &TestHarness, input: &str) -> Value {
     response_data(&response)["createScriptInstance"].clone()
 }
 
-/// Every saved instance, in run order.
+// Every saved instance, in run order.
 async fn instances(harness: &TestHarness) -> Vec<Value> {
     let response = harness
         .execute(&format!("{{ scriptInstances {{ {INSTANCE} }} }}"))
@@ -572,7 +572,7 @@ fn error_code(response: &async_graphql::Response) -> String {
     }
 }
 
-/// Create a named secret and return what the API reports for it.
+// Create a named secret and return what the API reports for it.
 async fn create_secret(harness: &TestHarness, name: &str, value: &str) -> Value {
     let response = harness
         .execute(&format!(
@@ -788,18 +788,18 @@ async fn inputs_are_saved_as_sent_and_a_secret_is_never_read_back() {
     assert_eq!(reapplied["headerDrift"], false);
 }
 
-/// What is read back for an input holding a secret of the instance's own.
+// What is read back for an input holding a secret of the instance's own.
 fn own_secret(name: &str) -> Value {
     json!({ "name": name, "value": "", "secret": null, "sealed": true })
 }
 
-/// What is read back for an input holding a plain value.
+// What is read back for an input holding a plain value.
 fn plain(name: &str, value: &str) -> Value {
     json!({ "name": name, "value": value, "secret": null, "sealed": false })
 }
 
-/// Every secret value in these tests starts `hunter`, and anything sealed
-/// starts `enc:v1:`; a response carries neither.
+// Every secret value in these tests starts `hunter`, and anything sealed
+// starts `enc:v1:`; a response carries neither.
 fn carries_no_secret(response: &async_graphql::Response) {
     let text = format!("{response:?}");
     assert!(
@@ -1134,7 +1134,7 @@ async fn secrets_are_admin_only_named_once_kept_while_linked_and_never_read_back
     assert!(harness.db.secrets().unwrap().is_empty());
 }
 
-/// The secret mutations, each aimed at `id`.
+// The secret mutations, each aimed at `id`.
 fn secret_mutations(id: &str) -> [String; 3] {
     [
         r#"mutation { createSecret(name: "From outside", value: "hunter9") { id } }"#.to_string(),
@@ -1145,7 +1145,7 @@ fn secret_mutations(id: &str) -> [String; 3] {
     ]
 }
 
-/// The names of the stored secrets, with when each was last changed.
+// The names of the stored secrets, with when each was last changed.
 fn stored_secrets(harness: &TestHarness) -> Vec<(String, i64)> {
     harness
         .db
@@ -1758,7 +1758,7 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
     assert_has_errors(&nowhere);
 }
 
-/// Record a finished run of `script` on the scan event, with no job.
+// Record a finished run of `script` on the scan event, with no job.
 async fn record_scan_run(
     harness: &TestHarness,
     script: &str,
@@ -1803,7 +1803,7 @@ async fn record_scan_run(
     .unwrap();
 }
 
-/// The scripts of every recorded run, newest first.
+// The scripts of every recorded run, newest first.
 async fn recorded_scripts(harness: &TestHarness) -> Vec<String> {
     let response = harness
         .execute("{ scriptRuns(limit: 50) { runs { script } } }")

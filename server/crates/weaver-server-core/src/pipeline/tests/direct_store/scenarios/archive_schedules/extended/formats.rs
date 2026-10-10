@@ -1,23 +1,23 @@
-//! Format coverage beyond the archive matrix proper: obfuscated RAR4 sets and
-//! the solid and encrypted multi-volume compressed layouts.
+// Format coverage beyond the archive matrix proper: obfuscated RAR4 sets and
+// the solid and encrypted multi-volume compressed layouts.
 use super::*;
 
 #[tokio::test]
 async fn rar4_obfuscated_arrival_schedules() {
     campaign(Format::Rar4Obfuscated, Selection::Smoke).await;
 }
-/// Both obfuscated volumes start conventionally before the recovery index
-/// arrives, a restart keeps no progress for either, and the set the index then
-/// admits routes the refetched articles past the dead process's bytes. Those
-/// bytes sit under the volumes' obfuscated names, which no role classifies as
-/// archive input, and must still be cleaned up rather than published beside
-/// the member. Each case loses the first volume's second article, so a repair
-/// runs before the set finalizes.
-///
-/// The leftover answers the first volume's description by its first 16 KiB,
-/// so deobfuscation must not name it as that volume, and verification must
-/// not hold its length against the set's verdict: the set, not the leftover,
-/// holds the volume's bytes.
+// Both obfuscated volumes start conventionally before the recovery index
+// arrives, a restart keeps no progress for either, and the set the index then
+// admits routes the refetched articles past the dead process's bytes. Those
+// bytes sit under the volumes' obfuscated names, which no role classifies as
+// archive input, and must still be cleaned up rather than published beside
+// the member. Each case loses the first volume's second article, so a repair
+// runs before the set finalizes.
+//
+// The leftover answers the first volume's description by its first 16 KiB,
+// so deobfuscation must not name it as that volume, and verification must
+// not hold its length against the set's verdict: the set, not the leftover,
+// holds the volume's bytes.
 #[tokio::test]
 async fn rar4_obfuscated_restart_publishes_no_pre_restart_volume() {
     let cases = combined_schedule_cases()
@@ -58,7 +58,7 @@ async fn rar4_obfuscated_restart_publishes_no_pre_restart_volume() {
     assert!(refused >= 3, "{refused} refusals");
 }
 
-/// Every event's message and fields, as one line each.
+// Every event's message and fields, as one line each.
 struct CapturedMessages(Arc<std::sync::Mutex<Vec<String>>>);
 
 impl tracing::Subscriber for CapturedMessages {

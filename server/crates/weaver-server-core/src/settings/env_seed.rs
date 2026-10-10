@@ -49,18 +49,18 @@ pub struct EnvSeedConfig {
     pub servers: Vec<EnvSeedServer>,
 }
 
-/// One seeded server, plus whether the environment stated its pipelining flag
-/// outright. A stated flag is a pin and is taken at its word; every other
-/// seeded server is asked, the way a server saved through the server form is.
+// One seeded server, plus whether the environment stated its pipelining flag
+// outright. A stated flag is a pin and is taken at its word; every other
+// seeded server is asked, the way a server saved through the server form is.
 #[derive(Debug, Clone)]
 pub struct EnvSeedServer {
     pub config: ServerConfig,
     pub pipelining_pinned: bool,
 }
 
-/// What asking one seeded server about pipelining came back with. A server
-/// that could not be reached reports the reason and keeps the sequential
-/// default, so a provider that is down at boot cannot stop the seed.
+// What asking one seeded server about pipelining came back with. A server
+// that could not be reached reports the reason and keeps the sequential
+// default, so a provider that is down at boot cannot stop the seed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeededServerProbeOutcome {
     pub server_id: u32,
@@ -237,24 +237,24 @@ pub fn apply_core_seed(
     Ok(seeded)
 }
 
-/// Whether the seeded servers are the ones this install will actually run on.
-/// Nothing is asked of a server the seed is not going to store.
+// Whether the seeded servers are the ones this install will actually run on.
+// Nothing is asked of a server the seed is not going to store.
 pub fn server_seed_applies(config: &Config, seed: &EnvSeedConfig) -> bool {
     config.servers.is_empty() && !seed.servers.is_empty()
 }
 
-/// How long boot waits, in all, for the seeded servers to answer. The probes
-/// run before the seed is stored and before the listener opens, so a server
-/// that never answers must not hold startup for its full connect timeouts.
+// How long boot waits, in all, for the seeded servers to answer. The probes
+// run before the seed is stored and before the listener opens, so a server
+// that never answers must not hold startup for its full connect timeouts.
 pub const SEED_PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Ask every seeded server whose pipelining flag the environment left unstated
-/// whether it pipelines, and keep what came back. The caller supplies the
-/// question so the seed can be exercised without a server to reach.
-///
-/// Every server is asked at once, and all of them share one
-/// [`SEED_PROBE_DEADLINE`]. A server with no answer by then is treated like
-/// one that could not be reached: it keeps the sequential default.
+// Ask every seeded server whose pipelining flag the environment left unstated
+// whether it pipelines, and keep what came back. The caller supplies the
+// question so the seed can be exercised without a server to reach.
+//
+// Every server is asked at once, and all of them share one
+// [`SEED_PROBE_DEADLINE`]. A server with no answer by then is treated like
+// one that could not be reached: it keeps the sequential default.
 pub async fn probe_seeded_server_pipelining<P, F>(
     seed: &mut EnvSeedConfig,
     probe: P,

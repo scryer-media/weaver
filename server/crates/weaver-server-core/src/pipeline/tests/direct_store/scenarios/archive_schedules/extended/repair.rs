@@ -1,22 +1,22 @@
-//! Repair and demotion axes beyond the archive matrix proper: PAR3 as the
-//! recovery format, and every demotion reason a schedule can force.
+// Repair and demotion axes beyond the archive matrix proper: PAR3 as the
+// recovery format, and every demotion reason a schedule can force.
 use super::*;
 use crate::pipeline::direct_store::router::crypt::{CryptRefusal, HeaderCryptRefusal};
 
-/// Combined cases that carry a loss, and so a recovery set.
+// Combined cases that carry a loss, and so a recovery set.
 const LOSS_CASES: usize = 6777;
-/// Combined cases with a demote action at some boundary.
+// Combined cases with a demote action at some boundary.
 const DEMOTE_CASES: usize = 2850;
 
-/// What a campaign schedules: one of the matrix's archive formats, or two
-/// independent single-volume sets in one job.
+// What a campaign schedules: one of the matrix's archive formats, or two
+// independent single-volume sets in one job.
 #[derive(Clone, Copy, Debug)]
 enum Target {
     Format(Format),
     TwoSets,
 }
 
-/// A job and everything a schedule over it must deliver.
+// A job and everything a schedule over it must deliver.
 struct Fixture {
     spec: JobSpec,
     volumes: Vec<(String, Vec<u8>)>,
@@ -31,7 +31,7 @@ impl Fixture {
     }
 }
 
-/// The fixtures the archive matrix posts for the same targets.
+// The fixtures the archive matrix posts for the same targets.
 fn fixture(target: Target) -> Fixture {
     let format = match target {
         Target::Format(format) => format,
@@ -109,18 +109,18 @@ fn fixture(target: Target) -> Fixture {
     }
 }
 
-/// Which slice of a campaign one test runs.
+// Which slice of a campaign one test runs.
 #[derive(Clone, Copy, Debug)]
 enum Slice {
-    /// The default suite's sample, drawn from the smoke schedules.
+    // The default suite's sample, drawn from the smoke schedules.
     Smoke,
-    /// One of `of` shards of the combined cases the campaign keeps.
+    // One of `of` shards of the combined cases the campaign keeps.
     Shard { shard: usize, of: usize },
 }
 
-/// The cases a campaign keeps, by the replay index of the matrix they are
-/// drawn from: `WEAVER_ARCHIVE_SCHEDULE_CASE` replays a smoke case and
-/// `WEAVER_ARCHIVE_COMBINED_CASE` a combined one.
+// The cases a campaign keeps, by the replay index of the matrix they are
+// drawn from: `WEAVER_ARCHIVE_SCHEDULE_CASE` replays a smoke case and
+// `WEAVER_ARCHIVE_COMBINED_CASE` a combined one.
 fn campaign_cases(
     slice: Slice,
     keep: fn(Interruption) -> bool,
@@ -163,7 +163,7 @@ fn demotes(interruption: Interruption) -> bool {
     )
 }
 
-/// Runs one schedule and holds it to what its profile and target allow.
+// Runs one schedule and holds it to what its profile and target allow.
 async fn run_case(
     fixture: &Fixture,
     options: ScheduleOptions,
@@ -209,7 +209,7 @@ async fn run_case(
     }
 }
 
-/// The matrix's loss schedules, answered by a PAR3 set instead of PAR2.
+// The matrix's loss schedules, answered by a PAR3 set instead of PAR2.
 async fn par3_campaign(format: Format, profile: ExtractionProfile, slice: Slice) {
     let mut fixture = fixture(Target::Format(format));
     if matches!(format, Format::Rar5Obfuscated) {
@@ -231,12 +231,12 @@ async fn par3_campaign(format: Format, profile: ExtractionProfile, slice: Slice)
     }
 }
 
-/// One demotion a campaign forces at every demote boundary.
+// One demotion a campaign forces at every demote boundary.
 #[derive(Clone, Copy, Debug)]
 enum Forced {
-    /// A direct-store set demotes under this reason.
+    // A direct-store set demotes under this reason.
     Direct(DemotionReason),
-    /// Speculative extraction is withdrawn under this reason and latch.
+    // Speculative extraction is withdrawn under this reason and latch.
     Chase(ChaseDemotion, AbortLatch),
 }
 
@@ -248,8 +248,8 @@ impl Forced {
         }
     }
 
-    /// Chase withdrawal is per job, so it has one target whatever the job
-    /// holds; a direct demotion claims one set.
+    // Chase withdrawal is per job, so it has one target whatever the job
+    // holds; a direct demotion claims one set.
     fn targets(self, route: Route) -> usize {
         match self {
             Self::Direct(_) => route.sets,
@@ -280,8 +280,8 @@ impl Forced {
     }
 }
 
-/// Every demote case of the matrix under `forced`, against every set it can
-/// claim.
+// Every demote case of the matrix under `forced`, against every set it can
+// claim.
 async fn demotion_campaign(target: Target, forced: Forced, slice: Slice) {
     let fixture = fixture(target);
     for (case, (order, interruption)) in campaign_cases(slice, demotes, DEMOTE_CASES) {
@@ -299,8 +299,8 @@ async fn demotion_campaign(target: Target, forced: Forced, slice: Slice) {
     }
 }
 
-/// The default suite's sample: the smoke demote cases, each under the next
-/// demotion of `every` and the next set, so every one is forced somewhere.
+// The default suite's sample: the smoke demote cases, each under the next
+// demotion of `every` and the next set, so every one is forced somewhere.
 async fn demotion_smoke(target: Target, every: &[Forced]) {
     let fixture = fixture(target);
     let cases = campaign_cases(Slice::Smoke, demotes, 0);
@@ -319,9 +319,9 @@ async fn demotion_smoke(target: Target, every: &[Forced]) {
     }
 }
 
-/// Lists every direct-store demotion a schedule forces, by test name, for
-/// `$callback`. A reason that carries a refusal is forced under one of them:
-/// the refusal names the metric and nothing else reads it.
+// Lists every direct-store demotion a schedule forces, by test name, for
+// `$callback`. A reason that carries a refusal is forced under one of them:
+// the refusal names the metric and nothing else reads it.
 macro_rules! direct_demotions {
     ($callback:ident!($($args:tt)*)) => {
         $callback! {$($args)*;
@@ -364,8 +364,8 @@ macro_rules! direct_demotions {
     };
 }
 
-/// Lists every chase withdrawal a schedule forces: each reason for good, and
-/// the two the pipeline also withdraws under a latch that may re-arm.
+// Lists every chase withdrawal a schedule forces: each reason for good, and
+// the two the pipeline also withdraws under a latch that may re-arm.
 macro_rules! chase_demotions {
     ($callback:ident!($($args:tt)*)) => {
         $callback! {$($args)*;
@@ -392,8 +392,8 @@ macro_rules! forced_list {
 const DIRECT_DEMOTIONS: [Forced; 35] = direct_demotions!(forced_list!());
 const CHASE_DEMOTIONS: [Forced; 10] = chase_demotions!(forced_list!());
 
-/// Each direct-store reason's variant, in declaration order. Exhaustive, so
-/// a reason added to the product does not compile here until it is forced.
+// Each direct-store reason's variant, in declaration order. Exhaustive, so
+// a reason added to the product does not compile here until it is forced.
 fn direct_variant(reason: DemotionReason) -> usize {
     use DemotionReason as R;
     match reason {
@@ -435,7 +435,7 @@ fn direct_variant(reason: DemotionReason) -> usize {
     }
 }
 
-/// [`direct_variant`] for chase withdrawals.
+// [`direct_variant`] for chase withdrawals.
 fn chase_variant(reason: ChaseDemotion) -> usize {
     match reason {
         ChaseDemotion::DownloadEnded => 0,
@@ -521,12 +521,12 @@ par3_smoke! {
     par3_conventional_rar5_obfuscated_loss_schedules Format::Rar5Obfuscated, ExtractionProfile::Conventional;
 }
 
-/// A posted file the PAR3 set must name from its bytes, whose first article
-/// arrives twice after that article was already held without a placement:
-/// once through a completed-file restore, once through a demotion handback.
-/// The duplicate's placement is the only one recorded, and publishing just
-/// that range hid the rest of the file, so the set rebuilt the volume beside
-/// the posted copy and left the copy's own archive set waiting on a volume.
+// A posted file the PAR3 set must name from its bytes, whose first article
+// arrives twice after that article was already held without a placement:
+// once through a completed-file restore, once through a demotion handback.
+// The duplicate's placement is the only one recorded, and publishing just
+// that range hid the rest of the file, so the set rebuilt the volume beside
+// the posted copy and left the copy's own archive set waiting on a volume.
 #[tokio::test]
 async fn par3_obfuscated_duplicate_after_unplaced_hold() {
     let mut fixture = fixture(Target::Format(Format::Rar5Obfuscated));
@@ -589,11 +589,11 @@ demotion_smoke! {
     chase_demotion_reasons_rar5_four_volume Target::Format(Format::Rar5FourVolumes), CHASE_DEMOTIONS;
 }
 
-/// One recovery set covers both archive sets, and the loss lands in the set
-/// that was demoted: wholly (the other set clean), beside a loss in the set
-/// still direct, and everywhere at once. The repair reads the direct set's
-/// volumes virtually and writes the demoted set's files in place, so the set
-/// the schedule left alone stays direct.
+// One recovery set covers both archive sets, and the loss lands in the set
+// that was demoted: wholly (the other set clean), beside a loss in the set
+// still direct, and everywhere at once. The repair reads the direct set's
+// volumes virtually and writes the demoted set's files in place, so the set
+// the schedule left alone stays direct.
 #[tokio::test]
 async fn two_sets_loss_in_the_demoted_set_leaves_the_other_direct() {
     let fixture = fixture(Target::TwoSets);
@@ -619,12 +619,12 @@ async fn two_sets_loss_in_the_demoted_set_leaves_the_other_direct() {
     }
 }
 
-/// The same two sets posted under obfuscated names, so the recovery set's
-/// descriptions are the only real names and each volume is admitted by its
-/// content. The demoted set's file lands on disk under its posted name, not
-/// the name its description declares, and its second article is lost. The
-/// repair still writes that file in place, through the identity its first
-/// article proved, and the set the schedule left alone stays direct.
+// The same two sets posted under obfuscated names, so the recovery set's
+// descriptions are the only real names and each volume is admitted by its
+// content. The demoted set's file lands on disk under its posted name, not
+// the name its description declares, and its second article is lost. The
+// repair still writes that file in place, through the identity its first
+// article proved, and the set the schedule left alone stays direct.
 #[tokio::test]
 async fn two_sets_loss_in_a_renamed_demoted_set_leaves_the_other_direct() {
     // Each offset-zero article has to cover its volume's 16 KiB fingerprint

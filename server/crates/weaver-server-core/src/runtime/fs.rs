@@ -26,8 +26,8 @@ pub(crate) struct DirectoryFingerprint {
     file_index: u64,
 }
 
-/// An atomic regular-file move with no copy or hard-link fallback. Callers
-/// journaling both names can replay an interruption without partial outputs.
+// An atomic regular-file move with no copy or hard-link fallback. Callers
+// journaling both names can replay an interruption without partial outputs.
 pub(crate) fn rename_file_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
     if !std::fs::symlink_metadata(src)?.file_type().is_file() {
         return Err(io::Error::new(

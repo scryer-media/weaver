@@ -1,8 +1,8 @@
-//! Encryption at rest for credentials, including NNTP, RSS and archive passwords.
-//!
-//! Uses AES-256-GCM with a 32-byte master key stored in platform-native secure storage.
-//! Encrypted values use the format `enc:v1:<base64(nonce || ciphertext || tag)>`.
-//! Values without this prefix pass through unchanged (backward compatibility).
+// Encryption at rest for credentials, including NNTP, RSS and archive passwords.
+//
+// Uses AES-256-GCM with a 32-byte master key stored in platform-native secure storage.
+// Encrypted values use the format `enc:v1:<base64(nonce || ciphertext || tag)>`.
+// Values without this prefix pass through unchanged (backward compatibility).
 
 pub(crate) mod keystore;
 
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 const ENCRYPTED_PREFIX: &str = "enc:v1:";
 const NONCE_LEN: usize = 12;
 
-/// A 32-byte AES-256-GCM key for encrypting/decrypting sensitive values at rest.
+// A 32-byte AES-256-GCM key for encrypting/decrypting sensitive values at rest.
 #[derive(Clone)]
 pub struct EncryptionKey {
     key_bytes: [u8; 32],
@@ -64,7 +64,7 @@ impl EncryptionKey {
     }
 }
 
-/// Encrypt a plaintext string. Returns `enc:v1:<base64(nonce || ciphertext || tag)>`.
+// Encrypt a plaintext string. Returns `enc:v1:<base64(nonce || ciphertext || tag)>`.
 pub fn encrypt_value(key: &EncryptionKey, plaintext: &str) -> Result<String, String> {
     let cipher = Aes256Gcm::new_from_slice(&key.key_bytes)
         .map_err(|e| format!("failed to create cipher: {e}"))?;
@@ -85,7 +85,7 @@ pub fn encrypt_value(key: &EncryptionKey, plaintext: &str) -> Result<String, Str
     Ok(format!("{ENCRYPTED_PREFIX}{}", STANDARD.encode(&combined)))
 }
 
-/// Decrypt a stored value. If it doesn't have the `enc:v1:` prefix, return as-is (plaintext passthrough).
+// Decrypt a stored value. If it doesn't have the `enc:v1:` prefix, return as-is (plaintext passthrough).
 pub fn decrypt_value(key: &EncryptionKey, stored: &str) -> Result<String, String> {
     let Some(encoded) = stored.strip_prefix(ENCRYPTED_PREFIX) else {
         return Ok(stored.to_string());
@@ -113,12 +113,12 @@ pub fn decrypt_value(key: &EncryptionKey, stored: &str) -> Result<String, String
     String::from_utf8(plaintext).map_err(|e| format!("decrypted value is not valid UTF-8: {e}"))
 }
 
-/// Check if a value is encrypted (has the `enc:v1:` prefix).
+// Check if a value is encrypted (has the `enc:v1:` prefix).
 pub fn is_encrypted(value: &str) -> bool {
     value.starts_with(ENCRYPTED_PREFIX)
 }
 
-/// Encrypt a value if it's not already encrypted. Returns as-is if already encrypted or empty/None.
+// Encrypt a value if it's not already encrypted. Returns as-is if already encrypted or empty/None.
 pub(crate) fn maybe_encrypt(
     key: Option<&EncryptionKey>,
     value: &Option<String>,
@@ -135,8 +135,8 @@ pub(crate) fn maybe_encrypt(
     encrypt_value(key, v).map(Some)
 }
 
-/// Encrypt a secret for new writes. Plaintext compatibility is read-only: callers
-/// that store new secrets should fail if no encryption key is available.
+// Encrypt a secret for new writes. Plaintext compatibility is read-only: callers
+// that store new secrets should fail if no encryption key is available.
 pub(crate) fn encrypt_secret_for_write(
     key: Option<&EncryptionKey>,
     value: &Option<String>,
@@ -153,7 +153,7 @@ pub(crate) fn encrypt_secret_for_write(
     encrypt_value(key, v).map(Some)
 }
 
-/// Decrypt a value if it's encrypted. Returns as-is if not encrypted or empty/None.
+// Decrypt a value if it's encrypted. Returns as-is if not encrypted or empty/None.
 pub(crate) fn maybe_decrypt(key: Option<&EncryptionKey>, value: Option<String>) -> Option<String> {
     let v = value?;
     if v.is_empty() || !is_encrypted(&v) {
@@ -171,13 +171,13 @@ pub(crate) fn maybe_decrypt(key: Option<&EncryptionKey>, value: Option<String>) 
     }
 }
 
-/// Ensure an encryption master key is available.
-///
-/// Priority:
-/// 1. `WEAVER_ENCRYPTION_KEY` env var explicit override
-/// 2. Platform keystores (Docker secret, OS keychain, key file)
-/// 3. Generate and create a key in a writable platform store, without overwriting
-/// 4. Auto-generate an in-memory ephemeral key when no store supports creation
+// Ensure an encryption master key is available.
+//
+// Priority:
+// 1. `WEAVER_ENCRYPTION_KEY` env var explicit override
+// 2. Platform keystores (Docker secret, OS keychain, key file)
+// 3. Generate and create a key in a writable platform store, without overwriting
+// 4. Auto-generate an in-memory ephemeral key when no store supports creation
 pub fn ensure_encryption_key(data_dir: Option<PathBuf>) -> Result<EncryptionKey, String> {
     ensure_encryption_key_for_state(data_dir, false)
 }
@@ -194,18 +194,18 @@ pub fn key_store_description(data_dir: Option<PathBuf>) -> String {
     }
 }
 
-/// Delete the master key Weaver keeps for `data_dir` in the Windows Credential
-/// Manager. Only the desktop app's uninstaller should call this: every secret
-/// encrypted under the key is unreadable afterwards.
+// Delete the master key Weaver keeps for `data_dir` in the Windows Credential
+// Manager. Only the desktop app's uninstaller should call this: every secret
+// encrypted under the key is unreadable afterwards.
 #[cfg(target_os = "windows")]
 pub fn delete_windows_credential_key(data_dir: &std::path::Path) -> Result<(), String> {
     use keystore::KeyStore as _;
     windows::WindowsCredentialManager::for_data_dir(Some(data_dir)).delete_key()
 }
 
-/// Ensure a key is available without ever replacing a missing key when
-/// encrypted credentials already exist. A fresh instance may create a key;
-/// an existing encrypted instance must recover the original key or fail.
+// Ensure a key is available without ever replacing a missing key when
+// encrypted credentials already exist. A fresh instance may create a key;
+// an existing encrypted instance must recover the original key or fail.
 pub fn ensure_encryption_key_for_state(
     data_dir: Option<PathBuf>,
     encrypted_credentials_exist: bool,

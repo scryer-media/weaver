@@ -1,11 +1,11 @@
-//! In-application upgrades.
-//!
-//! The upgrade mechanics — manifest validation, installation classification,
-//! download, verification, extraction, promotion, rollback, the durable journal
-//! and the Windows helper handoff — live in the shared `application-updater`
-//! crate. This module owns everything Weaver-specific: its product identity,
-//! the service that orchestrates a run, and the names the rest of the workspace
-//! imports from here.
+// In-application upgrades.
+//
+// The upgrade mechanics — manifest validation, installation classification,
+// download, verification, extraction, promotion, rollback, the durable journal
+// and the Windows helper handoff — live in the shared `application-updater`
+// crate. This module owns everything Weaver-specific: its product identity,
+// the service that orchestrates a run, and the names the rest of the workspace
+// imports from here.
 
 mod error;
 pub mod manifest;
@@ -28,13 +28,13 @@ pub use service::{
     application_upgrade_helper_update_journal, phases,
 };
 
-/// When the operating system last booted, where the platform can say.
-///
-/// A reboot-required upgrade is only finished by a boot that happened after
-/// the journal was written, so without this the run stays Running forever and
-/// blocks every upgrade behind it. Windows reports the time since boot with
-/// `GetTickCount64`; other platforms have no reboot-required path, so they
-/// answer `None` and the journal keeps waiting as it did.
+// When the operating system last booted, where the platform can say.
+//
+// A reboot-required upgrade is only finished by a boot that happened after
+// the journal was written, so without this the run stays Running forever and
+// blocks every upgrade behind it. Windows reports the time since boot with
+// `GetTickCount64`; other platforms have no reboot-required path, so they
+// answer `None` and the journal keeps waiting as it did.
 #[cfg(windows)]
 pub fn operating_system_boot_time() -> Option<std::time::SystemTime> {
     // SAFETY: `GetTickCount64` reads a counter and takes no arguments.
@@ -42,17 +42,17 @@ pub fn operating_system_boot_time() -> Option<std::time::SystemTime> {
     std::time::SystemTime::now().checked_sub(std::time::Duration::from_millis(uptime_ms))
 }
 
-/// When the operating system last booted. Not reported off Windows, which is
-/// the only platform with a reboot-required upgrade phase.
+// When the operating system last booted. Not reported off Windows, which is
+// the only platform with a reboot-required upgrade phase.
 #[cfg(not(windows))]
 pub fn operating_system_boot_time() -> Option<std::time::SystemTime> {
     None
 }
 
-/// Classify this installation from live startup evidence.
-///
-/// The observation and the judgement both live in the shared crate; this binds
-/// them to Weaver's environment markers, registry key and write-probe prefix.
+// Classify this installation from live startup evidence.
+//
+// The observation and the judgement both live in the shared crate; this binds
+// them to Weaver's environment markers, registry key and write-probe prefix.
 pub fn collect_installation_assessment() -> InstallationAssessment {
     application_updater::evidence::collect_installation_assessment(&WEAVER_PRODUCT)
 }

@@ -77,7 +77,7 @@ pub(super) struct RssServiceInner {
     clock_origin: tokio::time::Instant,
     #[cfg(test)]
     clock_epoch: i64,
-    /// Full feed rows the due-sync path has loaded.
+    // Full feed rows the due-sync path has loaded.
     #[cfg(test)]
     pub(super) full_feed_loads: std::sync::atomic::AtomicU64,
 }
@@ -97,13 +97,13 @@ impl RssService {
         *self.inner.scheduled_paused.borrow()
     }
 
-    /// Wall-clock seconds, so a host suspend or clock change is seen.
+    // Wall-clock seconds, so a host suspend or clock change is seen.
     #[cfg(not(test))]
     pub(super) fn now(&self) -> i64 {
         unix_now_secs()
     }
 
-    /// Unit tests drive the poller with tokio's paused clock.
+    // Unit tests drive the poller with tokio's paused clock.
     #[cfg(test)]
     pub(super) fn now(&self) -> i64 {
         self.inner.clock_epoch.saturating_add(

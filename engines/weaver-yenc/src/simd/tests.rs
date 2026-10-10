@@ -1154,9 +1154,9 @@ fn lcg(seed: &mut u64) -> u64 {
     *seed >> 33
 }
 
-/// Build an adversarial raw NNTP/yEnc stream: normal runs interleaved
-/// with escapes, chains, malformed escapes, bare breaks, line-start dots
-/// and escapes, and (rarely) control/terminator shapes.
+// Build an adversarial raw NNTP/yEnc stream: normal runs interleaved
+// with escapes, chains, malformed escapes, bare breaks, line-start dots
+// and escapes, and (rarely) control/terminator shapes.
 fn adversarial_stream(seed: &mut u64, len_target: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len_target + 16);
     while out.len() < len_target {
@@ -1628,9 +1628,9 @@ fn dispatch_kernel_handles_boundary_specials_like_scalar() {
     }
 }
 
-/// Diagnostic (run with `--ignored --nocapture`): dumps the first byte
-/// where the AVX2 kernel diverges from the scalar oracle across the same
-/// boundary corpus, with surrounding context, to pinpoint port bugs.
+// Diagnostic (run with `--ignored --nocapture`): dumps the first byte
+// where the AVX2 kernel diverges from the scalar oracle across the same
+// boundary corpus, with surrounding context, to pinpoint port bugs.
 #[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "diagnostic; run explicitly"]
@@ -1727,13 +1727,13 @@ fn avx2_active_kernel_required_matches_scalar() {
     }
 }
 
-/// Marker printed when the VBMI2 tier really is the dispatched one. The SDE
-/// lane greps stdout for this exact string, so a host (or an emulator profile)
-/// that silently stops exposing the VBMI2 feature set fails CI instead of
-/// turning the tripwire into a no-op skip.
-///
-/// The lane MUST pass `--nocapture`: libtest swallows a passing test's output
-/// otherwise and the grep can never match.
+// Marker printed when the VBMI2 tier really is the dispatched one. The SDE
+// lane greps stdout for this exact string, so a host (or an emulator profile)
+// that silently stops exposing the VBMI2 feature set fails CI instead of
+// turning the tripwire into a no-op skip.
+//
+// The lane MUST pass `--nocapture`: libtest swallows a passing test's output
+// otherwise and the grep can never match.
 #[cfg(target_arch = "x86_64")]
 const VBMI2_TRIPWIRE_ACTIVE: &str =
     "vbmi2-tripwire: VBMI2 tier ACTIVE (dispatcher selected the VBMI2 kernel)";
@@ -1742,19 +1742,19 @@ const VBMI2_TRIPWIRE_ACTIVE: &str =
 const VBMI2_TRIPWIRE_SKIPPED: &str =
     "vbmi2-tripwire: SKIPPED (host does not expose the full VBMI2 tier feature set)";
 
-/// VBMI2 analogue of [`avx2_active_kernel_required_matches_scalar`].
-///
-/// Two failures this catches that a per-tier differential test cannot:
-///
-///  * the feature set says the VBMI2 tier is usable but `decode_kernel` routes
-///    to a lower tier — a dispatch regression that leaves every VBMI2 box
-///    running AVX2 while all the forced-tier tests stay green;
-///  * the SDE lane stops emulating one of the nine gating features, which would
-///    otherwise downgrade this test to a silent skip (the lane's `--nocapture`
-///    grep for [`VBMI2_TRIPWIRE_ACTIVE`] is what turns that into a failure).
-///
-/// On a host without the tier this is a visible skip, matching the crate's
-/// existing skip-visibility convention.
+// VBMI2 analogue of [`avx2_active_kernel_required_matches_scalar`].
+//
+// Two failures this catches that a per-tier differential test cannot:
+//
+//  * the feature set says the VBMI2 tier is usable but `decode_kernel` routes
+//    to a lower tier — a dispatch regression that leaves every VBMI2 box
+//    running AVX2 while all the forced-tier tests stay green;
+//  * the SDE lane stops emulating one of the nine gating features, which would
+//    otherwise downgrade this test to a silent skip (the lane's `--nocapture`
+//    grep for [`VBMI2_TRIPWIRE_ACTIVE`] is what turns that into a failure).
+//
+// On a host without the tier this is a visible skip, matching the crate's
+// existing skip-visibility convention.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn vbmi2_active_kernel_required_matches_scalar() {
@@ -1952,10 +1952,10 @@ fn dispatch_kernel_matches_scalar_on_hinted_encoded_streams() {
     }
 }
 
-/// Line-structured, special-free payload for the NEON search-end differentials:
-/// `line_length` columns of data separated by raw `\r\n`, containing no `=`,
-/// `.`, `\r` or `\n` outside those breaks, so any terminator in a case body is
-/// exactly the one the test spliced in.
+// Line-structured, special-free payload for the NEON search-end differentials:
+// `line_length` columns of data separated by raw `\r\n`, containing no `=`,
+// `.`, `\r` or `\n` outside those breaks, so any terminator in a case body is
+// exactly the one the test spliced in.
 #[cfg(target_arch = "aarch64")]
 fn search_end_body(len: usize, line_length: usize) -> Vec<u8> {
     let mut body = Vec::with_capacity(len + 2);
@@ -1982,8 +1982,8 @@ fn splice_at(body: &[u8], at: usize, seq: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decode `input` as exactly two chunks split at `split`, carrying state
-/// across the boundary (the shape that drives the search-end head resolution).
+// Decode `input` as exactly two chunks split at `split`, carrying state
+// across the boundary (the shape that drives the search-end head resolution).
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::type_complexity)]
 fn run_kernel_split_once(
@@ -2028,8 +2028,8 @@ fn run_kernel_split_once(
     (output, consumed, end, state)
 }
 
-/// The search-end flat kernel must agree with the scalar oracle for a
-/// terminator/control sequence placed anywhere around a 64-byte window edge.
+// The search-end flat kernel must agree with the scalar oracle for a
+// terminator/control sequence placed anywhere around a 64-byte window edge.
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn neon_search_end_matches_scalar_around_window_boundaries() {
@@ -2059,8 +2059,8 @@ fn neon_search_end_matches_scalar_around_window_boundaries() {
     }
 }
 
-/// `=y` inside a data line is an escaped `y`, never a control boundary: the
-/// in-kernel probe must not fire without a preceding `\r\n`.
+// `=y` inside a data line is an escaped `y`, never a control boundary: the
+// in-kernel probe must not fire without a preceding `\r\n`.
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn neon_search_end_ignores_mid_line_eq_y() {
@@ -2083,9 +2083,9 @@ fn neon_search_end_ignores_mid_line_eq_y() {
     }
 }
 
-/// An escape at the last byte of a window carries `escFirst` into the window
-/// the probe aborts; the break state must be `Eq` so the scalar rescan
-/// unescapes the terminator's `\r` before resolving the boundary.
+// An escape at the last byte of a window carries `escFirst` into the window
+// the probe aborts; the break state must be `Eq` so the scalar rescan
+// unescapes the terminator's `\r` before resolving the boundary.
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn neon_search_end_handles_escape_at_window_edge() {
@@ -2110,9 +2110,9 @@ fn neon_search_end_handles_escape_at_window_edge() {
     }
 }
 
-/// Terminator sequences straddling a chunk entry: the leading `\r\n` lands in
-/// chunk 1, so only the head resolution can see it. Covers chunk-1 tails of
-/// `\r`, `\r\n`, `\r\n.`, `\r\n=` and `\r\n.\r`.
+// Terminator sequences straddling a chunk entry: the leading `\r\n` lands in
+// chunk 1, so only the head resolution can see it. Covers chunk-1 tails of
+// `\r`, `\r\n`, `\r\n.`, `\r\n=` and `\r\n.\r`.
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn neon_search_end_head_resolution_matches_scalar_across_chunk_entry() {
@@ -2140,13 +2140,13 @@ fn neon_search_end_head_resolution_matches_scalar_across_chunk_entry() {
     }
 }
 
-/// The four ways a `\r\n=y` control sequence can sit relative to a 64-byte
-/// window edge, expressed as the splice offset relative to the boundary.
-///
-/// The SEARCH_END probe answers "does a trailer start in this window?" from the
-/// window's own 64 bytes; the last three shapes below run off the end of it and
-/// are only resolvable by the tail carry, tested against the *next* window.
-/// `-8` is the control: entirely inside one window.
+// The four ways a `\r\n=y` control sequence can sit relative to a 64-byte
+// window edge, expressed as the splice offset relative to the boundary.
+//
+// The SEARCH_END probe answers "does a trailer start in this window?" from the
+// window's own 64 bytes; the last three shapes below run off the end of it and
+// are only resolvable by the tail carry, tested against the *next* window.
+// `-8` is the control: entirely inside one window.
 #[cfg(target_arch = "aarch64")]
 const WINDOW_EDGE_OFFSETS: [(i64, &str); 5] = [
     (-8, "\\r\\n=y| entirely within the window"),
@@ -2156,16 +2156,16 @@ const WINDOW_EDGE_OFFSETS: [(i64, &str); 5] = [
     (-1, "\\r|\\n=y  — `\\n=y` in the next window"),
 ];
 
-/// A control sequence straddling a 64-byte window edge at every alignment must
-/// still be found, and a *false* candidate at the same alignments (a line-start
-/// escape that is not `=y`) must resolve and resume decoding byte-identically.
-///
-/// `=\r\n=y` is included because an `=`-escaped CR still opens a line
-/// (`Eq` + `\r` -> `Cr`), so the tail classification has to stay byte-literal
-/// rather than vetoing escaped bytes.
-///
-/// Boundary 3968 is past the last window the flat loop can take on a 4096-byte
-/// body (`simd_limit` is 4029), so it exercises the post-loop carry flush.
+// A control sequence straddling a 64-byte window edge at every alignment must
+// still be found, and a *false* candidate at the same alignments (a line-start
+// escape that is not `=y`) must resolve and resume decoding byte-identically.
+//
+// `=\r\n=y` is included because an `=`-escaped CR still opens a line
+// (`Eq` + `\r` -> `Cr`), so the tail classification has to stay byte-literal
+// rather than vetoing escaped bytes.
+//
+// Boundary 3968 is past the last window the flat loop can take on a 4096-byte
+// body (`simd_limit` is 4029), so it exercises the post-loop carry flush.
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn neon_search_end_carry_resolves_trailer_at_every_window_alignment() {
@@ -2199,9 +2199,9 @@ fn neon_search_end_carry_resolves_trailer_at_every_window_alignment() {
     assert_eq!(covered, 3 * 7 * 5);
 }
 
-/// The same window-edge alignments driven through the chunked entry, so the
-/// carry has to survive a kernel call boundary landing anywhere in or around
-/// the control sequence (each split also re-phases every later window).
+// The same window-edge alignments driven through the chunked entry, so the
+// carry has to survive a kernel call boundary landing anywhere in or around
+// the control sequence (each split also re-phases every later window).
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn neon_search_end_carry_survives_chunked_entry_at_every_split() {
@@ -2238,11 +2238,11 @@ fn neon_search_end_carry_survives_chunked_entry_at_every_split() {
     }
 }
 
-/// Every line of this body opens with a legitimate `=X` escape, so the scalar
-/// candidate test fires on essentially every window. Each one must resolve to
-/// "not an end" and resume the SIMD loop with byte-identical output — the shape
-/// that would silently fall back to the scalar drain if a false candidate broke
-/// out of the window loop.
+// Every line of this body opens with a legitimate `=X` escape, so the scalar
+// candidate test fires on essentially every window. Each one must resolve to
+// "not an end" and resume the SIMD loop with byte-identical output — the shape
+// that would silently fall back to the scalar drain if a false candidate broke
+// out of the window loop.
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn neon_search_end_line_start_escapes_are_not_trailers() {
@@ -2286,15 +2286,15 @@ fn neon_search_end_line_start_escapes_are_not_trailers() {
     }
 }
 
-/// Special-free, line-structured body for the production-shape forced-tier
-/// differential: `columns` data bytes per line separated by `\r\n`, with no
-/// `=`, `.`, CR or LF outside those breaks, so the only escape or terminator in
-/// a body is the one the case splices in.
-///
-/// Deliberately a crate-local restatement of the SIMD-reaching shapes in
-/// `tests/rapidyenc_decode_diff.rs`: an integration test cannot be imported
-/// from inside the crate, and this one must also build on x86_64, where
-/// `search_end_body` above is `cfg`-ed out.
+// Special-free, line-structured body for the production-shape forced-tier
+// differential: `columns` data bytes per line separated by `\r\n`, with no
+// `=`, `.`, CR or LF outside those breaks, so the only escape or terminator in
+// a body is the one the case splices in.
+//
+// Deliberately a crate-local restatement of the SIMD-reaching shapes in
+// `tests/rapidyenc_decode_diff.rs`: an integration test cannot be imported
+// from inside the crate, and this one must also build on x86_64, where
+// `search_end_body` above is `cfg`-ed out.
 fn production_line_body(len: usize, columns: usize) -> Vec<u8> {
     const DATA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-*";
     let mut body = Vec::with_capacity(len + 2);
@@ -2321,11 +2321,11 @@ fn production_splice_at(body: &[u8], at: usize, seq: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Bodies for the production-shape forced-tier differential: no-end bodies,
-/// each end/control form swept across a 64-byte window edge (bytes 62..=66 of
-/// the window starting at 192), a mid-line `=y` that must NOT end, dot-stuffed
-/// line starts, escapes at the window edge and dense escape runs. Every body
-/// clears the 128-byte flat-kernel gate.
+// Bodies for the production-shape forced-tier differential: no-end bodies,
+// each end/control form swept across a 64-byte window edge (bytes 62..=66 of
+// the window starting at 192), a mid-line `=y` that must NOT end, dot-stuffed
+// line starts, escapes at the window edge and dense escape runs. Every body
+// clears the 128-byte flat-kernel gate.
 fn production_shape_bodies() -> Vec<(String, Vec<u8>)> {
     const WINDOW_EDGE: [usize; 5] = [254, 255, 256, 257, 258];
     let base = production_line_body(1024, 128);
@@ -2398,10 +2398,10 @@ type TierKernelFn = unsafe fn(
     bool,
 ) -> Result<KernelOutcome, YencError>;
 
-/// Every tier kernel the dispatcher can select on this target, with its
-/// runtime availability gate. Tiers whose features are missing self-skip, so
-/// the x86 legs compile (and stay meaningful under SDE/Rosetta/CI) on a machine
-/// that can only run the NEON leg, and vice versa.
+// Every tier kernel the dispatcher can select on this target, with its
+// runtime availability gate. Tiers whose features are missing self-skip, so
+// the x86 legs compile (and stay meaningful under SDE/Rosetta/CI) on a machine
+// that can only run the NEON leg, and vice versa.
 fn forced_tier_kernels() -> Vec<(&'static str, bool, TierKernelFn)> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -2451,14 +2451,14 @@ fn forced_tier_kernels() -> Vec<(&'static str, bool, TierKernelFn)> {
     }
 }
 
-/// Every tier kernel against the scalar oracle in the PRODUCTION decode shape
-/// — `dot_unstuffing`, `preserve_pending` and `search_end` all set, which is
-/// exactly what `decode_rapidyenc_incremental_into` drives — plus the
-/// `search_end=false` leg of the same preserving shape.
-///
-/// `forced_tier_kernels_match_scalar_with_line_hints` only ever drives
-/// `(dot=true, preserve=false, search_end=false)`, so no tier's end-detecting
-/// path had per-tier differential coverage before this.
+// Every tier kernel against the scalar oracle in the PRODUCTION decode shape
+// — `dot_unstuffing`, `preserve_pending` and `search_end` all set, which is
+// exactly what `decode_rapidyenc_incremental_into` drives — plus the
+// `search_end=false` leg of the same preserving shape.
+//
+// `forced_tier_kernels_match_scalar_with_line_hints` only ever drives
+// `(dot=true, preserve=false, search_end=false)`, so no tier's end-detecting
+// path had per-tier differential coverage before this.
 #[test]
 fn forced_tier_kernels_match_scalar_in_production_shape() {
     let tiers = forced_tier_kernels();
@@ -2539,14 +2539,14 @@ fn forced_tier_kernels_match_scalar_in_production_shape() {
     }
 }
 
-/// Every tier kernel against the scalar oracle with the input placed at every
-/// offset from a 64-byte boundary and entered in every decoder state, in the
-/// end-detecting shape. The AVX2 end search head-aligns its span with scalar
-/// steps, so the bytes those steps cover (stuffed dots, escapes, `=y` and
-/// terminators straddling the alignment point) must decode exactly as the
-/// scalar machine decodes them. Each boundary sequence is spliced at every
-/// position around the alignment point, and random bodies dense in the bytes
-/// the boundary rules read cover the remaining orderings.
+// Every tier kernel against the scalar oracle with the input placed at every
+// offset from a 64-byte boundary and entered in every decoder state, in the
+// end-detecting shape. The AVX2 end search head-aligns its span with scalar
+// steps, so the bytes those steps cover (stuffed dots, escapes, `=y` and
+// terminators straddling the alignment point) must decode exactly as the
+// scalar machine decodes them. Each boundary sequence is spliced at every
+// position around the alignment point, and random bodies dense in the bytes
+// the boundary rules read cover the remaining orderings.
 #[test]
 fn forced_tier_end_search_matches_scalar_at_every_alignment() {
     const ALPHABET: &[u8] = b"\r\n.=yAB";
@@ -2681,8 +2681,8 @@ fn forced_tier_end_search_matches_scalar_at_every_alignment() {
     }
 }
 
-/// One raw end-searching decode of `body` in `stretch`-byte bounded calls:
-/// the outcome or error, the bytes written, and the folded CRC.
+// One raw end-searching decode of `body` in `stretch`-byte bounded calls:
+// the outcome or error, the bytes written, and the folded CRC.
 fn raw_stretched(body: &[u8], stretch: usize) -> (Result<KernelOutcome, String>, Vec<u8>, u32) {
     let mut output = vec![0u8; body.len() + 64];
     let mut crc = crate::crc::Crc32::new();
@@ -2695,10 +2695,10 @@ fn raw_stretched(body: &[u8], stretch: usize) -> (Result<KernelOutcome, String>,
     (outcome, output, crc)
 }
 
-/// Folding the CRC behind bounded stretches decodes exactly what one
-/// whole-body call does, for stretches ending at every kind of byte: inside
-/// escapes, line breaks, stuffed dots, and `=y` or terminator candidates
-/// straddling the limit, at every input alignment.
+// Folding the CRC behind bounded stretches decodes exactly what one
+// whole-body call does, for stretches ending at every kind of byte: inside
+// escapes, line breaks, stuffed dots, and `=y` or terminator candidates
+// straddling the limit, at every input alignment.
 #[test]
 fn raw_stretches_match_one_whole_call() {
     const ALPHABET: &[u8] = b"\r\n.=yea";

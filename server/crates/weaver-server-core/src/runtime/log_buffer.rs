@@ -12,29 +12,29 @@ const BROADCAST_CAPACITY: usize = 256;
 const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_ROTATED_LOG_FILES: usize = 5;
 
-/// The log file path the process actually resolved at startup.
-///
-/// The resolution rules (CLI flag, environment, platform default) live in the
-/// binary, so anything that needs the *real* path — the diagnostics package, in
-/// particular — would otherwise have to guess at them a second time and get it
-/// wrong. Recorded once, read-only afterwards.
+// The log file path the process actually resolved at startup.
+//
+// The resolution rules (CLI flag, environment, platform default) live in the
+// binary, so anything that needs the *real* path — the diagnostics package, in
+// particular — would otherwise have to guess at them a second time and get it
+// wrong. Recorded once, read-only afterwards.
 static RESOLVED_LOG_FILE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// Records the resolved log file path. The first call wins; later calls are
-/// ignored so a test or a second subscriber cannot move the recorded path.
+// Records the resolved log file path. The first call wins; later calls are
+// ignored so a test or a second subscriber cannot move the recorded path.
 pub fn set_log_file_path(path: PathBuf) {
     let _ = RESOLVED_LOG_FILE_PATH.set(path);
 }
 
-/// The resolved log file path, or `None` when this process writes no log file.
+// The resolved log file path, or `None` when this process writes no log file.
 pub fn log_file_path() -> Option<&'static Path> {
     RESOLVED_LOG_FILE_PATH.get().map(PathBuf::as_path)
 }
 
-/// The active log file followed by every rotated generation that exists on
-/// disk, in newest-first order, then the stderr capture a supervisor keeps
-/// beside the log. Entries that do not exist are skipped, so the result is
-/// exactly the set of files a collector can read.
+// The active log file followed by every rotated generation that exists on
+// disk, in newest-first order, then the stderr capture a supervisor keeps
+// beside the log. Entries that do not exist are skipped, so the result is
+// exactly the set of files a collector can read.
 pub fn existing_log_files() -> Vec<PathBuf> {
     let Some(path) = log_file_path() else {
         return Vec::new();
@@ -58,19 +58,19 @@ pub fn existing_log_files() -> Vec<PathBuf> {
     files
 }
 
-/// Where a process that supervises this one keeps its captured stderr: the
-/// runtime's last words on a crash go there, not through the logger, and a
-/// collector wants them with the log. `weaver.log` pairs with
-/// `weaver.stderr.log`; a rotated capture adds `.1`.
+// Where a process that supervises this one keeps its captured stderr: the
+// runtime's last words on a crash go there, not through the logger, and a
+// collector wants them with the log. `weaver.log` pairs with
+// `weaver.stderr.log`; a rotated capture adds `.1`.
 pub fn stderr_capture_path(log_file: &Path) -> PathBuf {
     log_file.with_extension("stderr.log")
 }
 
-/// Thread-safe ring buffer that captures log lines for live viewing.
-///
-/// Implements `io::Write` so it can be used as a tracing subscriber layer writer.
-/// Each complete line (terminated by `\n`) is stored in the ring buffer and
-/// broadcast to any active subscribers.
+// Thread-safe ring buffer that captures log lines for live viewing.
+//
+// Implements `io::Write` so it can be used as a tracing subscriber layer writer.
+// Each complete line (terminated by `\n`) is stored in the ring buffer and
+// broadcast to any active subscribers.
 #[derive(Clone)]
 pub struct LogRingBuffer {
     inner: Arc<Mutex<RingBufferInner>>,
@@ -80,7 +80,7 @@ pub struct LogRingBuffer {
 struct RingBufferInner {
     lines: VecDeque<String>,
     capacity: usize,
-    /// Accumulates partial writes (no trailing newline yet).
+    // Accumulates partial writes (no trailing newline yet).
     partial: String,
 }
 
@@ -101,7 +101,7 @@ impl LogRingBuffer {
         Self::new(DEFAULT_CAPACITY)
     }
 
-    /// Returns the last `limit` lines from the buffer.
+    // Returns the last `limit` lines from the buffer.
     pub fn snapshot(&self, limit: usize) -> Vec<String> {
         let inner = self.inner.lock().unwrap();
         let safe_limit = limit.min(inner.lines.len());
@@ -113,7 +113,7 @@ impl LogRingBuffer {
             .collect()
     }
 
-    /// Subscribe to live log line broadcasts.
+    // Subscribe to live log line broadcasts.
     pub fn subscribe(&self) -> broadcast::Receiver<String> {
         self.tx.subscribe()
     }

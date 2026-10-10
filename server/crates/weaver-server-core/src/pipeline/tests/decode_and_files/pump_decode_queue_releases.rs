@@ -1,4 +1,4 @@
-//! `decode_and_files` tests, part of a mechanical split of the original file.
+// `decode_and_files` tests, part of a mechanical split of the original file.
 
 use super::*;
 
@@ -58,10 +58,10 @@ async fn pump_decode_queue_releases_bytes_for_inactive_job() {
     );
 }
 
-/// `weaver_pipeline_decode_task_duration_seconds` is absent until the decode
-/// path has timed something, then reports exactly one observation per decode
-/// task — the single clock read the task is allowed, taken once at its end
-/// whichever way the task exits.
+// `weaver_pipeline_decode_task_duration_seconds` is absent until the decode
+// path has timed something, then reports exactly one observation per decode
+// task — the single clock read the task is allowed, taken once at its end
+// whichever way the task exits.
 #[tokio::test]
 async fn decode_tasks_record_one_wall_duration_each() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2857,8 +2857,8 @@ async fn add_job_records_streamed_nzb_hash_in_active_jobs() {
     assert_eq!(stored_hash, expected_hash);
 }
 
-/// Overwrites the job's persisted NZB with bytes that cannot be parsed, so a
-/// harvest that still returns the NZB's candidates provably did not read it.
+// Overwrites the job's persisted NZB with bytes that cannot be parsed, so a
+// harvest that still returns the NZB's candidates provably did not read it.
 async fn corrupt_persisted_nzb(temp_dir: &tempfile::TempDir, job_id: JobId) {
     set_persisted_nzb(temp_dir, job_id, Some(vec![0xFFu8; 64])).await;
 }
@@ -3190,14 +3190,14 @@ async fn reprocess_job_rebuilds_complete_history_from_streamed_persisted_nzb() {
     assert!(state.download_queue.is_empty());
 }
 
-/// A job with no recovery set has nothing to compare a whole-file MD5
-/// against, whatever the file's role.
-///
-/// The deferral used to be restricted to standalone and unclassified files, so
-/// every split archive volume in a job with no recovery set was hashed in full
-/// on the orchestrator task for a value nothing would ever read. The file path
-/// handed to the finalizer does not exist: a read-back fallback would fail, so
-/// a checksum coming back at all is the proof that none happened.
+// A job with no recovery set has nothing to compare a whole-file MD5
+// against, whatever the file's role.
+//
+// The deferral used to be restricted to standalone and unclassified files, so
+// every split archive volume in a job with no recovery set was hashed in full
+// on the orchestrator task for a value nothing would ever read. The file path
+// handed to the finalizer does not exist: a read-back fallback would fail, so
+// a checksum coming back at all is the proof that none happened.
 #[tokio::test]
 async fn a_split_archive_volume_without_a_recovery_set_defers_its_md5() {
     let temp_dir = tempfile::tempdir().unwrap();
