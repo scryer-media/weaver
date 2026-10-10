@@ -406,7 +406,7 @@ pub(crate) async fn run(
             watch_folder: watch_folder.clone(),
             update_check: update_check.clone(),
             application_upgrade: application_upgrade.clone(),
-            schedules: shared_schedules,
+            schedules: shared_schedules.clone(),
             log_buffer: log_ring_buffer,
             system_runtime: weaver_server_api::SystemRuntimeContext {
                 profile: Arc::clone(&system_profile),
@@ -426,7 +426,8 @@ pub(crate) async fn run(
         Arc::clone(&server_transfer_policy),
         shared_config.clone(),
         buffers,
-    );
+    )
+    .with_schedules(shared_schedules);
 
     let mut pipeline_task = tokio::spawn(async move {
         pipeline.run().await;

@@ -201,6 +201,17 @@ func TestWeaverImagePlanDockerfilePublishedShape(t *testing.T) {
 			t.Fatalf("published dockerfile is missing cache optimization %q:\n%s", fragment, dockerfile)
 		}
 	}
+	// The post-processing script flows run .py and .go scripts inside weaver.
+	if !strings.Contains(runtime, "python3") || !strings.Contains(runtime, "COPY --from="+weaverImageGoToolchain+" /usr/local/go /usr/local/go") {
+		t.Fatalf("the runtime image must carry python3 and a pinned Go toolchain:\n%s", dockerfile)
+	}
+	for _, fragment := range []string{
+		"@sha256:",
+	} {
+		if !strings.Contains(dockerfile, fragment) {
+			t.Fatalf("published dockerfile is missing cache optimization %q:\n%s", fragment, dockerfile)
+		}
+	}
 }
 
 func TestWeaverImagePlanScopesTheCargoTargetCachePerCheckout(t *testing.T) {

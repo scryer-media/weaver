@@ -19,6 +19,9 @@ use chrono::{Datelike, Duration, NaiveDateTime, NaiveTime};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::bandwidth::schedule_metrics::{
+    self, ActionOutcome, Evaluator, HoldReason, ReplayReason,
+};
 use crate::bandwidth::{QuotaTarget, ScheduleAction, ScheduleEntry, ScheduleTrack, Weekday};
 
 use crate::jobs::handle::SchedulerHandle;
@@ -107,7 +110,11 @@ pub fn spawn_evaluator_with_services(
     tokio::sync::oneshot::Receiver<Result<(), String>>,
 ) {
     let (ready, replayed) = tokio::sync::oneshot::channel();
-    handle.set_schedule_admission_hold(Some("waiting for the first schedule replay".into()));
+    schedule_metrics::set_admission_hold(
+        &handle,
+        HoldReason::InitialReplay,
+        Some("waiting for the first schedule replay".into()),
+    );
     let (stop, mut stopping) = tokio::sync::oneshot::channel();
     let cancellation = crate::bandwidth::schedule::ScheduleCancellation::new();
     let stopping_actions = cancellation.clone();
@@ -143,7 +150,14 @@ pub fn spawn_evaluator_with_services(
                         let services = services.clone();
                         let cancellation = stopping_actions.clone();
                         async move {
-                            if let Err(error) = apply_one_shot(handle, services, entry.action, cancellation).await {
+                            let action = entry.action.clone();
+                            let result = apply_one_shot(handle, services, entry.action, cancellation).await;
+                            schedule_metrics::record_action(&entry.id, &action, None, match &result {
+                                Ok(()) => ActionOutcome::Applied,
+                                Err(ScheduleApplyError::Pending) => ActionOutcome::Skipped,
+                                Err(ScheduleApplyError::Failed(_)) => ActionOutcome::Failed,
+                            }, crate::e2e_clock::local_now().naive_utc(), None);
+                            if let Err(error) = result {
                                 warn!(%error, id = %entry.id, "scheduled one-shot failed");
                             }
                         }
@@ -192,7 +206,9 @@ pub fn spawn_evaluator_with_services(
                             ?result,
                             "cannot load schedule intake state; retrying next tick"
                         );
-                        handle.set_schedule_admission_hold(
+                        schedule_metrics::set_admission_hold(
+                            &handle,
+                            HoldReason::StateUnavailable,
                             holds_admission(&entries)
                                 .then(|| format!("cannot load schedule state: {result:?}")),
                         );
@@ -221,6 +237,7 @@ pub fn spawn_evaluator_with_services(
                 }
             }
             let clock = crate::e2e_clock::local_now();
+            schedule_metrics::record_evaluation();
             let now = clock.naive_local();
             let utc = clock.naive_utc();
             let mut due = one_shots.due_at(&entries, now, utc);
@@ -280,7 +297,11 @@ pub fn spawn_evaluator_with_services(
             match result {
                 Ok((tick, failures)) => {
                     evaluator = tick;
-                    handle.set_schedule_admission_hold(evaluator.admission_hold.clone());
+                    schedule_metrics::set_admission_hold(
+                        &handle,
+                        HoldReason::ActionFailed,
+                        evaluator.admission_hold.clone(),
+                    );
                     if failures.is_empty()
                         && let Some((watch_paused, rss_paused)) = intake_before_failure.take()
                     {
@@ -307,7 +328,9 @@ pub fn spawn_evaluator_with_services(
                     }
                 }
                 Err(panic) => {
-                    handle.set_schedule_admission_hold(
+                    schedule_metrics::set_admission_hold(
+                        &handle,
+                        HoldReason::EvaluationFailed,
                         holds_admission(&schedules.read().await)
                             .then(|| format!("schedule evaluation failed: {panic}")),
                     );
@@ -468,7 +491,13 @@ impl HoldEvaluator {
         let jumped = self.last_utc.is_some_and(|last| {
             last - utc > Duration::minutes(5) || utc - last > Duration::minutes(90)
         });
+        let replay = if self.last_utc.is_none() {
+            Some(ReplayReason::Startup)
+        } else {
+            jumped.then_some(ReplayReason::ClockJump)
+        };
         if jumped {
+            schedule_metrics::record_clock_jump(Evaluator::Hold);
             self.applied.clear();
             self.repeated_until = None;
         } else if self.last_tick.is_some_and(|last| now < last) {
@@ -543,7 +572,20 @@ impl HoldEvaluator {
                 continue;
             }
             info!(id = %entry.id, ?track, ?action, "schedule transition");
-            match apply(action.clone(), track).await {
+            let applied = apply(action.clone(), track).await;
+            schedule_metrics::record_action(
+                &entry.id,
+                &action,
+                Some(track),
+                match &applied {
+                    Ok(()) => ActionOutcome::Applied,
+                    Err(ScheduleApplyError::Pending) => ActionOutcome::Skipped,
+                    Err(ScheduleApplyError::Failed(_)) => ActionOutcome::Failed,
+                },
+                utc,
+                replay,
+            );
+            match applied {
                 Ok(()) => {
                     if let ScheduleTrack::Quota(QuotaTarget::Egress(id)) = track {
                         self.egress_quotas_set.insert(id);
@@ -872,6 +914,7 @@ impl OneShotEvaluator {
         if now < last
             || last_utc.is_some_and(|last| utc < last || utc - last > Duration::minutes(90))
         {
+            schedule_metrics::record_clock_jump(Evaluator::OneShot);
             return Vec::new();
         }
         let mut due = Vec::new();
@@ -886,6 +929,7 @@ impl OneShotEvaluator {
                 for time in entry_times(entry) {
                     let at = date.and_time(time);
                     if last < at && at <= now && self.fired.insert((entry.id.clone(), at)) {
+                        schedule_metrics::record_one_shot_fire(&entry.action);
                         due.push(entry.clone());
                     }
                 }
@@ -937,6 +981,8 @@ impl OneShotEvaluator {
             if let Some(at) = latest
                 && self.fired.insert((entry.id.clone(), at))
             {
+                schedule_metrics::record_catch_up_fire();
+                schedule_metrics::record_one_shot_fire(&entry.action);
                 due.push(entry.clone());
             }
         }

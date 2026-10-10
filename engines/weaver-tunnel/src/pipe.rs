@@ -586,6 +586,7 @@ impl Dialer for TransportHop {
                     remaining / (destinations.len() - index) as u32,
                 )
                 .await;
+            crate::metrics::record_stream(self.spec.kind.tunnel_kind(), &negotiated);
             match &negotiated {
                 Ok(()) => self.failure.clear(),
                 // The proxy answered for the next hop, so it is working.
@@ -809,6 +810,9 @@ impl Dialer for SessionHop {
             .map_err(|e| DialError::hop(self.id, e));
         drop(capacity);
         drop(activity);
+        if let Some(kind) = self.provider.kind() {
+            crate::metrics::record_session_prepare(kind, result.is_ok());
+        }
         match &result {
             Ok(()) => self.failure.clear(),
             Err(error) => self.failure.note(error),
@@ -825,6 +829,9 @@ impl Dialer for SessionHop {
     }
     async fn retire_idle(&self) -> bool {
         if let Ok(_activity) = self.activity.try_write() {
+            if let Some(kind) = self.provider.kind() {
+                crate::metrics::record_session_retirement(kind);
+            }
             self.provider.retire().await;
             self.capacity.release();
             true
@@ -856,6 +863,9 @@ impl Dialer for SessionHop {
             if matches!(connected, Ok(_) | Err(DialError::Fatal(_))) {
                 break;
             }
+        }
+        if let Some(kind) = self.provider.kind() {
+            crate::metrics::record_stream(kind, &connected);
         }
         let stream = match connected {
             Ok(stream) => {
@@ -907,6 +917,12 @@ impl Dialer for SessionHop {
             Some(provider) => provider
                 .resolve_host(host)
                 .await
+                .inspect(|_| {
+                    crate::metrics::record_resolution(crate::metrics::Resolver::WireGuard, true)
+                })
+                .inspect_err(|_| {
+                    crate::metrics::record_resolution(crate::metrics::Resolver::WireGuard, false)
+                })
                 .map(Resolution::Addresses)
                 .map_err(|error| DialError::hop(self.id, error))
                 .inspect_err(|error| self.failure.note(error)),
@@ -993,6 +1009,7 @@ impl Fallback {
         if let Some(error) = error {
             let now = tokio::time::Instant::now();
             if error.is_path_evidence() && state.until.is_none_or(|until| until <= now) {
+                crate::metrics::record_rung_cooldown(index);
                 state.failures = state.failures.saturating_add(1);
                 state.until = Some(now + self.rung_cooldown);
             }
@@ -1052,6 +1069,9 @@ impl Dialer for Fallback {
                         failures: 0,
                     };
                     dialed.path.rung = Some(index);
+                    if index > 0 {
+                        crate::metrics::record_rung_fallback(index);
+                    }
                     return Ok(dialed);
                 }
                 Err(error @ DialError::Fatal(_)) => return Err(error),

@@ -11,6 +11,15 @@ pub enum TransportKind {
     Socks5,
 }
 
+impl TransportKind {
+    pub fn tunnel_kind(self) -> crate::metrics::TunnelKind {
+        match self {
+            Self::HttpConnect => crate::metrics::TunnelKind::HttpConnect,
+            Self::Socks5 => crate::metrics::TunnelKind::Socks5,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TransportProxy {
     pub kind: TransportKind,
@@ -285,6 +294,9 @@ impl TransportProxy {
 
 #[async_trait::async_trait]
 impl TunnelProvider for TransportProxy {
+    fn kind(&self) -> Option<crate::metrics::TunnelKind> {
+        Some(self.kind.tunnel_kind())
+    }
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let mut stream = TcpStream::connect((self.host.as_str(), self.port))
             .await

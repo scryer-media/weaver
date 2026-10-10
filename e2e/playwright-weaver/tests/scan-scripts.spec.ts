@@ -54,9 +54,13 @@ async function plain(request: APIRequestContext, name: string): Promise<number> 
   }
 }
 
-type Scanned = { script: string; name: string; result: SubmissionResult | null; errors: string[] };
+type Scanned = { script: string; name: string; result: SubmissionResult | null; errors: string[]; output: string };
 
-/** List one SCAN script with `body`, submit an NZB through it, then unlist it. */
+/**
+ * List one SCAN script with `body`, submit an NZB through it, then unlist it.
+ * What the run printed is read while the script is still listed: removing a
+ * script job removes its recorded runs with it.
+ */
 async function scanned(request: APIRequestContext, id: string, body: string, input: Record<string, unknown> = {}): Promise<Scanned> {
   const name = `${id.toLowerCase()}-${token()}`;
   const script = writeFixtureScript(`${name}-scan`, { kinds: ["SCAN"], body });
@@ -65,7 +69,8 @@ async function scanned(request: APIRequestContext, id: string, body: string, inp
     const { result, errors } = await submitNzb(request, { nzbBase64: base64(document(name)), filename: `${name}.nzb`, ...input });
     if (result?.jobId) created.push(result.jobId);
     expect(scriptRecords(script), `${script} ran once`).toHaveLength(1);
-    return { script, name, result, errors };
+    const output = (await waitJobLessResults(script, 1)).at(-1)!.outputTail;
+    return { script, name, result, errors, output };
   } finally {
     await restore();
     removeFixtureScripts([script]);
@@ -73,10 +78,6 @@ async function scanned(request: APIRequestContext, id: string, body: string, inp
 }
 
 const directive = scriptBodies.directive;
-
-async function lastOutput(script: string): Promise<string> {
-  return (await waitJobLessResults(script, 1)).at(-1)!.outputTail;
-}
 
 async function queueItem(request: APIRequestContext, id: number) {
   return (await graphql<{ queueItem: { state: string; duplicateSummary: { semantic: { normalizedKey: string; score: number } | null } | null } | null }>(request,
@@ -86,11 +87,11 @@ async function queueItem(request: APIRequestContext, id: number) {
 test("SC01 a Parameter directive becomes a job attribute; an over-long name is refused", async ({ request }) => {
   note("discrepancy", "An invalid parameter name is reported as \"Invalid command\" at ERROR level, not WARNING.");
   const longName = "p".repeat(300);
-  const { script, result } = await scanned(request, "SC01", `${directive("NZBPR_sc01key", "sc01-value")}${directive(`NZBPR_${longName}`, "ignored")}`);
+  const { result, output } = await scanned(request, "SC01", `${directive("NZBPR_sc01key", "sc01-value")}${directive(`NZBPR_${longName}`, "ignored")}`);
   expect(result?.accepted).toBe(true);
   expect(attribute(result, "sc01key")).toBe("sc01-value");
   expect(attribute(result, longName)).toBeUndefined();
-  expect(await lastOutput(script)).toContain("Invalid command");
+  expect(output).toContain("Invalid command");
 });
 
 for (const [id, key, value] of [
@@ -100,9 +101,9 @@ for (const [id, key, value] of [
 ] as const) {
   test(`${id} a ${key} directive is not allowed for scan and the submission still goes ahead`, async ({ request }) => {
     if (id === "SC04") note("discrepancy", "MARK=BAD from a SCAN script does not reject the submission: SCAN refuses the directive (\"Command MARK is not allowed for scan\", logged at WARNING) and the NZB is queued.");
-    const { script, result } = await scanned(request, id, directive(key, value));
+    const { result, output } = await scanned(request, id, directive(key, value));
     expect(result?.accepted, JSON.stringify(result)).toBe(true);
-    expect(await lastOutput(script)).toContain(`Command ${key} is not allowed for scan`);
+    expect(output).toContain(`Command ${key} is not allowed for scan`);
   });
 }
 

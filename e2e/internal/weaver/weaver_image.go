@@ -32,6 +32,10 @@ const weaverImageBuilderWorkdir = "/app"
 // bootstrap userland stable independently of that compiler selection.
 const weaverImageBootstrapBase = "rust:1.96-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3"
 
+// The Go toolchain copied into the runtime image, for the Go post-processing
+// scripts weaver builds with `go`.
+const weaverImageGoToolchain = "golang:1.27-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61"
+
 // Used when weaver has no readable rust-toolchain.toml. rustup would still pick
 // up a toolchain file copied into the image, so this only covers the case where
 // there is genuinely no pin to honour.
@@ -324,8 +328,12 @@ RUN --mount=type=cache,id=weaver-e2e-cargo-registry,target=/usr/local/cargo/regi
     cp target/debug/weaver /tmp/weaver-debug
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata util-linux wget && \
+# python3 and a Go toolchain are here for the post-processing script flows:
+# weaver runs .py scripts through python3 and builds .go scripts with go, and
+# those contracts are proven from inside real runs.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata util-linux wget python3 && \
     rm -rf /var/lib/apt/lists/*
+COPY --from=%s /usr/local/go /usr/local/go
 COPY docker/entrypoint.sh /entrypoint.sh
 COPY --from=builder /tmp/weaver-debug /opt/weaver/weaver
 # A debug build does not embed the web bundle: it reads it at runtime from the
@@ -346,6 +354,7 @@ CMD ["--config", "/config", "serve", "--port", "9090"]
 		plan.Toolchain,
 		plan.Toolchain,
 		plan.cargoTargetCacheID(),
+		weaverImageGoToolchain,
 		weaverImageBuilderWorkdir,
 		weaverImageBuilderWorkdir,
 		weaverImageBuilderWorkdir,

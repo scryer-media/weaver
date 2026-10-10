@@ -163,6 +163,28 @@ func eventScriptsReleaseFlow() weaverReleaseFlowSpec {
 	}
 }
 
+// postProcessingScriptsReleaseFlow runs the post-processing script contract:
+// what each adapter hands a script, exit codes, instances, inputs, secrets,
+// the run token, interpreters, ordering, retention and the NZBGet facade. The
+// URL-submission case fetches from the proxy fixture, so it keeps the
+// fixture's fixed address like event-scripts. The concurrency limit applies
+// at start-up, which only its @restart half can check.
+func postProcessingScriptsReleaseFlow() weaverReleaseFlowSpec {
+	return weaverReleaseFlowSpec{
+		Name:             "post-processing-scripts",
+		Kind:             weaverReleaseFlowBehavior,
+		PlaywrightScript: "post-processing-scripts",
+		SpecFiles:        []string{"post-processing-scripts.spec.ts"},
+		Services:         []string{"nntp", "nntp2", "weaver", "proxy-fixture"},
+		Datastores:       releaseDatastoreMatrix(),
+		Artifacts:        append(defaultWeaverReleaseArtifacts(), "script-records"),
+		Timeout:          30 * time.Minute,
+		NetworkLayout:    weaverNetworkLayoutFixtureAddress,
+		Stages:           []string{"initial", "restarted"},
+		StageScripts:     map[string]string{"restarted": "post-processing-scripts-restarted"},
+	}
+}
+
 // schedulingReleaseFlow runs the schedule and automatic-backup specs. The
 // RSS fixture's counted feeds show how often a scheduled fetch ran.
 func schedulingReleaseFlow() weaverReleaseFlowSpec {
@@ -176,6 +198,25 @@ func schedulingReleaseFlow() weaverReleaseFlowSpec {
 		Artifacts:        append(defaultWeaverReleaseArtifacts(), "script-records"),
 		Timeout:          25 * time.Minute,
 		Stages:           []string{"initial", "restarted", "restarted-again"},
+	}
+}
+
+// schedulingTracksReleaseFlow drives every schedule action through the hold
+// matrix, the track overlaps, operator overrides and one-shot occurrences.
+// Between its stages the harness moves the clock while Weaver is stopped, so
+// a rule's occurrence falls while Weaver is down.
+func schedulingTracksReleaseFlow() weaverReleaseFlowSpec {
+	return weaverReleaseFlowSpec{
+		Name:              "scheduling-tracks",
+		Kind:              weaverReleaseFlowBehavior,
+		PlaywrightScript:  "scheduling-tracks",
+		SpecFiles:         []string{"schedule-tracks.spec.ts"},
+		Services:          []string{"nntp", "nntp2", "weaver", "rss-fixture"},
+		Datastores:        releaseDatastoreMatrix(),
+		Artifacts:         defaultWeaverReleaseArtifacts(),
+		Timeout:           40 * time.Minute,
+		Stages:            []string{"initial", "restarted"},
+		ClockWhileStopped: true,
 	}
 }
 
@@ -452,7 +493,11 @@ func runWeaverStagedReleaseFlow(
 }
 
 func restartWeaverForStage(spec weaverReleaseFlowSpec) error {
-	if err := dockerComposeRestart("weaver"); err != nil {
+	if spec.ClockWhileStopped {
+		if err := restartWeaverWithClockWhileStopped(); err != nil {
+			return err
+		}
+	} else if err := dockerComposeRestart("weaver"); err != nil {
 		return fmt.Errorf("restart Weaver: %w", err)
 	}
 	if err := waitForDockerServiceReady("weaver", 90*time.Second); err != nil {
@@ -468,5 +513,38 @@ func restartWeaverForStage(spec weaverReleaseFlowSpec) error {
 		}
 	}
 	log.Printf("%s: Weaver restarted between stages", spec.Name)
+	return nil
+}
+
+// weaverClockWhileStoppedScript puts the instant a spec left beside the e2e
+// clock file on the clock, and removes it, so a stage can make time pass
+// while Weaver is down. Nothing left means the clock stays where it is.
+const weaverClockWhileStoppedScript = `set -eu
+pending=/e2e-clock/now.while-stopped
+if [ -f "$pending" ]; then
+  mv -f "$pending" /e2e-clock/now
+  chown "${PUID:-1000}:${PGID:-1000}" /e2e-clock/now
+  echo "e2e clock set while Weaver was stopped: $(cat /e2e-clock/now)"
+fi`
+
+// restartWeaverWithClockWhileStopped stops Weaver, moves the e2e clock to the
+// instant the previous stage asked for, and starts Weaver again.
+func restartWeaverWithClockWhileStopped() error {
+	if err := stopWeaverReleaseService(context.Background()); err != nil {
+		return fmt.Errorf("stop Weaver: %w", err)
+	}
+	move := containerengine.Command(dockerComposeArgs(
+		"run", "--rm", "--no-deps", "--entrypoint", "/bin/sh", "weaver", "-c", weaverClockWhileStoppedScript,
+	)...)
+	move.Dir = e2eDir()
+	move.Env = os.Environ()
+	if err := runExternalCommand(move, "move the Weaver e2e clock while Weaver is stopped"); err != nil {
+		return err
+	}
+	start := containerengine.Command(dockerComposeArgs("start", "weaver")...)
+	start.Dir = e2eDir()
+	if err := runExternalCommand(start, "start Weaver"); err != nil {
+		return fmt.Errorf("start Weaver: %w", err)
+	}
 	return nil
 }

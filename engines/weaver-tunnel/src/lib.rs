@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod direct;
 pub mod dns;
 pub mod egress;
+pub mod metrics;
 pub mod pipe;
 pub mod revocation;
 pub use proxy_tunnels::endpoint;
