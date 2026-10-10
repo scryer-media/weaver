@@ -195,7 +195,11 @@ pub(super) fn family() -> Family<Par2Cell> {
 
 impl Par2Cell {
     fn volumes(self) -> usize {
-        if self.structure == Structure::TwoFiles { 2 } else { VOLUMES }
+        if self.structure == Structure::TwoFiles {
+            2
+        } else {
+            VOLUMES
+        }
     }
 
     /// The article size: a whole number of slices, or that and half a slice.
@@ -247,7 +251,9 @@ impl Par2Cell {
             Structure::IndexDamaged => {
                 for file in &index {
                     for article in 0..post.files[*file].articles() {
-                        post.files[*file].wire.insert(article, Wire::Damaged(Damage::CrcWrong));
+                        post.files[*file]
+                            .wire
+                            .insert(article, Wire::Damaged(Damage::CrcWrong));
                     }
                 }
             }
@@ -303,7 +309,10 @@ impl Par2Cell {
                 // one file of the set in turn.
                 let mut pairs: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
                 for packet in moved {
-                    pairs.entry(packet[64..80].to_vec()).or_default().extend(packet);
+                    pairs
+                        .entry(packet[64..80].to_vec())
+                        .or_default()
+                        .extend(packet);
                 }
                 let files = set.len();
                 for (at, (_, packets)) in pairs.into_iter().enumerate() {
@@ -333,7 +342,8 @@ impl Par2Cell {
                 }
             }
             Structure::Creator => {
-                let creator = par2_packet(&id, par2_type::CREATOR, CREATORS[self.creator].as_bytes());
+                let creator =
+                    par2_packet(&id, par2_type::CREATOR, CREATORS[self.creator].as_bytes());
                 for (_, bytes) in &mut set {
                     let mut rebuilt = Vec::new();
                     let mut replaced = false;
@@ -434,14 +444,13 @@ impl Cell for Par2Cell {
 /// The defects each cell and profile is held open for. Every one blocks a
 /// release: these are PAR2 rows.
 fn open_defect(cell: Par2Cell, profile: ExtractionProfile) -> Option<Defect> {
-    if cell.structure == Structure::IndexDamaged && cell.margin != Margin::OneShort {
-        return Some(Defect::Diverges(INDEX_DAMAGED_STRANDS_PROBED_VOLUMES));
-    }
     if cell.container == Container::Rar5EncryptedHeaders
         && profile == ExtractionProfile::DirectStore
         && cell.margin != Margin::OneShort
     {
-        return Some(Defect::Diverges(ENCRYPTED_HEADERS_REPAIRED_SET_HAS_NO_VOLUMES));
+        return Some(Defect::Diverges(
+            ENCRYPTED_HEADERS_REPAIRED_SET_HAS_NO_VOLUMES,
+        ));
     }
     None
 }
@@ -450,15 +459,33 @@ fn open_defect(cell: Par2Cell, profile: ExtractionProfile) -> Option<Defect> {
 /// virtual; extraction then finds no volume on disk and fails the job.
 const ENCRYPTED_HEADERS_REPAIRED_SET_HAS_NO_VOLUMES: &str = "encrypted headers: after an in-place PAR2 repair of a direct set, extraction fails with no on-disk RAR volumes";
 
-/// With every index article damaged, the recovery volumes probed by prefix
-/// for metadata are read back as volumes that cannot complete and are never
-/// promoted, so the job fails short of recovery it was posted with.
-const INDEX_DAMAGED_STRANDS_PROBED_VOLUMES: &str = "index damaged: prefix-probed recovery volumes are never promoted; the job fails with enough recovery posted";
-
 macro_rules! par2_smokes {
     ($($name:ident $slice:literal $redundancy:ident $margin:ident $band:ident $alignment:ident $pattern:ident $structure:ident $container:ident;)+) => {
         mod par2_realism_smoke {
             use super::*;
+            #[tokio::test]
+            async fn index_absent_restart_fetches_remaining_recovery() {
+                run_cell(
+                    Par2Cell {
+                        slice: 5240,
+                        redundancy: Redundancy::Ten,
+                        margin: Margin::With,
+                        band: Band::Hundreds,
+                        alignment: Alignment::Aligned,
+                        pattern: Pattern::MemberAbsent,
+                        structure: Structure::IndexAbsent,
+                        container: Container::SevenZip,
+                        creator: 2,
+                    },
+                    ExtractionProfile::DirectStore,
+                    vec![(941713, (vec![(0, 0), (0, 1), (0, 1)], Interruption::Combined {
+                        mask: 12,
+                        index_first: false,
+                        action: BoundaryAction::Restart,
+                        at: 3,
+                    }))],
+                ).await;
+            }
             $(
                 #[tokio::test]
                 async fn $name() {
