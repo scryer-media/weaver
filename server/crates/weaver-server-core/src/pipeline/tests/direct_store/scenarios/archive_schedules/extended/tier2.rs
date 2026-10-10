@@ -43,8 +43,6 @@ pub(super) enum Defect {
     /// The cases run, and at least one must still miss the ruling: once none
     /// does, the entry is stale and the campaign says so.
     Diverges(&'static str),
-    /// The job never settles, so the cases are not run at all.
-    Hangs(&'static str),
 }
 
 /// Which pool of schedules a family samples.
@@ -124,10 +122,6 @@ pub(super) struct Built {
 /// verdict, or to its defect where the cell is held open.
 pub(super) async fn run_cell<C: Cell>(cell: C, profile: ExtractionProfile, cases: Vec<(usize, Schedule)>) {
     let defect = cell.defect(profile);
-    if let Some(Defect::Hangs(why)) = defect {
-        eprintln!("{cell:?} profile={profile:?} held open, not run: {why}");
-        return;
-    }
     let mut built: BTreeMap<(u8, bool), Built> = BTreeMap::new();
     let mut diverged = 0;
     for (case, (order, interruption)) in cases {

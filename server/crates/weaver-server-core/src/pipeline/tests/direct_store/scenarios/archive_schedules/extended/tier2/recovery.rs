@@ -239,7 +239,28 @@ pub(in super::super) fn par2_set(
     }
     let creator = Par2Creator::new(options);
     let created = creator.create(&creator.plan().expect("a PAR2 plan over the fixture")).expect("a PAR2 set over the fixture");
-    read_outputs(&created.output_paths)
+    let mut files = read_outputs(&created.output_paths);
+    // Exact zero-row posts still need an independent metadata carrier when
+    // the index is damaged or absent. Duplicate only critical packets: this
+    // preserves zero recovery power instead of silently widening the margin.
+    if recovery == 0 {
+        let metadata = files.first().expect("the creator emits an index").1.clone();
+        files.push(("silver.horizon.vol00+00.par2".to_string(), metadata));
+    }
+    files
+}
+
+#[test]
+fn zero_row_par2_keeps_metadata_redundancy_without_repair_power() {
+    let files = par2_set(&[("payload.bin".to_string(), vec![7; 2048])], 512, 0, Par2Volumes::Uniform);
+    assert_eq!(files.len(), 2);
+    for (_, bytes) in &files {
+        assert!(recovery_packets(bytes).is_empty());
+        let packets = par2_packets(bytes);
+        for kind in [par2_type::MAIN, par2_type::FILE_DESC, par2_type::IFSC] {
+            assert!(packets.iter().any(|packet| &packet.kind == kind));
+        }
+    }
 }
 
 /// A PAR3 set over `sources`: the index first, then its recovery volumes.

@@ -451,6 +451,7 @@ macro_rules! damage_smokes {
 }
 
 damage_smokes! {
+    truncated_index_exact Truncated RecoveryIndex MostOfOne Recovery::Par2(Margin::Exact), Rar5;
     recomputed_mid_volume_par2 Recomputed MidVolume Two Recovery::Par2(Margin::With), Rar5;
     truncated_first_head_exact Truncated FirstVolumeHead TwelveAcrossThree Recovery::Par2(Margin::Exact), Rar5Encrypted;
     crc_wrong_straddle_unprotected CrcWrong SliceStraddle Two Recovery::None, Rar4;
