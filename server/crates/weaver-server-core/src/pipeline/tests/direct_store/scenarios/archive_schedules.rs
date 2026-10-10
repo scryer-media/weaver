@@ -46,6 +46,7 @@ fn enable_schedule_trace() {
 }
 
 mod extended;
+mod grouping;
 
 pub(super) fn arrival_orders() -> Vec<Vec<(u32, u32)>> {
     fn permute(at: usize, items: &mut [(u32, u32)], output: &mut Vec<Vec<(u32, u32)>>) {
@@ -884,7 +885,9 @@ async fn submit_schedule_recovery(
             )
             .await;
         }
-        RecoveryFormat::Embedded => unreachable!("an embedded set posts no recovery file"),
+        RecoveryFormat::Embedded | RecoveryFormat::Absent => {
+            unreachable!("an embedded or absent set posts no recovery file")
+        }
     }
 }
 
@@ -914,6 +917,9 @@ pub(super) enum RecoveryFormat {
     Par3,
     /// The volumes carry their own recovery set and nothing else is posted.
     Embedded,
+    /// Nothing is posted besides the volumes: no index names them and no
+    /// recovery block can mend a loss.
+    Absent,
 }
 
 /// Who a schedule's demote action claims, and why.
@@ -953,6 +959,16 @@ impl DemotionChoice {
 pub(super) struct ScheduleOptions {
     pub recovery: RecoveryFormat,
     pub demotion: DemotionChoice,
+    /// The recovery index arrives after every volume article, whatever the
+    /// schedule's loss would otherwise lead with: too late to name a volume
+    /// before its bytes land.
+    pub index_last: bool,
+    /// The recovery index arrives ahead of every volume article, whatever the
+    /// schedule's loss would otherwise lead with.
+    pub index_first: bool,
+    /// An `.sfv` listing the described names (the posted ones when nothing is
+    /// described) is posted too, and arrives where the index would.
+    pub sfv: bool,
 }
 
 impl ScheduleOptions {
@@ -960,6 +976,9 @@ impl ScheduleOptions {
     pub(super) const MATRIX: Self = Self {
         recovery: RecoveryFormat::Par2,
         demotion: DemotionChoice::Scheduled,
+        index_last: false,
+        index_first: false,
+        sfv: false,
     };
 }
 
@@ -1042,8 +1061,12 @@ pub(super) async fn run_schedule_with(
     let job = JobId(42200);
     let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
     let loss = interruption.loss();
-    let index_first = loss.map_or(described.is_some(), |(_, first)| first);
-    let recovery = if options.recovery == RecoveryFormat::Embedded {
+    let index_first = options.index_first
+        || (!options.index_last && loss.map_or(described.is_some(), |(_, first)| first));
+    let mut recovery = if matches!(
+        options.recovery,
+        RecoveryFormat::Embedded | RecoveryFormat::Absent
+    ) {
         Vec::new()
     } else if loss.is_some() || described.is_some() {
         // Keep several repair blocks per article even for larger compressed
@@ -1105,11 +1128,32 @@ pub(super) async fn run_schedule_with(
                     })
                     .collect()
             }
-            RecoveryFormat::Embedded => unreachable!("handled above"),
+            RecoveryFormat::Embedded | RecoveryFormat::Absent => unreachable!("handled above"),
         }
     } else {
         Vec::new()
     };
+    if options.sfv {
+        // A listing checks content; it carries no recovery block and, posted
+        // alone, it arrives where an index would.
+        let listing: String = volumes
+            .iter()
+            .enumerate()
+            .map(|(index, (name, bytes))| {
+                let name = described.map_or(name.as_str(), |names| names[index].as_str());
+                format!("{name} {:08x}\n", checksum::crc32(bytes))
+            })
+            .collect();
+        let carrier = ("silver.horizon.sfv".to_string(), listing.into_bytes());
+        let index = append_single_article_files(&mut spec, std::slice::from_ref(&carrier))[0];
+        recovery.push(ScheduleRecovery {
+            index,
+            name: carrier.0,
+            bytes: carrier.1,
+            // One whole file in one article, submitted as a PAR2 file is.
+            format: RecoveryFormat::Par2,
+        });
+    }
     insert_active_job(&mut pipeline, job, spec.clone()).await;
     let mut trace = vec![];
     if let Some(index) = recovery.first()
@@ -1335,6 +1379,10 @@ pub(super) async fn run_schedule_with(
                     ) {
                         break;
                     }
+                    if let Some(carrier) = recovery.iter().find(|carrier| carrier.index == file) {
+                        submit_schedule_recovery(&mut pipeline, job, carrier, article).await;
+                        continue;
+                    }
                     dispatch_and_submit(&mut pipeline, job, volumes, file, article, articles(file))
                         .await;
                 }
@@ -1556,44 +1604,473 @@ enum Format {
     /// names, as an obfuscated post's does, and the set is admitted by them.
     Rar5Obfuscated,
     Rar4Obfuscated,
+    // The rest take that crutch away: nothing in a volume's name, and nothing
+    // a recovery set says in time, groups the volumes or orders them. Only
+    // the archive headers can.
+    /// 32-hex extensionless volumes and nothing else posted: no index names
+    /// them and nothing can mend a loss.
+    Rar5HexBare,
+    Rar4HexBare,
+    /// The recovery set describes the volumes under the same hex names they
+    /// are posted under, so binding them to it changes nothing.
+    Rar5HexSelfDescribed,
+    Rar4HexSelfDescribed,
+    /// The recovery set carries the real names but arrives after every
+    /// volume article, too late to name a volume before its bytes land.
+    Rar5HexLateIndex,
+    Rar4HexLateIndex,
+    /// A hex stem with numeric extensions that misstate the order: the first
+    /// volume is `.002` and the second `.001`.
+    Rar5HexMisnumbered,
+    Rar4HexMisnumbered,
+    /// A hex stem whose `.rar` and `.r00` are swapped: the first volume is
+    /// the `.r00`.
+    Rar5HexSwappedRar,
+    Rar4HexSwappedRar,
+    /// Four volumes, each under an unrelated hex name with no shared stem,
+    /// in an order their names do not sort to.
+    Rar5HexScattered,
+    Rar4HexScattered,
+    /// A single-volume archive under a hex name.
+    Rar5HexSingle,
+    Rar4HexSingle,
 }
 
 impl Format {
     fn volume_count(self) -> usize {
         match self {
-            Self::Rar4FourVolumes | Self::Rar5FourVolumes | Self::Rar4EncryptedFourVolumes => 4,
+            Self::Rar4FourVolumes
+            | Self::Rar5FourVolumes
+            | Self::Rar4EncryptedFourVolumes
+            | Self::Rar5HexScattered
+            | Self::Rar4HexScattered => 4,
+            Self::Rar5HexSingle | Self::Rar4HexSingle => 1,
             _ => 2,
         }
     }
 
-    fn route(self) -> Route {
+    /// A layout whose volume names carry nothing the pipeline can group or
+    /// order them by, so the archive headers have to.
+    fn name_blind(self) -> bool {
+        matches!(
+            self,
+            Self::Rar5HexBare
+                | Self::Rar4HexBare
+                | Self::Rar5HexSelfDescribed
+                | Self::Rar4HexSelfDescribed
+                | Self::Rar5HexLateIndex
+                | Self::Rar4HexLateIndex
+                | Self::Rar5HexMisnumbered
+                | Self::Rar4HexMisnumbered
+                | Self::Rar5HexSwappedRar
+                | Self::Rar4HexSwappedRar
+                | Self::Rar5HexScattered
+                | Self::Rar4HexScattered
+                | Self::Rar5HexSingle
+                | Self::Rar4HexSingle
+        )
+    }
+
+    fn options(self) -> ScheduleOptions {
         match self {
-            Self::Rar4
-            | Self::Rar5
-            | Self::Rar4FourVolumes
-            | Self::Rar5FourVolumes
-            | Self::Rar4EncryptedFourVolumes
-            | Self::Rar4Encrypted
-            | Self::Rar4Unsalted
-            | Self::Rar5Encrypted
-            | Self::Rar5KeyedChecksum
-            | Self::Rar5EncryptedHeaders
-            | Self::QuickOpen => Route::DIRECT,
-            // Slots 0 and 2 are the two volumes' offset-zero articles.
-            Self::Rar5Obfuscated | Self::Rar4Obfuscated => Route {
+            Self::Rar5HexBare | Self::Rar4HexBare => ScheduleOptions {
+                recovery: RecoveryFormat::Absent,
+                ..ScheduleOptions::MATRIX
+            },
+            Self::Rar5HexLateIndex | Self::Rar4HexLateIndex => ScheduleOptions {
+                index_last: true,
+                ..ScheduleOptions::MATRIX
+            },
+            _ => ScheduleOptions::MATRIX,
+        }
+    }
+
+    /// The names the volumes are posted under, given their real ones.
+    fn posted_names(self, volumes: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
+        let stem = "5f0c9e2ab1d74c6e8a3f1b0d9c2e7a41";
+        match self {
+            Self::Rar5Obfuscated
+            | Self::Rar4Obfuscated
+            | Self::Rar5HexBare
+            | Self::Rar4HexBare
+            | Self::Rar5HexSelfDescribed
+            | Self::Rar4HexSelfDescribed
+            | Self::Rar5HexLateIndex
+            | Self::Rar4HexLateIndex => obfuscate_volumes(&volumes),
+            Self::Rar5HexMisnumbered | Self::Rar4HexMisnumbered => volumes
+                .into_iter()
+                .zip([".002", ".001"])
+                .map(|((_, bytes), suffix)| (format!("{stem}{suffix}"), bytes))
+                .collect(),
+            Self::Rar5HexSwappedRar | Self::Rar4HexSwappedRar => volumes
+                .into_iter()
+                .zip([".r00", ".rar"])
+                .map(|((_, bytes), suffix)| (format!("{stem}{suffix}"), bytes))
+                .collect(),
+            Self::Rar5HexScattered | Self::Rar4HexScattered => volumes
+                .into_iter()
+                .zip([
+                    "e93a07c1d25b4f68a0c3e1f7b9d24c85",
+                    "1b7f3d9e05a24c6f8e1d0b3a7c9f2e64",
+                    "c40e8b2f6a1d4973b5e0f2c8d16a9b37",
+                    "7a2c5e9f0b3d4e81a6f9c2b07d4e1f58",
+                ])
+                .map(|((_, bytes), name)| (name.to_string(), bytes))
+                .collect(),
+            Self::Rar5HexSingle | Self::Rar4HexSingle => volumes
+                .into_iter()
+                .map(|(_, bytes)| (stem.to_string(), bytes))
+                .collect(),
+            _ => volumes,
+        }
+    }
+
+    /// The grouping cell this layout is, whose ruling gives its route.
+    fn cell(self) -> grouping::Cell {
+        use grouping::{Binding, Container, Naming};
+        let (container, naming, binding) = match self {
+            Self::Rar4 => (Container::Rar4, Naming::Conventional, Binding::LegacyOnLoss),
+            Self::Rar5 => (Container::Rar5, Naming::Conventional, Binding::LegacyOnLoss),
+            Self::Rar4Encrypted => (
+                Container::Rar4Encrypted,
+                Naming::Conventional,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar4Unsalted => (
+                Container::Rar4Unsalted,
+                Naming::Conventional,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar5Encrypted => (
+                Container::Rar5Encrypted,
+                Naming::Conventional,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar5KeyedChecksum => (
+                Container::Rar5KeyedChecksum,
+                Naming::Conventional,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar5EncryptedHeaders => (
+                Container::Rar5EncryptedHeaders,
+                Naming::Conventional,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar5UncheckedHeaders => (
+                Container::Rar5UncheckedHeaders,
+                Naming::Conventional,
+                Binding::LegacyOnLoss,
+            ),
+            Self::QuickOpen => (
+                Container::QuickOpen,
+                Naming::Conventional,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Blake2 => (Container::Blake2, Naming::Conventional, Binding::LegacyOnLoss),
+            Self::Rar4FourVolumes => (
+                Container::Rar4,
+                Naming::ConventionalFour,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar5FourVolumes => (
+                Container::Rar5,
+                Naming::ConventionalFour,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar4EncryptedFourVolumes => (
+                Container::Rar4Encrypted,
+                Naming::ConventionalFour,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar5Obfuscated => (Container::Rar5, Naming::HexBare, Binding::LegacyReal),
+            Self::Rar4Obfuscated => (Container::Rar4, Naming::HexBare, Binding::LegacyReal),
+            Self::Rar5HexBare => (Container::Rar5, Naming::HexBare, Binding::Nothing),
+            Self::Rar4HexBare => (Container::Rar4, Naming::HexBare, Binding::Nothing),
+            Self::Rar5HexSelfDescribed => (Container::Rar5, Naming::HexBare, Binding::Par2Posted),
+            Self::Rar4HexSelfDescribed => (Container::Rar4, Naming::HexBare, Binding::Par2Posted),
+            Self::Rar5HexLateIndex => (Container::Rar5, Naming::HexBare, Binding::Par2RealLast),
+            Self::Rar4HexLateIndex => (Container::Rar4, Naming::HexBare, Binding::Par2RealLast),
+            Self::Rar5HexMisnumbered => (
+                Container::Rar5,
+                Naming::HexMisnumbered,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar4HexMisnumbered => (
+                Container::Rar4,
+                Naming::HexMisnumbered,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar5HexSwappedRar => (
+                Container::Rar5,
+                Naming::HexSwappedRar,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar4HexSwappedRar => (
+                Container::Rar4,
+                Naming::HexSwappedRar,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar5HexScattered => (
+                Container::Rar5,
+                Naming::HexScattered,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar4HexScattered => (
+                Container::Rar4,
+                Naming::HexScattered,
+                Binding::LegacyOnLoss,
+            ),
+            Self::Rar5HexSingle => (Container::Rar5, Naming::HexSingle, Binding::LegacyOnLoss),
+            Self::Rar4HexSingle => (Container::Rar4, Naming::HexSingle, Binding::LegacyOnLoss),
+        };
+        grouping::Cell {
+            container,
+            naming,
+            binding,
+        }
+    }
+
+    /// The direct-store route the layout's grouping cell is ruled to take.
+    fn route(self) -> Route {
+        grouping::alias_route(self.cell())
+    }
+}
+
+/// Every hand-named layout keeps the route it had before it became a cell.
+#[test]
+fn hand_named_formats_alias_their_routes() {
+    fn route_by_hand(format: Format) -> Route {
+        match format {
+            Format::Rar4
+            | Format::Rar5
+            | Format::Rar4FourVolumes
+            | Format::Rar5FourVolumes
+            | Format::Rar4EncryptedFourVolumes
+            | Format::Rar4Encrypted
+            | Format::Rar4Unsalted
+            | Format::Rar5Encrypted
+            | Format::Rar5KeyedChecksum
+            | Format::Rar5EncryptedHeaders
+            | Format::QuickOpen => Route::DIRECT,
+            Format::Rar5Obfuscated => Route {
                 unnamed_loss: |mask| mask & 0b0101 != 0,
                 ..Route::DIRECT
             },
-            Self::Rar5UncheckedHeaders => {
+            // The campaign used to widen this one by hand when the index
+            // arrived last; the cell states it.
+            Format::Rar4Obfuscated => Route {
+                unnamed_loss: |mask| mask & 0b0101 != 0,
+                named_by_early_index: true,
+                ..Route::DIRECT
+            },
+            Format::Rar5HexBare
+            | Format::Rar5HexSelfDescribed
+            | Format::Rar5HexLateIndex
+            | Format::Rar5HexMisnumbered => Route {
+                unnamed_loss: |mask| mask & 0b0101 != 0,
+                ..Route::DIRECT
+            },
+            Format::Rar5HexSingle => Route {
+                unnamed_loss: |mask| mask & 0b0001 != 0,
+                ..Route::DIRECT
+            },
+            Format::Rar5HexScattered => Route {
+                unnamed_loss: |mask| mask != 0,
+                ..Route::DIRECT
+            },
+            Format::Rar5HexSwappedRar | Format::Rar4HexSwappedRar => Route::refused(|reason| {
+                matches!(
+                    reason,
+                    DemotionReason::MemberIneligible(MemberIneligibility::MalformedChain)
+                )
+            }),
+            Format::Rar4HexBare
+            | Format::Rar4HexSelfDescribed
+            | Format::Rar4HexLateIndex
+            | Format::Rar4HexMisnumbered
+            | Format::Rar4HexScattered
+            | Format::Rar4HexSingle => Route::refused(|_| false),
+            Format::Rar5UncheckedHeaders => {
                 Route::refused(|reason| matches!(reason, DemotionReason::HeaderEncryptedRefused(_)))
             }
-            Self::Blake2 => Route::refused(|reason| {
+            Format::Blake2 => Route::refused(|reason| {
                 matches!(
                     reason,
                     DemotionReason::MemberIneligible(MemberIneligibility::Blake2OnlyNoCrc32)
                 )
             }),
         }
+    }
+    let reasons = [
+        DemotionReason::HoldsBudgetExceeded,
+        DemotionReason::VolumeCrcMismatch,
+        DemotionReason::IdentityRosterUnfillable,
+        DemotionReason::Par2Damaged,
+        DemotionReason::MemberIneligible(MemberIneligibility::Blake2OnlyNoCrc32),
+        DemotionReason::MemberIneligible(MemberIneligibility::MalformedChain),
+        DemotionReason::SevenZip(SevenZipRefusal::Coder),
+    ];
+    for format in [
+        Format::Rar4,
+        Format::Rar5,
+        Format::Rar4Encrypted,
+        Format::Rar4Unsalted,
+        Format::Rar5Encrypted,
+        Format::Rar5KeyedChecksum,
+        Format::Rar5EncryptedHeaders,
+        Format::Rar5UncheckedHeaders,
+        Format::QuickOpen,
+        Format::Blake2,
+        Format::Rar4FourVolumes,
+        Format::Rar5FourVolumes,
+        Format::Rar4EncryptedFourVolumes,
+        Format::Rar5Obfuscated,
+        Format::Rar4Obfuscated,
+        Format::Rar5HexBare,
+        Format::Rar4HexBare,
+        Format::Rar5HexSelfDescribed,
+        Format::Rar4HexSelfDescribed,
+        Format::Rar5HexLateIndex,
+        Format::Rar4HexLateIndex,
+        Format::Rar5HexMisnumbered,
+        Format::Rar4HexMisnumbered,
+        Format::Rar5HexSwappedRar,
+        Format::Rar4HexSwappedRar,
+        Format::Rar5HexScattered,
+        Format::Rar4HexScattered,
+        Format::Rar5HexSingle,
+        Format::Rar4HexSingle,
+    ] {
+        let (cell, hand) = (format.route(), route_by_hand(format));
+        assert_eq!(
+            (cell.direct, cell.sets, cell.named_by_early_index),
+            (hand.direct, hand.sets, hand.named_by_early_index),
+            "{format:?}"
+        );
+        for mask in 0..16 {
+            assert_eq!((cell.unmapped_loss)(mask), (hand.unmapped_loss)(mask), "{format:?}");
+            assert_eq!((cell.unnamed_loss)(mask), (hand.unnamed_loss)(mask), "{format:?}");
+        }
+        for reason in reasons {
+            assert_eq!(
+                (cell.shape_demotion)(reason),
+                (hand.shape_demotion)(reason),
+                "{format:?} {reason:?}"
+            );
+        }
+        // A name-blind layout is a hex-named cell with no real names in time.
+        let cell = format.cell();
+        assert_eq!(
+            format.name_blind(),
+            !matches!(
+                cell.naming,
+                grouping::Naming::Conventional | grouping::Naming::ConventionalFour
+            ) && cell.binding != grouping::Binding::LegacyReal,
+            "{format:?}"
+        );
+    }
+}
+
+/// The generator emits a campaign for exactly the cells the ruling allows.
+#[test]
+fn grouping_generator_covers_every_possible_cell() {
+    grouping::assert_generated(GENERATED_CELLS);
+}
+
+grouping::grouping_cells! {
+    campaign rar4 Rar4 {
+        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        reposted Reposted [par2_posted Par2Posted nothing Nothing]
+        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+    }
+    smoke rar5 Rar5 {
+        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        reposted Reposted [par2_posted Par2Posted nothing Nothing]
+        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+    }
+    campaign rar5_encrypted Rar5Encrypted {
+        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        reposted Reposted [par2_posted Par2Posted nothing Nothing]
+        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+    }
+    campaign rar5_encrypted_headers Rar5EncryptedHeaders {
+        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        reposted Reposted [par2_posted Par2Posted nothing Nothing]
+        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+    }
+    smoke seven_zip SevenZip {
+        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        reposted Reposted [par2_posted Par2Posted nothing Nothing]
+        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+        bare_first_part BareFirstPart [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+    }
+    campaign seven_zip_solid SevenZipSolid {
+        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_numbered_gap HexNumberedGap [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        reposted Reposted [par2_posted Par2Posted nothing Nothing]
+        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+        bare_first_part BareFirstPart [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
     }
 }
 
@@ -1647,7 +2124,12 @@ async fn slot_campaign(
         // A described volume is bound by the fingerprint of its first 16 KiB,
         // which its offset-zero article has to cover whole, as every real
         // article does. Two articles a volume puts that at 32 KiB a volume.
-        Format::Rar5Obfuscated | Format::Rar4Obfuscated => 70_001,
+        Format::Rar5Obfuscated
+        | Format::Rar4Obfuscated
+        | Format::Rar5HexSelfDescribed
+        | Format::Rar4HexSelfDescribed
+        | Format::Rar5HexLateIndex
+        | Format::Rar4HexLateIndex => 70_001,
         _ => 6001,
     };
     let payload: Vec<u8> = (0..length)
@@ -1655,13 +2137,35 @@ async fn slot_campaign(
         .collect();
     let count = format.volume_count();
     let volumes = match format {
-        Format::Rar4 | Format::Rar4FourVolumes => {
-            single_member_rar4_store_set(name, &payload, count)
+        Format::Rar4
+        | Format::Rar4FourVolumes
+        | Format::Rar4Obfuscated
+        | Format::Rar4HexBare
+        | Format::Rar4HexSelfDescribed
+        | Format::Rar4HexLateIndex
+        | Format::Rar4HexMisnumbered
+        | Format::Rar4HexSwappedRar
+        | Format::Rar4HexSingle => {
+            format.posted_names(single_member_rar4_store_set(name, &payload, count))
         }
-        Format::Rar5 | Format::Rar5FourVolumes => single_member_store_set(name, &payload, count),
-        Format::Rar5Obfuscated => obfuscate_volumes(&single_member_store_set(name, &payload, 2)),
-        Format::Rar4Obfuscated => {
-            obfuscate_volumes(&single_member_rar4_store_set(name, &payload, 2))
+        // The two middle volumes of an old-numbering set both open on the
+        // tail of the one member and end on more of it, so nothing in their
+        // headers says which comes first. A numbered set states it, as every
+        // RAR 3.x and later writer does.
+        Format::Rar4HexScattered => {
+            format.posted_names(single_member_rar4_store_set_numbered(name, &payload, count))
+        }
+        Format::Rar5
+        | Format::Rar5FourVolumes
+        | Format::Rar5Obfuscated
+        | Format::Rar5HexBare
+        | Format::Rar5HexSelfDescribed
+        | Format::Rar5HexLateIndex
+        | Format::Rar5HexMisnumbered
+        | Format::Rar5HexSwappedRar
+        | Format::Rar5HexScattered
+        | Format::Rar5HexSingle => {
+            format.posted_names(single_member_store_set(name, &payload, count))
         }
         Format::Rar4Encrypted | Format::Rar4EncryptedFourVolumes => {
             encrypted_rar4_store_set(name, &payload, count, password, Some(TEST_RAR4_SALT))
@@ -1707,8 +2211,14 @@ async fn slot_campaign(
         assert_eq!(extracted, payload);
     }
     let described = match format {
-        Format::Rar5Obfuscated => Some(single_member_store_set(name, &payload, 2)),
-        Format::Rar4Obfuscated => Some(single_member_rar4_store_set(name, &payload, 2)),
+        Format::Rar5Obfuscated | Format::Rar5HexLateIndex => {
+            Some(single_member_store_set(name, &payload, 2))
+        }
+        Format::Rar4Obfuscated | Format::Rar4HexLateIndex => {
+            Some(single_member_rar4_store_set(name, &payload, 2))
+        }
+        // Described, but under the very names it is posted under.
+        Format::Rar5HexSelfDescribed | Format::Rar4HexSelfDescribed => Some(volumes.clone()),
         _ => None,
     }
     .map(|volumes| {
@@ -1737,7 +2247,8 @@ async fn slot_campaign(
         }
     }
     spec.password = encrypted.then(|| password.to_string());
-    let baseline = run_described_schedule(
+    let baseline = run_schedule_with(
+        format.options(),
         ExtractionProfile::Conventional,
         spec.clone(),
         &volumes,
@@ -1766,7 +2277,8 @@ async fn slot_campaign(
         eprintln!(
             "wrong password {format:?} profile={profile:?} order={order:?} interruption={interruption:?}"
         );
-        let outcome = run_described_schedule(
+        let outcome = run_schedule_with(
+            format.options(),
             profile,
             wrong,
             &volumes,
@@ -1796,7 +2308,8 @@ async fn slot_campaign(
         eprintln!(
             "{format:?} profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
         );
-        let mut actual = run_described_schedule(
+        let mut actual = run_schedule_with(
+            format.options(),
             profile,
             spec.clone(),
             &volumes,
@@ -1809,18 +2322,17 @@ async fn slot_campaign(
         if known_defect(format, &order, interruption, &mut actual) {
             continue;
         }
-        if interruption.fails() {
+        // With nothing posted to repair from, any loss is beyond the job.
+        let unrepairable = format.options().recovery == RecoveryFormat::Absent
+            && interruption.loss().is_some_and(|(mask, _)| mask != 0);
+        if interruption.fails() || unrepairable {
             profile.assert_rejected(&actual, &[name]);
             continue;
         }
-        let mut route = format.route();
-        if matches!(format, Format::Rar4Obfuscated) {
-            // A RAR4 volume says nothing of its set in its own headers, so a
-            // recovery set that arrives last finds every volume already landed.
-            if interruption.loss().is_some_and(|(_, first)| !first) {
-                route.unnamed_loss = |_| true;
-            }
-        }
+        // A RAR4 volume says nothing of its set in its own headers, so a
+        // recovery set that arrives last finds every volume already landed:
+        // the cell's route states that as `named_by_early_index`.
+        let route = format.route();
         assert_eq!(
             actual.status,
             Some(JobStatus::Complete),
@@ -1839,10 +2351,7 @@ async fn slot_campaign(
             }
         }
         if profile == ExtractionProfile::DirectStore && matches!(interruption, Interruption::None) {
-            let expected = usize::from(!matches!(
-                format,
-                Format::Rar5UncheckedHeaders | Format::Blake2
-            ));
+            let expected = usize::from(format.route().direct);
             assert_eq!(
                 actual.finalized, expected,
                 "{format:?} case={case} order={order:?}: {:?}",
@@ -1919,6 +2428,62 @@ async fn rar4_encrypted_four_volume_arrival_schedules() {
 #[tokio::test]
 async fn rar5_obfuscated_arrival_schedules() {
     campaign(Format::Rar5Obfuscated, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar5_hex_bare_arrival_schedules() {
+    campaign(Format::Rar5HexBare, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar4_hex_bare_arrival_schedules() {
+    campaign(Format::Rar4HexBare, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar5_hex_self_described_arrival_schedules() {
+    campaign(Format::Rar5HexSelfDescribed, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar4_hex_self_described_arrival_schedules() {
+    campaign(Format::Rar4HexSelfDescribed, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar5_hex_late_index_arrival_schedules() {
+    campaign(Format::Rar5HexLateIndex, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar4_hex_late_index_arrival_schedules() {
+    campaign(Format::Rar4HexLateIndex, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar5_hex_misnumbered_arrival_schedules() {
+    campaign(Format::Rar5HexMisnumbered, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar4_hex_misnumbered_arrival_schedules() {
+    campaign(Format::Rar4HexMisnumbered, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar5_hex_swapped_rar_arrival_schedules() {
+    campaign(Format::Rar5HexSwappedRar, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar4_hex_swapped_rar_arrival_schedules() {
+    campaign(Format::Rar4HexSwappedRar, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar5_hex_scattered_arrival_schedules() {
+    campaign(Format::Rar5HexScattered, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar4_hex_scattered_arrival_schedules() {
+    campaign(Format::Rar4HexScattered, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar5_hex_single_arrival_schedules() {
+    campaign(Format::Rar5HexSingle, Selection::Smoke).await;
+}
+#[tokio::test]
+async fn rar4_hex_single_arrival_schedules() {
+    campaign(Format::Rar4HexSingle, Selection::Smoke).await;
 }
 
 /// Two single-volume stored sets in one job, two articles each. A demotion,

@@ -9,13 +9,13 @@ use super::*;
 
 mod embedded_par3;
 mod obfuscated_split;
-mod schedules;
+pub(super) mod schedules;
 
 use sevenz_turbo::encoder_options::AesEncoderOptions;
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
 
 /// One entry of a fixture archive.
-struct Entry {
+pub(super) struct Entry {
     name: &'static str,
     /// `None` for an entry the archive names but stores no bytes for. Such an
     /// entry has no stream at all — a zero-length stream is a different thing,
@@ -28,7 +28,7 @@ struct Entry {
 }
 
 impl Entry {
-    fn file(name: &'static str, bytes: Vec<u8>) -> Self {
+    pub(super) fn file(name: &'static str, bytes: Vec<u8>) -> Self {
         Self {
             name,
             bytes: Some(bytes),
@@ -70,7 +70,7 @@ impl Entry {
 
 /// Deterministic member payload: compressible enough that a non-Copy fixture
 /// really does shrink, and varied enough that a misrouted byte shows up.
-fn payload(seed: u8, len: usize) -> Vec<u8> {
+pub(super) fn payload(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| {
             let index = index as u64;
@@ -87,7 +87,7 @@ fn build_7z(entries: &[Entry], method: EncoderMethod, password: Option<&str>) ->
     build_7z_shaped(entries, method, password, false)
 }
 
-fn build_7z_shaped(
+pub(super) fn build_7z_shaped(
     entries: &[Entry],
     method: EncoderMethod,
     password: Option<&str>,
@@ -132,7 +132,7 @@ fn build_7z_shaped(
 /// a pure byte split at a fixed size, with no per-volume header. The last
 /// volume is whatever is left, so an `archive` that does not divide evenly
 /// produces the short tail real sets have.
-fn split_volumes(archive: &[u8], count: usize) -> Vec<(String, Vec<u8>)> {
+pub(super) fn split_volumes(archive: &[u8], count: usize) -> Vec<(String, Vec<u8>)> {
     assert!(count >= 1);
     if count == 1 {
         return vec![("silver.horizon.7z".to_string(), archive.to_vec())];
@@ -158,7 +158,7 @@ fn split_volumes(archive: &[u8], count: usize) -> Vec<(String, Vec<u8>)> {
 /// and their lengths are the only way a container offset becomes a (volume,
 /// offset) pair. The test harness drives the yEnc layout from the assembly's
 /// total, so the spec is where the true length has to be put.
-fn sevenz_job_spec(volumes: &[(String, Vec<u8>)], articles: usize) -> JobSpec {
+pub(super) fn sevenz_job_spec(volumes: &[(String, Vec<u8>)], articles: usize) -> JobSpec {
     sevenz_job_spec_stating(volumes, articles, |decoded| decoded)
 }
 

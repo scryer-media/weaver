@@ -192,6 +192,9 @@ pub(super) async fn embedded_campaign(profile: ExtractionProfile, selection: Sel
     let options = ScheduleOptions {
         recovery: RecoveryFormat::Embedded,
         demotion: DemotionChoice::Scheduled,
+        index_last: false,
+        index_first: false,
+        sfv: false,
     };
     let selected = match selection {
         Selection::Smoke => smoke(),
