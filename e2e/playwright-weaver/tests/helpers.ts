@@ -494,6 +494,62 @@ async function postYencProbeArticle(
   });
 }
 
+/**
+ * Post `data` as one single-part yEnc article named `filename`, so a test can
+ * download real file content (an archive, a corrupt one) rather than zeros.
+ */
+export async function postYencFileArticle(
+  messageId: string,
+  filename: string,
+  data: Buffer,
+  host = "nntp",
+  port = 119,
+): Promise<void> {
+  const normalizedId = messageId.replace(/^<|>$/g, "");
+  const lineLength = 128;
+  const lines: Buffer[] = [];
+  let line: number[] = [];
+  const critical = new Set([0x00, 0x0a, 0x0d, 0x3d]);
+  for (const byte of data) {
+    const encoded = (byte + 42) & 0xff;
+    const atEdge = line.length === 0 || line.length >= lineLength - 1;
+    // NUL, LF, CR and "=" always; a leading "." (dot-stuffing) and a tab or
+    // space at either edge of a line, which transports may strip.
+    if (critical.has(encoded) || (line.length === 0 && encoded === 0x2e) || (atEdge && (encoded === 0x09 || encoded === 0x20))) {
+      line.push(0x3d, (encoded + 64) & 0xff);
+    } else {
+      line.push(encoded);
+    }
+    if (line.length >= lineLength) {
+      lines.push(Buffer.from(line));
+      line = [];
+    }
+  }
+  if (line.length > 0) lines.push(Buffer.from(line));
+  let crc = 0xffffffff;
+  for (const byte of data) crc = (crc >>> 8) ^ crc32Table[(crc ^ byte) & 0xff]!;
+  const crc32 = ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, "0");
+  const crlf = Buffer.from("\r\n", "latin1");
+  const article = Buffer.concat([
+    Buffer.from([
+      `Message-ID: <${normalizedId}>`,
+      "Newsgroups: alt.binaries.test",
+      `Subject: "${filename}" yEnc (1/1)`,
+      "",
+      `=ybegin line=${lineLength} size=${data.length} name=${filename}`,
+      "",
+    ].join("\r\n"), "latin1"),
+    ...lines.flatMap(encoded => [encoded, crlf]),
+    Buffer.from(`=yend size=${data.length} crc32=${crc32}\r\n.\r\n`, "latin1"),
+  ]);
+  await withNntpConnection(host, port, async (session) => {
+    expect(await session.command("AUTHINFO USER e2e-user")).toMatch(/^381 /);
+    expect(await session.command("AUTHINFO PASS e2e-pass")).toMatch(/^281 /);
+    expect(await session.command("POST")).toMatch(/^340 /);
+    expect(await session.raw(article)).toMatch(/^240 /);
+  });
+}
+
 const zeroBodyCrc32Cache = new Map<number, string>();
 const crc32Table = Array.from({ length: 256 }, (_, byte) => {
   let value = byte;
@@ -580,6 +636,8 @@ export async function submitProbeNzb(
 
 type NntpSession = {
   command(command: string): Promise<string>;
+  /** Send `bytes` as they are, then read one response line. */
+  raw(bytes: Buffer): Promise<string>;
 };
 
 async function withNntpConnection(
@@ -627,6 +685,10 @@ async function withNntpConnection(
   const session: NntpSession = {
     command: async (command) => {
       socket.write(`${command}\r\n`);
+      return nextLine();
+    },
+    raw: async (bytes) => {
+      socket.write(bytes);
       return nextLine();
     },
   };

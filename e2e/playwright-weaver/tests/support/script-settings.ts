@@ -32,6 +32,11 @@ export type ScriptSettings = {
   terminationGraceSeconds: number;
   strictSecurityRefusesExecution: boolean;
   globalScriptsRun: "ALWAYS" | "ONLY_WITHOUT_CATEGORY_SCRIPTS";
+  /** Read back and sent again on every save: the settings input clears one it omits. */
+  pythonInterpreter: string | null;
+  powershellInterpreter: string | null;
+  batchInterpreter: string | null;
+  goInterpreter: string | null;
 };
 export type ListEntry = { script: string; enabled?: boolean; timeoutSeconds?: number | null };
 export type ScriptLists = { global: ListEntry[]; categories: Array<{ category: string; entries: ListEntry[] }> };
@@ -41,15 +46,19 @@ export type ScriptTrigger = "POST_PROCESSING" | "QUEUE" | "SCAN" | "SCHEDULER" |
 export type ScriptSchedule = { days: string[]; times: string[]; runAtStartup: boolean };
 export type ScriptInstance = {
   id: string; name: string; script: string; trigger: ScriptTrigger; queueEvent: string | null;
-  /** A secret input shows the secret it links, never a value. */
-  inputs: Array<{ name: string; value: string; secret: { id: string; name: string } | null }>;
+  /** A secret input shows the secret it links, or that it is sealed, never a value. */
+  inputs: Array<{ name: string; value: string; secret: { id: string; name: string } | null; sealed: boolean }>;
   categories: string[]; enabled: boolean; blocking: boolean; timeoutSeconds: number | null; runOrder: number;
   schedule: ScriptSchedule;
+  scriptProblem: string | null; headerDrift: boolean;
 };
 export type ScriptInstanceInput = {
   name?: string; script: string; trigger: ScriptTrigger; queueEvent?: string | null;
-  /** Each input is a plain `value` or the `secretId` of a named secret. */
-  inputs?: Array<{ name: string; value?: string; secretId?: string }>;
+  /**
+   * Each input is a plain `value`, the `secretId` of a named secret, or with
+   * `secret` a value sealed into the instance.
+   */
+  inputs?: Array<{ name: string; value?: string; secretId?: string; secret?: boolean }>;
   categories?: string[]; enabled?: boolean; blocking?: boolean; timeoutSeconds?: number | null;
   /** Only a schedule job keeps one. */
   schedule?: ScriptSchedule;
@@ -57,8 +66,10 @@ export type ScriptInstanceInput = {
 
 const SETTINGS_FIELDS = `eventScriptConcurrency eventScriptTimeoutSeconds fileDownloadedEventInterval
   scriptOutputRunsPerJob scriptOutputFailedRunsPerJob
-  scriptDirectory executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution globalScriptsRun`;
-const INSTANCE_FIELDS = "id name script trigger queueEvent inputs { name value secret { id name } } categories enabled blocking timeoutSeconds runOrder schedule { days times runAtStartup }";
+  scriptDirectory executionEnabled concurrency terminationGraceSeconds strictSecurityRefusesExecution globalScriptsRun
+  pythonInterpreter powershellInterpreter batchInterpreter goInterpreter`;
+const INSTANCE_FIELDS = `id name script trigger queueEvent inputs { name value secret { id name } sealed } categories enabled blocking
+  timeoutSeconds runOrder schedule { days times runAtStartup } scriptProblem headerDrift`;
 
 /** Every saved instance, in run order. */
 export async function scriptInstances(request: APIRequestContext): Promise<ScriptInstance[]> {
@@ -218,11 +229,13 @@ export async function useScripts(
 }
 
 export type ScriptResult = {
-  outputId: string | null; outputRetained: boolean; script: string; event: string; adapter: string;
+  outputId: string | null; outputRetained: boolean; script: string; instanceId: string | null; instanceName: string | null;
+  event: string; background: boolean; adapter: string;
   status: string; exitCode: number | null; durationMs: number; outputTail: string; outputTruncated: boolean;
   errorMessage: string | null; finishedAtEpochMs: number;
 };
-const RESULT_FIELDS = "outputId outputRetained script event adapter status exitCode durationMs outputTail outputTruncated errorMessage finishedAtEpochMs";
+const RESULT_FIELDS = `outputId outputRetained script instanceId instanceName event background adapter status exitCode durationMs
+  outputTail outputTruncated errorMessage finishedAtEpochMs`;
 
 export async function scriptResults(request: APIRequestContext, jobId: number): Promise<ScriptResult[]> {
   return (await graphql<{ postProcessingResults: ScriptResult[] }>(request,

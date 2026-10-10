@@ -150,6 +150,7 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 	advancedNetworkingNoNetRawReleaseFlow(),
 	advancedNetworkingExtendedReleaseFlow(),
 	eventScriptsReleaseFlow(),
+	postProcessingScriptsReleaseFlow(),
 	schedulingReleaseFlow(),
 	schedulingDSTReleaseFlow(),
 }
