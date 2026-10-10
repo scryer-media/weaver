@@ -60,7 +60,7 @@ pub enum SecretError {
 
 fn in_use_names(usages: &[SecretUsage]) -> String {
     if usages.is_empty() {
-        return "a script instance".to_string();
+        return "a script job".to_string();
     }
     usages
         .iter()

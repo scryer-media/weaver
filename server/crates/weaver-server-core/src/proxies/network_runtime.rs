@@ -326,6 +326,14 @@ impl NetworkRuntime {
     pub fn interfaces(&self) -> InterfaceSnapshot {
         self.interfaces.snapshot()
     }
+    pub fn egress_configuration(&self, id: u32) -> Option<EgressInterface> {
+        self.configuration
+            .read()
+            .expect("network configuration")
+            .egresses
+            .get(&id)
+            .cloned()
+    }
     pub fn configuration_snapshot(
         &self,
     ) -> (Vec<EgressInterface>, Vec<ProxyProfile>, Vec<ProxyPool>) {

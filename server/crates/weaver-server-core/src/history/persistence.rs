@@ -180,6 +180,7 @@ impl Database {
             .await
         });
         if result.as_ref().is_ok_and(|changed| *changed) {
+            self.forget_script_effects(job_id);
             self.invalidate_job_history_cache(job_id);
             self.notify_script_events_changed();
         }
@@ -215,6 +216,7 @@ impl Database {
             .await
         });
         if result.as_ref().is_ok_and(|changed| *changed) {
+            self.forget_script_effects(job_id);
             self.invalidate_job_history_cache(job_id);
             self.notify_script_events_changed();
         }
@@ -230,6 +232,9 @@ impl Database {
             .await
         });
         if result.as_ref().is_ok_and(|job_ids| !job_ids.is_empty()) {
+            for id in result.as_ref().unwrap() {
+                self.forget_script_effects(id.0);
+            }
             self.clear_job_history_cache();
             self.notify_script_events_changed();
         }
@@ -249,24 +254,26 @@ impl Database {
                 |tx| {
                     Box::pin(async move {
                         let job_ids = delete_all_job_history_bundles_tx(tx).await?;
-                        let changed = job_ids.len();
-                        for job_id in job_ids {
+                        for job_id in &job_ids {
                             crate::jobs::duplicate_persistence::forget_duplicate_identity_for_history_delete_tx(
-                                tx, job_id,
+                                tx, *job_id,
                             )
                             .await?;
                         }
-                        Ok(changed)
+                        Ok(job_ids)
                     })
                 },
             )
             .await
         });
-        if result.as_ref().is_ok_and(|changed| *changed > 0) {
+        if result.as_ref().is_ok_and(|ids| !ids.is_empty()) {
+            for id in result.as_ref().unwrap() {
+                self.forget_script_effects(id.0);
+            }
             self.clear_job_history_cache();
             self.notify_script_events_changed();
         }
-        result
+        result.map(|ids| ids.len())
     }
 
     pub fn insert_integration_events(

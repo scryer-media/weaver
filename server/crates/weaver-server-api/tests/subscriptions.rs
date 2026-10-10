@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_graphql::Request;
+use async_graphql::futures_util::FutureExt;
 use common::TestHarness;
 use tokio_stream::StreamExt;
 use weaver_server_api::auth::CallerScope;
@@ -87,13 +88,11 @@ async fn idle_queue_snapshots_client_gets_nothing_until_a_job_is_added() {
             .is_empty()
     );
 
-    // The clock is paused, so this window is virtual: it lets the 2 s
-    // heartbeat fire thirty times, and none of those ticks has anything new.
-    tokio::select! {
-        biased;
-        response = stream.next() => panic!("idle client got a repeat snapshot: {response:?}"),
-        () = tokio::time::sleep(Duration::from_secs(60)) => {}
-    }
+    // Poll the stream to register its next heartbeat, drive that exact
+    // deadline, and check that it leaves no snapshot queued.
+    assert!(stream.next().now_or_never().is_none());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(stream.next().now_or_never().is_none());
 
     let job_id = h.submit_test_nzb("idle-then-added").await;
     let response = stream.next().await.expect("stream should stay open");

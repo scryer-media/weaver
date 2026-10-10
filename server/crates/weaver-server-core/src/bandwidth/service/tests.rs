@@ -71,7 +71,7 @@ fn monthly_window_rolls_forward_after_clamped_anchor() {
 #[test]
 fn bandwidth_ledger_flushes_lazily() {
     let db = crate::Database::open_in_memory().unwrap();
-    let mut runtime = BandwidthCapRuntime::default();
+    let mut runtime = BandwidthLedgerRuntime::default();
 
     let now_minute = crate::e2e_clock::unix_seconds().div_euclid(60);
     runtime.record_download_bytes(&db, 512).unwrap();
@@ -92,7 +92,7 @@ fn bandwidth_ledger_flushes_lazily() {
 #[test]
 fn bandwidth_ledger_flushes_once_the_byte_threshold_is_reached() {
     let db = crate::Database::open_in_memory().unwrap();
-    let mut runtime = BandwidthCapRuntime::default();
+    let mut runtime = BandwidthLedgerRuntime::default();
 
     let now_minute = crate::e2e_clock::unix_seconds().div_euclid(60);
     runtime
@@ -113,7 +113,7 @@ fn bandwidth_ledger_flushes_once_the_byte_threshold_is_reached() {
 
 #[test]
 fn global_pause_origin_selects_the_block_kind() {
-    let runtime = BandwidthCapRuntime::default();
+    let runtime = BandwidthLedgerRuntime::default();
 
     // A schedule-driven pause must present as Scheduled even though it shares
     // the `global_paused` flag with a manual pause; a concurrent recomputation
@@ -137,7 +137,7 @@ fn quota_metering_excludes_unmetered_ledger_rows_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("quota.db");
     let db = crate::Database::open(&path).unwrap();
-    let mut runtime = BandwidthCapRuntime::default();
+    let mut runtime = BandwidthLedgerRuntime::default();
     runtime.record_pending_usage(100, 200);
     runtime.set_metering_enabled(false);
     runtime.record_pending_usage(100, 700);

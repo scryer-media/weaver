@@ -56,7 +56,7 @@ impl QuotaWindow {
 /// when it arrived, and flushes in batches. Download quotas themselves live on
 /// each egress and server; nothing here refuses work.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BandwidthCapRuntime {
+pub(crate) struct BandwidthLedgerRuntime {
     metering_suspended: bool,
     last_pruned_bucket_epoch_minute: Option<i64>,
     pending_usage_by_minute: BTreeMap<(i64, bool), u64>,
@@ -64,7 +64,7 @@ pub(crate) struct BandwidthCapRuntime {
     pending_usage_started_at: Option<Instant>,
 }
 
-impl BandwidthCapRuntime {
+impl BandwidthLedgerRuntime {
     pub(crate) fn set_metering_enabled(&mut self, enabled: bool) {
         self.metering_suspended = !enabled;
     }
@@ -332,7 +332,7 @@ impl Pipeline {
 
     pub(crate) fn publish_download_block(&mut self) {
         let mut block = self
-            .bandwidth_cap
+            .bandwidth_ledger
             .to_download_block_state(self.global_pause());
         block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
         self.shared_state.set_download_block(block);
@@ -342,14 +342,14 @@ impl Pipeline {
         &mut self,
         payload_bytes: u64,
     ) -> Result<(), SchedulerError> {
-        self.bandwidth_cap
+        self.bandwidth_ledger
             .record_download_bytes(&self.db, payload_bytes)?;
         Ok(())
     }
 
     pub(crate) fn flush_download_bandwidth_usage(&mut self) -> Result<(), SchedulerError> {
-        self.bandwidth_cap.flush_pending_usage(&self.db)?;
-        self.bandwidth_cap.prune_if_due(&self.db)?;
+        self.bandwidth_ledger.flush_pending_usage(&self.db)?;
+        self.bandwidth_ledger.prune_if_due(&self.db)?;
         Ok(())
     }
 }

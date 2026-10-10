@@ -321,7 +321,7 @@ impl SystemQuery {
         let handle = ctx.data::<SchedulerHandle>()?;
         Ok(handle.is_globally_paused())
     }
-    /// Current global download block state (manual pause or ISP cap).
+    /// Current global download block state (manual pause or download quota).
     async fn download_block(&self, ctx: &Context<'_>) -> Result<DownloadBlock> {
         let handle = ctx.data::<SchedulerHandle>()?;
         Ok(DownloadBlock::from(&handle.get_download_block()))

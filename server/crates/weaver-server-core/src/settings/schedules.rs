@@ -6,8 +6,8 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 
 /// The row every schedule read and write takes first, so saves and the
-/// tidying a load does never interleave. Its value means nothing any more.
-const LOCK_KEY: &str = "schedule_tracks_version";
+/// tidying a load does never interleave. The value is only a lock sentinel.
+const LOCK_KEY: &str = "schedule_write_lock";
 
 impl Database {
     /// The saved schedule rules. A rule that names an egress or provider that

@@ -12,7 +12,7 @@ test-support = ["proxy-tunnels/test-support", "dep:bytes", "dep:http", "dep:h3",
 
 [dependencies]
 # Shared protocols pinned to an immutable signed version tag.
-proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", rev = "c467e8952f29940c4f07d9f57adbff981d990a88", features = ["http3"] }
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.3.0", features = ["http3"] }
 base64 = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"
@@ -25,8 +25,8 @@ if-addrs = "0.15.0"
 # Reuse the approved HTTP/3 stack for local fixtures; absent from product builds.
 bytes = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
-h3 = { git = "https://github.com/scryer-media/proxy-tunnels.git", rev = "c467e8952f29940c4f07d9f57adbff981d990a88", optional = true }
-h3-quinn = { git = "https://github.com/scryer-media/proxy-tunnels.git", rev = "c467e8952f29940c4f07d9f57adbff981d990a88", optional = true }
+h3 = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.3.0", optional = true }
+h3-quinn = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.3.0", optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"], optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"], optional = true }
@@ -35,5 +35,5 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 windows-sys = { workspace = true, features = ["Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
-proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", rev = "c467e8952f29940c4f07d9f57adbff981d990a88", features = ["http3", "test-support"] }
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.3.0", features = ["http3", "test-support"] }
 tokio = { workspace = true, features = ["test-util"] }

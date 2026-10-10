@@ -10,9 +10,9 @@ use crate::RssRuleAction;
 use crate::SchedulerHandle;
 use crate::ingest::{SubmissionOptions, submit_nzb_bytes_with_options};
 use crate::jobs::{CallerScopedIdempotency, SubmissionOrigin};
-use crate::rss::model::{FeedItem, build_submission_metadata};
+use crate::rss::model::{FeedItem, build_submission_metadata, unix_now_secs};
 #[cfg(test)]
-use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items, unix_now_secs};
+use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items};
 use crate::security::RuntimeSecurityConfig;
 use crate::settings::SharedConfig;
 use crate::{Database, RssFeedRow, RssRuleRow, RssSeenItemRow};
@@ -72,7 +72,9 @@ pub(super) struct RssServiceInner {
     pub(super) config: SharedConfig,
     pub(super) security: RuntimeSecurityConfig,
     pub(super) sync_lock: Mutex<()>,
-    pub(super) scheduled_paused: std::sync::atomic::AtomicBool,
+    pub(super) scheduled_paused: tokio::sync::watch::Sender<bool>,
+    clock_origin: tokio::time::Instant,
+    clock_epoch: i64,
     /// Full feed rows the due-sync path has loaded.
     #[cfg(test)]
     pub(super) full_feed_loads: std::sync::atomic::AtomicU64,
@@ -80,15 +82,28 @@ pub(super) struct RssServiceInner {
 
 impl RssService {
     pub fn set_scheduled_paused(&self, paused: bool) {
-        self.inner
-            .scheduled_paused
-            .store(paused, std::sync::atomic::Ordering::Release);
+        self.inner.scheduled_paused.send_if_modified(|value| {
+            if *value == paused {
+                return false;
+            }
+            *value = paused;
+            true
+        });
     }
 
     pub fn is_scheduled_paused(&self) -> bool {
-        self.inner
-            .scheduled_paused
-            .load(std::sync::atomic::Ordering::Acquire)
+        *self.inner.scheduled_paused.borrow()
+    }
+
+    pub(super) fn now(&self) -> i64 {
+        self.inner.clock_epoch.saturating_add(
+            self.inner
+                .clock_origin
+                .elapsed()
+                .as_secs()
+                .try_into()
+                .unwrap_or(i64::MAX),
+        )
     }
 
     pub fn new(handle: SchedulerHandle, config: SharedConfig, db: Database) -> Self {
@@ -113,7 +128,9 @@ impl RssService {
                 config,
                 security,
                 sync_lock: Mutex::new(()),
-                scheduled_paused: std::sync::atomic::AtomicBool::new(false),
+                scheduled_paused: tokio::sync::watch::channel(false).0,
+                clock_origin: tokio::time::Instant::now(),
+                clock_epoch: unix_now_secs(),
                 #[cfg(test)]
                 full_feed_loads: std::sync::atomic::AtomicU64::new(0),
             }),

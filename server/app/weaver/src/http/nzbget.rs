@@ -919,7 +919,6 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
     ));
     for (name, value) in &request.parameters {
         if weaver_server_core::post_processing::directives::valid_parameter_name(name)
-            && weaver_server_core::is_public_history_attribute_key(name)
             && !name.eq_ignore_ascii_case("*Unpack:Password")
         {
             metadata.retain(|(key, _)| key != name);
@@ -1364,6 +1363,12 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let (free_disk_lo, free_disk_hi) = size_parts(free_disk);
     let (article_cache_lo, article_cache_hi) = size_parts(article_cache);
     let resume_time = ctx.scheduled_resume.resume_at().await;
+    let db = ctx.db.clone();
+    let queue_script_count = tokio::task::spawn_blocking(move || db.queue_script_count())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(0);
 
     Ok(json!({
         "RemainingSizeLo": remaining_lo,
@@ -1401,7 +1406,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         "ScanPaused": scan_paused,
         "QuotaReached": quota_reached,
         "FeedActive": false,
-        "QueueScriptCount": ctx.db.queue_script_count().unwrap_or(0),
+        "QueueScriptCount": queue_script_count,
         "NewsServers": news_servers,
         "FreeDiskSpaceLo": free_disk_lo,
         "FreeDiskSpaceHi": free_disk_hi,

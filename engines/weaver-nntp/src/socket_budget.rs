@@ -347,47 +347,47 @@ impl SocketSlot {
         });
     }
 
-    pub(crate) fn reusable(&self) -> bool {
+    /// Claim whether this socket can take another article. An excess socket
+    /// transitions to closing atomically with the decision, so other lanes
+    /// count it as gone before making their own claims.
+    pub(crate) fn claim_reuse(&self) -> bool {
+        let mut state = self.budget.state.lock().expect("socket budget poisoned");
+        if self.reusable_in(&state) {
+            return true;
+        }
+        if let Some(entry) = state.entries.get_mut(&self.id) {
+            entry.phase = SocketPhase::Closing;
+        }
+        false
+    }
+
+    fn reusable_in(&self, state: &State) -> bool {
         if self.retiring() {
             return false;
         }
-        let mut state = self.budget.state.lock().expect("socket budget poisoned");
-        let Some(targets) = &state.leg_targets else {
-            return true;
-        };
         let Some(entry) = state.entries.get(&self.id) else {
             return true;
         };
         if entry.phase == SocketPhase::Closing {
             return false;
         }
+        let Some(targets) = &state.leg_targets else {
+            return true;
+        };
         let Some(leg) = entry.path.as_ref().and_then(|path| path.leg) else {
             return true;
         };
         let target = usize::from(targets.get(leg).copied().unwrap_or(0));
-        let count = state
-            .entries
-            .values()
-            .filter(|entry| {
-                entry.phase != SocketPhase::Closing
-                    && entry.path.as_ref().and_then(|path| path.leg) == Some(leg)
-            })
-            .count();
-        if target == 0 {
-            return false;
-        }
-        if count > target {
-            // This socket is the excess and goes: claim that here, under the
-            // lock, so every other lane on the leg that asks in the same
-            // instant counts it as gone and keeps its own.
-            state
+        target != 0
+            && state
                 .entries
-                .get_mut(&self.id)
-                .expect("live socket slot")
-                .phase = SocketPhase::Closing;
-            return false;
-        }
-        true
+                .values()
+                .filter(|entry| {
+                    entry.phase != SocketPhase::Closing
+                        && entry.path.as_ref().and_then(|path| path.leg) == Some(leg)
+                })
+                .count()
+                <= target
     }
 
     pub(crate) fn idle(&self, phase: SocketPhase, recall: Recall) {

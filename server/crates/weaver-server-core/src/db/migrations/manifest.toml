@@ -586,27 +586,10 @@ scope = "upgrade_only"
 
 [[migration]]
 version = 56
-description = "how each recorded script run ended, as a column to filter on"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0056_script_run_status/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0056_script_run_status/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 57
 description = "default unwanted extension list for installs that never set one"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "rust"
-hook_id = "default_unwanted_extensions_v57"
+hook_id = "default_unwanted_extensions_v56"
 scope = "upgrade_only"

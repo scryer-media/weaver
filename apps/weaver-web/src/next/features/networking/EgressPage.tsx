@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useClient } from "urql";
-import { CREATE_EGRESS, DELETE_EGRESS, TEST_EGRESS, UPDATE_EGRESS } from "@/graphql/networking";
+import { CREATE_EGRESS, DELETE_EGRESS, RESET_EGRESS_USAGE, TEST_EGRESS, UPDATE_EGRESS } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { Egress } from "@/lib/networking";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
@@ -325,9 +325,18 @@ export function EgressEditor({
         deleteLabel={t("next.networking.egress.delete")}
         extraActions={
           editing.id >= 0 ? (
-            <SecondaryButton icon="test" onClick={() => setTesting(editing)}>
-              {t("next.networking.egress.test")}
-            </SecondaryButton>
+            <>
+              <SecondaryButton disabled={busy} onClick={() => {
+                void action(RESET_EGRESS_USAGE, { id: editing.id }).then((failure) => {
+                  setError(failure ?? null);
+                });
+              }}>
+                {t("next.providers.resetUsage")}
+              </SecondaryButton>
+              <SecondaryButton icon="test" onClick={() => setTesting(editing)}>
+                {t("next.networking.egress.test")}
+              </SecondaryButton>
+            </>
           ) : null
         }
         sections={[

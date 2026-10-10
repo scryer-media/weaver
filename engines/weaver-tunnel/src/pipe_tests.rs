@@ -662,6 +662,62 @@ async fn only_a_path_failure_retires_an_idle_session() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn saturated_fallback_reports_every_capacity_release_source() {
+    use std::sync::atomic::Ordering;
+    struct Capacity {
+        available: std::sync::atomic::AtomicBool,
+        changed: Arc<Notify>,
+    }
+    #[async_trait::async_trait]
+    impl Dialer for Capacity {
+        fn has_capacity(&self) -> bool {
+            self.available.load(Ordering::Acquire)
+        }
+        async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+            Err(DialError::AtCapacity(vec![self.changed.clone()]))
+        }
+        fn budget(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn describe(&self) -> String {
+            "capacity fixture".into()
+        }
+    }
+    let first = Arc::new(Capacity {
+        available: false.into(),
+        changed: Arc::new(Notify::new()),
+    });
+    let second = Arc::new(Capacity {
+        available: false.into(),
+        changed: Arc::new(Notify::new()),
+    });
+    let ladder = Fallback::new(vec![first.clone(), second.clone()]);
+    assert!(!ladder.has_capacity());
+    let Err(DialError::AtCapacity(changes)) =
+        ladder.dial(&target("127.0.0.1:119".parse().unwrap())).await
+    else {
+        panic!("all saturated rungs must report capacity");
+    };
+    assert_eq!(changes.len(), 2);
+    assert!(Arc::ptr_eq(&changes[0], &first.changed));
+    assert!(Arc::ptr_eq(&changes[1], &second.changed));
+    for rung in [&first, &second] {
+        rung.available.store(true, Ordering::Release);
+        assert!(ladder.has_capacity());
+        rung.available.store(false, Ordering::Release);
+        assert!(!ladder.has_capacity());
+    }
+    first.available.store(true, Ordering::Release);
+    ladder.report_rung(0, Some(&DialError::Egress(io::Error::other("path down"))));
+    assert!(
+        !ladder.has_capacity(),
+        "a cooling rung cannot satisfy normal acquisition"
+    );
+    tokio::time::advance(PATH_COOLDOWN).await;
+    assert!(ladder.has_capacity());
+}
+
+#[tokio::test(start_paused = true)]
 async fn destination_failures_do_not_cool_rungs_and_path_cooldown_is_flat() {
     let ladder = Fallback::new(vec![bottom()]);
     for _ in 0..20 {

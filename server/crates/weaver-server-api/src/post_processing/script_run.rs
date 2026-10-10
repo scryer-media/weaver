@@ -1,8 +1,8 @@
 //! The API as a running script sees its own run.
 //!
-//! A script calling with the token its run was handed may read whatever the
-//! API answers, but of everything that changes something it may only ask what
-//! is here: `Mutation.scriptRun`. Every other mutation is refused to it with
+//! A script calling with its run token may read the queue, history and its
+//! own run. It may only change its run through `Mutation.scriptRun`.
+//! Other guarded queries and every other mutation are refused with
 //! `NOT_ALLOWED_FOR_SCRIPT_RUN`. What is here is the part that is about that
 //! run: the download it is for, and the things it may ask weaver to do with
 //! it. Those are the commands a script may also print after `[NZB]`, under the
@@ -10,8 +10,10 @@
 //! same code.
 
 use async_graphql::{Context, Enum, Object, Result};
+use std::path::{Component, Path, PathBuf};
 use weaver_server_core::post_processing::callbacks::{LiveScriptRun, RunAction, RunActionError};
 use weaver_server_core::post_processing::directives::{Directive, DupeMode, ScriptLogLevel};
+use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::{Database, SchedulerHandle};
 
 use super::types::ScriptKindGql;
@@ -41,6 +43,63 @@ fn refusal(error: RunActionError) -> async_graphql::Error {
         RunActionError::NotAllowed(message) => graphql_error("NOT_ALLOWED_FOR_TRIGGER", message),
         RunActionError::Refused(message) => graphql_error("REFUSED", message),
     }
+}
+
+async fn resolved_destination(path: &Path) -> std::io::Result<PathBuf> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "an absolute path without parent traversal is required",
+        ));
+    }
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match tokio::fs::canonicalize(ancestor).await {
+            Ok(mut resolved) => {
+                for name in suffix.iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if tokio::fs::symlink_metadata(ancestor).await.is_ok() {
+                    return Err(error);
+                }
+                let Some(name) = ancestor.file_name() else {
+                    return Err(error);
+                };
+                suffix.push(name.to_owned());
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn allowed_directory(ctx: &Context<'_>, path: &str) -> Result<()> {
+    let roots = {
+        let config = ctx.data::<SharedConfig>()?.read().await;
+        [config.intermediate_dir(), config.complete_dir()]
+    };
+    let destination = resolved_destination(Path::new(path))
+        .await
+        .map_err(|error| graphql_error("REFUSED", error.to_string()))?;
+    for root in roots {
+        if let Ok(root) = resolved_destination(Path::new(&root)).await
+            && destination.starts_with(root)
+        {
+            return Ok(());
+        }
+    }
+    Err(graphql_error(
+        "REFUSED",
+        "script directories must be inside a configured intermediate or complete directory",
+    ))
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Enum)]
@@ -156,7 +215,7 @@ impl ScriptRunActionsGql {
     }
 }
 
-#[Object(name = "ScriptRunActions")]
+#[Object(name = "ScriptRunActions", serial)]
 impl ScriptRunActionsGql {
     /// `[NZB] CATEGORY=`. For a scan script.
     async fn set_category(&self, ctx: &Context<'_>, category: String) -> Result<bool> {
@@ -171,11 +230,13 @@ impl ScriptRunActionsGql {
     /// `[NZB] DIRECTORY=`. For a post-processing script, and for a queue
     /// script run when a download has finished downloading.
     async fn set_directory(&self, ctx: &Context<'_>, path: String) -> Result<bool> {
+        allowed_directory(ctx, &path).await?;
         self.command(ctx, Directive::Directory(path)).await
     }
 
     /// `[NZB] FINALDIR=`. For a post-processing script.
     async fn set_final_directory(&self, ctx: &Context<'_>, path: String) -> Result<bool> {
+        allowed_directory(ctx, &path).await?;
         self.command(ctx, Directive::FinalDirectory(path)).await
     }
 

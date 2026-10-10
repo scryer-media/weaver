@@ -81,6 +81,8 @@ struct ServerPool {
 /// Multi-server NNTP connection pool.
 pub struct NntpPool {
     route_probes_started: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    probe_waits: Vec<tokio::sync::watch::Sender<(u64, Option<tokio::time::Instant>)>>,
     pools: Vec<Arc<SyncMutex<ServerPool>>>,
     configs: Vec<ServerConfig>,
     stable_ids: Vec<StableServerId>,
@@ -455,6 +457,10 @@ impl NntpPool {
 
         NntpPool {
             route_probes_started: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            probe_waits: (0..server_count)
+                .map(|_| tokio::sync::watch::channel((0, None)).0)
+                .collect(),
             pools,
             configs,
             stable_ids,
@@ -500,20 +506,38 @@ impl NntpPool {
             };
             let weak = Arc::downgrade(self);
             let stopped = self.shutdown.clone();
+            let semaphore = self.semaphores[idx].clone();
+            let mut sockets = self.socket_budgets[idx].subscribe();
+            let mut recovery = self.recovery_gates[idx].subscribe();
             dialer.runtime.spawn(async move {
                 // A leg that needs a probe changes the route's leg targets
                 // when its cooldown lapses, so the loop wakes on that change
                 // rather than on a clock. It probes at most once per change;
                 // only a probe held back by this server's own gates (auth
                 // admission, over-limit, health, permits, socket budget)
-                // retries a second later, and only while one is still needed.
+                // wakes on the gate's release or its actual retry deadline.
                 let mut retry_at: Option<tokio::time::Instant> = None;
+                let mut wait_permit = false;
+                let mut wait_sockets = false;
+                let mut wait_recovery = false;
                 let mut first = true;
                 loop {
                     if !first {
+                        #[cfg(test)]
+                        if let Some(pool) = weak.upgrade() {
+                            pool.probe_waits[idx].send_modify(|state| {
+                                state.0 += 1;
+                                state.1 = retry_at;
+                            });
+                        }
                         tokio::select! {
                             _ = stopped.cancelled() => break,
                             result = targets.changed() => if result.is_err() { break; },
+                            result = sockets.changed(), if wait_sockets => if result.is_err() { break; },
+                            result = recovery.changed(), if wait_recovery => if result.is_err() { break; },
+                            result = semaphore.clone().acquire_owned(), if wait_permit => {
+                                if result.is_err() { break; }
+                            },
                             () = async {
                                 match retry_at {
                                     Some(at) => tokio::time::sleep_until(at).await,
@@ -524,6 +548,11 @@ impl NntpPool {
                     }
                     first = false;
                     retry_at = None;
+                    wait_permit = false;
+                    wait_sockets = false;
+                    wait_recovery = false;
+                    sockets.borrow_and_update();
+                    recovery.borrow_and_update();
                     let Some(pool) = weak.upgrade() else {
                         break;
                     };
@@ -531,25 +560,37 @@ impl NntpPool {
                     if !route.inner.needs_probe() {
                         continue;
                     }
-                    let held_back = tokio::time::Instant::now() + Duration::from_secs(1);
-                    if pool.auth_admission[idx].check().is_err()
-                        || pool.is_over_limit(ServerId(idx))
-                        || !pool.health.lock().await.is_available(idx)
-                    {
-                        retry_at = Some(held_back);
+                    if pool.auth_admission[idx].check().is_err() {
+                        let auth = &pool.auth_admission[idx];
+                        let remaining = auth.state.load(Ordering::Acquire).saturating_sub(2).saturating_sub(auth.elapsed_ms());
+                        retry_at = Some(tokio::time::Instant::now() + Duration::from_millis(remaining));
                         continue;
                     }
+                    if let Some(until) = pool.over_limit_until_epoch_ms(ServerId(idx)) {
+                        retry_at = Some(tokio::time::Instant::now() + Duration::from_millis(until.saturating_sub(unix_epoch_ms())));
+                        continue;
+                    }
+                    {
+                        let mut health = pool.health.lock().await;
+                        if !health.is_available(idx) {
+                            if let crate::health::ServerState::CoolingDown { until, .. } | crate::health::ServerState::Disabled { until, .. } = health.server(idx).state() {
+                                retry_at = Some(tokio::time::Instant::from_std(*until));
+                            }
+                            wait_recovery = true;
+                            continue;
+                        }
+                    }
                     let Ok(permit) = pool.semaphores[idx].clone().try_acquire_owned() else {
-                        retry_at = Some(held_back);
+                        wait_permit = true;
                         continue;
                     };
                     let Some(slot) = pool.socket_budgets[idx].try_acquire() else {
                         pool.socket_budgets[idx].recall_idle();
-                        retry_at = Some(held_back);
+                        wait_sockets = true;
                         continue;
                     };
                     let Some(health_lease) = pool.recovery_gates[idx].admit(false) else {
-                        retry_at = Some(held_back);
+                        wait_recovery = true;
                         continue;
                     };
                     let result = tokio::select! {
@@ -870,9 +911,7 @@ impl NntpPool {
                         .ok_or(NntpError::PoolExhausted)?;
                     let started = tokio::time::Instant::now();
                     let connect = self.connect_server(idx, initial_group);
-                    let connected = if self.configs[idx].dialer.is_some()
-                        || self.configs[idx].proxy.is_some()
-                    {
+                    let connected = if self.configs[idx].dialer.is_some() {
                         let result = connect.await;
                         if let Some(deadline) = deadline.as_deref_mut() {
                             *deadline += started.elapsed();
@@ -900,9 +939,13 @@ impl NntpPool {
                             {
                                 drop(slot);
                                 drop(health_lease);
-                                let notified = changed.notified();
-                                tokio::pin!(notified);
-                                notified.as_mut().enable();
+                                let mut notifications: Vec<_> = changed
+                                    .iter()
+                                    .map(|changed| Box::pin(changed.notified()))
+                                    .collect();
+                                for notification in &mut notifications {
+                                    notification.as_mut().enable();
+                                }
                                 if self.configs[idx]
                                     .dialer
                                     .as_ref()
@@ -913,7 +956,14 @@ impl NntpPool {
                                 acquisition_budget(deadline.as_deref(), async {
                                         tokio::select! {
                                             _ = self.shutdown.cancelled() => Err(NntpError::PoolShutdown),
-                                            _ = notified => Ok(()),
+                                            _ = std::future::poll_fn(|cx| {
+                                                for notification in &mut notifications {
+                                                    if std::future::Future::poll(notification.as_mut(), cx).is_ready() {
+                                                        return std::task::Poll::Ready(());
+                                                    }
+                                                }
+                                                std::task::Poll::Pending
+                                            }) => Ok(()),
                                         }
                                     }).await?;
                                 continue;
@@ -1005,7 +1055,7 @@ impl NntpPool {
             .ok_or(NntpError::PoolExhausted)?;
         let started = tokio::time::Instant::now();
         let connect = self.connect_server(idx, initial_group);
-        let connected = if self.configs[idx].dialer.is_some() || self.configs[idx].proxy.is_some() {
+        let connected = if self.configs[idx].dialer.is_some() {
             let result = connect.await;
             if let Some(deadline) = deadline {
                 *deadline += started.elapsed();
@@ -1971,9 +2021,10 @@ mod tests {
         pool.start_route_probes();
         checks.recv().await.unwrap();
 
-        // Nothing needs a probe and the targets hold still: a minute of
-        // (paused, virtual) time brings no further check and no dial.
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        // Observe the parked loop and verify that it armed no timer.
+        let mut waits = pool.probe_waits[0].subscribe();
+        waits.wait_for(|state| state.0 >= 1).await.unwrap();
+        assert!(waits.borrow().1.is_none());
         assert_eq!(route.checks.load(Ordering::Acquire), 1);
         assert_eq!(route.dials.load(Ordering::Acquire), 0);
 
@@ -1983,13 +2034,15 @@ mod tests {
         route.needed.store(true, Ordering::Release);
         route.targets.send_modify(|_| {});
         dials.recv().await.unwrap();
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        waits.wait_for(|state| state.0 >= 2).await.unwrap();
+        assert!(waits.borrow().1.is_none());
         assert_eq!(route.dials.load(Ordering::Acquire), 1);
 
         // The next lapse gets its own probe.
         route.targets.send_modify(|_| {});
         dials.recv().await.unwrap();
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        waits.wait_for(|state| state.0 >= 3).await.unwrap();
+        assert!(waits.borrow().1.is_none());
         assert_eq!(route.dials.load(Ordering::Acquire), 2);
         pool.shutdown().await;
     }

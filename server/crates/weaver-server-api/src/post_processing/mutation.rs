@@ -292,7 +292,7 @@ impl PostProcessingMutation {
             let existing = db
                 .script_instance(&id)
                 .map_err(|error| error.to_string())?
-                .ok_or("script instance does not exist")?;
+                .ok_or("script job does not exist")?;
             if keep_schedule {
                 draft.schedule = existing.schedule.clone();
             }
@@ -339,7 +339,7 @@ impl PostProcessingMutation {
                     .iter()
                     .any(|instance| &instance.id == id && in_group(instance))
                 {
-                    return Err(format!("'{id}' is not an instance of that trigger"));
+                    return Err(format!("'{id}' is not a script job with that trigger"));
                 }
                 if !named.insert(id.as_str()) {
                     return Err(format!("'{id}' is named more than once"));

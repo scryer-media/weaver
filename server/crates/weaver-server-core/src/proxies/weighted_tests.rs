@@ -365,6 +365,14 @@ fn timer_snapshots(weighted: &Weighted) -> u64 {
     weighted.shared.timer_snapshots.load(Ordering::Relaxed)
 }
 
+async fn assert_timer_parked(weighted: &Weighted) {
+    while !weighted.shared.timer_parked.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    let mut state = weighted.shared.state.lock().unwrap();
+    assert_eq!(weighted.shared.sample(&mut state, Instant::now()), None);
+}
+
 #[tokio::test(start_paused = true)]
 async fn idle_route_timer_builds_no_snapshot_and_publishes_nothing() {
     let (weighted, _) = create(5);
@@ -372,8 +380,7 @@ async fn idle_route_timer_builds_no_snapshot_and_publishes_nothing() {
     let mut updates = weighted.subscribe();
     updates.borrow_and_update();
     let before = timer_snapshots(&weighted);
-    // Paused clock: this minute is virtual, sixty of the old one-second ticks.
-    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_timer_parked(&weighted).await;
     assert_eq!(timer_snapshots(&weighted), before);
     assert!(!updates.has_changed().unwrap());
 }
@@ -402,12 +409,11 @@ async fn a_decayed_rate_is_published_at_zero_once_then_the_timer_sleeps() {
     settle_rate(&mut updates, 1024).await;
     settle_rate(&mut updates, 0).await;
     let settled = timer_snapshots(&weighted);
-    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_timer_parked(&weighted).await;
     assert_eq!(timer_snapshots(&weighted), settled);
     assert!(!updates.has_changed().unwrap());
 
-    // The first read after the quiet minute wakes the timer, and its window
-    // covers that one second, not the quiet minute: alongside the three
+    // The first read after parking wakes the timer. Alongside the three
     // empty windows left from the decay it reads 2048 / 4.
     dialed.outcome.read(2048);
     settle_rate(&mut updates, 512).await;

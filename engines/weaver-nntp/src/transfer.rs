@@ -947,6 +947,10 @@ impl ServerTransferControl {
     }
 
     fn reserve_rate(&self, bytes: u64) -> Option<RateTicket> {
+        self.reserve_rate_with_clock(bytes, || self.rate_now_micros())
+    }
+
+    fn reserve_rate_with_clock(&self, bytes: u64, now: impl Fn() -> u64) -> Option<RateTicket> {
         if bytes == 0 {
             return None;
         }
@@ -971,7 +975,7 @@ impl ServerTransferControl {
             }
             let epoch = current >> RATE_SCHEDULE_EPOCH_SHIFT;
             let previous_target = current & RATE_SCHEDULE_TARGET_MASK;
-            let now = self.rate_now_micros();
+            let now = now();
             let base = previous_target.max(now.saturating_sub(RATE_BURST_MICROS));
             let cost = rate_cost_micros(bytes, rate);
             let target_micros = base.saturating_add(cost).min(RATE_SCHEDULE_TARGET_MASK);
@@ -1627,15 +1631,41 @@ mod tests {
         );
 
         // Exactly the burst credit's worth of bytes schedules without a wait.
-        let warmup = control.reserve_rate(5).unwrap();
-        assert!(warmup.target_micros <= control.rate_now_micros());
-        let first = control.reserve_rate(50).expect("burst credit is exhausted");
-        let second = control.reserve_rate(50).expect("aggregate debt is shared");
+        let now = || RATE_BURST_MICROS;
+        let warmup = control.reserve_rate_with_clock(5, now).unwrap();
+        assert_eq!(warmup.target_micros, now());
+        let first = control
+            .reserve_rate_with_clock(50, now)
+            .expect("burst credit is exhausted");
+        let second = control
+            .reserve_rate_with_clock(50, now)
+            .expect("aggregate debt is shared");
         // Each ticket is scheduled after the one before it, by its own cost:
         // the burst credit went to the warmup and the debt is shared. The
         // targets are compared with each other, not with the clock.
         assert_eq!(first.target_micros - warmup.target_micros, 500_000);
         assert_eq!(second.target_micros - first.target_micros, 500_000);
+    }
+
+    #[test]
+    fn low_rates_sustain_the_configured_throughput_after_the_initial_burst() {
+        for rate in [1, 10, 100, 1024] {
+            let registry = ServerTransferRegistry::new();
+            let control = registry.configure(
+                StableServerId(1),
+                ServerTransferConfig {
+                    rate_bytes_per_sec: rate,
+                    quota: None,
+                },
+            );
+            for second in 0..20 {
+                let now = RATE_BURST_MICROS + second * 1_000_000;
+                let ticket = control.reserve_rate_with_clock(rate, || now).unwrap();
+                // One second's bytes costs one second on the shared ledger,
+                // even when the burst allowance is smaller than one byte.
+                assert_eq!(ticket.target_micros, (second + 1) * 1_000_000);
+            }
+        }
     }
 
     #[test]

@@ -251,9 +251,6 @@ pub enum PipeliningCapability {
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub dialer: Option<Arc<crate::route_dialer::RouteDialer>>,
-    /// Revocable route transport. None retains the direct socket path.
-    pub proxy: Option<Arc<weaver_tunnel::bridge::Bridge>>,
-    pub revocation: Option<Arc<crate::revocation::SocketRegistry>>,
     /// Hostname or IP address.
     pub host: String,
     /// Port number.
@@ -294,8 +291,6 @@ impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             dialer: None,
-            proxy: None,
-            revocation: None,
             host: String::new(),
             port: 563,
             tls: true,
@@ -323,7 +318,6 @@ pub struct NntpConnection {
     pub route_path: Option<weaver_tunnel::pipe::DialPath>,
     egress_control: Option<Arc<ServerTransferControl>>,
     pub(crate) route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
-    _route_socket: Option<Arc<socket2::Socket>>,
     /// Wrapped in Option to allow taking ownership during STARTTLS upgrade.
     transport: Option<NntpTransport>,
     codec: NntpCodec,
@@ -409,15 +403,10 @@ impl NntpConnection {
         initial_group: Option<&str>,
     ) -> Result<Self> {
         let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT)
-            + config.dialer.as_ref().map_or_else(
-                || {
-                    config
-                        .proxy
-                        .as_ref()
-                        .map_or(Duration::ZERO, |p| p.connect_timeout)
-                },
-                |d| d.inner.budget(),
-            );
+            + config
+                .dialer
+                .as_ref()
+                .map_or(Duration::ZERO, |d| d.inner.budget());
         let result = tokio::time::timeout(connect_timeout, async {
             Self::connect_inner(config, route, initial_group).await
         })
@@ -436,10 +425,6 @@ impl NntpConnection {
     ) -> Result<Self> {
         debug!(host = %config.host, port = config.port, tls = config.tls, "connecting to NNTP server");
 
-        if let Some(registry) = &config.revocation {
-            registry.check()?;
-        }
-        let mut route_socket = None;
         let mut route_outcome = None;
         let mut route_path = None;
         let mut pipe_setup = None;
@@ -455,40 +440,6 @@ impl NntpConnection {
                 inner: dialed.stream.into(),
                 remote_addr,
             };
-            if config.tls {
-                crate::tls::upgrade_starttls(
-                    plain,
-                    &config.host,
-                    config.tls_ca_cert.as_deref(),
-                    config.tls_name_mismatch_certificate_der.as_deref(),
-                    config.tls_cipher_preference,
-                )
-                .await?
-            } else {
-                plain
-            }
-        } else if config.proxy.is_some() {
-            let (transport, outcome) = crate::proxy::connect(config).await?;
-            route_outcome = Some(outcome);
-            transport
-        } else if let Some(registry) = &config.revocation {
-            let (tcp, remote_addr) =
-                crate::tls::dial_direct(&config.host, config.port, route, config.connect_timeout)
-                    .await?;
-            setup = route
-                .zip(remote_addr)
-                .map(|(route, addr)| route.watch_setup(addr));
-            let plain = NntpTransport::Plain {
-                inner: tcp.into(),
-                remote_addr,
-            };
-            if let NntpTransport::Plain {
-                inner: crate::route_stream::RouteStream::Tcp(inner),
-                ..
-            } = &plain
-            {
-                route_socket = Some(registry.track(socket2::SockRef::from(inner))?);
-            }
             if config.tls {
                 crate::tls::upgrade_starttls(
                     plain,
@@ -538,7 +489,6 @@ impl NntpConnection {
             }),
             route_path,
             route_outcome,
-            _route_socket: route_socket,
             transport: Some(transport),
             codec: NntpCodec::new(),
             read_buf: BytesMut::with_capacity(read_buf_capacity),
@@ -2191,7 +2141,10 @@ impl NntpConnection {
         self.health_lease
             .as_ref()
             .is_none_or(|lease| lease.0.current())
-            && self.socket_slot.as_ref().is_none_or(|slot| slot.reusable())
+            && self
+                .socket_slot
+                .as_ref()
+                .is_none_or(|slot| slot.claim_reuse())
     }
 
     /// The server's advertised capabilities.

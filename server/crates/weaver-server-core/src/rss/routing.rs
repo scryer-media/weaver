@@ -88,7 +88,10 @@ impl RssService {
                                 return Err(RssServiceError::Http(error.to_string()));
                             }
                         }
-                        _ => attempt.report(Some(&weaver_tunnel::pipe::DialError::Destination(
+                        Err(_) => attempt.report(Some(&weaver_tunnel::pipe::DialError::Timeout {
+                            stage: "RSS route".into(),
+                        })),
+                        _ => attempt.report(Some(&weaver_tunnel::pipe::DialError::Egress(
                             std::io::Error::new(
                                 std::io::ErrorKind::ConnectionReset,
                                 "RSS transport or routed DNS failed",
@@ -174,9 +177,9 @@ impl RssService {
             .map_err(|_| AttemptError::Route)?;
         if let Some(bridge) = &bridge {
             let addr = bridge.addr().map_err(|_| AttemptError::Route)?;
-            // socks5h hands the bridge the hostname: a proxy hop forwards it
-            // as NNTP does, and a direct dial uses exactly the checked
-            // addresses pinned on the attempt, trying each in turn.
+            // The local bridge receives the hostname for Host/SNI, but both
+            // direct and proxy hops connect only to the checked addresses
+            // pinned on the attempt; the remote proxy cannot resolve it again.
             builder = builder.proxy(
                 reqwest::Proxy::all(format!("socks5h://{addr}"))
                     .map_err(|_| AttemptError::Route)?

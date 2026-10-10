@@ -134,7 +134,7 @@ async fn copy_cap(
     let period = cap.period.as_str();
     conn.execute(
         "UPDATE egress_interfaces
-            SET download_quota_enabled = 1,
+            SET download_quota_enabled = TRUE,
                 download_quota_limit_bytes = {},
                 download_quota_period = {},
                 download_quota_reset_time_minutes_local = {},

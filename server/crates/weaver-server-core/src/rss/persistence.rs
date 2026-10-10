@@ -25,19 +25,17 @@ impl Database {
         let routing = routing.cloned();
         let consumer = crate::proxies::Consumer::Rss(feed.id);
         let (feed_id, scripts) = (feed.id, feed.scripts.clone());
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "save_consumer_routing", |tx| {
                 let args = args.clone(); let routing = routing.clone();
                 let scripts = scripts.clone();
                 Box::pin(async move {
-            // The `scripts` column is what feeds held before instances. It is
-            // no longer read; attachments are rows of their own.
             tx.execute(
                 "INSERT INTO rss_feeds
                     (id, name, url, enabled, poll_interval_secs, username, password, default_category,
                      default_metadata, etag, last_modified, last_polled_at, last_success_at, last_error,
-                     consecutive_failures, scripts)
-                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, '[]')",
+                     consecutive_failures)
+                 VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                 &args,
             )
             .await?;
@@ -46,7 +44,11 @@ impl Database {
             Ok(())
                 })
             }).await
-        })
+        });
+        if result.is_ok() {
+            self.invalidate_rss_schedules();
+        }
+        result
     }
 
     pub fn update_rss_feed(&self, feed: &RssFeedRow) -> Result<(), StateError> {
@@ -70,7 +72,7 @@ impl Database {
         let routing = routing.cloned();
         let consumer = crate::proxies::Consumer::Rss(feed.id);
         let (feed_id, scripts) = (feed.id, feed.scripts.clone());
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "save_consumer_routing", |tx| {
                 let args = args.clone();
                 let routing = routing.clone();
@@ -94,14 +96,28 @@ impl Database {
                 })
             })
             .await
-        })
+        });
+        if result.is_ok() {
+            self.invalidate_rss_schedules();
+        }
+        result
     }
 
     pub fn delete_rss_feed(&self, id: u32) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_routed_consumer", |tx| {
                 Box::pin(async move {
+                    tx.execute(
+                        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM script_outputs WHERE job_id IS NULL AND event = {}",
+                        &[SqlArg::Text(format!("feed:{id}"))],
+                    )
+                    .await?;
                     let changed = tx
                         .execute(
                             "DELETE FROM rss_feeds WHERE id = {}",
@@ -122,7 +138,11 @@ impl Database {
                 })
             })
             .await
-        })
+        });
+        if result.is_ok() {
+            self.invalidate_rss_schedules();
+        }
+        result
     }
 
     pub fn insert_rss_rule(&self, rule: &RssRuleRow) -> Result<(), StateError> {
@@ -258,7 +278,7 @@ impl Database {
         let datastore = self.datastore();
         let etag = etag.map(str::to_string);
         let last_modified = last_modified.map(str::to_string);
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             SqlRuntime::execute(
                 datastore.read_exec(),
                 "UPDATE rss_feeds
@@ -275,7 +295,11 @@ impl Database {
             )
             .await?;
             Ok(())
-        })
+        });
+        if result.is_ok() {
+            self.invalidate_rss_schedules();
+        }
+        result
     }
 
     pub fn record_rss_poll_failure(
@@ -286,7 +310,7 @@ impl Database {
     ) -> Result<(), StateError> {
         let datastore = self.datastore();
         let error = error.to_string();
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             SqlRuntime::execute(
                 datastore.read_exec(),
                 "UPDATE rss_feeds
@@ -302,7 +326,11 @@ impl Database {
             )
             .await?;
             Ok(())
-        })
+        });
+        if result.is_ok() {
+            self.invalidate_rss_schedules();
+        }
+        result
     }
 }
 

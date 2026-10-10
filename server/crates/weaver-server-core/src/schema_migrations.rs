@@ -15,8 +15,9 @@ use crate::migration_hook_ids;
 use crate::persistence::sql_runtime::SqlConn;
 
 pub(crate) mod egress_quotas_v53;
+mod schedule_tracks_v55;
 pub(crate) mod script_instances_v55;
-pub(crate) mod unwanted_extensions_v57;
+pub(crate) mod unwanted_extensions_v56;
 
 const EMBEDDED_MIGRATION_CATALOG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/migration_catalog.json.zst"));
@@ -27,7 +28,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 57;
+const CURRENT_SCHEMA_VERSION: i64 = 56;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -798,8 +799,8 @@ async fn run_rust_hook(
         script_instances_v55::HOOK_ID => {
             script_instances_v55::move_script_wiring_to_instances(&mut SqlConn::Sqlite(tx)).await
         }
-        unwanted_extensions_v57::HOOK_ID => {
-            unwanted_extensions_v57::fill_default_unwanted_extensions(&mut SqlConn::Sqlite(tx))
+        unwanted_extensions_v56::HOOK_ID => {
+            unwanted_extensions_v56::fill_default_unwanted_extensions(&mut SqlConn::Sqlite(tx))
                 .await
         }
         other => Err(StateError::Database(format!(
@@ -1384,10 +1385,10 @@ mod tests {
         assert_eq!(usage_cascade, 1);
     }
 
-    /// A run recorded before its status had a column of its own is still
-    /// found by how it ended.
+    /// Status exists from the first script-output schema and never needs to
+    /// parse a result blob during upgrade.
     #[tokio::test]
-    async fn sqlite_v56_upgrade_fills_in_how_each_recorded_run_ended() {
+    async fn sqlite_script_output_status_is_present_from_creation() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1395,7 +1396,7 @@ mod tests {
             .unwrap();
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(55), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(52), true)
             .await
             .unwrap();
 
@@ -1403,14 +1404,12 @@ mod tests {
             sqlx::query(
                 "INSERT INTO script_outputs
                     (id, job_id, event, script, seq, raw_bytes, truncated, output, stored_bytes,
-                     result_json, created_at)
-                 VALUES (?, NULL, 'scan', 'scan.sh', ?, 0, 0, x'', 0, ?, 1)",
+                     result_json, created_at, status)
+                 VALUES (?, NULL, 'scan', 'scan.sh', ?, 0, 0, x'', 0, 'invalid JSON', 1, ?)",
             )
             .bind(format!("run-{seq}"))
             .bind(seq)
-            .bind(format!(
-                r#"{{"script":"scan.sh","event":"scan","status":"{status}","outputTail":"\"status\":\"failed\""}}"#
-            ))
+            .bind(status)
             .execute(&pool)
             .await
             .unwrap();

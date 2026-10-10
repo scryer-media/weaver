@@ -198,7 +198,7 @@ struct SupervisorRequest {
     args: Vec<OsStringWire>,
     env: BTreeMap<OsStringWire, OsStringWire>,
     cwd: PathBuf,
-    /// The program is `go run`, whose exit status is not the script's own.
+    /// Compile the Go source before executing it with the script arguments.
     go_run: bool,
 }
 
@@ -374,7 +374,7 @@ pub async fn execute_spec_tapped(
         return Err(RunnerError::InvalidEntrypoint);
     }
     let (program, mut args) = resolve_program(&entrypoint, &spec.interpreters)?;
-    args.extend(spec.argv);
+    append_script_arguments(&entrypoint, &mut args, spec.argv);
     let go_run = is_go_source(&entrypoint);
     let mut env = sanitized_platform_environment()?;
     if go_run {
@@ -551,7 +551,7 @@ fn prepare_execution(request: &ScriptExecutionRequest) -> Result<PreparedExecuti
         insert_go_environment(&mut env, &request.context.compatibility)?;
     }
     let adapter_args = adapter_environment_and_args(request, &mut env)?;
-    args.extend(adapter_args);
+    append_script_arguments(&entrypoint, &mut args, adapter_args);
 
     let final_directory = fs::canonicalize(&request.context.final_directory)?;
 
@@ -584,6 +584,14 @@ fn is_go_source(entrypoint: &Path) -> bool {
     script_extension(entrypoint) == "go"
 }
 
+fn append_script_arguments(entrypoint: &Path, args: &mut Vec<OsString>, values: Vec<OsString>) {
+    // cmd.exe reinterprets argument text as shell syntax. Batch scripts get
+    // download-derived values exclusively through their compatibility env.
+    if !matches!(script_extension(entrypoint).as_str(), "bat" | "cmd") {
+        args.extend(values);
+    }
+}
+
 fn resolve_program(
     entrypoint: &Path,
     interpreters: &InterpreterConfig,
@@ -609,6 +617,12 @@ fn resolve_program(
             ],
         )),
         "bat" | "cmd" => {
+            if entrypoint
+                .to_string_lossy()
+                .contains(['"', '%', '^', '&', '|', '<', '>', '\r', '\n'])
+            {
+                return Err(RunnerError::InvalidEntrypoint);
+            }
             let interpreter = interpreters
                 .batch
                 .clone()
@@ -624,9 +638,8 @@ fn resolve_program(
                 ],
             ))
         }
-        // A Go script is one source file, compiled and run by `go run`. Go
-        // reads every leading argument that ends in `.go` as another source
-        // file, so a first script argument spelled that way fails the build.
+        // The supervisor builds this source separately before passing arguments
+        // to the executable. The prefix identifies the source in its request.
         "go" => Ok((
             interpreters
                 .go
@@ -1686,30 +1699,41 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
     let _job = WindowsJob::assign_current_process()?;
     let mut stdin = io::stdin();
     let request = read_supervisor_request(&mut stdin)?;
-    let go_run = request.go_run;
-    let mut command = std::process::Command::new(request.program);
-    command
-        .args(request.args.into_iter().map(OsStringWire::into_os))
-        .env_clear()
-        .envs(
-            request
-                .env
-                .into_iter()
-                .map(|(key, value)| (key.into_os(), value.into_os())),
-        )
-        .current_dir(request.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| RunnerError::SupervisorProtocol("child stdout was unavailable".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| RunnerError::SupervisorProtocol("child stderr was unavailable".into()))?;
+    let env: Vec<_> = request
+        .env
+        .into_iter()
+        .map(|(key, value)| (key.into_os(), value.into_os()))
+        .collect();
+    let args: Vec<_> = request
+        .args
+        .into_iter()
+        .map(OsStringWire::into_os)
+        .collect();
+    // The Go compiler cache remains under the configured data directory.
+    // Build and execute separately: a download name ending in .go must never
+    // be interpreted by the compiler as another source file.
+    let build_dir = request.go_run.then(tempfile::tempdir).transpose()?;
+    let mut commands = Vec::new();
+    if let Some(build_dir) = &build_dir {
+        let source = args
+            .get(1)
+            .ok_or_else(|| RunnerError::SupervisorProtocol("missing Go source".into()))?;
+        let binary = build_dir.path().join(if cfg!(windows) {
+            "script.exe"
+        } else {
+            "script"
+        });
+        let mut build = std::process::Command::new(&request.program);
+        build.arg("build").arg("-o").arg(&binary).arg(source);
+        commands.push(build);
+        let mut run = std::process::Command::new(binary);
+        run.args(&args[2..]);
+        commands.push(run);
+    } else {
+        let mut run = std::process::Command::new(&request.program);
+        run.args(args);
+        commands.push(run);
+    }
     let parent_pipe_lost = Arc::new(AtomicBool::new(false));
     let parent_liveness = parent_pipe_lost.clone();
     std::thread::spawn(move || {
@@ -1724,55 +1748,59 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
             }
         }
     });
-    let announced = {
-        let mut output = io::stdout().lock();
-        output
-            .write_all(SUPERVISOR_LAUNCHED)
-            .and_then(|()| output.flush())
-    };
-    if announced.is_err() {
-        terminate_on_parent_pipe_loss(&mut child);
-        return Ok(125);
-    }
-    let stdout_thread = relay_thread(stdout, io::stdout(), parent_pipe_lost.clone());
-    let stderr_thread = relay_thread(stderr, io::stderr(), parent_pipe_lost.clone());
-    let status = loop {
+    for (index, mut command) in commands.into_iter().enumerate() {
         if parent_pipe_lost.load(Ordering::Acquire) {
-            terminate_on_parent_pipe_loss(&mut child);
             return Ok(125);
         }
-        if let Some(status) = child.try_wait()? {
-            break status;
+        command
+            .env_clear()
+            .envs(env.iter().cloned())
+            .current_dir(&request.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            RunnerError::SupervisorProtocol("child stdout was unavailable".into())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            RunnerError::SupervisorProtocol("child stderr was unavailable".into())
+        })?;
+        if index == 0 {
+            let mut output = io::stdout().lock();
+            if output
+                .write_all(SUPERVISOR_LAUNCHED)
+                .and_then(|()| output.flush())
+                .is_err()
+            {
+                terminate_on_parent_pipe_loss(&mut child);
+                return Ok(125);
+            }
         }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    let _ = stdout_thread.join();
-    let stderr_tail = stderr_thread.join().unwrap_or_default();
-    let code = status.code().unwrap_or(126);
-    Ok(if go_run {
-        go_run_exit_code(code, &stderr_tail)
-    } else {
-        code
-    })
-}
-
-/// How much of the end of a relayed stream is kept for [`go_run_exit_code`].
-const RELAY_TAIL_BYTES: usize = 64;
-
-/// `go run` exits 1 when the program it built exits with anything but zero,
-/// and says which status that was in the last line it writes to stderr,
-/// `exit status N`. Read the script's own status back out of that line, so 93
-/// or 95 from a Go script means what it means from any other.
-fn go_run_exit_code(code: i32, stderr_tail: &[u8]) -> i32 {
-    if code != 1 {
-        return code;
+        let stdout_thread = relay_thread(stdout, io::stdout(), parent_pipe_lost.clone());
+        let stderr_thread = relay_thread(stderr, io::stderr(), parent_pipe_lost.clone());
+        let status = loop {
+            if parent_pipe_lost.load(Ordering::Acquire) {
+                terminate_on_parent_pipe_loss(&mut child);
+                return Ok(125);
+            }
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let _ = stdout_thread.join();
+        let _ = stderr_thread.join();
+        let code = status.code().unwrap_or(126);
+        if code != 0 {
+            return Ok(code);
+        }
     }
-    String::from_utf8_lossy(stderr_tail)
-        .trim_end()
-        .rsplit_once("exit status ")
-        .and_then(|(_, status)| status.parse().ok())
-        .unwrap_or(code)
+    Ok(0)
 }
+
+/// Bounded diagnostic tail retained by the relay.
+const RELAY_TAIL_BYTES: usize = 64;
 
 fn read_supervisor_request<R: Read>(reader: &mut R) -> Result<SupervisorRequest, RunnerError> {
     let mut length = [0_u8; 8];
@@ -2404,22 +2432,21 @@ mod go_run_tests {
     }
 
     #[test]
-    fn the_status_go_run_reports_for_the_script_becomes_the_exit_code() {
-        assert_eq!(go_run_exit_code(1, b"exit status 93\n"), 93);
-        assert_eq!(
-            go_run_exit_code(1, b"[INFO] done\r\nexit status 95\r\n"),
-            95
+    fn batch_scripts_receive_no_download_arguments() {
+        let mut args = vec![OsString::from("trusted.cmd")];
+        append_script_arguments(
+            Path::new("trusted.cmd"),
+            &mut args,
+            vec![OsString::from("name&command%value")],
         );
-        // The script ended its own stderr without a line break.
-        assert_eq!(go_run_exit_code(1, b"no line breakexit status 2\n"), 2);
-        assert_eq!(go_run_exit_code(1, b"exit status 93\nexit status 1\n"), 1);
-        // A build that failed reports no status of the script's.
-        assert_eq!(go_run_exit_code(1, b"./x.go:3:15: undefined: nothing\n"), 1);
-        assert_eq!(go_run_exit_code(1, b"exit status 93 or so\n"), 1);
-        assert_eq!(go_run_exit_code(1, b""), 1);
-        // Only the status `go run` itself fails with is read this way.
-        assert_eq!(go_run_exit_code(0, b"exit status 93\n"), 0);
-        assert_eq!(go_run_exit_code(2, b"exit status 93\n"), 2);
+        assert_eq!(args, ["trusted.cmd"]);
+        assert!(
+            resolve_program(
+                Path::new("/scripts/unsafe%name.cmd"),
+                &InterpreterConfig::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2431,7 +2458,7 @@ mod go_run_tests {
             .join()
             .unwrap();
         assert_eq!(tail.len(), RELAY_TAIL_BYTES);
-        assert_eq!(go_run_exit_code(1, &tail), 93);
+        assert!(tail.ends_with(b"exit status 93\n"));
 
         let tail = relay_thread(io::Cursor::new(b"short".to_vec()), io::sink(), lost.clone())
             .join()

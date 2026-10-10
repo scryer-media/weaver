@@ -1053,11 +1053,6 @@ impl Pipeline {
             )
         };
 
-        self.phase_end(job_id, JobPhase::Extracting);
-        self.phase_end(job_id, JobPhase::Repairing);
-        let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
-        self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
-
         let requested = self
             .db
             .job_script_effects(job_id.0)
@@ -1099,6 +1094,10 @@ impl Pipeline {
                 None,
             )
         };
+        self.phase_end(job_id, JobPhase::Extracting);
+        self.phase_end(job_id, JobPhase::Repairing);
+        let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
+        self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
         self.inflight_moves.insert(job_id);

@@ -40,21 +40,83 @@ impl JobScriptEffects {
 
 impl Database {
     pub fn job_script_effects(&self, job_id: u64) -> Result<JobScriptEffects, StateError> {
+        self.warm_script_effects()?;
+        Ok(self
+            .script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(|cache| cache.get(&job_id))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn warm_script_effects(&self) -> Result<(), StateError> {
+        if self
+            .script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+        {
+            return Ok(());
+        }
+        let _writer = self
+            .script_runtime
+            .effects_writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self
+            .script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+        {
+            return Ok(());
+        }
         let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(
+        let cache = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT state FROM script_job_state WHERE job_id = {}",
-                &[SqlArg::I64(job_id as i64)],
+                "SELECT job_id, state FROM script_job_state",
+                &[],
             )
             .await?
+            .into_iter()
             .map(|row| {
-                serde_json::from_str(&row.text("state")?)
-                    .map_err(|error| StateError::Database(error.to_string()))
+                Ok((
+                    row.i64("job_id")? as u64,
+                    serde_json::from_str(&row.text("state")?)
+                        .map_err(|error| StateError::Database(error.to_string()))?,
+                ))
             })
-            .transpose()
-            .map(Option::unwrap_or_default)
-        })
+            .collect::<Result<BTreeMap<_, _>, StateError>>()
+        })?;
+        *self
+            .script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(cache);
+        Ok(())
+    }
+
+    pub(crate) fn forget_script_effects(&self, job_id: u64) {
+        let _writer = self
+            .script_runtime
+            .effects_writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(cache) = self
+            .script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+        {
+            cache.remove(&job_id);
+        }
     }
 
     pub fn save_job_script_effects(
@@ -65,7 +127,12 @@ impl Database {
         let datastore = self.datastore();
         let state = serde_json::to_string(effects)
             .map_err(|error| StateError::Database(error.to_string()))?;
-        self.run_sql_blocking(async move {
+        let _writer = self
+            .script_runtime
+            .effects_writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let saved = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "apply_script_directive", |tx| {
                 let state = state.clone();
                 Box::pin(async move {
@@ -95,7 +162,17 @@ impl Database {
                     Ok(current)
                 })
             }).await
-        })
+        })?;
+        if let Some(cache) = self
+            .script_runtime
+            .effects_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+        {
+            cache.insert(job_id, saved.clone());
+        }
+        Ok(saved)
     }
 }
 

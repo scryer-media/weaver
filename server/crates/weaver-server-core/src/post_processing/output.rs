@@ -51,15 +51,11 @@ pub fn excerpt(output: &[u8]) -> String {
 pub fn decode_output(bytes: &[u8], ceiling: usize) -> Result<String, StateError> {
     let ceiling = ceiling.min(MAX_DECODE_BYTES);
     let mut decoded = Vec::new();
-    if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        zstd::stream::read::Decoder::new(bytes)
-            .map_err(error)?
-            .take(ceiling as u64 + 1)
-            .read_to_end(&mut decoded)
-            .map_err(error)?;
-    } else {
-        decoded.extend_from_slice(&bytes[..bytes.len().min(ceiling + 1)]);
-    }
+    zstd::stream::read::Decoder::new(bytes)
+        .map_err(error)?
+        .take(ceiling as u64 + 1)
+        .read_to_end(&mut decoded)
+        .map_err(error)?;
     if decoded.len() > ceiling {
         return Err(error("script output exceeds its decode ceiling"));
     }
@@ -81,8 +77,11 @@ pub async fn retain_output(
 ) -> Result<ScriptResult, StateError> {
     result.output_tail = excerpt(&output);
     tokio::task::spawn_blocking(move || {
-        let compressed =
-            zstd::stream::encode_all(output.as_slice(), COMPRESSION_LEVEL).map_err(error)?;
+        let compressed = if output.is_empty() {
+            Vec::new()
+        } else {
+            zstd::stream::encode_all(output.as_slice(), COMPRESSION_LEVEL).map_err(error)?
+        };
         db.insert_script_output(job_id, result, raw_bytes, compressed, limits)
     })
     .await
@@ -114,17 +113,6 @@ fn expired_runs(runs: &[(String, bool)], limits: &EventScriptSettings) -> Vec<St
         .collect()
 }
 
-/// The runs the limits count together: a job's runs, or the runs no job owns
-/// of one event (every scan, one schedule's runs, one feed's runs).
-type RetentionGroup = (Option<i64>, Option<String>);
-
-fn retention_group(job_id: Option<i64>, event: &str) -> RetentionGroup {
-    match job_id {
-        Some(_) => (job_id, None),
-        None => (None, Some(event.to_string())),
-    }
-}
-
 /// A run's id and whether its stored `status` column counts it as failed.
 fn run_and_failure(row: &SqlRow) -> Result<(String, bool), StateError> {
     let failed =
@@ -151,27 +139,42 @@ async fn trim_all_tx(tx: &mut SqlTx<'_>, limits: &EventScriptSettings) -> Result
         &[],
     )
     .await?;
-    let rows = tx
-        .fetch_all(
-            "SELECT id, job_id, event, status FROM script_outputs ORDER BY seq DESC",
-            &[],
+    let orphans = tx.execute(
+        "DELETE FROM script_outputs WHERE
+            (job_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM active_jobs WHERE active_jobs.job_id = script_outputs.job_id)
+             AND NOT EXISTS (SELECT 1 FROM job_history WHERE job_history.job_id = script_outputs.job_id))
+            OR (job_id IS NULL AND event LIKE 'feed:%'
+                AND NOT EXISTS (SELECT 1 FROM rss_feeds WHERE script_outputs.event = 'feed:' || CAST(rss_feeds.id AS TEXT)))",
+        &[],
+    ).await?;
+    let trimmed = tx
+        .execute(
+            "WITH ranked AS (
+            SELECT id, job_id, CASE WHEN job_id IS NULL THEN event ELSE NULL END AS event_group,
+                seq, status,
+                ROW_NUMBER() OVER (
+                    PARTITION BY job_id, CASE WHEN job_id IS NULL THEN event ELSE NULL END
+                    ORDER BY seq DESC
+                ) AS position
+            FROM script_outputs
+        ), overflow AS (
+            SELECT id, status,
+                SUM(CASE WHEN status IN ('failed', 'timed_out', 'cancelled') THEN 1 ELSE 0 END)
+                    OVER (PARTITION BY job_id, event_group ORDER BY seq DESC) AS failed_position
+            FROM ranked WHERE position > {}
+        )
+        DELETE FROM script_outputs WHERE id IN (
+            SELECT id FROM overflow
+            WHERE status NOT IN ('failed', 'timed_out', 'cancelled') OR failed_position > {}
+        )",
+            &[
+                SqlArg::I64(i64::from(limits.script_output_runs_per_job)),
+                SqlArg::I64(i64::from(limits.script_output_failed_runs_per_job)),
+            ],
         )
         .await?;
-    let mut groups = std::collections::BTreeMap::<RetentionGroup, Vec<(String, bool)>>::new();
-    for row in rows {
-        let job_id = row.opt_i64("job_id")?;
-        groups
-            .entry(retention_group(job_id, &row.text("event")?))
-            .or_default()
-            .push(run_and_failure(&row)?);
-    }
-    let expired = groups
-        .values()
-        .flat_map(|runs| expired_runs(runs, limits))
-        .collect::<Vec<_>>();
-    let count = expired.len() as u64;
-    delete_runs(tx, expired).await?;
-    Ok(count)
+    Ok(orphans + trimmed)
 }
 
 /// Background trims after a retention limit was lowered: one at a time, and a
@@ -231,6 +234,14 @@ impl Database {
                     // This row serializes insertion and trimming on both SQL backends.
                     let state = tx.fetch_optional("UPDATE script_output_state SET next_seq = next_seq + 1 WHERE singleton = 1 RETURNING next_seq", &[]).await?.ok_or_else(|| error("script output state is missing"))?;
                     let seq = state.i64("next_seq")?;
+                    if let Some(instance_id) = &result.instance_id
+                        && tx.fetch_optional("SELECT id FROM script_instances WHERE id = {}", &[SqlArg::Text(instance_id.clone())]).await?.is_none() {
+                        return Ok(result);
+                    }
+                    if let super::model::ScriptEventLabel::Feed(id) = result.event
+                        && tx.fetch_optional("SELECT id FROM rss_feeds WHERE id = {}", &[SqlArg::I64(id as i64)]).await?.is_none() {
+                        return Ok(result);
+                    }
                     if let Some(job_id) = job_id
                         && tx.fetch_optional("SELECT job_id FROM active_jobs WHERE job_id = {} UNION ALL SELECT job_id FROM job_history WHERE job_id = {} LIMIT 1", &[SqlArg::I64(job_id), SqlArg::I64(job_id)]).await?.is_none() {
                         return Ok(result);
@@ -240,12 +251,16 @@ impl Database {
                     getrandom::fill(&mut entropy).map_err(error)?;
                     let id = format!("script-output-{}", hex::encode(entropy));
                     result.output_id = (stored_bytes > 0).then(|| id.clone());
-                    tx.execute("INSERT INTO script_outputs (id, job_id, event, script, status, seq, raw_bytes, truncated, output, stored_bytes, result_json, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})", &[
-                        SqlArg::Text(id), SqlArg::OptI64(job_id), SqlArg::Text(result.event.to_string()), SqlArg::Text(result.script.to_string()), SqlArg::Text(result.status.as_str().to_string()), SqlArg::I64(seq), SqlArg::I64(raw_bytes), SqlArg::Bool(result.output_truncated), SqlArg::Bytes(output), SqlArg::I64(stored_bytes), SqlArg::Text(serde_json::to_string(&result).map_err(error)?), SqlArg::I64(result.finished_at_epoch_ms),
+                    tx.execute("INSERT INTO script_outputs (id, job_id, event, script, status, seq, raw_bytes, truncated, output, stored_bytes, result_json, created_at, instance_id) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})", &[
+                        SqlArg::Text(id), SqlArg::OptI64(job_id), SqlArg::Text(result.event.to_string()), SqlArg::Text(result.script.to_string()), SqlArg::Text(result.status.as_str().to_string()), SqlArg::I64(seq), SqlArg::I64(raw_bytes), SqlArg::Bool(result.output_truncated), SqlArg::Bytes(output), SqlArg::I64(stored_bytes), SqlArg::Text(serde_json::to_string(&result).map_err(error)?), SqlArg::I64(result.finished_at_epoch_ms), SqlArg::OptText(result.instance_id.clone()),
                     ]).await?;
                     // A download's runs are kept together; runs that belong to
                     // no download are kept per kind of event.
-                    let runs = tx.fetch_all("SELECT id, status FROM script_outputs WHERE job_id IS NOT DISTINCT FROM {} AND (job_id IS NOT NULL OR event = {}) ORDER BY seq DESC", &[SqlArg::OptI64(job_id), SqlArg::Text(result.event.to_string())]).await?
+                    let rows = match job_id {
+                        Some(job_id) => tx.fetch_all("SELECT id, status FROM script_outputs WHERE job_id = {} ORDER BY seq DESC", &[SqlArg::I64(job_id)]).await?,
+                        None => tx.fetch_all("SELECT id, status FROM script_outputs WHERE job_id IS NULL AND event = {} ORDER BY seq DESC", &[SqlArg::Text(result.event.to_string())]).await?,
+                    };
+                    let runs = rows
                         .iter()
                         .map(run_and_failure)
                         .collect::<Result<Vec<_>, _>>()?;
@@ -557,6 +572,28 @@ mod tests {
     use super::super::model::{ScriptAdapter, ScriptName};
     use super::*;
 
+    fn feed(db: &Database, id: u32) {
+        db.insert_rss_feed(&crate::RssFeedRow {
+            id,
+            name: format!("feed {id}"),
+            url: "https://example.test/feed".into(),
+            enabled: true,
+            poll_interval_secs: 60,
+            username: None,
+            password: None,
+            default_category: None,
+            default_metadata: Vec::new(),
+            scripts: Vec::new(),
+            etag: None,
+            last_modified: None,
+            last_polled_at: None,
+            last_success_at: None,
+            last_error: None,
+            consecutive_failures: 0,
+        })
+        .unwrap();
+    }
+
     fn active(db: &Database, id: u64) {
         db.create_active_job(&crate::ActiveJob {
             job_id: crate::JobId(id),
@@ -611,16 +648,99 @@ mod tests {
     }
 
     #[test]
-    fn decode_is_bounded_and_accepts_legacy_plain_text() {
-        assert_eq!(decode_output(b"legacy", 6).unwrap(), "legacy");
+    fn decode_is_bounded_and_rejects_uncompressed_data() {
+        assert!(decode_output(b"invalid frame", 64).is_err());
         let bytes = zstd::stream::encode_all(&b"1234567"[..], COMPRESSION_LEVEL).unwrap();
         assert!(decode_output(&bytes, 6).is_err());
         assert_eq!(decode_output(&bytes, 7).unwrap(), "1234567");
     }
 
     #[tokio::test]
+    async fn effect_cache_tracks_writes_deletion_and_reopening() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("effects.db");
+        let db = Database::open(&path).unwrap();
+        active(&db, 1);
+        assert!(!db.job_script_effects(1).unwrap().marked_bad);
+        let effects = super::super::effects::JobScriptEffects {
+            marked_bad: true,
+            parameters: [("fixture".into(), "saved".into())].into(),
+            ..Default::default()
+        };
+        db.save_job_script_effects(1, &effects).unwrap();
+        assert!(db.clone().job_script_effects(1).unwrap().marked_bad);
+        db.close().unwrap();
+        let reopened = Database::open(&path).unwrap();
+        let restored = reopened.job_script_effects(1).unwrap();
+        assert!(restored.marked_bad);
+        assert_eq!(restored.parameters.get("fixture").unwrap(), "saved");
+        reopened.delete_active_job(crate::JobId(1)).unwrap();
+        let removed = reopened.job_script_effects(1).unwrap();
+        assert!(!removed.marked_bad);
+        assert!(removed.parameters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_feed_removes_its_runs_and_refuses_late_results() {
+        let db = Database::open_in_memory().unwrap();
+        feed(&db, 1);
+        let saved = retain_output(
+            db.clone(),
+            None,
+            result(ScriptEventLabel::Feed(1)),
+            b"before deletion".to_vec(),
+            EventScriptSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert!(db.delete_rss_feed(1).unwrap());
+        assert!(
+            !db.script_output_retained(saved.output_id.as_deref().unwrap())
+                .unwrap()
+        );
+        let late = retain_output(
+            db.clone(),
+            None,
+            result(ScriptEventLabel::Feed(1)),
+            b"after deletion".to_vec(),
+            EventScriptSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert!(late.output_id.is_none());
+        assert!(runs_of(&db, None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn periodic_retention_removes_preexisting_orphan_groups() {
+        let db = Database::open_in_memory().unwrap();
+        feed(&db, 1);
+        retain_output(
+            db.clone(),
+            None,
+            result(ScriptEventLabel::Feed(1)),
+            b"orphan".to_vec(),
+            EventScriptSettings::default(),
+        )
+        .await
+        .unwrap();
+        let datastore = db.datastore();
+        db.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "remove_feed_fixture", |tx| {
+                Box::pin(async move { tx.execute("DELETE FROM rss_feeds WHERE id = 1", &[]).await })
+            })
+            .await
+        })
+        .unwrap();
+        assert_eq!(db.trim_script_outputs().unwrap(), 1);
+        assert!(runs_of(&db, None).is_empty());
+    }
+
+    #[tokio::test]
     async fn jobless_output_run_cap_is_scoped_to_event_label() {
         let db = Database::open_in_memory().unwrap();
+        feed(&db, 1);
+        feed(&db, 2);
         let limits = EventScriptSettings {
             script_output_runs_per_job: 1,
             ..Default::default()
@@ -819,6 +939,8 @@ mod tests {
     #[tokio::test]
     async fn runs_without_a_job_are_kept_per_event() {
         let db = Database::open_in_memory().unwrap();
+        feed(&db, 1);
+        feed(&db, 2);
         let limits = EventScriptSettings {
             script_output_runs_per_job: 1,
             script_output_failed_runs_per_job: 1,
@@ -1047,6 +1169,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_output_is_recorded_without_a_retained_frame() {
+        let db = Database::open_in_memory().unwrap();
+        let kept = retain_output(
+            db.clone(),
+            None,
+            result(ScriptEventLabel::Scan),
+            Vec::new(),
+            EventScriptSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert!(kept.output_id.is_none());
+        let runs = db.script_runs(Default::default(), None, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(!runs[0].output_retained);
+        assert!(db.script_output(&runs[0].id).unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn a_result_with_nothing_to_show_is_kept_without_output() {
         let db = Database::open_in_memory().unwrap();
         active(&db, 1);
@@ -1068,6 +1209,7 @@ mod tests {
     #[tokio::test]
     async fn runs_are_listed_latest_first_whatever_started_them() {
         let db = Database::open_in_memory().unwrap();
+        feed(&db, 9);
         active(&db, 1);
         history(&db, 2, "finished job");
         let limits = EventScriptSettings::default();
@@ -1161,6 +1303,7 @@ mod tests {
     #[tokio::test]
     async fn the_run_count_is_the_filtered_set_across_every_page() {
         let db = Database::open_in_memory().unwrap();
+        feed(&db, 9);
         active(&db, 1);
         let limits = EventScriptSettings::default();
         let recorded = [
@@ -1216,6 +1359,7 @@ mod tests {
     #[tokio::test]
     async fn runs_are_listed_and_counted_by_how_they_ended() {
         let db = Database::open_in_memory().unwrap();
+        feed(&db, 9);
         let limits = EventScriptSettings::default();
         let recorded = [
             (ScriptEventLabel::Scan, "a.sh", ScriptStatus::Succeeded),

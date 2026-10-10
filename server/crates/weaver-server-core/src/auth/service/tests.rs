@@ -92,11 +92,11 @@ fn a_login_token_and_a_script_run_token_are_never_taken_for_each_other() {
     let run = create_script_run_jwt(&run_claims(u64::MAX), &secret);
     assert!(matches!(
         verify_script_run_jwt(&login, &secret),
-        Err(JwtError::InvalidClaims(_))
+        Err(JwtError::InvalidSignature)
     ));
     assert!(matches!(
         verify_jwt(&run, &secret),
-        Err(JwtError::InvalidClaims(_))
+        Err(JwtError::InvalidSignature)
     ));
 }
 
