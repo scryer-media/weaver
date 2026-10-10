@@ -625,9 +625,9 @@ impl Pipeline {
         // job, and a repair clears the failed set before its retry.
         let par2_verdict_stale_after_failed_extraction = self.par2_verified.contains(&job_id)
             && self.par2_runtime(job_id).is_some_and(|runtime| {
-                runtime.served().is_some_and(|set_runtime| {
-                    set_runtime.settled_via_strong_decode
-                })
+                runtime
+                    .served()
+                    .is_some_and(|set_runtime| set_runtime.settled_via_strong_decode)
             })
             && has_crc_failures
             && (self.job_has_live_rar_waiting_for_absent_volumes(job_id)

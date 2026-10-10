@@ -198,8 +198,12 @@ pub(super) async fn embedded_campaign(profile: ExtractionProfile, selection: Sel
     };
     let selected = match selection {
         Selection::Smoke => smoke(),
-        Selection::Case(index) => vec![cases().into_iter()
-            .find(|(case, _)| *case == index).expect("embedded regression schedule exists")],
+        Selection::Case(index) => vec![
+            cases()
+                .into_iter()
+                .find(|(case, _)| *case == index)
+                .expect("embedded regression schedule exists"),
+        ],
         Selection::Shard(shard) => cases()
             .into_iter()
             .filter(|(case, _)| case % SHARDS == shard)

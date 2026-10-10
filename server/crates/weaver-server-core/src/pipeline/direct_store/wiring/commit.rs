@@ -1235,7 +1235,10 @@ impl Pipeline {
         // A recovery verdict can supersede the damaged posted copy, but an
         // unrecoverable neighbour must fail before any set is committed.
         let recovery_verified = self.par2_verified.contains(&job_id)
-            || self.par3_runtime.as_ref().is_some_and(|runtime| runtime.verified(job_id));
+            || self
+                .par3_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.verified(job_id));
         if !recovery_verified
             && self.jobs.get(&job_id).is_some_and(|state| {
                 state.assembly.files().any(|file| {
