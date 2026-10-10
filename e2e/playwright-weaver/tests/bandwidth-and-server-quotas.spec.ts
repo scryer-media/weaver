@@ -32,6 +32,17 @@ type QuotaSnapshot = {
   timezoneName: string;
 };
 
+type EgressQuotaUsage = {
+  lifetimeBytes: number;
+  usedBytes: number;
+  reservedBytes: number;
+  remainingBytes: number;
+  blocked: boolean;
+  windowStartsAtEpochMs: number | null;
+  windowEndsAtEpochMs: number | null;
+  timezoneName: string;
+};
+
 type DownloadBlockSnapshot = {
   kind: string;
   egressId: number | null;
@@ -370,7 +381,14 @@ async function exerciseManualResetAndPeriodWindows(
   });
   expect(reset.lifetimeBytes).toBe(lifetimeBeforeReset);
   expect((await systemEgressQuotaUsage(request)).usedBytes).toBe(egressUsedBeforeReset);
+  // The egress allowance has its own reset, which likewise keeps lifetime.
+  const egressLifetimeBeforeReset = (await systemEgressQuotaUsage(request)).lifetimeBytes;
+  const egressReset = await resetEgressQuota(request, SYSTEM_EGRESS_ID);
+  expect(egressReset).toMatchObject({ usedBytes: 0, blocked: false });
+  expect(egressReset.lifetimeBytes).toBe(egressLifetimeBeforeReset);
+  expect(egressReset.remainingBytes).toBe(egressLimit - egressReset.reservedBytes);
   let body = await metrics(request);
+  expect(metricValue(body, "weaver_egress_download_quota_used_bytes", egressLabel)).toBe(0);
   expect(
     metricValue(body, "weaver_server_download_quota_used_bytes", {
       server_id: String(primary.id),
@@ -823,6 +841,27 @@ async function resetServerQuota(
     { id },
   );
   return data.resetServerDownloadQuotaUsage.downloadQuota;
+}
+
+async function resetEgressQuota(
+  request: APIRequestContext,
+  id: number,
+): Promise<EgressQuotaUsage> {
+  const data = await graphql<{
+    resetEgressDownloadQuotaUsage: { downloadQuotaUsage: EgressQuotaUsage };
+  }>(
+    request,
+    `mutation WeaverE2EResetEgressQuota($id: Int!) {
+      resetEgressDownloadQuotaUsage(id: $id) {
+        downloadQuotaUsage {
+          lifetimeBytes usedBytes reservedBytes remainingBytes blocked
+          windowStartsAtEpochMs windowEndsAtEpochMs timezoneName
+        }
+      }
+    }`,
+    { id },
+  );
+  return data.resetEgressDownloadQuotaUsage.downloadQuotaUsage;
 }
 
 async function runProbe(

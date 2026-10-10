@@ -182,6 +182,11 @@
       "oracle": "api-metrics"
     },
     {
+      "name": "resetEgressDownloadQuotaUsage",
+      "owner": "bandwidth-and-server-quotas",
+      "oracle": "api-metrics"
+    },
+    {
       "name": "cancelJob",
       "owner": "duplicate-and-queue-policy",
       "oracle": "unit-only",
