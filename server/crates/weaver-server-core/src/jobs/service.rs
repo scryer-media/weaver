@@ -1346,7 +1346,7 @@ impl Pipeline {
             self.persist_file_identities(job_id, &file_identities).await;
         }
 
-        if let Some(state) = self.jobs.get(&job_id) {
+        if let Some(state) = self.jobs.get_mut(&job_id) {
             let mut metadata = state.spec.metadata.clone();
             metadata.retain(|(key, _)| {
                 key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
@@ -1361,7 +1361,7 @@ impl Pipeline {
             self.db
                 .update_active_job(job_id, &update)
                 .map_err(crate::SchedulerError::State)?;
-            update.apply_to_spec(&mut self.jobs.get_mut(&job_id).unwrap().spec);
+            update.apply_to_spec(&mut state.spec);
         }
         self.queue_scripts_completed.remove(&job_id);
         self.delete_failed_history_entry(job_id).await;

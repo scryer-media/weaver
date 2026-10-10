@@ -174,7 +174,6 @@ export function GeneralPanel() {
   ];
 
   const blocks: (SettingsBlock | null)[] = [
-    { kind: "custom", id: "archivePasswords", title: t("next.archivePasswords.title"), searchText: "archive password file", body: <ArchivePasswordSettings /> },
     { kind: "section", id: "interface", title: t("next.general.interface"), fields: interfaceFields },
     {
       kind: "section",
@@ -328,6 +327,13 @@ export function GeneralPanel() {
           })),
         }
       : null,
+    {
+      kind: "custom",
+      id: "archivePasswords",
+      title: t("next.archivePasswords.title"),
+      searchText: "archive password file",
+      body: <ArchivePasswordSettings />,
+    },
   ];
 
   return <SettingsBlocks blocks={blocks} loading={fetching && !data} />;
