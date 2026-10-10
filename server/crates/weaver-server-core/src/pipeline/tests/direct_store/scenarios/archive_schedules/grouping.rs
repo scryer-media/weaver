@@ -728,35 +728,41 @@ impl Binding {
 /// The direct-store route a cell's expectation allows, with `unmapped` the
 /// loss masks that leave its map unreadable.
 fn route(cell: Cell, expect: Expect, unmapped: fn(u8) -> bool) -> Route {
+    let (_, posted) = cell.naming.layout();
+    // Identity loss precedes codec selection, including a solid archive that
+    // would normally demote only after its map revealed an unsupported coder.
+    let unnamed_loss: fn(u8) -> bool = if cell.naming.names_place() {
+        |_| false
+    } else {
+        match posted.len() {
+            1 => |mask| mask & 0b0001 != 0,
+            2 => |mask| mask & 0b0101 != 0,
+            _ => |mask| mask != 0,
+        }
+    };
     let shape = match expect {
         Expect::Direct => {
-            let (_, posted) = cell.naming.layout();
-            // A set admitted by content knows a volume by its offset-zero
-            // article alone; slots 0 and 2 are those of two volumes.
-            let unnamed_loss: fn(u8) -> bool = if cell.naming.names_place() {
-                |_| false
-            } else {
-                match posted.len() {
-                    1 => |mask| mask & 0b0001 != 0,
-                    2 => |mask| mask & 0b0101 != 0,
-                    _ => |mask| mask != 0,
-                }
-            };
             // A set only the index's descriptions name is named in time only
             // when the index leads.
             let named_by_early_index = cell.binding == Binding::LegacyReal
                 && !cell.naming.names_place()
                 && !cell.container.headers_chain();
             Route {
-                unnamed_loss,
                 named_by_early_index,
                 ..Route::DIRECT
             }
         }
         Expect::Demotes(reason) => Route::refused(reason),
-        Expect::Streams | Expect::Downloads | Expect::Fails(_) => Route::refused(|_| false),
+        Expect::Streams | Expect::Downloads => match cell.container.admitted() {
+            // A restart can put retained metadata ahead of refetched parts,
+            // admitting a set that originally entered the conventional path.
+            Expect::Demotes(reason) => Route::refused(reason),
+            _ => Route::refused(|_| false),
+        },
+        Expect::Fails(_) => Route::refused(|_| false),
     };
     Route {
+        unnamed_loss,
         unmapped_loss: unmapped,
         ..shape
     }
@@ -929,6 +935,22 @@ async fn sfv_cannot_repair_an_unavailable_first_article() {
                 Cell { container, naming, binding: Binding::Sfv },
                 profile,
                 vec![(0, (slot_arrivals(4), Interruption::Loss { mask: 1, index_first: false }))],
+            ).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn solid_bare_first_part_keeps_repair_and_restart_fallbacks() {
+    for binding in [Binding::Par2RealFirst, Binding::Par2RealLast] {
+        for profile in PROFILES {
+            run_cell(
+                Cell { container: Container::SevenZipSolid, naming: Naming::BareFirstPart, binding },
+                profile,
+                vec![
+                    (240, (slot_arrivals(4), Interruption::Loss { mask: 1, index_first: false })),
+                    (0, (slot_arrivals(4), Interruption::Restart(2))),
+                ],
             ).await;
         }
     }
