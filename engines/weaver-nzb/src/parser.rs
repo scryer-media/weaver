@@ -150,6 +150,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
     // Meta accumulation
     let mut meta_title: Option<String> = None;
     let mut meta_password: Option<String> = None;
+    let mut meta_passwords = Vec::new();
     let mut meta_tags: Vec<(String, String)> = Vec::new();
 
     // File accumulation
@@ -184,6 +185,9 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             }
                         }
                         text_buf.clear();
+                        reader
+                            .config_mut()
+                            .trim_text(current_meta_type.as_deref() != Some("password"));
                     }
                     "file" => {
                         let mut poster = None;
@@ -299,10 +303,20 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                 match local {
                     "head" => in_head = false,
                     "meta" if in_head => {
+                        reader.config_mut().trim_text(true);
                         if let Some(key) = current_meta_type.take() {
                             match key.as_str() {
                                 "title" => meta_title = Some(text_buf.clone()),
-                                "password" => meta_password = Some(text_buf.clone()),
+                                "password" => {
+                                    if !text_buf.trim().is_empty()
+                                        && !meta_passwords.contains(&text_buf)
+                                    {
+                                        if meta_password.is_none() {
+                                            meta_password = Some(text_buf.clone());
+                                        }
+                                        meta_passwords.push(text_buf.clone());
+                                    }
+                                }
                                 _ => meta_tags.push((key, text_buf.clone())),
                             }
                         }
@@ -422,9 +436,39 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
 
             Ok(Event::Text(e)) => {
                 let decoded = e.xml_content(XmlVersion::Implicit1_0);
-                text_buf = quick_xml::escape::unescape(&decoded)
-                    .map_err(|e| NzbError::Xml(e.to_string()))?
-                    .into_owned();
+                let text = quick_xml::escape::unescape(&decoded)
+                    .map_err(|e| NzbError::Xml(e.to_string()))?;
+                if current_meta_type.as_deref() == Some("password") {
+                    text_buf.push_str(&text);
+                } else {
+                    text_buf = text.into_owned();
+                }
+            }
+
+            Ok(Event::GeneralRef(e)) if current_meta_type.as_deref() == Some("password") => {
+                if let Some(value) = e
+                    .resolve_char_ref()
+                    .map_err(|_| NzbError::Xml("invalid password character reference".into()))?
+                {
+                    text_buf.push(value);
+                } else {
+                    let value = match e.as_ref() {
+                        "amp" => '&',
+                        "lt" => '<',
+                        "gt" => '>',
+                        "quot" => '"',
+                        "apos" => '\'',
+                        _ => {
+                            return Err(NzbError::Xml(
+                                "unsupported password entity reference".into(),
+                            ));
+                        }
+                    };
+                    text_buf.push(value);
+                }
+            }
+            Ok(Event::CData(e)) if current_meta_type.as_deref() == Some("password") => {
+                text_buf.push_str(&e.xml_content(XmlVersion::Implicit1_0));
             }
 
             Err(e) => return Err(NzbError::Xml(e.to_string())),
@@ -459,6 +503,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
         meta: NzbMeta {
             title: meta_title,
             password: meta_password,
+            passwords: meta_passwords,
             tags: meta_tags,
         },
         files,
@@ -575,6 +620,24 @@ mod tests {
 
     use super::*;
     use weaver_model::files::FileRole;
+
+    #[test]
+    fn repeated_password_metadata_preserves_literals_and_redacts_debug() {
+        let input = std::str::from_utf8(MINIMAL_NZB).unwrap().replace(
+            "  <file",
+            r#"  <head>
+          <meta type="password"> </meta>
+          <meta type="password">1</meta>
+          <meta type="password">tr&#117;e</meta>
+          <meta type="password">  synthetic &amp; <![CDATA[<key>]]> Ω  </meta>
+          <meta type="password">1</meta>
+        </head><file"#,
+        );
+        let nzb = parse_nzb(input.as_bytes()).unwrap();
+        assert_eq!(nzb.meta.password.as_deref(), Some("1"));
+        assert_eq!(nzb.meta.passwords, ["1", "true", "  synthetic & <key> Ω  "]);
+        assert!(!format!("{:?}", nzb.meta).contains("synthetic"));
+    }
 
     const MINIMAL_NZB: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
 <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">

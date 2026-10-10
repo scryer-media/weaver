@@ -955,14 +955,14 @@ export const CANCEL_JOB_MUTATION = gql`
 `;
 
 export const REPROCESS_JOB_MUTATION = gql`
-  mutation ReprocessJob($id: Int!) {
-    reprocessJob(id: $id)
+  mutation ReprocessJob($id: Int!, $password: String) {
+    reprocessJob(id: $id, password: $password)
   }
 `;
 
 export const REDOWNLOAD_JOB_MUTATION = gql`
-  mutation RedownloadJob($id: Int!) {
-    redownloadJob(id: $id)
+  mutation RedownloadJob($id: Int!, $password: String) {
+    redownloadJob(id: $id, password: $password)
   }
 `;
 

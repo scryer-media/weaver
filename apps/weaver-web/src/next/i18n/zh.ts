@@ -2,6 +2,15 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** Chinese strings for the Next interface; the keys and their order follow `en.ts`. */
 export const nextZh: LocaleDictionary = {
+  "next.archivePasswords.title": "压缩包密码",
+  "next.archivePasswords.list": "密码（每行一个）",
+  "next.archivePasswords.file": "密码文件",
+  "next.archivePasswords.saved": "密码已保存",
+  "next.archivePasswords.clear": "清除密码",
+  "next.archivePasswords.password": "压缩包密码",
+  "next.archivePasswords.show": "显示",
+  "next.archivePasswords.hide": "隐藏",
+  "next.archivePasswords.loadFailed": "无法加载密码",
   // Shell
   "next.nav.downloads": "下载",
   "next.nav.history": "历史",

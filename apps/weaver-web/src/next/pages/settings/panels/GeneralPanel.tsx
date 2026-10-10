@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { ArchivePasswordSettings } from "./ArchivePasswordSettings";
 import { useMutation, useQuery } from "urql";
 import {
   HARDWARE_PROFILE_QUERY,
@@ -326,6 +327,13 @@ export function GeneralPanel() {
           })),
         }
       : null,
+    {
+      kind: "custom",
+      id: "archivePasswords",
+      title: t("next.archivePasswords.title"),
+      searchText: "archive password file",
+      body: <ArchivePasswordSettings />,
+    },
   ];
 
   return <SettingsBlocks blocks={blocks} loading={fetching && !data} />;

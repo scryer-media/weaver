@@ -852,7 +852,11 @@ fn spawn_test_scheduler(
                         .expect("failed to delete all history rows from test db");
                     let _ = reply.send(Ok(()));
                 }
-                SchedulerCommand::ReprocessJob { job_id, reply } => {
+                SchedulerCommand::ReprocessJob {
+                    job_id,
+                    password,
+                    reply,
+                } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
                             let (download_state, post_state, run_state, _) =
@@ -860,6 +864,9 @@ fn spawn_test_scheduler(
                             state.download_state = download_state;
                             state.post_state = post_state;
                             state.run_state = run_state;
+                            if let Some(password) = password {
+                                state.spec.password = Some(password);
+                            }
                             state.failure_error = None;
                             state.refresh_legacy_status();
                             Ok(())
@@ -872,7 +879,11 @@ fn spawn_test_scheduler(
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::RedownloadJob { job_id, reply } => {
+                SchedulerCommand::RedownloadJob {
+                    job_id,
+                    password,
+                    reply,
+                } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
                             let (download_state, post_state, run_state, _) =
@@ -880,6 +891,9 @@ fn spawn_test_scheduler(
                             state.download_state = download_state;
                             state.post_state = post_state;
                             state.run_state = run_state;
+                            if let Some(password) = password {
+                                state.spec.password = Some(password);
+                            }
                             state.failure_error = None;
                             state.refresh_legacy_status();
                             Ok(())

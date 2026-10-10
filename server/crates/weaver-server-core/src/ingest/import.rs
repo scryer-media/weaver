@@ -104,18 +104,8 @@ pub fn nzb_to_spec(
 }
 
 pub fn normalize_archive_password_candidate(raw: Option<&str>) -> Option<String> {
-    let value = raw?.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let normalized = value.to_ascii_lowercase();
-    if matches!(
-        normalized.as_str(),
-        "0" | "1" | "true" | "false" | "yes" | "no" | "passworded" | "protected"
-    ) {
-        return None;
-    }
-    Some(value.to_string())
+    raw.filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
 }
 
 pub fn nzb_password_candidates(
@@ -134,6 +124,13 @@ pub fn nzb_password_candidates(
         ArchivePasswordSource::NzbMeta,
         nzb.meta.password.as_deref(),
     );
+    for password in &nzb.meta.passwords {
+        push_password_candidate(
+            &mut candidates,
+            ArchivePasswordSource::NzbMeta,
+            Some(password),
+        );
+    }
 
     if let Some(stem) = nzb_path.file_stem().and_then(|segment| segment.to_str())
         && let Some(start) = stem.find("{{")

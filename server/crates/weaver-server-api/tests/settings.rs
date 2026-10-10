@@ -57,6 +57,54 @@ async fn the_schedules_screen_takes_no_script_rules() {
 }
 
 #[tokio::test]
+async fn archive_password_settings_never_return_passwords_and_support_replace_clear() {
+    let h = TestHarness::new().await;
+    let saved = h.execute(r#"mutation { updateArchivePasswordSettings(passwords: ["synthetic-key", "enc:v1:literal"], passwordFile: "/fixture/passwords") { hasPasswords passwordFile } }"#).await;
+    assert_no_errors(&saved);
+    assert_eq!(
+        response_data(&saved)["updateArchivePasswordSettings"]["hasPasswords"],
+        true
+    );
+    assert!(!response_data(&saved).to_string().contains("synthetic-key"));
+    assert!(
+        !h.db
+            .get_setting("archive_passwords")
+            .unwrap()
+            .unwrap()
+            .contains("synthetic-key")
+    );
+    let kept = h.execute(r#"mutation { updateArchivePasswordSettings(passwordFile: null) { hasPasswords passwordFile } }"#).await;
+    assert_no_errors(&kept);
+    assert_eq!(
+        response_data(&kept)["updateArchivePasswordSettings"]["hasPasswords"],
+        true
+    );
+    assert!(response_data(&kept)["updateArchivePasswordSettings"]["passwordFile"].is_null());
+    let cleared = h
+        .execute(r#"mutation { updateArchivePasswordSettings(passwords: []) { hasPasswords } }"#)
+        .await;
+    assert_no_errors(&cleared);
+    assert_eq!(
+        response_data(&cleared)["updateArchivePasswordSettings"]["hasPasswords"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn archive_password_settings_and_reveal_require_admin() {
+    let h = TestHarness::new().await;
+    for scope in [CallerScope::Read, CallerScope::Control] {
+        for query in [
+            "{ archivePasswordSettings { hasPasswords passwordFile } }",
+            "mutation { updateArchivePasswordSettings(passwords: [\"synthetic\"]) { hasPasswords } }",
+            "{ validatedArchivePassword(id: 1) }",
+        ] {
+            assert!(!h.execute_as(query, scope).await.errors.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn get_settings_defaults() {
     let h = TestHarness::new().await;
     let resp = h

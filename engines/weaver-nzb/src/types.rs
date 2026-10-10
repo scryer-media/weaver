@@ -9,12 +9,25 @@ pub struct Nzb {
 }
 
 // NZB metadata from the `<head>` section.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct NzbMeta {
     pub title: Option<String>,
     pub password: Option<String>,
+    #[serde(default)]
+    pub passwords: Vec<String>,
     // Arbitrary key-value pairs from `<meta>` elements (excluding title/password).
     pub tags: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for NzbMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NzbMeta")
+            .field("title", &self.title)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("password_count", &self.passwords.len())
+            .field("tags", &self.tags)
+            .finish()
+    }
 }
 
 // A single file in the NZB (one `<file>` element).

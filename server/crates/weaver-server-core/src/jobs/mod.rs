@@ -1,3 +1,4 @@
+mod archive_password;
 pub mod assembly;
 pub mod duplicate;
 pub mod duplicate_persistence;

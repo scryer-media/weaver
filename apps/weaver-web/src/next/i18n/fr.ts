@@ -2,6 +2,15 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** French strings for the Next interface; the keys and their order follow `en.ts`. */
 export const nextFr: LocaleDictionary = {
+  "next.archivePasswords.title": "Mots de passe des archives",
+  "next.archivePasswords.list": "Mots de passe (un par ligne)",
+  "next.archivePasswords.file": "Fichier de mots de passe",
+  "next.archivePasswords.saved": "Mots de passe enregistrés",
+  "next.archivePasswords.clear": "Effacer les mots de passe",
+  "next.archivePasswords.password": "Mot de passe de l’archive",
+  "next.archivePasswords.show": "Afficher",
+  "next.archivePasswords.hide": "Masquer",
+  "next.archivePasswords.loadFailed": "Impossible de charger le mot de passe",
   // Shell
   "next.nav.downloads": "Téléchargements",
   "next.nav.history": "Historique",

@@ -44,6 +44,30 @@ pub(crate) struct SettingsMutation;
 
 #[Object]
 impl SettingsMutation {
+    #[graphql(guard = "AdminGuard")]
+    async fn update_archive_password_settings(
+        &self,
+        ctx: &Context<'_>,
+        passwords: Option<Vec<String>>,
+        password_file: MaybeUndefined<String>,
+    ) -> Result<crate::settings::types::ArchivePasswordSettings> {
+        let db = ctx.data::<Database>()?.clone();
+        let password_file = match password_file {
+            MaybeUndefined::Undefined => None,
+            MaybeUndefined::Null => Some(None),
+            MaybeUndefined::Value(file) => Some(Some(file)),
+        };
+        let (has_passwords, password_file) = tokio::task::spawn_blocking(move || {
+            db.save_archive_password_settings(passwords, password_file)?;
+            db.archive_password_settings()
+        })
+        .await??;
+        Ok(crate::settings::types::ArchivePasswordSettings {
+            has_passwords,
+            password_file,
+        })
+    }
+
     /// Choose how hard Weaver leans on this machine.
     ///
     /// A profile the machine cannot honour is refused by name rather than

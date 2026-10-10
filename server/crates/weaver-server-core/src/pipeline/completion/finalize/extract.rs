@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
 
+mod password_candidates;
+use password_candidates::extract_7z_with_password_candidates;
 pub(in crate::pipeline) mod sequential;
 
 // The decoder an xz file on disk gets: single-threaded over the whole file,
@@ -598,7 +600,7 @@ where
     };
     let archive = archive
         .and_then(|archive| check_sevenz_decoder_memory(&archive, &job_limits).map(|()| archive))
-        .map_err(|e| format!("failed to read 7z archive: {e}"))?;
+        .map_err(|e| sevenz_extraction_error(&e))?;
     Ok((archive, permit))
 }
 
@@ -1054,6 +1056,11 @@ pub(in crate::pipeline) const SEVENZ_BLOCK_DATA_ERROR_PREFIX: &str = "7z block d
 
 fn sevenz_extraction_error(error: &sevenz_turbo::Error) -> String {
     use sevenz_turbo::BlockErrorKind;
+    if matches!(error, sevenz_turbo::Error::PasswordRequired)
+        || matches!(error, sevenz_turbo::Error::BlockDecode { kind: BlockErrorKind::Password, message, .. } if message == "PasswordRequired")
+    {
+        return "WEAVER_PASSWORD_REQUIRED: the 7z archive requires a valid password".into();
+    }
 
     let bytes_are_wrong = match error {
         sevenz_turbo::Error::BlockDecode {
@@ -1151,15 +1158,52 @@ where
 
     // Metadata pass: every member's path and declared size is checked before
     // anything is created on disk.
-    let (known_total, decode_reservation) = {
-        let (archive, _header_permit) = read_sevenz_archive_for_listing(
+    let (known_total, decode_reservation, selected_password) = {
+        let plaintext = read_sevenz_archive_for_listing(
             decode_memory,
             end_header_bytes,
             budget,
-            password,
+            &sevenz_turbo::Password::empty(),
             &|granted| header_pass_archive_limits(budget, granted, end_header_bytes),
             &mut open_reader,
-        )?;
+        );
+        let ((archive, _header_permit), encrypted_headers) = match plaintext {
+            Ok(archive) => (archive, false),
+            Err(error)
+                if error.starts_with("WEAVER_PASSWORD_REQUIRED:") && !password.is_empty() =>
+            {
+                (
+                    read_sevenz_archive_for_listing(
+                        decode_memory,
+                        end_header_bytes,
+                        budget,
+                        password,
+                        &|granted| header_pass_archive_limits(budget, granted, end_header_bytes),
+                        &mut open_reader,
+                    )?,
+                    true,
+                )
+            }
+            Err(error) => return Err(error),
+        };
+        let encrypted = encrypted_headers
+            || archive
+                .blocks
+                .iter()
+                .flat_map(|block| &block.coders)
+                .any(|coder| {
+                    coder.encoder_method_id() == sevenz_turbo::EncoderMethod::ID_AES256_SHA256
+                });
+        let selected_password = if encrypted && !password.is_empty() {
+            let units: Vec<_> = password
+                .as_slice()
+                .chunks_exact(2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .collect();
+            String::from_utf16(&units).ok()
+        } else {
+            None
+        };
         for entry in &archive.files {
             budget.check_member_metadata(entry.name(), entry.size())?;
             root.validate_relative_path(entry.name())
@@ -1199,7 +1243,7 @@ where
                 budget.max_memory_bytes(),
             ),
         };
-        (known_total, decode_reservation)
+        (known_total, decode_reservation, selected_password)
     };
     phase_counters
         .total_bytes
@@ -1372,7 +1416,7 @@ where
     Ok(FullSetExtractionOutcome {
         extracted: extracted_members,
         failed: Vec::new(),
-        selected_password: None,
+        selected_password,
     })
 }
 
@@ -1932,18 +1976,18 @@ fn extract_zip(
     archive_path: &Path,
     root: &ExtractionRoot,
     budget: &Arc<JobExtractionBudget>,
-    password: Option<&str>,
+    passwords: &[crate::jobs::ArchivePasswordCandidate],
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
     phase_counters: Option<Arc<PhaseCounters>>,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Option<String>), String> {
     let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open zip: {e}"))?;
-    extract_zip_stream(
+    extract_zip_stream_candidates(
         file,
         root,
         budget,
-        password,
+        passwords,
         event_tx,
         job_id,
         set_name,
@@ -1952,6 +1996,7 @@ fn extract_zip(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(in crate::pipeline) fn extract_zip_stream<R: std::io::Read + std::io::Seek>(
     file: R,
     root: &ExtractionRoot,
@@ -1962,6 +2007,39 @@ pub(in crate::pipeline) fn extract_zip_stream<R: std::io::Read + std::io::Seek>(
     set_name: &str,
     phase_counters: Option<Arc<PhaseCounters>>,
 ) -> Result<Vec<String>, String> {
+    let passwords = password
+        .into_iter()
+        .map(|value| {
+            crate::jobs::ArchivePasswordCandidate::new(
+                crate::jobs::ArchivePasswordSource::Explicit,
+                value.to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    extract_zip_stream_candidates(
+        file,
+        root,
+        budget,
+        &passwords,
+        event_tx,
+        job_id,
+        set_name,
+        phase_counters,
+    )
+    .map(|(members, _)| members)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::pipeline) fn extract_zip_stream_candidates<R: std::io::Read + std::io::Seek>(
+    file: R,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
+    passwords: &[crate::jobs::ArchivePasswordCandidate],
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+    phase_counters: Option<Arc<PhaseCounters>>,
+) -> Result<(Vec<String>, Option<String>), String> {
     let file = BudgetedReader::new(file, Arc::clone(budget));
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("failed to read zip archive: {e}"))?;
@@ -1987,16 +2065,42 @@ pub(in crate::pipeline) fn extract_zip_stream<R: std::io::Read + std::io::Seek>(
             .fetch_add(known_total, Ordering::Relaxed);
     }
 
+    let mut winner: Option<usize> = None;
     for i in 0..archive.len() {
-        let mut entry = if let Some(pw) = password {
-            archive
-                .by_index_decrypt(i, pw.as_bytes())
-                .map_err(|e| format!("failed to read zip entry {i}: {e}"))?
+        let encrypted = archive
+            .by_index_raw(i)
+            .map_err(|error| format!("failed to read zip entry metadata {i}: {error}"))?
+            .encrypted();
+        let selected = if encrypted {
+            let mut selected = None;
+            for index in winner
+                .into_iter()
+                .chain((0..passwords.len()).filter(|index| Some(*index) != winner))
+            {
+                budget
+                    .check_active_io()
+                    .map_err(|error| error.to_string())?;
+                match archive.by_index_decrypt(i, passwords[index].value().as_bytes()) {
+                    Ok(_) => {
+                        selected = Some(index);
+                        break;
+                    }
+                    Err(zip::result::ZipError::InvalidPassword) => continue,
+                    Err(error) => return Err(format!("failed to read zip entry {i}: {error}")),
+                }
+            }
+            Some(selected.ok_or_else(|| {
+                "WEAVER_PASSWORD_REQUIRED: no supplied password could decrypt the ZIP member"
+                    .to_string()
+            })?)
         } else {
-            archive
-                .by_index(i)
-                .map_err(|e| format!("failed to read zip entry {i}: {e}"))?
+            None
         };
+        let mut entry = match selected {
+            Some(index) => archive.by_index_decrypt(i, passwords[index].value().as_bytes()),
+            None => archive.by_index(i),
+        }
+        .map_err(|error| format!("failed to read zip entry {i}: {error}"))?;
         budget.check_member_metadata(entry.name(), entry.size())?;
         let raw_name = entry.name().to_string();
         let safe_path =
@@ -2055,9 +2159,15 @@ pub(in crate::pipeline) fn extract_zip_stream<R: std::io::Read + std::io::Seek>(
         });
         tracing::info!(job_id = job_id.0, member = %name, bytes_written, "zip member extracted");
         extracted.push(name);
+        if selected.is_some() {
+            winner = selected;
+        }
     }
 
-    Ok(extracted)
+    Ok((
+        extracted,
+        winner.map(|index| passwords[index].value().to_string()),
+    ))
 }
 
 fn extract_tar(
@@ -3046,7 +3156,7 @@ impl Pipeline {
         set_name: &str,
     ) -> Result<u32, String> {
         let part_candidates = self.archive_set_indexed_part_paths(job_id, set_name)?;
-        let password = self.primary_archive_password_for_job(job_id);
+        let passwords = self.archive_password_candidates_for_set(job_id, set_name);
 
         let output_dir = self.extraction_staging_dir(job_id);
         let budget = self.extraction_budget(job_id, &output_dir)?;
@@ -3102,19 +3212,13 @@ impl Pipeline {
                         .map_err(|error| format!("failed to read 7z archive: {error}"))?;
                     let end_header_bytes = sevenz_declared_end_header_bytes(&file_paths[0]);
 
-                    let pw = if let Some(ref p) = password {
-                        sevenz_turbo::Password::new(p)
-                    } else {
-                        sevenz_turbo::Password::empty()
-                    };
-
                     let context = SevenZipExtractionContext {
                         job_id,
                         set_name: set_name_owned,
                         output_dir,
                         root,
                         budget,
-                        password: pw,
+                        password: sevenz_turbo::Password::empty(),
                         event_tx,
                         phase_counters,
                         decode_memory: SevenZipDecodeMemory::ReservedForFixedThreads {
@@ -3128,12 +3232,12 @@ impl Pipeline {
                     // concatenation of its parts. That is the only difference
                     // between the two conventional paths.
                     if file_paths.len() == 1 {
-                        extract_7z_stream(&context, || {
+                        extract_7z_with_password_candidates(context, &passwords, || {
                             std::fs::File::open(&file_paths[0])
                                 .map_err(|e| format!("failed to open 7z file: {e}"))
                         })
                     } else {
-                        extract_7z_stream(&context, || {
+                        extract_7z_with_password_candidates(context, &passwords, || {
                             crate::pipeline::archive::split_reader::SplitFileReader::open(
                                 &file_paths,
                             )
@@ -3216,7 +3320,7 @@ impl Pipeline {
         kind: SimpleArchiveKind,
     ) -> Result<u32, String> {
         let file_paths = self.archive_set_part_paths(job_id, set_name)?;
-        let password = self.primary_archive_password_for_job(job_id);
+        let passwords = self.archive_password_candidates_for_set(job_id, set_name);
         let joined_output_already_present = matches!(kind, SimpleArchiveKind::Split)
             .then(|| self.present_split_join_output(job_id, set_name, &file_paths))
             .flatten();
@@ -3276,17 +3380,22 @@ impl Pipeline {
                         &budget,
                     )?;
 
+                    let mut selected_password = None;
                     let extracted_members = match kind {
-                        SimpleArchiveKind::Zip => extract_zip(
-                            &file_paths[0],
-                            &root,
-                            &budget,
-                            password.as_deref(),
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                            Some(Arc::clone(&phase_counters)),
-                        )?,
+                        SimpleArchiveKind::Zip => {
+                            let (members, password) = extract_zip(
+                                &file_paths[0],
+                                &root,
+                                &budget,
+                                &passwords,
+                                &event_tx,
+                                job_id,
+                                &set_name_owned,
+                                Some(Arc::clone(&phase_counters)),
+                            )?;
+                            selected_password = password;
+                            members
+                        }
                         SimpleArchiveKind::Tar => extract_tar(
                             &file_paths[0],
                             &root,
@@ -3383,7 +3492,7 @@ impl Pipeline {
                     Ok(FullSetExtractionOutcome {
                         extracted: extracted_members,
                         failed: Vec::new(),
-                        selected_password: None,
+                        selected_password,
                     })
                 })
             })

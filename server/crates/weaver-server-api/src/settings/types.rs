@@ -6,6 +6,12 @@ use weaver_server_core::runtime::system_profile::SystemProfile;
 
 use crate::jobs::types::DuplicateActionGql;
 
+#[derive(SimpleObject)]
+pub struct ArchivePasswordSettings {
+    pub has_passwords: bool,
+    pub password_file: Option<String>,
+}
+
 /// How hard Weaver leans on the machine it runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
 pub enum HardwareProfileGql {
