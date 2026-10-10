@@ -139,7 +139,9 @@ jobs:
             sevenz) filter='test(::sevenz_store::schedules::)' ;;
             *) echo 'Unknown archive family' >&2; exit 1 ;;
           esac
-          cargo nextest run --locked \
+          # Running from an archive builds nothing, so nextest refuses cargo
+          # build options here; the build job above already resolves --locked.
+          cargo nextest run \
             --profile archive-matrix-all \
             --run-ignored all \
             --archive-file target/archive-matrix-extended.tar.zst \
