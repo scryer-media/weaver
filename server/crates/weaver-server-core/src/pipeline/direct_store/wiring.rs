@@ -2097,6 +2097,12 @@ impl Pipeline {
                         })
                 });
             if let Some((set_index, position_claimed)) = existing {
+                // A volume whose first member does not continue the member its
+                // neighbour leaves open belongs to another archive: the same
+                // two sets the claim collision proves, caught one volume
+                // earlier.
+                let position_claimed = position_claimed
+                    || self.header_chain_breaks(job_id, set_index, file_index, volume_number);
                 if position_claimed || leaked {
                     // A second file for a claimed position is a second set
                     // the bytes cannot tell apart; a leaked file that proves
@@ -2134,12 +2140,21 @@ impl Pipeline {
                     volume_index: volume_number,
                 });
             }
+            // One header volume set per job for the job's life, not only while
+            // the first is open: a set retires from the registry once whole,
+            // and a volume arriving after that is a second archive's, which
+            // nothing in the bytes ties to positions of its own.
             if leaked
                 || self
                     .direct_store
                     .identity
                     .get(&job_id)
                     .is_some_and(|admission| admission.header_volume_sets_poisoned)
+                || self.direct_store.sets_for(job_id).iter().any(|set| {
+                    set.plan().identity.is_some_and(|identity| {
+                        identity.kind == super::plan::IdentityKind::HeaderVolumeSet
+                    })
+                })
             {
                 return None;
             }
@@ -2410,6 +2425,68 @@ impl Pipeline {
 
     /// Books one header binding, retiring the set's bookkeeping once its plan
     /// closed and every position bound.
+    /// Whether binding `file_index` at `volume_number` into a header volume
+    /// set breaks the member chain a bound neighbour states.
+    ///
+    /// A RAR5 volume whose first member continues past its end holds that one
+    /// member and nothing else, so the next volume of the same archive opens
+    /// with the continuation of exactly that member. Anything else is a
+    /// volume of another archive at the same position. A volume whose first
+    /// member closes inside it says nothing about its last member from its
+    /// first 16 KiB, and binds as before; so does a pair whose prefixes are
+    /// not both held.
+    fn header_chain_breaks(
+        &self,
+        job_id: JobId,
+        set_index: usize,
+        file_index: u32,
+        volume_number: u32,
+    ) -> bool {
+        let Some(header_set) = self
+            .direct_store
+            .identity
+            .get(&job_id)
+            .and_then(|admission| {
+                admission
+                    .header_sets
+                    .iter()
+                    .find(|header_set| header_set.set_index == set_index)
+            })
+        else {
+            return false;
+        };
+        let first_member = |file_index: u32| {
+            let prefix = self
+                .file_prefix_16k
+                .get(&NzbFileId { job_id, file_index })?;
+            let walk = unrar_rs::RarArchive::parse_volume_facts_walk(
+                std::io::Cursor::new(prefix.clone()),
+                None,
+            )
+            .ok()?;
+            walk.facts
+                .members
+                .into_iter()
+                .next()
+                .map(|member| (member.name, member.split_before, member.split_after))
+        };
+        let breaks = |previous: &(String, bool, bool), next: &(String, bool, bool)| {
+            previous.2 && !(next.1 && next.0 == previous.0)
+        };
+        let Some(own) = first_member(file_index) else {
+            return false;
+        };
+        header_set.bound.iter().any(|(&other, &position)| {
+            if position.checked_add(1) == Some(volume_number) {
+                first_member(other).is_some_and(|previous| breaks(&previous, &own))
+            } else if volume_number.checked_add(1) == Some(position) {
+                first_member(other).is_some_and(|next| breaks(&own, &next))
+            } else {
+                false
+            }
+        })
+    }
+
     fn record_header_binding(
         &mut self,
         job_id: JobId,
@@ -2725,24 +2802,34 @@ impl Pipeline {
         }
     }
 
-    /// Retires every header set a repair just overtook.
+    /// Retires every header volume set a repair overtakes.
     ///
-    /// A file the repair rebuilt holds conventional bytes, so no set admitted
-    /// from volume headers can bind it any more. A live header set that does
-    /// not already hold that file could have needed it, and the conventional
-    /// set naming the file now waits on the volumes the header set holds
-    /// virtually: neither would ever finish. The header set demotes, its
-    /// volumes materialize, and the conventional set completes. The rebuilt
-    /// files are booked as leaked, so the starvation arm judges the rosters
-    /// on the same evidence.
-    pub(crate) async fn note_identity_repaired_files(&mut self, job_id: JobId, files: &[u32]) {
+    /// A file a repair rebuilds holds conventional bytes, so no set admitted
+    /// from volume headers can bind it any more. A live header volume set
+    /// that does not already hold that file could have needed it, and the
+    /// conventional set naming the file would wait on the volumes the header
+    /// set holds virtually: neither would ever finish. The header set demotes,
+    /// its volumes materialize, and the conventional set completes. A
+    /// standalone header archive is whole at admission and stays.
+    ///
+    /// Returns whether a header set left. A job without header sets is left
+    /// as it was: rosters never coexist with header sets, and their own arms
+    /// judge a repaired file.
+    pub(crate) async fn note_identity_repaired_files(
+        &mut self,
+        job_id: JobId,
+        files: &[u32],
+    ) -> bool {
         if files.is_empty() {
-            return;
+            return false;
         }
         let overtaken: Vec<usize> = {
             let Some(admission) = self.direct_store.identity.get_mut(&job_id) else {
-                return;
+                return false;
             };
+            if admission.header_sets.is_empty() {
+                return false;
+            }
             admission.leaked.extend(files.iter().copied());
             let admission = &self.direct_store.identity[&job_id];
             let held: HashSet<u32> = admission
@@ -2760,14 +2847,17 @@ impl Pipeline {
                 .header_sets
                 .iter()
                 .filter(|header_set| {
-                    self.direct_store
-                        .set(job_id, header_set.set_index)
-                        .is_some_and(|set| !set.is_demoted() && !set.is_finalized())
+                    header_set.volume_set
+                        && self
+                            .direct_store
+                            .set(job_id, header_set.set_index)
+                            .is_some_and(|set| !set.is_demoted() && !set.is_finalized())
                         && files.iter().any(|file| !held.contains(file))
                 })
                 .map(|header_set| header_set.set_index)
                 .collect()
         };
+        let any = !overtaken.is_empty();
         for set_index in overtaken {
             warn!(
                 job_id = job_id.0,
@@ -2778,6 +2868,40 @@ impl Pipeline {
             self.condemn_header_set(job_id, set_index).await;
         }
         self.identity_viability_sweep(job_id).await;
+        any
+    }
+
+    /// Demotes every identity-admitted set still routing when the job is
+    /// about to leave for extraction or the final move.
+    ///
+    /// By then every article is in and the PAR2 question is settled, so a
+    /// live set is one that will never finalize: its evidence bound volumes
+    /// that do not make one archive. Its volumes exist only virtually, so no
+    /// conventional set can see them, and completing the job would publish
+    /// the set's member partials and envelopes in place of its members. The
+    /// set demotes, its volumes materialize, and the job goes round again.
+    pub(crate) async fn demote_stranded_identity_sets(&mut self, job_id: JobId) -> bool {
+        let stranded: Vec<usize> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| {
+                set.plan().identity.is_some() && !set.is_demoted() && !set.is_finalized()
+            })
+            .map(|(set_index, _)| set_index)
+            .collect();
+        if stranded.is_empty() {
+            return false;
+        }
+        for set_index in stranded {
+            warn!(
+                job_id = job_id.0,
+                set_index, "an identity-admitted set was still routing when the job settled"
+            );
+            self.condemn_header_set(job_id, set_index).await;
+        }
+        true
     }
 
     /// Retires one roster: a pending one is simply dropped, an admitted one

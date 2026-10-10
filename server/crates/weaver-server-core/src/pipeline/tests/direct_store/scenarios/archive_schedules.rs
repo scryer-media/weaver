@@ -166,6 +166,10 @@ pub(super) struct Route {
     /// that arrives after the body names nothing in time and the set goes
     /// conventional.
     pub named_by_early_index: bool,
+    /// Each set is admitted from its own volumes and either finishes direct
+    /// or leaves on its own, so a schedule may finish any number of them,
+    /// all included. The campaign states the exact count where it is known.
+    pub sets_finish_independently: bool,
 }
 
 impl Route {
@@ -176,6 +180,7 @@ impl Route {
         unmapped_loss: |_| false,
         unnamed_loss: |_| false,
         named_by_early_index: false,
+        sets_finish_independently: false,
     };
 
     /// A set the layout refuses to route: it demotes for its shape and
@@ -188,6 +193,7 @@ impl Route {
             unmapped_loss: |_| false,
             unnamed_loss: |_| false,
             named_by_early_index: false,
+            sets_finish_independently: false,
         }
     }
 }
@@ -361,6 +367,8 @@ impl ExtractionProfile {
             );
         } else if route.sets == 1 {
             assert_eq!(outcome.finalized, 0, "{trace:?}");
+        } else if route.sets_finish_independently {
+            assert!(outcome.finalized <= route.sets, "{trace:?}");
         } else {
             assert!(outcome.finalized < route.sets, "{trace:?}");
         }
@@ -1052,8 +1060,7 @@ pub(super) async fn run_schedule_with(
     let job = JobId(42200);
     let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
     let loss = interruption.loss();
-    let index_first =
-        !options.index_last && loss.map_or(described.is_some(), |(_, first)| first);
+    let index_first = !options.index_last && loss.map_or(described.is_some(), |(_, first)| first);
     let recovery = if matches!(
         options.recovery,
         RecoveryFormat::Embedded | RecoveryFormat::Absent
@@ -2288,15 +2295,49 @@ impl HexTwoSets {
         "26f9b0e3c7a14d58b2e6f0a9c3d7e1b4",
     ];
 
+    /// How many sets direct store finishes in an uninterrupted arrival order.
+    ///
+    /// Direct store admits one header volume set per job, from the first
+    /// RAR5 volume to arrive. When the next distinct volume is the same
+    /// archive's, the set is whole and finishes direct, and the other
+    /// archive's volumes go the conventional way. When it is the other
+    /// archive's, its position collides or its first member does not
+    /// continue the open set's member, so the set demotes as unfillable and
+    /// both archives extract conventionally. RAR4 states no position, so no
+    /// set is admitted at all.
+    fn direct_finalized(self, order: &[(u32, u32)]) -> usize {
+        if matches!(self, Self::Rar4) {
+            return 0;
+        }
+        // A schedule names slot `2 * pair.0 + pair.1`, one article a volume,
+        // and the first archive holds the even slots.
+        let mut distinct = Vec::new();
+        for (high, low) in order {
+            let slot = 2 * high + low;
+            if !distinct.contains(&slot) {
+                distinct.push(slot);
+            }
+        }
+        match distinct.as_slice() {
+            [first, second, ..] if first % 2 == second % 2 => 1,
+            _ => 0,
+        }
+    }
+
     fn route(self) -> Route {
         match self {
-            // Direct store admits one set by content per job. A second set's
-            // first volume leaves the roster it admitted unfillable, so both
-            // sets leave direct store and extract from their volumes, each
-            // placed by its own headers.
+            // See `direct_finalized`: either the first archive finishes direct
+            // and the second never enters direct store, or the open set
+            // demotes as unfillable. A restart forgets the job's one header
+            // set, so the second archive may then finish direct as well.
+            // Neither archive ever finishes from the other's volumes: both
+            // members' exact bytes are checked in every case.
             Self::Rar5 => Route {
                 sets: 2,
-                ..Route::refused(|reason| matches!(reason, DemotionReason::IdentityRosterUnfillable))
+                sets_finish_independently: true,
+                ..Route::refused(|reason| {
+                    matches!(reason, DemotionReason::IdentityRosterUnfillable)
+                })
             },
             // A RAR4 volume says nothing of its set in its own headers.
             Self::Rar4 => Route {
@@ -2319,7 +2360,16 @@ async fn hex_two_set_conventional_campaign(format: HexTwoSets, selection: Select
     hex_two_set_profile(format, selection, ExtractionProfile::Conventional).await;
 }
 
-async fn hex_two_set_profile(format: HexTwoSets, selection: Selection, profile: ExtractionProfile) {
+/// The members, their payloads, the posted volumes and the job of the
+/// two-set fixture.
+type HexTwoSetFixture = (
+    [&'static str; 2],
+    Vec<Vec<u8>>,
+    Vec<(String, Vec<u8>)>,
+    JobSpec,
+);
+
+fn hex_two_set_fixture(format: HexTwoSets) -> HexTwoSetFixture {
     let members = ["alpha.mkv", "nested/beta.mkv"];
     let payloads: Vec<Vec<u8>> = [(6001, 7), (4093, 11)]
         .into_iter()
@@ -2346,6 +2396,66 @@ async fn hex_two_set_profile(format: HexTwoSets, selection: Selection, profile: 
         .map(|((set, part), name)| (name.to_string(), sets[set][part].clone()))
         .collect();
     let spec = direct_store_job_spec_with_articles("Hex two set schedules", &volumes, 1);
+    (members, payloads, volumes, spec)
+}
+
+/// Holds one finished two-set schedule to its route and to both members'
+/// exact bytes.
+fn assert_hex_two_set_delivery(
+    format: HexTwoSets,
+    profile: ExtractionProfile,
+    outcome: &Outcome,
+    interruption: Interruption,
+) {
+    let (members, payloads, _, _) = hex_two_set_fixture(format);
+    assert_eq!(
+        outcome.status,
+        Some(JobStatus::Complete),
+        "{format:?} {interruption:?}: {:?}",
+        outcome.trace
+    );
+    profile.assert_delivery(outcome, format.route(), &members, interruption);
+    for (member, payload) in members.iter().zip(&payloads) {
+        assert_eq!(
+            outcome.files[*member].as_deref(),
+            Some(payload.as_slice()),
+            "{format:?} {member} {interruption:?}: {:?}",
+            outcome.trace
+        );
+    }
+}
+
+/// Runs one named arrival order of the two-set fixture in every profile.
+async fn hex_two_set_order(format: HexTwoSets, order: &[(u32, u32)], finalized: usize) {
+    assert_eq!(format.direct_finalized(order), finalized);
+    let (members, _, volumes, spec) = hex_two_set_fixture(format);
+    for profile in [
+        ExtractionProfile::DirectStore,
+        ExtractionProfile::Chase,
+        ExtractionProfile::Conventional,
+    ] {
+        let outcome = run_profile_schedule(
+            profile,
+            spec.clone(),
+            &volumes,
+            order,
+            &members,
+            Interruption::None,
+        )
+        .await;
+        assert_hex_two_set_delivery(format, profile, &outcome, Interruption::None);
+        if profile == ExtractionProfile::DirectStore {
+            assert_eq!(
+                outcome.finalized, finalized,
+                "{format:?} order={order:?}: {:?}",
+                outcome.trace
+            );
+        }
+    }
+}
+
+async fn hex_two_set_profile(format: HexTwoSets, selection: Selection, profile: ExtractionProfile) {
+    let (members, payloads, volumes, spec) = hex_two_set_fixture(format);
     let route = format.route();
     let check = |outcome: &Outcome, interruption: Interruption| {
         assert_eq!(
@@ -2423,7 +2533,7 @@ async fn hex_two_set_profile(format: HexTwoSets, selection: Selection, profile: 
             let unique_arrivals = order.len() == volumes.len();
             match profile {
                 ExtractionProfile::DirectStore => {
-                    let expected = if route.direct { route.sets } else { 0 };
+                    let expected = format.direct_finalized(&order);
                     assert_eq!(
                         outcome.finalized, expected,
                         "{format:?} case={case} order={order:?}: {:?}",
@@ -2450,6 +2560,23 @@ async fn hex_two_set_profile(format: HexTwoSets, selection: Selection, profile: 
 #[tokio::test]
 async fn rar5_hex_two_set_arrival_schedules() {
     hex_two_set_campaign(HexTwoSets::Rar5, Selection::Smoke).await;
+}
+
+/// The first archive's second volume, then the second archive's first, then
+/// the rest: the order that once bound one volume of each archive into a
+/// single set and completed the job with that set's partials as output.
+#[tokio::test]
+async fn rar5_hex_two_sets_interleaved_across_positions_never_merge() {
+    // Slots 2, 1, 0, 3: A1, B0, A0, B1.
+    hex_two_set_order(HexTwoSets::Rar5, &[(1, 0), (0, 1), (0, 0), (1, 1)], 0).await;
+}
+
+/// Each archive's later volume ahead of its first, as a `.r00` posted before
+/// its `.rar` arrives: the first archive is whole before the second appears.
+#[tokio::test]
+async fn rar5_hex_two_sets_with_each_later_volume_first_never_merge() {
+    // Slots 2, 0, 3, 1: A1, A0, B1, B0.
+    hex_two_set_order(HexTwoSets::Rar5, &[(1, 0), (0, 0), (1, 1), (0, 1)], 1).await;
 }
 #[tokio::test]
 async fn rar4_hex_two_set_arrival_schedules() {

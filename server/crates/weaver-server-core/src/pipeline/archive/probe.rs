@@ -808,7 +808,10 @@ impl NamelessRarVolume {
     fn follows(&self, previous: &NamelessRarVolume, index: u32) -> bool {
         if self.facts.format != previous.facts.format
             || self.facts.is_encrypted != previous.facts.is_encrypted
-            || self.facts.volume_number.is_some_and(|stated| stated != index)
+            || self
+                .facts
+                .volume_number
+                .is_some_and(|stated| stated != index)
         {
             return false;
         }
@@ -826,7 +829,6 @@ impl NamelessRarVolume {
             _ => false,
         }
     }
-
 }
 
 /// Why a volume with these headers is not a set's first volume, in words an
@@ -1060,8 +1062,7 @@ impl Pipeline {
                 to_volume = ?wanted.volume_index,
                 "placing RAR volume by its headers"
             );
-            if let Err(error) = self.set_detected_archive_identity(job_id, volume.file_id, wanted)
-            {
+            if let Err(error) = self.set_detected_archive_identity(job_id, volume.file_id, wanted) {
                 tracing::warn!(
                     job_id = job_id.0,
                     filename = %volume.filename,

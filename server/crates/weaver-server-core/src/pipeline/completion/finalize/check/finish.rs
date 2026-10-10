@@ -261,7 +261,8 @@ impl Pipeline {
         // holds virtually, so the header set hands them over.
         let repaired_files =
             self.par2_rewritten_job_files(job_id, &post_repair_verification, &rewritten);
-        self.note_identity_repaired_files(job_id, &repaired_files)
+        let _ = self
+            .note_identity_repaired_files(job_id, &repaired_files)
             .await;
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.refresh_topologies", stage_start);

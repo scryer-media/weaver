@@ -46,7 +46,12 @@ async fn complete_job_and_drive_extraction(
     drive_extractions_to_terminal(pipeline, job_id, 64).await;
 }
 
-fn assert_completed_with_member(pipeline: &Pipeline, job_id: JobId, complete_dir: &Path, name: &str) {
+fn assert_completed_with_member(
+    pipeline: &Pipeline,
+    job_id: JobId,
+    complete_dir: &Path,
+    name: &str,
+) {
     let status = job_status_for_assert(pipeline, job_id);
     assert_eq!(
         status,
@@ -117,7 +122,10 @@ async fn extensionless_hex_volumes_without_a_first_volume_report_what_was_seen()
         "the set must not reach an extraction attempt: {error}"
     );
     for (filename, _) in &files {
-        assert!(error.contains(filename.as_str()), "{filename} missing from: {error}");
+        assert!(
+            error.contains(filename.as_str()),
+            "{filename} missing from: {error}"
+        );
     }
     assert!(error.contains("header states volume 1"), "{error}");
 }
@@ -144,7 +152,12 @@ async fn extensionless_hex_volumes_bound_through_par2_group_into_one_set() {
     let mut spec = rar_job_spec(name, &files);
     spec.password = Some(PASSWORD.to_string());
     insert_active_job(&mut pipeline, job_id, spec).await;
-    install_test_par2_runtime(&mut pipeline, job_id, placement_par2_file_set(&described), &[]);
+    install_test_par2_runtime(
+        &mut pipeline,
+        job_id,
+        placement_par2_file_set(&described),
+        &[],
+    );
 
     for (index, (filename, bytes)) in files.iter().enumerate() {
         write_and_complete_file(&mut pipeline, job_id, index as u32, filename, bytes).await;

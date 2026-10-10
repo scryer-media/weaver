@@ -2761,6 +2761,14 @@ impl Pipeline {
                     }
                 }
                 if rar_waiting_for_missing_volumes {
+                    // The missing volume may be one an identity set holds
+                    // virtually. With every article in and no PAR2 verdict
+                    // coming, that set can never finish; handing its volumes
+                    // over is what the waiting set needs.
+                    if self.demote_stranded_identity_sets(job_id).await {
+                        self.schedule_job_completion_check(job_id);
+                        return;
+                    }
                     let reason = self.invalid_rar_retry_frontier_reason(job_id).unwrap_or_else(|| {
                         "RAR extraction stalled waiting for missing volumes after downloads finished"
                             .to_string()
@@ -2852,6 +2860,14 @@ impl Pipeline {
         //    use rather than arriving after the job is already filed.
         if let Some(error) = self.verify_par2_less_job_with_sfv(job_id).await {
             self.fail_job(job_id, error);
+            return;
+        }
+
+        // Every branch below dispatches the job onward, so an identity set
+        // still routing here would never finalize, and its volumes, held only
+        // virtually, would reach neither an extractor nor the output.
+        if self.demote_stranded_identity_sets(job_id).await {
+            self.schedule_job_completion_check(job_id);
             return;
         }
 
