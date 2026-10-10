@@ -2,15 +2,6 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** German strings for the Next interface; the keys and their order follow `en.ts`. */
 export const nextDe: LocaleDictionary = {
-  "next.archivePasswords.title": "Archivpasswörter",
-  "next.archivePasswords.list": "Passwörter (eines pro Zeile)",
-  "next.archivePasswords.file": "Passwortdatei",
-  "next.archivePasswords.saved": "Passwörter gespeichert",
-  "next.archivePasswords.clear": "Passwörter löschen",
-  "next.archivePasswords.password": "Archivpasswort",
-  "next.archivePasswords.show": "Anzeigen",
-  "next.archivePasswords.hide": "Verbergen",
-  "next.archivePasswords.loadFailed": "Passwort konnte nicht geladen werden",
   // Shell
   "next.nav.downloads": "Downloads",
   "next.nav.history": "Verlauf",
@@ -677,6 +668,15 @@ export const nextDe: LocaleDictionary = {
   "next.general.seconds": "Sekunden",
   "next.general.srrdb": "SRRDB-Release-Suche",
   "next.general.srrdbHelp": "Für verschleierte Archivteile nur deren CRC32-Prüfsumme an den öffentlichen SRRDB-Index senden, um einen Release-Namen zu ermitteln.",
+  "next.archivePasswords.title": "Archivpasswörter",
+  "next.archivePasswords.list": "Passwörter (eines pro Zeile)",
+  "next.archivePasswords.cleared": "Wird beim Speichern entfernt",
+  "next.archivePasswords.keep": "Behalten",
+  "next.archivePasswords.file": "Passwortdatei",
+  "next.archivePasswords.password": "Archivpasswort",
+  "next.archivePasswords.show": "Anzeigen",
+  "next.archivePasswords.hide": "Verbergen",
+  "next.archivePasswords.loadFailed": "Passwort konnte nicht geladen werden",
   "next.general.storage": "Speicher",
   "next.general.storageNote": "Pfade, in die der Dienst schreibt",
   "next.general.dataDirHelp": "Wird beim Start des Dienstes festgelegt; Datenbank und Standardordner liegen hier.",

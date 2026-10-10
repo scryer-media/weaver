@@ -2,15 +2,6 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** Korean strings for the Next interface; the keys and their order follow `en.ts`. */
 export const nextKo: LocaleDictionary = {
-  "next.archivePasswords.title": "압축 파일 비밀번호",
-  "next.archivePasswords.list": "비밀번호 (한 줄에 하나)",
-  "next.archivePasswords.file": "비밀번호 파일",
-  "next.archivePasswords.saved": "비밀번호 저장됨",
-  "next.archivePasswords.clear": "비밀번호 지우기",
-  "next.archivePasswords.password": "압축 파일 비밀번호",
-  "next.archivePasswords.show": "표시",
-  "next.archivePasswords.hide": "숨기기",
-  "next.archivePasswords.loadFailed": "비밀번호를 불러올 수 없습니다",
   // Shell
   "next.nav.downloads": "다운로드",
   "next.nav.history": "기록",
@@ -677,6 +668,15 @@ export const nextKo: LocaleDictionary = {
   "next.general.seconds": "초",
   "next.general.srrdb": "SRRDB 릴리스 조회",
   "next.general.srrdbHelp": "난독화된 아카이브 멤버의 경우 CRC32 체크섬만 공개 SRRDB 색인에 보내 릴리스 이름을 복원합니다.",
+  "next.archivePasswords.title": "압축 파일 비밀번호",
+  "next.archivePasswords.list": "비밀번호 (한 줄에 하나)",
+  "next.archivePasswords.cleared": "저장 시 삭제됨",
+  "next.archivePasswords.keep": "유지",
+  "next.archivePasswords.file": "비밀번호 파일",
+  "next.archivePasswords.password": "압축 파일 비밀번호",
+  "next.archivePasswords.show": "표시",
+  "next.archivePasswords.hide": "숨기기",
+  "next.archivePasswords.loadFailed": "비밀번호를 불러올 수 없습니다",
   "next.general.storage": "저장소",
   "next.general.storageNote": "서비스가 기록하는 경로",
   "next.general.dataDirHelp": "서비스 시작 시 정해지며, 데이터베이스와 기본 폴더가 여기에 있습니다.",

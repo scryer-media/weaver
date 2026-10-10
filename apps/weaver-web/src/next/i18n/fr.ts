@@ -2,15 +2,6 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** French strings for the Next interface; the keys and their order follow `en.ts`. */
 export const nextFr: LocaleDictionary = {
-  "next.archivePasswords.title": "Mots de passe des archives",
-  "next.archivePasswords.list": "Mots de passe (un par ligne)",
-  "next.archivePasswords.file": "Fichier de mots de passe",
-  "next.archivePasswords.saved": "Mots de passe enregistrés",
-  "next.archivePasswords.clear": "Effacer les mots de passe",
-  "next.archivePasswords.password": "Mot de passe de l’archive",
-  "next.archivePasswords.show": "Afficher",
-  "next.archivePasswords.hide": "Masquer",
-  "next.archivePasswords.loadFailed": "Impossible de charger le mot de passe",
   // Shell
   "next.nav.downloads": "Téléchargements",
   "next.nav.history": "Historique",
@@ -677,6 +668,15 @@ export const nextFr: LocaleDictionary = {
   "next.general.seconds": "secondes",
   "next.general.srrdb": "Recherche de publication SRRDB",
   "next.general.srrdbHelp": "Pour les membres d'archive obfusqués, envoyer uniquement leur somme CRC32 à l'index public SRRDB afin de retrouver le nom de la publication.",
+  "next.archivePasswords.title": "Mots de passe des archives",
+  "next.archivePasswords.list": "Mots de passe (un par ligne)",
+  "next.archivePasswords.cleared": "Supprimé à l’enregistrement",
+  "next.archivePasswords.keep": "Conserver",
+  "next.archivePasswords.file": "Fichier de mots de passe",
+  "next.archivePasswords.password": "Mot de passe de l’archive",
+  "next.archivePasswords.show": "Afficher",
+  "next.archivePasswords.hide": "Masquer",
+  "next.archivePasswords.loadFailed": "Impossible de charger le mot de passe",
   "next.general.storage": "Stockage",
   "next.general.storageNote": "chemins où le service écrit",
   "next.general.dataDirHelp": "Défini au démarrage du service ; la base de données et les dossiers par défaut s'y trouvent.",

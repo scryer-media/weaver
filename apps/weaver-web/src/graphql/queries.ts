@@ -2305,3 +2305,27 @@ export const ANALYZE_NZB_MUTATION = gql`
     }
   }
 `;
+
+export const ARCHIVE_PASSWORD_SETTINGS_QUERY = gql`
+  query ArchivePasswordSettings {
+    archivePasswordSettings {
+      hasPasswords
+      passwordFile
+    }
+  }
+`;
+
+export const UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION = gql`
+  mutation UpdateArchivePasswordSettings($passwords: [String!], $passwordFile: String) {
+    updateArchivePasswordSettings(passwords: $passwords, passwordFile: $passwordFile) {
+      hasPasswords
+      passwordFile
+    }
+  }
+`;
+
+export const VALIDATED_ARCHIVE_PASSWORD_QUERY = gql`
+  query ValidatedArchivePassword($id: Int!) {
+    validatedArchivePassword(id: $id)
+  }
+`;

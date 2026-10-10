@@ -15,7 +15,7 @@ import { statusToken } from "@/lib/status-tokens";
 import { EmptyState, MetricCell, MetricStrip, SectionHeader, Square } from "../components/chrome";
 import { BulkBar, BulkButton, BulkCluster } from "../components/BulkBar";
 import { ConfirmDialog } from "../components/ConfirmDialog";
-import { ArchivePassword, ArchivePasswordDialog } from "../components/ArchivePassword";
+import { ArchivePasswordDialog } from "../components/ArchivePassword";
 import { Pagination } from "../components/Pagination";
 import { CheckBox, SecondaryButton, TextField } from "../components/controls";
 import { Icon } from "../components/icons";
@@ -691,7 +691,9 @@ export function HistoryPage() {
                     />
                     <div className="min-w-0 truncate font-wv-mono text-[12.5px] text-wv-fg">
                       {formatJobReleaseName(row)}
-                      {row.hasPassword ? <ArchivePassword id={row.id} /> : null}
+                      {row.hasPassword ? (
+                        <Icon name="lock" size={11} className="ml-[6px] inline-block align-[-1px] text-wv-muted" />
+                      ) : null}
                     </div>
                     <div className="flex min-w-0 items-center gap-[7px]">
                       <Square

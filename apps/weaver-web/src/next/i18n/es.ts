@@ -2,15 +2,6 @@ import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** Spanish strings for the Next interface; the keys and their order follow `en.ts`. */
 export const nextEs: LocaleDictionary = {
-  "next.archivePasswords.title": "Contraseñas de archivos",
-  "next.archivePasswords.list": "Contraseñas (una por línea)",
-  "next.archivePasswords.file": "Archivo de contraseñas",
-  "next.archivePasswords.saved": "Contraseñas guardadas",
-  "next.archivePasswords.clear": "Borrar contraseñas",
-  "next.archivePasswords.password": "Contraseña del archivo",
-  "next.archivePasswords.show": "Mostrar",
-  "next.archivePasswords.hide": "Ocultar",
-  "next.archivePasswords.loadFailed": "No se pudo cargar la contraseña",
   // Shell
   "next.nav.downloads": "Descargas",
   "next.nav.history": "Historial",
@@ -677,6 +668,15 @@ export const nextEs: LocaleDictionary = {
   "next.general.seconds": "segundos",
   "next.general.srrdb": "Búsqueda de publicaciones en SRRDB",
   "next.general.srrdbHelp": "Para miembros de archivo ofuscados, enviar solo su suma CRC32 al índice público de SRRDB para recuperar el nombre de la publicación.",
+  "next.archivePasswords.title": "Contraseñas de archivos",
+  "next.archivePasswords.list": "Contraseñas (una por línea)",
+  "next.archivePasswords.cleared": "Se elimina al guardar",
+  "next.archivePasswords.keep": "Conservar",
+  "next.archivePasswords.file": "Archivo de contraseñas",
+  "next.archivePasswords.password": "Contraseña del archivo",
+  "next.archivePasswords.show": "Mostrar",
+  "next.archivePasswords.hide": "Ocultar",
+  "next.archivePasswords.loadFailed": "No se pudo cargar la contraseña",
   "next.general.storage": "Almacenamiento",
   "next.general.storageNote": "rutas en las que escribe el servicio",
   "next.general.dataDirHelp": "Se fija al iniciar el servicio; aquí están la base de datos y las carpetas predeterminadas.",
