@@ -2,11 +2,11 @@
 //! its end header, and both at once; Cauchy and FFT codes; recovery with
 //! margin, exact and one block short; three block sizes; one member and two;
 //! one archive set in the job and two; the index present, absent and damaged.
+use super::super::super::super::sevenz_store::embedded_par3::with_embedded_par3_named;
+use super::super::super::super::sevenz_store::{Entry, build_7z_shaped, split_volumes};
 use super::fixtures::{Container, MEMBER, SEVENZ_MEMBER, payload};
 use super::post::{Damage, Post, Posted, Role, Wire};
 use super::recovery::{self, Code, Geometry, MARGINS, Margin, recovery_packets};
-use super::super::super::super::sevenz_store::embedded_par3::with_embedded_par3;
-use super::super::super::super::sevenz_store::{Entry, build_7z_shaped, split_volumes};
 use super::*;
 
 const ARTICLE: usize = 768;
@@ -158,14 +158,17 @@ impl Par3Cell {
     }
 
     fn member(self, set: usize, entry: usize) -> String {
-        let base = if self.container == Container::SevenZip { SEVENZ_MEMBER } else { MEMBER };
-        let base = match (set, entry) {
+        let base = if self.container == Container::SevenZip {
+            SEVENZ_MEMBER
+        } else {
+            MEMBER
+        };
+        match (set, entry) {
             (0, 0) => base.to_string(),
             (0, _) => base.replace("lantern", "beacon"),
             (_, 0) => base.replace("lantern", "amber"),
             (_, _) => base.replace("lantern", "ember"),
-        };
-        base
+        }
     }
 
     /// The posted volumes of one archive set, with the tail inserted where
@@ -181,7 +184,22 @@ impl Par3Cell {
                 let mut archive =
                     build_7z_shaped(&entries, sevenz_turbo::EncoderMethod::COPY, None, false);
                 if self.placement != Placement::Sidecar {
-                    archive = with_embedded_par3(&archive, self.block as u64, tail_blocks.max(1) as u64);
+                    use par3_rs::creation::{CreationCodec, CreationOptions};
+                    // The authenticated filename must follow the archive set,
+                    // not the fixture helper's single-set default name.
+                    let recovery_count = tail_blocks.max(1) as u64;
+                    // PAR-inside authoring requires Cauchy. The code axis
+                    // selects the sidecar codec when this post has a sidecar.
+                    archive = with_embedded_par3_named(
+                        &archive,
+                        &format!("{}.7z", set.prefix),
+                        CreationOptions {
+                            block_size: self.block as u64,
+                            codec: CreationCodec::Cauchy,
+                            recovery_count,
+                            ..CreationOptions::default()
+                        },
+                    );
                 }
                 split_volumes(&archive, VOLUMES)
             }
@@ -316,9 +334,7 @@ impl Par3Cell {
             let (least, most) = recovery_surviving(&post, sets[set].prefix, &lost_now);
             let starved = interruption.fails();
             let (least, most) = if starved { (0, 0) } else { (least, most) };
-            let mut sidecar = if upper == 0 {
-                Verdict::Completes
-            } else if upper <= least {
+            let mut sidecar = if upper <= least {
                 Verdict::Completes
             } else if lower > most {
                 Verdict::Fails
@@ -450,9 +466,17 @@ fn container_span(post: &Post, files: &[usize]) -> (usize, Vec<usize>) {
         offsets.push(at);
         at += post.files[file].bytes.len();
     }
-    let whole: Vec<u8> = files.iter().flat_map(|&file| post.files[file].bytes.clone()).collect();
-    let tail = recovery_packets(&whole).first().map_or(whole.len(), |first| first.start);
-    (tail, offsets)
+    let whole: Vec<u8> = files
+        .iter()
+        .flat_map(|&file| post.files[file].bytes.clone())
+        .collect();
+    // PAR-inside protects the 7z container, not its following description
+    // packets. The start header declares the exact end of that container.
+    let next = u64::from_le_bytes(whole[12..20].try_into().unwrap());
+    let size = u64::from_le_bytes(whole[20..28].try_into().unwrap());
+    let end = usize::try_from(32 + next + size).unwrap();
+    assert!(end <= whole.len());
+    (end, offsets)
 }
 
 /// Container blocks a tail may and must mend: the wrong ranges that fall
@@ -522,28 +546,10 @@ impl Cell for Par3Cell {
         }
     }
 
-    fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-        open_defect(self, profile)
-    }
-
     fn par2(self) -> bool {
         false
     }
 }
-
-/// The defects each cell and profile is held open for.
-fn open_defect(cell: Par3Cell, profile: ExtractionProfile) -> Option<Defect> {
-    let _ = profile;
-    (cell.placement == Placement::Embedded).then_some(Defect::Diverges(EMBEDDED_PAR3_SPLIT_NOT_REPAIRED))
-}
-
-/// A split 7z whose only recovery is the PAR3 embedded in its tail is demoted
-/// for volume size when an article is lost, and the conventional path then
-/// fails "no PAR2 metadata is available for repair" without reading the tail.
-/// The product repairs lost articles from an embedded tail only in a
-/// single-volume archive. Not PAR2, so not release-blocking.
-const EMBEDDED_PAR3_SPLIT_NOT_REPAIRED: &str =
-    "embedded PAR3 in a split 7z is never used to repair a lost article; the set demotes and fails";
 
 macro_rules! par3_smokes {
     ($($name:ident $placement:ident $code:ident $margin:ident $block:literal $entries:ident $sets:ident $index:ident $container:ident;)+) => {
@@ -595,6 +601,21 @@ mod par3_breadth_loss_smoke {
             sets: Sets::One,
             index: Index::Present,
             container: Container::Rar5,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn embedded_cauchy_two_sets() {
+        loss_smoke(Par3Cell {
+            placement: Placement::Embedded,
+            code: Code::Cauchy,
+            margin: Margin::With,
+            block: 512,
+            entries: Entries::Two,
+            sets: Sets::Two,
+            index: Index::Present,
+            container: Container::SevenZip,
         })
         .await;
     }

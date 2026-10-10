@@ -886,7 +886,11 @@ impl Pipeline {
                 || prefix.starts_with(b"PK\x05\x06")
                 || prefix.starts_with(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])
         });
-        if !file.is_complete() && self.job_has_pending_download_pipeline_work(job_id) {
+        // A tail part can finish before the preceding split lengths are known.
+        // Publish its embedded metadata only with a stable whole-archive view.
+        if (!file.is_complete() || matches!(file.role(), FileRole::SevenZipSplit { .. }))
+            && self.job_has_pending_download_pipeline_work(job_id)
+        {
             return;
         }
         // A volume of a live direct set has no file to probe, and its router
@@ -898,7 +902,9 @@ impl Pipeline {
             && (container_signature
                 || matches!(
                     file.role(),
-                    FileRole::ZipArchive | FileRole::SevenZipArchive
+                    FileRole::ZipArchive
+                        | FileRole::SevenZipArchive
+                        | FileRole::SevenZipSplit { .. }
                 ))
             && !state
                 .spec
@@ -1041,7 +1047,9 @@ impl Pipeline {
                     .find(|file| {
                         matches!(
                             file.role(),
-                            FileRole::ZipArchive | FileRole::SevenZipArchive
+                            FileRole::ZipArchive
+                                | FileRole::SevenZipArchive
+                                | FileRole::SevenZipSplit { .. }
                         ) && !self.par3_inside_probes.contains(file.file_id())
                             && self.live_direct_set_of(file.file_id()).is_none()
                             && (file.is_complete()
@@ -1144,11 +1152,42 @@ impl Pipeline {
         let name = self.current_filename_for_file(job_id, file);
         let path = state.working_dir.join(&name);
         let source = SourceId(u64::from(file_id.file_index));
+        let discovered_embedded = embedded;
+        let split = matches!(file.role(), FileRole::SevenZipSplit { .. });
+        let embedded_source = if split {
+            split::source(file_id.file_index)
+        } else {
+            source
+        };
         let embedded = embedded.or_else(|| {
             self.par3_runtime
                 .as_ref()
-                .and_then(|runtime| runtime.embedded_start(job_id, source))
+                .and_then(|runtime| runtime.embedded_start(job_id, embedded_source))
         });
+        if split && self.par2_join_consumed_split_part(job_id, file_id) {
+            // A verified whole replacement supersedes the old parts. Refresh
+            // its bytes after later binding invalidations, never their holes.
+            let base = name.rsplit_once('.').expect("split archive name").0;
+            let coordinator = self.par3_runtime.as_mut().expect("admitted PAR3 job");
+            if coordinator.knows_source(job_id, embedded_source) {
+                coordinator.enqueue_complete_file(
+                    job_id,
+                    embedded_source,
+                    state.working_dir.join(base),
+                    base.to_string(),
+                )?;
+            }
+        } else if let Some(start) = embedded
+            && split
+            && let Some((volume, name, start)) =
+                self.split_par3_image(job_id, file_id, start, discovered_embedded.is_some())?
+        {
+            let coordinator = self.par3_runtime.as_mut().expect("admitted PAR3 job");
+            // The whole archive and its posted tail part are distinct sources.
+            // Sidecar sets still need the original part under its own identity.
+            coordinator.enqueue_embedded_virtual(job_id, embedded_source, volume, name, start)?;
+        }
+        let embedded = if split { None } else { embedded };
         let carrier = embedded.is_some()
             || matches!(file.role(), FileRole::Par3 { .. })
             || self
@@ -1500,8 +1539,8 @@ impl Pipeline {
             }
         }
         for source in dirty {
-            let file_index = u32::try_from(source.0)
-                .map_err(|_| EngineError::InvalidState("unknown PAR3 source identity"))?;
+            let file_index = split::file_index(source)
+                .ok_or(EngineError::InvalidState("unknown PAR3 source identity"))?;
             let file_id = NzbFileId { job_id, file_index };
             if self
                 .active_downloads_by_file
@@ -1619,6 +1658,7 @@ mod outputs;
 pub(in crate::pipeline) mod paths;
 mod placement;
 mod readback;
+mod split;
 pub(in crate::pipeline) mod virtual_source;
 pub(in crate::pipeline) mod work;
 

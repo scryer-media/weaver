@@ -249,10 +249,6 @@ impl Cell for UuCell {
         }
     }
 
-    fn defect(self, _profile: ExtractionProfile) -> Option<Defect> {
-        None
-    }
-
     fn par2(self) -> bool {
         self.has_par2()
     }

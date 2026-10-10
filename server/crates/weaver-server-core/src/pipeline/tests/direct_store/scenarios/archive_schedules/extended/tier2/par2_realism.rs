@@ -452,10 +452,6 @@ impl Cell for Par2Cell {
         }
     }
 
-    fn defect(self, _profile: ExtractionProfile) -> Option<Defect> {
-        None
-    }
-
     fn par2(self) -> bool {
         true
     }
@@ -553,8 +549,8 @@ par2_smokes! {
     headers_encrypted_with 1048 Twenty With Hundreds Aligned TwelveAcrossThree Plain Rar5EncryptedHeaders;
 }
 
-/// The campaign: 2,200 shards of about 500 cases; half the cells carry a
-/// set of thousands of blocks, whose cases run several times longer.
+// The campaign: 2,200 cost-balanced shards. Thousands-block cells retain
+// every profile with fewer schedules and a higher partition weight.
 mod combined_par2_realism {
     use super::*;
 

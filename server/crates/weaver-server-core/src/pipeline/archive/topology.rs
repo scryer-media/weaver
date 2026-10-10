@@ -2821,11 +2821,14 @@ impl Pipeline {
         // parts here — job restore, and the archive finalization that re-refreshes
         // every unextracted source file — and rebuilding the topology from one of
         // them would put the joiner back in front of a verified output.
-        if matches!(role, weaver_model::files::FileRole::SplitFile { .. })
-            && self
-                .par2_joined_split_sets
-                .get(&job_id)
-                .is_some_and(|sets| sets.contains_key(&set_name))
+        if matches!(
+            role,
+            weaver_model::files::FileRole::SplitFile { .. }
+                | weaver_model::files::FileRole::SevenZipSplit { .. }
+        ) && self
+            .par2_joined_split_sets
+            .get(&job_id)
+            .is_some_and(|sets| sets.contains_key(&set_name))
         {
             debug!(
                 job_id = job_id.0,
@@ -2887,7 +2890,11 @@ impl Pipeline {
 
                 let mut volume_map = std::collections::HashMap::new();
                 let mut max_number = 0u32;
-                for f in state.assembly.files() {
+                for f in state
+                    .assembly
+                    .files()
+                    .filter(|file| !self.par2_join_consumed_split_part(job_id, file.file_id()))
+                {
                     if let Some(n) = part_number(self.classified_role_for_file(job_id, f))
                         && self
                             .classified_archive_set_name_for_file(job_id, f)
@@ -2909,7 +2916,11 @@ impl Pipeline {
                 // entries and not by the largest declared volume number.
                 let recovered_parts: Vec<(String, u32)> = {
                     let numbered: HashSet<u32> = volume_map.values().copied().collect();
+                    let consumed = self.par2_joined_split_part_names(job_id);
                     recovered_7z_parts_on_disk(&state.working_dir, &set_name, &numbered)
+                        .into_iter()
+                        .filter(|(name, _)| !consumed.contains(name))
+                        .collect()
                 };
                 for (name, number) in &recovered_parts {
                     volume_map.insert(name.clone(), *number);
@@ -2943,6 +2954,7 @@ impl Pipeline {
                     .assembly
                     .files()
                     .filter(|f| f.is_complete())
+                    .filter(|file| !self.par2_join_consumed_split_part(job_id, file.file_id()))
                     .filter_map(|f| {
                         if let Some(n) = part_number(self.classified_role_for_file(job_id, f))
                             && self

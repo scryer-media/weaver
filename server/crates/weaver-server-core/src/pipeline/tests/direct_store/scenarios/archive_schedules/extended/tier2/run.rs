@@ -121,7 +121,7 @@ async fn deliver(pipeline: &mut Pipeline, job: JobId, post: &Post, file: u32, ar
     use weaver_nntp::client::{DecodedBody, DecodedBodyTrace};
     retire_schedule_article(pipeline, job, file, article);
     for body in post.files[file as usize].wire_copies(article) {
-        if pipeline.jobs.get(&job).is_none() || terminal(pipeline, job) {
+        if !pipeline.jobs.contains_key(&job) || terminal(pipeline, job) {
             return;
         }
         let segment = SegmentId {
@@ -363,7 +363,7 @@ pub(in super::super) async fn run(
     // rounds, never a time.
     let mut idle = 0;
     for _ in 0..256 {
-        if retired.is_some() || pipeline.jobs.get(&job).is_none() {
+        if retired.is_some() || !pipeline.jobs.contains_key(&job) {
             break;
         }
         drain_rar_refreshes(&mut pipeline).await;
@@ -401,7 +401,7 @@ pub(in super::super) async fn run(
         pipeline.flush_quiescent_write_backlog().await;
         pipeline.check_job_completion(job).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
-        if terminal(&pipeline, job) || pipeline.jobs.get(&job).is_none() {
+        if terminal(&pipeline, job) || !pipeline.jobs.contains_key(&job) {
             break;
         }
         if dispatchable(&pipeline, job) && !queued(&mut pipeline, job).is_empty() {
@@ -546,7 +546,11 @@ impl Ran {
                     "{context}: left {:?} behind: {trace:?}",
                     self.leftovers
                 );
-                assert_ne!(verdict, Verdict::Fails, "{context}: completed with source bytes where it must fail: {trace:?}");
+                assert_ne!(
+                    verdict,
+                    Verdict::Fails,
+                    "{context}: completed with source bytes where it must fail: {trace:?}"
+                );
             }
             Some(JobStatus::Failed { error }) => {
                 assert_ne!(

@@ -402,10 +402,6 @@ impl Cell for DamageCell {
         }
     }
 
-    fn defect(self, _profile: ExtractionProfile) -> Option<Defect> {
-        None
-    }
-
     fn par2(self) -> bool {
         matches!(self.recovery, Recovery::Par2(_))
     }
@@ -422,7 +418,13 @@ async fn swapped_encrypted_headers_repaired_after_restart() {
             container: Container::Rar5Encrypted,
         },
         ExtractionProfile::DirectStore,
-        vec![(0, (vec![(0, 0), (1, 1), (0, 1), (1, 0)], Interruption::Restart(2)))],
+        vec![(
+            0,
+            (
+                vec![(0, 0), (1, 1), (0, 1), (1, 0)],
+                Interruption::Restart(2),
+            ),
+        )],
     )
     .await;
 }

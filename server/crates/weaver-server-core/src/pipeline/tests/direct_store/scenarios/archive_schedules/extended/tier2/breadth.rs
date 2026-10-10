@@ -338,11 +338,6 @@ pub(super) mod lies {
             }
         }
 
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            None
-        }
-
         fn par2(self) -> bool {
             true
         }
@@ -525,10 +520,6 @@ pub(super) mod nesting {
             }
         }
 
-        fn defect(self, _profile: ExtractionProfile) -> Option<Defect> {
-            None
-        }
-
         fn par2(self) -> bool {
             matches!(self.recovery, Recovery::Par2(_))
         }
@@ -692,11 +683,6 @@ pub(super) mod scale {
                 geometry,
                 ruling: None,
             }
-        }
-
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            None
         }
 
         fn par2(self) -> bool {
@@ -873,11 +859,6 @@ pub(super) mod password {
             }
         }
 
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            None
-        }
-
         fn par2(self) -> bool {
             matches!(self.recovery, Recovery::Par2(_))
         }
@@ -1022,11 +1003,6 @@ pub(super) mod wire {
                 geometry,
                 ruling: None,
             }
-        }
-
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            None
         }
 
         fn par2(self) -> bool {
@@ -1202,11 +1178,6 @@ pub(super) mod naming {
                 geometry,
                 ruling: None,
             }
-        }
-
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            None
         }
 
         fn par2(self) -> bool {
@@ -1401,11 +1372,6 @@ pub(super) mod sets {
             }
         }
 
-        fn defect(self, profile: ExtractionProfile) -> Option<Defect> {
-            let _ = profile;
-            None
-        }
-
         fn par2(self) -> bool {
             matches!(self.recovery, Recovery::Par2(_))
         }
@@ -1453,10 +1419,21 @@ pub(super) mod sets {
                 volumes: 2,
             };
             for profile in PROFILES {
-                run_cell(cell, profile, vec![(0, (slot_arrivals(4), Interruption::Loss {
-                    mask: 8,
-                    index_first: true,
-                }))]).await;
+                run_cell(
+                    cell,
+                    profile,
+                    vec![(
+                        0,
+                        (
+                            slot_arrivals(4),
+                            Interruption::Loss {
+                                mask: 8,
+                                index_first: true,
+                            },
+                        ),
+                    )],
+                )
+                .await;
             }
         }
 
