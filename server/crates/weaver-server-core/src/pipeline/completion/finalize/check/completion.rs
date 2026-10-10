@@ -63,6 +63,23 @@ impl Pipeline {
             .get(&job_id)
             .cloned()
             .unwrap_or_default();
+
+        // A set that has never had a first volume would otherwise fall back to
+        // a full-set extraction, which cannot open it and used to end the job
+        // on the spot. Parked as waiting on volume 0 it is a missing volume,
+        // and the completion check that follows routes it to repair, or to a
+        // failure that names what was seen.
+        let mut parked_without_first_volume = false;
+        for set_name in &set_names {
+            if !extracted_archives.contains(set_name) {
+                parked_without_first_volume |=
+                    self.park_rar_set_waiting_for_first_volume(job_id, set_name);
+            }
+        }
+        if parked_without_first_volume {
+            self.schedule_job_completion_check(job_id);
+            return;
+        }
         let mut forced_recompute = false;
         let (fallback_sets, has_incomplete_sets, has_ready_incremental_work) = loop {
             let mut fallback_sets = Vec::new();

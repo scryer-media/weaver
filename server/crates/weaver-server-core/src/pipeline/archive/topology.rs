@@ -938,6 +938,16 @@ pub(in crate::pipeline) fn present_waiting_rar_volumes(
     volumes
 }
 
+/// The text every "this set has no volume 0 to open from" refusal carries, so
+/// the scheduler can route it to the missing-volume path instead of failing
+/// the job outright.
+pub(in crate::pipeline) const MISSING_FIRST_RAR_VOLUME_ERROR_MARKER: &str =
+    "has no first volume (volume 0) to open from";
+
+pub(in crate::pipeline) fn is_missing_first_rar_volume_error(error: &str) -> bool {
+    error.contains(MISSING_FIRST_RAR_VOLUME_ERROR_MARKER)
+}
+
 const INCOHERENT_RAR_WAITING_STATE_ERROR_MARKER: &str =
     "produced incoherent waiting state with no missing volumes after rebuild";
 const OWNERLESS_RAR_PLAN_ERROR_MARKER: &str =
@@ -1020,12 +1030,18 @@ impl Pipeline {
     /// states none anywhere, and treating an unstated number as an identity
     /// collapses the whole set onto one key. `None` is the format staying
     /// silent; a stated `Some(0)` wins like any other stated number.
+    ///
+    /// RAR5 is the exception to that silence: it writes the number in every
+    /// volume but the first, so a RAR5 volume that states none *is* the first
+    /// one, whatever its name says. Taking the layout there puts a misnamed
+    /// first volume on the same key as the volume its name belongs to.
     pub(in crate::pipeline) fn rar_registration_volume(
         observed_volume: Option<u32>,
         facts: &unrar_rs::RarVolumeFacts,
     ) -> u32 {
         match facts.volume_number {
             Some(stated) => stated,
+            None if facts.format == 5 && facts.is_volume => 0,
             None => observed_volume.unwrap_or(0),
         }
     }
@@ -1688,6 +1704,91 @@ impl Pipeline {
         fallback.fallback_reason = Some(error.clone());
         self.apply_rar_plan(job_id, set_name, fallback);
         Err(error)
+    }
+
+    /// Whether a set has volumes registered but has never had a first volume:
+    /// no volume 0 among its facts, its files or on disk, and no header
+    /// snapshot that could stand in for one. Such a set cannot be opened at
+    /// all, and a full-set extraction of it fails before reading a byte.
+    pub(in crate::pipeline) fn rar_set_lacks_first_volume(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> bool {
+        let Some(state) = self.rar_sets.get(&(job_id, set_name.to_string())) else {
+            return false;
+        };
+        !state.facts.is_empty()
+            && !state.facts.contains_key(&0)
+            && !state.volume_files.contains_key(&0)
+            && state.cached_headers.is_none()
+            && self.load_rar_snapshot(job_id, set_name).is_none()
+            && !self
+                .volume_paths_for_rar_set(job_id, set_name)
+                .contains_key(&0)
+    }
+
+    /// Park a set that has no first volume as waiting for it, rather than
+    /// letting it fall back to a full-set extraction that can only fail.
+    ///
+    /// The plan names every volume below the lowest one present as missing,
+    /// which is what puts the set on the ordinary missing-volume route: a
+    /// PAR2 repair when recovery data can rebuild it, and a failure that says
+    /// which volumes were seen when nothing can. Returns whether it changed
+    /// the set's plan.
+    pub(in crate::pipeline) fn park_rar_set_waiting_for_first_volume(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> bool {
+        if !self.rar_set_lacks_first_volume(job_id, set_name) {
+            return false;
+        }
+        let Some(state) = self.rar_sets.get(&(job_id, set_name.to_string())) else {
+            return false;
+        };
+        if state.active_workers > 0
+            || !state.in_flight_members.is_empty()
+            || state.plan.as_ref().is_some_and(|plan| {
+                plan.phase == RarSetPhase::WaitingForVolumes && plan.waiting_on_volumes.contains(&0)
+            })
+        {
+            return false;
+        }
+        let present: BTreeSet<u32> = state
+            .facts
+            .keys()
+            .chain(state.volume_files.keys())
+            .copied()
+            .collect();
+        let lowest_present = present.iter().next().copied().unwrap_or(1).max(1);
+        let waiting_on_volumes: HashSet<u32> = (0..lowest_present).collect();
+        let plan = RarDerivedPlan {
+            phase: RarSetPhase::WaitingForVolumes,
+            is_solid: false,
+            ready_members: Vec::new(),
+            member_names: Vec::new(),
+            member_dependencies: HashMap::new(),
+            waiting_on_volumes,
+            deletion_eligible: HashSet::new(),
+            delete_decisions: BTreeMap::new(),
+            topology: ArchiveTopology {
+                archive_type: ArchiveType::Rar,
+                volume_map: self.build_rar_volume_map(job_id, set_name),
+                complete_volumes: present.into_iter().collect(),
+                expected_volume_count: None,
+                members: Vec::new(),
+                unresolved_spans: Vec::new(),
+            },
+            fallback_reason: None,
+        };
+        warn!(
+            job_id = job_id.0,
+            set_name = %set_name,
+            "RAR set has no first volume; waiting on it as a missing volume"
+        );
+        self.apply_rar_plan(job_id, set_name, plan);
+        true
     }
 
     pub(in crate::pipeline) fn latest_completed_rar_volume(

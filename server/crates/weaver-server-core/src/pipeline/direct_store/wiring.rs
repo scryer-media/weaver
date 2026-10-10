@@ -2725,6 +2725,61 @@ impl Pipeline {
         }
     }
 
+    /// Retires every header set a repair just overtook.
+    ///
+    /// A file the repair rebuilt holds conventional bytes, so no set admitted
+    /// from volume headers can bind it any more. A live header set that does
+    /// not already hold that file could have needed it, and the conventional
+    /// set naming the file now waits on the volumes the header set holds
+    /// virtually: neither would ever finish. The header set demotes, its
+    /// volumes materialize, and the conventional set completes. The rebuilt
+    /// files are booked as leaked, so the starvation arm judges the rosters
+    /// on the same evidence.
+    pub(crate) async fn note_identity_repaired_files(&mut self, job_id: JobId, files: &[u32]) {
+        if files.is_empty() {
+            return;
+        }
+        let overtaken: Vec<usize> = {
+            let Some(admission) = self.direct_store.identity.get_mut(&job_id) else {
+                return;
+            };
+            admission.leaked.extend(files.iter().copied());
+            let admission = &self.direct_store.identity[&job_id];
+            let held: HashSet<u32> = admission
+                .header_sets
+                .iter()
+                .flat_map(|header_set| header_set.bound.keys().copied())
+                .chain(
+                    admission
+                        .rosters
+                        .values()
+                        .flat_map(|roster| roster.bound.keys().copied()),
+                )
+                .collect();
+            admission
+                .header_sets
+                .iter()
+                .filter(|header_set| {
+                    self.direct_store
+                        .set(job_id, header_set.set_index)
+                        .is_some_and(|set| !set.is_demoted() && !set.is_finalized())
+                        && files.iter().any(|file| !held.contains(file))
+                })
+                .map(|header_set| header_set.set_index)
+                .collect()
+        };
+        for set_index in overtaken {
+            warn!(
+                job_id = job_id.0,
+                set_index,
+                repaired = files.len(),
+                "a repair rebuilt a file a header-admitted set could have claimed"
+            );
+            self.condemn_header_set(job_id, set_index).await;
+        }
+        self.identity_viability_sweep(job_id).await;
+    }
+
     /// Retires one roster: a pending one is simply dropped, an admitted one
     /// demotes its set through the ordinary materialization.
     async fn condemn_identity_roster(&mut self, job_id: JobId, set_name: &str) {

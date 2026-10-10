@@ -3056,6 +3056,13 @@ impl Pipeline {
         if let Some(failure) = failure {
             return Err(failure);
         }
+        // The conventional files this repair rebuilt are on disk now, out of
+        // reach of any set admitted from volume headers.
+        let rebuilt: Vec<u32> = conventional
+            .iter()
+            .map(|target| target.file_id.file_index)
+            .collect();
+        self.note_identity_repaired_files(job_id, &rebuilt).await;
         crate::runtime::perf_probe::record(
             "direct_store.repaired_while_direct",
             std::time::Duration::from_nanos(1),

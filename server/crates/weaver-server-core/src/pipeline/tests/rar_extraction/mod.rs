@@ -394,6 +394,7 @@ fn extraction_dispatched(pipeline: &Pipeline, job_id: JobId, set_name: &str) -> 
 }
 
 mod extraction_reserves_member_totals;
+mod hex_named_volumes;
 mod no_par2_retry_reclassifies;
 mod par2_metadata_immediately_rebinds;
 mod repaired_rar_set_holds;

@@ -255,6 +255,14 @@ impl Pipeline {
         let adopted_numbered_parts = registration.numbered_parts;
         let registered_rar_outputs = registration.registered;
         self.invalidate_rar_plans_for_repaired_sets(job_id, registration.set_names);
+        // A file the repair rebuilt now holds conventional bytes on disk. A set
+        // admitted from volume headers that could have claimed it never will,
+        // and the conventional set that names it waits on the volumes that set
+        // holds virtually, so the header set hands them over.
+        let repaired_files =
+            self.par2_rewritten_job_files(job_id, &post_repair_verification, &rewritten);
+        self.note_identity_repaired_files(job_id, &repaired_files)
+            .await;
         stage_start =
             note_par2_repair_stage(job_id, "par2_repair.finish.refresh_topologies", stage_start);
         if let Err(error) = self
@@ -1620,6 +1628,53 @@ impl Pipeline {
         self.jobs
             .get(&job_id)
             .is_some_and(|state| state.assembly.archive_topology_for(&set_name).is_none())
+    }
+
+    /// The job's files a repair rewrote, by NZB file index: every file whose
+    /// name, under any identity it has carried, answers to a description in
+    /// `rewritten`.
+    pub(super) fn par2_rewritten_job_files(
+        &self,
+        job_id: JobId,
+        verification: &par2_rs::VerificationResult,
+        rewritten: &HashSet<par2_rs::FileId>,
+    ) -> Vec<u32> {
+        if rewritten.is_empty() {
+            return Vec::new();
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return Vec::new();
+        };
+        let mut by_name = HashMap::<String, (NzbFileId, bool)>::new();
+        for file in state.assembly.files() {
+            let file_id = file.file_id();
+            Self::insert_par2_name_candidates(&mut by_name, file.filename(), file_id, false);
+            if let Some(identity) = self.effective_file_identity(job_id, file_id) {
+                for name in [
+                    Some(identity.current_filename.as_str()),
+                    Some(identity.source_filename.as_str()),
+                    identity.canonical_filename.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    Self::insert_par2_name_candidates(&mut by_name, name, file_id, false);
+                }
+            }
+        }
+        let mut files: Vec<u32> = verification
+            .files
+            .iter()
+            .filter(|file| rewritten.contains(&file.file_id))
+            .filter_map(|file| {
+                Self::par2_verification_candidate_names(file)
+                    .into_iter()
+                    .find_map(|name| by_name.get(&name).map(|(id, _)| id.file_index))
+            })
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        files
     }
 
     pub(super) fn insert_par2_name_candidates(
