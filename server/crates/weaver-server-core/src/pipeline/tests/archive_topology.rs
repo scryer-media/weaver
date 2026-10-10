@@ -1,5 +1,79 @@
 use super::*;
 
+#[tokio::test]
+async fn nested_extraction_discards_outer_articles_with_missing_or_reused_indices() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(100_713);
+    let mut spec = segmented_job_spec("Nested Late Articles", "outer.bin", &[8]);
+    let mut recovery = spec.files[0].clone();
+    recovery.filename = "outer.vol00+01.par2".into();
+    recovery.role = FileRole::from_filename(&recovery.filename);
+    spec.files.push(recovery);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let staging = temp_dir.path().join("nested-late-articles");
+    tokio::fs::create_dir_all(&staging).await.unwrap();
+    let inner = rar5_fixture_bytes("rar5_nested_2deep.rar");
+    tokio::fs::write(staging.join("inner.rar"), &inner)
+        .await
+        .unwrap();
+    pipeline.jobs.get_mut(&job_id).unwrap().staging_dir = Some(staging.clone());
+    assert!(matches!(
+        pipeline
+            .maybe_start_nested_extraction(job_id)
+            .await
+            .unwrap(),
+        crate::pipeline::completion::NestedExtractionDecision::Started
+    ));
+    assert_eq!(pipeline.jobs[&job_id].extraction_depth, 1);
+
+    for (file_index, filename) in [(0, "outer.bin"), (1, "outer.vol00+01.par2")] {
+        let segment_id = SegmentId {
+            file_id: NzbFileId { job_id, file_index },
+            segment_number: 0,
+        };
+        pipeline
+            .handle_decode_success(
+                DecodeResult {
+                    encoding: SegmentEncoding::Yenc,
+                    segment_id,
+                    raw_size: 8,
+                    yenc_layout: YencLayoutAssertions {
+                        file_size: 8,
+                        part: Some(1),
+                        total: Some(1),
+                        begin: Some(1),
+                        end: Some(8),
+                    },
+                    crc_valid: true,
+                    part_crc_verified: true,
+                    part_crc: checksum::crc32(b"old-data"),
+                    truncation_suspected: false,
+                    expected_file_crc: None,
+                    data: DecodedChunk::from(b"old-data".to_vec()),
+                    yenc_name: filename.into(),
+                    checkpoint_plan: pipeline.par2_checkpoint_plan(job_id),
+                    segments: Vec::new(),
+                },
+                SegmentSource {
+                    source_server_idx: None,
+                    exclude_servers: Vec::new(),
+                },
+            )
+            .await;
+        pipeline.handle_decode_failure(segment_id, "late outer decode failure", &[], None);
+        assert!(!pipeline.decode_retries.contains_key(&segment_id));
+        assert!(matches!(
+            pipeline.jobs[&job_id].status,
+            JobStatus::Extracting
+        ));
+        assert_eq!(
+            tokio::fs::read(staging.join("inner.rar")).await.unwrap(),
+            inner
+        );
+    }
+}
+
 #[test]
 fn started_member_names_excludes_orphan_split_continuations() {
     let payload = b"movie-payload-spanning-three-volumes";

@@ -530,9 +530,6 @@ pub(super) mod nesting {
             if self.depth == Depth::RarInside7z {
                 return Some(Defect::Diverges(RAR_INSIDE_7Z_PUBLISHED_AS_IS));
             }
-            if self.members == 2 && matches!(self.depth, Depth::Two | Depth::Three) && self.par2() {
-                return Some(Defect::Diverges(NESTED_TWO_MEMBERS_PAR2_FILE_MISSING));
-            }
             None
         }
 
@@ -544,13 +541,6 @@ pub(super) mod nesting {
     /// A 7z whose member is a RAR publishes the RAR itself: nested extraction
     /// is not entered from a 7z outer. Not PAR2, so not release-blocking.
     const RAR_INSIDE_7Z_PUBLISHED_AS_IS: &str = "a RAR inside a 7z is published as the archive, never extracted";
-
-    /// A four-volume RAR holding a two-member RAR beside a PAR2 set completes
-    /// every volume, fetches the PAR2 set and then fails "invalid authoritative
-    /// NZB segment layout: FileMissing" under DirectStore with nothing lost.
-    /// PAR2 with sufficient margin: release-blocking.
-    const NESTED_TWO_MEMBERS_PAR2_FILE_MISSING: &str =
-        "a nested two-member RAR beside a PAR2 set fails FileMissing after completing every volume";
 
     mod nesting_smoke {
         use super::*;
