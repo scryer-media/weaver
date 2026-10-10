@@ -788,7 +788,11 @@ fn retire_schedule_article(pipeline: &mut Pipeline, job: JobId, file: u32, artic
         },
         segment_number: article,
     };
-    let state = pipeline.jobs.get_mut(&job).unwrap();
+    // A job that already reached a terminal state has no queues to retire
+    // from; the schedule keeps delivering so the run can settle.
+    let Some(state) = pipeline.jobs.get_mut(&job) else {
+        return;
+    };
     // The schedule owns delivery, including deliberate duplicates. Retire a
     // queued copy when present so a later drain cannot fabricate a rewrite.
     for queue in [&mut state.download_queue, &mut state.recovery_queue] {

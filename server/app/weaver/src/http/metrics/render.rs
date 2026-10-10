@@ -7,6 +7,9 @@
 
 use std::collections::HashMap;
 
+use weaver_server_core::bandwidth::schedule_metrics::{
+    ActionOutcome, HoldReason, ScheduleMetricsSnapshot,
+};
 use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::instrumentation::{
     DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
@@ -15,6 +18,14 @@ use weaver_server_core::operations::instrumentation::{
 };
 use weaver_server_core::operations::metrics_store::JOB_STATUS_KEYS;
 use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot;
+use weaver_server_core::post_processing::run_metrics::{
+    RunStatus, ScriptMetrics, ScriptRunMetricsSnapshot,
+};
+use weaver_server_core::proxies::network_metrics::tunnel::TunnelMetricsSnapshot;
+use weaver_server_core::proxies::network_metrics::{
+    EgressHealthLabel, EgressMetrics, LegMetrics, LegStateLabel, NetworkMetricsSnapshot,
+    PoolMetrics, RungStateLabel, proxy_kind_label,
+};
 use weaver_server_core::settings::PerJobSeries;
 use weaver_server_core::{
     DownloadPressureReason, DownloadPressureState, JobInfo, JobStatus, MetricsSnapshot,
@@ -59,6 +70,10 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) semantic_duplicate_lifecycle: &'a [(&'static str, u64)],
     pub(crate) extraction_rejections: &'a [(&'static str, u64)],
     pub(crate) post_processing: Option<&'a PostProcessingMetricsSnapshot>,
+    pub(crate) script_runs: Option<&'a ScriptRunMetricsSnapshot>,
+    pub(crate) schedules: Option<&'a ScheduleMetricsSnapshot>,
+    pub(crate) network: Option<&'a NetworkMetricsSnapshot>,
+    pub(crate) tunnel: Option<&'a TunnelMetricsSnapshot>,
     pub(crate) build: BuildInfo,
     pub(crate) start_time_seconds: f64,
     pub(crate) per_job_series: PerJobSeries,
@@ -97,6 +112,10 @@ impl<'a> PrometheusRenderInput<'a> {
             semantic_duplicate_lifecycle: &[],
             extraction_rejections: &[],
             post_processing: None,
+            script_runs: None,
+            schedules: None,
+            network: None,
+            tunnel: None,
             build: BuildInfo {
                 version: env!("CARGO_PKG_VERSION"),
                 commit: option_env!("WEAVER_GIT_COMMIT").unwrap_or("unknown"),
@@ -154,6 +173,10 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         semantic_duplicate_lifecycle,
         extraction_rejections,
         post_processing,
+        script_runs,
+        schedules,
+        network,
+        tunnel,
         build,
         start_time_seconds,
         per_job_series,
@@ -225,6 +248,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     render_servers(&mut out, server_health, runtime_generation);
     render_server_transfers(&mut out, server_transfers, server_health);
     render_egress_quotas(&mut out, egress_transfers);
+    render_egress_transfers(&mut out, egress_transfers);
     render_server_articles(&mut out, server_metrics, server_health);
 
     if let Some(lifecycle) = job_lifecycle {
@@ -252,6 +276,18 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     }
     if let Some(metrics) = post_processing {
         render_post_processing(&mut out, metrics);
+    }
+    if let Some(metrics) = script_runs {
+        render_script_runs(&mut out, metrics);
+    }
+    if let Some(metrics) = schedules {
+        render_schedules(&mut out, metrics);
+    }
+    if let Some(metrics) = network {
+        render_network(&mut out, metrics);
+    }
+    if let Some(metrics) = tunnel {
+        render_tunnel(&mut out, metrics);
     }
 
     out.finish()
@@ -1529,22 +1565,18 @@ fn render_http(out: &mut Encoder, http: &HttpMetricsSnapshot) {
 pub(crate) fn render_post_processing(out: &mut Encoder, metrics: &PostProcessingMetricsSnapshot) {
     out.sample(&f::PP_QUEUE_DEPTH, &[], metrics.queue_depth);
     out.sample(&f::PP_ACTIVE_ATTEMPTS, &[], metrics.active_attempts);
-    out.summary(
-        &f::PP_ATTEMPT_DURATION,
-        &[],
-        metrics.duration_sum_millis as f64 / 1_000.0,
-        metrics.duration_count,
-    );
-    for (result, count) in [
+    let results = [
         ("succeeded", metrics.succeeded),
         ("failed", metrics.failed),
         ("skipped", metrics.skipped),
         ("timed_out", metrics.timed_out),
         ("cancelled", metrics.cancelled),
         ("interrupted", metrics.interrupted),
-    ] {
-        out.sample(&f::PP_ATTEMPT_RESULTS, &[("result", result)], count);
-        out.sample(&f::PP_ATTEMPTS, &[("result", result)], count);
+    ];
+    for family in [&f::PP_ATTEMPT_RESULTS, &f::PP_ATTEMPTS] {
+        for (result, count) in results {
+            out.sample(family, &[("result", result)], count);
+        }
     }
     out.sample(&f::PP_OUTPUT_TRUNCATIONS_LEGACY, &[], metrics.truncated);
     out.sample(&f::PP_OUTPUT_TRUNCATIONS, &[], metrics.truncated);
@@ -1644,4 +1676,494 @@ pub(crate) fn job_status_label(status: &JobStatus) -> &'static str {
         JobStatus::Failed { .. } => "failed",
         JobStatus::Paused => "paused",
     }
+}
+
+// Script runs: slot occupancy, queue backlog, job summaries, retention and
+// the per-script families. Every family is rendered whole before the next.
+pub(crate) fn render_script_runs(out: &mut Encoder, metrics: &ScriptRunMetricsSnapshot) {
+    for &(kind, count) in &metrics.started {
+        out.sample(&f::PP_RUNS_STARTED, &[("kind", kind.as_str())], count);
+    }
+    for &(kind, count) in &metrics.running {
+        out.sample(&f::PP_RUNS_RUNNING, &[("kind", kind.as_str())], count);
+    }
+    for &(kind, count) in &metrics.waiting {
+        out.sample(&f::PP_WAITING_FOR_SLOT, &[("kind", kind.as_str())], count);
+    }
+    for &(kind, count) in &metrics.slot_waits {
+        out.sample(&f::PP_SLOT_WAITS, &[("kind", kind.as_str())], count);
+    }
+    if let Some(limit) = metrics.concurrency_limit {
+        out.sample(&f::PP_CONCURRENCY_LIMIT, &[], limit);
+    }
+    if let Some(running) = metrics.slots_in_use {
+        out.sample(&f::PP_SLOTS_IN_USE, &[], running);
+    }
+    if let Some(waiting) = metrics.slots_waiting {
+        out.sample(&f::PP_SLOTS_WAITING, &[], waiting);
+    }
+    if let Some(backlog) = metrics.queue_event_backlog {
+        out.sample(&f::PP_QUEUE_EVENT_BACKLOG, &[], backlog);
+    }
+    for &(kind, count) in &metrics.refusals {
+        out.sample(&f::PP_REFUSALS, &[("kind", kind.as_str())], count);
+    }
+    for &(summary, count) in &metrics.job_summaries {
+        out.sample(
+            &f::PP_JOB_SUMMARIES,
+            &[("summary", summary.as_str())],
+            count,
+        );
+    }
+    out.sample(
+        &f::PP_INTERRUPTED_RECOVERED,
+        &[],
+        metrics.interrupted_recovered,
+    );
+    for &(action, count) in &metrics.retained {
+        out.sample(&f::PP_RETAINED_RUNS, &[("action", action.as_str())], count);
+    }
+
+    let scripts = &metrics.scripts;
+    for script in scripts {
+        for run in &script.runs {
+            out.sample(
+                &f::PP_SCRIPT_RUNS,
+                &[
+                    ("script", &script.script),
+                    ("kind", run.kind.as_str()),
+                    ("adapter", run.adapter.as_str()),
+                    ("waited", bool_label(run.waited)),
+                    ("status", run.status.as_str()),
+                ],
+                run.runs,
+            );
+        }
+    }
+    for script in scripts {
+        for run in &script.durations {
+            render_histogram(
+                out,
+                &f::PP_ATTEMPT_DURATION,
+                &[
+                    ("script", &script.script),
+                    ("kind", run.kind.as_str()),
+                    ("waited", bool_label(run.waited)),
+                    ("status", run.status.as_str()),
+                ],
+                &run.duration,
+            );
+        }
+    }
+    for script in scripts {
+        out.sample(
+            &f::PP_SCRIPT_NONZERO_EXITS,
+            &[("script", &script.script)],
+            script.nonzero_exits,
+        );
+    }
+    for script in scripts {
+        if let Some(code) = script.last_exit_code {
+            out.sample(
+                &f::PP_SCRIPT_LAST_EXIT_CODE,
+                &[("script", &script.script)],
+                code,
+            );
+        }
+    }
+    for script in scripts {
+        if let Some(ms) = script.last_duration_ms {
+            out.sample_f64(
+                &f::PP_SCRIPT_LAST_DURATION,
+                &[("script", &script.script)],
+                ms as f64 / 1_000.0,
+            );
+        }
+    }
+    for script in scripts {
+        if let Some(ms) = script.last_finished_epoch_ms {
+            out.sample_f64(
+                &f::PP_SCRIPT_LAST_RUN_TIMESTAMP,
+                &[("script", &script.script)],
+                ms as f64 / 1_000.0,
+            );
+        }
+    }
+    for script in scripts {
+        if let Some(last) = script.last_status {
+            for status in RunStatus::ALL {
+                out.sample(
+                    &f::PP_SCRIPT_LAST_RUN_STATUS,
+                    &[("script", &script.script), ("status", status.as_str())],
+                    u8::from(status == last),
+                );
+            }
+        }
+    }
+    for (family, value) in [
+        (
+            &f::PP_SCRIPT_OUTPUT_BYTES,
+            (|s: &ScriptMetrics| s.output_bytes) as fn(&ScriptMetrics) -> u64,
+        ),
+        (&f::PP_SCRIPT_OUTPUT_STORED_BYTES, |s| s.stored_bytes),
+        (&f::PP_SCRIPT_OUTPUT_TRUNCATIONS, |s| s.truncations),
+        (&f::PP_SCRIPT_PRUNED_RUNS, |s| s.pruned),
+    ] {
+        for script in scripts {
+            out.sample(family, &[("script", &script.script)], value(script));
+        }
+    }
+}
+
+pub(crate) fn render_schedules(out: &mut Encoder, metrics: &ScheduleMetricsSnapshot) {
+    out.sample(&f::SCHEDULE_EVALUATIONS, &[], metrics.evaluations);
+    for &(action, track, outcome, count) in &metrics.actions {
+        out.sample(
+            &f::SCHEDULE_ACTIONS,
+            &[
+                ("action", action.as_str()),
+                ("track", track.as_str()),
+                ("outcome", outcome.as_str()),
+            ],
+            count,
+        );
+    }
+    for &(action, count) in &metrics.one_shot_fires {
+        out.sample(
+            &f::SCHEDULE_ONE_SHOT_FIRES,
+            &[("action", action.as_str())],
+            count,
+        );
+    }
+    for &(reason, count) in &metrics.replays {
+        out.sample(&f::SCHEDULE_REPLAYS, &[("reason", reason.as_str())], count);
+    }
+    for &(evaluator, count) in &metrics.clock_jumps {
+        out.sample(
+            &f::SCHEDULE_CLOCK_JUMPS,
+            &[("evaluator", evaluator.as_str())],
+            count,
+        );
+    }
+    for reason in HoldReason::ALL {
+        out.sample(
+            &f::SCHEDULE_ADMISSION_HOLD,
+            &[("reason", reason.as_str())],
+            u8::from(metrics.hold.unwrap_or(HoldReason::None) == reason),
+        );
+    }
+    for &(action, total, _) in &metrics.rules_by_action {
+        out.sample(&f::SCHEDULE_RULES, &[("action", action.as_str())], total);
+    }
+    for &(action, _, enabled) in &metrics.rules_by_action {
+        out.sample(
+            &f::SCHEDULE_RULES_ENABLED,
+            &[("action", action.as_str())],
+            enabled,
+        );
+    }
+    for rule in &metrics.rules {
+        out.sample(
+            &f::SCHEDULE_RULE_ENABLED,
+            &[("rule_id", &rule.id), ("action", rule.action.as_str())],
+            u8::from(rule.enabled),
+        );
+    }
+    for rule in &metrics.rules {
+        for &(outcome, count) in &rule.fires {
+            out.sample(
+                &f::SCHEDULE_RULE_FIRES,
+                &[("rule_id", &rule.id), ("outcome", outcome.as_str())],
+                count,
+            );
+        }
+    }
+    for rule in &metrics.rules {
+        out.sample_f64(
+            &f::SCHEDULE_RULE_LAST_FIRE,
+            &[("rule_id", &rule.id)],
+            rule.last_fire_epoch_ms
+                .map_or(0.0, |ms| ms as f64 / 1_000.0),
+        );
+    }
+    for rule in &metrics.rules {
+        for outcome in ActionOutcome::ALL {
+            out.sample(
+                &f::SCHEDULE_RULE_LAST_OUTCOME,
+                &[("rule_id", &rule.id), ("outcome", outcome.as_str())],
+                u8::from(rule.last_outcome == Some(outcome)),
+            );
+        }
+    }
+}
+
+// One per-leg gauge's value, or `None` to leave the leg's series out.
+type LegValue = fn(&LegMetrics) -> Option<f64>;
+
+pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot) {
+    let legs: Vec<(String, String, &LegMetrics)> = metrics
+        .legs
+        .iter()
+        .map(|leg| (leg.position.to_string(), leg.egress_id.to_string(), leg))
+        .collect();
+    for (position, egress, leg) in &legs {
+        for state in LegStateLabel::ALL {
+            out.sample(
+                &f::NETWORK_LEG_STATE,
+                &[
+                    ("consumer", leg.consumer.as_str()),
+                    ("position", position),
+                    ("egress_id", egress),
+                    ("state", state.as_str()),
+                ],
+                u8::from(leg.state == state),
+            );
+        }
+    }
+    let leg_families: [(&'static MetricFamily, LegValue); 7] = [
+        (&f::NETWORK_LEG_STATE_SINCE, |l| {
+            Some(l.state_since_epoch_ms as f64 / 1_000.0)
+        }),
+        (&f::NETWORK_LEG_LIVE, |l| Some(f64::from(u8::from(l.live)))),
+        (&f::NETWORK_LEG_TARGET, |l| Some(l.target as f64)),
+        (&f::NETWORK_LEG_OPEN, |l| Some(l.open as f64)),
+        (&f::NETWORK_LEG_OPENING, |l| Some(l.opening as f64)),
+        (&f::NETWORK_LEG_THROUGHPUT, |l| {
+            Some(l.bytes_per_second as f64)
+        }),
+        (&f::NETWORK_LEG_RUNG, |l| l.rung.map(|r| r as f64)),
+    ];
+    for (family, value) in leg_families {
+        for (position, egress, leg) in &legs {
+            if let Some(value) = value(leg) {
+                out.sample_f64(
+                    family,
+                    &[
+                        ("consumer", leg.consumer.as_str()),
+                        ("position", position),
+                        ("egress_id", egress),
+                    ],
+                    value,
+                );
+            }
+        }
+    }
+    for (position, _, leg) in &legs {
+        for (rung, rung_state) in leg.rungs.iter().enumerate() {
+            let rung = rung.to_string();
+            for state in RungStateLabel::ALL {
+                out.sample(
+                    &f::NETWORK_RUNG_STATE,
+                    &[
+                        ("consumer", leg.consumer.as_str()),
+                        ("position", position),
+                        ("rung", &rung),
+                        ("state", state.as_str()),
+                    ],
+                    u8::from(*rung_state == state),
+                );
+            }
+        }
+    }
+
+    let egresses: Vec<(String, &EgressMetrics)> = metrics
+        .egresses
+        .iter()
+        .map(|egress| (egress.egress_id.to_string(), egress))
+        .collect();
+    for (id, egress) in &egresses {
+        for health in EgressHealthLabel::ALL {
+            out.sample(
+                &f::NETWORK_EGRESS_HEALTH,
+                &[("egress_id", id), ("health", health.as_str())],
+                u8::from(egress.health == health),
+            );
+        }
+    }
+    for (id, egress) in &egresses {
+        out.sample_f64(
+            &f::NETWORK_EGRESS_HEALTH_SINCE,
+            &[("egress_id", id)],
+            egress.health_since_epoch_ms as f64 / 1_000.0,
+        );
+    }
+    for (id, egress) in &egresses {
+        out.sample(
+            &f::NETWORK_EGRESS_ENABLED,
+            &[("egress_id", id)],
+            u8::from(egress.enabled),
+        );
+    }
+    for (id, egress) in &egresses {
+        for (result, count) in egress.dials {
+            out.sample(
+                &f::NETWORK_EGRESS_DIALS,
+                &[("egress_id", id), ("result", result.as_str())],
+                count,
+            );
+        }
+    }
+    for (id, egress) in &egresses {
+        out.sample(
+            &f::NETWORK_EGRESS_COOLDOWNS,
+            &[("egress_id", id)],
+            egress.cooldowns,
+        );
+    }
+
+    let pools: Vec<(String, String, &PoolMetrics)> = metrics
+        .pools
+        .iter()
+        .map(|pool| (pool.pool_id.to_string(), pool.egress_id.to_string(), pool))
+        .collect();
+    for (pool_id, egress, pool) in &pools {
+        let members = &pool.members;
+        for (stage, count) in [
+            ("total", members.len()),
+            ("warmed", members.iter().filter(|m| m.warmed).count()),
+            ("blocked", members.iter().filter(|m| m.blocked).count()),
+        ] {
+            out.sample(
+                &f::NETWORK_POOL_MEMBERS,
+                &[
+                    ("pool_id", pool_id),
+                    ("egress_id", egress),
+                    ("stage", stage),
+                ],
+                count,
+            );
+        }
+    }
+    for (pool_id, egress, pool) in &pools {
+        for (state, count) in [
+            ("open", pool.members.iter().map(|m| m.open).sum::<u64>()),
+            ("opening", pool.members.iter().map(|m| m.opening).sum()),
+        ] {
+            out.sample(
+                &f::NETWORK_POOL_CONNECTIONS,
+                &[
+                    ("pool_id", pool_id),
+                    ("egress_id", egress),
+                    ("state", state),
+                ],
+                count,
+            );
+        }
+    }
+    for (pool_id, egress, pool) in &pools {
+        for (result, count) in [("won", pool.races_won), ("failed", pool.races_failed)] {
+            out.sample(
+                &f::NETWORK_POOL_RACES,
+                &[
+                    ("pool_id", pool_id),
+                    ("egress_id", egress),
+                    ("result", result),
+                ],
+                count,
+            );
+        }
+    }
+    for (pool_id, egress, pool) in &pools {
+        for member in &pool.members {
+            if let Some(seconds) = member.session_handshake_seconds {
+                let member_id = member.member_id.to_string();
+                out.sample_f64(
+                    &f::NETWORK_POOL_MEMBER_HANDSHAKE,
+                    &[
+                        ("pool_id", pool_id),
+                        ("egress_id", egress),
+                        ("member_id", &member_id),
+                    ],
+                    seconds,
+                );
+            }
+        }
+    }
+    for &(kind, enabled, count) in &metrics.proxies {
+        out.sample(
+            &f::NETWORK_PROXIES,
+            &[
+                ("kind", proxy_kind_label(kind)),
+                ("enabled", bool_label(enabled)),
+            ],
+            count,
+        );
+    }
+}
+
+// The egress rate limiter's counters, from the same registry the egress
+// quota families read.
+fn render_egress_transfers(
+    out: &mut Encoder,
+    egress_transfers: &[weaver_nntp::transfer::ServerTransferSnapshot],
+) {
+    let ids: Vec<String> = egress_transfers
+        .iter()
+        .map(|t| t.stable_server_id.0.to_string())
+        .collect();
+    for (id, transfer) in ids.iter().zip(egress_transfers) {
+        out.sample(
+            &f::EGRESS_DOWNLOAD_BYTES,
+            &[("egress_id", id)],
+            transfer.lifetime_body_bytes,
+        );
+    }
+    for (id, transfer) in ids.iter().zip(egress_transfers) {
+        out.sample(
+            &f::EGRESS_DOWNLOAD_RATE_LIMIT,
+            &[("egress_id", id)],
+            transfer.rate_bytes_per_sec,
+        );
+    }
+    for (id, transfer) in ids.iter().zip(egress_transfers) {
+        out.sample_f64(
+            &f::EGRESS_DOWNLOAD_THROTTLE_SECONDS,
+            &[("egress_id", id)],
+            transfer.throttle_wait.as_secs_f64(),
+        );
+    }
+}
+
+pub(crate) fn render_tunnel(out: &mut Encoder, metrics: &TunnelMetricsSnapshot) {
+    for &(kind, result, count) in &metrics.streams {
+        out.sample(
+            &f::TUNNEL_STREAMS,
+            &[("kind", kind.as_str()), ("result", result.as_str())],
+            count,
+        );
+    }
+    for &(kind, ok, failed) in &metrics.session_prepares {
+        for (result, count) in [("success", ok), ("failed", failed)] {
+            out.sample(
+                &f::TUNNEL_SESSION_PREPARES,
+                &[("kind", kind.as_str()), ("result", result)],
+                count,
+            );
+        }
+    }
+    for &(kind, count) in &metrics.session_retirements {
+        out.sample(
+            &f::TUNNEL_SESSION_RETIREMENTS,
+            &[("kind", kind.as_str())],
+            count,
+        );
+    }
+    for &(resolver, ok, failed) in &metrics.resolutions {
+        for (result, count) in [("success", ok), ("failed", failed)] {
+            out.sample(
+                &f::NETWORK_DNS_RESOLUTIONS,
+                &[("resolver", resolver.as_str()), ("result", result)],
+                count,
+            );
+        }
+    }
+    for (rung, count) in metrics.rung_cooldowns.iter().enumerate() {
+        let rung = rung.to_string();
+        out.sample(&f::NETWORK_RUNG_COOLDOWNS, &[("rung", &rung)], *count);
+    }
+    for (rung, count) in metrics.rung_fallbacks.iter().enumerate() {
+        let rung = rung.to_string();
+        out.sample(&f::NETWORK_RUNG_FALLBACKS, &[("rung", &rung)], *count);
+    }
+    out.sample(&f::NETWORK_LEG_REVOCATIONS, &[], metrics.revocations);
 }

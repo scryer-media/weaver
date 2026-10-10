@@ -3,7 +3,6 @@ import { NumberField } from "@/next/components/controls";
 import type { FieldSpec, SettingsBlock } from "@/next/pages/settings/framework";
 
 export const eventScriptDefaults = {
-  eventScriptConcurrency: 1,
   eventScriptTimeoutSeconds: 300,
   fileDownloadedEventInterval: 0,
   scriptOutputRunsPerJob: 32,
@@ -29,7 +28,6 @@ const FIELDS: {
   /** Lowering it deletes stored runs on save, so the field says so first. */
   deletesWhenLowered?: boolean;
 }[] = [
-  { key: "eventScriptConcurrency", label: "next.postProcessing.eventConcurrency", help: "next.postProcessing.eventConcurrencyHelp", min: 1, max: 8 },
   { key: "eventScriptTimeoutSeconds", label: "next.postProcessing.eventTimeout", help: "next.postProcessing.eventTimeoutHelp", min: 1, max: 86400, unit: "next.general.seconds" },
   { key: "fileDownloadedEventInterval", label: "next.postProcessing.fileEventInterval", help: "next.postProcessing.fileEventIntervalHelp", min: -1, max: 86400, unit: "next.general.seconds" },
   { key: "scriptOutputRunsPerJob", label: "next.postProcessing.outputRuns", help: "next.postProcessing.outputRunsHelp", min: 1, max: 128, deletesWhenLowered: true },

@@ -379,35 +379,39 @@ test("Q08 nothing is admitted without an enabled subscriber or with execution of
   }
 });
 
-test("Q09 queue events run one at a time; scan scripts honour eventScriptConcurrency", async ({ request }) => {
-  note("discrepancy", "eventScriptConcurrency applies to scan, feed and scheduler runs; queue events always drain one at a time. The queue half asserts serial order, the scan half asserts the concurrency of 2.");
+test("Q09 queue events of different downloads and scan scripts share the one concurrency setting", async ({ request }) => {
+  note("discrepancy", "One concurrency setting bounds every script weaver runs. Queue events of different downloads run side by side up to it; a download's own events still run one at a time. Both halves assert the concurrency of 2.");
   const tag = `q09-${token()}`;
   const queueScript = writeFixtureScript(`${tag}-queue`, { kinds: ["QUEUE"], queueEvents: ["NZB_ADDED"], gate: true });
   const scanScript = writeFixtureScript(`${tag}-scan`, { kinds: ["SCAN"], gate: true });
-  const restore = await useScripts(request, { global: [{ script: queueScript }] }, { eventScriptConcurrency: 2 });
+  const restore = await useScripts(request, { global: [{ script: queueScript }] }, { concurrency: 2 });
   const jobs: number[] = [];
   await pauseAll(request);
   try {
     for (let index = 0; index < 5; index += 1) jobs.push(await job(request, `${tag}-${index}`));
     const rowsSql = `SELECT job_id, state, seq FROM script_event_queue WHERE event = 'NZB_ADDED' AND job_id IN (${jobs.map(literal).join(", ")}) ORDER BY seq`;
-    const released: number[] = [];
     let violation = "";
     await expect.poll(async () => {
       const started = (await query(rowsSql)).filter(row => row.state === "started");
       const waiting = gateKeys(queueScript);
-      if (started.length > 1 || waiting.length > 1) {
-        violation = `started ${JSON.stringify(started)}, waiting ${JSON.stringify(waiting)}`;
-        return true;
-      }
+      if (started.length > 2 || waiting.length > 2) violation = `started ${JSON.stringify(started)}, waiting ${JSON.stringify(waiting)}`;
+      return waiting.length >= 2;
+    }, { message: "two NZB_ADDED runs of different downloads at their gates", timeout: 0 }).toBe(true);
+    expect(violation).toBe("");
+    const released = new Set<string>();
+    await expect.poll(async () => {
+      const started = (await query(rowsSql)).filter(row => row.state === "started");
+      const waiting = gateKeys(queueScript);
+      if (started.length > 2 || waiting.length > 2) violation = `started ${JSON.stringify(started)}, waiting ${JSON.stringify(waiting)}`;
       for (const key of waiting) {
         await openGate(queueScript, key);
-        released.push(Number(key));
+        released.add(key);
       }
-      return released.length === jobs.length;
-    }, { message: "five NZB_ADDED runs released one at a time", timeout: 0 }).toBe(true);
+      return released.size === jobs.length;
+    }, { message: "five NZB_ADDED runs released, at most two at a time", timeout: 0 }).toBe(true);
     expect(violation).toBe("");
-    const rows = await waitRows(rowsSql, all => all.length === jobs.length && all.every(row => row.state === "done"), "every NZB_ADDED run done");
-    expect(released).toEqual(rows.map(row => Number(row.job_id)));
+    await waitRows(rowsSql, all => all.length === jobs.length && all.every(row => row.state === "done"), "every NZB_ADDED run done");
+    expect([...released].map(Number).sort((a, b) => a - b)).toEqual([...jobs].sort((a, b) => a - b));
 
     await setScriptLists(request, { global: [{ script: scanScript }] });
     const submissions = [0, 1, 2].map(index => {
@@ -558,7 +562,7 @@ const PLATFORM_ENV = new Set(["PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "WIND
 // The shell the fixture runs in sets these itself.
 const SHELL_ENV = new Set(["PWD", "SHLVL", "OLDPWD", "_"]);
 
-test("Q15 a post-processing script gets the NZBGet environment and nothing outside the allow-list", async ({ request }) => {
+test("Q15 a post-processing script gets the NZBGet, SABnzbd and weaver environments and nothing outside the allow-list", async ({ request }) => {
   const tag = `q15-${token()}`;
   const script = writeFixturePackage(tag, { kinds: ["POST-PROCESSING"], exitCode: 93, scriptOptions: [{ name: "Label", value: "q15-label" }] });
   const restore = await useScripts(request, { global: [{ script }] });
@@ -573,7 +577,10 @@ test("Q15 a post-processing script gets the NZBGet environment and nothing outsi
       expect(env, key).toHaveProperty(key);
     }
     expect(env.NZBPO_LABEL).toBe("q15-label");
-    const outside = Object.keys(env).filter(key => !PLATFORM_ENV.has(key) && !SHELL_ENV.has(key) && !/^NZB(PP|PO|OP|PR)_/.test(key));
+    // Weaver hands every script all three families, whatever its adapter.
+    expect(env.SAB_NZO_ID).toBe(String(jobId));
+    expect(env.WEAVER_JOB_ID).toBe(String(jobId));
+    const outside = Object.keys(env).filter(key => !PLATFORM_ENV.has(key) && !SHELL_ENV.has(key) && !/^(NZB(PP|PO|OP|PR)_|SAB_|WEAVER_)/.test(key));
     expect(outside).toEqual([]);
   } finally {
     await restore();
@@ -582,14 +589,16 @@ test("Q15 a post-processing script gets the NZBGet environment and nothing outsi
 });
 
 test("Q16 exit codes map to statuses per adapter", async ({ request }) => {
-  note("discrepancy", "NZBGet exit 0 maps to FAILED (NZBGet requires 93 for success); the WARNING case is a SABnzbd-adapter script exiting non-zero, not exit 0 with warning output.");
+  note("design", "Every adapter reads 0, 92 and 93 as success, 95 as skipped and anything else as failed; NZBGet itself reads exit 0 as a failure. WARNING is only for a listed script that cannot be run (see post-processing-scripts PP04).");
   const tag = `q16-${token()}`;
   const cases = [
     { script: writeFixtureScript(`${tag}-93`, { kinds: ["POST-PROCESSING"], exitCode: 93 }), status: "SUCCEEDED" },
+    { script: writeFixtureScript(`${tag}-92`, { kinds: ["POST-PROCESSING"], exitCode: 92 }), status: "SUCCEEDED" },
     { script: writeFixtureScript(`${tag}-94`, { kinds: ["POST-PROCESSING"], exitCode: 94 }), status: "FAILED" },
     { script: writeFixtureScript(`${tag}-95`, { kinds: ["POST-PROCESSING"], exitCode: 95 }), status: "SKIPPED" },
-    { script: writeFixtureScript(`${tag}-0`, { kinds: ["POST-PROCESSING"], body: "echo '[WARNING] q16 warning'\n", exitCode: 0 }), status: "FAILED" },
-    { script: writeBareScript(`${tag}-sab-1`, { body: "echo q16 warning\n", exitCode: 1 }), status: "WARNING" },
+    { script: writeFixtureScript(`${tag}-0`, { kinds: ["POST-PROCESSING"], body: "echo '[WARNING] q16 warning'\n", exitCode: 0 }), status: "SUCCEEDED" },
+    { script: writeBareScript(`${tag}-sab-0`, { exitCode: 0 }), status: "SUCCEEDED" },
+    { script: writeBareScript(`${tag}-sab-1`, { body: "echo q16 warning\n", exitCode: 1 }), status: "FAILED" },
   ];
   try {
     for (const { script, status } of cases) {
@@ -844,7 +853,7 @@ test("FS02 a FEED script rewrites item titles, and a rewritten feed over the cei
   }
 });
 
-test("UI01 the settings and job pages show script kinds, declarations and run statuses", async ({ cleanPage: page, request }) => {
+test("UI01 the settings and job pages show script jobs by trigger, and run statuses by event", async ({ cleanPage: page, request }) => {
   const tag = `ui01-${token()}`;
   const queue = writeFixtureScript(`${tag}-queue`, { kinds: ["POST-PROCESSING", "QUEUE"], queueEvents: ["NZB_ADDED", "NZB_DOWNLOADED"], exitCode: 93 });
   const scheduler = writeFixtureScript(`${tag}-scheduler`, { kinds: ["SCHEDULER"], taskTimes: ["04:00", "*:20"] });
@@ -856,19 +865,17 @@ test("UI01 the settings and job pages show script kinds, declarations and run st
     await expect(page.getByRole("textbox", { name: "Scripts directory", exact: true })).toHaveValue(WEAVER_SCRIPTS_DIR);
     await expect(page.getByRole("region", { name: "Event scripts and output retention", exact: true })).toBeVisible();
     await page.goto("/settings/scripts/list");
-    // A discovered script's row; its name cell carries the script's file name.
-    const entry = (name: string) =>
-      page.getByRole("region", { name: "Discovered scripts", exact: true })
-        .getByRole("button").filter({ has: page.getByText(name, { exact: true }) });
-    await expect(entry(queue)).toContainText("Post-processing");
-    await expect(entry(queue)).toContainText("Queue");
-    await expect(entry(queue)).toContainText("Declared events:");
-    await expect(entry(queue)).toContainText("NZB_ADDED");
-    await expect(entry(queue)).toContainText("NZB_DOWNLOADED");
-    await expect(entry(scheduler)).toContainText("Scheduler");
-    await expect(entry(scheduler)).toContainText("Task times: 04:00, *:20");
-    await expect(entry(scan)).toContainText("Scan");
-    await expect(entry(feed)).toContainText("Feed");
+    // Jobs are grouped by what starts them; a job's row carries its name.
+    const jobs = page.getByRole("region", { name: "Jobs", exact: true });
+    const row = (group: string, name: string) =>
+      jobs.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(name, { exact: true }) });
+    for (const [group, name] of [
+      ["Post-processing", queue], ["Queue · NZB_ADDED", queue], ["Queue · NZB_DOWNLOADED", queue],
+      ["Schedule", scheduler], ["Scan", scan], ["Feed", feed],
+    ] as const) {
+      await expect(row(group, name), `${name} under ${group}`).toBeVisible();
+      await expect(jobs.getByRole("region", { name: group, exact: true }).getByRole("switch", { name: `${name} enabled`, exact: true })).toBeChecked();
+    }
 
     await pauseAll(request);
     const jobId = await job(request, tag);
@@ -878,15 +885,15 @@ test("UI01 the settings and job pages show script kinds, declarations and run st
     const results = (await waitResults(request, jobId, all => all.filter(result => result.script === queue).length >= 3, "three runs of the queue script"))
       .filter(result => result.script === queue);
     await page.goto(`/jobs/${jobId}`);
-    const groups = new Map<string, number>();
-    for (const result of results) groups.set(result.event, (groups.get(result.event) ?? 0) + 1);
+    // One group per event, named with its run count, each showing how its runs ended.
     const allResults = await scriptResults(request, jobId);
-    for (const [event] of groups) {
-      const count = allResults.filter(result => result.event === event).length;
-      await expect(page.getByText(`${event} (${count})`, { exact: true })).toBeVisible();
-    }
-    for (const status of new Set(results.map(result => result.status))) {
-      await expect(page.getByText(status, { exact: true }).first()).toBeVisible();
+    for (const event of new Set(results.map(result => result.event))) {
+      const ofEvent = allResults.filter(result => result.event === event);
+      const group = page.getByRole("group", { name: `${event} (${ofEvent.length})`, exact: true });
+      await expect(group).toBeVisible();
+      for (const status of new Set(ofEvent.map(result => result.status))) {
+        await expect(group.getByText(status, { exact: true })).toHaveCount(ofEvent.filter(result => result.status === status).length);
+      }
     }
   } finally {
     await resumeAll(request);

@@ -261,6 +261,13 @@ impl Posted {
                 reach.end = (reach.end + self.article).min(self.bytes.len());
             }
             upper.push(reach);
+            if *damage == Damage::Swapped {
+                // A swapped body is another article's bytes, intact and merely
+                // misplaced. A verifier that finds blocks and packets at any
+                // offset may still use them, so the swap is only possibly
+                // wrong and never certainly so.
+                continue;
+            }
             if let Some(written) = self.definite(article) {
                 // Positions the written copy leaves different, or does not
                 // reach at all.

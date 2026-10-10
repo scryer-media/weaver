@@ -15,7 +15,6 @@ use std::fmt::Display;
 pub(crate) enum MetricKind {
     Counter,
     Gauge,
-    Summary,
     Histogram,
 }
 
@@ -24,7 +23,6 @@ impl MetricKind {
         match self {
             Self::Counter => "counter",
             Self::Gauge => "gauge",
-            Self::Summary => "summary",
             Self::Histogram => "histogram",
         }
     }
@@ -110,20 +108,6 @@ impl Encoder {
     ) {
         self.family(family);
         self.write_line(family.name, "", labels, &format_prometheus_f64(value));
-    }
-
-    // Emit the `_sum`/`_count` pair of a summary family.
-    pub(crate) fn summary(
-        &mut self,
-        family: &'static MetricFamily,
-        labels: &[(&str, &str)],
-        sum: f64,
-        count: u64,
-    ) {
-        debug_assert_eq!(family.kind, MetricKind::Summary);
-        self.family(family);
-        self.write_line(family.name, "_sum", labels, &format_prometheus_f64(sum));
-        self.write_line(family.name, "_count", labels, &count.to_string());
     }
 
     // Emit a histogram family from a bucketed snapshot.

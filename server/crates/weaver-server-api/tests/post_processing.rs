@@ -66,7 +66,7 @@ async fn settings_are_admin_only_and_execution_is_off_by_default() {
     let settings = &response_data(&response)["postProcessingSettings"];
     assert!(std::path::Path::new(settings["scriptDirectory"].as_str().unwrap()).is_absolute());
     assert_eq!(settings["executionEnabled"], false);
-    assert_eq!(settings["concurrency"], 4);
+    assert_eq!(settings["concurrency"], 32);
     assert_eq!(settings["terminationGraceSeconds"], 10);
     assert_eq!(
         settings["unacceptableExtensions"],
@@ -201,7 +201,7 @@ async fn settings_round_trip_preserves_omitted_extensions_and_rejects_invalid_up
         .execute(
             r#"mutation { setPostProcessingSettings(input: {
                 executionEnabled: true
-                concurrency: 99
+                concurrency: 129
                 terminationGraceSeconds: 15
             }) { concurrency } }"#,
         )
@@ -1756,6 +1756,88 @@ async fn recorded_runs_are_listed_in_pages_for_any_reader() {
         )
         .await;
     assert_has_errors(&nowhere);
+}
+
+#[tokio::test]
+async fn a_run_of_a_job_still_in_the_queue_shows_the_jobs_name() {
+    use weaver_server_core::post_processing::model::{
+        ScriptAdapter, ScriptEventLabel, ScriptName, ScriptResult, ScriptStatus,
+    };
+    use weaver_server_core::post_processing::output::retain_output;
+
+    let harness = TestHarness::new().await;
+    let job_id = harness.submit_test_nzb("queued-release").await;
+    let named = harness
+        .execute_as(
+            &format!("{{ job(id: {job_id}) {{ name }} }}"),
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&named);
+    let name = response_data(&named)["job"]["name"].clone();
+    assert!(name.is_string());
+    // The job's row, as the pipeline writes it, keeps the run from being
+    // trimmed as an orphan; its name lives only in the queue.
+    harness
+        .db
+        .create_active_job(&weaver_server_core::ActiveJob {
+            job_id: weaver_server_core::JobId(job_id),
+            nzb_hash: [7; 32],
+            nzb_path: "queued-release.nzb".into(),
+            nzb_zstd: Vec::new(),
+            output_dir: "queued-release".into(),
+            created_at: 1,
+            category: None,
+            metadata: Vec::new(),
+            status: "queued",
+            download_state: "queued",
+            post_state: "idle",
+            run_state: "active",
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            password_override: None,
+        })
+        .unwrap();
+    retain_output(
+        harness.db.clone(),
+        Some(job_id),
+        ScriptResult {
+            script: ScriptName::new("added.sh").unwrap(),
+            instance_id: None,
+            instance_name: None,
+            event: ScriptEventLabel::Queue(
+                weaver_server_core::post_processing::model::QueueEvent::NzbAdded,
+            ),
+            output_id: None,
+            background: false,
+            adapter: ScriptAdapter::Nzbget,
+            status: ScriptStatus::Succeeded,
+            exit_code: Some(0),
+            duration_ms: 5,
+            output_tail: String::new(),
+            output_truncated: false,
+            error_message: None,
+            finished_at_epoch_ms: 1_000,
+        },
+        b"added".to_vec(),
+        5,
+        harness.db.post_processing_settings().unwrap().event_scripts,
+    )
+    .await
+    .unwrap();
+
+    let runs = harness
+        .execute_as(
+            &format!("{{ scriptRuns(jobId: {job_id}) {{ runs {{ jobId jobName }} }} }}"),
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&runs);
+    let runs = response_data(&runs)["scriptRuns"]["runs"].clone();
+    assert_eq!(runs.as_array().unwrap().len(), 1);
+    assert_eq!(runs[0]["jobId"], job_id);
+    assert_eq!(runs[0]["jobName"], name);
 }
 
 // Record a finished run of `script` on the scan event, with no job.

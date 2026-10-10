@@ -94,7 +94,7 @@ fn request(
 }
 
 fn executor(db: &Database, data_dir: &Path) -> PostProcessingExecutor {
-    PostProcessingExecutor::new(db.clone(), data_dir.join("scripts"), 1)
+    PostProcessingExecutor::new(db.clone(), data_dir.join("scripts"))
         .with_supervisor_executable(supervisor())
 }
 

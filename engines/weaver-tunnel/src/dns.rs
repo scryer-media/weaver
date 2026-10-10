@@ -20,6 +20,16 @@ pub async fn resolve(
     if let Ok(ip) = host.parse() {
         return Ok(vec![ip]);
     }
+    let resolved = resolve_name(provider, servers, host).await;
+    crate::metrics::record_resolution(crate::metrics::Resolver::Routed, resolved.is_ok());
+    resolved
+}
+
+async fn resolve_name(
+    provider: &dyn TunnelProvider,
+    servers: &[IpAddr],
+    host: &str,
+) -> Result<Vec<IpAddr>, TunnelError> {
     if servers.is_empty() {
         return Err(TunnelError::Configuration(
             "this proxy needs a routed DNS server for hostname resolution".into(),

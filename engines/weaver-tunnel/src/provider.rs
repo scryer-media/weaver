@@ -14,6 +14,10 @@ pub trait TunnelProvider: Send + Sync {
         Ok(())
     }
     async fn retire(&self) {}
+    // The kind of tunnel this provider speaks, when it is one.
+    fn kind(&self) -> Option<crate::metrics::TunnelKind> {
+        None
+    }
     fn source_address(&self) -> Option<std::net::SocketAddr> {
         None
     }

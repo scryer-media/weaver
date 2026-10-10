@@ -354,8 +354,9 @@ metric_families! {
         "Jobs waiting for a turn to run a post-processing script.");
     PP_ACTIVE_ATTEMPTS = ("weaver_post_processing_active_attempts", Gauge, [],
         "Post-processing scripts currently running.");
-    PP_ATTEMPT_DURATION = ("weaver_post_processing_attempt_duration_seconds", Summary, [],
-        "Wall-clock duration of completed post-processing script executions.");
+    PP_ATTEMPT_DURATION = ("weaver_post_processing_attempt_duration_seconds", Histogram,
+        ["script", "kind", "waited", "status"],
+        "Wall-clock duration of finished script runs, by script, run kind, whether the job waited on the run, and status. Every run kind records here.");
     PP_ATTEMPT_RESULTS = ("weaver_post_processing_attempt_results", Counter, ["result"],
         "Completed post-processing script executions by outcome.",
         deprecated_by = "weaver_post_processing_attempts_total");
@@ -366,6 +367,142 @@ metric_families! {
         deprecated_by = "weaver_post_processing_output_truncations_total");
     PP_OUTPUT_TRUNCATIONS = ("weaver_post_processing_output_truncations_total", Counter, [],
         "Post-processing script executions whose captured output was truncated.");
+    PP_RUNS_STARTED = ("weaver_post_processing_runs_started_total", Counter, ["kind"],
+        "Script runs that took a slot, by run kind.");
+    PP_RUNS_RUNNING = ("weaver_post_processing_runs_running", Gauge, ["kind"],
+        "Script runs holding a slot now, by run kind.");
+    PP_WAITING_FOR_SLOT = ("weaver_post_processing_waiting_for_slot", Gauge, ["kind"],
+        "Script runs waiting for a slot now, by run kind.");
+    PP_SLOT_WAITS = ("weaver_post_processing_slot_waits_total", Counter, ["kind"],
+        "Script runs that entered a slot wait, by run kind.");
+    PP_CONCURRENCY_LIMIT = ("weaver_post_processing_concurrency_limit", Gauge, [],
+        "Configured number of script runs that may hold a slot at once.");
+    PP_SLOTS_IN_USE = ("weaver_post_processing_slots_in_use", Gauge, [],
+        "Script runs holding a slot in the shared pool, as the pool counts them.");
+    PP_SLOTS_WAITING = ("weaver_post_processing_slots_waiting", Gauge, [],
+        "Script runs queued for a slot in the shared pool, as the pool counts them.");
+    PP_QUEUE_EVENT_BACKLOG = ("weaver_post_processing_queue_event_backlog", Gauge, [],
+        "Queue events recorded for scripts and not yet started.");
+    PP_REFUSALS = ("weaver_post_processing_refusals_total", Counter, ["kind"],
+        "Script events refused before any script ran, by run kind.");
+    PP_JOB_SUMMARIES = ("weaver_post_processing_job_summaries_total", Counter, ["summary"],
+        "Jobs whose post-processing pass finished, by the pass's summary.");
+    PP_INTERRUPTED_RECOVERED = ("weaver_post_processing_interrupted_recovered_total", Counter, [],
+        "Jobs whose post-processing pass was cut off by a restart and resumed.");
+    PP_RETAINED_RUNS = ("weaver_post_processing_retained_runs_total", Counter, ["action"],
+        "Script run records by what retention did with them: kept, discarded on arrival, or pruned.");
+    PP_SCRIPT_RUNS = ("weaver_post_processing_script_runs_total", Counter,
+        ["script", "kind", "adapter", "waited", "status"],
+        "Finished script runs by script, run kind, adapter, whether the job waited on the run, and status.");
+    PP_SCRIPT_NONZERO_EXITS = ("weaver_post_processing_script_nonzero_exits_total", Counter, ["script"],
+        "Script runs that exited with a non-zero code.");
+    PP_SCRIPT_LAST_EXIT_CODE = ("weaver_post_processing_script_last_exit_code", Gauge, ["script"],
+        "Exit code of the script's most recent run that exited; absent until one has.");
+    PP_SCRIPT_LAST_DURATION = ("weaver_post_processing_script_last_duration_seconds", Gauge, ["script"],
+        "Duration of the script's most recent finished run.");
+    PP_SCRIPT_LAST_RUN_TIMESTAMP = ("weaver_post_processing_script_last_run_timestamp_seconds", Gauge,
+        ["script"], "When the script's most recent run finished, as a unix timestamp.");
+    PP_SCRIPT_LAST_RUN_STATUS = ("weaver_post_processing_script_last_run_status", Gauge,
+        ["script", "status"], "Status of the script's most recent run; exactly one status is 1.");
+    PP_SCRIPT_OUTPUT_BYTES = ("weaver_post_processing_script_output_bytes_total", Counter, ["script"],
+        "Output bytes the script's runs produced before compression.");
+    PP_SCRIPT_OUTPUT_STORED_BYTES = ("weaver_post_processing_script_output_stored_bytes_total", Counter,
+        ["script"], "Compressed output bytes kept for the script's runs.");
+    PP_SCRIPT_OUTPUT_TRUNCATIONS = ("weaver_post_processing_script_output_truncations_total", Counter,
+        ["script"], "Script runs whose captured output was truncated.");
+    PP_SCRIPT_PRUNED_RUNS = ("weaver_post_processing_script_pruned_runs_total", Counter, ["script"],
+        "Script run records retention removed to make room for newer runs.");
+
+    // ---- schedules ----------------------------------------------------------------
+    SCHEDULE_EVALUATIONS = ("weaver_schedule_evaluations_total", Counter, [],
+        "Schedule evaluator ticks.");
+    SCHEDULE_ACTIONS = ("weaver_schedule_actions_total", Counter, ["action", "track", "outcome"],
+        "Schedule actions applied, by action kind, the state track it drives, and outcome.");
+    SCHEDULE_ONE_SHOT_FIRES = ("weaver_schedule_one_shot_fires_total", Counter, ["action"],
+        "One-shot schedule rules that came due.");
+    SCHEDULE_REPLAYS = ("weaver_schedule_replays_total", Counter, ["reason"],
+        "Schedule actions applied as a replay rather than at their time, by reason.");
+    SCHEDULE_CLOCK_JUMPS = ("weaver_schedule_clock_jumps_total", Counter, ["evaluator"],
+        "Wall-clock jumps the schedule evaluators detected.");
+    SCHEDULE_ADMISSION_HOLD = ("weaver_schedule_admission_hold", Gauge, ["reason"],
+        "Why the schedule holds download admission; exactly one reason is 1, and none means no hold.");
+    SCHEDULE_RULES = ("weaver_schedule_rules", Gauge, ["action"],
+        "Configured schedule rules by action kind.");
+    SCHEDULE_RULES_ENABLED = ("weaver_schedule_rules_enabled", Gauge, ["action"],
+        "Enabled schedule rules by action kind.");
+    SCHEDULE_RULE_ENABLED = ("weaver_schedule_rule_enabled", Gauge, ["rule_id", "action"],
+        "Whether each configured schedule rule is enabled.");
+    SCHEDULE_RULE_FIRES = ("weaver_schedule_rule_fires_total", Counter, ["rule_id", "outcome"],
+        "Actions each configured schedule rule applied, by outcome.");
+    SCHEDULE_RULE_LAST_FIRE = ("weaver_schedule_rule_last_fire_timestamp_seconds", Gauge, ["rule_id"],
+        "When each schedule rule last applied its action, as a unix timestamp; 0 until it has.");
+    SCHEDULE_RULE_LAST_OUTCOME = ("weaver_schedule_rule_last_outcome", Gauge, ["rule_id", "outcome"],
+        "Outcome of each schedule rule's last action; all zero until it has fired.");
+
+    // ---- networking -----------------------------------------------------------------
+    NETWORK_LEG_STATE = ("weaver_network_leg_state", Gauge,
+        ["consumer", "position", "egress_id", "state"],
+        "Health of each route leg; exactly one state is 1.");
+    NETWORK_LEG_STATE_SINCE = ("weaver_network_leg_state_since_timestamp_seconds", Gauge,
+        ["consumer", "position", "egress_id"],
+        "When a scrape first saw the leg's current state, as a unix timestamp.");
+    NETWORK_LEG_LIVE = ("weaver_network_leg_live", Gauge, ["consumer", "position", "egress_id"],
+        "Whether the leg's consumer has a live dialer; 0 for a configured but dormant route.");
+    NETWORK_LEG_TARGET = ("weaver_network_leg_target_connections", Gauge,
+        ["consumer", "position", "egress_id"], "Connections the leg is weighted to carry.");
+    NETWORK_LEG_OPEN = ("weaver_network_leg_open_connections", Gauge,
+        ["consumer", "position", "egress_id"], "Connections open on the leg.");
+    NETWORK_LEG_OPENING = ("weaver_network_leg_opening_connections", Gauge,
+        ["consumer", "position", "egress_id"], "Connections being set up on the leg.");
+    NETWORK_LEG_THROUGHPUT = ("weaver_network_leg_throughput_bytes_per_second", Gauge,
+        ["consumer", "position", "egress_id"],
+        "Bytes per second the leg carried over its last few seconds.");
+    NETWORK_LEG_RUNG = ("weaver_network_leg_rung", Gauge, ["consumer", "position", "egress_id"],
+        "Ladder rung the leg's last connection used, counted from 0; absent on a leg without one.");
+    NETWORK_RUNG_STATE = ("weaver_network_rung_state", Gauge,
+        ["consumer", "position", "rung", "state"],
+        "State of each ladder rung; exactly one state is 1.");
+    NETWORK_EGRESS_HEALTH = ("weaver_network_egress_health", Gauge, ["egress_id", "health"],
+        "Health of each configured egress; exactly one health is 1.");
+    NETWORK_EGRESS_HEALTH_SINCE = ("weaver_network_egress_health_since_timestamp_seconds", Gauge,
+        ["egress_id"], "When a scrape first saw the egress's current health, as a unix timestamp.");
+    NETWORK_EGRESS_ENABLED = ("weaver_network_egress_enabled", Gauge, ["egress_id"],
+        "Whether each configured egress is enabled.");
+    NETWORK_EGRESS_DIALS = ("weaver_network_egress_dials_total", Counter, ["egress_id", "result"],
+        "Route leg connection attempts by egress and result; ignored results are no evidence about the path.");
+    NETWORK_EGRESS_COOLDOWNS = ("weaver_network_egress_cooldowns_total", Counter, ["egress_id"],
+        "Times a route leg on the egress entered a cooldown.");
+    EGRESS_DOWNLOAD_BYTES = ("weaver_egress_download_bytes_total", Counter, ["egress_id"],
+        "Raw NNTP BODY bytes received over each egress.");
+    EGRESS_DOWNLOAD_RATE_LIMIT = ("weaver_egress_download_rate_limit_bytes_per_second", Gauge,
+        ["egress_id"], "Configured download rate limit of each egress; 0 means unlimited.");
+    EGRESS_DOWNLOAD_THROTTLE_SECONDS = ("weaver_egress_download_throttle_seconds_total", Counter,
+        ["egress_id"], "Time spent waiting on an egress download rate limit.");
+    NETWORK_POOL_MEMBERS = ("weaver_network_pool_members", Gauge, ["pool_id", "egress_id", "stage"],
+        "Members of each proxy pool stage by stage: total, warmed or blocked.");
+    NETWORK_POOL_CONNECTIONS = ("weaver_network_pool_connections", Gauge,
+        ["pool_id", "egress_id", "state"], "Connections across a proxy pool's members, open or opening.");
+    NETWORK_POOL_RACES = ("weaver_network_pool_races_total", Counter, ["pool_id", "egress_id", "result"],
+        "Proxy pool connection races, won or failed.");
+    NETWORK_POOL_MEMBER_HANDSHAKE = ("weaver_network_pool_member_session_handshake_seconds", Gauge,
+        ["pool_id", "egress_id", "member_id"],
+        "Duration of each pool member's last session handshake; absent until it has one.");
+    NETWORK_PROXIES = ("weaver_network_proxies", Gauge, ["kind", "enabled"],
+        "Configured proxy profiles by kind and whether they are enabled.");
+    NETWORK_DNS_RESOLUTIONS = ("weaver_network_dns_resolutions_total", Counter, ["resolver", "result"],
+        "Host name lookups made for routed connections, by resolver and result.");
+    NETWORK_RUNG_COOLDOWNS = ("weaver_network_rung_cooldowns_total", Counter, ["rung"],
+        "Times a ladder rung entered a cooldown, by rung position.");
+    NETWORK_RUNG_FALLBACKS = ("weaver_network_rung_fallbacks_total", Counter, ["rung"],
+        "Connections a ladder made on a rung past the first, by the rung that connected.");
+    NETWORK_LEG_REVOCATIONS = ("weaver_network_leg_revocations_total", Counter, [],
+        "Route stages revoked, closing the connections that ran over them.");
+    TUNNEL_STREAMS = ("weaver_tunnel_streams_total", Counter, ["kind", "result"],
+        "Streams opened through a proxy hop, by proxy kind and result.");
+    TUNNEL_SESSION_PREPARES = ("weaver_tunnel_session_prepares_total", Counter, ["kind", "result"],
+        "Session preparations on session-based proxy hops, by proxy kind and result.");
+    TUNNEL_SESSION_RETIREMENTS = ("weaver_tunnel_session_retirements_total", Counter, ["kind"],
+        "Idle proxy sessions retired, by proxy kind.");
 
     // ---- per-server article outcomes ---------------------------------------------
     SERVER_ARTICLE_ATTEMPTS = ("weaver_server_article_attempts_total", Counter,

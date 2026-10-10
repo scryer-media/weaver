@@ -106,7 +106,7 @@ exit {exit_code}
         ))
         .unwrap();
     pipeline.terminal_post_processing_executor =
-        PostProcessingExecutor::new(pipeline.db.clone(), scripts.clone(), 1)
+        PostProcessingExecutor::new(pipeline.db.clone(), scripts.clone())
             .with_supervisor_executable(supervisor);
     pipeline.terminal_post_processing_executor.pause();
 
@@ -285,7 +285,7 @@ exit 93
             .unwrap();
     }
     pipeline.terminal_post_processing_executor =
-        PostProcessingExecutor::new(pipeline.db.clone(), scripts.clone(), 1)
+        PostProcessingExecutor::new(pipeline.db.clone(), scripts.clone())
             .with_supervisor_executable(supervisor);
     scripts
 }

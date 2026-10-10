@@ -554,6 +554,105 @@ fn one_shots_skip_startup_and_fire_crossed_minutes_once() {
     assert!(restarted.due(&entries, local_time(28, 8, 1)).is_empty());
 }
 
+// A start whose watermark is `mark`, at local and UTC time `at` alike.
+fn started_after(mark: Option<NaiveDateTime>) -> OneShotEvaluator {
+    let mut evaluator = OneShotEvaluator::default();
+    evaluator.restore(mark.map(|at| OneShotWatermark { utc: at, local: at }));
+    evaluator
+}
+
+#[test]
+fn a_start_fires_the_latest_missed_occurrence_once() {
+    let entries = vec![entry("scan", "08:00", vec![], prune())];
+    let mut evaluator = started_after(Some(local_time(28, 7, 59)));
+    assert_eq!(evaluator.due(&entries, local_time(28, 9, 0)), entries);
+    assert!(evaluator.due(&entries, local_time(28, 9, 1)).is_empty());
+    assert!(evaluator.due(&entries, local_time(28, 9, 2)).is_empty());
+}
+
+#[test]
+fn a_second_start_with_no_new_occurrence_fires_nothing() {
+    let entries = vec![entry("scan", "08:00", vec![], prune())];
+    let mut first = started_after(Some(local_time(28, 7, 59)));
+    assert_eq!(first.due(&entries, local_time(28, 9, 0)).len(), 1);
+    // The first start's tick left its own watermark behind.
+    let mut second = started_after(Some(local_time(28, 9, 0)));
+    assert!(second.due(&entries, local_time(28, 9, 30)).is_empty());
+    assert!(second.due(&entries, local_time(28, 9, 31)).is_empty());
+}
+
+#[test]
+fn a_start_without_a_watermark_fires_nothing() {
+    let entries = vec![entry("scan", "08:00", vec![], prune())];
+    let mut evaluator = started_after(None);
+    assert!(evaluator.due(&entries, local_time(28, 9, 0)).is_empty());
+    assert!(evaluator.due(&entries, local_time(28, 9, 1)).is_empty());
+}
+
+#[test]
+fn a_start_after_several_missed_occurrences_fires_only_the_latest_of_each_rule() {
+    let mut twice = entry("twice", "08:00", vec![], prune());
+    twice.times = vec!["08:00".into(), "20:00".into()];
+    let mut hourly = entry("hourly", "00:00", vec![], prune());
+    hourly.every_hour_at_minute = Some(15);
+    let mondays = entry("mondays", "06:00", vec![Weekday::Mon], prune());
+    let entries = vec![twice, hourly, mondays];
+    // Stopped three days and more, past every rule's latest occurrence.
+    let mut evaluator = started_after(Some(local_time(25, 7, 0)));
+    let due = evaluator.due(&entries, local_time(28, 9, 0));
+    assert_eq!(
+        due.iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        ["twice", "hourly", "mondays"]
+    );
+    assert!(
+        evaluator
+            .fired
+            .contains(&("twice".to_string(), local_time(28, 8, 0)))
+    );
+    assert!(
+        evaluator
+            .fired
+            .contains(&("hourly".to_string(), local_time(28, 8, 15)))
+    );
+    // 2026-09-28 is a Monday.
+    assert!(
+        evaluator
+            .fired
+            .contains(&("mondays".to_string(), local_time(28, 6, 0)))
+    );
+    assert!(evaluator.due(&entries, local_time(28, 9, 1)).is_empty());
+    // A watermark weeks old still fires one occurrence per rule.
+    let mut stale = started_after(Some(local_time(1, 0, 0)));
+    assert_eq!(stale.due(&entries, local_time(28, 9, 0)).len(), 3);
+}
+
+#[test]
+fn a_start_after_the_clock_went_back_fires_nothing() {
+    let entries = vec![entry("scan", "08:00", vec![], prune())];
+    let mut evaluator = OneShotEvaluator::default();
+    evaluator.restore(Some(OneShotWatermark {
+        utc: local_time(28, 10, 0),
+        local: local_time(28, 7, 0),
+    }));
+    assert!(
+        evaluator
+            .due_at(&entries, local_time(28, 9, 0), local_time(28, 9, 0))
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_watermark_reads_back_as_it_was_written() {
+    let mark = OneShotWatermark {
+        utc: local_time(28, 7, 0),
+        local: local_time(28, 9, 30),
+    };
+    assert_eq!(OneShotWatermark::parse(&mark.to_string()), Some(mark));
+    assert_eq!(OneShotWatermark::parse("not a watermark"), None);
+}
+
 #[test]
 fn one_shots_deduplicate_fall_back_and_cross_spring_gap() {
     let entries = vec![entry("scan", "01:30", vec![], prune())];

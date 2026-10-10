@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::io::Read;
 
 use super::model::{EventScriptSettings, ScriptEventLabel, ScriptKind, ScriptResult, ScriptStatus};
+use super::run_metrics::RetentionAction;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 use crate::persistence::{Database, StateError};
 
@@ -82,6 +83,7 @@ pub async fn retain_output(
         } else {
             zstd::stream::encode_all(output.as_slice(), COMPRESSION_LEVEL).map_err(error)?
         };
+        super::run_metrics::record_output(result.label(), raw_bytes, compressed.len() as u64);
         db.insert_script_output(job_id, result, raw_bytes, compressed, limits)
     })
     .await
@@ -225,12 +227,17 @@ impl Database {
         let datastore = self.datastore();
         let job_id = job_id.map(i64::try_from).transpose().map_err(error)?;
         let raw_bytes = i64::try_from(raw_bytes).unwrap_or(i64::MAX);
+        let retention = super::run_metrics::RetentionTally::default();
+        let committed = retention.clone();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "retain_script_output", |tx| {
                 let mut result = result.clone();
                 let output = output.clone();
                 let limits = limits.clone();
+                let retention = retention.clone();
                 Box::pin(async move {
+                    retention.reset();
+                    retention.set(RetentionAction::Discarded, 1);
                     // This row serializes insertion and trimming on both SQL backends.
                     let state = tx.fetch_optional("UPDATE script_output_state SET next_seq = next_seq + 1 WHERE singleton = 1 RETURNING next_seq", &[]).await?.ok_or_else(|| error("script output state is missing"))?;
                     let seq = state.i64("next_seq")?;
@@ -264,11 +271,16 @@ impl Database {
                         .iter()
                         .map(run_and_failure)
                         .collect::<Result<Vec<_>, _>>()?;
-                    delete_runs(tx, expired_runs(&runs, &limits)).await?;
+                    let expired = expired_runs(&runs, &limits);
+                    retention.set(RetentionAction::Discarded, 0);
+                    retention.set(RetentionAction::Kept, 1);
+                    retention.pruned(super::run_metrics::pruned_scripts(tx, &expired).await?);
+                    delete_runs(tx, expired).await?;
                     Ok(result)
                 })
             }).await
         })
+        .inspect(|_| committed.commit())
     }
 
     // Trim every job and event kind to the stored retention limits, in the
@@ -354,6 +366,7 @@ impl Database {
             })
             .await
         })
+        .inspect(|pruned| super::run_metrics::record_retention(RetentionAction::Pruned, *pruned))
     }
 
     pub fn script_output(&self, id: &str) -> Result<Option<String>, StateError> {
@@ -1250,7 +1263,8 @@ mod tests {
         );
         assert!(all.iter().all(|run| run.output_retained));
         assert!(all.windows(2).all(|pair| pair[0].seq > pair[1].seq));
-        // A job still in the queue has no name to show; one in history does.
+        // The history row names a finished job. A job still in the queue has
+        // no stored name: the API names it from the live queue.
         assert_eq!(all[0].job_name.as_deref(), Some("finished job"));
         assert_eq!(all[5].job_name, None);
         assert_eq!(

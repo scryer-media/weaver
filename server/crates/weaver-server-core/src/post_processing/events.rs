@@ -23,24 +23,118 @@ use crate::persistence::{Database, StateError};
 type EventCancellations = BTreeMap<String, (Option<u64>, watch::Sender<bool>)>;
 type BackgroundRuns = BTreeMap<u64, (Option<u64>, watch::Sender<bool>)>;
 
-// Fire-and-forget runs allowed at once. They are bounded apart from the
-// scripts weaver waits for, so neither takes a turn from the other.
-const BACKGROUND_RUNS: usize = 32;
-
+#[derive(Default)]
 struct BackgroundLane {
-    turns: std::sync::Arc<tokio::sync::Semaphore>,
     runs: std::sync::Mutex<BackgroundRuns>,
     next: std::sync::atomic::AtomicU64,
     settled: tokio::sync::Notify,
 }
 
-impl Default for BackgroundLane {
-    fn default() -> Self {
-        Self {
-            turns: std::sync::Arc::new(tokio::sync::Semaphore::new(BACKGROUND_RUNS)),
-            runs: Default::default(),
-            next: Default::default(),
-            settled: Default::default(),
+// The one pool every script weaver runs takes a slot from: the scripts a job
+// waits for, the ones it does not, queue events, scans, feeds and schedules.
+// Its size is the concurrency setting, read when a waiter reaches the head of
+// the queue, so a changed setting applies to the next run. Waiters are served
+// in the order they arrived.
+#[derive(Default)]
+pub(crate) struct ScriptSlots {
+    state: std::sync::Mutex<SlotQueue>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct SlotQueue {
+    running: usize,
+    waiting: BTreeSet<u64>,
+    next: u64,
+}
+
+impl ScriptSlots {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SlotQueue> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    // Wake every waiter to look again: a slot came free, the head of the
+    // queue changed, or the setting did.
+    pub(crate) fn wake(&self) {
+        self.changed.notify_waiters();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> usize {
+        self.lock().running
+    }
+
+    // Runs holding a slot and runs queued for one, read at scrape time.
+    pub(crate) fn occupancy(&self) -> (usize, usize) {
+        let queue = self.lock();
+        (queue.running, queue.waiting.len())
+    }
+}
+
+// A slot in the shared pool, given back when this is dropped.
+pub(crate) struct ScriptSlot(std::sync::Arc<ScriptRuntime>);
+
+impl Drop for ScriptSlot {
+    fn drop(&mut self) {
+        self.0.slots.lock().running -= 1;
+        self.0.slots.wake();
+    }
+}
+
+// A place in the queue for a slot, left when this is dropped.
+struct SlotTicket<'a> {
+    slots: &'a ScriptSlots,
+    id: u64,
+}
+
+impl Drop for SlotTicket<'_> {
+    fn drop(&mut self) {
+        if self.slots.lock().waiting.remove(&self.id) {
+            self.slots.wake();
+        }
+    }
+}
+
+// A slot in the shared pool, or `None` when `cancellation` fired first.
+pub(crate) async fn script_slot(
+    db: &Database,
+    cancellation: &mut watch::Receiver<bool>,
+) -> Result<Option<ScriptSlot>, StateError> {
+    if *cancellation.borrow() {
+        return Ok(None);
+    }
+    let runtime = db.script_runtime.clone();
+    let slots = &runtime.slots;
+    let ticket = {
+        let mut queue = slots.lock();
+        let id = queue.next;
+        queue.next += 1;
+        queue.waiting.insert(id);
+        SlotTicket { slots, id }
+    };
+    loop {
+        let changed = slots.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        // Only the head of the queue reads the setting: the others wait for
+        // it to be served or to leave.
+        let head = slots.lock().waiting.first() == Some(&ticket.id);
+        if head {
+            let limit = usize::from(db.post_processing_settings()?.concurrency).max(1);
+            let mut queue = slots.lock();
+            if queue.running < limit {
+                queue.running += 1;
+                queue.waiting.remove(&ticket.id);
+                drop(queue);
+                drop(ticket);
+                // The next in line may fit as well.
+                slots.wake();
+                return Ok(Some(ScriptSlot(runtime.clone())));
+            }
+        }
+        tokio::select! {
+            _ = changed => {},
+            _ = cancellation.changed() => return Ok(None),
         }
     }
 }
@@ -48,6 +142,7 @@ impl Default for BackgroundLane {
 // One fire-and-forget run, registered from the moment it is decided on so
 // that a cancel reaches it while it still waits for its turn.
 pub(crate) struct BackgroundRun {
+    db: Database,
     runtime: std::sync::Arc<ScriptRuntime>,
     id: u64,
     cancellation: watch::Receiver<bool>,
@@ -68,20 +163,24 @@ impl BackgroundRun {
             .unwrap_or_else(|error| error.into_inner())
             .insert(id, (job_id, cancel));
         Self {
+            db: db.clone(),
             runtime,
             id,
             cancellation,
         }
     }
 
-    // The run's turn and its cancel signal, or `None` when it was cancelled
-    // while it waited for the turn.
-    pub(crate) async fn turn(
-        &self,
-    ) -> Option<(tokio::sync::OwnedSemaphorePermit, watch::Receiver<bool>)> {
+    // The run's slot and its cancel signal, or `None` when it was cancelled
+    // while it waited for the slot.
+    pub(crate) async fn turn(&self) -> Option<(ScriptSlot, watch::Receiver<bool>)> {
         let mut cancellation = self.cancellation.clone();
-        let turn = background_turn(&self.runtime, &mut cancellation).await?;
-        Some((turn, cancellation))
+        match script_slot(&self.db, &mut cancellation).await {
+            Ok(slot) => Some((slot?, cancellation)),
+            Err(error) => {
+                tracing::warn!(%error, "a fire-and-forget script could not take a slot");
+                None
+            }
+        }
     }
 }
 
@@ -97,28 +196,12 @@ impl Drop for BackgroundRun {
     }
 }
 
-// A turn among the fire-and-forget runs, or `None` when `cancellation` fired
-// first.
-async fn background_turn(
-    runtime: &std::sync::Arc<ScriptRuntime>,
-    cancellation: &mut watch::Receiver<bool>,
-) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    if *cancellation.borrow() {
-        return None;
-    }
-    tokio::select! {
-        biased;
-        turn = runtime.background.turns.clone().acquire_owned() => turn.ok(),
-        _ = cancellation.changed() => None,
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct ScriptRuntime {
     queue: tokio::sync::Mutex<()>,
+    queue_wake: tokio::sync::Notify,
     changed: tokio::sync::Notify,
-    running: std::sync::Mutex<usize>,
-    capacity_changed: tokio::sync::Notify,
+    pub(crate) slots: ScriptSlots,
     cancellations: std::sync::Mutex<EventCancellations>,
     claimed: std::sync::Mutex<EventCancellations>,
     worker_active: std::sync::atomic::AtomicBool,
@@ -161,19 +244,6 @@ struct QueueAdmissions {
     pending: VecDeque<QueueAdmission>,
     running: bool,
     active_job: Option<u64>,
-}
-
-struct EventPermit(std::sync::Arc<ScriptRuntime>);
-
-impl Drop for EventPermit {
-    fn drop(&mut self) {
-        *self
-            .0
-            .running
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) -= 1;
-        self.0.capacity_changed.notify_waiters();
-    }
 }
 
 struct RunRegistration {
@@ -318,39 +388,6 @@ impl EventContext {
     }
 }
 
-// A turn among the event scripts weaver waits for, or `None` when the run was
-// cancelled while it waited for one.
-async fn event_turn(
-    db: &Database,
-    runtime: &std::sync::Arc<ScriptRuntime>,
-    cancellation: &mut watch::Receiver<bool>,
-) -> Result<Option<EventPermit>, StateError> {
-    loop {
-        let changed = runtime.capacity_changed.notified();
-        tokio::pin!(changed);
-        changed.as_mut().enable();
-        let limit = usize::from(
-            db.post_processing_settings()?
-                .event_scripts
-                .event_script_concurrency,
-        );
-        {
-            let mut running = runtime
-                .running
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if *running < limit {
-                *running += 1;
-                return Ok(Some(EventPermit(runtime.clone())));
-            }
-        }
-        tokio::select! {
-            _ = changed => {},
-            _ = cancellation.changed() => return Ok(None),
-        }
-    }
-}
-
 // The instances an event runs: the ones handed to it, or the ones saved for
 // its trigger and category.
 pub fn selected_scripts(
@@ -431,6 +468,7 @@ pub async fn run_event(
 ) -> Result<Vec<ScriptResult>, StateError> {
     let settings = db.post_processing_settings()?;
     if execution_refusal(&settings, strict_security_enabled()).is_some() {
+        super::run_metrics::record_refusal(super::run_metrics::RunKind::of(&context.event, false));
         return Ok(Vec::new());
     }
     let runtime = db.script_runtime.clone();
@@ -525,7 +563,10 @@ pub async fn run_event(
                 // overlapping. It only gives up its place among the scripts
                 // that are waited for.
                 turn = None;
-                let Some(_turn) = background_turn(&runtime, &mut cancel_rx).await else {
+                let kind = super::run_metrics::RunKind::of(&context.event, true);
+                let Some(_turn) =
+                    super::run_metrics::waiting(kind, script_slot(db, &mut cancel_rx)).await?
+                else {
                     break;
                 };
                 results.push(run_entry(db, context, run, cancellation.clone()).await?);
@@ -535,7 +576,10 @@ pub async fn run_event(
             continue;
         }
         if turn.is_none() {
-            let Some(acquired) = event_turn(db, &runtime, &mut cancel_rx).await? else {
+            let kind = super::run_metrics::RunKind::of(&context.event, false);
+            let Some(acquired) =
+                super::run_metrics::waiting(kind, script_slot(db, &mut cancel_rx)).await?
+            else {
                 break;
             };
             turn = Some(acquired);
@@ -568,7 +612,10 @@ fn spawn_background_entry(db: &Database, context: &EventContext, mut run: EntryR
     let db = db.clone();
     let mut context = context.clone();
     tokio::spawn(async move {
-        let Some((_turn, cancellation)) = registration.turn().await else {
+        let kind = super::run_metrics::RunKind::of(&context.event, true);
+        let Some((_turn, cancellation)) =
+            super::run_metrics::waiting(kind, registration.turn()).await
+        else {
             return;
         };
         match db.post_processing_settings() {
@@ -604,6 +651,11 @@ async fn run_entry(
         background,
     } = run;
     let started = Instant::now();
+    let _running = super::run_metrics::RunningGuard::enter(super::run_metrics::RunKind::of(
+        &context.event,
+        background,
+    ));
+    let mut not_started = script.is_err();
     let (adapter, status, exit_code, (output, output_bytes), output_truncated, error_message) =
         match script {
             // Nothing ran, so nothing failed: the operator is told, and whatever
@@ -630,7 +682,10 @@ async fn run_entry(
                             .map_err(|error| error.to_string())
                     });
                 let execution = match prepared {
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        not_started = true;
+                        Err(error)
+                    }
                     Ok((inputs, mut identity)) => {
                         let mut env = context.weaver_env();
                         env.extend(context.env.clone());
@@ -725,6 +780,7 @@ async fn run_entry(
         error_message,
         finished_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
     };
+    super::run_metrics::record_finished(&result, !not_started);
     let result = super::output::retain_output(
         db.clone(),
         context.job_id,
@@ -1002,6 +1058,8 @@ impl Database {
         jobs.0 = jobs.0.wrapping_add(1);
         jobs.1 = None;
         drop(jobs);
+        // A changed concurrency setting applies to whoever waits for a slot.
+        self.script_runtime.slots.wake();
         // Refresh on the cold settings-write path, so arrival decisions can
         // distinguish blocking scripts without holding the actor behind SQL.
         if let Err(error) = self.warm_script_dispatch_jobs() {
@@ -1292,7 +1350,9 @@ impl Database {
                 Box::pin(async move {
                 tx.execute("UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1", &[]).await?;
                 loop {
-                let Some(row) = tx.fetch_optional("SELECT run_id, payload FROM script_event_queue WHERE state = 'queued' ORDER BY priority DESC, seq LIMIT 1", &[]).await? else { return Ok(None); };
+                // A download with an event under way waits for it to end:
+                // its events run one at a time.
+                let Some(row) = tx.fetch_optional("SELECT run_id, payload FROM script_event_queue queued WHERE state = 'queued' AND NOT EXISTS (SELECT 1 FROM script_event_queue started WHERE started.state = 'started' AND started.job_id IS NOT DISTINCT FROM queued.job_id) ORDER BY priority DESC, seq LIMIT 1", &[]).await? else { return Ok(None); };
                 let run_id = row.text("run_id")?;
                 let context: EventContext = match serde_json::from_str(&row.text("payload")?) {
                     Ok(context) => context,
@@ -1596,89 +1656,145 @@ pub async fn drain_queue(db: Database) -> Result<(), StateError> {
         .await
         .map_err(|error| StateError::Database(error.to_string()))??;
     }
+    // Events of different downloads run side by side, as many at once as the
+    // concurrency setting allows. One download's events still run one at a
+    // time, in the order the claim picks them: a claim passes over a download
+    // that has an event under way. Once something has failed nothing more is
+    // claimed, and the runs under way are seen to their end before this
+    // returns, so none is cut off part way.
+    let mut running = tokio::task::JoinSet::new();
+    let mut failure = None;
     loop {
-        let worker_db = db.clone();
-        let Some((run_id, mut context, claim)) =
-            tokio::task::spawn_blocking(move || worker_db.claim_script_event())
-                .await
-                .map_err(|error| StateError::Database(error.to_string()))??
-        else {
-            break;
-        };
-        let execution: Result<(), StateError> = async {
-            let deleted = if let Some(job_id) = context.job_id {
-                let worker_db = db.clone();
-                tokio::task::spawn_blocking(move || {
-                    let datastore = worker_db.datastore();
-                    worker_db.run_sql_blocking_read(async move {
-                        Ok(SqlRuntime::fetch_optional(
-                            datastore.read_exec(),
-                            "SELECT job_id FROM active_jobs WHERE job_id = {}",
-                            &[SqlArg::I64(job_id as i64)],
-                        )
-                        .await?
-                        .is_none())
-                    })
-                })
-                .await
-                .map_err(|error| StateError::Database(error.to_string()))??
-            } else {
-                false
+        let woken = db.script_runtime.queue_wake.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        while failure.is_none() {
+            let limit = match db.post_processing_settings() {
+                Ok(settings) => usize::from(settings.concurrency).max(1),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
             };
-            let allow_deleted = matches!(
-                context.event,
-                ScriptEventLabel::Queue(QueueEvent::NzbDeleted | QueueEvent::NzbMarked)
-            );
-            if !deleted || allow_deleted {
-                run_event(
-                    &db,
-                    &mut context,
-                    &run_id,
-                    Some(claim.cancellation.clone()),
+            if running.len() >= limit {
+                break;
+            }
+            let worker_db = db.clone();
+            let claimed = tokio::task::spawn_blocking(move || worker_db.claim_script_event())
+                .await
+                .map_err(|error| StateError::Database(error.to_string()))
+                .and_then(std::convert::identity);
+            match claimed {
+                Ok(Some((run_id, context, claim))) => {
+                    running.spawn(run_queue_event(db.clone(), run_id, context, claim));
+                }
+                Ok(None) => break,
+                Err(error) => failure = Some(error),
+            }
+        }
+        if running.is_empty() {
+            break;
+        }
+        tokio::select! {
+            joined = running.join_next() => match joined {
+                Some(Ok(Ok(()))) | None => {}
+                Some(Ok(Err(error))) => {
+                    failure.get_or_insert(error);
+                }
+                Some(Err(error)) => {
+                    failure.get_or_insert(StateError::Database(error.to_string()));
+                }
+            },
+            () = &mut woken => {}
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+// Run one claimed queue event and record that it is over.
+async fn run_queue_event(
+    db: Database,
+    run_id: String,
+    mut context: EventContext,
+    claim: QueueClaimRegistration,
+) -> Result<(), StateError> {
+    let execution: Result<(), StateError> = async {
+        let deleted = if let Some(job_id) = context.job_id {
+            let worker_db = db.clone();
+            tokio::task::spawn_blocking(move || {
+                let datastore = worker_db.datastore();
+                worker_db.run_sql_blocking_read(async move {
+                    Ok(SqlRuntime::fetch_optional(
+                        datastore.read_exec(),
+                        "SELECT job_id FROM active_jobs WHERE job_id = {}",
+                        &[SqlArg::I64(job_id as i64)],
+                    )
+                    .await?
+                    .is_none())
+                })
+            })
+            .await
+            .map_err(|error| StateError::Database(error.to_string()))??
+        } else {
+            false
+        };
+        let allow_deleted = matches!(
+            context.event,
+            ScriptEventLabel::Queue(QueueEvent::NzbDeleted | QueueEvent::NzbMarked)
+        );
+        if !deleted || allow_deleted {
+            run_event(
+                &db,
+                &mut context,
+                &run_id,
+                Some(claim.cancellation.clone()),
+                None,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    .await;
+    let error = execution.err().map(|error| error.to_string());
+    if let Some(error) = &error {
+        tracing::warn!(%run_id, %error, "queue script run failed");
+        // Keep the failure on the job's timeline; the job itself carries on.
+        if let Some(job_id) = context.job_id {
+            let worker_db = db.clone();
+            let message = format!("{}: scripts could not run: {error}", context.event);
+            let recorded = tokio::task::spawn_blocking(move || {
+                worker_db.insert_job_event(
+                    job_id,
+                    chrono::Utc::now().timestamp_millis(),
+                    "ScriptWarning",
+                    &message,
                     None,
                 )
-                .await?;
-            }
-            Ok(())
-        }
-        .await;
-        let error = execution.err().map(|error| error.to_string());
-        if let Some(error) = &error {
-            tracing::warn!(%run_id, %error, "queue script run failed");
-            // Keep the failure on the job's timeline; the job itself carries on.
-            if let Some(job_id) = context.job_id {
-                let worker_db = db.clone();
-                let message = format!("{}: scripts could not run: {error}", context.event);
-                let recorded = tokio::task::spawn_blocking(move || {
-                    worker_db.insert_job_event(
-                        job_id,
-                        chrono::Utc::now().timestamp_millis(),
-                        "ScriptWarning",
-                        &message,
-                        None,
-                    )
-                })
-                .await;
-                if !matches!(recorded, Ok(Ok(()))) {
-                    tracing::warn!(%run_id, ?recorded, "could not record the queue script failure");
-                }
+            })
+            .await;
+            if !matches!(recorded, Ok(Ok(()))) {
+                tracing::warn!(%run_id, ?recorded, "could not record the queue script failure");
             }
         }
-        let worker_db = db.clone();
-        tokio::task::spawn_blocking(move || match error {
-            Some(error) => worker_db.finish_script_event_with_error(&run_id, Some(error)),
-            None => worker_db.finish_script_event(&run_id),
-        })
-        .await
-        .map_err(|error| StateError::Database(error.to_string()))??;
-        db.script_runtime.changed.notify_waiters();
     }
+    let worker_db = db.clone();
+    tokio::task::spawn_blocking(move || match error {
+        Some(error) => worker_db.finish_script_event_with_error(&run_id, Some(error)),
+        None => worker_db.finish_script_event(&run_id),
+    })
+    .await
+    .map_err(|error| StateError::Database(error.to_string()))??;
+    drop(claim);
+    db.script_runtime.changed.notify_waiters();
     Ok(())
 }
 
 pub fn wake_queue(db: Database) {
     use std::sync::atomic::Ordering::SeqCst;
     db.script_runtime.queue_requested.store(true, SeqCst);
+    // A coordinator already at work picks up what was just queued alongside
+    // the runs it has under way.
+    db.script_runtime.queue_wake.notify_one();
     if db.script_runtime.worker_active.swap(true, SeqCst) {
         return;
     }

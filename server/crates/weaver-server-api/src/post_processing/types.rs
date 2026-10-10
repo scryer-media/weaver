@@ -21,7 +21,6 @@ pub const MASKED_SECRET: &str = "[REDACTED]";
 
 #[derive(Debug, Clone, SimpleObject)]
 pub struct PostProcessingSettingsGql {
-    pub event_script_concurrency: u8,
     pub event_script_timeout_seconds: u64,
     pub file_downloaded_event_interval: i64,
     /// The newest runs kept for each download (or each scan, schedule or feed
@@ -81,7 +80,6 @@ impl PostProcessingSettingsGql {
     ) -> Self {
         Self {
             script_directory: script_directory.into(),
-            event_script_concurrency: value.event_scripts.event_script_concurrency,
             event_script_timeout_seconds: value.event_scripts.event_script_timeout_seconds,
             file_downloaded_event_interval: value.event_scripts.file_downloaded_event_interval,
             script_output_runs_per_job: value.event_scripts.script_output_runs_per_job,
@@ -104,7 +102,6 @@ impl PostProcessingSettingsGql {
 
 #[derive(Debug, Clone, InputObject)]
 pub struct PostProcessingSettingsInput {
-    pub event_script_concurrency: Option<u8>,
     pub event_script_timeout_seconds: Option<u64>,
     pub file_downloaded_event_interval: Option<i64>,
     /// Lowering it deletes older runs soon after the save. Omission keeps it.

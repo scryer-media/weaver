@@ -72,32 +72,29 @@ test("event script limits are a section of the configuration and save with the r
   const page = await open();
   try {
     const events = page.getByRole("region", { name: "Event scripts and output retention", exact: true });
-    await events.getByText("queue events run one at a time", { exact: true }).waitFor();
+    await events.getByText("a download's queue events run one at a time", { exact: true }).waitFor();
     const limit = (name) => events.getByRole("spinbutton", { name, exact: true });
     for (const [name, value] of [
-      ["Concurrent event scripts", "1"], ["Default event timeout", "300"], ["File event interval", "0"],
+      ["Default event timeout", "300"], ["File event interval", "0"],
       ["Retained runs per download", "32"], ["Retain failed runs", "8"],
     ]) assert.equal(await limit(name).inputValue(), value);
     assert.deepEqual(await events.getByRole("spinbutton").evaluateAll((fields) => fields.map((field) => field.getAttribute("aria-label"))),
-      ["Concurrent event scripts", "Default event timeout", "File event interval", "Retained runs per download", "Retain failed runs"]);
-    // The execution limit keeps a name of its own beside the event one.
+      ["Default event timeout", "File event interval", "Retained runs per download", "Retain failed runs"]);
+    // One concurrency setting covers every script, so the event section has none of its own.
     assert.equal(await page.getByRole("spinbutton", { name: "Concurrent scripts", exact: true }).count(), 1);
     const save = page.getByRole("button", { name: "Save changes", exact: true });
     assert.equal(await save.isDisabled(), true);
     // A number field commits what was typed when focus leaves it, held to the range the daemon accepts.
     await limit("File event interval").fill("-1");
     await limit("File event interval").blur();
-    await limit("Concurrent event scripts").fill("12");
-    await limit("Concurrent event scripts").blur();
     await limit("Retain failed runs").fill("200");
     await limit("Retain failed runs").blur();
     await save.click();
     await page.getByRole("contentinfo").getByText("Saved", { exact: true }).waitFor();
     const settings = await stored(page);
     assert.equal(settings.fileDownloadedEventInterval, -1);
-    assert.equal(settings.eventScriptConcurrency, 8);
+    assert.equal(settings.eventScriptConcurrency, undefined);
     assert.equal(settings.scriptOutputFailedRunsPerJob, 128);
-    assert.equal(await limit("Concurrent event scripts").inputValue(), "8");
     assert.equal(await limit("Retain failed runs").inputValue(), "128");
   } finally { await page.close(); }
 });

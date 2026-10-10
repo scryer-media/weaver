@@ -95,7 +95,7 @@ const state = {
   settings: {
     scriptDirectory: "/fixture/scripts", executionEnabled: true, concurrency: 2,
     globalScriptsRun: has("cascade") ? "ONLY_WITHOUT_CATEGORY_SCRIPTS" : "ALWAYS",
-    eventScriptConcurrency: 1, eventScriptTimeoutSeconds: 300, fileDownloadedEventInterval: 0,
+    eventScriptTimeoutSeconds: 300, fileDownloadedEventInterval: 0,
     scriptOutputRunsPerJob: 32, scriptOutputFailedRunsPerJob: 8, terminationGraceSeconds: 10,
     pythonInterpreter: null as string | null, powershellInterpreter: null as string | null,
     batchInterpreter: null as string | null, goInterpreter: null as string | null,

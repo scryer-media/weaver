@@ -136,7 +136,6 @@ pub fn build_schema_with_backup(
     let staged_upload_manager = StagedUploadManager::new();
     staged_upload_manager.spawn_cleanup_worker();
     let post_processing_executor = context.post_processing_executor.clone().unwrap_or_else(|| {
-        let settings = context.db.post_processing_settings().unwrap_or_default();
         // Only reached in tests: production hands over the pipeline's executor.
         let data_dir = context
             .config
@@ -150,7 +149,6 @@ pub fn build_schema_with_backup(
         weaver_server_core::post_processing::executor::PostProcessingExecutor::new(
             context.db.clone(),
             script_directory,
-            usize::from(settings.concurrency),
         )
     });
 
