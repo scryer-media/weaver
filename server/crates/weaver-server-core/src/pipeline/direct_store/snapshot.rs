@@ -108,12 +108,15 @@ pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
 // redownload per set that was mid-download across the upgrade — but it is
 // user-visible traffic and belongs in the notes rather than in a support
 // thread.
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 8;
+// Version 9 adds observed full-volume identity digests. They prove repost
+// identity only and never contribute coverage or refetch floors.
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u16 = 9;
 
 // The older versions [`decode`] still reads, lifted into the current shape
 // with what they did not carry absent. Nothing writes them.
 const SNAPSHOT_V6: u16 = 6;
 const SNAPSHOT_V7: u16 = 7;
+const SNAPSHOT_V8: u16 = 8;
 
 const FRAME_HEADER_LEN: usize = 6;
 
@@ -262,6 +265,16 @@ pub(crate) struct CoverageSnapshot {
     // Sorted by `file_index`. Empty for every set but a standalone one whose
     // file's opening bytes have arrived.
     pub(crate) fingerprints: Vec<ProvenFingerprint>,
+    // Identity evidence, including bytes formerly held only in memory. Never
+    // use this to assert that the original volume's bytes survived restart.
+    pub(crate) repost_digests: Vec<RepostDigest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RepostDigest {
+    pub(crate) file_index: u32,
+    pub(crate) length: u64,
+    pub(crate) blake3: [u8; 32],
 }
 
 // The recovery-set fingerprint of a standalone set's file, taken from its
@@ -293,6 +306,7 @@ impl From<CoverageSnapshotV6> for CoverageSnapshot {
             floors: old.floors,
             identity: None,
             fingerprints: Vec::new(),
+            repost_digests: Vec::new(),
         }
     }
 }
@@ -316,6 +330,32 @@ impl From<CoverageSnapshotV7> for CoverageSnapshot {
             floors: old.floors,
             identity: old.identity,
             fingerprints: Vec::new(),
+            repost_digests: Vec::new(),
+        }
+    }
+}
+
+// The v8 body, positionally: no full-volume repost evidence.
+#[derive(Deserialize)]
+struct CoverageSnapshotV8 {
+    generation: u64,
+    plan_digest: [u8; 32],
+    destinations: Vec<DestinationClaim>,
+    floors: Vec<VolumeFloor>,
+    identity: Option<IdentityBinding>,
+    fingerprints: Vec<ProvenFingerprint>,
+}
+
+impl From<CoverageSnapshotV8> for CoverageSnapshot {
+    fn from(old: CoverageSnapshotV8) -> Self {
+        Self {
+            generation: old.generation,
+            plan_digest: old.plan_digest,
+            destinations: old.destinations,
+            floors: old.floors,
+            identity: old.identity,
+            fingerprints: old.fingerprints,
+            repost_digests: Vec::new(),
         }
     }
 }
@@ -357,6 +397,9 @@ impl CoverageSnapshot {
         normalized
             .fingerprints
             .sort_by_key(|fingerprint| fingerprint.file_index);
+        normalized
+            .repost_digests
+            .sort_by_key(|digest| digest.file_index);
         normalized
     }
 }
@@ -416,7 +459,11 @@ pub(crate) fn decode(blob: &[u8]) -> Result<CoverageSnapshot, SnapshotError> {
         return Err(SnapshotError::BadMagic);
     }
     let version = u16::from_le_bytes([blob[4], blob[5]]);
-    if version != SNAPSHOT_SCHEMA_VERSION && version != SNAPSHOT_V6 && version != SNAPSHOT_V7 {
+    if version != SNAPSHOT_SCHEMA_VERSION
+        && version != SNAPSHOT_V6
+        && version != SNAPSHOT_V7
+        && version != SNAPSHOT_V8
+    {
         return Err(SnapshotError::UnsupportedVersion {
             found: version,
             supported: SNAPSHOT_SCHEMA_VERSION,
@@ -436,6 +483,9 @@ pub(crate) fn decode(blob: &[u8]) -> Result<CoverageSnapshot, SnapshotError> {
         }
         SNAPSHOT_V7 => {
             CoverageSnapshotV7::deserialize(&mut deserializer).map(CoverageSnapshot::from)
+        }
+        SNAPSHOT_V8 => {
+            CoverageSnapshotV8::deserialize(&mut deserializer).map(CoverageSnapshot::from)
         }
         _ => CoverageSnapshot::deserialize(&mut deserializer),
     }
@@ -519,6 +569,16 @@ fn validate(snapshot: &CoverageSnapshot) -> Result<(), SnapshotError> {
         previous_file = Some(fingerprint.file_index);
     }
 
+    let mut previous_file = None;
+    for digest in &snapshot.repost_digests {
+        if digest.length == 0 || previous_file.is_some_and(|previous| previous >= digest.file_index)
+        {
+            return Err(SnapshotError::Malformed(
+                "invalid repost digest ordering or length".into(),
+            ));
+        }
+        previous_file = Some(digest.file_index);
+    }
     Ok(())
 }
 

@@ -125,6 +125,7 @@ fn snapshot_round_trips_exactly() {
         ],
         identity: None,
         fingerprints: Vec::new(),
+        repost_digests: Vec::new(),
     };
 
     let blob = encode(&snapshot).unwrap();
@@ -199,6 +200,7 @@ fn two_thousand_volume_snapshot_round_trips_in_a_sane_blob() {
         floors,
         identity: None,
         fingerprints: Vec::new(),
+        repost_digests: Vec::new(),
     };
 
     let blob = encode(&snapshot).unwrap();
@@ -323,6 +325,44 @@ fn a_version_7_row_decodes_with_its_identity_and_no_fingerprints() {
         "non-vacuity: the binding survived"
     );
     assert!(decoded.fingerprints.is_empty());
+}
+
+#[test]
+fn a_version_8_row_keeps_coverage_without_repost_evidence() {
+    let snapshot = sample_identity_snapshot();
+    let body = rmp_serde::to_vec(&(
+        snapshot.generation,
+        snapshot.plan_digest,
+        &snapshot.destinations,
+        &snapshot.floors,
+        &snapshot.identity,
+        &snapshot.fingerprints,
+    ))
+    .unwrap();
+    let mut blob = SNAPSHOT_MAGIC.to_vec();
+    blob.extend_from_slice(&8u16.to_le_bytes());
+    blob.extend_from_slice(&body);
+    assert_eq!(decode(&blob).unwrap(), snapshot);
+}
+
+#[test]
+fn observed_repost_digest_round_trips_without_promoting_coverage() {
+    let mut snapshot = sample_identity_snapshot();
+    let floors = refetch_floors(&snapshot);
+    snapshot.repost_digests = vec![super::super::snapshot::RepostDigest {
+        file_index: 0,
+        length: 70_001,
+        blake3: *blake3::hash(b"observed full archive bytes").as_bytes(),
+    }];
+    let restored = decode(&encode(&snapshot).unwrap()).unwrap();
+    assert_eq!(restored, snapshot);
+    assert_eq!(refetch_floors(&restored), floors);
+    assert!(!restored.floors[0].complete);
+    snapshot.repost_digests.push(snapshot.repost_digests[0]);
+    assert!(matches!(
+        decode(&encode(&snapshot).unwrap()),
+        Err(SnapshotError::Malformed(_))
+    ));
 }
 
 #[test]

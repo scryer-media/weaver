@@ -1658,10 +1658,11 @@ impl Pipeline {
         else {
             return false;
         };
-        let Some(set) = self.direct_store.set(file_id.job_id, header_set.set_index) else {
+        let set_index = header_set.set_index;
+        let Some(set) = self.direct_store.set(file_id.job_id, set_index) else {
             return false;
         };
-        if set.is_demoted() || !set.volume_is_complete(volume_number) {
+        if set.is_demoted() {
             return false;
         }
         let Some(original) = set.plan().volumes.get(&volume_number) else {
@@ -1671,7 +1672,44 @@ impl Pipeline {
             job_id: file_id.job_id,
             file_index: *original,
         };
-        if self.file_declared_size.get(&original_id) != Some(&segment.declared_file_len) {
+        if let Some(digest) = set.repost_digest(original_id.file_index)
+            && digest.length == segment.declared_file_len
+        {
+            let mut hash = blake3::Hasher::new();
+            segment.data.for_each_slice(|bytes| {
+                hash.update(bytes);
+            });
+            if hash.finalize().as_bytes() == &digest.blake3 {
+                // Persist the identity and placements before the duplicate can
+                // become a durable conventional file. Otherwise a crash can
+                // retain only that copy and lose the direct set it belongs to.
+                self.run_direct_barrier(
+                    file_id.job_id,
+                    set_index,
+                    super::barrier::BarrierTrigger::Demand(
+                        super::barrier::BarrierDemand::PhaseChange,
+                    ),
+                )
+                .await;
+                if let Some(admission) = self.direct_store.identity.get_mut(&file_id.job_id) {
+                    admission.no_match.insert(file_id.file_index);
+                }
+                return true;
+            }
+            return false;
+        }
+        if !set.volume_is_complete(volume_number) {
+            return false;
+        }
+        // A restored complete volume has durable decoded coverage even when
+        // its transport header was not retained. Compare that exact extent
+        // before comparing all bytes of the arriving repost.
+        let original_len = self
+            .file_declared_size
+            .get(&original_id)
+            .copied()
+            .unwrap_or_else(|| set.virtual_volume_len(volume_number, 0));
+        if original_len != segment.declared_file_len {
             return false;
         }
         let volumes = set
@@ -1975,10 +2013,94 @@ impl Pipeline {
             roster.set_index = Some(set_index);
         }
         self.record_identity_binding(job_id, &set_name, file_index, volume_index);
+        self.bind_named_identity_roster(job_id, &set_name, set_index);
         Some(DirectFileTarget::Route {
             set_index,
             volume_index,
         })
+    }
+
+    // A described set can mix an unnamed first volume with named continuations.
+    // Bind unique named continuations before their first article, so complete
+    // loss still repairs into this set instead of an unrelated disk file.
+    fn bind_named_identity_roster(&mut self, job_id: JobId, set_name: &str, set_index: usize) {
+        let Some(admission) = self.direct_store.identity.get(&job_id) else {
+            return;
+        };
+        let Some(roster) = admission.rosters.get(set_name) else {
+            return;
+        };
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let mut candidates = Vec::new();
+        for file in state.assembly.files() {
+            let file_id = file.file_id();
+            if file.received_bytes() != 0
+                || self
+                    .write_buffers
+                    .get(&file_id)
+                    .is_some_and(|buffer| buffer.buffered_chunks().next().is_some())
+                || admission.leaked.contains(&file_id.file_index)
+                || self
+                    .direct_store
+                    .sets_for(job_id)
+                    .iter()
+                    .any(|set| set.plan().files.contains_key(&file_id.file_index))
+            {
+                continue;
+            }
+            let Some(binding) = self.resolve_par2_file_binding(file_id) else {
+                continue;
+            };
+            let Some(description) = self
+                .par2_set_for(job_id, binding.recovery_set_id)
+                .and_then(|set| set.file_description(&binding.par2_file_id))
+            else {
+                continue;
+            };
+            let described = weaver_model::files::sanitize_download_filename(&description.filename);
+            if !self
+                .par2_binding_candidate_names(file_id)
+                .is_some_and(|names| {
+                    names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&described))
+                })
+            {
+                continue;
+            }
+            for (&volume, facts) in &roster.volumes {
+                if !roster.bound.values().any(|bound| *bound == volume)
+                    && facts.length == description.length
+                    && facts.hash_16k == description.hash_16k
+                {
+                    candidates.push((file_id.file_index, volume));
+                }
+            }
+        }
+        for &(file_index, volume) in &candidates {
+            if candidates
+                .iter()
+                .filter(|(_, candidate)| *candidate == volume)
+                .count()
+                != 1
+                || candidates
+                    .iter()
+                    .filter(|(candidate, _)| *candidate == file_index)
+                    .count()
+                    != 1
+            {
+                continue;
+            }
+            if self
+                .direct_store
+                .set_mut(job_id, set_index)
+                .is_some_and(|set| set.bind_identity_volume(volume, file_index))
+            {
+                self.record_identity_binding(job_id, set_name, file_index, volume);
+            }
+        }
     }
 
     // The job's files that really are PAR2 material — declared by role, or

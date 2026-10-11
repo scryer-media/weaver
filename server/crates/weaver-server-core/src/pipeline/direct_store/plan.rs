@@ -444,7 +444,22 @@ impl DirectSetPlan {
                             &candidate.role,
                         ) == weaver_model::files::archive_base_name(&file.filename, &file.role)
                 });
-            if !matches!(file.role, FileRole::Unknown | FileRole::SplitFile { .. }) && !orphan_rar {
+            // A bare first 7z part looks like a whole archive by name. The
+            // described roster can establish that it belongs to a split set;
+            // preserve that binding under the same set name and position.
+            let described_sevenz = binding.kind == IdentityKind::SevenZipRoster
+                && binding.expected_volumes.is_some_and(|count| count > 1)
+                && weaver_model::files::archive_base_name(&file.filename, &file.role).as_deref()
+                    == Some(set_name)
+                && match file.role {
+                    FileRole::SevenZipArchive => volume_index == 0,
+                    FileRole::SevenZipSplit { number } => volume_index == number,
+                    _ => false,
+                };
+            if !matches!(file.role, FileRole::Unknown | FileRole::SplitFile { .. })
+                && !orphan_rar
+                && !described_sevenz
+            {
                 return Err("a bound file's name now classifies it");
             }
             if volumes.insert(volume_index, file_index).is_some() {

@@ -171,6 +171,7 @@ pub(crate) struct DirectSet {
     // index. Taken once per file of a standalone set, and given back by a
     // restored checkpoint.
     proven_fingerprints: BTreeMap<u32, ([u8; 16], u64)>,
+    repost_digests: BTreeMap<u32, super::snapshot::RepostDigest>,
 }
 
 impl std::fmt::Debug for DirectSet {
@@ -207,7 +208,25 @@ impl DirectSet {
             status: DirectSetStatus::Routing,
             retained: None,
             proven_fingerprints: BTreeMap::new(),
+            repost_digests: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn record_repost_digest(&mut self, digest: super::snapshot::RepostDigest) {
+        if self
+            .plan()
+            .identity
+            .is_some_and(|identity| identity.kind == super::plan::IdentityKind::HeaderVolumeSet)
+            && self.plan().files.contains_key(&digest.file_index)
+        {
+            self.repost_digests
+                .entry(digest.file_index)
+                .or_insert(digest);
+        }
+    }
+
+    pub(crate) fn repost_digest(&self, file_index: u32) -> Option<&super::snapshot::RepostDigest> {
+        self.repost_digests.get(&file_index)
     }
 
     // The recovery-set fingerprints this set holds, by NZB file index.
@@ -353,6 +372,12 @@ impl DirectSet {
                     (fingerprint.hash_16k, fingerprint.length),
                 )
             })
+            .collect();
+        self.repost_digests = rekeyed
+            .repost_digests
+            .iter()
+            .filter(|digest| self.plan().files.contains_key(&digest.file_index))
+            .map(|digest| (digest.file_index, *digest))
             .collect();
         self.resumed = Some(rekeyed);
         self.ensure_registered();
@@ -1143,10 +1168,12 @@ impl DirectSet {
         let crypt = self.router.member_crypt_snapshots();
         let identity = self.router.plan().identity_binding();
         let fingerprints = self.fingerprint_rows();
+        let repost_digests = self.repost_digests.values().copied().collect();
         let barrier = self.barrier.as_mut()?;
         barrier.set_member_crypt(crypt);
         barrier.set_identity_binding(identity);
         barrier.set_proven_fingerprints(fingerprints);
+        barrier.set_repost_digests(repost_digests);
         Some(barrier.barrier(trigger, now, drain, sync, persist))
     }
 
@@ -1171,10 +1198,12 @@ impl DirectSet {
         let crypt = self.router.member_crypt_snapshots();
         let identity = self.router.plan().identity_binding();
         let fingerprints = self.fingerprint_rows();
+        let repost_digests = self.repost_digests.values().copied().collect();
         let barrier = self.barrier.as_mut()?;
         barrier.set_member_crypt(crypt);
         barrier.set_identity_binding(identity);
         barrier.set_proven_fingerprints(fingerprints);
+        barrier.set_repost_digests(repost_digests);
         Some(barrier.prepare(trigger, now, drain))
     }
 

@@ -36,6 +36,22 @@ impl Pipeline {
             return;
         }
 
+        // Recovery can replace an entirely lost posted roster under a new
+        // name. Once the replacement is verified and extracted, its empty
+        // predecessor must not keep waiting for an archive it never received.
+        if self.par2_verified.contains(&job_id)
+            && self.par2_verdict_delivered_unposted_payload(job_id)
+            && !self.job_has_pending_download_pipeline_work(job_id)
+        {
+            for set_name in &set_names {
+                if matches!(self.classify_unmaterialized_archive_set(job_id, set_name),
+                    crate::pipeline::completion::finalize::rar::UnmaterializedArchiveSet::ConsumedBy(_))
+                {
+                    self.extracted_archives.entry(job_id).or_default().insert(set_name.clone());
+                }
+            }
+        }
+
         // A full-set extraction of a set with no runtime state of its own (a
         // name only a file classification still carries) counts no workers,
         // so its in-flight entry is the only sign it is running. Starting
@@ -86,7 +102,11 @@ impl Pipeline {
             .direct_store
             .sets_for(job_id)
             .iter()
-            .filter(|set| !set.is_demoted() && !set.is_finalized())
+            .filter(|set| {
+                !set.is_demoted()
+                    && !set.is_finalized()
+                    && !extracted_archives.contains(&set.plan().set_name)
+            })
             .map(|set| set.plan().set_name.clone())
             .collect();
         let mut parked_without_first_volume = false;
@@ -294,7 +314,25 @@ impl Pipeline {
         };
         let mut saw_incomplete = false;
 
+        // A repaired archive may have no posted file bound to its canonical
+        // name. Superseding its damaged inputs does not discharge extraction
+        // of the verified replacement.
+        if let Some(unposted) = self.recovery_unposted_outputs.get(&job_id) {
+            for name in &unposted.outputs {
+                let role = weaver_model::files::FileRole::from_filename(name);
+                if let Some(set_name) = weaver_model::files::archive_base_name(name, &role)
+                    && !set_is_extracted(&set_name)
+                {
+                    return false;
+                }
+            }
+        }
+
         for file in state.assembly.files() {
+            if self.recovery_superseded_source(job_id, file.file_id()) {
+                saw_incomplete |= !file.is_complete();
+                continue;
+            }
             if file.is_complete() {
                 // A volume that arrived intact still has to be opened. Skipping
                 // every complete file meant this read "nothing is left to do"
@@ -804,7 +842,28 @@ impl Pipeline {
         });
         let known_archive_damage =
             self.archive_extraction_held_for_known_damage(job_id) || known_file_crc_damage;
+        // Successful decoding only covers posted files. Recovery metadata can
+        // describe an absent volume before the archive topology discovers it.
+        let unposted_protected_payload = par2_validation_needed
+            && self.par2_set(job_id).is_some_and(|set| {
+                let bound: HashSet<_> = self.jobs[&job_id]
+                    .assembly
+                    .files()
+                    .filter_map(|file| {
+                        self.resolve_par2_file_binding_in_set(file.file_id(), set.recovery_set_id)
+                            .map(|binding| binding.par2_file_id)
+                    })
+                    .collect();
+                let ignored = self.par2_ignore_extensions();
+                set.recovery_file_ids.iter().any(|id| {
+                    !bound.contains(id)
+                        && set.file_description(id).is_none_or(|description| {
+                            !par2_damage_ignorable(&description.filename, &ignored)
+                        })
+                })
+            });
         let authoritative_par2_verification_owed = rar_par2_repair_ready
+            || unposted_protected_payload
             || self.par3_requires_authoritative_par2(job_id)
             || known_archive_damage
             // Completed transport is not proof that a restored direct image
@@ -1844,25 +1903,44 @@ impl Pipeline {
                                 return;
                             }
                         };
-                        // The scan is a second read of a directory the analysis
-                        // described a moment ago, and it is the one this arm
-                        // stands its verdict on. If the two disagree —
-                        // `verify_all` cannot report misplacement, so a
-                        // disagreement is damage or an absence that appeared in
-                        // between — then "placement only" was concluded from a
-                        // state that no longer holds, and marking the set
-                        // verified on it would accept a verdict nothing re-read.
-                        // Nothing is moved and the gate is re-armed instead: the
-                        // next lap analyses the disk as it is now and takes
-                        // whichever ladder that answer deserves.
+                        // The rename-only proposal cannot express copying one
+                        // intact repost onto multiple described names. A scan
+                        // disagreement therefore needs the repairer's verified
+                        // installation, not another identical analysis loop.
+                        // The repairer also revalidates its sources if the
+                        // directory changed between these two reads.
                         if par2_verification_needs_repair(&scanned) {
                             warn!(
                                 job_id = job_id.0,
                                 damaged = scanned.total_missing_blocks,
-                                "PAR2 placement pass disagreed with the analysis it stood in \
-                                 for — re-checking before placing anything"
+                                "PAR2 placement needs verified installation instead of renames"
                             );
-                            self.schedule_job_completion_check(job_id);
+                            if !self.maybe_start_repair(job_id).await {
+                                return;
+                            }
+                            match self
+                                .run_par2_repairer(
+                                    job_id,
+                                    Arc::clone(&par2_set),
+                                    working_dir.clone(),
+                                    true,
+                                    Some(verification),
+                                )
+                                .await
+                            {
+                                Ok(outcome) => {
+                                    self.finish_par2_repair(
+                                        job_id,
+                                        Arc::clone(&par2_set),
+                                        working_dir.clone(),
+                                        verification,
+                                        outcome,
+                                        has_crc_failures,
+                                    )
+                                    .await;
+                                }
+                                Err(message) => self.fail_par2_repair(job_id, message),
+                            }
                             return;
                         }
                         self.try_deobfuscate_files_with_par2(job_id).await;

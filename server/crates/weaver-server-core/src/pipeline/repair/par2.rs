@@ -1584,7 +1584,7 @@ impl Pipeline {
         let file = state.assembly.file(file_id)?;
         let current_filename = self.current_filename_for_file(file_id.job_id, file);
         let names = self.par2_binding_candidate_names(file_id)?;
-        let candidates = set
+        let mut candidates = set
             .files
             .iter()
             .filter_map(|(par2_file_id, desc)| {
@@ -1593,6 +1593,25 @@ impl Pipeline {
                     .then_some(*par2_file_id)
             })
             .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            // Posted subjects can change case without changing file identity.
+            // Only a unique folded match is usable; length must not resolve a
+            // collision between distinct case-sensitive recovery names.
+            candidates = set
+                .files
+                .iter()
+                .filter_map(|(par2_file_id, desc)| {
+                    let described = sanitize_download_filename(&desc.filename);
+                    names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&described))
+                        .then_some(*par2_file_id)
+                })
+                .collect();
+            if candidates.len() > 1 {
+                return None;
+            }
+        }
         // Two names, two descriptions: the posted name of a swapped pair
         // answers to the partner's description, and once the canonical name is
         // known the file answers to both. Length breaks that tie whenever the
@@ -2510,6 +2529,27 @@ impl Pipeline {
         source_access: Option<std::sync::Arc<dyn par2_rs::FileAccess + Send + Sync>>,
     ) -> Result<Option<(par2_rs::Par2RepairSession, bool)>, String> {
         if !self.stateful_par2_session_gate() {
+            return Ok(None);
+        }
+        // A retained physical session scans only unresolved source paths.
+        // Seeding an intact repost can therefore hide the bytes needed by an
+        // identical missing description. Use the full source scan for these
+        // sets so one physical copy can satisfy every matching description.
+        if source_access.is_none()
+            && self.par2_runtime(job_id).is_some_and(|runtime| {
+                runtime
+                    .set_runtime(set_id)
+                    .and_then(|set_runtime| set_runtime.set.as_deref())
+                    .is_some_and(|set| {
+                        let mut contents = std::collections::HashSet::new();
+                        set.recovery_file_ids.iter().any(|id| {
+                            set.file_description(id).is_some_and(|description| {
+                                !contents.insert((description.length, description.hash_full))
+                            })
+                        })
+                    })
+            })
+        {
             return Ok(None);
         }
         // Which of this job's files belong to somebody else, computed here so

@@ -1322,6 +1322,93 @@ async fn rar_refresh_done_uses_actual_refreshed_frontier() {
 }
 
 #[tokio::test]
+async fn synchronous_rar_rebuild_rejects_pending_refresh() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40139);
+    let files = build_multifile_multivolume_rar_set();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("RAR Rebuild Refresh Ordering", &files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    let key = (job_id, "show".to_string());
+    let first = pipeline.rar_sets.get(&key).unwrap();
+    let stale_plan = first.plan.clone().unwrap();
+    let stale_headers = pipeline.load_rar_snapshot(job_id, "show").unwrap();
+
+    for (index, (filename, bytes)) in files.iter().enumerate().skip(1) {
+        write_and_complete_rar_volume(&mut pipeline, job_id, index as u32, filename, bytes).await;
+    }
+    let generation = pipeline.rar_sets[&key].extraction_generation;
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: Some(RarRefreshRequest {
+                target_completed_volume: 0,
+                reason: RefreshReason::CoverageExpansion,
+            }),
+            queued: None,
+            latest_completed_volume: 0,
+            refreshed_volumes: BTreeSet::from([0]),
+            structure_dirty: false,
+            last_error: None,
+            last_completion_fingerprint: None,
+        },
+    );
+
+    pipeline
+        .recompute_rar_set_state(job_id, "show")
+        .await
+        .unwrap();
+    let ready = |pipeline: &Pipeline| {
+        pipeline.rar_sets[&key]
+            .plan
+            .as_ref()
+            .unwrap()
+            .ready_members
+            .iter()
+            .map(|member| member.name.clone())
+            .collect::<Vec<_>>()
+    };
+    let expected = ready(&pipeline);
+    assert!(expected.iter().any(|name| name == "E01.mkv"));
+    assert!(
+        !stale_plan
+            .ready_members
+            .iter()
+            .any(|member| member.name == "E01.mkv")
+    );
+
+    pipeline
+        .handle_rar_refresh_done(RarRefreshDone {
+            job_id,
+            set_name: "show".to_string(),
+            request: RarRefreshRequest {
+                target_completed_volume: 0,
+                reason: RefreshReason::CoverageExpansion,
+            },
+            extraction_generation: generation,
+            result: Ok(ComputedRarSetState {
+                plan: stale_plan,
+                headers: stale_headers,
+                rebuild_source:
+                    crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+                integrated_volumes: BTreeSet::from([0]),
+            }),
+        })
+        .await;
+    assert_eq!(ready(&pipeline), expected);
+    if let Some(refresh) = pipeline.rar_refresh_state.get(&key) {
+        assert!(refresh.in_flight.is_none());
+        assert!(refresh.queued.is_none());
+    }
+}
+
+#[tokio::test]
 async fn stale_post_extraction_refresh_does_not_replace_live_rar_plan() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
