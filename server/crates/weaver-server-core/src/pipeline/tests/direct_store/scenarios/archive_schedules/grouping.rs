@@ -505,6 +505,17 @@ impl Naming {
         )
     }
 
+    // Whether leaving one posted volume out of the post says something the
+    // naming does not already: a repost carries every volume twice, so one
+    // copy left out withholds nothing, and a numbered gap is already a set
+    // missing a part.
+    fn withholds(self) -> bool {
+        !matches!(
+            self,
+            Self::Reposted | Self::HexReposted | Self::HexNumberedGap
+        )
+    }
+
     // The names each posted volume goes under, given each one's real name.
     fn posted(self, real: &[String]) -> Vec<String> {
         const STEM: &str = "5f0c9e2ab1d74c6e8a3f1b0d9c2e7a41";
@@ -845,7 +856,10 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
         published.push("silver.horizon.sfv");
     }
     for (case, (order, interruption)) in cases {
-        if !profile.includes(interruption) {
+        if !profile.includes(interruption)
+            || !interruption.fits(fixture.volumes.len())
+            || (interruption.withheld().is_some() && !cell.naming.withholds())
+        {
             continue;
         }
         let context = format!(
@@ -871,6 +885,31 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 && interruption.loss().is_some_and(|(mask, _)| mask != 0);
             if interruption.fails() || unrepairable {
                 profile.assert_rejected(&outcome, &wanted);
+                return;
+            }
+            // A volume the post never carried comes back only from recovery
+            // blocks. Without them the job fails; a set that names its
+            // volumes says which part it is missing.
+            let withheld = interruption.withheld().is_some();
+            if withheld
+                && (options.recovery == RecoveryFormat::Absent || matches!(expect, Expect::Fails(_)))
+            {
+                profile.assert_rejected(&outcome, &wanted);
+                let Some(JobStatus::Failed { error }) = &outcome.status else {
+                    unreachable!("assert_rejected holds the job failed")
+                };
+                // A withheld first volume reads as a set with no start, which
+                // is its own diagnostic.
+                if options.recovery == RecoveryFormat::Absent
+                    && cell.naming.names_place()
+                    && interruption.withheld().is_some_and(|(volume, _)| volume > 0)
+                {
+                    assert!(
+                        error.contains(MISSING_PART),
+                        "{context}: {error}: {:?}",
+                        outcome.trace
+                    );
+                }
                 return;
             }
             if let Expect::Fails(why) = expect {
@@ -935,6 +974,14 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 // PAR2 names. Without its content prefix a volume cannot be
                 // bound safely; repair must use materialized source files.
                 route.shape_demotion = |reason| reason == DemotionReason::Par2Unbindable;
+            }
+            if withheld {
+                // The direct store repairs in place only volumes the job lists:
+                // a repair target is keyed by its NZB file. A volume the post
+                // never carried is damage outside every direct set, so the
+                // whole set goes to the conventional repairer and completes
+                // there.
+                route.direct = false;
             }
             profile.assert_delivery(&outcome, route, &published, interruption);
             if matches!(interruption, Interruption::None) {

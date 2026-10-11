@@ -170,6 +170,7 @@ fn kind(interruption: Interruption) -> (u8, BoundaryAction, BoundaryAction, bool
         Interruption::Loss { .. } => (2, Action::None, Action::None, false),
         Interruption::Combined { action, .. } => (3, action, Action::None, false),
         Interruption::Starved { .. } => (4, Action::None, Action::None, false),
+        Interruption::Withheld { .. } => (7, Action::None, Action::None, false),
         Interruption::Twice {
             mask,
             first,
