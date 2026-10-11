@@ -200,6 +200,119 @@ async fn browse_entries_sorted() {
     assert_eq!(names, vec!["apple", "banana", "cherry"]);
 }
 
+fn names(listing: &serde_json::Value, field: &str) -> Vec<String> {
+    listing[field]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+// Names that sort differently ignoring case than by byte, and that stay
+// distinct on a filesystem that ignores case.
+fn mixed_directory() -> tempfile::TempDir {
+    let tempdir = tempfile::TempDir::new().expect("failed to create temp dir");
+    for folder in ["Zulu", "alpha"] {
+        std::fs::create_dir(tempdir.path().join(folder)).unwrap();
+    }
+    for file in ["banana.txt", "Date.txt", "Cherry.txt", "apple.txt"] {
+        std::fs::write(tempdir.path().join(file), b"x").unwrap();
+    }
+    std::fs::write(tempdir.path().join("alpha").join("nested.txt"), b"x").unwrap();
+    tempdir
+}
+
+#[tokio::test]
+async fn browse_lists_no_files_unless_asked() {
+    let tempdir = mixed_directory();
+    let dir_path = gql_string(tempdir.path());
+    let h = TestHarness::new().await;
+
+    for arguments in [
+        format!("path: {dir_path}"),
+        format!("path: {dir_path}, includeFiles: false"),
+        format!("path: {dir_path}, includeFiles: null"),
+    ] {
+        let resp = h
+            .execute(&format!(
+                "{{ browseDirectories({arguments}) {{ entries {{ name }} files {{ name }} }} }}"
+            ))
+            .await;
+        assert_no_errors(&resp);
+        let data = response_data(&resp);
+        let listing = &data["browseDirectories"];
+        assert_eq!(names(listing, "entries"), ["alpha", "Zulu"], "{arguments}");
+        assert_eq!(listing["files"], serde_json::json!([]), "{arguments}");
+    }
+}
+
+#[tokio::test]
+async fn browse_lists_files_apart_from_folders_when_asked() {
+    let tempdir = mixed_directory();
+    let dir_path = gql_string(tempdir.path());
+    let h = TestHarness::new().await;
+
+    let resp = h
+        .execute(&format!(
+            "{{ browseDirectories(path: {dir_path}, includeFiles: true) {{ currentPath entries {{ name path }} files {{ name path }} }} }}"
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let listing = &data["browseDirectories"];
+
+    assert_eq!(names(listing, "entries"), ["alpha", "Zulu"]);
+    assert_eq!(
+        names(listing, "files"),
+        ["apple.txt", "banana.txt", "Cherry.txt", "Date.txt"]
+    );
+    assert_eq!(
+        listing["files"][1]["path"].as_str().unwrap(),
+        &*tempdir.path().join("banana.txt").to_string_lossy()
+    );
+    assert_eq!(
+        listing["entries"][0]["path"].as_str().unwrap(),
+        &*tempdir.path().join("alpha").to_string_lossy()
+    );
+}
+
+#[tokio::test]
+async fn browse_with_files_still_refuses_a_file_path() {
+    let tempdir = mixed_directory();
+    let file_path = gql_string(&tempdir.path().join("banana.txt"));
+    let h = TestHarness::new().await;
+
+    let resp = h
+        .execute(&format!(
+            "{{ browseDirectories(path: {file_path}, includeFiles: true) {{ currentPath }} }}"
+        ))
+        .await;
+
+    assert_eq!(resp.errors.len(), 1);
+    assert_eq!(resp.errors[0].message, "Path is not a directory");
+    let error = serde_json::to_value(&resp.errors[0]).unwrap();
+    assert_eq!(error["extensions"]["code"], "INVALID_INPUT");
+}
+
+#[tokio::test]
+async fn create_directory_lists_no_files() {
+    let tempdir = mixed_directory();
+    let parent_path = gql_string(tempdir.path());
+    let h = TestHarness::new().await;
+
+    let resp = h
+        .execute(&format!(
+            "mutation {{ createDirectory(path: {parent_path}, name: \"beta\") {{ entries {{ name }} files {{ name }} }} }}"
+        ))
+        .await;
+
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(data["createDirectory"]["entries"], serde_json::json!([]));
+    assert_eq!(data["createDirectory"]["files"], serde_json::json!([]));
+}
+
 #[tokio::test]
 async fn create_directory_creates_folder_and_returns_listing() {
     let tempdir = tempfile::TempDir::new().expect("failed to create temp dir");

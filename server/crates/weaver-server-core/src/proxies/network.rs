@@ -5,7 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{ProxyKind, ProxyProfile, RoutingPolicy};
+use super::{NetworkRefusal, ProxyKind, ProxyProfile, RoutingPolicy};
 
 pub const SYSTEM_EGRESS_ID: u32 = 0;
 pub const MAX_ROUTE_LEGS: usize = 8;
@@ -83,14 +83,10 @@ pub fn validate_instance_budget(
     profiles: &HashMap<u32, ProxyProfile>,
     pools: &HashMap<u32, ProxyPool>,
     limit: usize,
-) -> Result<(), String> {
-    let instances = wireguard_sessions(routes, profiles, pools);
-    if instances.len() > limit {
-        return Err(format!(
-            "routes require {} WireGuard instances × 516 MiB = {} MiB; this host permits {limit} instances (available memory / 4 / 516 MiB, clamped to 1–8). Pool members count individually.",
-            instances.len(),
-            instances.len() * 516
-        ));
+) -> Result<(), NetworkRefusal> {
+    let required = wireguard_sessions(routes, profiles, pools).len();
+    if required > limit {
+        return Err(NetworkRefusal::WireGuardInstanceLimit { required, limit });
     }
     Ok(())
 }
@@ -103,7 +99,7 @@ pub fn validate_wireguard_paths(
     routes: &[Route],
     profiles: &HashMap<u32, ProxyProfile>,
     pools: &HashMap<u32, ProxyPool>,
-) -> Result<(), String> {
+) -> Result<(), NetworkRefusal> {
     let mut paths: HashMap<(u32, u32), Vec<Vec<u32>>> = HashMap::new();
     for (egress, path) in wireguard_sessions(routes, profiles, pools) {
         let id = *path.last().expect("a session path names its own hop");
@@ -114,21 +110,13 @@ pub fn validate_wireguard_paths(
         .filter(|(_, paths)| paths.len() > 1)
         .collect();
     conflicts.sort();
-    if let Some(((egress, id), mut paths)) = conflicts.into_iter().next() {
+    if let Some(((egress, proxy), mut paths)) = conflicts.into_iter().next() {
         paths.sort();
-        let paths = paths
-            .iter()
-            .map(|path| {
-                path.iter()
-                    .map(|id| format!("proxy {id}"))
-                    .collect::<Vec<_>>()
-                    .join(" → ")
-            })
-            .collect::<Vec<_>>()
-            .join(" and ");
-        return Err(format!(
-            "WireGuard proxy {id} is used on egress {egress} by two different paths ({paths}); a WireGuard server accepts one connection per key, so a WireGuard proxy may reach the egress by only one path"
-        ));
+        return Err(NetworkRefusal::WireGuardPathConflict {
+            proxy,
+            egress,
+            paths,
+        });
     }
     Ok(())
 }
@@ -167,26 +155,28 @@ impl EgressInterface {
         }
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), NetworkRefusal> {
         if self.name.trim().is_empty() || self.name.chars().count() > 128 {
-            return Err("egress name must contain 1–128 characters".into());
+            return Err(NetworkRefusal::EgressNameLength);
         }
-        self.download_quota.validate_for("egress")?;
+        if let Some(fault) = self.download_quota.fault() {
+            return Err(NetworkRefusal::EgressQuota(fault));
+        }
         if self.id == SYSTEM_EGRESS_ID {
             if self.binding != EgressBinding::System || self.name != "System" || !self.enabled {
-                return Err("the System egress cannot be renamed, rebound, or disabled".into());
+                return Err(NetworkRefusal::EgressSystemImmutable);
             }
         } else if self.binding == EgressBinding::System {
-            return Err("only egress 0 may use the System binding".into());
+            return Err(NetworkRefusal::EgressSystemBindingReserved);
         }
         match &self.binding {
             EgressBinding::Interface { name } if name.is_empty() || name.contains('\0') => {
-                Err("interface name must be nonempty and contain no NUL".into())
+                Err(NetworkRefusal::EgressInterfaceNameInvalid)
             }
             EgressBinding::SourceAddress { address }
                 if address.is_unspecified() || address.is_multicast() =>
             {
-                Err("source address must be a unicast host address".into())
+                Err(NetworkRefusal::EgressSourceAddressNotUnicast)
             }
             _ => Ok(()),
         }
@@ -247,21 +237,21 @@ pub struct ProxyPool {
 }
 
 impl ProxyPool {
-    pub fn validate(&self, profiles: &HashMap<u32, ProxyProfile>) -> Result<(), String> {
+    pub fn validate(&self, profiles: &HashMap<u32, ProxyProfile>) -> Result<(), NetworkRefusal> {
         if self.name.trim().is_empty() || self.name.chars().count() > 128 {
-            return Err("pool name must contain 1–128 characters".into());
+            return Err(NetworkRefusal::PoolNameLength);
         }
         if !(2..=16).contains(&self.member_ids.len()) {
-            return Err("a pool requires between two and sixteen members".into());
+            return Err(NetworkRefusal::PoolMemberCount);
         }
         let mut seen = HashSet::new();
         for id in &self.member_ids {
             if !seen.insert(id) {
-                return Err("a proxy cannot appear twice in a pool".into());
+                return Err(NetworkRefusal::PoolProxyRepeated);
             }
-            let profile = profiles.get(id).ok_or("pool references a missing proxy")?;
+            let profile = profiles.get(id).ok_or(NetworkRefusal::PoolProxyMissing)?;
             if profile.kind != self.kind {
-                return Err("all pool members must have the pool's proxy kind".into());
+                return Err(NetworkRefusal::PoolMemberKindMismatch);
             }
         }
         Ok(())
@@ -320,12 +310,12 @@ impl Route {
         }
     }
 
-    pub fn validate_shape(&self) -> Result<(), String> {
+    pub fn validate_shape(&self) -> Result<(), NetworkRefusal> {
         if !(1..=MAX_ROUTE_LEGS).contains(&self.legs.len()) {
-            return Err("a route requires between one and eight legs".into());
+            return Err(NetworkRefusal::RouteLegCount);
         }
         if self.legs.iter().any(|leg| !(1..=100).contains(&leg.weight)) {
-            return Err("leg weights must be between 1 and 100".into());
+            return Err(NetworkRefusal::RouteLegWeightRange);
         }
         if self
             .legs
@@ -334,18 +324,18 @@ impl Route {
             .sum::<u16>()
             != 100
         {
-            return Err("leg weights must sum to exactly 100".into());
+            return Err(NetworkRefusal::RouteLegWeightSum);
         }
         for leg in &self.legs {
             if let LegPath::Ladder { rungs, .. } = &leg.path {
                 if !(1..=MAX_LADDER_RUNGS).contains(&rungs.len()) {
-                    return Err("a ladder requires between one and eight rungs".into());
+                    return Err(NetworkRefusal::RouteLadderRungCount);
                 }
                 for rung in rungs {
                     if let Rung::Chain { ids } = rung
                         && !(2..=3).contains(&ids.len())
                     {
-                        return Err("a chain requires two or three proxies".into());
+                        return Err(NetworkRefusal::RouteChainLength);
                     }
                 }
             }
@@ -359,14 +349,14 @@ impl Route {
         profiles: &HashMap<u32, ProxyProfile>,
         pools: &HashMap<u32, ProxyPool>,
         require_dns: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), NetworkRefusal> {
         self.validate_shape()?;
         for leg in &self.legs {
             let egress = egresses
                 .get(&leg.egress_id)
-                .ok_or("route references a missing egress")?;
+                .ok_or(NetworkRefusal::RouteEgressMissing)?;
             if !egress.enabled {
-                return Err("route references a disabled egress".into());
+                return Err(NetworkRefusal::RouteEgressDisabled);
             }
             let LegPath::Ladder { rungs, .. } = &leg.path else {
                 continue;
@@ -376,19 +366,16 @@ impl Route {
                 let ids = match rung {
                     Rung::Proxy { id } => std::slice::from_ref(id),
                     Rung::Pool { id } => {
-                        let pool = pools.get(id).ok_or("route references a missing pool")?;
+                        let pool = pools.get(id).ok_or(NetworkRefusal::RoutePoolMissing)?;
                         pool.validate(profiles)?;
                         &pool.member_ids
                     }
                     Rung::Chain { ids } => ids,
                 };
                 for (position, id) in ids.iter().enumerate() {
-                    let profile = profiles.get(id).ok_or("route references a missing proxy")?;
+                    let profile = profiles.get(id).ok_or(NetworkRefusal::RouteProxyMissing)?;
                     if !seen.insert(id) {
-                        return Err(
-                            "a proxy cannot appear twice in a ladder, including pools and chains"
-                                .into(),
-                        );
+                        return Err(NetworkRefusal::RouteProxyRepeated);
                     }
                     // Only a WireGuard hop carries the UDP that WireGuard
                     // and HTTP/3 travel over, and only WireGuard can use it.
@@ -402,10 +389,10 @@ impl Route {
                         && matches!(profile.kind, ProxyKind::WireGuard | ProxyKind::Http3Connect)
                         && !carried
                     {
-                        return Err("WireGuard and HTTP/3 must be the first proxy in a chain, directly above the egress; WireGuard may also sit directly on another WireGuard proxy".into());
+                        return Err(NetworkRefusal::RouteChainTransport);
                     }
                     if require_dns && profile.dns_servers.is_empty() {
-                        return Err("every RSS proxy and pool member requires DNS servers".into());
+                        return Err(NetworkRefusal::RouteRssProxyNeedsDns);
                     }
                 }
             }
@@ -413,7 +400,7 @@ impl Route {
         Ok(())
     }
 
-    pub(crate) fn validate_allocation(&self) -> Result<(), String> {
+    pub(crate) fn validate_allocation(&self) -> Result<(), NetworkRefusal> {
         if self
             .legacy_policy()
             .is_some_and(|p| p.proxy_ids.is_empty() && !p.allow_direct)

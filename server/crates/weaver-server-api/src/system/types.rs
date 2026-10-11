@@ -22,6 +22,7 @@ pub struct DirectoryBrowseResult {
     pub current_path: String,
     pub parent_path: Option<String>,
     pub entries: Vec<DirectoryBrowseEntry>,
+    pub files: Vec<DirectoryBrowseEntry>,
 }
 
 impl From<CoreDirectoryBrowseEntry> for DirectoryBrowseEntry {
@@ -39,6 +40,7 @@ impl From<CoreDirectoryBrowseListing> for DirectoryBrowseResult {
             current_path: value.current_path,
             parent_path: value.parent_path,
             entries: value.entries.into_iter().map(Into::into).collect(),
+            files: value.files.into_iter().map(Into::into).collect(),
         }
     }
 }

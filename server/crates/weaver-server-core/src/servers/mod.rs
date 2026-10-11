@@ -13,8 +13,8 @@ pub use connectivity::{
     ServerConnectivityResult, probe_server_connection, probe_server_connection_with_route,
 };
 pub use model::{
-    MAX_PERSISTED_SERVER_DOWNLOAD_BYTES, ServerConfig, ServerDownloadQuotaConfig,
-    ServerDownloadQuotaPeriod,
+    DownloadQuotaFault, MAX_PERSISTED_SERVER_DOWNLOAD_BYTES, ServerConfig,
+    ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod,
 };
 pub use tls_diagnostics::ServerTlsDiagnostics;
 pub use usage::ServerDownloadUsage;

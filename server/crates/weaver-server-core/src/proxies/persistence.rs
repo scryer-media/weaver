@@ -1,10 +1,11 @@
-use super::{Consumer, ProxyProfile, RoutingPolicy};
+use super::{Consumer, NetworkRefusal, ProxyProfile, RoutingPolicy};
 use crate::persistence::{
     encryption::{decrypt_value, encrypt_value},
     sql_runtime::{SqlArg, SqlRuntime},
 };
 use crate::{Database, StateError};
 
+// A storage fault. Input the operator can correct is a `NetworkRefusal`.
 fn error(e: impl std::fmt::Display) -> StateError {
     StateError::Database(e.to_string())
 }
@@ -61,7 +62,7 @@ impl Database {
 
     pub fn reset_proxy_host_key(&self, profile: &ProxyProfile) -> Result<ProxyProfile, StateError> {
         if profile.kind != super::ProxyKind::Ssh {
-            return Err(error("only SSH profiles have host-key trust"));
+            return Err(NetworkRefusal::ProxyHostKeyNotSsh.into());
         }
         self.write_proxy_profile(profile, true)
     }
@@ -76,7 +77,7 @@ impl Database {
         if profile.kind == super::ProxyKind::Ssh {
             profile.secrets.password = None;
         }
-        profile.validate().map_err(error)?;
+        profile.validate()?;
         let key = self
             .encryption_key()
             .ok_or_else(|| error("encryption key required for proxy credentials"))?;
@@ -96,7 +97,7 @@ impl Database {
                         let members: Vec<u32> = serde_json::from_str(&row.text("member_ids")?).map_err(error)?;
                         let kind: super::ProxyKind = serde_json::from_str(&row.text("kind")?).map_err(error)?;
                         if members.contains(&profile.id) && kind != profile.kind {
-                            return Err(error("proxy kind cannot change while the proxy belongs to a pool"));
+                            return Err(NetworkRefusal::ProxyKindLockedByPool.into());
                         }
                     }
                     let id = [SqlArg::I64(i64::from(profile.id))];
@@ -106,16 +107,16 @@ impl Database {
                     if let Some(row) = tx.fetch_optional("SELECT config FROM proxy_profiles WHERE id = {}", &id).await? {
                         let existing: ProxyProfile = serde_json::from_str(&row.text("config")?).map_err(error)?;
                         if profile.revision < existing.revision || (reset_trust && profile.revision == existing.revision) {
-                            return Err(error("proxy revision changed"));
+                            return Err(NetworkRefusal::ProxyRevisionChanged.into());
                         }
                         profile.host_key_fingerprint = if reset_trust { None } else { existing.host_key_fingerprint.clone() };
                         // Key rotation rewrites encrypted secrets without changing
                         // the public profile or its runtime revision.
                         if profile.revision == existing.revision && serde_json::to_value(&profile).map_err(error)? != serde_json::to_value(&existing).map_err(error)? {
-                            return Err(error("proxy revision changed"));
+                            return Err(NetworkRefusal::ProxyRevisionChanged.into());
                         }
                     } else if reset_trust {
-                        return Err(error("proxy no longer exists"));
+                        return Err(NetworkRefusal::ProxyGone.into());
                     }
                     tx.execute("INSERT INTO proxy_profiles (id, config, password) VALUES ({}, {}, {}) ON CONFLICT(id) DO UPDATE SET config = excluded.config, password = excluded.password", &[
                         SqlArg::I64(i64::from(profile.id)),
@@ -142,9 +143,7 @@ impl Database {
                         let members: Vec<u32> =
                             serde_json::from_str(&row.text("member_ids")?).map_err(error)?;
                         if members.contains(&id) {
-                            return Err(error(
-                                "proxy belongs to a pool; remove it from the pool first",
-                            ));
+                            return Err(NetworkRefusal::ProxyInPool.into());
                         }
                     }
                     for row in tx.fetch_all("SELECT policy FROM proxy_routes", &[]).await? {
@@ -159,7 +158,7 @@ impl Database {
                                 })
                             }
                         }) {
-                            return Err(error("proxy is referenced by a server or RSS feed"));
+                            return Err(NetworkRefusal::ProxyInUse.into());
                         }
                     }
                     tx.execute(
@@ -215,7 +214,7 @@ impl Database {
         consumer: Consumer,
         policy: &RoutingPolicy,
     ) -> Result<(), StateError> {
-        policy.validate().map_err(error)?;
+        policy.validate()?;
         let key = consumer.key();
         let policy = policy.clone();
         let store = self.datastore();

@@ -1,6 +1,15 @@
 use super::*;
 use crate::proxies::{Failover, ProxyKind, ProxySecrets, RouteLeg};
 
+// The code of the refusal a write was turned away with. A storage fault has
+// none, so a refusal that degrades into one fails here.
+fn refused<T: std::fmt::Debug>(result: Result<T, StateError>) -> &'static str {
+    match result.unwrap_err() {
+        StateError::Refused(refusal) => refusal.code,
+        other => panic!("not a refusal: {other}"),
+    }
+}
+
 fn egress() -> EgressInterface {
     EgressInterface {
         id: 0,
@@ -80,7 +89,10 @@ fn migration_seeds_exactly_one_system_egress_and_backup_accepts_it() {
     assert!(db.list_proxy_pools().unwrap().is_empty());
     assert!(db.restore_target_is_pristine().unwrap());
     db.validate_backup_catalog().unwrap();
-    assert!(db.delete_egress_interface(0).is_err());
+    assert_eq!(
+        refused(db.delete_egress_interface(0)),
+        "EGRESS_SYSTEM_UNDELETABLE"
+    );
     assert!(
         db.create_egress_interface(&EgressInterface::system())
             .is_err()
@@ -89,7 +101,10 @@ fn migration_seeds_exactly_one_system_egress_and_backup_accepts_it() {
     system.max_download_speed = 5_000_000;
     assert_eq!(db.update_egress_interface(&system).unwrap(), system);
     system.name = "renamed".into();
-    assert!(db.update_egress_interface(&system).is_err());
+    assert_eq!(
+        refused(db.update_egress_interface(&system)),
+        "EGRESS_SYSTEM_IMMUTABLE"
+    );
 }
 
 #[test]
@@ -137,46 +152,25 @@ fn referenced_resources_cannot_be_deleted_and_pool_edits_validate_existing_ladde
             failover: Failover::Redistribute,
         },
     );
-    assert!(
-        db.delete_egress_interface(egress.id)
-            .unwrap_err()
-            .to_string()
-            .contains("referenced")
+    assert_eq!(
+        refused(db.delete_egress_interface(egress.id)),
+        "EGRESS_IN_USE"
     );
-    assert!(
-        db.delete_proxy_pool(pool.id)
-            .unwrap_err()
-            .to_string()
-            .contains("referenced")
-    );
-    assert!(
-        db.delete_proxy_profile(1)
-            .unwrap_err()
-            .to_string()
-            .contains("pool")
-    );
-    assert!(
-        db.delete_proxy_profile(3)
-            .unwrap_err()
-            .to_string()
-            .contains("referenced")
-    );
+    assert_eq!(refused(db.delete_proxy_pool(pool.id)), "POOL_IN_USE");
+    assert_eq!(refused(db.delete_proxy_profile(1)), "PROXY_IN_POOL");
+    assert_eq!(refused(db.delete_proxy_profile(3)), "PROXY_IN_USE");
     pool.member_ids = vec![1, 3];
-    assert!(
-        db.update_proxy_pool(&pool)
-            .unwrap_err()
-            .to_string()
-            .contains("repeat")
+    assert_eq!(
+        refused(db.update_proxy_pool(&pool)),
+        "POOL_EDIT_REPEATS_PROXY"
     );
     assert_eq!(db.list_proxy_pools().unwrap()[0].member_ids, [1, 2]);
     let mut changed = profile(1);
     changed.kind = ProxyKind::HttpConnect;
     changed.revision += 1;
-    assert!(
-        db.save_proxy_profile(&changed)
-            .unwrap_err()
-            .to_string()
-            .contains("kind")
+    assert_eq!(
+        refused(db.save_proxy_profile(&changed)),
+        "PROXY_KIND_LOCKED_BY_POOL"
     );
 }
 
@@ -208,12 +202,7 @@ fn proxy_references_in_later_legs_and_chain_hops_are_protected() {
         },
     );
     for id in 1..=2 {
-        assert!(
-            db.delete_proxy_profile(id)
-                .unwrap_err()
-                .to_string()
-                .contains("referenced")
-        );
+        assert_eq!(refused(db.delete_proxy_profile(id)), "PROXY_IN_USE");
     }
 }
 
@@ -444,14 +433,11 @@ fn a_route_may_stack_wireguard_only_on_wireguard() {
     let server = crate::proxies::Consumer::Server(1);
     db.save_proxy_routing_policy(server, &chain(vec![2, 3, 1]))
         .unwrap();
-    for refused in [vec![1, 2], vec![2, 1, 3]] {
-        let error = db
-            .save_proxy_routing_policy(server, &chain(refused.clone()))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("WireGuard may also sit directly on another WireGuard proxy"),
-            "{refused:?}: {error}"
+    for path in [vec![1, 2], vec![2, 1, 3]] {
+        assert_eq!(
+            refused(db.save_proxy_routing_policy(server, &chain(path.clone()))),
+            "ROUTE_CHAIN_TRANSPORT",
+            "{path:?}"
         );
     }
     // Turning the hop beneath into a stream proxy would strand the
@@ -464,10 +450,9 @@ fn a_route_may_stack_wireguard_only_on_wireguard() {
         .unwrap();
     changed.kind = ProxyKind::Socks5;
     changed.revision += 1;
-    let error = db.save_proxy_profile(&changed).unwrap_err().to_string();
-    assert!(
-        error.contains("WireGuard may also sit directly on another WireGuard proxy"),
-        "{error}"
+    assert_eq!(
+        refused(db.save_proxy_profile(&changed)),
+        "ROUTE_CHAIN_TRANSPORT"
     );
 }
 
@@ -513,10 +498,18 @@ fn a_wireguard_proxy_is_saved_on_only_one_path_per_egress() {
     // same server under the same key.
     let error = db
         .save_proxy_routing_policy(second, &ladder(Rung::Proxy { id: 3 }))
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+    // The sentence stands alone: nothing in it reads as a storage fault.
     assert!(
-        error.contains("WireGuard proxy 3 is used on egress 0 by two different paths"),
+        error
+            .to_string()
+            .starts_with("WireGuard proxy 3 is used on egress 0 by two different paths"),
         "{error}"
+    );
+    let refusal = error.refusal().expect("a refusal").clone();
+    assert_eq!(refusal.code, "WIREGUARD_PROXY_PATH_CONFLICT");
+    assert_eq!(
+        serde_json::Value::Object(refusal.params),
+        serde_json::json!({ "proxyId": 3, "egressId": 0, "paths": [[2, 3], [3]] })
     );
 }

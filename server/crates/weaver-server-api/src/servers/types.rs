@@ -189,16 +189,23 @@ impl TryFrom<ServerDownloadQuotaInput> for ServerDownloadQuotaConfig {
     type Error = String;
 
     fn try_from(value: ServerDownloadQuotaInput) -> Result<Self, Self::Error> {
-        let config = Self {
-            enabled: value.enabled,
-            limit_bytes: value.limit_bytes,
-            period: value.period.into(),
-            reset_time_minutes_local: value.reset_time_minutes_local,
-            weekly_reset_weekday: value.weekly_reset_weekday.into(),
-            monthly_reset_day: value.monthly_reset_day,
-        };
+        let config = value.config();
         config.validate()?;
         Ok(config)
+    }
+}
+
+impl ServerDownloadQuotaInput {
+    // The quota as entered, for a holder that checks the bounds itself.
+    pub(crate) fn config(self) -> ServerDownloadQuotaConfig {
+        ServerDownloadQuotaConfig {
+            enabled: self.enabled,
+            limit_bytes: self.limit_bytes,
+            period: self.period.into(),
+            reset_time_minutes_local: self.reset_time_minutes_local,
+            weekly_reset_weekday: self.weekly_reset_weekday.into(),
+            monthly_reset_day: self.monthly_reset_day,
+        }
     }
 }
 
