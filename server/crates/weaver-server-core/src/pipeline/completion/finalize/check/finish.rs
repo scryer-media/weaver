@@ -1082,7 +1082,7 @@ impl Pipeline {
             .get(&job_id)
             .map(|unposted| unposted.superseded.clone())
             .unwrap_or_default();
-        let candidates: Vec<(NzbFileId, PathBuf)> = state
+        let candidates: Vec<_> = state
             .assembly
             .files()
             .filter(|file| {
@@ -1099,6 +1099,7 @@ impl Pipeline {
                 (
                     file.file_id(),
                     working_dir.join(self.current_filename_for_file(job_id, file)),
+                    file.protected_write_ranges().collect::<Vec<_>>(),
                 )
             })
             .collect();
@@ -1118,10 +1119,17 @@ impl Pipeline {
             } else {
                 candidates
                     .into_iter()
-                    .filter(|(_, path)| {
+                    .filter(|(_, path, ranges)| {
                         superseded_source_probe(path, slice_size, &present, &working_dir)
+                            || superseded_article_probe(
+                                path,
+                                ranges,
+                                slice_size,
+                                &present,
+                                &working_dir,
+                            )
                     })
-                    .map(|(file_id, _)| file_id)
+                    .map(|(file_id, _, _)| file_id)
                     .collect()
             };
             let names: Vec<String> = present.into_iter().map(|(name, _, _)| name).collect();
@@ -1731,6 +1739,69 @@ impl Pipeline {
 // the file.
 const SUPERSEDED_PROBE_SLICES: usize = 3;
 
+// A small source can lose both ends without retaining one complete PAR2 slice.
+// Compare its committed article ranges with verified outputs instead of
+// treating the sparse holes between those ranges as received bytes. Every
+// surviving byte must agree with exactly one output, within the slice budget.
+fn superseded_article_probe(
+    path: &Path,
+    ranges: &[(u64, u64)],
+    slice_size: u64,
+    outputs: &[(String, u64, Vec<par2_rs::SliceChecksum>)],
+    output_dir: &Path,
+) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let budget = slice_size.saturating_mul(SUPERSEDED_PROBE_SLICES as u64);
+    let Some(total) = ranges.iter().try_fold(0u64, |total, (start, end)| {
+        total.checked_add(end.checked_sub(*start)?)
+    }) else {
+        return false;
+    };
+    if total < 32 || total > budget {
+        return false;
+    }
+    let Ok(mut source) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut received = Vec::new();
+    for &(start, end) in ranges {
+        let Ok(len) = usize::try_from(end - start) else {
+            return false;
+        };
+        let mut bytes = vec![0; len];
+        if source.seek(SeekFrom::Start(start)).is_err() || source.read_exact(&mut bytes).is_err() {
+            return false;
+        }
+        received.push((start, bytes));
+    }
+    if !received
+        .iter()
+        .any(|(_, bytes)| bytes.iter().any(|byte| *byte != 0))
+    {
+        return false;
+    }
+    outputs
+        .iter()
+        .filter(|(name, length, _)| {
+            if ranges.iter().any(|(_, end)| end > length) {
+                return false;
+            }
+            let Ok(mut output) = std::fs::File::open(output_dir.join(name)) else {
+                return false;
+            };
+            received.iter().all(|(start, bytes)| {
+                let mut expected = vec![0; bytes.len()];
+                output.seek(SeekFrom::Start(*start)).is_ok()
+                    && output.read_exact(&mut expected).is_ok()
+                    && &expected == bytes
+            })
+        })
+        .take(2)
+        .count()
+        == 1
+}
+
 // Whether the file at `path` holds a slice of one of `outputs` at the offset
 // the recovery set describes it.
 //
@@ -1834,7 +1905,35 @@ fn superseded_source_probe(
 
 #[cfg(test)]
 mod superseded_prefix_tests {
-    use super::superseded_source_probe;
+    use super::{superseded_article_probe, superseded_source_probe};
+
+    #[test]
+    fn committed_ranges_require_one_exact_verified_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let full: Vec<u8> = (0..256).map(|n| (n % 251) as u8).collect();
+        let source = directory.path().join("posted");
+        let mut sparse = vec![0; full.len()];
+        sparse[64..128].copy_from_slice(&full[64..128]);
+        std::fs::write(&source, &sparse).unwrap();
+        std::fs::write(directory.path().join("archive.7z"), &full).unwrap();
+        let mut outputs = vec![("archive.7z".to_owned(), full.len() as u64, Vec::new())];
+        let matches = |outputs: &[_], ranges: &[_], slice_size| {
+            superseded_article_probe(&source, ranges, slice_size, outputs, directory.path())
+        };
+        assert!(matches(&outputs, &[(64, 128)], 256));
+        assert!(!matches(&outputs, &[(0, 128)], 256));
+        assert!(!matches(&outputs, &[(64, 80)], 256));
+        assert!(!matches(&outputs, &[(64, 128)], 8));
+
+        sparse[90] ^= 1;
+        std::fs::write(&source, &sparse).unwrap();
+        assert!(!matches(&outputs, &[(64, 128)], 256));
+        sparse[90] ^= 1;
+        std::fs::write(&source, &sparse).unwrap();
+        std::fs::write(directory.path().join("other.7z"), &full).unwrap();
+        outputs.push(("other.7z".to_owned(), full.len() as u64, Vec::new()));
+        assert!(!matches(&outputs, &[(64, 128)], 256));
+    }
 
     #[test]
     fn truncated_sevenz_prefix_requires_one_exact_verified_owner() {
