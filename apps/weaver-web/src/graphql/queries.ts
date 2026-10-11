@@ -393,6 +393,23 @@ export const BROWSE_DIRECTORIES_QUERY = gql`
   }
 `;
 
+export const BROWSE_FILES_QUERY = gql`
+  query BrowseFiles($path: String) {
+    browseDirectories(path: $path, includeFiles: true) {
+      currentPath
+      parentPath
+      entries {
+        name
+        path
+      }
+      files {
+        name
+        path
+      }
+    }
+  }
+`;
+
 export const CREATE_DIRECTORY_MUTATION = gql`
   mutation CreateDirectory($path: String!, $name: String!) {
     createDirectory(path: $path, name: $name) {

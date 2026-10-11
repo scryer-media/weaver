@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useClient } from "urql";
-import { BROWSE_DIRECTORIES_QUERY, CREATE_DIRECTORY_MUTATION } from "@/graphql/queries";
+import { BROWSE_DIRECTORIES_QUERY, BROWSE_FILES_QUERY, CREATE_DIRECTORY_MUTATION } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import { cn } from "@/lib/utils";
@@ -20,7 +20,12 @@ interface DirectoryListing {
   currentPath: string;
   parentPath: string | null;
   entries: DirectoryEntry[];
+  /** The folder's files, listed only for a picker that picks one. */
+  files?: DirectoryEntry[];
 }
+
+/** A folder to try next when one cannot be read, and the file to pick in it. */
+type Stop = { path: string | null; select?: string };
 
 const ROW_HEIGHT = 34;
 const COLUMNS = "minmax(0,1fr) auto";
@@ -30,18 +35,20 @@ function failureMessage(error: { graphQLErrors: { message: string }[]; message: 
 }
 
 /**
- * Pick a folder on the daemon's filesystem.
+ * Pick a folder on the daemon's filesystem, or a file with `pick="file"`.
  *
  * A library folder can hold thousands of entries, so the listing is a
  * virtualized table: only the rows in view exist in the DOM, however long the
- * directory is. Clicking a row opens it; "Use this folder" takes the folder
- * being shown. Browsing with no starting path opens the completed folder, the
- * daemon's own default.
+ * directory is. Clicking a folder's row opens it; "Use this folder" takes the
+ * folder being shown. Picking a file lists a folder's files under its folders:
+ * clicking one picks it, and "Use this file" takes it. Browsing with no
+ * starting path opens the completed folder, the daemon's own default.
  */
 type DirectoryBrowserProps = {
   open: boolean;
   initialPath: string | null;
   title?: string;
+  pick?: "folder" | "file";
   onClose: () => void;
   onChoose: (path: string) => void;
 };
@@ -51,7 +58,8 @@ export function DirectoryBrowserDialog(props: DirectoryBrowserProps) {
   return props.open ? <DirectoryBrowserSession key={props.initialPath} {...props} /> : null;
 }
 
-function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }: DirectoryBrowserProps) {
+function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onChoose }: DirectoryBrowserProps) {
+  const files = pick === "file";
   const t = useTranslate();
   const client = useClient();
   const [listing, setListing] = useState<DirectoryListing | null>(null);
@@ -59,6 +67,7 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
   const [filter, setFilter] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
   const [newFolder, setNewFolder] = useState("");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -69,22 +78,23 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
   const crumbsRef = useRef<HTMLDivElement | null>(null);
   const pathInputRef = useRef<HTMLInputElement | null>(null);
 
-  const show = useCallback((next: DirectoryListing) => {
+  const show = useCallback((next: DirectoryListing, select?: string) => {
     setListing(next);
     setTypedPath(next.currentPath);
     setFilter("");
     setError(null);
+    setSelected(select !== undefined && next.files?.some((file) => file.path === select) ? select : null);
   }, []);
 
   const browse = useCallback(
-    async (path: string | null, fallback?: string | null) => {
+    async (path: string | null, otherwise: Stop[] = [], select?: string) => {
       const request = ++requestRef.current;
       setLoading(true);
       setError(null);
       setCreateError(null);
       const result = await client
         .query<{ browseDirectories: DirectoryListing }>(
-          BROWSE_DIRECTORIES_QUERY,
+          files ? BROWSE_FILES_QUERY : BROWSE_DIRECTORIES_QUERY,
           { path },
           { requestPolicy: "network-only" },
         )
@@ -93,8 +103,9 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
         return;
       }
       if (result.error || !result.data?.browseDirectories) {
-        if (fallback !== undefined) {
-          void browse(fallback, fallback === null ? "/" : undefined);
+        const [next, ...rest] = otherwise;
+        if (next) {
+          void browse(next.path, rest, next.select);
           return;
         }
         setLoading(false);
@@ -102,9 +113,18 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
         return;
       }
       setLoading(false);
-      show(result.data.browseDirectories);
+      show(result.data.browseDirectories, select);
     },
-    [client, show, t],
+    [client, files, show, t],
+  );
+
+  // A path that names a file opens the folder it is in, with the file picked.
+  const fileStops = useCallback(
+    (path: string): Stop[] => {
+      const above = files ? parentOf(path) : null;
+      return above === null ? [] : [{ path: above, select: path }];
+    },
+    [files],
   );
 
   useEffect(() => {
@@ -119,8 +139,8 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
     }
     const start = initialPath?.trim() || null;
     // A saved path that no longer exists still opens somewhere useful.
-    void browse(start, start === null ? "/" : null);
-  }, [browse, initialPath, open]);
+    void browse(start, start === null ? [{ path: "/" }] : [...fileStops(start), { path: null }, { path: "/" }]);
+  }, [browse, fileStops, initialPath, open]);
 
   // Keys go to the picker once it is up, not to the field under the overlay.
   useEffect(() => {
@@ -152,8 +172,22 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
     show(result.data.createDirectory);
   };
 
-  const entries = listing?.entries ?? [];
+  const entries = useMemo(
+    () => [
+      ...(listing?.entries ?? []).map((entry) => ({ ...entry, file: false })),
+      ...(listing?.files ?? []).map((entry) => ({ ...entry, file: true })),
+    ],
+    [listing],
+  );
   const shown = filterEntries(entries, filter);
+  // A folder's row opens it; a file's row picks it.
+  const activate = (entry: (typeof entries)[number]) => {
+    if (entry.file) {
+      setSelected(entry.path);
+    } else {
+      void browse(entry.path);
+    }
+  };
   const currentPath = listing?.currentPath ?? "";
   const parent = listing ? (listing.parentPath ?? parentOf(listing.currentPath)) : null;
   const busy = loading || creating;
@@ -182,7 +216,7 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
   return (
     <Dialog
       open={open}
-      title={title ?? t("next.folders.choose")}
+      title={title ?? t(files ? "next.files.choose" : "next.folders.choose")}
       onDismiss={onClose}
       width={720}
       footer={
@@ -191,18 +225,24 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
               adding a line of its own that would grow the dialog. */}
           <span
             aria-live="polite"
-            title={createError ?? currentPath}
+            title={createError ?? selected ?? currentPath}
             className={cn(
               "mr-auto min-w-0 flex-[1_1_200px] truncate text-[11.5px]",
               createError === null ? "font-wv-mono text-wv-muted" : "text-wv-error-text",
             )}
           >
-            {createError ?? currentPath}
+            {createError ?? selected ?? currentPath}
           </span>
           <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
-          <PrimaryButton disabled={busy || !listing} onClick={() => listing && onChoose(listing.currentPath)}>
-            {t("next.folders.use")}
-          </PrimaryButton>
+          {files ? (
+            <PrimaryButton disabled={busy || selected === null} onClick={() => selected !== null && onChoose(selected)}>
+              {t("next.files.use")}
+            </PrimaryButton>
+          ) : (
+            <PrimaryButton disabled={busy || !listing} onClick={() => listing && onChoose(listing.currentPath)}>
+              {t("next.folders.use")}
+            </PrimaryButton>
+          )}
         </>
       }
     >
@@ -243,7 +283,7 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !busy && typedPath.trim() !== "") {
                   event.preventDefault();
-                  void browse(typedPath.trim());
+                  void browse(typedPath.trim(), fileStops(typedPath.trim()));
                 }
               }}
               className="min-w-0 flex-1"
@@ -251,21 +291,21 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
             <SecondaryButton
               icon="go"
               disabled={busy || typedPath.trim() === ""}
-              onClick={() => void browse(typedPath.trim())}
+              onClick={() => void browse(typedPath.trim(), fileStops(typedPath.trim()))}
             >
               {t("next.folders.go")}
             </SecondaryButton>
           </div>
           <TextField
-            label={t("next.folders.filter")}
+            label={t(files ? "next.files.filter" : "next.folders.filter")}
             placeholder={t("next.folders.filterPlaceholder")}
             value={filter}
             onChange={setFilter}
             onKeyDown={(event) => {
-              // With the list narrowed to one folder, Enter opens it.
+              // With the list narrowed to one entry, Enter opens the folder or picks the file.
               if (event.key === "Enter" && shown.length === 1 && !busy) {
                 event.preventDefault();
-                void browse(shown[0]!.path);
+                activate(shown[0]!);
               }
             }}
             className="w-[200px] max-w-full flex-[1_1_160px]"
@@ -275,8 +315,8 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
         <GridHeader
           columns={COLUMNS}
           cells={[
-            t("next.folders.folder"),
-            listing && !loading && error === null ? describeEntryCount(t, shown.length, entries.length) : "",
+            files ? t("next.files.name") : t("next.folders.folder"),
+            !files && listing && !loading && error === null ? describeEntryCount(t, shown.length, entries.length) : "",
           ]}
           cellClassNames={[undefined, "text-right"]}
         />
@@ -308,7 +348,9 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
             <div className="px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">{error}</div>
           ) : shown.length === 0 ? (
             <div className="px-4 py-4 text-[12.5px] text-wv-muted sm:px-6">
-              {entries.length === 0 ? t("next.folders.empty") : t("next.folders.noMatch")}
+              {entries.length === 0
+                ? t(files ? "next.files.empty" : "next.folders.empty")
+                : t(files ? "next.files.noMatch" : "next.folders.noMatch")}
             </div>
           ) : (
             <div style={{ height: virtualizer.getTotalSize() }} className="relative w-full">
@@ -323,11 +365,19 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
                     <GridRow
                       columns={COLUMNS}
                       title={entry.path}
-                      onClick={busy ? undefined : () => void browse(entry.path)}
+                      selected={entry.path === selected}
+                      onClick={busy ? undefined : () => activate(entry)}
                       className="h-full border-b border-wv-hairline px-4 sm:px-[22px]"
                     >
                       <Cell className="text-wv-fg">{entry.name}</Cell>
-                      <span />
+                      {/* Among files, a folder is the row that opens. */}
+                      {files && !entry.file ? (
+                        <span aria-hidden className="text-right font-wv-mono text-[11px] text-wv-faint">
+                          ›
+                        </span>
+                      ) : (
+                        <span />
+                      )}
                     </GridRow>
                   </div>
                 );
@@ -336,32 +386,34 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
           )}
         </div>
 
-        <div className="flex flex-none flex-wrap items-center gap-2 border-t border-wv-line-strong px-4 py-3 sm:px-6">
-          <TextField
-            label={t("next.folders.newName")}
-            placeholder={t("next.folders.newNamePlaceholder")}
-            value={newFolder}
-            mono={false}
-            onChange={(next) => {
-              setNewFolder(next);
-              setCreateError(null);
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !busy && newFolder.trim() !== "") {
-                event.preventDefault();
-                void createFolder();
-              }
-            }}
-            className="min-w-0 flex-[1_1_240px]"
-          />
-          <SecondaryButton
-            icon="createFolder"
-            disabled={busy || !listing || newFolder.trim() === ""}
-            onClick={() => void createFolder()}
-          >
-            {t("next.folders.create")}
-          </SecondaryButton>
-        </div>
+        {files ? null : (
+          <div className="flex flex-none flex-wrap items-center gap-2 border-t border-wv-line-strong px-4 py-3 sm:px-6">
+            <TextField
+              label={t("next.folders.newName")}
+              placeholder={t("next.folders.newNamePlaceholder")}
+              value={newFolder}
+              mono={false}
+              onChange={(next) => {
+                setNewFolder(next);
+                setCreateError(null);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !busy && newFolder.trim() !== "") {
+                  event.preventDefault();
+                  void createFolder();
+                }
+              }}
+              className="min-w-0 flex-[1_1_240px]"
+            />
+            <SecondaryButton
+              icon="createFolder"
+              disabled={busy || !listing || newFolder.trim() === ""}
+              onClick={() => void createFolder()}
+            >
+              {t("next.folders.create")}
+            </SecondaryButton>
+          </div>
+        )}
       </div>
     </Dialog>
   );
@@ -370,13 +422,16 @@ function DirectoryBrowserSession({ open, initialPath, title, onClose, onChoose }
 /**
  * A path text field with a Browse button beside it. Focusing the field opens
  * the picker too; closing it hands focus back to the field without reopening,
- * so a path can still be typed, pasted or cleared there.
+ * so a path can still be typed, pasted or cleared there. The path is a folder
+ * unless `pick` says it is a file.
  */
 export function PathField({
   value,
   onChange,
   label,
   placeholder,
+  pick,
+  browseFrom,
   compact = false,
   className,
 }: {
@@ -384,6 +439,9 @@ export function PathField({
   onChange: (next: string) => void;
   label: string;
   placeholder?: string;
+  pick?: "folder" | "file";
+  /** The folder the picker opens in while the field is empty. */
+  browseFrom?: string;
   /** Table-cell height, for a path edited inside a row. */
   compact?: boolean;
   className?: string;
@@ -407,7 +465,7 @@ export function PathField({
   }, []);
 
   const openPicker = () => {
-    setStartPath(value.trim() || null);
+    setStartPath(value.trim() || browseFrom?.trim() || null);
     setBrowsing(true);
   };
   const closePicker = () => {
@@ -448,6 +506,7 @@ export function PathField({
         open={browsing}
         initialPath={startPath}
         title={label}
+        pick={pick}
         onClose={closePicker}
         onChoose={(path) => {
           onChange(path);

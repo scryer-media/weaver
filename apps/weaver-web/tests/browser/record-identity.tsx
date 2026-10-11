@@ -1,7 +1,7 @@
 import { act, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router";
-import { Client, Provider, type OperationResult } from "urql";
+import { Client, CombinedError, Provider, type OperationResult } from "urql";
 import { fromValue, make, mergeMap, pipe } from "wonka";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
@@ -35,6 +35,11 @@ function snapshot(id: number) {
     jobEvents: [], jobTimeline: null, serverAttribution: [] };
 }
 const listing = (path: string) => ({ currentPath: path, parentPath: "/", entries: [] });
+// One folder that holds a folder and two files; anything with an extension is a file, which is no folder to list.
+const fileListing = (path: string) => ({ currentPath: path, parentPath: "/",
+  entries: [{ name: "keys", path: `${path}/keys` }],
+  files: ["archive-passwords.txt", "notes.txt"].map((name) => ({ name, path: `${path}/${name}` })) });
+const isFile = (path: unknown) => /\.[a-z]+$/.test(String(path));
 const pending: { name: string; variables: Record<string, unknown>; deliver: () => void }[] = [];
 const mutations: { name: string; variables: Record<string, unknown> }[] = [];
 const delivered: string[] = [];
@@ -47,6 +52,9 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
     const variables = operation.variables;
     if (operation.kind === "mutation") mutations.push({ name, variables });
     const id = Number(variables.id ?? variables.jobId ?? 1);
+    if (name === "BrowseFiles" && isFile(variables.path)) {
+      return fromValue({ operation, error: new CombinedError({ graphQLErrors: [{ message: "Path is not a directory" }] }) } as OperationResult);
+    }
     const data = name === "Server" ? { server: servers.find((server) => server.id === id) }
       : name === "UpdateServer" ? { updateServer: { ...servers[id - 1], ...variables.input as object } }
       : name === "AddServer" ? { addServer: { ...servers[0], ...variables.input as object, id: 4 } }
@@ -54,6 +62,7 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
       : name === "TestConnection" ? { testConnection: { success: false, message: "Result for provider 1", latencyMs: null,
           adoptableTlsNameMismatchCertificate: { derBase64: "old-certificate", sha256Fingerprint: "old-fingerprint", names: ["provider-1.example"] } } }
       : name === "BrowseDirectories" ? { browseDirectories: listing(String(variables.path)) }
+      : name === "BrowseFiles" ? { browseDirectories: fileListing(String(variables.path)) }
       : name === "CreateDirectory" ? { createDirectory: listing(`${variables.path}/${variables.name}`) }
       : name === "JobDetailUpdates" ? { jobDetailUpdates: snapshot(id) }
       : name === "Job" ? { jobDetailSnapshot: snapshot(id) }
@@ -101,9 +110,9 @@ function Fixture() {
     fixture.openFolder = setFolder;
     fixture.ready = true;
   }, [navigate]);
-  if (screen === "folders") {
+  if (screen === "folders" || screen === "files") {
     const choose = (path: string) => { fixture.chosen = path; setFolder(null); };
-    return <DirectoryBrowserDialog open={folder !== null} initialPath={folder} onClose={() => setFolder(null)} onChoose={choose} />;
+    return <DirectoryBrowserDialog open={folder !== null} initialPath={folder} pick={screen === "files" ? "file" : undefined} onClose={() => setFolder(null)} onChoose={choose} />;
   }
   if (screen === "jobs") return <Routes><Route path="/jobs/:id" element={<JobDetailPage />} /></Routes>;
   return <SettingsShellProvider search="" actionsRef={{ current: null }} setFlags={() => {}} controlsHost={document.getElementById("controls")}>{screen === "feeds" ? <RssPanel /> : <ProvidersPanel />}</SettingsShellProvider>;

@@ -310,6 +310,41 @@ test(`a completed deletion cannot navigate away from another job`, RUNNER_BOUND,
   } finally { await page.close(); }
 });
 
+test(`a file picker lists a folder's files, opens on the saved file and takes the one picked`, RUNNER_BOUND, async () => {
+  const page = await open("files");
+  try {
+    const use = page.getByRole("button", { name: "Use this file", exact: true });
+    const row = (name) => page.getByRole("dialog").getByRole("button", { name, exact: true });
+    // From a folder nothing is picked yet, and there is no folder to create.
+    await page.evaluate(() => window.recordFixture.openFolder("/data"));
+    await row("notes.txt").waitFor();
+    assert.equal(await use.isDisabled(), true);
+    assert.equal(await page.getByRole("button", { name: /^Create folder$/i }).count(), 0);
+    assert.equal(await page.getByRole("button", { name: "Use this folder", exact: true }).count(), 0);
+    await cancel(page);
+    // A saved file opens its folder with that file picked.
+    await page.evaluate(() => window.recordFixture.openFolder("/data/archive-passwords.txt"));
+    await row("notes.txt").waitFor();
+    assert.equal(await page.getByLabel("Folder path").inputValue(), "/data");
+    assert.equal(await use.isDisabled(), false);
+    await use.click();
+    assert.equal(await page.evaluate(() => window.recordFixture.chosen), "/data/archive-passwords.txt");
+    // A folder's row opens it and drops the pick; a file's row picks it.
+    await page.evaluate(() => window.recordFixture.openFolder("/data/archive-passwords.txt"));
+    await row("keys").click();
+    await page.waitForFunction(() => [...document.querySelectorAll("input")].some((input) => input.value === "/data/keys"));
+    assert.equal(await use.isDisabled(), true);
+    await row("notes.txt").click();
+    await use.click();
+    assert.equal(await page.evaluate(() => window.recordFixture.chosen), "/data/keys/notes.txt");
+    if (process.env.RECORD_IDENTITY_SCREENSHOT_DIR) {
+      await page.evaluate(() => window.recordFixture.openFolder("/data/archive-passwords.txt"));
+      await row("notes.txt").waitFor();
+      await page.screenshot({ path: `${process.env.RECORD_IDENTITY_SCREENSHOT_DIR}/file-picker.png` });
+    }
+  } finally { await page.close(); }
+});
+
 test(`a rule can be added only once there is a feed for it`, RUNNER_BOUND, async () => {
   const page = await open("feeds");
   try {

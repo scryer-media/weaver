@@ -92,12 +92,15 @@ export type FieldControl =
       /** Keep password managers out. Defaults to on for a password that is not the Weaver login. */
       secret?: boolean;
     }
-  /** A folder on the daemon's filesystem: typed, or picked with Browse. */
+  /** A folder on the daemon's filesystem, or a file: typed, or picked with Browse. */
   | {
       kind: "path";
       value: string;
       onChange: (next: string) => void;
       placeholder?: string;
+      pick?: "folder" | "file";
+      /** The folder Browse opens in while the field is empty. */
+      browseFrom?: string;
     }
   | {
       kind: "number";
@@ -211,6 +214,8 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           onChange={control.onChange}
           label={spec.label}
           placeholder={control.placeholder}
+          pick={control.pick}
+          browseFrom={control.browseFrom}
         />
       );
     case "number":

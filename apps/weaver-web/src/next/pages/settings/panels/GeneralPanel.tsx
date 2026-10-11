@@ -327,7 +327,9 @@ export function GeneralPanel() {
               label: t("next.archivePasswords.file"),
               keywords: `${values.archivePasswordFile} archive password file`,
               control: {
-                kind: "text",
+                kind: "path",
+                pick: "file",
+                browseFrom: values.dataDir,
                 value: values.archivePasswordFile,
                 placeholder: `${values.dataDir}/archive-passwords.txt`,
                 onChange: (next) => draft.set({ archivePasswordFile: next }),
