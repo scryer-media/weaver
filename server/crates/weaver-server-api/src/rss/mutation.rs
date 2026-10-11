@@ -67,7 +67,7 @@ impl RssMutation {
         })
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        .map_err(crate::observability::state_error)?;
 
         crate::proxies::refresh(ctx).await?;
         Ok(feed)
@@ -118,7 +118,7 @@ impl RssMutation {
         })
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
-        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        .map_err(crate::observability::state_error)?;
 
         crate::proxies::refresh(ctx).await?;
         Ok(feed)

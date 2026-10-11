@@ -79,7 +79,7 @@ pub use operations::{
     MetricsHistoryQueryData, MetricsHistoryQueryResult, MetricsHistoryTier, RawMetricsHistoryPoint,
     RollupMetricsHistoryPoint, StableStateExport,
 };
-pub use persistence::{Database, StateError};
+pub use persistence::{Database, Refusal, StateError};
 pub use pipeline::Pipeline;
 pub use pipeline::download::{DownloadQueue, DownloadWork};
 pub use rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};

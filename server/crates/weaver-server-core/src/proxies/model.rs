@@ -52,10 +52,10 @@ impl ProxyProfile {
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(u64::from(self.timeout_seconds))
     }
-    pub fn validate(&self) -> Result<(), TunnelError> {
-        let invalid = |s: &str| TunnelError::Configuration(s.into());
+    pub fn validate(&self) -> Result<(), super::NetworkRefusal> {
+        use super::NetworkRefusal as Refusal;
         if self.name.trim().is_empty() || self.name.len() > 128 {
-            return Err(invalid("proxy name must contain 1–128 characters"));
+            return Err(Refusal::ProxyNameLength);
         }
         if self.host.is_empty()
             || self.host.len() > 253
@@ -64,13 +64,13 @@ impl ProxyProfile {
             })
             || self.port == 0
         {
-            return Err(invalid("proxy endpoint must have a valid host and port"));
+            return Err(Refusal::ProxyEndpointInvalid);
         }
         if !(1..=300).contains(&self.timeout_seconds) {
-            return Err(invalid("proxy timeout must be between 1 and 300 seconds"));
+            return Err(Refusal::ProxyTimeoutRange);
         }
         if self.dns_servers.len() > 4 || self.tunnel_addresses.len() > 8 {
-            return Err(invalid("too many DNS servers or tunnel addresses"));
+            return Err(Refusal::ProxyAddressCount);
         }
         for secret in [
             &self.secrets.username,
@@ -83,19 +83,19 @@ impl ProxyProfile {
         .flatten()
         {
             if secret.len() > 16384 {
-                return Err(invalid("proxy credential is too large"));
+                return Err(Refusal::ProxyCredentialTooLarge);
             }
         }
         match self.kind {
             ProxyKind::WireGuard => self.wireguard_spec()?.validate()?,
             ProxyKind::Ssh => {
                 if self.secrets.username.as_ref().is_none_or(|v| v.is_empty()) {
-                    return Err(invalid("SSH requires a username"));
+                    return Err(Refusal::ProxySshUsernameRequired);
                 }
                 if let Some(key) = &self.secrets.private_key {
                     weaver_tunnel::validate_private_key(key, self.secrets.passphrase.as_deref())?;
                 } else {
-                    return Err(invalid("SSH requires an Ed25519 private key"));
+                    return Err(Refusal::ProxySshKeyRequired);
                 }
             }
             ProxyKind::Socks5 => {
@@ -103,7 +103,7 @@ impl ProxyProfile {
                 // password alone would be dropped and the proxy dialled
                 // unauthenticated.
                 if self.secrets.password.is_some() && self.secrets.username.is_none() {
-                    return Err(invalid("SOCKS5 proxy password requires a username"));
+                    return Err(Refusal::ProxySocks5PasswordNeedsUsername);
                 }
                 if self
                     .secrets
@@ -116,12 +116,15 @@ impl ProxyProfile {
                         .as_ref()
                         .is_some_and(|v| v.len() > 255)
                 {
-                    return Err(invalid("SOCKS5 credentials must fit in 255 bytes"));
+                    return Err(Refusal::ProxySocks5CredentialLength);
                 }
             }
             ProxyKind::Http3Connect => {
                 // Construction validates authority, credentials and timeout;
                 // sessions are lazy, so saving a profile does not use networking.
+                if self.secrets.username.is_none() && self.secrets.password.is_some() {
+                    return Err(Refusal::ProxyHttp3PasswordNeedsUsername);
+                }
                 Http3TunnelProvider::new(self.http3_spec()?)?;
             }
             ProxyKind::HttpConnect => {
@@ -131,7 +134,7 @@ impl ProxyProfile {
                     .as_ref()
                     .is_some_and(|v| v.contains(':'))
                 {
-                    return Err(invalid("HTTP proxy username cannot contain a colon"));
+                    return Err(Refusal::ProxyHttpUsernameColon);
                 }
             }
         }
@@ -154,7 +157,7 @@ impl ProxyProfile {
     pub fn http3_spec(&self) -> Result<Http3TunnelSpec, TunnelError> {
         if self.secrets.username.is_none() && self.secrets.password.is_some() {
             return Err(TunnelError::Configuration(
-                "HTTP/3 proxy password requires a username".into(),
+                super::NetworkRefusal::ProxyHttp3PasswordNeedsUsername.to_string(),
             ));
         }
         Ok(Http3TunnelSpec {
@@ -286,16 +289,16 @@ impl RoutingPolicy {
             )
         }
     }
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), super::NetworkRefusal> {
         if !self.legs.is_empty() {
             return self.route().validate_shape();
         }
         if self.proxy_ids.len() > 8 {
-            return Err("a route supports at most eight proxies".into());
+            return Err(super::NetworkRefusal::RoutingProxyCount);
         }
         let unique: HashSet<_> = self.proxy_ids.iter().collect();
         if unique.len() != self.proxy_ids.len() {
-            return Err("a proxy cannot appear twice in a ladder".into());
+            return Err(super::NetworkRefusal::RoutingProxyRepeated);
         }
         Ok(())
     }

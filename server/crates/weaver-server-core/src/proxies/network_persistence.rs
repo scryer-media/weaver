@@ -1,13 +1,16 @@
 use std::collections::HashMap;
 
 use super::{
-    EgressBinding, EgressInterface, LegPath, ProxyPool, ProxyProfile, Route, RoutingPolicy, Rung,
+    EgressBinding, EgressInterface, LegPath, NetworkRefusal, ProxyPool, ProxyProfile, Route,
+    RoutingPolicy, Rung,
 };
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 use crate::servers::record::{parse_quota_weekday, quota_weekday_str};
 use crate::servers::{ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod};
 use crate::{Database, StateError};
 
+// A storage fault: a row that cannot be read back, or an id that cannot be
+// allocated. Input the operator can correct is a `NetworkRefusal` instead.
 fn error(value: impl std::fmt::Display) -> StateError {
     StateError::Database(value.to_string())
 }
@@ -138,7 +141,7 @@ pub(super) async fn validate_policy(
     consumer: super::Consumer,
     policy: &RoutingPolicy,
 ) -> Result<RoutingPolicy, StateError> {
-    policy.validate().map_err(error)?;
+    policy.validate()?;
     if policy.legs.is_empty() {
         if let Some(row) = tx
             .fetch_optional(
@@ -150,13 +153,11 @@ pub(super) async fn validate_policy(
                 .legacy_policy()
                 .is_none()
         {
-            return Err(error(
-                "this route has advanced legs; edit it in Networking instead of replacing its legacy projection",
-            ));
+            return Err(NetworkRefusal::RouteHasAdvancedLegs.into());
         }
         let profiles = profiles(tx).await?;
         if policy.proxy_ids.iter().any(|id| !profiles.contains_key(id)) {
-            return Err(error("routing policy references a missing proxy"));
+            return Err(NetworkRefusal::RoutingProxyMissing.into());
         }
         return Ok(policy.clone());
     }
@@ -176,14 +177,12 @@ pub(super) async fn validate_policy(
         .collect::<Result<HashMap<_, _>, _>>()?;
     let profiles = profiles(tx).await?;
     let route = policy.route();
-    route
-        .validate_references(
-            &egresses,
-            &profiles,
-            &pools,
-            matches!(consumer, super::Consumer::Rss(_)),
-        )
-        .map_err(error)?;
+    route.validate_references(
+        &egresses,
+        &profiles,
+        &pools,
+        matches!(consumer, super::Consumer::Rss(_)),
+    )?;
     Ok(RoutingPolicy::from_route(route, &pools))
 }
 
@@ -233,20 +232,18 @@ pub(super) async fn validate_stored_network(tx: &mut SqlTx<'_>) -> Result<(), St
                 });
         }
         if route.legacy_policy().is_none() {
-            route
-                .validate_references(
-                    &restored_egresses,
-                    &profiles,
-                    &pools,
-                    row.text("consumer")?.starts_with("rss:"),
-                )
-                .map_err(error)?;
+            route.validate_references(
+                &restored_egresses,
+                &profiles,
+                &pools,
+                row.text("consumer")?.starts_with("rss:"),
+            )?;
         }
         routes.push(route);
     }
-    super::validate_wireguard_paths(&routes, &profiles, &pools).map_err(error)?;
-    super::validate_instance_budget(&routes, &profiles, &pools, super::max_wireguard_instances())
-        .map_err(error)
+    super::validate_wireguard_paths(&routes, &profiles, &pools)?;
+    super::validate_instance_budget(&routes, &profiles, &pools, super::max_wireguard_instances())?;
+    Ok(())
 }
 
 impl Database {
@@ -286,7 +283,7 @@ impl Database {
     ) -> Result<EgressInterface, StateError> {
         let egress = egress.clone();
         let speed = i64::try_from(egress.max_download_speed)
-            .map_err(|_| error("egress speed limit is too large"))?;
+            .map_err(|_| NetworkRefusal::EgressSpeedLimitTooLarge)?;
         let store = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&store, "save_egress", |tx| {
@@ -296,9 +293,9 @@ impl Database {
                     if create {
                         egress.id = next_egress_id(tx).await?;
                     } else if tx.fetch_optional("SELECT id FROM egress_interfaces WHERE id = {}", &[SqlArg::I64(i64::from(egress.id))]).await?.is_none() {
-                        return Err(error("egress no longer exists"));
+                        return Err(NetworkRefusal::EgressGone.into());
                     }
-                    egress.validate().map_err(error)?;
+                    egress.validate()?;
                     let (kind, value) = match &egress.binding {
                         EgressBinding::System => ("system", None),
                         EgressBinding::Interface { name } => ("interface", Some(name.clone())),
@@ -322,7 +319,7 @@ impl Database {
 
     pub fn delete_egress_interface(&self, id: u32) -> Result<(), StateError> {
         if id == 0 {
-            return Err(error("the System egress cannot be deleted"));
+            return Err(NetworkRefusal::EgressSystemUndeletable.into());
         }
         let store = self.datastore();
         self.run_sql_blocking(async move {
@@ -334,7 +331,7 @@ impl Database {
                         .iter()
                         .any(|route| route.legs.iter().any(|leg| leg.egress_id == id))
                     {
-                        return Err(error("egress is referenced by a server or RSS feed"));
+                        return Err(NetworkRefusal::EgressInUse.into());
                     }
                     tx.execute(
                         "DELETE FROM egress_interfaces WHERE id = {}",
@@ -383,10 +380,10 @@ impl Database {
                         let row = tx.fetch_optional("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM proxy_pools", &[]).await?.ok_or_else(|| error("cannot allocate pool id"))?;
                         pool.id = u32::try_from(row.i64("next_id")?).map_err(error)?;
                     } else if tx.fetch_optional("SELECT id FROM proxy_pools WHERE id = {}", &[SqlArg::I64(i64::from(pool.id))]).await?.is_none() {
-                        return Err(error("proxy pool no longer exists"));
+                        return Err(NetworkRefusal::PoolGone.into());
                     }
                     let profiles = profiles(tx).await?;
-                    pool.validate(&profiles).map_err(error)?;
+                    pool.validate(&profiles)?;
                     let mut pools: HashMap<_, _> = tx.fetch_all("SELECT * FROM proxy_pools", &[]).await?.into_iter().map(pool_row).collect::<Result<Vec<_>, _>>()?.into_iter().map(|pool| (pool.id, pool)).collect();
                     pools.insert(pool.id, pool.clone());
                     // Revalidate all consumers that use this pool before changing its members.
@@ -401,12 +398,12 @@ impl Database {
                             for rung in rungs {
                                 let ids = match rung {
                                     Rung::Proxy { id } => vec![id], Rung::Chain { ids } => ids,
-                                    Rung::Pool { id } => pools.get(&id).ok_or_else(|| error("route references a missing pool"))?.member_ids.clone(),
+                                    Rung::Pool { id } => pools.get(&id).ok_or(NetworkRefusal::RoutePoolMissing)?.member_ids.clone(),
                                 };
                                 for id in ids {
-                                    if !seen.insert(id) { return Err(error("pool edit would repeat a proxy in an existing ladder")); }
+                                    if !seen.insert(id) { return Err(NetworkRefusal::PoolEditRepeatsProxy.into()); }
                                     if require_dns && profiles.get(&id).is_none_or(|profile| profile.dns_servers.is_empty()) {
-                                        return Err(error("every RSS proxy and pool member requires DNS servers"));
+                                        return Err(NetworkRefusal::RouteRssProxyNeedsDns.into());
                                     }
                                 }
                             }
@@ -432,7 +429,7 @@ impl Database {
                     for leg in route.legs {
                         if let LegPath::Ladder { rungs, .. } = leg.path
                             && rungs.iter().any(|rung| matches!(rung, Rung::Pool { id: referenced } if *referenced == id)) {
-                            return Err(error("pool is referenced by a server or RSS feed"));
+                            return Err(NetworkRefusal::PoolInUse.into());
                         }
                     }
                 }

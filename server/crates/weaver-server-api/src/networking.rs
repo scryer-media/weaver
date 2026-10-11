@@ -1,11 +1,15 @@
-use crate::{auth::AdminGuard, observability::spawn_blocking_db, proxies::ProxyKind};
+use crate::{
+    auth::AdminGuard,
+    observability::{refusal_error, spawn_blocking_db},
+    proxies::ProxyKind,
+};
 use async_graphql::{
     Context, Enum, InputObject, Object, OneofObject, Result, SimpleObject, Subscription,
 };
 use std::{sync::Arc, time::Duration};
 use weaver_server_core::{
     Database,
-    proxies::{self as core, ProxyRuntime},
+    proxies::{self as core, NetworkRefusal, ProxyRuntime},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Enum)]
@@ -67,7 +71,9 @@ impl TryFrom<RouteLegInput> for core::RouteLeg {
     fn try_from(value: RouteLegInput) -> Result<Self> {
         let path = match value.path {
             LegPathInput::Direct(true) => core::LegPath::Direct,
-            LegPathInput::Direct(false) => return Err("a direct path must be true".into()),
+            LegPathInput::Direct(false) => {
+                return Err(refusal_error(NetworkRefusal::RouteDirectPathFalse));
+            }
             LegPathInput::Ladder(ladder) => core::LegPath::Ladder {
                 rungs: ladder.rungs.into_iter().map(Into::into).collect(),
                 direct_fallback: ladder.direct_fallback,
@@ -106,7 +112,7 @@ pub(crate) fn selected_policy(
     route: Option<RouteInput>,
 ) -> Result<Option<core::RoutingPolicy>> {
     match (routing, route) {
-        (Some(_), Some(_)) => Err("specify route or routing, not both".into()),
+        (Some(_), Some(_)) => Err(refusal_error(NetworkRefusal::RouteAndRoutingBoth)),
         (Some(legacy), None) => Ok(Some(legacy.into())),
         (None, Some(input)) => {
             let route = input.route()?;
@@ -129,7 +135,7 @@ impl RouteInput {
                 .collect::<Result<_>>()?,
             failover: self.failover.into(),
         };
-        route.validate_shape().map_err(async_graphql::Error::new)?;
+        route.validate_shape().map_err(refusal_error)?;
         Ok(route)
     }
 }
@@ -241,29 +247,31 @@ impl EgressInterfaceInput {
         id: u32,
         saved_quota: weaver_server_core::servers::ServerDownloadQuotaConfig,
     ) -> Result<core::EgressInterface> {
+        // The egress checks its own quota below, so a refusal names an egress.
         let download_quota = match self.download_quota {
-            Some(quota) => quota.try_into().map_err(async_graphql::Error::new)?,
+            Some(quota) => quota.config(),
             None => saved_quota,
         };
         let binding = match self.binding_kind {
             EgressBindingKind::System => core::EgressBinding::System,
             EgressBindingKind::Interface => {
                 if cfg!(windows) {
-                    return Err(
-                        "Interface binding is not supported on Windows; use a source address"
-                            .into(),
-                    );
+                    return Err(refusal_error(
+                        NetworkRefusal::EgressInterfaceBindingUnsupported,
+                    ));
                 }
                 core::EgressBinding::Interface {
-                    name: self.interface_name.ok_or("interface name is required")?,
+                    name: self.interface_name.ok_or_else(|| {
+                        refusal_error(NetworkRefusal::EgressInterfaceNameRequired)
+                    })?,
                 }
             }
             EgressBindingKind::SourceAddress => core::EgressBinding::SourceAddress {
                 address: self
                     .source_address
-                    .ok_or("source address is required")?
+                    .ok_or_else(|| refusal_error(NetworkRefusal::EgressSourceAddressRequired))?
                     .parse()
-                    .map_err(|_| async_graphql::Error::new("invalid source address"))?,
+                    .map_err(|_| refusal_error(NetworkRefusal::EgressSourceAddressInvalid))?,
             },
         };
         let egress = core::EgressInterface {
@@ -274,7 +282,7 @@ impl EgressInterfaceInput {
             max_download_speed: self.max_download_speed,
             download_quota,
         };
-        egress.validate().map_err(async_graphql::Error::new)?;
+        egress.validate().map_err(refusal_error)?;
         Ok(egress)
     }
 }
@@ -864,9 +872,7 @@ impl NetworkingMutation {
                 .list_egress_interfaces()?
                 .into_iter()
                 .find(|egress| egress.id == id)
-                .ok_or_else(|| {
-                    weaver_server_core::StateError::Conflict("egress not found".into())
-                })?;
+                .ok_or(NetworkRefusal::EgressNotFound)?;
             policy.reset_egress_usage(id)?;
             Ok::<_, weaver_server_core::StateError>(saved)
         })
@@ -1032,9 +1038,7 @@ impl NetworkingMutation {
                 core::Consumer::Rss(id) => db.get_rss_feed(id)?.is_some(),
             };
             if !exists {
-                return Err(weaver_server_core::StateError::Database(
-                    "routing consumer no longer exists".into(),
-                ));
+                return Err(NetworkRefusal::RouteConsumerGone.into());
             }
             db.save_proxy_routing_policy(consumer, &policy)
         })

@@ -124,6 +124,153 @@ async fn harness() -> TestHarness {
     );
     h
 }
+
+// The one error a refused mutation answers with, as (message, code, params).
+// A refusal is worded for the operator: nothing in it reads as a storage fault.
+fn refusal(response: &async_graphql::Response) -> (String, String, serde_json::Value) {
+    assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
+    let error = serde_json::to_value(&response.errors[0]).unwrap();
+    let message = error["message"].as_str().unwrap().to_owned();
+    assert!(
+        !message.contains("db error") && !message.contains("database error"),
+        "{message}"
+    );
+    let code = error["extensions"]["code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no code on: {error}"))
+        .to_owned();
+    (message, code, error["extensions"]["params"].clone())
+}
+
+// A feed to route, and a proxy to route it through.
+async fn feed_and_proxy(h: &TestHarness) -> (u64, u64) {
+    let result = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}){id}}"#).await;
+    assert_no_errors(&result);
+    let proxy = response_data(&result)["saveProxyProfile"]["id"]
+        .as_u64()
+        .unwrap();
+    let result = h.execute(r#"mutation{addRssFeed(input:{name:"Routed",url:"https://feed.invalid/rss",enabled:false}){id}}"#).await;
+    assert_no_errors(&result);
+    let feed = response_data(&result)["addRssFeed"]["id"].as_u64().unwrap();
+    (feed, proxy)
+}
+
+#[tokio::test]
+async fn a_route_repeating_a_proxy_is_refused_by_code_in_plain_words() {
+    let h = harness().await;
+    let (feed, proxy) = feed_and_proxy(&h).await;
+    let response = h.execute(&format!("mutation{{saveNetworkRoute(kind:RSS,id:{feed},input:{{legs:[{{egressId:0,weight:100,path:{{ladder:{{rungs:[{{proxy:{proxy}}},{{proxy:{proxy}}}],directFallback:false}}}}}}]}}){{consumer}}}}")).await;
+    let (message, code, params) = refusal(&response);
+    assert_eq!(code, "ROUTE_PROXY_REPEATED");
+    assert_eq!(
+        message,
+        "a proxy cannot appear twice in a ladder, including pools and chains"
+    );
+    assert!(params.is_null(), "{params}");
+    // The same refusal reached by saving the feed with that route.
+    let response = h.execute(&format!(r#"mutation{{updateRssFeed(id:{feed},input:{{name:"Routed",url:"https://feed.invalid/rss",enabled:false,route:{{legs:[{{egressId:0,weight:100,path:{{ladder:{{rungs:[{{proxy:{proxy}}},{{proxy:{proxy}}}],directFallback:false}}}}}}]}}}}){{id}}}}"#)).await;
+    assert_eq!(refusal(&response).1, "ROUTE_PROXY_REPEATED");
+    assert!(h.db.list_proxy_routes().unwrap().is_empty());
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+#[tokio::test]
+async fn a_misshapen_route_is_refused_by_code_before_it_reaches_storage() {
+    let h = harness().await;
+    let (feed, _) = feed_and_proxy(&h).await;
+    for (legs, code, sentence) in [
+        (
+            "{egressId:0,weight:60,path:{direct:true}},{egressId:0,weight:30,path:{direct:true}}",
+            "ROUTE_LEG_WEIGHT_SUM",
+            "leg weights must sum to exactly 100",
+        ),
+        (
+            "{egressId:0,weight:100,path:{ladder:{rungs:[],directFallback:true}}}",
+            "ROUTE_LADDER_RUNG_COUNT",
+            "a ladder requires between one and eight rungs",
+        ),
+        (
+            "{egressId:0,weight:100,path:{ladder:{rungs:[{chain:[1]}],directFallback:false}}}",
+            "ROUTE_CHAIN_LENGTH",
+            "a chain requires two or three proxies",
+        ),
+        (
+            "{egressId:0,weight:100,path:{direct:false}}",
+            "ROUTE_DIRECT_PATH_FALSE",
+            "a direct path must be true",
+        ),
+    ] {
+        let response = h
+            .execute(&format!(
+                "mutation{{saveNetworkRoute(kind:RSS,id:{feed},input:{{legs:[{legs}]}}){{consumer}}}}"
+            ))
+            .await;
+        let (message, refused, _) = refusal(&response);
+        assert_eq!((refused.as_str(), message.as_str()), (code, sentence));
+    }
+    assert!(h.db.list_proxy_routes().unwrap().is_empty());
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+#[tokio::test]
+async fn egress_and_pool_refusals_carry_their_codes() {
+    let h = harness().await;
+    let (feed, proxy) = feed_and_proxy(&h).await;
+    for (mutation, code) in [
+        (
+            "deleteEgressInterface(id:0)".to_owned(),
+            "EGRESS_SYSTEM_UNDELETABLE",
+        ),
+        (
+            r#"updateEgressInterface(id:0,input:{name:"Renamed",bindingKind:SYSTEM}){id}"#
+                .to_owned(),
+            "EGRESS_SYSTEM_IMMUTABLE",
+        ),
+        (
+            r#"updateEgressInterface(id:999,input:{name:"Gone",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1"}){id}"#
+                .to_owned(),
+            "EGRESS_NOT_FOUND",
+        ),
+        (
+            r#"createEgressInterface(input:{name:"No address",bindingKind:SOURCE_ADDRESS}){id}"#
+                .to_owned(),
+            "EGRESS_SOURCE_ADDRESS_REQUIRED",
+        ),
+        (
+            r#"createEgressInterface(input:{name:"Quota",bindingKind:SOURCE_ADDRESS,sourceAddress:"127.0.0.1",downloadQuota:{enabled:true,limitBytes:0,period:ONE_TIME}}){id}"#
+                .to_owned(),
+            "EGRESS_QUOTA_LIMIT_REQUIRED",
+        ),
+        (
+            "resetEgressDownloadQuotaUsage(id:999){id}".to_owned(),
+            "EGRESS_NOT_FOUND",
+        ),
+        (
+            format!(r#"createProxyPool(input:{{name:"Alone",kind:SOCKS5,memberIds:[{proxy}]}}){{id}}"#),
+            "POOL_MEMBER_COUNT",
+        ),
+        (
+            format!(r#"createProxyPool(input:{{name:"Twice",kind:SOCKS5,memberIds:[{proxy},{proxy}]}}){{id}}"#),
+            "POOL_PROXY_REPEATED",
+        ),
+        (
+            format!(r#"updateProxyPool(id:999,input:{{name:"Gone",kind:SOCKS5,memberIds:[{proxy},{proxy}]}}){{id}}"#),
+            "POOL_NOT_FOUND",
+        ),
+    ] {
+        let response = h.execute(&format!("mutation{{{mutation}}}")).await;
+        assert_eq!(refusal(&response).1, code, "{mutation}");
+    }
+    // A proxy a feed routes through is in use.
+    assert_no_errors(&h.execute(&format!("mutation{{saveNetworkRoute(kind:RSS,id:{feed},input:{{legs:[{{egressId:0,weight:100,path:{{ladder:{{rungs:[{{proxy:{proxy}}}],directFallback:false}}}}}}]}}){{consumer}}}}")).await);
+    let response = h
+        .execute(&format!("mutation{{deleteProxyProfile(id:{proxy})}}"))
+        .await;
+    let (message, code, _) = refusal(&response);
+    assert_eq!(code, "PROXY_IN_USE");
+    assert_eq!(message, "proxy is referenced by a server or RSS feed");
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
 #[tokio::test]
 async fn advanced_route_round_trip_refuses_lossy_legacy_writes_and_preserves_unrelated_edits() {
     let h = harness().await;
@@ -305,14 +452,9 @@ async fn route_save_rejects_missing_consumers_without_persisting() {
     let h = harness().await;
     for kind in ["SERVER", "RSS"] {
         let response = h.execute(&format!("mutation {{ saveNetworkRoute(kind:{kind}, id:999, input:{{legs:[{{egressId:0,weight:100,path:{{direct:true}}}}]}}) {{ consumer }} }}")).await;
-        assert!(
-            response
-                .errors
-                .iter()
-                .any(|e| e.message.contains("consumer no longer exists")),
-            "{:?}",
-            response.errors
-        );
+        let (message, code, _) = refusal(&response);
+        assert_eq!(code, "ROUTE_CONSUMER_NOT_FOUND");
+        assert_eq!(message, "routing consumer no longer exists");
     }
     assert!(h.db.list_proxy_routes().unwrap().is_empty());
     h.handle.proxy_runtime().unwrap().stop_all().await;

@@ -65,6 +65,35 @@ impl Default for ServerDownloadQuotaConfig {
     }
 }
 
+// What is out of bounds in a download quota, whatever holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadQuotaFault {
+    LimitTooLarge,
+    LimitRequired,
+    ResetTimeRange,
+    MonthlyResetDayRange,
+}
+
+impl DownloadQuotaFault {
+    // The sentence for a quota held by `subject`.
+    pub fn message(self, subject: &str) -> String {
+        match self {
+            Self::LimitTooLarge => {
+                format!("{subject} download quota limit exceeds database range")
+            }
+            Self::LimitRequired => {
+                format!("enabled {subject} download quota limit must be greater than zero")
+            }
+            Self::ResetTimeRange => {
+                format!("{subject} download quota reset time must be between 0 and 1439")
+            }
+            Self::MonthlyResetDayRange => {
+                format!("{subject} download quota monthly reset day must be between 1 and 31")
+            }
+        }
+    }
+}
+
 impl ServerDownloadQuotaConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.validate_for("server")
@@ -73,27 +102,25 @@ impl ServerDownloadQuotaConfig {
     // The same bounds for a quota held by something other than a server;
     // `subject` names it in the error.
     pub fn validate_for(&self, subject: &str) -> Result<(), String> {
+        self.fault()
+            .map_or(Ok(()), |fault| Err(fault.message(subject)))
+    }
+
+    // The first bound this quota breaks.
+    pub fn fault(&self) -> Option<DownloadQuotaFault> {
         if self.limit_bytes > MAX_PERSISTED_SERVER_DOWNLOAD_BYTES {
-            return Err(format!(
-                "{subject} download quota limit exceeds database range"
-            ));
+            return Some(DownloadQuotaFault::LimitTooLarge);
         }
         if self.enabled && self.limit_bytes == 0 {
-            return Err(format!(
-                "enabled {subject} download quota limit must be greater than zero"
-            ));
+            return Some(DownloadQuotaFault::LimitRequired);
         }
         if self.reset_time_minutes_local >= 24 * 60 {
-            return Err(format!(
-                "{subject} download quota reset time must be between 0 and 1439"
-            ));
+            return Some(DownloadQuotaFault::ResetTimeRange);
         }
         if !(1..=31).contains(&self.monthly_reset_day) {
-            return Err(format!(
-                "{subject} download quota monthly reset day must be between 1 and 31"
-            ));
+            return Some(DownloadQuotaFault::MonthlyResetDayRange);
         }
-        Ok(())
+        None
     }
 }
 

@@ -521,15 +521,15 @@ impl ProxyRuntime {
         &self,
         consumer: Consumer,
         policy: &RoutingPolicy,
-    ) -> Result<(), String> {
+    ) -> Result<(), NetworkRefusal> {
         policy.validate()?;
         let profiles = self.profiles.read().expect("proxy profiles");
         for id in &policy.proxy_ids {
             let hop = profiles
                 .get(id)
-                .ok_or("routing policy references a missing proxy")?;
+                .ok_or(NetworkRefusal::RoutingProxyMissing)?;
             if matches!(consumer, Consumer::Rss(_)) && hop.profile.dns_servers.is_empty() {
-                return Err("RSS proxy routes require configured DNS servers".into());
+                return Err(NetworkRefusal::RssRouteProxyNeedsDns);
             }
         }
         Ok(())

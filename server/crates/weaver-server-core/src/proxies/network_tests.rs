@@ -140,12 +140,18 @@ fn malformed_weights_and_ladders_are_not_normalized() {
         rungs: vec![],
         direct_fallback: true,
     };
-    assert!(route.validate_shape().unwrap_err().contains("rungs"));
+    assert_eq!(
+        route.validate_shape().unwrap_err(),
+        NetworkRefusal::RouteLadderRungCount
+    );
     route.legs[0].path = LegPath::Ladder {
         rungs: vec![Rung::Chain { ids: vec![1] }],
         direct_fallback: false,
     };
-    assert!(route.validate_shape().unwrap_err().contains("chain"));
+    assert_eq!(
+        route.validate_shape().unwrap_err(),
+        NetworkRefusal::RouteChainLength
+    );
 }
 
 #[test]
@@ -207,22 +213,22 @@ fn reference_validation_catches_overlap_udp_chains_and_rss_dns() {
         rungs: vec![Rung::Pool { id: 1 }, Rung::Proxy { id: 2 }],
         direct_fallback: false,
     };
-    assert!(
+    assert_eq!(
         route
             .validate_references(&egresses, &profiles, &pools, false)
-            .unwrap_err()
-            .contains("twice")
+            .unwrap_err(),
+        NetworkRefusal::RouteProxyRepeated
     );
     route.legs[0].path = LegPath::Ladder {
         rungs: vec![Rung::Chain { ids: vec![1, 2] }],
         direct_fallback: false,
     };
     profiles.get_mut(&2).unwrap().kind = ProxyKind::WireGuard;
-    assert!(
+    assert_eq!(
         route
             .validate_references(&egresses, &profiles, &pools, false)
-            .unwrap_err()
-            .contains("first")
+            .unwrap_err(),
+        NetworkRefusal::RouteChainTransport
     );
     profiles.get_mut(&2).unwrap().kind = ProxyKind::Socks5;
     assert!(
@@ -231,18 +237,18 @@ fn reference_validation_catches_overlap_udp_chains_and_rss_dns() {
             .is_ok()
     );
     profiles.get_mut(&2).unwrap().dns_servers.clear();
-    assert!(
+    assert_eq!(
         route
             .validate_references(&egresses, &profiles, &pools, true)
-            .unwrap_err()
-            .contains("DNS")
+            .unwrap_err(),
+        NetworkRefusal::RouteRssProxyNeedsDns
     );
     route.legs[0].egress_id = 7;
-    assert!(
+    assert_eq!(
         route
             .validate_references(&egresses, &profiles, &pools, false)
-            .unwrap_err()
-            .contains("egress")
+            .unwrap_err(),
+        NetworkRefusal::RouteEgressMissing
     );
 }
 
@@ -285,13 +291,16 @@ fn a_wireguard_hop_may_sit_only_on_the_egress_or_another_wireguard_hop() {
         &[2, 1, 5],
         &[5, 1],
     ] {
-        let error = check(refused).unwrap_err();
-        assert!(
-            error.contains("WireGuard and HTTP/3 must be the first proxy in a chain"),
-            "{refused:?}: {error}"
+        assert_eq!(
+            check(refused).unwrap_err(),
+            NetworkRefusal::RouteChainTransport,
+            "{refused:?}"
         );
     }
-    assert!(check(&[1, 2, 1]).unwrap_err().contains("twice"));
+    assert_eq!(
+        check(&[1, 2, 1]).unwrap_err(),
+        NetworkRefusal::RouteProxyRepeated
+    );
 }
 
 #[test]
@@ -318,7 +327,19 @@ fn a_stacked_wireguard_hop_is_its_own_instance() {
     let pools = HashMap::new();
     assert!(validate_instance_budget(&routes, &profiles, &pools, 3).is_ok());
     let error = validate_instance_budget(&routes, &profiles, &pools, 2).unwrap_err();
-    assert!(error.contains("require 3 WireGuard instances"), "{error}");
+    assert_eq!(
+        error,
+        NetworkRefusal::WireGuardInstanceLimit {
+            required: 3,
+            limit: 2
+        }
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("require 3 WireGuard instances × 516 MiB = 1548 MiB"),
+        "{error}"
+    );
 }
 
 fn ladder_on(egress_id: u32, rung: Rung) -> Route {
@@ -390,7 +411,9 @@ fn a_wireguard_proxy_reaches_one_egress_by_only_one_path() {
             "(proxy 1 → proxy 2 and proxy 2)",
         ),
     ] {
-        let error = check(&routes).unwrap_err();
+        let refusal = check(&routes).unwrap_err();
+        assert_eq!(refusal.code(), "WIREGUARD_PROXY_PATH_CONFLICT");
+        let error = refusal.to_string();
         assert!(
             error.starts_with("WireGuard proxy 2 is used on egress 0 by two different paths"),
             "{error}"

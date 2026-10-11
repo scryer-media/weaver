@@ -1,11 +1,14 @@
-use crate::{auth::AdminGuard, observability::spawn_blocking_db};
+use crate::{
+    auth::AdminGuard,
+    observability::{refusal_error, spawn_blocking_db},
+};
 use async_graphql::{
     ComplexObject, Context, Enum, InputObject, MaybeUndefined, Object, Result, SimpleObject,
 };
 use std::{sync::Arc, time::Duration};
 use weaver_server_core::{
     Database, SchedulerHandle,
-    proxies::{self, Consumer, ProxyProfile, ProxyRuntime, RoutingPolicy},
+    proxies::{self, Consumer, NetworkRefusal, ProxyProfile, ProxyRuntime, RoutingPolicy},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
@@ -178,12 +181,12 @@ fn secret_update(target: &mut Option<String>, value: MaybeUndefined<String>) {
 impl ProxyProfileInput {
     fn profile(self, id: u32, existing: Option<&ProxyProfile>) -> Result<ProxyProfile> {
         if existing.is_some_and(|p| p.kind != self.kind.into()) {
-            return Err("create a new profile to change proxy type".into());
+            return Err(refusal_error(NetworkRefusal::ProxyKindImmutable));
         }
         if matches!(self.kind, ProxyKind::Ssh)
             && matches!(&self.password, MaybeUndefined::Value(password) if !password.is_empty())
         {
-            return Err("SSH requires an Ed25519 private key and takes no password".into());
+            return Err(refusal_error(NetworkRefusal::ProxySshPasswordUnsupported));
         }
         let mut secrets = existing.map(|p| p.secrets.clone()).unwrap_or_default();
         secret_update(&mut secrets.username, self.username);
@@ -203,7 +206,7 @@ impl ProxyProfileInput {
                 .iter()
                 .map(|s| s.trim().parse())
                 .collect::<std::result::Result<_, _>>()
-                .map_err(|_| async_graphql::Error::new("DNS servers must be IP addresses"))?,
+                .map_err(|_| refusal_error(NetworkRefusal::ProxyDnsServerInvalid))?,
             tunnel_addresses: self.tunnel_addresses,
             peer_public_key: self.peer_public_key,
             mtu: self.mtu,
@@ -215,9 +218,7 @@ impl ProxyProfileInput {
             })?,
             secrets,
         };
-        profile
-            .validate()
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        profile.validate().map_err(refusal_error)?;
         Ok(profile)
     }
 }
@@ -240,6 +241,12 @@ pub(crate) fn draft_route(
         return Err("proxy runtime unavailable".into());
     };
     let policy = input.unwrap_or_else(|| runtime.policy(consumer));
+    // A route the operator may not save is refused by its code; a draft that
+    // cannot be built for any other reason is reported as it stands.
+    runtime
+        .network
+        .validate_policy(consumer, &policy)
+        .map_err(refusal_error)?;
     runtime
         .network
         .draft_route(consumer, policy, Duration::from_secs(30))
@@ -317,11 +324,11 @@ impl ProxiesMutation {
                 profiles
                     .iter()
                     .find(|p| p.id == id)
-                    .ok_or_else(|| async_graphql::Error::new("proxy not found"))
+                    .ok_or_else(|| refusal_error(NetworkRefusal::ProxyNotFound))
             })
             .transpose()?;
         if id.is_none() && profiles.len() >= 128 {
-            return Err("at most 128 proxy profiles are supported".into());
+            return Err(refusal_error(NetworkRefusal::ProxyLimitReached));
         }
         let id = id.unwrap_or(
             profiles
@@ -343,7 +350,7 @@ impl ProxiesMutation {
                 .iter()
                 .any(|(key, policy)| key.starts_with("rss:") && policy.proxy_ids.contains(&id))
             {
-                return Err("RSS proxy routes require configured DNS servers".into());
+                return Err(refusal_error(NetworkRefusal::RssRouteProxyNeedsDns));
             }
         }
         let saved = profile.clone();
@@ -371,9 +378,9 @@ impl ProxiesMutation {
             .await?
             .into_iter()
             .find(|p| p.id == id)
-            .ok_or("proxy not found")?;
+            .ok_or_else(|| refusal_error(NetworkRefusal::ProxyNotFound))?;
         if profile.kind != proxies::ProxyKind::Ssh {
-            return Err("only SSH profiles have host-key trust".into());
+            return Err(refusal_error(NetworkRefusal::ProxyHostKeyNotSsh));
         }
         profile.host_key_fingerprint = None;
         profile.revision = profile

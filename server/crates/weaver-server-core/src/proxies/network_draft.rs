@@ -154,7 +154,7 @@ impl NetworkRuntime {
         &self,
         consumer: Consumer,
         policy: &RoutingPolicy,
-    ) -> Result<(), String> {
+    ) -> Result<(), NetworkRefusal> {
         policy.validate()?;
         let config = self.configuration.read().expect("network configuration");
         if policy.legs.is_empty() && policy.proxy_ids.is_empty() && !policy.allow_direct {
