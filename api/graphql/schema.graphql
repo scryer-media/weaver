@@ -338,6 +338,7 @@ type DirectoryBrowseResult {
 	currentPath: String!
 	parentPath: String
 	entries: [DirectoryBrowseEntry!]!
+	files: [DirectoryBrowseEntry!]!
 }
 
 type DiscoveredNetworkInterface {
@@ -2434,7 +2435,7 @@ type QueryRoot {
 	Tiered local metrics history for the built-in monitoring UI.
 	"""
 	metricsHistory(range: MetricsHistoryRangeGql!): MetricsHistoryResult!
-	browseDirectories(path: String): DirectoryBrowseResult!
+	browseDirectories(path: String, includeFiles: Boolean): DirectoryBrowseResult!
 	"""
 	How full the disk under a folder is, for a folder that is not saved yet.
 

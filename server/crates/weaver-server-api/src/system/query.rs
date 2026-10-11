@@ -215,6 +215,7 @@ impl SystemQuery {
         &self,
         ctx: &Context<'_>,
         path: Option<String>,
+        include_files: Option<bool>,
     ) -> Result<DirectoryBrowseResult> {
         let config = ctx.data::<SharedConfig>()?;
         let default_path = with_timed_config_read(
@@ -234,7 +235,10 @@ impl SystemQuery {
         };
 
         let listing = tokio::task::spawn_blocking(move || {
-            weaver_server_core::operations::browse_directories(&requested_path)
+            weaver_server_core::operations::browse_directories(
+                &requested_path,
+                include_files.unwrap_or(false),
+            )
         })
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
