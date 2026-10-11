@@ -348,6 +348,9 @@ test("a chain's hops open in order and offer only the proxies that can still fol
     // Each hop waits for the one beneath it, and all three read alike.
     assert.deepEqual(await Promise.all([1, 2, 3].map((position) => hop(position).textContent())), Array(3).fill("Select proxy"));
     assert.deepEqual(await Promise.all([1, 2, 3].map((position) => hop(position).isDisabled())), [false, true, true]);
+    // Under each hop, whether the chain needs it: the first two, and not the third.
+    const notes = editor.locator("span").filter({ hasText: /^(\* Required|Optional)$/ });
+    assert.deepEqual(await notes.allTextContents(), ["* Required", "* Required", "Optional"]);
     await shot(page, "route-chain-empty");
 
     assert.deepEqual(

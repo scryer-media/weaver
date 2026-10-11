@@ -1742,6 +1742,8 @@ export const nextKo: LocaleDictionary = {
   "next.networking.route.pool": "풀",
   "next.networking.route.chain": "체인",
   "next.networking.route.hop": "체인 {{position}}번째 홉",
+  "next.networking.route.hopRequired": "* 필수",
+  "next.networking.route.hopOptional": "선택 사항",
   "next.networking.route.chooseProxy": "프록시 선택",
   "next.networking.route.choosePool": "풀 선택",
   "next.networking.route.rungUp": "단계 위로",

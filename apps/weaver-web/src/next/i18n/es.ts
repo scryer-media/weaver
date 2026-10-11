@@ -1742,6 +1742,8 @@ export const nextEs: LocaleDictionary = {
   "next.networking.route.pool": "Grupo",
   "next.networking.route.chain": "Cadena",
   "next.networking.route.hop": "Salto {{position}} de la cadena",
+  "next.networking.route.hopRequired": "* Obligatorio",
+  "next.networking.route.hopOptional": "Opcional",
   "next.networking.route.chooseProxy": "Elige un proxy",
   "next.networking.route.choosePool": "Elige un grupo",
   "next.networking.route.rungUp": "Subir escalón",

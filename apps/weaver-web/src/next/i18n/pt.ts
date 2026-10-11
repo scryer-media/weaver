@@ -1742,6 +1742,8 @@ export const nextPt: LocaleDictionary = {
   "next.networking.route.pool": "Pool",
   "next.networking.route.chain": "Cadeia",
   "next.networking.route.hop": "Salto {{position}} da cadeia",
+  "next.networking.route.hopRequired": "* Obrigatório",
+  "next.networking.route.hopOptional": "Opcional",
   "next.networking.route.chooseProxy": "Escolha um proxy",
   "next.networking.route.choosePool": "Escolha um pool",
   "next.networking.route.rungUp": "Subir degrau",

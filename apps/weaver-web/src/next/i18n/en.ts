@@ -1750,6 +1750,8 @@ export const nextEn: LocaleDictionary = {
   "next.networking.route.pool": "Pool",
   "next.networking.route.chain": "Chain",
   "next.networking.route.hop": "Chain hop {{position}}",
+  "next.networking.route.hopRequired": "* Required",
+  "next.networking.route.hopOptional": "Optional",
   "next.networking.route.chooseProxy": "Select proxy",
   "next.networking.route.choosePool": "Select pool",
   "next.networking.route.rungUp": "Move rung up",

@@ -1742,6 +1742,8 @@ export const nextDe: LocaleDictionary = {
   "next.networking.route.pool": "Pool",
   "next.networking.route.chain": "Kette",
   "next.networking.route.hop": "Kettenglied {{position}}",
+  "next.networking.route.hopRequired": "* Erforderlich",
+  "next.networking.route.hopOptional": "Optional",
   "next.networking.route.chooseProxy": "Proxy wählen",
   "next.networking.route.choosePool": "Pool wählen",
   "next.networking.route.rungUp": "Stufe nach oben",

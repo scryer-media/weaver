@@ -256,31 +256,35 @@ export function RouteEditor({
                       {rung.kind === "CHAIN" ? (
                         <div className="flex w-full min-w-0 flex-wrap gap-2">
                           {[0, 1, 2].map((hop) => (
-                            <Select
-                              key={hop}
-                              label={t("next.networking.route.hop", { position: hop + 1 })}
-                              value={rung.chainIds[hop] == null ? "" : String(rung.chainIds[hop])}
-                              className="w-full min-w-0 sm:w-[200px]"
-                              disabled={hop > rung.chainIds.length}
-                              onChange={(next) => {
-                                const chainIds = withChainHop(
-                                  profiles,
-                                  rung.chainIds,
-                                  hop,
-                                  next ? Number(next) : null,
-                                  chainLimits(path.rungs, rungIndex),
-                                );
-                                setRungs(path.rungs.map((current, n) => (n === rungIndex ? { ...current, chainIds } : current)));
-                              }}
-                              options={[
-                                { value: "", label: t("next.networking.route.chooseProxy") },
-                                ...chainHopProfiles(profiles, rung.chainIds, hop, chainLimits(path.rungs, rungIndex))
-                                  .map((profile) => ({
-                                    value: String(profile.id),
-                                    label: `${profile.name} · ${proxyLabels[profile.kind]}`,
-                                  })),
-                              ]}
-                            />
+                            <div key={hop} className="flex w-full min-w-0 flex-col gap-1 sm:w-[200px]">
+                              <Select
+                                label={t("next.networking.route.hop", { position: hop + 1 })}
+                                value={rung.chainIds[hop] == null ? "" : String(rung.chainIds[hop])}
+                                className="w-full min-w-0"
+                                disabled={hop > rung.chainIds.length}
+                                onChange={(next) => {
+                                  const chainIds = withChainHop(
+                                    profiles,
+                                    rung.chainIds,
+                                    hop,
+                                    next ? Number(next) : null,
+                                    chainLimits(path.rungs, rungIndex),
+                                  );
+                                  setRungs(path.rungs.map((current, n) => (n === rungIndex ? { ...current, chainIds } : current)));
+                                }}
+                                options={[
+                                  { value: "", label: t("next.networking.route.chooseProxy") },
+                                  ...chainHopProfiles(profiles, rung.chainIds, hop, chainLimits(path.rungs, rungIndex))
+                                    .map((profile) => ({
+                                      value: String(profile.id),
+                                      label: `${profile.name} · ${proxyLabels[profile.kind]}`,
+                                    })),
+                                ]}
+                              />
+                              <span className="font-wv-mono text-[11px] text-wv-muted">
+                                {hop < 2 ? t("next.networking.route.hopRequired") : t("next.networking.route.hopOptional")}
+                              </span>
+                            </div>
                           ))}
                         </div>
                       ) : (
