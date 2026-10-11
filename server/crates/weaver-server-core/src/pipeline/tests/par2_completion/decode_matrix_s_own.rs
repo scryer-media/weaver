@@ -489,8 +489,15 @@ async fn metadata_probe_extracts_a_nonbootstrap_volume_from_its_recovery_queue()
         state
             .recovery_queue
             .count_matching(|work| work.segment_id.file_id == selected_file),
+        1,
+        "the unrequested remainder stays available for later recovery"
+    );
+    assert_eq!(
+        state.recovery_queue.count_matching(|work| {
+            work.segment_id.file_id == selected_file && work.segment_id.segment_number == 0
+        }),
         0,
-        "the parked original must not race the promoted probe"
+        "the promoted prefix must not also remain parked"
     );
 
     {

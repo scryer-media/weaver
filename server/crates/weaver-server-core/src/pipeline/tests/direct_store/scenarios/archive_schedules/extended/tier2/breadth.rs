@@ -1539,6 +1539,28 @@ pub(super) mod sets {
         use super::*;
 
         #[tokio::test]
+        async fn demoted_sevenz_extracts_before_healthy_neighbour_commits() {
+            run_cell(
+                SetsCell {
+                    layout: Layout::TwoSetsFurniture,
+                    container: Container::SevenZip,
+                    recovery: Recovery::None,
+                    stale_sfv: false,
+                    volumes: 2,
+                },
+                ExtractionProfile::DirectStore,
+                vec![(
+                    113487,
+                    (
+                        vec![(0, 0), (0, 0), (0, 1), (1, 0), (1, 1)],
+                        Interruption::Demote(1),
+                    ),
+                )],
+            )
+            .await;
+        }
+
+        #[tokio::test]
         async fn damaged_neighbour_keeps_healthy_set_unfinalized() {
             let cell = SetsCell {
                 layout: Layout::TwoSets,

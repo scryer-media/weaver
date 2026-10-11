@@ -1736,6 +1736,16 @@ impl Pipeline {
     ) -> Option<DirectFileTarget> {
         let job_id = file_id.job_id;
         let file_index = file_id.file_index;
+        // Late descriptions cannot take a refetched file away from the set
+        // whose demotion now owns its conventional reconstruction.
+        if self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| set.is_demoted() && set.plan().volume_for_file(file_index).is_some())
+        {
+            return None;
+        }
         // Two rungs, mutually exclusive per job. Described rosters — PAR2
         // metadata named the volumes — are the stronger evidence and go
         // first; a job without them falls to the header rung, where the
@@ -2253,7 +2263,20 @@ impl Pipeline {
                     admission
                         .header_sets
                         .iter()
-                        .find(|header_set| header_set.volume_set)
+                        .find(|header_set| {
+                            header_set.volume_set
+                                && self
+                                    .direct_store
+                                    .set(job_id, header_set.set_index)
+                                    .is_some_and(|set| {
+                                        !set.plan()
+                                            .identity
+                                            .and_then(|identity| identity.expected_volumes)
+                                            .is_some_and(|expected| {
+                                                set.plan().volumes.len() as u32 == expected
+                                            })
+                                    })
+                        })
                         .map(|header_set| {
                             (
                                 header_set.set_index,
@@ -2322,6 +2345,33 @@ impl Pipeline {
                     set.plan().identity.is_some_and(|identity| {
                         identity.kind == super::plan::IdentityKind::HeaderVolumeSet
                     })
+                })
+            {
+                return None;
+            }
+            // A restart can restore a conventional neighbour before this
+            // volume arrives. Its persisted headers still own the chain;
+            // admitting only the new tail would strand the restored head.
+            if let Some(prefix) = self.file_prefix_16k.get(&file_id)
+                && let Ok(walk) = unrar_rs::RarArchive::parse_volume_facts_walk(
+                    std::io::Cursor::new(prefix.clone()),
+                    None,
+                )
+                && self.rar_sets.iter().any(|((owner, _), state)| {
+                    *owner == job_id
+                        && state.facts.iter().any(|(number, facts)| {
+                            facts.members.iter().any(|other| {
+                                walk.facts.members.iter().any(|own| {
+                                    own.name == other.name
+                                        && ((number.checked_add(1) == Some(volume_number)
+                                            && other.split_after
+                                            && own.split_before)
+                                            || (volume_number.checked_add(1) == Some(*number)
+                                                && own.split_after
+                                                && other.split_before))
+                                })
+                            })
+                        })
                 })
             {
                 return None;
@@ -2624,6 +2674,14 @@ impl Pipeline {
             return false;
         };
         let first_member = |file_index: u32| {
+            // A restart retains parsed facts but not the transport prefix.
+            // Use those same facts when checking a new neighbour's chain.
+            if let Some(set) = self.direct_store.set(job_id, set_index)
+                && let Some(volume) = set.plan().files.get(&file_index)
+                && let Some(member) = set.router.first_rar_member(*volume)
+            {
+                return Some(member);
+            }
             let prefix = self
                 .file_prefix_16k
                 .get(&NzbFileId { job_id, file_index })?;

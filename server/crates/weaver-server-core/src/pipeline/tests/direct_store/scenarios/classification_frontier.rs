@@ -1335,9 +1335,9 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
     let (spec, index_file_index) = par2_bearing_job_spec("Silver Horizon", &volumes, &par2_bytes);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
 
-    // The index first, so the ambiguity is provable before anything acts on it —
-    // and so the PAR2 identity pass, which rewrites every file's identity as the
-    // set parses, cannot undo it.
+    // Parse the index and admit the headers before injecting the ambiguity.
+    // Incoming content normally corrects a false canonical name, so the
+    // conflicting identity must be installed at the pre-verification boundary.
     submit_decoded_segment(
         &mut pipeline,
         NzbFileId {
@@ -1351,6 +1351,11 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
         None,
     )
     .await;
+    let mut arrivals = in_order_arrivals(volumes.len());
+    let last = arrivals.pop().unwrap();
+    for (file_index, segment_number) in arrivals {
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
     // Volume 1's identity now carries a canonical name that is *another*
     // volume's PAR2 name, so its candidate set spans two descriptions of the
     // same recovery set and `resolve_par2_file_binding` refuses to pick one.
@@ -1394,9 +1399,8 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
          one volume rather than about a job with no recovery set"
     );
 
-    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
-        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
-    }
+    assert!(pipeline.demote_unbindable_direct_sets(job_id).await);
+    submit_volume_article(&mut pipeline, job_id, &volumes, last.0, last.1).await;
     // The last article's placement must land before the check that gates the
     // pass may judge the set.
     settle_direct_verification_read(&mut pipeline, job_id).await;
@@ -1405,10 +1409,11 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
     assert!(
         sets.contains("Demoted(Par2Unbindable)"),
         "a set holding a volume PAR2 cannot name must leave direct mode before the \
-         pass, on its own reason, got {sets}"
+         pass, on its own reason, got {sets}; identity={:?}",
+        pipeline.jobs[&job_id].file_identities.get(&1)
     );
-    // Demotion materialized the volumes from the set's own routed bytes, which
-    // is what the pass then reads — nothing repaired a virtual volume.
+    // Demotion materialized the routed bytes and the final article completed
+    // the disk source. Nothing repaired a virtual volume.
     for (filename, bytes) in &volumes {
         assert_eq!(
             std::fs::read(working_dir.join(filename)).ok().as_deref(),

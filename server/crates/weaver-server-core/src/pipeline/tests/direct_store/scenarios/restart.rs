@@ -18,6 +18,13 @@ async fn restart_reopens_the_database_only_after_the_old_incarnation_released_it
 
     let temp_dir = tempfile::tempdir().unwrap();
     let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    // Initialization writes must settle before this transaction blocks the
+    // writer that retirement drains before closing the pool.
+    pipeline.db.flush_write_queue().await.unwrap();
+    // An event claim uses the serial database worker too. Keep that independent
+    // worker idle while the held transaction tests pool-close ordering.
+    let event_db = pipeline.db.clone();
+    let _event_queue = crate::post_processing::events::hold_test_event_queue(&event_db).await;
     let StoreDatastore::Sqlite { pool, .. } = pipeline.db.datastore() else {
         panic!("the harness database is SQLite");
     };

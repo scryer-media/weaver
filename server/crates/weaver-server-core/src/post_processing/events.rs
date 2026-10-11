@@ -1825,6 +1825,11 @@ pub fn wake_queue(db: Database) {
 mod tests;
 
 #[cfg(test)]
+pub(crate) async fn hold_test_event_queue(db: &Database) -> tokio::sync::MutexGuard<'_, ()> {
+    db.script_runtime.queue.lock().await
+}
+
+#[cfg(test)]
 pub(crate) fn hold_test_event_run(db: &Database, job_id: u64, run_id: &str) -> impl Drop + use<> {
     let (cancel, _receiver) = watch::channel(false);
     db.script_runtime

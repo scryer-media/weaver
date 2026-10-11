@@ -362,10 +362,11 @@ impl Pipeline {
         }
         let mut edge_reads = Vec::new();
         for index in 0..targets.len() {
-            if !targets[index].cipher || targets[index].deferred {
+            if !targets[index].cipher {
                 continue;
             }
-            match self.plan_par3_edges(job_id, &targets, index, MAX_EDGES - edge_reads.len()) {
+            match self.plan_par3_edges(job_id, &targets, index, MAX_EDGES - edge_reads.len(), true)
+            {
                 Ok(reads) => edge_reads.extend(reads),
                 Err(error) => {
                     self.fail_job(job_id, error.into());
@@ -405,20 +406,25 @@ impl Pipeline {
         targets: &[Target],
         index: usize,
         limit: usize,
+        before_installation: bool,
     ) -> Result<Vec<EdgeRead>, &'static str> {
         let target = &targets[index];
         let set = self
             .direct_store
             .set(job_id, target.set)
             .ok_or("missing PAR3 direct set")?;
-        let reads = set
-            .router
-            .cipher_replacement_edge_reads_bounded(target.volume, limit, &|volume| {
-                targets
-                    .iter()
-                    .any(|other| other.set == target.set && other.volume == volume)
-            })
-            .ok_or("PAR3 cipher edge plan is incomplete or exceeds the host budget")?;
+        let reads = if before_installation && target.deferred {
+            set.router
+                .cipher_unplaced_edge_reads_bounded(target.volume, limit)
+        } else {
+            set.router
+                .cipher_replacement_edge_reads_bounded(target.volume, limit, &|volume| {
+                    targets
+                        .iter()
+                        .any(|other| other.set == target.set && other.volume == volume)
+                })
+        }
+        .ok_or("PAR3 cipher edge plan is incomplete or exceeds the host budget")?;
         let mut edge_reads = Vec::with_capacity(reads.len());
         for (volume, offset, len) in reads {
             let file = set
@@ -696,10 +702,33 @@ impl Pipeline {
                     &installation.targets,
                     installation.current,
                     installation.edge_budget,
+                    false,
                 )?;
                 installation.edge_budget -= reads.len();
-                installation.edge_reads.extend(reads);
                 let current = installation.current;
+                let captured = std::mem::take(&mut installation.targets[current].edges);
+                for read in reads {
+                    if let Some((_, offset, bytes)) =
+                        captured.iter().find(|(volume, offset, bytes)| {
+                            *volume == read.volume
+                                && *offset <= read.offset
+                                && read.offset - offset + read.len <= bytes.len() as u64
+                        })
+                    {
+                        let start = (read.offset - offset) as usize;
+                        installation.targets[current].edges.push((
+                            read.volume,
+                            read.offset,
+                            bytes.slice(start..start + read.len as usize),
+                        ));
+                    } else if read.output.is_some() {
+                        installation.edge_reads.push(read);
+                    } else {
+                        return Err(
+                            "PAR3 deferred cipher edge was not captured before installation".into(),
+                        );
+                    }
+                }
                 installation.targets[current].deferred = false;
             }
             self.par3_runtime

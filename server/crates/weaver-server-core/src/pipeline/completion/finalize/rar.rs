@@ -174,10 +174,13 @@ impl Pipeline {
             return ArchiveSetRetirement::NotRar;
         }
 
-        let busy = self
-            .rar_sets
-            .get(&set_key)
-            .is_some_and(|state| state.active_workers > 0 || !state.in_flight_members.is_empty());
+        let busy =
+            self.rar_sets.get(&set_key).is_some_and(|state| {
+                state.active_workers > 0 || !state.in_flight_members.is_empty()
+            }) || self
+                .rar_refresh_state
+                .get(&set_key)
+                .is_some_and(|refresh| refresh.in_flight.is_some());
         if busy {
             return ArchiveSetRetirement::Busy;
         }

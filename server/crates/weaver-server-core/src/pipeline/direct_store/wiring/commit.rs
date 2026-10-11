@@ -1238,9 +1238,16 @@ impl Pipeline {
             self.demote_direct_set(job_id, set_index, DemotionReason::PartChecksumMismatch)
                 .await;
         }
-        // Keep healthy members staged while another posted payload is missing.
-        // A recovery verdict can supersede the damaged posted copy, but an
-        // unrecoverable neighbour must fail before any set is committed.
+        // Keep healthy members staged while another archive is still short of
+        // its volumes. A recovery verdict can supersede the damaged posted
+        // copy, but an unrecoverable neighbouring set must fail before any set
+        // is committed. Only archive parts hold the gate: a loose file still
+        // downloading beside a finished set, a release's notes or a sample, is
+        // not a set that can fail the job's archives, and a set that finalizes
+        // while such a file is in flight is the window a restart must survive.
+        // The role is the classified one, not the posted name's: an obfuscated
+        // volume is declared unknown by its name, and an unknown file holds the
+        // gate until its bytes say what it is.
         let recovery_verified = self.par2_verified.contains(&job_id)
             || self
                 .par3_runtime
@@ -1251,9 +1258,10 @@ impl Pipeline {
                 state.assembly.files().any(|file| {
                     !file.is_complete()
                         && !matches!(
-                            file.role(),
+                            self.classified_role_for_file(job_id, file),
                             weaver_model::files::FileRole::Par2 { .. }
                                 | weaver_model::files::FileRole::Par3 { .. }
+                                | weaver_model::files::FileRole::Standalone
                         )
                 })
             })
@@ -1267,10 +1275,23 @@ impl Pipeline {
             .enumerate()
             .any(|(index, set)| {
                 if set.is_demoted() {
-                    return !self
+                    let extracted = self
                         .extracted_archives
                         .get(&job_id)
-                        .is_some_and(|names| names.contains(set.set_name()));
+                        .is_some_and(|names| names.contains(set.set_name()))
+                        || self
+                            .rar_sets
+                            .get(&(job_id, set.set_name().to_owned()))
+                            .and_then(|state| state.plan.as_ref())
+                            .is_some_and(|plan| {
+                                // Incremental extraction records members before
+                                // the later job-level pass records the set name.
+                                !plan.member_names.is_empty()
+                                    && self.extracted_members.get(&job_id).is_some_and(|names| {
+                                        plan.member_names.iter().all(|name| names.contains(name))
+                                    })
+                            });
+                    return !extracted;
                 }
                 !set.is_finalized()
                     && (!set.ready_to_finalize()
@@ -1664,6 +1685,22 @@ impl Pipeline {
         };
         let outcome = set.run_barrier(trigger, now, &mut drain, &mut sync, &mut persist);
         Self::report_direct_barrier(job_id, dirty_bytes, outcome);
+    }
+
+    // Construct retained images from the older per-set publication policy.
+    #[cfg(test)]
+    pub(in crate::pipeline) async fn finalize_legacy_direct_set_for_test(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+    ) {
+        assert!(
+            self.direct_store
+                .set(job_id, set_index)
+                .unwrap()
+                .ready_to_finalize()
+        );
+        self.finalize_direct_set(job_id, set_index).await;
     }
 
     // Commits a finished set: every member's partial becomes its destination

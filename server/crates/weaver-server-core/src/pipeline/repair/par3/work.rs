@@ -548,6 +548,7 @@ struct JobSlot {
     known: BTreeMap<SourceId, KnownSource>,
     materialized: BTreeMap<SourceId, EngineResult<MaterializedRanges>>,
     dirty: std::collections::BTreeSet<SourceId>,
+    superseded_sets: std::collections::BTreeSet<par3_rs::InputSetId>,
     pending: BTreeMap<WorkKey, QueuedInput>,
     ticket: Option<u64>,
     errors: BTreeMap<SourceId, EngineError>,
@@ -594,6 +595,7 @@ impl Default for JobSlot {
             known: BTreeMap::new(),
             materialized: BTreeMap::new(),
             dirty: std::collections::BTreeSet::new(),
+            superseded_sets: std::collections::BTreeSet::new(),
             pending: BTreeMap::new(),
             ticket: None,
             errors: BTreeMap::new(),
@@ -1853,6 +1855,32 @@ impl Coordinator {
                     .filter_map(|(&id, set)| set.view.as_ref().map(|view| (id, view)))
                     .chain(runtime.dormant_views.iter().map(|(&id, view)| (id, view)))
             })
+            .filter(move |(id, _)| !self.jobs[&job_id].superseded_sets.contains(id))
+    }
+
+    // A verified embedded replacement can retire sidecar obligations that
+    // describe only its old split inputs, including their unprotected tail.
+    // A set covering any other file keeps its entire recovery obligation.
+    pub(super) fn supersede_split_inputs(&mut self, job_id: JobId, names: &[String]) {
+        let Some(job) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let Some(runtime) = job.runtime.as_ref() else {
+            return;
+        };
+        for (id, view) in runtime
+            .sets
+            .iter()
+            .filter_map(|(&id, set)| set.view.as_ref().map(|view| (id, view)))
+            .chain(runtime.dormant_views.iter().map(|(&id, view)| (id, view)))
+        {
+            if view.embedded_source.is_none()
+                && !view.files.is_empty()
+                && view.files.iter().all(|file| names.contains(&file.path))
+            {
+                job.superseded_sets.insert(id);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1870,7 +1898,19 @@ impl Coordinator {
     }
 
     pub(in crate::pipeline) fn verified(&self, job_id: JobId) -> bool {
-        let count = self.authenticated_set_count(job_id);
+        let superseded = self.jobs.get(&job_id).map_or(0, |job| {
+            job.runtime.as_ref().map_or(0, |runtime| {
+                job.superseded_sets
+                    .iter()
+                    .filter(|id| {
+                        runtime.sets.contains_key(id) || runtime.dormant_views.contains_key(id)
+                    })
+                    .count()
+            })
+        });
+        let count = self
+            .authenticated_set_count(job_id)
+            .saturating_sub(superseded);
         count != 0
             && self
                 .assessments(job_id)

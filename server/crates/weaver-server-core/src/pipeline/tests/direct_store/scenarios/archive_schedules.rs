@@ -1908,9 +1908,18 @@ fn hand_named_formats_alias_their_routes() {
             Format::Rar4HexBare
             | Format::Rar4HexSelfDescribed
             | Format::Rar4HexLateIndex
-            | Format::Rar4HexMisnumbered
-            | Format::Rar4HexScattered
-            | Format::Rar4HexSingle => Route::refused(|_| false),
+            | Format::Rar4HexMisnumbered => Route {
+                unnamed_loss: |mask| mask & 0b0101 != 0,
+                ..Route::refused(|_| false)
+            },
+            Format::Rar4HexScattered => Route {
+                unnamed_loss: |mask| mask != 0,
+                ..Route::refused(|_| false)
+            },
+            Format::Rar4HexSingle => Route {
+                unnamed_loss: |mask| mask & 0b0001 != 0,
+                ..Route::refused(|_| false)
+            },
             Format::Rar5UncheckedHeaders => {
                 Route::refused(|reason| matches!(reason, DemotionReason::HeaderEncryptedRefused(_)))
             }
@@ -2662,6 +2671,11 @@ async fn two_set_campaign(profile: ExtractionProfile, selection: Selection) {
 }
 
 #[tokio::test]
+async fn demoted_set_extracts_without_claiming_its_direct_neighbour() {
+    two_set_campaign(ExtractionProfile::DirectStore, Selection::Case(128)).await;
+}
+
+#[tokio::test]
 async fn two_set_arrival_schedules() {
     two_set_campaign(ExtractionProfile::DirectStore, Selection::Smoke).await;
 }
@@ -2946,6 +2960,21 @@ async fn hex_two_set_profile(format: HexTwoSets, selection: Selection, profile: 
             }
         }
     }
+}
+
+#[tokio::test]
+async fn restored_header_set_rejects_another_archives_neighbour() {
+    hex_two_set_campaign(HexTwoSets::Rar5, Selection::Case(3456)).await;
+}
+
+#[tokio::test]
+async fn closed_header_set_survives_another_archives_arrival() {
+    hex_two_set_campaign(HexTwoSets::Rar5, Selection::Case(5312)).await;
+}
+
+#[tokio::test]
+async fn demoted_header_set_survives_crash_before_neighbours_first_volume() {
+    hex_two_set_campaign(HexTwoSets::Rar5, Selection::Case(8640)).await;
 }
 
 #[tokio::test]

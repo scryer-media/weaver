@@ -1067,15 +1067,18 @@ async fn an_encrypted_finalized_set_keeps_a_retained_image_that_reads_back_as_po
     );
 
     pipeline.par2_verified.insert(job_id);
-    pipeline.finalize_ready_direct_sets(job_id).await;
-
-    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    // Exercise retained images from the older per-set publication policy.
     let encrypted_index = pipeline
         .direct_store
         .sets_for(job_id)
         .iter()
         .position(|set| set.router.routes_encrypted())
-        .unwrap_or_else(|| panic!("the encrypted set must still be there; got {sets}"));
+        .expect("the encrypted set must still be there");
+    pipeline
+        .finalize_legacy_direct_set_for_test(job_id, encrypted_index)
+        .await;
+
+    let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
         pipeline
             .direct_store

@@ -120,6 +120,28 @@ impl Pipeline {
         let filename_changed = previous
             .as_ref()
             .is_none_or(|previous| previous.current_filename != identity.current_filename);
+        let displaced_split = previous
+            .as_ref()
+            .filter(|previous| {
+                previous.classification_source == FileIdentitySource::Probe
+                    && matches!(
+                        identity.classification_source,
+                        FileIdentitySource::Par2 | FileIdentitySource::Par3
+                    )
+                    && previous.classification.as_ref().is_some_and(|old| {
+                        old.kind == PersistedDetectedArchiveKind::SevenZipSplit
+                            && identity
+                                .classification
+                                .as_ref()
+                                .is_none_or(|new| new.set_name != old.set_name)
+                    })
+            })
+            .and_then(|previous| {
+                previous
+                    .classification
+                    .as_ref()
+                    .map(|old| old.set_name.clone())
+            });
         self.db
             .save_file_identity(job_id, &identity)
             .map_err(|error| format!("failed to save file identity: {error}"))?;
@@ -142,6 +164,32 @@ impl Pipeline {
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.file_identities.insert(identity.file_index, identity);
         }
+        if let Some(old_set) = displaced_split {
+            // The signature promoted all same-stem numeric files to 7z parts.
+            // Once recovery proves that signature belongs to another set,
+            // an entirely absent neighbour has no independent archive evidence.
+            let inferred: Vec<_> = self
+                .jobs
+                .get(&job_id)
+                .into_iter()
+                .flat_map(|state| {
+                    state.assembly.files().filter_map(|file| {
+                        let identity = state.file_identities.get(&file.file_id().file_index)?;
+                        (file.received_bytes() == 0
+                            && matches!(file.declared_role(), FileRole::SplitFile { .. })
+                            && identity.classification_source == FileIdentitySource::Probe
+                            && identity.classification.as_ref().is_some_and(|known| {
+                                known.kind == PersistedDetectedArchiveKind::SevenZipSplit
+                                    && known.set_name == old_set
+                            }))
+                        .then_some(file.file_id())
+                    })
+                })
+                .collect();
+            for inferred_file in inferred {
+                self.clear_detected_archive_identity(job_id, inferred_file);
+            }
+        }
         self.refresh_par2_md5_substitution_binding(file_id);
         Ok(())
     }
@@ -156,6 +204,18 @@ impl Pipeline {
         let mut identity = self
             .effective_file_identity(job_id, file_id)
             .ok_or_else(|| format!("job {} file {} not found", job_id.0, file_id.file_index))?;
+        // A confirming content probe does not undo a recovery set's proven
+        // identity. Cleanup and placement still need its canonical alias.
+        let source = if source == FileIdentitySource::Probe
+            && classification == identity.classification
+            && matches!(
+                identity.classification_source,
+                FileIdentitySource::Par2 | FileIdentitySource::Par3
+            ) {
+            identity.classification_source
+        } else {
+            source
+        };
         identity.classification =
             if classification.is_none() && matches!(source, FileIdentitySource::Declared) {
                 self.jobs
@@ -196,7 +256,7 @@ impl Pipeline {
         }
         self.classify_completed_file(job_id, file_id, allow_probe)
             .await;
-        self.group_header_first_sevenz(job_id);
+        self.group_header_first_sevenz(job_id).await;
 
         let Some(state) = self.jobs.get(&job_id) else {
             return;
@@ -376,6 +436,18 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return ExtractionReadiness::NotApplicable;
         };
+        // A live 7z direct set has no disk topology. Let its demoted neighbour
+        // extract, but keep the job pending until the direct set can commit.
+        let direct_sets: Vec<_> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .filter(|set| {
+                set.plan().format == crate::pipeline::direct_store::plan::SetFormat::SevenZip
+                    && !set.is_demoted()
+                    && !set.is_finalized()
+            })
+            .collect();
 
         if state.assembly.archive_topologies().is_empty() {
             let has_archive = state.assembly.files().any(|file| {
@@ -406,6 +478,11 @@ impl Pipeline {
                         // A posted copy a repaired output replaced belongs to
                         // no set: the output's roster is the one that extracts.
                         self.direct_set_already_installed(job_id, file)
+                            || direct_sets.iter().any(|set| {
+                                set.plan()
+                                    .volume_for_file(file.file_id().file_index)
+                                    .is_some()
+                            })
                             || self.recovery_superseded_source(job_id, file.file_id())
                             || state
                                 .assembly
@@ -425,15 +502,18 @@ impl Pipeline {
             };
         }
 
-        if state.assembly.archive_topologies().len() == 1 {
+        if state.assembly.archive_topologies().len() == 1 && direct_sets.is_empty() {
             let set_name = state.assembly.archive_topologies().keys().next().unwrap();
             return state.assembly.set_extraction_readiness(set_name);
         }
 
-        let mut all_ready = true;
+        let mut all_ready = direct_sets.is_empty();
         let mut any_ready = false;
         let mut extractable = Vec::new();
-        let mut waiting_on = Vec::new();
+        let mut waiting_on: Vec<_> = direct_sets
+            .iter()
+            .map(|set| set.set_name().to_owned())
+            .collect();
 
         for set_name in state.assembly.archive_topologies().keys() {
             match state.assembly.set_extraction_readiness(set_name) {
@@ -463,7 +543,65 @@ impl Pipeline {
         }
     }
 
-    fn group_header_first_sevenz(&mut self, job_id: JobId) {
+    async fn group_header_first_sevenz(&mut self, job_id: JobId) {
+        // Restart restores completed files, but not their transport prefix
+        // or decoded-length caches. Re-read bounded evidence from those files
+        // before deciding whether an unnamed first part fits a numbered set.
+        let missing: Vec<_> = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .assembly
+                    .files()
+                    .filter_map(|file| {
+                        let role = self.classified_role_for_file(job_id, file);
+                        let head = matches!(role, FileRole::SevenZipArchive)
+                            && matches!(file.declared_role(), FileRole::Unknown);
+                        let id = file.file_id();
+                        (file.is_complete()
+                            && matches!(
+                                role,
+                                FileRole::SevenZipArchive | FileRole::SevenZipSplit { .. }
+                            )
+                            && (!self.file_declared_size.contains_key(&id)
+                                || (head && !self.file_prefix_16k.contains_key(&id))))
+                        .then(|| {
+                            (
+                                id,
+                                state
+                                    .working_dir
+                                    .join(self.current_filename_for_file(job_id, file)),
+                                head,
+                            )
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (file_id, path, head) in missing {
+            use tokio::io::AsyncReadExt;
+            let Ok(file) = tokio::fs::File::open(path).await else {
+                continue;
+            };
+            let Ok(metadata) = file.metadata().await else {
+                continue;
+            };
+            self.file_declared_size
+                .entry(file_id)
+                .or_insert(metadata.len());
+            if head && !self.file_prefix_16k.contains_key(&file_id) {
+                let mut prefix = Vec::new();
+                if file
+                    .take(crate::pipeline::PAR2_HASH_16K_BYTES as u64)
+                    .read_to_end(&mut prefix)
+                    .await
+                    .is_ok()
+                {
+                    self.file_prefix_16k.insert(file_id, prefix);
+                }
+            }
+        }
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };

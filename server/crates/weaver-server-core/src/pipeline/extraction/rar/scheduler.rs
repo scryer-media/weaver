@@ -43,6 +43,9 @@ impl Pipeline {
             || lower.contains("crc mismatch")
             || lower.contains("crcmismatch")
             || lower.contains("no crc-valid start header")
+            // A decoded part can be complete yet truncated on the wire.
+            // Its length mismatch must reach verification and repair.
+            || lower.contains("has no candidate of the required size")
             || lower.contains("truncated header at offset")
             || lower.contains("not a rar archive (bad signature)")
             || lower.contains("failed to fill whole buffer")
