@@ -284,30 +284,32 @@ export function RouteEditor({
                           ))}
                         </div>
                       ) : (
-                        <Select
-                          label={t("next.networking.route.rungTarget", { leg: index + 1, rung: rungIndex + 1 })}
-                          value={String((rung.kind === "PROXY" ? rung.proxyId : rung.poolId) ?? "")}
-                          className="w-full min-w-0"
-                          onChange={(next) =>
-                            setRungs(
-                              path.rungs.map((current, n) =>
-                                n === rungIndex
-                                  ? { ...current, [current.kind === "PROXY" ? "proxyId" : "poolId"]: next ? Number(next) : null }
-                                  : current,
-                              ),
-                            )
-                          }
-                          options={[
-                            {
-                              value: "",
-                              label: rung.kind === "PROXY" ? t("next.networking.route.chooseProxy") : t("next.networking.route.choosePool"),
-                            },
-                            ...(rung.kind === "PROXY" ? profiles : pools).map((target) => ({
-                              value: String(target.id),
-                              label: target.enabled ? target.name : `${target.name} · ${t("next.networking.disabled")}`,
-                            })),
-                          ]}
-                        />
+                        <div className="flex w-full min-w-0 flex-wrap gap-2">
+                          <Select
+                            label={t("next.networking.route.rungTarget", { leg: index + 1, rung: rungIndex + 1 })}
+                            value={String((rung.kind === "PROXY" ? rung.proxyId : rung.poolId) ?? "")}
+                            className="w-full min-w-0 sm:w-[200px]"
+                            onChange={(next) =>
+                              setRungs(
+                                path.rungs.map((current, n) =>
+                                  n === rungIndex
+                                    ? { ...current, [current.kind === "PROXY" ? "proxyId" : "poolId"]: next ? Number(next) : null }
+                                    : current,
+                                ),
+                              )
+                            }
+                            options={[
+                              {
+                                value: "",
+                                label: rung.kind === "PROXY" ? t("next.networking.route.chooseProxy") : t("next.networking.route.choosePool"),
+                              },
+                              ...(rung.kind === "PROXY" ? profiles : pools).map((target) => ({
+                                value: String(target.id),
+                                label: target.enabled ? target.name : `${target.name} · ${t("next.networking.disabled")}`,
+                              })),
+                            ]}
+                          />
+                        </div>
                       )}
                     </li>
                   ))}

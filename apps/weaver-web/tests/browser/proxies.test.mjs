@@ -324,6 +324,17 @@ test("a chain's hops open in order and offer only the proxies that can still fol
     const editor = page.getByRole("dialog", { name: "Route for news.fixture.invalid", exact: true });
     await option(editor, "Proxy ladder").click();
     await action(editor, "Add rung").click();
+    // A proxy's or a pool's select sits under the rung's type, where a chain's hops do.
+    const type = editor.getByRole("radiogroup", { name: "Leg 1 rung 1 type", exact: true });
+    for (const [kind, placeholder] of [["Proxy", "Select proxy"], ["Pool", "Select pool"]]) {
+      await option(editor, kind).click();
+      const target = action(editor, "Leg 1 rung 1");
+      assert.equal(await target.textContent(), placeholder);
+      const [select, group] = [await target.boundingBox(), await type.boundingBox()];
+      assert.ok(select.y >= group.y + group.height, `${kind} select is under the type`);
+      assert.ok(select.x < group.x, `${kind} select starts at the rung's left edge`);
+    }
+    await shot(page, "route-rung-pool");
     await option(editor, "Chain").click();
     const hop = (position) => action(editor, `Chain hop ${position}`);
     /** What the hop's menu lists, read with the menu open and closed again by picking `choice`. */
