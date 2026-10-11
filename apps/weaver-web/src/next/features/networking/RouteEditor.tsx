@@ -13,7 +13,7 @@ import {
   type ProxyPool,
   type Rung,
 } from "@/lib/networking";
-import { chainHopProfiles, proxyLabels, type ProxyProfile } from "@/lib/proxies";
+import { chainHopProfiles, proxyLabels, withChainHop, type ChainLimits, type ProxyProfile } from "@/lib/proxies";
 import { cn } from "@/lib/utils";
 import { Square } from "../../components/chrome";
 import { NumberField, SecondaryButton, Segmented, Select } from "../../components/controls";
@@ -81,6 +81,21 @@ export function RouteEditor({
     setDown(new Set());
     onChange({ ...value, legs });
   };
+  /** What the ladder's other rungs leave a chain on rung `own`: a ladder uses a proxy once. */
+  const chainLimits = (rungs: Rung[], own: number): ChainLimits => ({
+    needsDns: rss,
+    taken: new Set(
+      rungs.flatMap((rung, position) =>
+        position === own
+          ? []
+          : rung.kind === "PROXY"
+            ? (rung.proxyId === null ? [] : [rung.proxyId])
+            : rung.kind === "POOL"
+              ? (pools.find((pool) => pool.id === rung.poolId)?.memberIds ?? [])
+              : rung.chainIds,
+      ),
+    ),
+  });
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
@@ -246,21 +261,20 @@ export function RouteEditor({
                               label={t("next.networking.route.hop", { position: hop + 1 })}
                               value={rung.chainIds[hop] == null ? "" : String(rung.chainIds[hop])}
                               className="w-full min-w-0 sm:w-[200px]"
+                              disabled={hop > rung.chainIds.length}
                               onChange={(next) => {
-                                const ids = [...rung.chainIds];
-                                if (next) {
-                                  ids[hop] = Number(next);
-                                } else {
-                                  ids.splice(hop, 1);
-                                }
-                                setRungs(path.rungs.map((current, n) => (n === rungIndex ? { ...current, chainIds: ids } : current)));
+                                const chainIds = withChainHop(
+                                  profiles,
+                                  rung.chainIds,
+                                  hop,
+                                  next ? Number(next) : null,
+                                  chainLimits(path.rungs, rungIndex),
+                                );
+                                setRungs(path.rungs.map((current, n) => (n === rungIndex ? { ...current, chainIds } : current)));
                               }}
                               options={[
-                                {
-                                  value: "",
-                                  label: hop === 2 ? t("next.networking.route.optionalHop") : t("next.networking.route.chooseProxy"),
-                                },
-                                ...chainHopProfiles(profiles, rung.chainIds, hop)
+                                { value: "", label: t("next.networking.route.chooseProxy") },
+                                ...chainHopProfiles(profiles, rung.chainIds, hop, chainLimits(path.rungs, rungIndex))
                                   .map((profile) => ({
                                     value: String(profile.id),
                                     label: `${profile.name} · ${proxyLabels[profile.kind]}`,

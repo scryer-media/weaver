@@ -1744,7 +1744,6 @@ export const nextIt: LocaleDictionary = {
   "next.networking.route.hop": "Salto {{position}} della catena",
   "next.networking.route.chooseProxy": "Scegli un proxy",
   "next.networking.route.choosePool": "Scegli un pool",
-  "next.networking.route.optionalHop": "Terzo salto facoltativo",
   "next.networking.route.rungUp": "Sposta gradino su",
   "next.networking.route.rungDown": "Sposta gradino giù",
   "next.networking.route.removeRung": "Rimuovi gradino",

@@ -36,16 +36,49 @@ export type ProxyProfile = {
   mtu: number; keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null;
   hasUsername: boolean; hasPassword: boolean; hasPrivateKey: boolean; hasPassphrase: boolean; hasPresharedKey: boolean;
 };
+type ChainProfile = Pick<ProxyProfile, "id" | "kind"> & Partial<Pick<ProxyProfile, "dnsServers">>;
+/** What a chain's ladder rules out besides the chain's own hops. */
+export type ChainLimits = {
+  /** The proxies the ladder's other rungs already use, pool members included. */
+  taken?: ReadonlySet<number>;
+  /** A feed's route resolves names through its proxies, so each needs DNS servers. */
+  needsDns?: boolean;
+};
 /**
- * The proxies a chain's hop can use. WireGuard and HTTP/3 need UDP, which only
- * the egress or a WireGuard hop beneath them carries, and only WireGuard can
- * ride a WireGuard hop. The hop's saved choice always stays listed.
+ * Whether `profile` can sit on the hops in `beneath`, as the daemon rules it.
+ * A ladder uses a proxy once. WireGuard and HTTP/3 need UDP, which only the
+ * egress or a WireGuard hop beneath them carries, and only WireGuard can ride
+ * a WireGuard hop.
  */
-export function chainHopProfiles<T extends Pick<ProxyProfile, "id" | "kind">>(profiles: T[], chainIds: number[], hop: number): T[] {
-  if (hop === 0) return profiles;
-  const beneath = profiles.find((profile) => profile.id === chainIds[hop - 1])?.kind;
+function chainHopAllows<T extends ChainProfile>(profiles: T[], beneath: number[], profile: T, limits: ChainLimits): boolean {
+  if (beneath.includes(profile.id) || limits.taken?.has(profile.id)) return false;
+  if (limits.needsDns && !profile.dnsServers?.length) return false;
+  if (beneath.length === 0 || (profile.kind !== "WIRE_GUARD" && profile.kind !== "HTTP3_CONNECT")) return true;
+  const carrier = profiles.find((candidate) => candidate.id === beneath.at(-1))?.kind;
+  return profile.kind === "WIRE_GUARD" && carrier === "WIRE_GUARD";
+}
+/**
+ * The proxies a chain's hop can use: those the hops beneath it allow and no
+ * other hop holds. The hop's own choice always stays listed.
+ */
+export function chainHopProfiles<T extends ChainProfile>(profiles: T[], chainIds: number[], hop: number, limits: ChainLimits = {}): T[] {
+  const beneath = chainIds.slice(0, hop);
   return profiles.filter((profile) =>
     profile.id === chainIds[hop]
-    || (profile.kind !== "WIRE_GUARD" && profile.kind !== "HTTP3_CONNECT")
-    || (profile.kind === "WIRE_GUARD" && beneath === "WIRE_GUARD"));
+    || (!chainIds.includes(profile.id) && chainHopAllows(profiles, beneath, profile, limits)));
+}
+/**
+ * The chain with `id` at `hop`, or with that hop taken out when `id` is null.
+ * The hops above it stay only while each can still sit on what is now beneath
+ * it, so the chain is cut at the first that cannot.
+ */
+export function withChainHop<T extends ChainProfile>(profiles: T[], chainIds: number[], hop: number, id: number | null, limits: ChainLimits = {}): number[] {
+  const ids = chainIds.slice(0, hop);
+  if (id !== null) ids.push(id);
+  for (const above of chainIds.slice(hop + 1)) {
+    const profile = profiles.find((candidate) => candidate.id === above);
+    if (!profile || !chainHopAllows(profiles, ids, profile, limits)) break;
+    ids.push(above);
+  }
+  return ids;
 }

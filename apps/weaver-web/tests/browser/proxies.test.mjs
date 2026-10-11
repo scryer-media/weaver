@@ -317,6 +317,51 @@ test("a route opens from anywhere on its line and from its Edit button", async (
   }
 });
 
+test("a chain's hops open in order and offer only the proxies that can still follow", async () => {
+  const page = await open("?routes", "news.fixture.invalid");
+  try {
+    await action(page, "Edit route").click();
+    const editor = page.getByRole("dialog", { name: "Route for news.fixture.invalid", exact: true });
+    await option(editor, "Proxy ladder").click();
+    await action(editor, "Add rung").click();
+    await option(editor, "Chain").click();
+    const hop = (position) => action(editor, `Chain hop ${position}`);
+    /** What the hop's menu lists, read with the menu open and closed again by picking `choice`. */
+    const offered = async (position, choice) => {
+      await hop(position).click();
+      const items = page.getByRole("menuitemradio");
+      const names = await items.allTextContents();
+      await items.filter({ hasText: choice }).click();
+      return names;
+    };
+    // Each hop waits for the one beneath it, and all three read alike.
+    assert.deepEqual(await Promise.all([1, 2, 3].map((position) => hop(position).textContent())), Array(3).fill("Select proxy"));
+    assert.deepEqual(await Promise.all([1, 2, 3].map((position) => hop(position).isDisabled())), [false, true, true]);
+    await shot(page, "route-chain-empty");
+
+    assert.deepEqual(
+      await offered(1, "Amsterdam"),
+      ["Select proxy", "Amsterdam · WireGuard", "Seedbox · SSH", "Relay · SOCKS5", "Paris · WireGuard"],
+    );
+    assert.deepEqual(await Promise.all([2, 3].map((position) => hop(position).isDisabled())), [false, true]);
+    // The proxy beneath is gone from the list, and WireGuard still rides WireGuard.
+    assert.deepEqual(await offered(2, "Seedbox"), ["Select proxy", "Seedbox · SSH", "Relay · SOCKS5", "Paris · WireGuard"]);
+    // Nothing that needs UDP rides SSH.
+    assert.deepEqual(await offered(3, "Relay"), ["Select proxy", "Relay · SOCKS5"]);
+    await shot(page, "route-chain");
+
+    // With the first hop taken out the two above it move down, and the third opens again.
+    await offered(1, "Select proxy");
+    assert.deepEqual(
+      await Promise.all([1, 2, 3].map((position) => hop(position).textContent())),
+      ["Seedbox · SSH", "Relay · SOCKS5", "Select proxy"],
+    );
+    assert.equal(await hop(3).isDisabled(), false);
+  } finally {
+    await page.close();
+  }
+});
+
 test("SSH signs in with an Ed25519 key and has no password", async () => {
   const page = await open();
   try {

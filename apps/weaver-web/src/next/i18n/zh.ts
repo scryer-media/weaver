@@ -1744,7 +1744,6 @@ export const nextZh: LocaleDictionary = {
   "next.networking.route.hop": "链的第 {{position}} 跳",
   "next.networking.route.chooseProxy": "选择代理",
   "next.networking.route.choosePool": "选择代理池",
-  "next.networking.route.optionalHop": "可选的第三跳",
   "next.networking.route.rungUp": "上移此级",
   "next.networking.route.rungDown": "下移此级",
   "next.networking.route.removeRung": "移除此级",

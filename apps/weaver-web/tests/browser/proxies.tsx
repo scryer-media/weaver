@@ -91,7 +91,7 @@ const query = new URLSearchParams(window.location.search);
 const screen = query.has("pools")
   ? <PoolsPage data={pools} action={async () => null} busy={false} proxies={panel} />
   : query.has("routes")
-    ? <RoutesPage data={pools} consumers={consumers} flow={{ legs: [], pools: [] }} action={async () => null} busy={false} />
+    ? <RoutesPage data={{ ...pools, proxyProfiles: [...pools.proxyProfiles, view(stored(4, "Paris", "WIRE_GUARD", 51820)) as NetworkingData["proxyProfiles"][number]] }} consumers={consumers} flow={{ legs: [], pools: [] }} action={async () => null} busy={false} />
     : panel;
 Object.assign(window, { proxiesFixture: fixture });
 

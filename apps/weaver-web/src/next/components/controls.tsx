@@ -359,7 +359,8 @@ export function Select<T extends string>({
         aria-label={label}
         onClick={(event) => setPlacement(open ? null : placeMenu(event.currentTarget))}
         className={cn(
-          "flex h-[34px] min-w-[208px] cursor-pointer items-center justify-between gap-3 border border-wv-control bg-wv-input px-3 text-[13px] text-wv-fg hover:border-wv-control-hover-strong",
+          "flex h-[34px] min-w-[208px] items-center justify-between gap-3 border border-wv-control bg-wv-input px-3 text-[13px]",
+          disabled ? "cursor-default text-wv-disabled" : "cursor-pointer text-wv-fg hover:border-wv-control-hover-strong",
           className,
         )}
       >

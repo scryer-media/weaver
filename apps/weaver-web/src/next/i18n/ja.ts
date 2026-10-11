@@ -1744,7 +1744,6 @@ export const nextJa: LocaleDictionary = {
   "next.networking.route.hop": "チェーンの {{position}} 段目",
   "next.networking.route.chooseProxy": "プロキシを選択",
   "next.networking.route.choosePool": "プールを選択",
-  "next.networking.route.optionalHop": "3 段目（任意）",
   "next.networking.route.rungUp": "段を上へ",
   "next.networking.route.rungDown": "段を下へ",
   "next.networking.route.removeRung": "段を削除",
