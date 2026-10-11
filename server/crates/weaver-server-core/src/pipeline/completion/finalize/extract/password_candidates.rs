@@ -28,7 +28,9 @@ where
         SevenZipDecodeMemory::ReservedForFixedThreads {
             end_header_bytes, ..
         }
-        | SevenZipDecodeMemory::ReservedPerPass { end_header_bytes } => end_header_bytes,
+        | SevenZipDecodeMemory::ReservedPerPass {
+            end_header_bytes, ..
+        } => end_header_bytes,
     };
     let list = |password: &sevenz_turbo::Password, open: &mut F| {
         read_sevenz_archive_for_listing(

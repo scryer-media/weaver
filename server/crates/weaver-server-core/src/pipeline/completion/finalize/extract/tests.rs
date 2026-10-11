@@ -1800,19 +1800,35 @@ fn sevenz_end_header_bytes(archive: &[u8]) -> u64 {
 // backlog is gone.
 #[test]
 fn chase_decode_threads_follow_the_backlog_under_the_ceiling() {
-    assert_eq!(chase_decode_thread_target(0, 8), 1);
-    assert_eq!(chase_decode_thread_target(1, 8), 2);
-    assert_eq!(chase_decode_thread_target(3, 8), 4);
-    assert_eq!(chase_decode_thread_target(7, 8), 8);
-    assert_eq!(chase_decode_thread_target(500, 8), 8);
-    assert_eq!(chase_decode_thread_target(0, 1), 1);
-    assert_eq!(chase_decode_thread_target(9, 1), 1);
+    assert_eq!(chase_decode_thread_target(0, 8, false), 1);
+    assert_eq!(chase_decode_thread_target(1, 8, false), 2);
+    assert_eq!(chase_decode_thread_target(3, 8, false), 4);
+    assert_eq!(chase_decode_thread_target(7, 8, false), 8);
+    assert_eq!(chase_decode_thread_target(500, 8, false), 8);
+    assert_eq!(chase_decode_thread_target(0, 1, false), 1);
+    assert_eq!(chase_decode_thread_target(9, 1, false), 1);
     assert_eq!(
-        chase_decode_thread_target(9, 0),
+        chase_decode_thread_target(9, 0, false),
         1,
         "a ceiling of zero is one"
     );
-    assert_eq!(chase_decode_thread_target(usize::MAX, 16), 16);
+    assert_eq!(chase_decode_thread_target(usize::MAX, 16, false), 16);
+}
+
+// The wide profile's way: still one thread at the frontier, but the whole
+// ceiling on the first waiting run, and back to one once the backlog is gone.
+#[test]
+fn chase_decode_threads_take_the_whole_ceiling_at_once_when_asked() {
+    assert_eq!(chase_decode_thread_target(0, 8, true), 1);
+    assert_eq!(chase_decode_thread_target(1, 8, true), 8);
+    assert_eq!(chase_decode_thread_target(3, 8, true), 8);
+    assert_eq!(chase_decode_thread_target(500, 8, true), 8);
+    assert_eq!(chase_decode_thread_target(1, 1, true), 1);
+    assert_eq!(
+        chase_decode_thread_target(1, 0, true),
+        1,
+        "a ceiling of zero is one"
+    );
 }
 
 // A chase's decode reservation is its decoders, end header and allowance:
@@ -1967,7 +1983,10 @@ fn chase_decode_widens_on_a_backlog_of_complete_runs() {
         sevenz_archive_limits(&budget),
         SevenZipDecodeThreads::Adaptive {
             ceiling: 4,
-            poll: std::time::Duration::from_millis(1),
+            widening: crate::runtime::hardware_profile::ChaseWidening {
+                all_at_once: false,
+                poll: std::time::Duration::from_millis(1),
+            },
             budget: Arc::clone(&budget),
         },
         |entry, reader, _dest| {
@@ -2040,7 +2059,10 @@ fn chase_7z_extraction_decodes_a_multi_run_block_adaptively() {
         password: sevenz_turbo::Password::empty(),
         event_tx,
         phase_counters: Arc::new(PhaseCounters::default()),
-        decode_memory: SevenZipDecodeMemory::ReservedPerPass { end_header_bytes },
+        decode_memory: SevenZipDecodeMemory::ReservedPerPass {
+            end_header_bytes,
+            widening: crate::runtime::hardware_profile::ChaseWidening::default(),
+        },
         decode_threads: 4,
     };
     let outcome = extract_7z_stream(&context, || {

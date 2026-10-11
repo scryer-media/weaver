@@ -136,6 +136,10 @@ pub struct SharedPipelineState {
     // profile put in force now reaches the next extraction. `u64::MAX` means no profile cap, and
     // the extraction ceiling alone bounds the decoder.
     sevenz_decode_memory_bytes: Arc<AtomicU64>,
+    // How a direct-unpack chase widens its 7z decoder, as the hardware
+    // profile in force decides it. Read when a chase starts, so a profile put
+    // in force now reaches the next chase.
+    chase_widening: Arc<RwLock<crate::runtime::hardware_profile::ChaseWidening>>,
     // The hardware profile whose limits are in force, and the scheduled one
     // overriding the operator's choice, if any. `None` until a pipeline has
     // resolved one.
@@ -199,6 +203,9 @@ impl SharedPipelineState {
             download_transport: Arc::new(RwLock::new(Vec::new())),
             server_probe_latency: Arc::new(RwLock::new(HashMap::new())),
             sevenz_decode_memory_bytes: Arc::new(AtomicU64::new(u64::MAX)),
+            chase_widening: Arc::new(RwLock::new(
+                crate::runtime::hardware_profile::ChaseWidening::default(),
+            )),
             hardware_profile: Arc::new(RwLock::new(None)),
             job_cancellations: JobCancellationRegistry::default(),
             segment_events,
@@ -443,6 +450,18 @@ impl SharedPipelineState {
     pub fn set_sevenz_decode_memory_bytes(&self, bytes: u64) {
         self.sevenz_decode_memory_bytes
             .store(bytes.max(1), Ordering::Relaxed);
+    }
+
+    // How a direct-unpack chase widens its 7z decoder. The balanced
+    // profile's widening until a profile is put in force.
+    pub fn chase_widening(&self) -> crate::runtime::hardware_profile::ChaseWidening {
+        *self.chase_widening.read().unwrap()
+    }
+
+    // Apply the chosen profile's chase widening. Chases already running keep
+    // the widening they started with.
+    pub fn set_chase_widening(&self, widening: crate::runtime::hardware_profile::ChaseWidening) {
+        *self.chase_widening.write().unwrap() = widening;
     }
 
     // The hardware profile in force, or `None` before a pipeline has

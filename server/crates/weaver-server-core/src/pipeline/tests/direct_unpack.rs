@@ -3021,7 +3021,10 @@ fn chase_context(
         password: sevenz_turbo::Password::empty(),
         event_tx: events,
         phase_counters: std::sync::Arc::new(crate::jobs::PhaseCounters::default()),
-        decode_memory: SevenZipDecodeMemory::ReservedPerPass { end_header_bytes },
+        decode_memory: SevenZipDecodeMemory::ReservedPerPass {
+            end_header_bytes,
+            widening: crate::runtime::hardware_profile::ChaseWidening::default(),
+        },
         decode_threads: 1,
     }
 }

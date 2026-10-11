@@ -1,12 +1,12 @@
 use super::rar::{ArchiveSetRetirement, UnmaterializedArchiveSet};
 use super::*;
 use crate::pipeline::extraction::{BudgetedReader, MemoryPermit, RarExtractionOpenRequest};
+use crate::runtime::hardware_profile::ChaseWidening;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::time::Duration;
 
 mod password_candidates;
 use password_candidates::extract_7z_with_password_candidates;
@@ -335,6 +335,9 @@ pub(in crate::pipeline) enum SevenZipDecodeMemory {
         // `next_header_size` from the signature header — the end header the
         // metadata pass buffers whole, and which the decode pass parses again.
         end_header_bytes: u64,
+        // How the chase widens onto its threads, from the hardware profile in
+        // force when it started.
+        widening: ChaseWidening,
     },
 }
 
@@ -370,25 +373,32 @@ pub(in crate::pipeline) const CHASE_DECODE_ALLOWANCE_BYTES: u64 = 8 * 1024 * 102
 // all its threads up front; a chase reserves it one thread at a time as it
 // widens.
 pub(in crate::pipeline) const CHASE_WIDENING_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
-// How often a chase looks at its decoder's backlog to decide its threads.
-//
-// A run is at least a dictionary's worth of decoded bytes, so at download
-// speed runs arrive tenths of a second apart at the fastest; looking more
-// often than this would find the same backlog.
-const CHASE_WIDEN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 // Threads a chase's LZMA2 decoder should use with `pending_runs` complete
 // runs waiting behind the one being decoded, under `ceiling`.
 //
 // One thread while nothing waits: the decoder is at the frontier, and a
-// second thread would only idle. One more per waiting run, so a backlog is
-// cleared as fast as the ceiling allows and the count falls back to one as
-// soon as it is gone.
-pub(in crate::pipeline) fn chase_decode_thread_target(pending_runs: usize, ceiling: u32) -> u32 {
+// second thread would only idle. With a backlog, either one more per waiting
+// run, so a backlog is cleared as fast as the ceiling allows and the count
+// falls back to one as soon as it is gone, or, `all_at_once`, the whole
+// ceiling: the wide profile's way, which clears the backlog in the fewest
+// polls at the price of taking every thread's memory on the first one.
+pub(in crate::pipeline) fn chase_decode_thread_target(
+    pending_runs: usize,
+    ceiling: u32,
+    all_at_once: bool,
+) -> u32 {
+    let ceiling = ceiling.max(1);
+    if pending_runs == 0 {
+        return 1;
+    }
+    if all_at_once {
+        return ceiling;
+    }
     u32::try_from(pending_runs)
         .unwrap_or(u32::MAX)
         .saturating_add(1)
-        .clamp(1, ceiling.max(1))
+        .clamp(1, ceiling)
 }
 
 // Room for a decode on `decode_threads` threads over its decoders. Nothing
@@ -773,8 +783,8 @@ pub(in crate::pipeline) enum SevenZipDecodeThreads {
     // [`WideningRoom`].
     Adaptive {
         ceiling: u32,
-        // How often the backlog is looked at.
-        poll: Duration,
+        // How often the backlog is looked at, and how far one look widens.
+        widening: ChaseWidening,
         budget: Arc<JobExtractionBudget>,
     },
 }
@@ -969,7 +979,7 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
             archive_reader.for_each_entries(|entry, reader| extract_fn(entry, reader, &destination))
         };
 
-    let (ceiling, poll, budget) = match threads {
+    let (ceiling, widening, budget) = match threads {
         SevenZipDecodeThreads::Fixed(count) => {
             archive_reader.set_threads(count);
             walk(&mut archive_reader)?;
@@ -979,9 +989,9 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
         }
         SevenZipDecodeThreads::Adaptive {
             ceiling,
-            poll,
+            widening,
             budget,
-        } => (ceiling.max(1), poll, budget),
+        } => (ceiling.max(1), widening, budget),
     };
 
     archive_reader.set_adaptive_lzma2(ceiling > 1);
@@ -996,12 +1006,16 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
                 let mut room = WideningRoom::new(budget);
                 let mut applied = 1u32;
                 while !finished.load(Ordering::Acquire) {
-                    std::thread::sleep(poll);
+                    std::thread::sleep(widening.poll);
                     let Some(progress) = handle.progress() else {
                         continue;
                     };
                     note_adaptive_backlog(job_id, progress.pending_runs);
-                    let target = chase_decode_thread_target(progress.pending_runs, ceiling);
+                    let target = chase_decode_thread_target(
+                        progress.pending_runs,
+                        ceiling,
+                        widening.all_at_once,
+                    );
                     // Widening is paid for before the decoder is told, and
                     // narrowing keeps its room until the walk ends.
                     let next = if target > applied {
@@ -1153,7 +1167,9 @@ where
         SevenZipDecodeMemory::ReservedForFixedThreads {
             end_header_bytes, ..
         }
-        | SevenZipDecodeMemory::ReservedPerPass { end_header_bytes } => *end_header_bytes,
+        | SevenZipDecodeMemory::ReservedPerPass {
+            end_header_bytes, ..
+        } => *end_header_bytes,
     };
 
     // Metadata pass: every member's path and declared size is checked before
@@ -1372,7 +1388,7 @@ where
             limits.memory_limit_bytes = decode_granted;
             SevenZipDecodeThreads::Fixed(*decode_threads)
         }
-        SevenZipDecodeMemory::ReservedPerPass { .. } => {
+        SevenZipDecodeMemory::ReservedPerPass { widening, .. } => {
             // The reader's limit is fixed when it opens and cannot follow the
             // room the chase takes as it widens, so it is set to what the
             // chase would hold widened to its ceiling. The thread count is
@@ -1383,7 +1399,7 @@ where
                 .min(budget.max_memory_bytes());
             SevenZipDecodeThreads::Adaptive {
                 ceiling: *decode_threads,
-                poll: CHASE_WIDEN_POLL_INTERVAL,
+                widening: *widening,
                 budget: Arc::clone(budget),
             }
         }

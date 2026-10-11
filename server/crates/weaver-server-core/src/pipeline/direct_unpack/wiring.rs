@@ -1855,6 +1855,8 @@ impl Pipeline {
         // its pool. These threads are the decoder's own, not pool workers; the
         // chase keeps the one worker it was admitted on.
         let decode_threads = u32::try_from(pp_pool.current_num_threads()).unwrap_or(u32::MAX);
+        // And how it spends them: the profile in force when the chase starts.
+        let widening = self.shared_state.chase_widening();
         let db = self.db.clone();
         let cached_policy = self.unacceptable_extension_policies.get(&job_id).cloned();
         let chase_budget = Arc::clone(&budget);
@@ -2062,7 +2064,10 @@ impl Pipeline {
                         password: pw,
                         event_tx: silent_events,
                         phase_counters: counters,
-                        decode_memory: SevenZipDecodeMemory::ReservedPerPass { end_header_bytes },
+                        decode_memory: SevenZipDecodeMemory::ReservedPerPass {
+                            end_header_bytes,
+                            widening,
+                        },
                         decode_threads,
                     };
 

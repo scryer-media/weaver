@@ -129,6 +129,11 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(efficient.decode_threads, 2);
     assert_eq!(efficient.extract_threads, 4);
     assert_eq!(efficient.max_concurrent_downloads_cap, Some(10));
+    assert!(!efficient.chase_widening.all_at_once);
+    assert_eq!(
+        efficient.chase_widening.poll,
+        std::time::Duration::from_millis(200)
+    );
 
     let balanced = HardwareProfile::Balanced.tuning(&large);
     assert_eq!(balanced.sevenz_decode_memory_bytes, GIB);
@@ -136,6 +141,13 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(balanced.decode_threads, 4);
     assert_eq!(balanced.extract_threads, 8);
     assert_eq!(balanced.max_concurrent_downloads_cap, None);
+    assert_eq!(balanced.chase_widening, ChaseWidening::BALANCED);
+    assert_eq!(balanced.chase_widening, ChaseWidening::default());
+    assert!(!balanced.chase_widening.all_at_once);
+    assert_eq!(
+        balanced.chase_widening.poll,
+        std::time::Duration::from_millis(100)
+    );
 
     let performance = HardwareProfile::Performance.tuning(&large);
     assert_eq!(performance.sevenz_decode_memory_bytes, 4 * GIB);
@@ -143,6 +155,11 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(performance.decode_threads, 16);
     assert_eq!(performance.extract_threads, 8);
     assert_eq!(performance.max_concurrent_downloads_cap, None);
+    assert!(performance.chase_widening.all_at_once);
+    assert_eq!(
+        performance.chase_widening.poll,
+        std::time::Duration::from_millis(50)
+    );
 }
 
 // The extraction, PAR3 and holds limits shrink with the profile, and the
