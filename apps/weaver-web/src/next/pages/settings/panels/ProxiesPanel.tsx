@@ -259,6 +259,9 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
       ],
       empty: t("next.proxies.empty"),
       emptyAction: { label: t("next.proxies.add"), onClick: () => setEditingId("new") },
+      footer: profiles.length ? (
+        <PrimaryButton icon="add" onClick={() => setEditingId("new")}>{t("next.proxies.add")}</PrimaryButton>
+      ) : undefined,
       onRowClick: (id) => {
         const profile = profiles.find((entry) => String(entry.id) === id);
         if (profile) {

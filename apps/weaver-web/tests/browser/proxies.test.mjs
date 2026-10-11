@@ -11,12 +11,12 @@ before(async () => {
   browser = await chromium.launch({ headless: true });
 });
 after(async () => { await browser?.close(); await server?.close(); });
-async function open() {
+async function open(query = "") {
   const page = await browser.newPage({ viewport: { width: 1400, height: 1500 } });
   page.setDefaultTimeout(0);
   page.on("pageerror", (error) => console.error(error));
   await page.route("**/*", (route) => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort());
-  await page.goto(`${baseUrl}/tests/browser/proxies.html`);
+  await page.goto(`${baseUrl}/tests/browser/proxies.html${query}`);
   await page.getByText("Amsterdam", { exact: true }).waitFor();
   return page;
 }
@@ -251,6 +251,36 @@ test("a stored WireGuard proxy opens on its details, and a configuration can sti
     await editor.locator("input[type='file']").setInputFiles(file("wg0.conf", CONFIG));
     await filled(editor);
   } finally { await page.close(); }
+});
+
+test("pools and proxies are each added from the top bar and from the right under their own table", async () => {
+  const page = await open("?pools");
+  try {
+    const bar = page.locator("#controls");
+    const list = page.locator("main");
+    const primary = await action(bar, "Add proxy").evaluate((button) => getComputedStyle(button).backgroundColor);
+    for (const name of ["Add pool", "Add proxy"]) {
+      await action(bar, name).waitFor();
+      const under = action(list, name);
+      assert.equal(await under.count(), 1);
+      // Past the middle of the list, and the same button as the top bar's.
+      const [button, table] = [await under.boundingBox(), await list.boundingBox()];
+      assert.ok(button.x > table.x + table.width / 2, `${name} sits on the right`);
+      assert.equal(await under.evaluate((button) => getComputedStyle(button).backgroundColor), primary);
+      await under.click();
+      const editor = page.getByRole("dialog", { name, exact: true });
+      await editor.waitFor();
+      await action(editor, "Cancel").click();
+      await editor.waitFor({ state: "detached" });
+      await action(bar, name).click();
+      await editor.waitFor();
+      await action(editor, "Cancel").click();
+      await editor.waitFor({ state: "detached" });
+    }
+    await shot(page, "pools-and-proxies");
+  } finally {
+    await page.close();
+  }
 });
 
 test("SSH signs in with an Ed25519 key and has no password", async () => {

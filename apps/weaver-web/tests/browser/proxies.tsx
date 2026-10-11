@@ -6,6 +6,8 @@ import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import { PasswordManagersKeptOut } from "@/lib/password-manager";
 import type { ProxyKind } from "@/lib/proxies";
+import type { NetworkingData } from "@/next/features/networking/data";
+import { PoolsPage } from "@/next/features/networking/PoolsPage";
 import { nextEn } from "@/next/i18n/en";
 import { ProxiesPanel } from "@/next/pages/settings/panels/ProxiesPanel";
 import { SettingsShellProvider } from "@/next/pages/settings/framework";
@@ -75,6 +77,16 @@ function graphql(name: string, variables: Record<string, unknown>) {
   return { data: { proxyProfiles: profiles.map(view), testProxyProfile: { success: true, message: "" } } };
 }
 const fixture = { profiles, requests, changes: 0 };
+const panel = <ProxiesPanel onChanged={() => { fixture.changes += 1; }} />;
+/* With `?pools` the table sits where the app shows it, under the pools that group its proxies. */
+const pools = {
+  egressInterfaces: [], proxyProfiles: profiles.map(view), proxyPools: [{ id: 1, name: "Exits", kind: "SOCKS5", memberIds: [3], enabled: true }],
+  discoverNetworkInterfaces: [], servers: [], rssFeeds: [],
+  platformNetworking: { platform: "fixture", egressBindingKinds: ["SYSTEM"], sourceAddressHint: null, container: false, bridgeNetworkSuspected: false, maxWireguardInstances: 4, notes: [] },
+} as unknown as NetworkingData;
+const screen = new URLSearchParams(window.location.search).has("pools")
+  ? <PoolsPage data={pools} action={async () => null} busy={false} proxies={panel} />
+  : panel;
 Object.assign(window, { proxiesFixture: fixture });
 
 const client = new Client({ url: "/graphql", exchanges: [fetchExchange], preferGetMethod: false });
@@ -88,4 +100,4 @@ const dictionary: Record<string, string> = { ...en, ...nextEn };
 const shell = {
   search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls"),
 };
-createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto flex max-w-[1400px] flex-col p-8"><PasswordManagersKeptOut value><ProxiesPanel onChanged={() => { fixture.changes += 1; }} /></PasswordManagersKeptOut></main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);
+createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto flex max-w-[1400px] flex-col p-8"><PasswordManagersKeptOut value>{screen}</PasswordManagersKeptOut></main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);
