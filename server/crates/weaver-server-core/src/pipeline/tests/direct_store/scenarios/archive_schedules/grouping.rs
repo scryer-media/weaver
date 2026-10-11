@@ -955,6 +955,22 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 // no refetch of durable articles below.
                 route.direct = outcome.finalized == route.sets;
             }
+            if cell.naming == Naming::HexSwappedRar
+                && matches!(cell.binding, Binding::Par2RealFirst | Binding::Par2RealLast)
+                && interruption
+                    .loss()
+                    .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
+            {
+                // A lost identity prefix can prevent binding before enough
+                // header evidence survives to prove the swapped chain.
+                route.shape_demotion = |reason| {
+                    matches!(
+                        reason,
+                        DemotionReason::Par2Unbindable
+                            | DemotionReason::MemberIneligible(MemberIneligibility::MalformedChain)
+                    )
+                };
+            }
             if cell.naming == Naming::OldStyleS
                 && interruption
                     .loss()
@@ -993,6 +1009,46 @@ pub(super) async fn cell_smoke(cell: Cell) {
             (1, (backward.clone(), Interruption::None)),
         ];
         run_cell(cell, profile, cases).await;
+    }
+}
+
+#[tokio::test]
+async fn repaired_swapped_rar_retires_lost_posted_volumes() {
+    run_cell(
+        Cell {
+            container: Container::Rar4,
+            naming: Naming::HexSwappedRar,
+            binding: Binding::Par2RealFirst,
+        },
+        ExtractionProfile::DirectStore,
+        [240, 244, 252, 268]
+            .into_iter()
+            .map(|case| (case, schedules().into_iter().nth(case).unwrap()))
+            .collect(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn repaired_swapped_rar_does_not_reextract_damaged_sources() {
+    for (container, profile, case) in [
+        (Container::Rar4, ExtractionProfile::Chase, 248),
+        (
+            Container::Rar5Encrypted,
+            ExtractionProfile::DirectStore,
+            266,
+        ),
+    ] {
+        run_cell(
+            Cell {
+                container,
+                naming: Naming::HexSwappedRar,
+                binding: Binding::Par2RealFirst,
+            },
+            profile,
+            vec![(case, schedules().into_iter().nth(case).unwrap())],
+        )
+        .await;
     }
 }
 

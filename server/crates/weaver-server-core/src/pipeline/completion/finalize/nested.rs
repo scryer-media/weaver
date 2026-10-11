@@ -472,7 +472,7 @@ impl Pipeline {
             self.deferred_post_processing.insert(job_id);
             return Ok(NestedExtractionDecision::Deferred);
         }
-        let current_archive_sources: HashSet<String> = self
+        let mut current_archive_sources: HashSet<String> = self
             .jobs
             .get(&job_id)
             .ok_or_else(|| format!("job {} not found", job_id.0))?
@@ -481,6 +481,17 @@ impl Pipeline {
             .values()
             .flat_map(|topology| topology.volume_map.keys().cloned())
             .collect();
+        // Verified recovery can retire an opaque damaged source before it
+        // ever acquires an archive topology. It is still an outer input, not
+        // an archive member produced by extraction.
+        if let Some(state) = self.jobs.get(&job_id) {
+            for file in state.assembly.files() {
+                if self.recovery_superseded_source(job_id, file.file_id()) {
+                    current_archive_sources
+                        .insert(self.current_filename_for_file(job_id, file).to_string());
+                }
+            }
+        }
         let scan_root = self.nested_scan_root(job_id)?;
         if self
             .jobs

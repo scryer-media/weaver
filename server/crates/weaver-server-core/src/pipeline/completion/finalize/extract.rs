@@ -2905,6 +2905,18 @@ impl Pipeline {
                     // retirement exit was written to protect.
                     if !self.rar_sets.contains_key(&(job_id, set_name.to_string())) {
                         match self.classify_unmaterialized_archive_set(job_id, set_name) {
+                            UnmaterializedArchiveSet::ReplacedBy(owner) => {
+                                debug!(
+                                    job_id = job_id.0,
+                                    set_name = %set_name,
+                                    owner = %owner,
+                                    "waiting for the verified replacement archive to extract"
+                                );
+                                if let Some(inflight) = self.inflight_extractions.get_mut(&job_id) {
+                                    inflight.remove(set_name);
+                                }
+                                return Ok(0);
+                            }
                             UnmaterializedArchiveSet::ConsumedBy(owner) => {
                                 info!(
                                     job_id = job_id.0,

@@ -36,6 +36,22 @@ impl Pipeline {
             return;
         }
 
+        // Recovery can replace an entirely lost posted roster under a new
+        // name. Once the replacement is verified and extracted, its empty
+        // predecessor must not keep waiting for an archive it never received.
+        if self.par2_verified.contains(&job_id)
+            && self.par2_verdict_delivered_unposted_payload(job_id)
+            && !self.job_has_pending_download_pipeline_work(job_id)
+        {
+            for set_name in &set_names {
+                if matches!(self.classify_unmaterialized_archive_set(job_id, set_name),
+                    crate::pipeline::completion::finalize::rar::UnmaterializedArchiveSet::ConsumedBy(_))
+                {
+                    self.extracted_archives.entry(job_id).or_default().insert(set_name.clone());
+                }
+            }
+        }
+
         // A full-set extraction of a set with no runtime state of its own (a
         // name only a file classification still carries) counts no workers,
         // so its in-flight entry is the only sign it is running. Starting
@@ -86,7 +102,11 @@ impl Pipeline {
             .direct_store
             .sets_for(job_id)
             .iter()
-            .filter(|set| !set.is_demoted() && !set.is_finalized())
+            .filter(|set| {
+                !set.is_demoted()
+                    && !set.is_finalized()
+                    && !extracted_archives.contains(&set.plan().set_name)
+            })
             .map(|set| set.plan().set_name.clone())
             .collect();
         let mut parked_without_first_volume = false;
@@ -294,7 +314,25 @@ impl Pipeline {
         };
         let mut saw_incomplete = false;
 
+        // A repaired archive may have no posted file bound to its canonical
+        // name. Superseding its damaged inputs does not discharge extraction
+        // of the verified replacement.
+        if let Some(unposted) = self.recovery_unposted_outputs.get(&job_id) {
+            for name in &unposted.outputs {
+                let role = weaver_model::files::FileRole::from_filename(name);
+                if let Some(set_name) = weaver_model::files::archive_base_name(name, &role)
+                    && !set_is_extracted(&set_name)
+                {
+                    return false;
+                }
+            }
+        }
+
         for file in state.assembly.files() {
+            if self.recovery_superseded_source(job_id, file.file_id()) {
+                saw_incomplete |= !file.is_complete();
+                continue;
+            }
             if file.is_complete() {
                 // A volume that arrived intact still has to be opened. Skipping
                 // every complete file meant this read "nothing is left to do"
