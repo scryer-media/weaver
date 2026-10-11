@@ -310,6 +310,19 @@ test(`a completed deletion cannot navigate away from another job`, RUNNER_BOUND,
   } finally { await page.close(); }
 });
 
+test(`a rule can be added only once there is a feed for it`, RUNNER_BOUND, async () => {
+  const page = await open("feeds");
+  try {
+    const add = page.getByRole("button", { name: "Add rule", exact: true });
+    await add.waitFor();
+    assert.equal(await add.count(), 1);
+    assert.equal(await add.isDisabled(), true);
+    if (process.env.RECORD_IDENTITY_SCREENSHOT_DIR) {
+      await page.screenshot({ path: `${process.env.RECORD_IDENTITY_SCREENSHOT_DIR}/rss-empty.png` });
+    }
+  } finally { await page.close(); }
+});
+
 test(`late folder creation cannot replace a reopened picker`, RUNNER_BOUND, async () => {
   const page = await open("folders");
   try {

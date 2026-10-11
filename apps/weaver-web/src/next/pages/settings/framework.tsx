@@ -364,7 +364,7 @@ export interface SettingsTableModel {
    * empty panel's next step belongs where the eye already is, not only in the
    * top bar's corner.
    */
-  emptyAction?: { label: string; onClick: () => void };
+  emptyAction?: { label: string; onClick: () => void; disabled?: boolean };
   /**
    * A trailing row of the table's own actions — "Add rule", "Clear history".
    * The top bar carries a panel's actions; a table that owns more than one
@@ -581,7 +581,7 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
           <div className="flex flex-col items-start gap-3 px-4 sm:px-6 py-5">
             <span className="text-[13px] text-wv-muted">{block.empty ?? t("next.settings.nothingConfigured")}</span>
             {block.emptyAction === undefined ? null : (
-              <PrimaryButton icon="add" onClick={block.emptyAction.onClick}>
+              <PrimaryButton icon="add" onClick={block.emptyAction.onClick} disabled={block.emptyAction.disabled}>
                 {block.emptyAction.label}
               </PrimaryButton>
             )}

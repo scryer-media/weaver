@@ -531,6 +531,8 @@ export function RssPanel() {
         t("next.rss.filesInto"),
       ],
       empty: t("next.rss.rulesEmpty"),
+      // A rule belongs to a feed, so there is nothing to add one to before a feed exists.
+      emptyAction: { label: t("next.rss.addRule"), onClick: () => openRule(null), disabled: feeds.length === 0 },
       onRowClick: (id) => {
         const entry = rules.find((candidate) => String(candidate.rule.id) === id);
         if (entry) {
@@ -538,8 +540,8 @@ export function RssPanel() {
         }
       },
       footer:
-        feeds.length > 0 ? (
-          <SecondaryButton icon="add" onClick={() => openRule(null)}>{t("next.rss.addRule")}</SecondaryButton>
+        rules.length > 0 ? (
+          <PrimaryButton icon="add" onClick={() => openRule(null)}>{t("next.rss.addRule")}</PrimaryButton>
         ) : undefined,
       rows: rules.map(({ rule, feed }) => ({
         id: String(rule.id),
