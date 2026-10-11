@@ -169,6 +169,131 @@ fn verified_sevenz_part_paths(parts: &[(u32, PathBuf)]) -> Result<Vec<PathBuf>, 
     Ok(selected)
 }
 
+struct SevenZipParts {
+    paths: Vec<PathBuf>,
+    lengths: Option<Vec<u64>>,
+}
+
+impl SevenZipParts {
+    fn open(&self) -> std::io::Result<crate::pipeline::archive::split_reader::SplitFileReader> {
+        use crate::pipeline::archive::split_reader::SplitFileReader;
+        match &self.lengths {
+            Some(lengths) => SplitFileReader::open_with_lengths(&self.paths, lengths),
+            None => SplitFileReader::open(&self.paths),
+        }
+    }
+}
+
+// A malformed UU line count can expose up to two zero padding bytes. Only
+// sets with a known UU source qualify for this fallback. A completed sibling
+// can survive restart without its transport cache. The start header fixes the total
+// length, and its end-header CRC must identify one unique split geometry before
+// the ordinary extractor verifies every member. Source files remain untouched.
+fn resolve_sevenz_parts(
+    parts: &[(u32, PathBuf)],
+    uu_paths: &HashSet<PathBuf>,
+) -> Result<SevenZipParts, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let original_error = match verified_sevenz_part_paths(parts) {
+        Ok(paths) => {
+            return Ok(SevenZipParts {
+                paths,
+                lengths: None,
+            });
+        }
+        Err(error) => error,
+    };
+    if parts.is_empty()
+        || !parts.iter().any(|(_, path)| uu_paths.contains(path))
+        || !parts
+            .iter()
+            .enumerate()
+            .all(|(index, (part, _))| *part as usize == index)
+    {
+        return Err(original_error);
+    }
+    let Some(header) = read_sevenz_start_header(&parts[0].1) else {
+        return Err(original_error);
+    };
+    let offset = u64::from_le_bytes(header[12..20].try_into().unwrap());
+    let size = u64::from_le_bytes(header[20..28].try_into().unwrap());
+    let Some(start) = 32u64.checked_add(offset) else {
+        return Err(original_error);
+    };
+    let Some(total) = start.checked_add(size) else {
+        return Err(original_error);
+    };
+    let sizes = parts
+        .iter()
+        .map(|(_, path)| {
+            std::fs::metadata(path)
+                .map(|meta| meta.len())
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut selected = None;
+    for padding in 0..=if parts.len() == 1 { 0 } else { 2 } {
+        let Some(chunk) = sizes[0].checked_sub(padding).filter(|chunk| *chunk >= 32) else {
+            continue;
+        };
+        if total.div_ceil(chunk) != parts.len() as u64 {
+            continue;
+        }
+        let lengths: Vec<_> = (0..parts.len())
+            .map(|index| chunk.min(total - index as u64 * chunk))
+            .collect();
+        let valid_tails =
+            parts
+                .iter()
+                .zip(&sizes)
+                .zip(&lengths)
+                .all(|(((_, path), physical), logical)| {
+                    let Some(excess) = physical.checked_sub(*logical).filter(|excess| *excess <= 2)
+                    else {
+                        return false;
+                    };
+                    let Ok(mut file) = std::fs::File::open(path) else {
+                        return false;
+                    };
+                    let mut tail = [0; 2];
+                    file.seek(SeekFrom::Start(*logical)).is_ok()
+                        && file.read_exact(&mut tail[..excess as usize]).is_ok()
+                        && tail == [0; 2]
+                });
+        if !valid_tails {
+            continue;
+        }
+        let candidate = SevenZipParts {
+            paths: parts.iter().map(|(_, path)| path.clone()).collect(),
+            lengths: Some(lengths),
+        };
+        let mut reader = candidate.open().map_err(|error| error.to_string())?;
+        reader
+            .seek(SeekFrom::Start(start))
+            .map_err(|error| error.to_string())?;
+        let mut remaining = size;
+        let mut buffer = [0; 64 * 1024];
+        let mut crc = weaver_yenc::crc::Crc32::new();
+        while remaining != 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            reader
+                .read_exact(&mut buffer[..count])
+                .map_err(|error| error.to_string())?;
+            crc.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+        if crc.finalize() != u32::from_le_bytes(header[28..32].try_into().unwrap()) {
+            continue;
+        }
+        if selected.is_some() {
+            return Err("ambiguous UU 7z part padding".into());
+        }
+        selected = Some(candidate);
+    }
+    selected.ok_or(original_error)
+}
+
 // A decoder can reach EOF before its checksum reader reaches the declared
 // length. Verify both facts before committing the member or its counters.
 fn copy_verified_7z_member(
@@ -3188,6 +3313,22 @@ impl Pipeline {
     ) -> Result<u32, String> {
         let part_candidates = self.archive_set_indexed_part_paths(job_id, set_name)?;
         let passwords = self.archive_password_candidates_for_set(job_id, set_name);
+        let uu_paths: HashSet<PathBuf> = self
+            .jobs
+            .get(&job_id)
+            .into_iter()
+            .flat_map(|state| {
+                state
+                    .assembly
+                    .files()
+                    .filter(|file| self.uu_files.contains_key(&file.file_id()))
+                    .map(|file| {
+                        state
+                            .working_dir
+                            .join(self.current_filename_for_file(job_id, file))
+                    })
+            })
+            .collect();
 
         let output_dir = self.extraction_staging_dir(job_id);
         let budget = self.extraction_budget(job_id, &output_dir)?;
@@ -3239,9 +3380,9 @@ impl Pipeline {
                 pp_pool.install(move || {
                     let _task_permit = task_permit;
                     let root = _task_permit.root();
-                    let file_paths = verified_sevenz_part_paths(&part_candidates)
+                    let parts = resolve_sevenz_parts(&part_candidates, &uu_paths)
                         .map_err(|error| format!("failed to read 7z archive: {error}"))?;
-                    let end_header_bytes = sevenz_declared_end_header_bytes(&file_paths[0]);
+                    let end_header_bytes = sevenz_declared_end_header_bytes(&parts.paths[0]);
 
                     let context = SevenZipExtractionContext {
                         job_id,
@@ -3259,22 +3400,11 @@ impl Pipeline {
                         decode_threads: sevenz_decode_threads,
                     };
 
-                    // A one-part set is a plain file; anything more is the
-                    // concatenation of its parts. That is the only difference
-                    // between the two conventional paths.
-                    if file_paths.len() == 1 {
-                        extract_7z_with_password_candidates(context, &passwords, || {
-                            std::fs::File::open(&file_paths[0])
-                                .map_err(|e| format!("failed to open 7z file: {e}"))
-                        })
-                    } else {
-                        extract_7z_with_password_candidates(context, &passwords, || {
-                            crate::pipeline::archive::split_reader::SplitFileReader::open(
-                                &file_paths,
-                            )
-                            .map_err(|e| format!("failed to open 7z split files: {e}"))
-                        })
-                    }
+                    extract_7z_with_password_candidates(context, &passwords, || {
+                        parts
+                            .open()
+                            .map_err(|error| format!("failed to open 7z parts: {error}"))
+                    })
                 })
             })
             .await;
