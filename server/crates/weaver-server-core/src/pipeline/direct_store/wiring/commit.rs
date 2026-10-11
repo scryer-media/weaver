@@ -1254,19 +1254,61 @@ impl Pipeline {
                 .as_ref()
                 .is_some_and(|runtime| runtime.verified(job_id));
         if !recovery_verified
-            && self.jobs.get(&job_id).is_some_and(|state| {
-                state.assembly.files().any(|file| {
-                    !file.is_complete()
-                        && !matches!(
-                            self.classified_role_for_file(job_id, file),
-                            weaver_model::files::FileRole::Par2 { .. }
-                                | weaver_model::files::FileRole::Par3 { .. }
-                                | weaver_model::files::FileRole::Standalone
-                        )
-                })
+            && let Some(incomplete) = self.jobs.get(&job_id).and_then(|state| {
+                state
+                    .assembly
+                    .files()
+                    .find(|file| {
+                        !file.is_complete()
+                            && !matches!(
+                                self.classified_role_for_file(job_id, file),
+                                weaver_model::files::FileRole::Par2 { .. }
+                                    | weaver_model::files::FileRole::Par3 { .. }
+                                    | weaver_model::files::FileRole::Standalone
+                            )
+                    })
+                    .map(|file| self.current_filename_for_file(job_id, file))
             })
         {
+            // The recovery gates above have released this job. Once download
+            // work is exhausted, an incomplete archive cannot release its own
+            // hold; fail before publishing any neighbouring healthy member.
+            if !self.job_has_pending_download_pipeline_work(job_id) {
+                self.fail_job(
+                    job_id,
+                    format!("archive file {incomplete} is incomplete after downloads and recovery settled"),
+                );
+            }
             return;
+        }
+        if !recovery_verified && !self.job_has_pending_download_pipeline_work(job_id) {
+            // Complete article coverage can still leave an unfillable member
+            // chain after damaged headers. With no remaining recovery verdict
+            // or validation worker, let the conventional parser judge it.
+            let stalled: Vec<_> = self
+                .direct_store
+                .sets_for(job_id)
+                .iter()
+                .enumerate()
+                .filter(|(index, set)| {
+                    !set.is_demoted()
+                        && !set.is_finalized()
+                        && !set.ready_to_finalize()
+                        && !self.direct_set_has_pending_volume_tail(job_id, *index)
+                        && !self.direct_rearm_in_flight.contains(&(job_id, *index))
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for index in stalled {
+                self.demote_direct_set(
+                    job_id,
+                    index,
+                    DemotionReason::MemberIneligible(
+                        super::super::router::MemberIneligibility::MalformedChain,
+                    ),
+                )
+                .await;
+            }
         }
         if self
             .direct_store
