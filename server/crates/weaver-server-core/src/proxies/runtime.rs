@@ -500,6 +500,15 @@ impl ProxyRuntime {
             )
             .collect())
     }
+    // Whether the runtime knows this consumer, so a route for it can be
+    // drafted and governed. A feed row that exists before the next reload
+    // is not yet a consumer, and polling it would bypass its kill switch.
+    pub fn routes_consumer(&self, consumer: Consumer) -> bool {
+        self.consumers
+            .read()
+            .expect("proxy consumers")
+            .contains(&consumer.key())
+    }
     pub fn policy(&self, consumer: Consumer) -> RoutingPolicy {
         self.policies
             .read()
@@ -658,9 +667,19 @@ impl ProxyRuntime {
                 }
                 *self.profiles.write().expect("proxy profiles") = profiles;
                 *self.policies.write().expect("proxy policies") = policies;
-                *self.consumers.write().expect("proxy consumers") = consumers;
-                obsolete
+                let previous = std::mem::replace(
+                    &mut *self.consumers.write().expect("proxy consumers"),
+                    consumers,
+                );
+                let new_feeds = self
+                    .consumers
+                    .read()
+                    .expect("proxy consumers")
+                    .iter()
+                    .any(|key| key.starts_with("rss:") && !previous.contains(key));
+                (obsolete, new_feeds)
             };
+        let (obsolete, new_feeds) = obsolete;
         for route in obsolete {
             route.revoke().await;
         }
@@ -668,6 +687,11 @@ impl ProxyRuntime {
             hop.provider.shutdown().await;
         }
         self.network.reload().await?;
+        if new_feeds {
+            // The poller skipped these feeds while they had no route; now
+            // that one exists, poll them through it without waiting a tick.
+            self.db.wake_rss_scheduler();
+        }
         Ok(())
     }
     pub async fn stop_all(&self) {

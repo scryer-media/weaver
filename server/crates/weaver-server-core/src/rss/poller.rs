@@ -322,7 +322,7 @@ impl RssService {
                         .map_err(|e| RssServiceError::Http(e.to_string()))?
                         // Re-checked on the full row: it may have been
                         // edited between the two reads.
-                        .filter(|feed| feed.enabled && is_due(feed, now))
+                        .filter(|feed| feed.enabled && is_due(feed, now) && self.has_route(feed.id))
                     {
                         feeds.push(feed);
                     }
@@ -335,7 +335,7 @@ impl RssService {
                 .list_rss_feeds()
                 .map_err(|e| RssServiceError::Http(e.to_string()))?
                 .into_iter()
-                .filter(|feed| feed.enabled)
+                .filter(|feed| feed.enabled && self.has_route(feed.id))
                 .collect(),
         };
 
@@ -345,6 +345,17 @@ impl RssService {
 
         let now = self.now();
         Ok(feeds.into_iter().filter(|feed| is_due(feed, now)).collect())
+    }
+
+    // A feed is polled only through its routed, kill-switch-governed path.
+    // Between the row insert and the proxy runtime reload that installs its
+    // route, a new feed has none, so a sweep leaves it for the wake the
+    // reload sends instead of polling it unrouted or recording a failure.
+    fn has_route(&self, feed_id: u32) -> bool {
+        self.inner
+            .handle
+            .proxy_runtime()
+            .is_none_or(|runtime| runtime.routes_consumer(crate::proxies::Consumer::Rss(feed_id)))
     }
 
     async fn sync_feed(

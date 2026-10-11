@@ -1005,6 +1005,39 @@ async fn due_sync_uses_a_cached_schedule_until_the_actual_deadline() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_feed_without_a_route_waits_for_the_runtime_reload() {
+    let temp = TempDir::new().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let service = build_service(temp.path(), db.clone(), Arc::new(StdMutex::new(Vec::new())));
+    let runtime =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    service.inner.handle.set_proxy_runtime(runtime.clone());
+    // Inserted the way the API does it, before the runtime has reloaded:
+    // the row is due but has no consumer route yet.
+    db.insert_rss_feed(&scheduled_feed(1, None)).unwrap();
+    let target = crate::rss::poller::RssSyncTarget::AllEnabledFeeds;
+    assert!(service.load_target_feeds(target, true).unwrap().is_empty());
+    assert!(service.load_target_feeds(target, false).unwrap().is_empty());
+    assert!(matches!(
+        service.try_run_due_sync().await.unwrap(),
+        DueSyncOutcome::NoFeedsDue
+    ));
+    assert_eq!(db.get_rss_feed(1).unwrap().unwrap().last_error, None);
+    let mut changed = db.rss_schedule_cache.changed.subscribe();
+    runtime.reload().await.unwrap();
+    changed.changed().await.unwrap();
+    assert_eq!(
+        service
+            .load_target_feeds(target, true)
+            .unwrap()
+            .iter()
+            .map(|feed| feed.id)
+            .collect::<Vec<_>>(),
+        [1]
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_scheduled_pause_parks_the_due_timer_until_resume() {
     let temp = TempDir::new().unwrap();
     let db = Database::open_in_memory().unwrap();

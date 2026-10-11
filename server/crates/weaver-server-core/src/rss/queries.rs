@@ -196,6 +196,13 @@ impl Database {
             .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
+    // Re-run the due check without discarding the cached schedules.
+    pub(crate) fn wake_rss_scheduler(&self) {
+        self.rss_schedule_cache
+            .changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
     pub fn list_rss_rules(&self, feed_id: u32) -> Result<Vec<RssRuleRow>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
