@@ -1093,12 +1093,13 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                             | Naming::ConventionalFour
                             | Naming::Single
                             | Naming::MixedCase
-                            | Naming::OldStyleS
                     )
                 {
                     // Recognizable posted names retain their direct identity even
                     // with every payload article absent. Obfuscated, reordered or
-                    // reposted names need content evidence and rebuild on disk.
+                    // reposted names need content evidence and rebuild on disk, and
+                    // so do old-style names, which differ from the real PAR2 names
+                    // and bind only through a content prefix the loss took.
                     route.direct = false;
                 }
                 if matches!(
