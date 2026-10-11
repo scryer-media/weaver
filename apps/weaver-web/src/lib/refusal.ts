@@ -23,10 +23,24 @@ export function refusalMessage(t: Translate, error: FailedRequest): string {
   const code = refusal.extensions?.code;
   if (typeof code === "string") {
     const key = refusalKey(code);
-    const sentence = t(key);
+    const sentence = t(key, namedValues(refusal.extensions?.params));
     if (sentence !== key) {
       return sentence;
     }
   }
   return refusal.message;
+}
+
+/** The numbers and words a refusal names, for a sentence that repeats them. */
+function namedValues(params: unknown): Record<string, string | number> | undefined {
+  if (typeof params !== "object" || params === null) {
+    return undefined;
+  }
+  const values: Record<string, string | number> = {};
+  for (const [name, value] of Object.entries(params)) {
+    if (typeof value === "string" || typeof value === "number") {
+      values[name] = value;
+    }
+  }
+  return values;
 }
