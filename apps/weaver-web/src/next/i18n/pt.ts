@@ -1372,8 +1372,6 @@ export const nextPt: LocaleDictionary = {
   "next.system.kernel.rarCrc32": "CRC32 do RAR",
   "next.system.kernel.rarSha1": "SHA-1 do RAR",
   "next.system.kernel.rarAes": "Descriptografia RAR",
-  "next.proxies.betaNotice": "Os proxies estão em beta. Teste cada perfil antes de encaminhar um provedor ou feed por ele.",
-  "next.routing.betaNotice": "O roteamento por proxy está em beta. Teste os proxies desta rota antes de depender dela.",
   "next.login.username": "Usuário",
   "next.login.password": "Senha",
   "next.login.submit": "Entrar",

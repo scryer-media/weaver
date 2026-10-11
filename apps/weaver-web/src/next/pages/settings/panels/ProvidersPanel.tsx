@@ -14,7 +14,7 @@ import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import type { DownloadQuota } from "@/lib/networking";
 import { blockedRouting, directRouting, routeFields, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
-import { BetaTag, Square } from "../../../components/chrome";
+import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Icon } from "../../../components/icons";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
@@ -648,7 +648,6 @@ export function ProvidersPanel() {
         {
           id: "routing",
           title: t("next.providers.networkRoute"),
-          tag: <BetaTag />,
           fields:
             editingId === "new"
               ? [

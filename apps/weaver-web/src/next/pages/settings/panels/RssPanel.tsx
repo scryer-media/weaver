@@ -14,7 +14,7 @@ import {
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { blockedRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
-import { BetaTag, Square } from "../../../components/chrome";
+import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { PrimaryButton, SecondaryButton, Select } from "../../../components/controls";
@@ -819,7 +819,6 @@ export function RssPanel() {
     {
       id: "routing",
       title: t("next.providers.networkRoute"),
-      tag: <BetaTag />,
       fields:
         feedId === "new"
           ? [

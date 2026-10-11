@@ -86,7 +86,6 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     group: "networking",
     label: "settings.networkOverview",
     note: "settings.networkingDesc",
-    tag: "beta",
     icon: "networkOverview",
     Component: NetworkingPanel,
   },

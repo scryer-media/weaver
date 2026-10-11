@@ -17,7 +17,7 @@ import {
   wireguardConfigProblems,
   type WireguardConfigProblem,
 } from "@/lib/wireguard-config";
-import { BetaNotice, BetaTag, Square } from "../../../components/chrome";
+import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { PrimaryButton, SecondaryButton, Segmented, TextArea, TextField } from "../../../components/controls";
@@ -248,7 +248,6 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
       kind: "table",
       id: "proxies",
       title: t("next.settings.panel.proxies"),
-      tag: <BetaTag />,
       note: t("next.proxies.tableNote"),
       columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 82px",
       headers: [
@@ -298,8 +297,6 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
       <PanelControls>
         <PrimaryButton icon="add" onClick={() => setEditingId("new")}>{t("next.proxies.add")}</PrimaryButton>
       </PanelControls>
-
-      <BetaNotice>{t("next.proxies.betaNotice")}</BetaNotice>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
@@ -897,16 +894,15 @@ export function ProxyEditor({
   );
 
   const sections: EditorSection[] = [
-    { id: "connection", title: t("next.proxies.connection"), tag: <BetaTag />, fields: connectionFields },
+    { id: "connection", title: t("next.proxies.connection"), fields: connectionFields },
     ...(isWireguard
-      ? [{ id: "start", title: t("next.proxies.wgStart"), tag: <BetaTag />, fields: [], body: startBody }]
+      ? [{ id: "start", title: t("next.proxies.wgStart"), fields: [], body: startBody }]
       : []),
     ...(detailsOpen
       ? [
           {
             id: "credentials",
             title: isWireguard ? t("next.proxies.tunnel") : t("next.proxies.credentials"),
-            tag: <BetaTag />,
             note: t("next.proxies.secretsNote"),
             fields: credentialFields,
           },
@@ -919,12 +915,7 @@ export function ProxyEditor({
       <RecordEditor
         open
         title={editingId === "new" ? t("next.proxies.add") : (editing?.name ?? t("next.proxies.proxy"))}
-        note={
-          <span className="inline-flex items-center gap-2">
-            <BetaTag />
-            {editingId === "new" ? t("next.proxies.newNote") : proxyLabels[form.kind]}
-          </span>
-        }
+        note={editingId === "new" ? t("next.proxies.newNote") : proxyLabels[form.kind]}
         width={620}
         sections={sections}
         error={error}

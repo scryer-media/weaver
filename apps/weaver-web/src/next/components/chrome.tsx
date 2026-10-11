@@ -324,15 +324,6 @@ export function BetaTag({ className }: { className?: string }) {
   );
 }
 
-/** A full-width beta band: the chip, then what the reader should know about it. */
-export function BetaNotice({ children }: { children: ReactNode }) {
-  return (
-    <div className="flex flex-none items-center gap-[10px] border-b border-wv-hairline bg-wv-cell-hover px-4 py-3 text-[12.5px] text-wv-warn sm:px-6">
-      <BetaTag />
-      <span className="min-w-0">{children}</span>
-    </div>
-  );
-}
 
 /** An outlined mono chip: a parsed release's flags, and nothing else so far. */
 export function Tag({ children }: { children: ReactNode }) {
