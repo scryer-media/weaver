@@ -908,10 +908,19 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 );
             }
             let mut route = route;
-            if interruption.loss().is_some_and(|(mask, _)| mask == 15) {
-                // With every payload article absent, no content can bind the
-                // posted names, so the set is rebuilt conventionally. The
-                // completion and exact output-byte checks above still apply.
+            if interruption.loss().is_some_and(|(mask, _)| mask == 15)
+                && !matches!(
+                    cell.naming,
+                    Naming::Conventional
+                        | Naming::ConventionalFour
+                        | Naming::Single
+                        | Naming::MixedCase
+                        | Naming::OldStyleS
+                )
+            {
+                // Recognizable posted names retain their direct identity even
+                // with every payload article absent. Obfuscated, reordered or
+                // reposted names need content evidence and rebuild on disk.
                 route.direct = false;
             }
             if matches!(
