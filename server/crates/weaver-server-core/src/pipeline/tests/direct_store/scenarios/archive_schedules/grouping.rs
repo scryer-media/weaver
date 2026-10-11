@@ -862,133 +862,147 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
         {
             continue;
         }
-        let context = format!(
-            "{cell:?} profile={profile:?} case={case} order={order:?} interruption={interruption:?}"
-        );
-        eprintln!("{context}");
-        let outcome = run_schedule_with(
-            options,
-            profile,
-            fixture.spec.clone(),
-            &fixture.volumes,
-            described.as_deref(),
-            &order,
-            &wanted,
-            interruption,
-        )
-        .await;
-        let check = || {
-            // The schedule makes these articles unavailable on every source.
-            // SFV can identify intact files but cannot repair missing bytes;
-            // transport failure precedes the no-loss topology diagnostic.
-            let unrepairable = options.recovery == RecoveryFormat::Absent
-                && interruption.loss().is_some_and(|(mask, _)| mask != 0);
-            if interruption.fails() || unrepairable {
-                profile.assert_rejected(&outcome, &wanted);
-                return;
-            }
-            // A volume the post never carried comes back only from recovery
-            // blocks. Without them the job fails; a set that names its
-            // volumes says which part it is missing.
-            let withheld = interruption.withheld().is_some();
-            if withheld
-                && (options.recovery == RecoveryFormat::Absent || matches!(expect, Expect::Fails(_)))
-            {
-                profile.assert_rejected(&outcome, &wanted);
-                let Some(JobStatus::Failed { error }) = &outcome.status else {
-                    unreachable!("assert_rejected holds the job failed")
-                };
-                // A withheld first volume reads as a set with no start, which
-                // is its own diagnostic.
-                if options.recovery == RecoveryFormat::Absent
-                    && cell.naming.names_place()
-                    && interruption.withheld().is_some_and(|(volume, _)| volume > 0)
+        // A repair also runs against the recovery set as posters lay it out,
+        // so the volumes it needs are promoted one by one.
+        let ladder = options.recovery == RecoveryFormat::Par2
+            && (interruption.loss().is_some() || interruption.withheld().is_some());
+        let ladder = ladder.then_some(ScheduleOptions {
+            recovery: RecoveryFormat::Par2Ladder,
+            ..options
+        });
+        for options in std::iter::once(options).chain(ladder) {
+            let context = format!(
+                "{cell:?} profile={profile:?} case={case} order={order:?} interruption={interruption:?} recovery={:?}",
+                options.recovery
+            );
+            eprintln!("{context}");
+            let outcome = run_schedule_with(
+                options,
+                profile,
+                fixture.spec.clone(),
+                &fixture.volumes,
+                described.as_deref(),
+                &order,
+                &wanted,
+                interruption,
+            )
+            .await;
+            let check = || {
+                // The schedule makes these articles unavailable on every source.
+                // SFV can identify intact files but cannot repair missing bytes;
+                // transport failure precedes the no-loss topology diagnostic.
+                let unrepairable = options.recovery == RecoveryFormat::Absent
+                    && interruption.loss().is_some_and(|(mask, _)| mask != 0);
+                if interruption.fails() || unrepairable {
+                    profile.assert_rejected(&outcome, &wanted);
+                    return;
+                }
+                // A volume the post never carried comes back only from recovery
+                // blocks. Without them the job fails; a set that names its
+                // volumes says which part it is missing.
+                let withheld = interruption.withheld().is_some();
+                if withheld
+                    && (options.recovery == RecoveryFormat::Absent
+                        || matches!(expect, Expect::Fails(_)))
                 {
+                    profile.assert_rejected(&outcome, &wanted);
+                    let Some(JobStatus::Failed { error }) = &outcome.status else {
+                        unreachable!("assert_rejected holds the job failed")
+                    };
+                    // A withheld first volume reads as a set with no start, which
+                    // is its own diagnostic.
+                    if options.recovery == RecoveryFormat::Absent
+                        && cell.naming.names_place()
+                        && interruption
+                            .withheld()
+                            .is_some_and(|(volume, _)| volume > 0)
+                    {
+                        assert!(
+                            error.contains(MISSING_PART),
+                            "{context}: {error}: {:?}",
+                            outcome.trace
+                        );
+                    }
+                    return;
+                }
+                if let Expect::Fails(why) = expect {
+                    profile.assert_rejected(&outcome, &wanted);
+                    let Some(JobStatus::Failed { error }) = &outcome.status else {
+                        unreachable!("assert_rejected holds the job failed")
+                    };
+                    // A posted-name index authenticates the misleading numbering.
+                    // After restart it can reach the bounded extraction retry;
+                    // clean recovery data still cannot establish archive order.
+                    let verified_but_unordered = why == UNORDERED_7Z
+                        && cell.binding == Binding::Par2Posted
+                        && error.contains(
+                            "clean PAR2 verification but extraction still failing after retry",
+                        );
                     assert!(
-                        error.contains(MISSING_PART),
+                        error.contains(why) || verified_but_unordered,
                         "{context}: {error}: {:?}",
                         outcome.trace
                     );
+                    return;
                 }
-                return;
-            }
-            if let Expect::Fails(why) = expect {
-                profile.assert_rejected(&outcome, &wanted);
-                let Some(JobStatus::Failed { error }) = &outcome.status else {
-                    unreachable!("assert_rejected holds the job failed")
-                };
-                // A posted-name index authenticates the misleading numbering.
-                // After restart it can reach the bounded extraction retry;
-                // clean recovery data still cannot establish archive order.
-                let verified_but_unordered = why == UNORDERED_7Z
-                    && cell.binding == Binding::Par2Posted
-                    && error.contains(
-                        "clean PAR2 verification but extraction still failing after retry",
-                    );
-                assert!(
-                    error.contains(why) || verified_but_unordered,
-                    "{context}: {error}: {:?}",
-                    outcome.trace
-                );
-                return;
-            }
-            assert_eq!(
-                outcome.status,
-                Some(JobStatus::Complete),
-                "{context}: {:?}",
-                outcome.trace
-            );
-            for (name, bytes) in &fixture.expected {
                 assert_eq!(
-                    outcome.files[*name].as_deref(),
-                    Some(bytes.as_slice()),
+                    outcome.status,
+                    Some(JobStatus::Complete),
                     "{context}: {:?}",
                     outcome.trace
                 );
-            }
-            let mut route = route;
-            if interruption.loss().is_some_and(|(mask, _)| mask == 15) {
-                // With every payload article absent, no content can bind the
-                // posted names, so the set is rebuilt conventionally. The
-                // completion and exact output-byte checks above still apply.
-                route.direct = false;
-            }
-            if matches!(
-                interruption,
-                Interruption::Restart(_) | Interruption::Crash(_)
-            ) && matches!(expect, Expect::Streams | Expect::Downloads)
-                && matches!(cell.container.admitted(), Expect::Direct)
-            {
-                // Retained index metadata can identify refetched parts before
-                // their arrivals after restart. Either route remains valid;
-                // direct admission still requires no unexpected demotion and
-                // no refetch of durable articles below.
-                route.direct = outcome.finalized == route.sets;
-            }
-            if cell.naming == Naming::OldStyleS
-                && interruption
-                    .loss()
-                    .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
-            {
-                // These posted names admit a RAR set but differ from the real
-                // PAR2 names. Without its content prefix a volume cannot be
-                // bound safely; repair must use materialized source files.
-                route.shape_demotion = |reason| reason == DemotionReason::Par2Unbindable;
-            }
-            if withheld {
-                // The direct store repairs in place only volumes the job lists:
-                // a repair target is keyed by its NZB file. A volume the post
-                // never carried is damage outside every direct set, so the
-                // whole set goes to the conventional repairer and completes
-                // there.
-                route.direct = false;
-            }
-            profile.assert_delivery(&outcome, route, &published, interruption);
-            if matches!(interruption, Interruption::None) {
-                expect.assert_clean(&outcome, order.len() == 4, &context);
-            }
-        };
-        check();
+                for (name, bytes) in &fixture.expected {
+                    assert_eq!(
+                        outcome.files[*name].as_deref(),
+                        Some(bytes.as_slice()),
+                        "{context}: {:?}",
+                        outcome.trace
+                    );
+                }
+                let mut route = route;
+                if interruption.loss().is_some_and(|(mask, _)| mask == 15) {
+                    // With every payload article absent, no content can bind the
+                    // posted names, so the set is rebuilt conventionally. The
+                    // completion and exact output-byte checks above still apply.
+                    route.direct = false;
+                }
+                if matches!(
+                    interruption,
+                    Interruption::Restart(_) | Interruption::Crash(_)
+                ) && matches!(expect, Expect::Streams | Expect::Downloads)
+                    && matches!(cell.container.admitted(), Expect::Direct)
+                {
+                    // Retained index metadata can identify refetched parts before
+                    // their arrivals after restart. Either route remains valid;
+                    // direct admission still requires no unexpected demotion and
+                    // no refetch of durable articles below.
+                    route.direct = outcome.finalized == route.sets;
+                }
+                if cell.naming == Naming::OldStyleS
+                    && interruption
+                        .loss()
+                        .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
+                {
+                    // These posted names admit a RAR set but differ from the real
+                    // PAR2 names. Without its content prefix a volume cannot be
+                    // bound safely; repair must use materialized source files.
+                    route.shape_demotion = |reason| reason == DemotionReason::Par2Unbindable;
+                }
+                if withheld {
+                    // The direct store repairs in place only volumes the job lists:
+                    // a repair target is keyed by its NZB file. A volume the post
+                    // never carried is damage outside every direct set, so the
+                    // whole set goes to the conventional repairer and completes
+                    // there.
+                    route.direct = false;
+                }
+                profile.assert_delivery(&outcome, route, &published, interruption);
+                if matches!(interruption, Interruption::None) {
+                    expect.assert_clean(&outcome, order.len() == 4, &context);
+                }
+            };
+            check();
+        }
     }
 }
 

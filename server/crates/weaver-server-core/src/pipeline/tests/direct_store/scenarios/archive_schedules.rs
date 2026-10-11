@@ -935,7 +935,7 @@ async fn submit_schedule_recovery(
         file_index: recovery.index,
     };
     match recovery.format {
-        RecoveryFormat::Par2 => {
+        RecoveryFormat::Par2 | RecoveryFormat::Par2Ladder => {
             submit_decoded_segment(
                 pipeline,
                 file,
@@ -990,6 +990,10 @@ fn scheduled_demotion(order: &[(u32, u32)], step: usize, sets: usize) -> (usize,
 pub(super) enum RecoveryFormat {
     // One PAR2 file carrying the descriptions and every recovery block.
     Par2,
+    // The same blocks as a poster lays them out: an index of descriptions
+    // alone, then volumes of doubling block counts. The index arrives where
+    // the PAR2 file would; a volume arrives when the pipeline asks.
+    Par2Ladder,
     // A PAR3 index and its recovery volumes. The index arrives where the
     // PAR2 file would; a recovery volume arrives when the pipeline asks.
     Par3,
@@ -1219,6 +1223,21 @@ pub(super) async fn run_schedule_with(
                     bytes,
                     format: RecoveryFormat::Par2,
                 }]
+            }
+            RecoveryFormat::Par2Ladder => {
+                let carriers =
+                    build_test_par2_ladder(&described, slice as u64, blocks, "silver.horizon");
+                let indices = append_single_article_files(&mut spec, &carriers);
+                indices
+                    .into_iter()
+                    .zip(carriers)
+                    .map(|(index, (name, bytes))| ScheduleRecovery {
+                        index,
+                        name,
+                        bytes,
+                        format: RecoveryFormat::Par2Ladder,
+                    })
+                    .collect()
             }
             RecoveryFormat::Par3 => {
                 let described: Vec<_> = described
