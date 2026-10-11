@@ -10,6 +10,7 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { proxyLabels, type ProxyKind, type ProxyProfile } from "@/lib/proxies";
 import { cn } from "@/lib/utils";
+import { refusalMessage } from "@/lib/refusal";
 import {
   WIREGUARD_KEY,
   parseWireguardConfig,
@@ -568,7 +569,7 @@ export function ProxyEditor({
     });
     setBusy(false);
     if (result.error) {
-      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      setError(refusalMessage(t, result.error));
       return;
     }
     onClose();

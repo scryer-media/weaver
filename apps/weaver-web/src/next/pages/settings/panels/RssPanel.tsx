@@ -14,6 +14,7 @@ import {
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { blockedRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
+import { refusalMessage } from "@/lib/refusal";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
@@ -413,7 +414,7 @@ export function RssPanel() {
         : await updateFeed({ id: feedId, input });
     setBusy(false);
     if (result.error) {
-      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      setError(refusalMessage(t, result.error));
       return;
     }
     setError(null);
@@ -444,7 +445,7 @@ export function RssPanel() {
         : await updateRule({ id: ruleId, input });
     setBusy(false);
     if (result.error) {
-      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      setError(refusalMessage(t, result.error));
       return;
     }
     setError(null);
@@ -458,7 +459,7 @@ export function RssPanel() {
     const result = await runSync({ feedId: feed ? feed.id : null });
     if (result.error) {
       setStatus(null);
-      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      setError(refusalMessage(t, result.error));
       return;
     }
     const report = result.data?.runRssSync as SyncReport | undefined;

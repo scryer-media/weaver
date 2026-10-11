@@ -13,6 +13,7 @@ import {
   type ProxyPool,
 } from "@/lib/networking";
 import type { ProxyProfile } from "@/lib/proxies";
+import { refusalMessage } from "@/lib/refusal";
 
 export type NetworkingData = {
   egressInterfaces: Egress[];
@@ -150,7 +151,7 @@ export function useNetworkingWorkspace(page: string) {
     setMessage(null);
     try {
       const result = await client.mutation(document, variables).toPromise();
-      const failure = result.error ? (result.error.graphQLErrors[0]?.message ?? result.error.message) : null;
+      const failure = result.error ? refusalMessage(t, result.error) : null;
       setFailed(failure !== null);
       setMessage(failure ?? t("next.networking.saved"));
       if (failure === null) {

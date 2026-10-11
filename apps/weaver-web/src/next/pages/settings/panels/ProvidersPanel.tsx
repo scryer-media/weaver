@@ -14,6 +14,7 @@ import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import type { DownloadQuota } from "@/lib/networking";
 import { blockedRouting, directRouting, routeFields, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
+import { refusalMessage } from "@/lib/refusal";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Icon } from "../../../components/icons";
@@ -368,7 +369,7 @@ export function ProvidersPanel() {
         await runTest();
         return;
       }
-      setError(message);
+      setError(refusalMessage(t, result.error));
       return;
     }
     void reexecute({ requestPolicy: "network-only" });
