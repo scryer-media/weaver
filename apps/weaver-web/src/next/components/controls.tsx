@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState, type ReactNode, type Ref } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
-import { ignoredByPasswordManagers, PASSWORD_MANAGER_IGNORE } from "@/lib/password-manager";
+import { usePasswordManagerIgnore } from "@/lib/password-manager";
 import { cn } from "@/lib/utils";
 import { Icon, type IconName } from "./icons";
 import { Menu, MenuCheckItem, MenuItem } from "./Menu";
@@ -587,12 +587,13 @@ export function TextField({
   autoComplete?: string;
   autoFocus?: boolean;
 }) {
+  const ignore = usePasswordManagerIgnore({ secret, type, autoComplete });
   return (
     <input
       ref={ref}
       id={id}
       autoComplete={autoComplete}
-      {...(ignoredByPasswordManagers({ secret, type, autoComplete }) ? PASSWORD_MANAGER_IGNORE : null)}
+      {...ignore}
       autoFocus={autoFocus}
       type={type}
       list={list}
@@ -705,6 +706,7 @@ export function NumberField({
     setDraft(null);
   };
 
+  const ignore = usePasswordManagerIgnore({ type: "number" });
   return (
     <label
       className={cn(
@@ -715,6 +717,7 @@ export function NumberField({
       )}
     >
       <input
+        {...ignore}
         type="number"
         aria-label={label}
         min={min}
@@ -749,7 +752,7 @@ export function TextArea({
   placeholder,
   rows = 3,
   className,
-  secret = false,
+  secret,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -760,9 +763,10 @@ export function TextArea({
   /** Keep password managers out, for key material. */
   secret?: boolean;
 }) {
+  const ignore = usePasswordManagerIgnore({ secret, type: "textarea" });
   return (
     <textarea
-      {...(secret ? PASSWORD_MANAGER_IGNORE : null)}
+      {...ignore}
       aria-label={label}
       placeholder={placeholder}
       rows={rows}
@@ -793,8 +797,10 @@ export function TimeField({
   label: string;
   className?: string;
 }) {
+  const ignore = usePasswordManagerIgnore({ type: "time" });
   return (
     <input
+      {...ignore}
       type="time"
       aria-label={label}
       value={value}

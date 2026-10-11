@@ -1,4 +1,5 @@
 import type { Translate } from "@/lib/context/translate-context";
+import { usePasswordManagerIgnore } from "@/lib/password-manager";
 import type { DownloadQuota, QuotaPeriod, Weekday } from "@/lib/networking";
 import { formatSize } from "../../data/format";
 import type { FieldSpec } from "./framework";
@@ -7,6 +8,31 @@ import type { FieldSpec } from "./framework";
  * A download allowance in an editor. Providers and egresses carry the same
  * quota, so both edit it with these fields.
  */
+
+/** The allowance as typed: a decimal number, kept as text until it is saved. */
+function AllowanceInput({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  const ignore = usePasswordManagerIgnore({ type: "text" });
+  return (
+    <input
+      {...ignore}
+      type="text"
+      inputMode="decimal"
+      aria-label={label}
+      value={value}
+      placeholder="0"
+      onChange={(event) => onChange(event.target.value)}
+      className="h-[34px] w-[110px] border border-wv-control bg-wv-input px-3 font-wv-mono text-[12px] text-wv-fg outline-none focus:border-wv-control-focus"
+    />
+  );
+}
 
 const GIB = 1024 ** 3;
 const TIB = 1024 ** 4;
@@ -136,14 +162,10 @@ export function quotaFields(
         kind: "custom",
         control: (
           <div className="flex items-center gap-[10px]">
-            <input
-              type="text"
-              inputMode="decimal"
-              aria-label={t("next.bandwidth.allowance")}
+            <AllowanceInput
+              label={t("next.bandwidth.allowance")}
               value={draft.limit}
-              placeholder="0"
-              onChange={(event) => onChange({ ...draft, limit: event.target.value })}
-              className="h-[34px] w-[110px] border border-wv-control bg-wv-input px-3 font-wv-mono text-[12px] text-wv-fg outline-none focus:border-wv-control-focus"
+              onChange={(limit) => onChange({ ...draft, limit })}
             />
             <div className="flex border border-wv-control bg-wv-input">
               {(["GB", "TB"] as const).map((unit, index) => (

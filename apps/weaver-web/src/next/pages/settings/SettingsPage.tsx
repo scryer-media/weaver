@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useNavigate, useParams } from "react-router";
 import { useTranslate } from "@/lib/context/translate-context";
+import { PasswordManagersKeptOut } from "@/lib/password-manager";
 import { NextShell } from "../../shell/NextShell";
 import { PanelListBlock } from "../../shell/rail-blocks";
 import { useNextData } from "../../data/next-data";
@@ -160,7 +161,13 @@ export function SettingsPage() {
               title={panelSearchTitle(t, entry)}
               onOpen={() => navigate(`/settings/${entry.slug}`)}
             >
-              <entry.Component />
+              {/*
+                The grouped screens, Networking and Scripts, hold credentials
+                for other things and never the Weaver login.
+              */}
+              <PasswordManagersKeptOut value={entry.group !== undefined}>
+                <entry.Component />
+              </PasswordManagersKeptOut>
             </SettingsPanelScope>
           ))}
           {searching ? <SearchOutcomeState search={search.trim()} registry={registry} /> : null}

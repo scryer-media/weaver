@@ -48,7 +48,8 @@ export function NetworkingWorkspace({
   bandwidth,
   proxyEditor,
 }: {
-  proxies: ReactNode;
+  /** The stored proxies' table. It calls back when one is saved or removed. */
+  proxies: (onChanged: () => void) => ReactNode;
   bandwidth: ReactNode;
   /** One stored proxy's editor, for a proxy picked in the flow. */
   proxyEditor: (id: number, onClose: () => void, onChanged: () => void) => ReactNode;
@@ -167,7 +168,7 @@ export function NetworkingWorkspace({
             </>
           ) : null}
           {page === "egress" ? <EgressPage data={data} egresses={egresses} action={action} busy={busy} /> : null}
-          {page === "proxies" ? <PoolsPage data={data} action={action} busy={busy} proxies={proxies} /> : null}
+          {page === "proxies" ? <PoolsPage data={data} action={action} busy={busy} proxies={proxies(workspace.retry)} /> : null}
           {page === "routes" ? (
             <RoutesPage key={location.search} data={data} consumers={consumers} flow={flow} action={action} busy={busy} />
           ) : null}

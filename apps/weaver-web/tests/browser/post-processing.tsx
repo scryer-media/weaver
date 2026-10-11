@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router";
 import { Client, Provider, fetchExchange } from "urql";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
+import { PasswordManagersKeptOut } from "@/lib/password-manager";
 import { nextEn } from "@/next/i18n/en";
 import { JobScriptResults } from "@/next/components/JobScriptResults";
 import { ScriptConfigurationPanel, ScriptListPanel } from "@/next/pages/settings/panels/PostProcessingPanel";
@@ -552,4 +553,4 @@ const shell = {
   setFlags: (flags: PanelFlags) => { status.textContent = flags.status ?? ""; save.disabled = !flags.dirty || flags.busy; },
   controlsHost: document.getElementById("controls"),
 };
-createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto flex max-w-[1400px] flex-col p-8">{screen}</main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);
+createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto flex max-w-[1400px] flex-col p-8"><PasswordManagersKeptOut value>{screen}</PasswordManagersKeptOut></main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);

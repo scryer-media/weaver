@@ -190,6 +190,14 @@ const creator = (page) => page.getByRole("dialog", { name: "Add job", exact: tru
 const field = (editor, name) => editor.getByRole("textbox", { name, exact: true });
 // A password input has no role to be found by.
 const secretField = (scope, name) => scope.getByLabel(name, { exact: true });
+/** The fields in `scope` a password manager is still free to fill or to offer to save. */
+const openToPasswordManagers = (scope) =>
+  scope
+    .locator("input:not([type='file']):not([type='checkbox']):not([type='radio']):not([type='range']), textarea")
+    .evaluateAll((fields) =>
+      fields
+        .filter((field) => field.getAttribute("data-1p-ignore") !== "true" || field.getAttribute("autocomplete") !== "off")
+        .map((field) => field.getAttribute("aria-label") ?? field.outerHTML));
 const secretBox = (editor, name) => editor.getByRole("checkbox", { name: `${name} is a secret`, exact: true });
 const secretDialog = (page, name) => page.getByRole("dialog", { name, exact: true });
 
@@ -785,6 +793,8 @@ test("an input the header does not have is added as a value or as the job's own 
     assert.equal(await editor.getByRole("radiogroup").count(), 1);
     assert.equal(await own.isChecked(), false);
     assert.equal(await value.getAttribute("type"), "text");
+    // None of a job's fields is the Weaver login, so none is left to a password manager.
+    assert.deepEqual(await openToPasswordManagers(editor), []);
     assert.equal(await action(editor, "Add input").isDisabled(), true);
     await name.fill("bad name");
     await action(editor, "Add input").click();
@@ -1099,6 +1109,7 @@ test("a secret is added, renamed and given a new value without its value ever be
   try {
     await action(controls(page), "Add secret").click();
     let editor = secretDialog(page, "Add secret");
+    assert.deepEqual(await openToPasswordManagers(editor), []);
     assert.equal(await secretField(editor, "Value").getAttribute("type"), "password");
     assert.equal(await secretField(editor, "Value").getAttribute("placeholder"), null);
     await field(editor, "Name").fill("Mail token");
@@ -1750,7 +1761,7 @@ test("the status tabs ask the daemon for runs that ended one way, from the first
     const rows = runRows(page);
     await rows.first().and(rowsHolding(page, "nightly.py")).waitFor();
     // Every status has a tab, in one order, and says how many runs ended that way.
-    const tabs = [["All", 60], ["Succeeded", 58], ["Warning", 1], ["Failed", 1], ["Timed out", 0], ["Skipped", 0], ["Cancelled", 0]];
+    const tabs = [["All", 60], ["Succeeded", 58], ["Warning", 1], ["Failed", 1], ["Timed out", 0], ["Interrupted", 0], ["Skipped", 0], ["Cancelled", 0]];
     assert.deepEqual(
       await statusTabs(page).evaluateAll((all) => all.map((tab) => tab.textContent)),
       tabs.map(([name, count]) => `${name}${count}`),

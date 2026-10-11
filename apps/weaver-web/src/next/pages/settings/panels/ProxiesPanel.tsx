@@ -217,7 +217,7 @@ function proxyInput(form: ProxyForm) {
   };
 }
 
-export function ProxiesPanel() {
+export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
   const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({
     query: PROXY_PROFILES_QUERY,
@@ -309,7 +309,10 @@ export function ProxiesPanel() {
           id={editingId}
           profile={editing}
           onClose={() => setEditingId(null)}
-          onChanged={() => void reexecute({ requestPolicy: "network-only" })}
+          onChanged={() => {
+            void reexecute({ requestPolicy: "network-only" });
+            onChanged?.();
+          }}
         />
       )}
     </>

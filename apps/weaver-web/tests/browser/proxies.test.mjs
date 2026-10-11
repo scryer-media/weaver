@@ -29,6 +29,14 @@ async function shot(page, name) {
 const daemon = (page) => page.evaluate(() => window.proxiesFixture);
 const action = (scope, name) => scope.getByRole("button", { name, exact: true });
 const field = (scope, name) => scope.getByLabel(name, { exact: true });
+/** The fields in `scope` a password manager is still free to fill or to offer to save. */
+const openToPasswordManagers = (scope) =>
+  scope
+    .locator("input:not([type='file']):not([type='checkbox']):not([type='radio']):not([type='range']), textarea")
+    .evaluateAll((fields) =>
+      fields
+        .filter((field) => field.getAttribute("data-1p-ignore") !== "true" || field.getAttribute("autocomplete") !== "off")
+        .map((field) => field.getAttribute("aria-label") ?? field.outerHTML));
 const option = (scope, name) => scope.getByRole("radio", { name, exact: true });
 const dropZone = (scope) => action(scope, "Drop a config file here, or click to choose");
 const file = (name, text) => ({ name, mimeType: "text/plain", buffer: Buffer.from(text) });
@@ -257,6 +265,8 @@ test("SSH signs in with an Ed25519 key and has no password", async () => {
     assert.equal(await editor.getByRole("radiogroup").count(), 0);
     assert.equal(await field(editor, "Port").inputValue(), "22");
     await editor.getByText("Ed25519 keys only.", { exact: true }).waitFor();
+    // None of it is the Weaver login, so no field is left to a password manager.
+    assert.deepEqual(await openToPasswordManagers(editor), []);
     await shot(page, "proxy-ssh");
     await field(editor, "Name").fill("Bastion");
     await field(editor, "Host").fill("bastion.fixture.invalid");
@@ -264,6 +274,8 @@ test("SSH signs in with an Ed25519 key and has no password", async () => {
     await field(editor, "Private key").fill("fixture-ed25519-key");
     await action(editor, "Save").click();
     await page.getByText("Bastion", { exact: true }).waitFor();
+    // Whatever holds the table is told, so its own list of proxies can follow.
+    assert.equal((await daemon(page)).changes, 1);
     const input = (await daemon(page)).requests.at(-1).variables.input;
     assert.equal(input.kind, "SSH");
     assert.equal(input.username, "operator");

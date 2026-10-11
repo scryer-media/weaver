@@ -5,7 +5,7 @@ import { BandwidthPanel } from "./BandwidthPanel";
 export function NetworkingPanel() {
   return (
     <NetworkingWorkspace
-      proxies={<ProxiesPanel />}
+      proxies={(onChanged) => <ProxiesPanel onChanged={onChanged} />}
       bandwidth={<BandwidthPanel />}
       proxyEditor={(id, onClose, onChanged) => (
         <ProxyEditorFor key={id} id={id} onClose={onClose} onChanged={onChanged} />

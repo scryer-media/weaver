@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router";
 import { Client, Provider, fetchExchange } from "urql";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
+import { PasswordManagersKeptOut } from "@/lib/password-manager";
 import type { ProxyKind } from "@/lib/proxies";
 import { nextEn } from "@/next/i18n/en";
 import { ProxiesPanel } from "@/next/pages/settings/panels/ProxiesPanel";
@@ -73,7 +74,8 @@ function graphql(name: string, variables: Record<string, unknown>) {
   }
   return { data: { proxyProfiles: profiles.map(view), testProxyProfile: { success: true, message: "" } } };
 }
-Object.assign(window, { proxiesFixture: { profiles, requests } });
+const fixture = { profiles, requests, changes: 0 };
+Object.assign(window, { proxiesFixture: fixture });
 
 const client = new Client({ url: "/graphql", exchanges: [fetchExchange], preferGetMethod: false });
 const originalFetch = window.fetch.bind(window);
@@ -86,4 +88,4 @@ const dictionary: Record<string, string> = { ...en, ...nextEn };
 const shell = {
   search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls"),
 };
-createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto flex max-w-[1400px] flex-col p-8"><ProxiesPanel /></main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);
+createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter><SettingsShellProvider {...shell}><main className="mx-auto flex max-w-[1400px] flex-col p-8"><PasswordManagersKeptOut value><ProxiesPanel onChanged={() => { fixture.changes += 1; }} /></PasswordManagersKeptOut></main></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);
