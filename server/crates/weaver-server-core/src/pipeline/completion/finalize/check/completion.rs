@@ -798,7 +798,28 @@ impl Pipeline {
         });
         let known_archive_damage =
             self.archive_extraction_held_for_known_damage(job_id) || known_file_crc_damage;
+        // Successful decoding only covers posted files. Recovery metadata can
+        // describe an absent volume before the archive topology discovers it.
+        let unposted_protected_payload = par2_validation_needed
+            && self.par2_set(job_id).is_some_and(|set| {
+                let bound: HashSet<_> = self.jobs[&job_id]
+                    .assembly
+                    .files()
+                    .filter_map(|file| {
+                        self.resolve_par2_file_binding_in_set(file.file_id(), set.recovery_set_id)
+                            .map(|binding| binding.par2_file_id)
+                    })
+                    .collect();
+                let ignored = self.par2_ignore_extensions();
+                set.recovery_file_ids.iter().any(|id| {
+                    !bound.contains(id)
+                        && set.file_description(id).is_none_or(|description| {
+                            !par2_damage_ignorable(&description.filename, &ignored)
+                        })
+                })
+            });
         let authoritative_par2_verification_owed = rar_par2_repair_ready
+            || unposted_protected_payload
             || self.par3_requires_authoritative_par2(job_id)
             || known_archive_damage
             // Completed transport is not proof that a restored direct image
