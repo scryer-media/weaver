@@ -2744,8 +2744,15 @@ impl Pipeline {
                 }
                 // The reader or topology refresh re-arms completion when it
                 // finishes. Retiring its tombstone and re-queuing ourselves
-                // here would starve the very result that releases it.
-                ArchiveSetRetirement::Busy => return Ok(0),
+                // here would starve the very result that releases it. No task
+                // starts here, so the entry the caller recorded must go, or
+                // the completion check reads it as an extraction in progress.
+                ArchiveSetRetirement::Busy => {
+                    if let Some(inflight) = self.inflight_extractions.get_mut(&job_id) {
+                        inflight.remove(set_name);
+                    }
+                    return Ok(0);
+                }
                 ArchiveSetRetirement::NotRar => {}
                 ArchiveSetRetirement::StillReferenced => {
                     // A claimed name with no runtime entry of its own is the

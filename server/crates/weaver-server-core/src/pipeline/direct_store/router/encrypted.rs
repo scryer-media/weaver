@@ -521,25 +521,45 @@ impl DirectSetRouter {
             {
                 continue;
             }
-            for part in &member.parts {
-                let (offset, len) = if Some(part.volume) == volume.checked_sub(1) {
-                    let len = part.data_size.min(2 * AES_BLOCK - 1);
-                    (
-                        part.data_offset
-                            .checked_add(part.data_size.checked_sub(len)?)?,
-                        len,
-                    )
-                } else if Some(part.volume) == volume.checked_add(1) {
-                    (part.data_offset, part.data_size.min(AES_BLOCK - 1))
-                } else {
-                    continue;
-                };
+            // A seam reaches as far as it needs: a neighbouring part shorter
+            // than the seam hands the remainder to the part beyond it, and the
+            // walk stops at the first volume the member has no part in.
+            let mut before = 2 * AES_BLOCK - 1;
+            let mut previous = volume.checked_sub(1);
+            while before != 0
+                && let Some(target) = previous
+                && let Some(part) = member.parts.iter().find(|part| part.volume == target)
+            {
+                let len = part.data_size.min(before);
                 if len != 0 {
                     if reads.len() == limit {
                         return None;
                     }
-                    reads.push((part.volume, offset, len));
+                    reads.push((
+                        part.volume,
+                        part.data_offset
+                            .checked_add(part.data_size.checked_sub(len)?)?,
+                        len,
+                    ));
                 }
+                before -= len;
+                previous = target.checked_sub(1);
+            }
+            let mut after = AES_BLOCK - 1;
+            let mut next = volume.checked_add(1);
+            while after != 0
+                && let Some(target) = next
+                && let Some(part) = member.parts.iter().find(|part| part.volume == target)
+            {
+                let len = part.data_size.min(after);
+                if len != 0 {
+                    if reads.len() == limit {
+                        return None;
+                    }
+                    reads.push((part.volume, part.data_offset, len));
+                }
+                after -= len;
+                next = target.checked_add(1);
             }
         }
         Some(reads)

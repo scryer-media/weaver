@@ -910,9 +910,9 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
             let mut route = route;
             if interruption.loss().is_some_and(|(mask, _)| mask == 15) {
                 // With every payload article absent, no content can bind the
-                // posted names. Verified conventional reconstruction is valid;
-                // the completion and exact output-byte checks above still apply.
-                route.direct = outcome.finalized == route.sets;
+                // posted names, so the set is rebuilt conventionally. The
+                // completion and exact output-byte checks above still apply.
+                route.direct = false;
             }
             if matches!(
                 interruption,

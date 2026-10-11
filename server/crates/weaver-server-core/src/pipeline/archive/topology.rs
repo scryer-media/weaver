@@ -2156,6 +2156,9 @@ impl Pipeline {
 
         if stale_refresh && live_fact_volumes.is_empty() {
             self.purge_empty_rar_set_if_idle(done.job_id, &done.set_name);
+            // An extraction attempt that found this refresh in flight stepped
+            // aside for it; this exit is what releases that attempt.
+            self.schedule_job_completion_check(done.job_id);
             return;
         }
 
@@ -2190,6 +2193,10 @@ impl Pipeline {
                 self.try_delete_volumes(done.job_id, &done.set_name);
             }
             self.check_job_completion(done.job_id).await;
+        } else {
+            // A failed refresh with nothing queued behind it still releases
+            // the extraction attempt that stepped aside while it ran.
+            self.schedule_job_completion_check(done.job_id);
         }
     }
 

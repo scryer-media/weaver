@@ -908,6 +908,12 @@ impl Pipeline {
         if slice_size == 0 || slice_size > 4 * 1024 * 1024 {
             return;
         }
+        // Each probed volume costs up to three slice reads on the pipeline's
+        // blocking pool while this actor waits; a pass samples at most this
+        // many volumes, and later passes pick up where the names still need
+        // binding.
+        const MAX_PROBED_VOLUMES: usize = 16;
+        let mut probed = 0;
         let mut reads = Vec::new();
         for set in self.direct_store.sets_for(job_id) {
             if set.is_demoted() || set.is_finalized() {
@@ -916,6 +922,9 @@ impl Pipeline {
             let mut lengths = BTreeMap::new();
             let mut wanted = Vec::new();
             for (&volume, &file_index) in &set.plan().volumes {
+                if probed == MAX_PROBED_VOLUMES {
+                    break;
+                }
                 let file_id = NzbFileId { job_id, file_index };
                 if self.resolve_par2_file_binding(file_id).is_some() {
                     continue;
@@ -941,6 +950,7 @@ impl Pipeline {
                 }
                 lengths.insert(volume, len);
                 wanted.push((file_id, volume, declared));
+                probed += 1;
             }
             if !wanted.is_empty() {
                 reads.push((set.virtual_provider(&lengths), wanted));

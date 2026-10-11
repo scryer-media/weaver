@@ -1245,6 +1245,9 @@ impl Pipeline {
         // downloading beside a finished set, a release's notes or a sample, is
         // not a set that can fail the job's archives, and a set that finalizes
         // while such a file is in flight is the window a restart must survive.
+        // The role is the classified one, not the posted name's: an obfuscated
+        // volume is declared unknown by its name, and an unknown file holds the
+        // gate until its bytes say what it is.
         let recovery_verified = self.par2_verified.contains(&job_id)
             || self
                 .par3_runtime
@@ -1255,11 +1258,10 @@ impl Pipeline {
                 state.assembly.files().any(|file| {
                     !file.is_complete()
                         && !matches!(
-                            file.role(),
+                            self.classified_role_for_file(job_id, file),
                             weaver_model::files::FileRole::Par2 { .. }
                                 | weaver_model::files::FileRole::Par3 { .. }
                                 | weaver_model::files::FileRole::Standalone
-                                | weaver_model::files::FileRole::Unknown
                         )
                 })
             })
