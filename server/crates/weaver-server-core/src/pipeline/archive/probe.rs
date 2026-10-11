@@ -565,7 +565,11 @@ impl Pipeline {
                                 FileRole::SevenZipArchive | FileRole::SevenZipSplit { .. }
                             )
                             && (!self.file_declared_size.contains_key(&id)
-                                || (head && !self.file_prefix_16k.contains_key(&id))))
+                                || (head
+                                    && self
+                                        .file_prefix_16k
+                                        .get(&id)
+                                        .is_none_or(|prefix| prefix.len() < 32))))
                         .then(|| {
                             (
                                 id,
@@ -590,7 +594,14 @@ impl Pipeline {
             self.file_declared_size
                 .entry(file_id)
                 .or_insert(metadata.len());
-            if head && !self.file_prefix_16k.contains_key(&file_id) {
+            // An out-of-order article can leave an empty prefix entry. After
+            // repair the file is complete, so recover its header from disk.
+            if head
+                && self
+                    .file_prefix_16k
+                    .get(&file_id)
+                    .is_none_or(|prefix| prefix.len() < 32)
+            {
                 let mut prefix = Vec::new();
                 if file
                     .take(crate::pipeline::PAR2_HASH_16K_BYTES as u64)
