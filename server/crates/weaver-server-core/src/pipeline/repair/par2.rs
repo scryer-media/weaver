@@ -1584,7 +1584,7 @@ impl Pipeline {
         let file = state.assembly.file(file_id)?;
         let current_filename = self.current_filename_for_file(file_id.job_id, file);
         let names = self.par2_binding_candidate_names(file_id)?;
-        let candidates = set
+        let mut candidates = set
             .files
             .iter()
             .filter_map(|(par2_file_id, desc)| {
@@ -1593,6 +1593,25 @@ impl Pipeline {
                     .then_some(*par2_file_id)
             })
             .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            // Posted subjects can change case without changing file identity.
+            // Only a unique folded match is usable; length must not resolve a
+            // collision between distinct case-sensitive recovery names.
+            candidates = set
+                .files
+                .iter()
+                .filter_map(|(par2_file_id, desc)| {
+                    let described = sanitize_download_filename(&desc.filename);
+                    names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&described))
+                        .then_some(*par2_file_id)
+                })
+                .collect();
+            if candidates.len() > 1 {
+                return None;
+            }
+        }
         // Two names, two descriptions: the posted name of a swapped pair
         // answers to the partner's description, and once the canonical name is
         // known the file answers to both. Length breaks that tie whenever the
