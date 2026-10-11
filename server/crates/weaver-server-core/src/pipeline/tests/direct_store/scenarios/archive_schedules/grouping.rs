@@ -1014,6 +1014,33 @@ pub(super) async fn cell_smoke(cell: Cell) {
     }
 }
 
+// A split part the post never carried, between two that it did: every listed
+// file is whole, so only the hole in the numbering says the recovery set
+// has work, and it rebuilds the part rather than the job failing on it.
+#[tokio::test]
+async fn a_withheld_middle_split_part_is_rebuilt_from_recovery() {
+    let case = schedules().into_iter().nth(361).unwrap();
+    assert_eq!(
+        case.1,
+        Interruption::Withheld {
+            volume: 2,
+            index_first: false,
+        }
+    );
+    for profile in PROFILES {
+        run_cell(
+            Cell {
+                container: Container::SevenZip,
+                naming: Naming::ConventionalFour,
+                binding: Binding::Par2RealLast,
+            },
+            profile,
+            vec![(361, case.clone())],
+        )
+        .await;
+    }
+}
+
 #[tokio::test]
 async fn reposted_rar_recovers_both_articles_of_one_copy() {
     run_cell(
