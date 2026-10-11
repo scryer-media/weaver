@@ -1258,7 +1258,25 @@ impl Pipeline {
         let existing = input.existing.clone();
         match Self::run_rar_set_compute(input).await {
             Ok(computed) => {
+                // A synchronous rebuild can overtake a background refresh
+                // that captured the pre-repair volume roster. Retire that
+                // refresh before installing the newer plan and header view.
+                let key = (job_id, set_name.to_string());
+                let supersedes_refresh = self
+                    .rar_refresh_state
+                    .get(&key)
+                    .is_some_and(|refresh| refresh.in_flight.is_some());
+                if supersedes_refresh {
+                    let state = self.rar_sets.entry(key.clone()).or_default();
+                    state.extraction_generation = state.extraction_generation.saturating_add(1);
+                }
                 self.apply_computed_rar_set_state(job_id, set_name, computed);
+                if supersedes_refresh && let Some(refresh) = self.rar_refresh_state.get_mut(&key) {
+                    // This rebuild consumed all currently known facts and
+                    // supersedes requests queued behind the older snapshot.
+                    refresh.queued = None;
+                    refresh.structure_dirty = false;
+                }
                 Ok(())
             }
             Err(error) => {
@@ -2043,6 +2061,8 @@ impl Pipeline {
                 if request.is_none()
                     && !live_fact_volumes.is_empty()
                     && done.request.reason != RefreshReason::PostExtraction
+                    && (state.structure_dirty
+                        || !live_fact_volumes.is_subset(&state.refreshed_volumes))
                 {
                     request = Some(RarRefreshRequest {
                         target_completed_volume: state
