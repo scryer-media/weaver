@@ -1568,7 +1568,15 @@ impl Pipeline {
                 );
                 return;
             };
-            if is_terminal_status(&state.status) {
+            // Cleanup has already selected the delivery contents before the
+            // final move starts. A late duplicate must not recreate an input
+            // file while that directory is being published.
+            if is_terminal_status(&state.status)
+                || matches!(
+                    state.status,
+                    JobStatus::Moving | JobStatus::QueuedPostProcessing | JobStatus::PostProcessing
+                )
+            {
                 debug!(
                     job_id = job_id.0,
                     segment = %segment_id,
