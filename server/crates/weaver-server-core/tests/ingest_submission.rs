@@ -183,14 +183,16 @@ fn nzb_to_submission_spec_sanitizes_and_classifies_archive_roles() {
 }
 
 #[test]
-fn nzb_password_candidates_ignore_placeholder_explicit_password() {
+fn nzb_password_candidates_preserve_literal_explicit_password() {
     let nzb = nzb_with_password(Some("nzb-secret"));
 
     let candidates = nzb_password_candidates(&nzb, std::path::Path::new("Release.nzb"), Some("1"));
 
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].source().as_str(), "nzb_meta");
-    assert_eq!(candidates[0].value(), "nzb-secret");
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].source().as_str(), "explicit");
+    assert_eq!(candidates[0].value(), "1");
+    assert_eq!(candidates[1].source().as_str(), "nzb_meta");
+    assert_eq!(candidates[1].value(), "nzb-secret");
 }
 
 #[test]
@@ -220,7 +222,7 @@ fn nzb_password_candidates_keep_real_explicit_then_nzb_meta() {
 }
 
 #[test]
-fn nzb_to_submission_spec_uses_nzb_meta_when_explicit_is_placeholder() {
+fn nzb_to_submission_spec_preserves_literal_explicit_password() {
     let nzb = nzb_with_password(Some("nzb-secret"));
 
     let spec = nzb_to_submission_spec(
@@ -231,7 +233,7 @@ fn nzb_to_submission_spec_uses_nzb_meta_when_explicit_is_placeholder() {
         vec![],
     );
 
-    assert_eq!(spec.password.as_deref(), Some("nzb-secret"));
+    assert_eq!(spec.password.as_deref(), Some("1"));
 }
 
 #[test]

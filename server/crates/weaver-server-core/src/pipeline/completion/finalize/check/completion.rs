@@ -1094,13 +1094,19 @@ impl Pipeline {
                 || !self.job_spec_has_par2_file(job_id)
                 || (!par2_verdict_open && self.par2_gate_settlement_complete(job_id)))
             && !self.rar_recovery_restore_pending(job_id)
-            && let Some(error) = self.missing_numbered_archive_part(job_id).or_else(|| {
+            && let Some(mut error) = self.missing_numbered_archive_part(job_id).or_else(|| {
                 (!has_crc_failures
                     && rar_waiting_for_missing_volumes
                     && self.job_has_live_rar_waiting_for_absent_volumes(job_id))
-                .then(|| "missing RAR volume after recovery settled".to_string())
+                .then(|| {
+                    self.missing_first_rar_volume_report(job_id)
+                        .unwrap_or_else(|| "missing RAR volume after recovery settled".to_string())
+                })
             })
         {
+            if !self.job_spec_has_par2_file(job_id) {
+                error.push_str("; no PAR2 metadata is available for repair");
+            }
             self.fail_job(job_id, error);
             return;
         }

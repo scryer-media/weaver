@@ -3632,11 +3632,9 @@ fn two_set_par2_fixture(
 // article but the lost one delivered, the PAR2 index parsed, the download
 // pipeline drained, and set A finalized while set B is still live and damaged.
 //
-// Reaching the state directly, because it is a *state*, not a sequence: a job
-// whose PAR2 already read clean once released its ready sets, and one of them
-// being ready while the other is not is the whole shape. Later passes happen
-// for reasons that have nothing to do with the direct sets — a conventional
-// member failing extraction is enough.
+// Construct an older persisted state directly. The current publication gate
+// holds both sets until their members are ready, but retained images created
+// before that gate still need to support later repair and restart.
 async fn direct_job_with_one_finalized_neighbour(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -3674,7 +3672,15 @@ async fn direct_job_with_one_finalized_neighbour(
     }
 
     pipeline.par2_verified.insert(job_id);
-    pipeline.finalize_ready_direct_sets(job_id).await;
+    let ready = pipeline
+        .direct_store
+        .sets_for(job_id)
+        .iter()
+        .position(|set| set.ready_to_finalize())
+        .expect("the complete neighbour must pass its member gate");
+    pipeline
+        .finalize_legacy_direct_set_for_test(job_id, ready)
+        .await;
 
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert_eq!(

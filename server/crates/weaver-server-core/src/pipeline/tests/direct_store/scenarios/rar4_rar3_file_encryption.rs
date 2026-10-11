@@ -832,18 +832,9 @@ async fn a_header_encrypted_set_with_no_password_demotes_by_name() {
 }
 
 #[tokio::test]
-async fn a_header_encrypted_set_does_not_try_a_placeholder_spec_password() {
-    // `spec.password` reaches the `-hp` ring by a different route from the rest
-    // of the harvest — the per-article re-offer in `refresh_direct_passwords` —
-    // and it has to be normalized the way
-    // `archive_password_candidates_for_job` normalizes, or the two routes
-    // disagree about what a password even *is*.
-    //
-    // Indexers use `password=yes` to mean "this post is passworded", and
-    // `normalize_archive_password_candidate` drops that whole family. Offering
-    // it here anyway would spend a PBKDF2 derivation proving nothing — and
-    // would report the refusal as `NoVerifiedCandidate`, "everything we tried
-    // was wrong", for a job that had nothing to try.
+async fn a_header_encrypted_set_tries_a_literal_explicit_password() {
+    // Explicit passwords remain literal even when the same value in harvested
+    // metadata would be a placeholder. The header ring must try and refute it.
     let payload: Vec<u8> = (0..1600u32).map(|index| (index % 163) as u8).collect();
     let volumes = header_encrypted_store_set(
         "Silver.Horizon.S04E14.mkv",
@@ -866,13 +857,13 @@ async fn a_header_encrypted_set_does_not_try_a_placeholder_spec_password() {
     assert!(
         outcome
             .shape
-            .contains("Demoted(HeaderEncryptedRefused(NoPassword))"),
-        "a placeholder is not a candidate, so this job had nothing to try, got {}",
+            .contains("Demoted(HeaderEncryptedRefused(NoVerifiedCandidate))"),
+        "the explicit password must be tried and refuted, got {}",
         outcome.shape
     );
     assert!(
-        !outcome.shape.contains("NoVerifiedCandidate"),
-        "and it must not be reported as a password that was tried and refuted, got {}",
+        !outcome.shape.contains("NoPassword"),
+        "an explicit password must not be discarded as missing, got {}",
         outcome.shape
     );
 }

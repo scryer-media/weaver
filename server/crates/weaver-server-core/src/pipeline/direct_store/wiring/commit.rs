@@ -1238,9 +1238,13 @@ impl Pipeline {
             self.demote_direct_set(job_id, set_index, DemotionReason::PartChecksumMismatch)
                 .await;
         }
-        // Keep healthy members staged while another posted payload is missing.
-        // A recovery verdict can supersede the damaged posted copy, but an
-        // unrecoverable neighbour must fail before any set is committed.
+        // Keep healthy members staged while another archive is still short of
+        // its volumes. A recovery verdict can supersede the damaged posted
+        // copy, but an unrecoverable neighbouring set must fail before any set
+        // is committed. Only archive parts hold the gate: a loose file still
+        // downloading beside a finished set, a release's notes or a sample, is
+        // not a set that can fail the job's archives, and a set that finalizes
+        // while such a file is in flight is the window a restart must survive.
         let recovery_verified = self.par2_verified.contains(&job_id)
             || self
                 .par3_runtime
@@ -1254,6 +1258,8 @@ impl Pipeline {
                             file.role(),
                             weaver_model::files::FileRole::Par2 { .. }
                                 | weaver_model::files::FileRole::Par3 { .. }
+                                | weaver_model::files::FileRole::Standalone
+                                | weaver_model::files::FileRole::Unknown
                         )
                 })
             })
@@ -1677,6 +1683,22 @@ impl Pipeline {
         };
         let outcome = set.run_barrier(trigger, now, &mut drain, &mut sync, &mut persist);
         Self::report_direct_barrier(job_id, dirty_bytes, outcome);
+    }
+
+    // Construct retained images from the older per-set publication policy.
+    #[cfg(test)]
+    pub(in crate::pipeline) async fn finalize_legacy_direct_set_for_test(
+        &mut self,
+        job_id: JobId,
+        set_index: usize,
+    ) {
+        assert!(
+            self.direct_store
+                .set(job_id, set_index)
+                .unwrap()
+                .ready_to_finalize()
+        );
+        self.finalize_direct_set(job_id, set_index).await;
     }
 
     // Commits a finished set: every member's partial becomes its destination
