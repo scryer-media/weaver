@@ -11,13 +11,13 @@ before(async () => {
   browser = await chromium.launch({ headless: true });
 });
 after(async () => { await browser?.close(); await server?.close(); });
-async function open(query = "") {
+async function open(query = "", shown = "Amsterdam") {
   const page = await browser.newPage({ viewport: { width: 1400, height: 1500 } });
   page.setDefaultTimeout(0);
   page.on("pageerror", (error) => console.error(error));
   await page.route("**/*", (route) => new URL(route.request().url()).origin === baseUrl ? route.continue() : route.abort());
   await page.goto(`${baseUrl}/tests/browser/proxies.html${query}`);
-  await page.getByText("Amsterdam", { exact: true }).waitFor();
+  await page.getByText(shown, { exact: true }).waitFor();
   return page;
 }
 /** With `PROXIES_SCREENSHOT_DIR` set to a directory, the page as it stands is saved there as `name`.png. */
@@ -278,6 +278,40 @@ test("pools and proxies are each added from the top bar and from the right under
       await editor.waitFor({ state: "detached" });
     }
     await shot(page, "pools-and-proxies");
+  } finally {
+    await page.close();
+  }
+});
+
+/** The line of a table that holds `text`, which is a button itself and holds its own Edit button. */
+const line = (page, text) => page.locator("main").getByRole("button").filter({ hasText: text });
+/** Opens `title` from the line's own body, then from its Edit button, and closes it each time. */
+async function opensBothWays(page, text, edit, title) {
+  const editor = page.getByRole("dialog", { name: title, exact: true });
+  for (const target of [page.getByText(text, { exact: true }), action(line(page, text), edit)]) {
+    await target.click();
+    await editor.waitFor();
+    await action(editor, "Cancel").click();
+    await editor.waitFor({ state: "detached" });
+  }
+}
+
+test("a pool and a proxy open from anywhere on their line and from its Edit button", async () => {
+  const page = await open("?pools");
+  try {
+    await opensBothWays(page, "Exits", "Edit pool", "Exits");
+    await opensBothWays(page, "Seedbox", "Edit proxy", "Seedbox");
+    await shot(page, "pools-and-proxies-edit");
+  } finally {
+    await page.close();
+  }
+});
+
+test("a route opens from anywhere on its line and from its Edit button", async () => {
+  const page = await open("?routes", "news.fixture.invalid");
+  try {
+    await opensBothWays(page, "news.fixture.invalid", "Edit route", "Route for news.fixture.invalid");
+    await shot(page, "routes-edit");
   } finally {
     await page.close();
   }

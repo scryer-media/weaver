@@ -65,6 +65,12 @@ export function RoutesPage({
         "",
       ],
       empty: t("next.networking.routes.empty"),
+      onRowClick: (key) => {
+        const consumer = consumers.find((candidate) => candidate.key === key);
+        if (consumer) {
+          setEditing(consumer);
+        }
+      },
       rows: consumers.map((consumer) => {
         const legs = flow.legs.filter((leg) => leg.consumer === consumer.key);
         const openCount = legs.reduce((sum, leg) => sum + leg.open, 0);
@@ -85,9 +91,11 @@ export function RoutesPage({
               label={stateLabel(t, state)}
               detail={consumer.kind === "SERVER" ? `${openCount} / ${consumer.cap}` : undefined}
             />,
-            <SecondaryButton key="edit" size="compact" onClick={() => setEditing(consumer)} className="ml-auto">
-              {t("next.networking.routes.edit")}
-            </SecondaryButton>,
+            <span key="edit" className="ml-auto" onClick={(event) => event.stopPropagation()}>
+              <SecondaryButton size="compact" onClick={() => setEditing(consumer)}>
+                {t("next.networking.routes.edit")}
+              </SecondaryButton>
+            </span>,
           ],
         };
       }),

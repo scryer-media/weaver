@@ -8,6 +8,7 @@ import { PasswordManagersKeptOut } from "@/lib/password-manager";
 import type { ProxyKind } from "@/lib/proxies";
 import type { NetworkingData } from "@/next/features/networking/data";
 import { PoolsPage } from "@/next/features/networking/PoolsPage";
+import { RoutesPage } from "@/next/features/networking/RoutesPage";
 import { nextEn } from "@/next/i18n/en";
 import { ProxiesPanel } from "@/next/pages/settings/panels/ProxiesPanel";
 import { SettingsShellProvider } from "@/next/pages/settings/framework";
@@ -84,9 +85,14 @@ const pools = {
   discoverNetworkInterfaces: [], servers: [], rssFeeds: [],
   platformNetworking: { platform: "fixture", egressBindingKinds: ["SYSTEM"], sourceAddressHint: null, container: false, bridgeNetworkSuspected: false, maxWireguardInstances: 4, notes: [] },
 } as unknown as NetworkingData;
-const screen = new URLSearchParams(window.location.search).has("pools")
+/* With `?routes` it is the routes table instead, over one server that goes direct. */
+const consumers = [{ key: "server:1", id: 1, name: "news.fixture.invalid", kind: "SERVER" as const, cap: 20, route: null }];
+const query = new URLSearchParams(window.location.search);
+const screen = query.has("pools")
   ? <PoolsPage data={pools} action={async () => null} busy={false} proxies={panel} />
-  : panel;
+  : query.has("routes")
+    ? <RoutesPage data={pools} consumers={consumers} flow={{ legs: [], pools: [] }} action={async () => null} busy={false} />
+    : panel;
 Object.assign(window, { proxiesFixture: fixture });
 
 const client = new Client({ url: "/graphql", exchanges: [fetchExchange], preferGetMethod: false });

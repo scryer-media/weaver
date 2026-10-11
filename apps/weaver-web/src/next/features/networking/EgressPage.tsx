@@ -54,13 +54,14 @@ export function EgressPage({
       kind: "table",
       id: "egress",
       title: t("next.networking.egress.title"),
-      columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 0.9fr) 104px minmax(0, 1fr)",
+      columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 0.9fr) 104px minmax(0, 1fr) 124px",
       headers: [
         t("next.networking.egress.name"),
         t("next.networking.egress.bindingColumn"),
         t("next.networking.egress.health"),
         t("next.networking.egress.limit"),
         t("next.networking.egress.quota"),
+        "",
       ],
       empty: t("next.networking.egress.empty"),
       emptyAction: { label: t("next.networking.egress.add"), onClick: () => open(null) },
@@ -108,6 +109,11 @@ export function EgressPage({
             >
               {quotaSummary(egress)}
             </Cell>,
+            <span key="edit" className="ml-auto" onClick={(event) => event.stopPropagation()}>
+              <SecondaryButton size="compact" onClick={() => open(egress)}>
+                {t("next.networking.egress.edit")}
+              </SecondaryButton>
+            </span>,
           ],
         };
       }),

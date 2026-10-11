@@ -249,7 +249,7 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
       id: "proxies",
       title: t("next.settings.panel.proxies"),
       note: t("next.proxies.tableNote"),
-      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 82px",
+      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 180px",
       headers: [
         t("next.proxies.name"),
         t("next.proxies.type"),
@@ -285,9 +285,12 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
           <Cell key="health" mono className="text-wv-muted">
             {health[profile.id] ?? "—"}
           </Cell>,
-          <span key="test" onClick={(event) => event.stopPropagation()}>
+          <span key="actions" className="ml-auto flex items-center gap-2" onClick={(event) => event.stopPropagation()}>
             <SecondaryButton icon="test" className="h-7 px-2" onClick={() => void runTest(profile)}>
               {t("next.proxies.test")}
+            </SecondaryButton>
+            <SecondaryButton className="h-7 px-2" onClick={() => setEditingId(profile.id)}>
+              {t("next.proxies.edit")}
             </SecondaryButton>
           </span>,
         ],

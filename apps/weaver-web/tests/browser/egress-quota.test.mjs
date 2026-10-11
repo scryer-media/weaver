@@ -31,12 +31,17 @@ test("the egress editor saves a download quota, and refuses one switched on with
   const { page, errors } = await open("egress");
   const row = (name) => page.getByRole("button", { name: new RegExp(`^${name}`) });
   // The table's quota column: used against allowance, or a dash where there is none.
-  assert.deepEqual((await cells(row("WAN Fiber"))).slice(4), ["400 GB / 1.0 TB"]);
-  assert.deepEqual((await cells(row("LTE standby"))).slice(4), ["20.0 GB / 20.0 GB"]);
-  assert.deepEqual((await cells(row("System"))).slice(4), ["—"]);
+  assert.deepEqual((await cells(row("WAN Fiber"))).slice(4), ["400 GB / 1.0 TB", "Edit egress"]);
+  assert.deepEqual((await cells(row("LTE standby"))).slice(4), ["20.0 GB / 20.0 GB", "Edit egress"]);
+  assert.deepEqual((await cells(row("System"))).slice(4), ["—", "Edit egress"]);
 
-  await row("WAN Fiber").click();
+  if (shot("egress-table")) await page.screenshot({ path: shot("egress-table") });
+  // The line opens its egress, and so does the button on it.
   const editor = page.getByRole("dialog", { name: "WAN Fiber", exact: true });
+  await row("WAN Fiber").getByRole("button", { name: "Edit egress", exact: true }).click();
+  await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+  await editor.waitFor({ state: "detached" });
+  await page.getByText("WAN Fiber", { exact: true }).click();
   await editor.getByText("Download quota", { exact: true }).first().waitFor();
   assert.equal(await editor.getByRole("switch", { name: "Enforce a download quota", exact: true }).getAttribute("aria-checked"), "true");
   await editor.getByText("Used so far: 400 GB.", { exact: true }).waitFor();

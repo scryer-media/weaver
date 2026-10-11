@@ -50,12 +50,13 @@ export function PoolsPage({
       id: "pools",
       title: t("next.networking.pools.title"),
       note: countLabel(t, "next.networking.pools.count", data.proxyPools.length),
-      columns: "minmax(0, 1fr) 132px minmax(0, 1.6fr) 104px",
+      columns: "minmax(0, 1fr) 132px minmax(0, 1.6fr) 104px 112px",
       headers: [
         t("next.networking.pools.name"),
         t("next.networking.pools.type"),
         t("next.networking.pools.members"),
         t("next.networking.pools.state"),
+        "",
       ],
       empty: t("next.networking.pools.empty"),
       emptyAction: { label: t("next.networking.pools.add"), onClick: () => open(null) },
@@ -90,6 +91,11 @@ export function PoolsPage({
               state={pool.enabled ? "UP" : "IDLE"}
               label={pool.enabled ? t("next.networking.enabled") : t("next.networking.disabled")}
             />,
+            <span key="edit" className="ml-auto" onClick={(event) => event.stopPropagation()}>
+              <SecondaryButton size="compact" onClick={() => open(pool)}>
+                {t("next.networking.pools.edit")}
+              </SecondaryButton>
+            </span>,
           ],
         };
       }),
