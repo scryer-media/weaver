@@ -2165,6 +2165,22 @@ impl Pipeline {
                     set_index,
                     volume_index,
                 }) => {
+                    // Capture observed identity before routing may checkpoint.
+                    // This never grants coverage to bytes held only in memory.
+                    if file_offset == 0
+                        && buffered_segment.damaged_source.is_none()
+                        && buffered_segment.data.len_bytes() as u64 == buffered_segment.declared_file_len
+                        && let Some(set) = self.direct_store.set_mut(job_id, set_index)
+                        && set.plan().identity.is_some_and(|identity| identity.kind == crate::pipeline::direct_store::plan::IdentityKind::HeaderVolumeSet)
+                    {
+                        let mut hash = blake3::Hasher::new();
+                        buffered_segment.data.for_each_slice(|bytes| { hash.update(bytes); });
+                        set.record_repost_digest(crate::pipeline::direct_store::snapshot::RepostDigest {
+                            file_index: file_id.file_index,
+                            length: buffered_segment.declared_file_len,
+                            blake3: *hash.finalize().as_bytes(),
+                        });
+                    }
                     drop(_cpu_scope);
                     let outcome = self
                         .handle_direct_decode_success(

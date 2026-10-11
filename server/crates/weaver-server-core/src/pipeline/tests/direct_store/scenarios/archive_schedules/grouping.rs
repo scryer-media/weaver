@@ -868,9 +868,13 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
             // same bytes. Otherwise a listing cannot repair missing data.
             let unrepairable = (options.recovery == RecoveryFormat::Absent || interruption.fails())
                 && interruption.loss().is_some_and(|(mask, _)| {
-                    // Only named reposts identify an absent copy without its
-                    // content; opaque postings retain their existing contract.
-                    if cell.naming != Naming::Reposted {
+                    // Names or posted PAR2 descriptions can identify the
+                    // absent copy. Parity is unnecessary when identical
+                    // source bytes remain available in another posting.
+                    let identifiable_copy = cell.naming == Naming::Reposted
+                        || (cell.naming == Naming::HexReposted
+                            && cell.binding == Binding::Par2Posted);
+                    if !identifiable_copy {
                         return mask != 0;
                     }
                     let articles_per_file = 4 / fixture.volumes.len();
@@ -1047,6 +1051,61 @@ async fn repaired_swapped_rar_does_not_reextract_damaged_sources() {
             },
             profile,
             vec![(case, schedules().into_iter().nth(case).unwrap())],
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn restored_opaque_repost_keeps_observed_identity() {
+    for (container, case) in [
+        (Container::Rar5, 156),
+        (Container::Rar5Encrypted, 108),
+        (Container::Rar5, 277),
+        (Container::Rar5Encrypted, 277),
+    ] {
+        run_cell(
+            Cell {
+                container,
+                naming: Naming::HexReposted,
+                binding: Binding::Nothing,
+            },
+            ExtractionProfile::DirectStore,
+            vec![(case, schedules().into_iter().nth(case).unwrap())],
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn opaque_repost_repairs_a_missing_original_article() {
+    run_cell(
+        Cell {
+            container: Container::Rar5,
+            naming: Naming::HexReposted,
+            binding: Binding::Par2Posted,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(242, schedules().into_iter().nth(242).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn opaque_repost_recovers_without_parity_when_an_identical_copy_survives() {
+    for (container, profile) in [
+        (Container::Rar5, ExtractionProfile::DirectStore),
+        (Container::Rar4, ExtractionProfile::DirectStore),
+        (Container::Rar5, ExtractionProfile::Chase),
+    ] {
+        run_cell(
+            Cell {
+                container,
+                naming: Naming::HexReposted,
+                binding: Binding::Par2Posted,
+            },
+            profile,
+            vec![(342, schedules().into_iter().nth(342).unwrap())],
         )
         .await;
     }

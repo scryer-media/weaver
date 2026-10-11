@@ -2531,6 +2531,27 @@ impl Pipeline {
         if !self.stateful_par2_session_gate() {
             return Ok(None);
         }
+        // A retained physical session scans only unresolved source paths.
+        // Seeding an intact repost can therefore hide the bytes needed by an
+        // identical missing description. Use the full source scan for these
+        // sets so one physical copy can satisfy every matching description.
+        if source_access.is_none()
+            && self.par2_runtime(job_id).is_some_and(|runtime| {
+                runtime
+                    .set_runtime(set_id)
+                    .and_then(|set_runtime| set_runtime.set.as_deref())
+                    .is_some_and(|set| {
+                        let mut contents = std::collections::HashSet::new();
+                        set.recovery_file_ids.iter().any(|id| {
+                            set.file_description(id).is_some_and(|description| {
+                                !contents.insert((description.length, description.hash_full))
+                            })
+                        })
+                    })
+            })
+        {
+            return Ok(None);
+        }
         // Which of this job's files belong to somebody else, computed here so
         // every consumer of a retained session gets the same answer: a reused
         // session is re-pointed at the current list, and a fresh one opens with

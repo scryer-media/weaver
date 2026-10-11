@@ -1895,25 +1895,44 @@ impl Pipeline {
                                 return;
                             }
                         };
-                        // The scan is a second read of a directory the analysis
-                        // described a moment ago, and it is the one this arm
-                        // stands its verdict on. If the two disagree —
-                        // `verify_all` cannot report misplacement, so a
-                        // disagreement is damage or an absence that appeared in
-                        // between — then "placement only" was concluded from a
-                        // state that no longer holds, and marking the set
-                        // verified on it would accept a verdict nothing re-read.
-                        // Nothing is moved and the gate is re-armed instead: the
-                        // next lap analyses the disk as it is now and takes
-                        // whichever ladder that answer deserves.
+                        // The rename-only proposal cannot express copying one
+                        // intact repost onto multiple described names. A scan
+                        // disagreement therefore needs the repairer's verified
+                        // installation, not another identical analysis loop.
+                        // The repairer also revalidates its sources if the
+                        // directory changed between these two reads.
                         if par2_verification_needs_repair(&scanned) {
                             warn!(
                                 job_id = job_id.0,
                                 damaged = scanned.total_missing_blocks,
-                                "PAR2 placement pass disagreed with the analysis it stood in \
-                                 for — re-checking before placing anything"
+                                "PAR2 placement needs verified installation instead of renames"
                             );
-                            self.schedule_job_completion_check(job_id);
+                            if !self.maybe_start_repair(job_id).await {
+                                return;
+                            }
+                            match self
+                                .run_par2_repairer(
+                                    job_id,
+                                    Arc::clone(&par2_set),
+                                    working_dir.clone(),
+                                    true,
+                                    Some(verification),
+                                )
+                                .await
+                            {
+                                Ok(outcome) => {
+                                    self.finish_par2_repair(
+                                        job_id,
+                                        Arc::clone(&par2_set),
+                                        working_dir.clone(),
+                                        verification,
+                                        outcome,
+                                        has_crc_failures,
+                                    )
+                                    .await;
+                                }
+                                Err(message) => self.fail_par2_repair(job_id, message),
+                            }
                             return;
                         }
                         self.try_deobfuscate_files_with_par2(job_id).await;

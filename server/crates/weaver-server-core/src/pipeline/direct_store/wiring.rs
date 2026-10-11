@@ -1658,10 +1658,11 @@ impl Pipeline {
         else {
             return false;
         };
-        let Some(set) = self.direct_store.set(file_id.job_id, header_set.set_index) else {
+        let set_index = header_set.set_index;
+        let Some(set) = self.direct_store.set(file_id.job_id, set_index) else {
             return false;
         };
-        if set.is_demoted() || !set.volume_is_complete(volume_number) {
+        if set.is_demoted() {
             return false;
         }
         let Some(original) = set.plan().volumes.get(&volume_number) else {
@@ -1671,7 +1672,44 @@ impl Pipeline {
             job_id: file_id.job_id,
             file_index: *original,
         };
-        if self.file_declared_size.get(&original_id) != Some(&segment.declared_file_len) {
+        if let Some(digest) = set.repost_digest(original_id.file_index)
+            && digest.length == segment.declared_file_len
+        {
+            let mut hash = blake3::Hasher::new();
+            segment.data.for_each_slice(|bytes| {
+                hash.update(bytes);
+            });
+            if hash.finalize().as_bytes() == &digest.blake3 {
+                // Persist the identity and placements before the duplicate can
+                // become a durable conventional file. Otherwise a crash can
+                // retain only that copy and lose the direct set it belongs to.
+                self.run_direct_barrier(
+                    file_id.job_id,
+                    set_index,
+                    super::barrier::BarrierTrigger::Demand(
+                        super::barrier::BarrierDemand::PhaseChange,
+                    ),
+                )
+                .await;
+                if let Some(admission) = self.direct_store.identity.get_mut(&file_id.job_id) {
+                    admission.no_match.insert(file_id.file_index);
+                }
+                return true;
+            }
+            return false;
+        }
+        if !set.volume_is_complete(volume_number) {
+            return false;
+        }
+        // A restored complete volume has durable decoded coverage even when
+        // its transport header was not retained. Compare that exact extent
+        // before comparing all bytes of the arriving repost.
+        let original_len = self
+            .file_declared_size
+            .get(&original_id)
+            .copied()
+            .unwrap_or_else(|| set.virtual_volume_len(volume_number, 0));
+        if original_len != segment.declared_file_len {
             return false;
         }
         let volumes = set

@@ -354,6 +354,7 @@ pub(crate) struct CoverageBarrier {
     // The fingerprints the next checkpoint carries, pushed beside the
     // identity binding.
     fingerprints: Vec<super::snapshot::ProvenFingerprint>,
+    repost_digests: Vec<super::snapshot::RepostDigest>,
     // A [`PreparedBarrier`] is out, its sync running elsewhere. While it is,
     // no automatic trigger is due and no second one can be prepared: two
     // barriers in flight would both persist generation `n + 1`, and the one
@@ -412,6 +413,7 @@ impl CoverageBarrier {
             member_crypt: BTreeMap::new(),
             identity: None,
             fingerprints: Vec::new(),
+            repost_digests: Vec::new(),
             in_flight: false,
             row_epoch: 0,
         }
@@ -446,6 +448,10 @@ impl CoverageBarrier {
         fingerprints: Vec<super::snapshot::ProvenFingerprint>,
     ) {
         self.fingerprints = fingerprints;
+    }
+
+    pub(crate) fn set_repost_digests(&mut self, digests: Vec<super::snapshot::RepostDigest>) {
+        self.repost_digests = digests;
     }
 
     // Points the next snapshot at the plan the set is **currently** routing
@@ -531,6 +537,7 @@ impl CoverageBarrier {
         barrier.committed_generation = snapshot.generation;
         barrier.identity = snapshot.identity.clone();
         barrier.fingerprints = snapshot.fingerprints.clone();
+        barrier.repost_digests = snapshot.repost_digests.clone();
         for entry in &snapshot.floors {
             let volume = barrier.volumes.entry(entry.volume_index).or_default();
             volume.file_index = entry.file_index;
@@ -850,6 +857,7 @@ impl CoverageBarrier {
                 .collect(),
             identity: self.identity.clone(),
             fingerprints: self.fingerprints.clone(),
+            repost_digests: self.repost_digests.clone(),
         }
     }
 

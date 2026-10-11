@@ -259,6 +259,7 @@ fn sample_snapshot() -> CoverageSnapshot {
         }],
         identity: None,
         fingerprints: Vec::new(),
+        repost_digests: Vec::new(),
     }
 }
 
