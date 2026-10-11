@@ -53,6 +53,49 @@ fn sevenz_member_requires_declared_length_and_crc() {
 }
 
 #[test]
+fn uu_sevenz_padding_requires_a_verified_container_geometry() {
+    let dir = TempDir::new().unwrap();
+    let payload: Vec<_> = (0..4096).map(|index| (index % 251) as u8).collect();
+    let archive = sevenz_archive_with_dictionary(1024 * 1024, &[("member.bin", &payload)]);
+    for count in [1, 2] {
+        let parts: Vec<_> = archive
+            .chunks(archive.len().div_ceil(count))
+            .enumerate()
+            .map(|(index, bytes)| {
+                let path = dir.path().join(format!("part-{count}-{index}"));
+                let mut padded = bytes.to_vec();
+                padded.push(0);
+                fs::write(&path, padded).unwrap();
+                (index as u32, path)
+            })
+            .collect();
+        let uu: HashSet<_> = parts.iter().map(|(_, path)| path.clone()).collect();
+        assert!(resolve_sevenz_parts(&parts, &HashSet::new()).is_err());
+        let resolved = resolve_sevenz_parts(&parts, &uu).unwrap();
+        let mut actual = Vec::new();
+        resolved.open().unwrap().read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, archive);
+
+        let surviving_transport = HashSet::from([parts.last().unwrap().1.clone()]);
+        let restored = resolve_sevenz_parts(&parts, &surviving_transport).unwrap();
+        let mut actual = Vec::new();
+        restored.open().unwrap().read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, archive);
+
+        let last = &parts.last().unwrap().1;
+        let mut corrupted = fs::read(last).unwrap();
+        *corrupted.last_mut().unwrap() = 1;
+        fs::write(last, &corrupted).unwrap();
+        assert!(resolve_sevenz_parts(&parts, &uu).is_err());
+        *corrupted.last_mut().unwrap() = 0;
+        let footer = corrupted.len() - 2;
+        corrupted[footer] ^= 1;
+        fs::write(last, corrupted).unwrap();
+        assert!(resolve_sevenz_parts(&parts, &uu).is_err());
+    }
+}
+
+#[test]
 fn sevenz_reposts_require_equivalent_bytes_and_container_bounds() {
     let dir = TempDir::new().unwrap();
     let first = dir.path().join("archive.7z.001");

@@ -1285,24 +1285,26 @@ impl Pipeline {
             }
         }
 
-        // The sweep is a directory walk, and it runs at restore for every job.
-        // A job whose spec declares no RAR volume cannot have produced a
-        // `.direct.partial`, an envelope or a holds scratch — routing only ever
-        // touches a set discovered from those roles — so it is skipped outright
-        // rather than paying a walk per restored job at startup. Gate-independent
-        // on purpose: the files a *disabled* gate has to sweep were written by an
-        // enabled one, over the same spec.
-        // A durable row is the other proof: an identity-admitted set routes
-        // files whose names classify as nothing, so a spec with no RAR volume
-        // role can still have left partials and envelopes behind.
-        let could_have_routed = !durable_set_names.is_empty()
-            || spec
-                .files
-                .iter()
-                .any(|file| matches!(file.role, weaver_model::files::FileRole::RarVolume { .. }));
-        if could_have_routed {
+        // A named archive can leave scratch before its first checkpoint,
+        // including a 7z shape that discovery refuses on restart. Derive only
+        // exact set names from the job spec; the sweep still reconstructs each
+        // scratch filename before removing it.
+        let mut scratch_set_names = durable_set_names;
+        for file in &spec.files {
+            if matches!(
+                file.role,
+                weaver_model::files::FileRole::RarVolume { .. }
+                    | weaver_model::files::FileRole::SevenZipArchive
+                    | weaver_model::files::FileRole::SevenZipSplit { .. }
+            ) && let Some(name) =
+                weaver_model::files::archive_base_name(&file.filename, &file.role)
+            {
+                scratch_set_names.insert(name);
+            }
+        }
+        if !scratch_set_names.is_empty() {
             result.swept =
-                sweep_orphan_direct_files(&roots, &claimed, &owned, &durable_set_names).await;
+                sweep_orphan_direct_files(&roots, &claimed, &owned, &scratch_set_names).await;
         }
 
         // The restart ledger, in the four numbers that separate "resumed" from

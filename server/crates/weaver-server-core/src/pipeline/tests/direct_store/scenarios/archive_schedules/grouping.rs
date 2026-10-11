@@ -864,12 +864,36 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
         )
         .await;
         let check = || {
-            // The schedule makes these articles unavailable on every source.
-            // SFV can identify intact files but cannot repair missing bytes;
-            // transport failure precedes the no-loss topology diagnostic.
-            let unrepairable = options.recovery == RecoveryFormat::Absent
-                && interruption.loss().is_some_and(|(mask, _)| mask != 0);
-            if interruption.fails() || unrepairable {
+            // An available article from a byte-identical repost supplies the
+            // same bytes. Otherwise a listing cannot repair missing data.
+            let unrepairable = (options.recovery == RecoveryFormat::Absent || interruption.fails())
+                && interruption.loss().is_some_and(|(mask, _)| {
+                    // Names or posted PAR2 descriptions can identify the
+                    // absent copy. Parity is unnecessary when identical
+                    // source bytes remain available in another posting.
+                    let identifiable_copy = cell.naming == Naming::Reposted
+                        || (cell.naming == Naming::HexReposted
+                            && cell.binding == Binding::Par2Posted);
+                    if !identifiable_copy {
+                        return mask != 0;
+                    }
+                    let articles_per_file = 4 / fixture.volumes.len();
+                    (0..4).any(|slot| {
+                        mask & (1 << slot) != 0
+                            && !fixture
+                                .volumes
+                                .iter()
+                                .enumerate()
+                                .any(|(copy, (_, bytes))| {
+                                    bytes == &fixture.volumes[slot / articles_per_file].1
+                                        && mask
+                                            & (1 << (copy * articles_per_file
+                                                + slot % articles_per_file))
+                                            == 0
+                                })
+                    })
+                });
+            if unrepairable {
                 profile.assert_rejected(&outcome, &wanted);
                 return;
             }
@@ -908,10 +932,19 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 );
             }
             let mut route = route;
-            if interruption.loss().is_some_and(|(mask, _)| mask == 15) {
-                // With every payload article absent, no content can bind the
-                // posted names, so the set is rebuilt conventionally. The
-                // completion and exact output-byte checks above still apply.
+            if interruption.loss().is_some_and(|(mask, _)| mask == 15)
+                && !matches!(
+                    cell.naming,
+                    Naming::Conventional
+                        | Naming::ConventionalFour
+                        | Naming::Single
+                        | Naming::MixedCase
+                        | Naming::OldStyleS
+                )
+            {
+                // Recognizable posted names retain their direct identity even
+                // with every payload article absent. Obfuscated, reordered or
+                // reposted names need content evidence and rebuild on disk.
                 route.direct = false;
             }
             if matches!(
@@ -925,6 +958,22 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 // direct admission still requires no unexpected demotion and
                 // no refetch of durable articles below.
                 route.direct = outcome.finalized == route.sets;
+            }
+            if cell.naming == Naming::HexSwappedRar
+                && matches!(cell.binding, Binding::Par2RealFirst | Binding::Par2RealLast)
+                && interruption
+                    .loss()
+                    .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
+            {
+                // A lost identity prefix can prevent binding before enough
+                // header evidence survives to prove the swapped chain.
+                route.shape_demotion = |reason| {
+                    matches!(
+                        reason,
+                        DemotionReason::Par2Unbindable
+                            | DemotionReason::MemberIneligible(MemberIneligibility::MalformedChain)
+                    )
+                };
             }
             if cell.naming == Naming::OldStyleS
                 && interruption
@@ -964,6 +1013,101 @@ pub(super) async fn cell_smoke(cell: Cell) {
             (1, (backward.clone(), Interruption::None)),
         ];
         run_cell(cell, profile, cases).await;
+    }
+}
+
+#[tokio::test]
+async fn repaired_swapped_rar_retires_lost_posted_volumes() {
+    run_cell(
+        Cell {
+            container: Container::Rar4,
+            naming: Naming::HexSwappedRar,
+            binding: Binding::Par2RealFirst,
+        },
+        ExtractionProfile::DirectStore,
+        [240, 244, 252, 268]
+            .into_iter()
+            .map(|case| (case, schedules().into_iter().nth(case).unwrap()))
+            .collect(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn repaired_swapped_rar_does_not_reextract_damaged_sources() {
+    for (container, profile, case) in [
+        (Container::Rar4, ExtractionProfile::Chase, 248),
+        (
+            Container::Rar5Encrypted,
+            ExtractionProfile::DirectStore,
+            266,
+        ),
+    ] {
+        run_cell(
+            Cell {
+                container,
+                naming: Naming::HexSwappedRar,
+                binding: Binding::Par2RealFirst,
+            },
+            profile,
+            vec![(case, schedules().into_iter().nth(case).unwrap())],
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn restored_opaque_repost_keeps_observed_identity() {
+    for (container, case) in [
+        (Container::Rar5, 156),
+        (Container::Rar5Encrypted, 108),
+        (Container::Rar5, 277),
+        (Container::Rar5Encrypted, 277),
+    ] {
+        run_cell(
+            Cell {
+                container,
+                naming: Naming::HexReposted,
+                binding: Binding::Nothing,
+            },
+            ExtractionProfile::DirectStore,
+            vec![(case, schedules().into_iter().nth(case).unwrap())],
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn opaque_repost_repairs_a_missing_original_article() {
+    run_cell(
+        Cell {
+            container: Container::Rar5,
+            naming: Naming::HexReposted,
+            binding: Binding::Par2Posted,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(242, schedules().into_iter().nth(242).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn opaque_repost_recovers_without_parity_when_an_identical_copy_survives() {
+    for (container, profile) in [
+        (Container::Rar5, ExtractionProfile::DirectStore),
+        (Container::Rar4, ExtractionProfile::DirectStore),
+        (Container::Rar5, ExtractionProfile::Chase),
+    ] {
+        run_cell(
+            Cell {
+                container,
+                naming: Naming::HexReposted,
+                binding: Binding::Par2Posted,
+            },
+            profile,
+            vec![(342, schedules().into_iter().nth(342).unwrap())],
+        )
+        .await;
     }
 }
 

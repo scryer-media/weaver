@@ -3238,6 +3238,64 @@ impl CompressedFormat {
     }
 }
 
+#[tokio::test]
+async fn solid_encrypted_rar_repairs_an_unposted_middle_volume() {
+    use sha2::Digest;
+
+    let format = CompressedFormat::Rar5SolidEncryptedFourVolumes;
+    let (oracle_key, parts) = format.volumes().unwrap();
+    let mut volumes: Vec<_> = parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            (
+                format!("compressed.part{:02}.rar", index + 1),
+                bytes.to_vec(),
+            )
+        })
+        .collect();
+    let slice_size = 1024;
+    let recovery_blocks = volumes[2].1.len().div_ceil(slice_size as usize);
+    let described: Vec<_> = volumes
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let par2 = build_test_par2_with_recovery(&described, slice_size, recovery_blocks);
+    // The missing volume is absent from the NZB itself, not a failed article.
+    volumes.remove(2);
+    let outcome = run_repairable_par2_gate_inner(
+        DirectStoreGate::Enabled,
+        JobId(98701),
+        "compressible.txt",
+        &volumes,
+        &par2,
+        IndexPosition::First,
+        format.fixture().2,
+        1,
+        None,
+    )
+    .await;
+    assert_eq!(
+        outcome.status,
+        Some(JobStatus::Complete),
+        "{}",
+        outcome.sets
+    );
+    let member = outcome.member.expect("repaired member was delivered");
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles/expected.json"
+    )))
+    .unwrap();
+    let expected = &oracle["archives"][oracle_key]["compressible.txt"];
+    assert_eq!(member.len() as u64, expected["size"].as_u64().unwrap());
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&member)),
+        expected["sha256"].as_str().unwrap()
+    );
+    assert_eq!(outcome.repair_scratch_left, 0);
+}
+
 async fn compressed_direct_campaign(format: CompressedFormat, selection: Selection) {
     compressed_campaign(format, selection, ExtractionProfile::DirectStore).await;
 }

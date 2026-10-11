@@ -40,6 +40,9 @@ pub(crate) enum UnmaterializedArchiveSet {
     // which has already extracted or finalized. This name is a second view of
     // content the job already holds.
     ConsumedBy(String),
+    // Verified replacement volumes exist under one canonical name, but its
+    // extraction still owns the obligation to deliver the archive members.
+    ReplacedBy(String),
     // No name link survives an identity rebind either way, but the job
     // demonstrably consumed archive content under another name — extracted in
     // this run, or volume facts persisted under another set — and never
@@ -187,13 +190,15 @@ impl Pipeline {
 
         let still_referenced = self.jobs.get(&job_id).is_some_and(|state| {
             state.assembly.files().any(|file| {
-                matches!(
-                    self.classified_role_for_file(job_id, file),
-                    weaver_model::files::FileRole::RarVolume { .. }
-                ) && self
-                    .classified_archive_set_name_for_file(job_id, file)
-                    .as_deref()
-                    == Some(set_name)
+                !self.recovery_superseded_source(job_id, file.file_id())
+                    && matches!(
+                        self.classified_role_for_file(job_id, file),
+                        weaver_model::files::FileRole::RarVolume { .. }
+                    )
+                    && self
+                        .classified_archive_set_name_for_file(job_id, file)
+                        .as_deref()
+                        == Some(set_name)
             })
         });
         if still_referenced {
@@ -222,6 +227,93 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return UnmaterializedArchiveSet::MissingVolumes;
         };
+
+        // A fully lost posted volume cannot supply a content identity. Its
+        // surviving sibling can still prove that this entire posted roster
+        // moved to one verified, extracted canonical set. Require the same
+        // volume count and no unmatched surviving bytes before retiring it.
+        if self.par2_verified.contains(&job_id)
+            && self.par2_verdict_delivered_unposted_payload(job_id)
+        {
+            let cohort: Vec<_> = state
+                .assembly
+                .files()
+                .filter_map(|file| {
+                    let identity = self.effective_file_identity(job_id, file.file_id())?;
+                    let role =
+                        weaver_model::files::FileRole::from_filename(&identity.source_filename);
+                    (matches!(role, weaver_model::files::FileRole::RarVolume { .. })
+                        && weaver_model::files::archive_base_name(&identity.source_filename, &role)
+                            .as_deref()
+                            == Some(set_name))
+                    .then_some((file, identity))
+                })
+                .collect();
+            let mut owners: HashSet<_> = cohort
+                .iter()
+                .filter_map(|(file, identity)| {
+                    (file.is_complete()
+                        && identity.classification_source
+                            == crate::jobs::record::FileIdentitySource::Par2)
+                        .then(|| self.classified_archive_set_name_for_file(job_id, file))
+                        .flatten()
+                        .filter(|name| name != set_name)
+                })
+                .collect();
+            // With total article loss there is no content identity to retain.
+            // The sole verified replacement roster may discharge the sole
+            // empty posted roster, but never choose among several archives.
+            if owners.is_empty()
+                && !cohort.is_empty()
+                && cohort.iter().all(|(file, _)| {
+                    self.recovery_superseded_source(job_id, file.file_id())
+                        || (file.received_bytes() == 0 && !file.has_retained_damage())
+                })
+                && !self.job_has_pending_download_pipeline_work(job_id)
+            {
+                let names = self.rar_set_names_for_job(job_id);
+                if names.len() == 2 && names.iter().any(|name| name == set_name) {
+                    owners.extend(names.into_iter().filter(|name| name != set_name));
+                }
+            }
+            if owners.len() == 1 {
+                let owner = owners.iter().next().unwrap();
+                let extracted = self
+                    .extracted_archives
+                    .get(&job_id)
+                    .is_some_and(|sets| sets.contains(owner))
+                    || self
+                        .rar_sets
+                        .get(&(job_id, owner.clone()))
+                        .and_then(|set| set.plan.as_ref())
+                        .is_some_and(|plan| {
+                            !plan.member_names.is_empty()
+                                && self.extracted_members.get(&job_id).is_some_and(|members| {
+                                    plan.member_names
+                                        .iter()
+                                        .all(|member| members.contains(member))
+                                })
+                        });
+                let volume_count = self
+                    .rar_sets
+                    .get(&(job_id, owner.clone()))
+                    .map(|set| set.volume_files.len());
+                let accounted = cohort.iter().all(|(file, _)| {
+                    self.classified_archive_set_name_for_file(job_id, file)
+                        .as_deref()
+                        == Some(owner)
+                        || self.recovery_superseded_source(job_id, file.file_id())
+                        || (file.received_bytes() == 0 && !file.has_retained_damage())
+                });
+                if volume_count == Some(cohort.len()) && accounted {
+                    return if extracted {
+                        UnmaterializedArchiveSet::ConsumedBy(owner.clone())
+                    } else {
+                        UnmaterializedArchiveSet::ReplacedBy(owner.clone())
+                    };
+                }
+            }
+        }
 
         // Every name this job has known these files by. A PAR2 rebind moves a
         // file between its posted name and its canonical one, and the set that
@@ -1202,10 +1294,12 @@ impl Pipeline {
         }
 
         for file in state.assembly.files() {
-            if matches!(
-                self.classified_role_for_file(job_id, file),
-                weaver_model::files::FileRole::RarVolume { .. }
-            ) && let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file)
+            if !self.recovery_superseded_source(job_id, file.file_id())
+                && matches!(
+                    self.classified_role_for_file(job_id, file),
+                    weaver_model::files::FileRole::RarVolume { .. }
+                )
+                && let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file)
             {
                 set_names.insert(set_name);
             }

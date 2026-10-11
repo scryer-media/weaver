@@ -2894,6 +2894,19 @@ impl Pipeline {
         for (file_id, filename, received) in finished {
             self.direct_unpack_note_commit(file_id, &filename, received, true);
         }
+        // A verified replacement may have no posted file and therefore no
+        // file-completion event. Publish its final extent before ownership
+        // leaves the actor, or the chase can wait forever for that event.
+        let key = (job_id, set_name.to_string());
+        if let Some(armed) = self.direct_unpack.armed.get(&key) {
+            for (index, path) in armed.paths.iter().enumerate() {
+                if let Some(length) = self.direct_unpack_rebuilt_part_len(job_id, path) {
+                    armed.coverage.note_part_len(index, length);
+                    armed.coverage.advance_watermark(index, length);
+                    armed.coverage.mark_part_complete(index);
+                }
+            }
+        }
     }
 
     // Publish a completed part to the chase that owns it: its final
