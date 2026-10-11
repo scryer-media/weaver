@@ -31,6 +31,13 @@ pub(super) enum Container {
     Rar5EncryptedHeaders,
     SevenZip,
     SevenZipSolid,
+    // Solid compressed sets a real archiver wrote, with the data encrypted
+    // under plain headers or not: direct store refuses every member, so
+    // they extract by the fallback route.
+    Rar4Solid,
+    Rar4SolidEncrypted,
+    Rar5Solid,
+    Rar5SolidEncrypted,
     // Codec and integrity variants the grouping cross does not vary; they
     // exist as cells only so their hand-named formats alias to one.
     Rar4Encrypted,
@@ -221,16 +228,59 @@ impl Container {
         matches!(self, Self::SevenZip | Self::SevenZipSolid)
     }
 
+    fn is_solid_rar(self) -> bool {
+        matches!(
+            self,
+            Self::Rar4Solid | Self::Rar4SolidEncrypted | Self::Rar5Solid | Self::Rar5SolidEncrypted
+        )
+    }
+
+    // The checked-in archive written as `volumes` volumes, if there is one.
+    fn solid_format(self, volumes: usize) -> Option<CompressedFormat> {
+        use CompressedFormat as F;
+        Some(match (self, volumes) {
+            (Self::Rar4Solid, 1) => F::Rar4Solid,
+            (Self::Rar4Solid, 2) => F::Rar4SolidTwoVolumes,
+            (Self::Rar4Solid, 4) => F::Rar4SolidFourVolumes,
+            (Self::Rar4SolidEncrypted, 1) => F::Rar4SolidEncrypted,
+            (Self::Rar4SolidEncrypted, 2) => F::Rar4SolidEncryptedTwoVolumes,
+            (Self::Rar4SolidEncrypted, 4) => F::Rar4SolidEncryptedFourVolumes,
+            (Self::Rar5Solid, 1) => F::Rar5Solid,
+            (Self::Rar5Solid, 2) => F::Rar5SolidTwoVolumes,
+            (Self::Rar5Solid, 4) => F::Rar5SolidFourVolumes,
+            (Self::Rar5SolidEncrypted, 1) => F::Rar5SolidEncrypted,
+            (Self::Rar5SolidEncrypted, 2) => F::Rar5SolidEncryptedTwoVolumes,
+            (Self::Rar5SolidEncrypted, 4) => F::Rar5SolidEncryptedFourVolumes,
+            _ => return None,
+        })
+    }
+
     // Whether the volumes' own readable headers chain the set, so a set no
     // name or index places is still admitted by content.
     fn headers_chain(self) -> bool {
-        matches!(self, Self::Rar5 | Self::Rar5Encrypted)
+        matches!(
+            self,
+            Self::Rar5 | Self::Rar5Encrypted | Self::Rar5Solid | Self::Rar5SolidEncrypted
+        )
     }
 
     // What direct store does with a set it has admitted.
     fn admitted(self) -> Expect {
         match self {
             Self::SevenZipSolid => Expect::Demotes(sevenz_coder),
+            Self::Rar4Solid
+            | Self::Rar4SolidEncrypted
+            | Self::Rar5Solid
+            | Self::Rar5SolidEncrypted => Expect::Demotes(|reason| {
+                matches!(
+                    reason,
+                    DemotionReason::MemberIneligible(
+                        MemberIneligibility::Compressed
+                            | MemberIneligibility::Solid
+                            | MemberIneligibility::Encrypted
+                    )
+                )
+            }),
             Self::Rar5UncheckedHeaders => Expect::Demotes(|reason| {
                 matches!(reason, DemotionReason::HeaderEncryptedRefused(_))
             }),
@@ -279,7 +329,11 @@ pub(super) fn rule(cell: Cell) -> Ruling {
         | Container::Rar5Encrypted
         | Container::Rar5EncryptedHeaders
         | Container::SevenZip
-        | Container::SevenZipSolid => crossed(cell),
+        | Container::SevenZipSolid
+        | Container::Rar4Solid
+        | Container::Rar4SolidEncrypted
+        | Container::Rar5Solid
+        | Container::Rar5SolidEncrypted => crossed(cell),
     }
 }
 
@@ -329,6 +383,9 @@ fn crossed(cell: Cell) -> Ruling {
     match (naming, binding) {
         (Naming::OldStyleS | Naming::HexSwappedRar, any_binding!()) if sevenz => {
             Ruling::Impossible("a RAR naming")
+        }
+        (Naming::HexNumberedGap, any_binding!()) if container.is_solid_rar() => {
+            Ruling::Impossible("no solid set was written as three volumes")
         }
         (Naming::BareFirstPart, any_binding!()) if !sevenz => Ruling::Impossible("a 7z naming"),
         (
@@ -381,6 +438,24 @@ fn crossed(cell: Cell) -> Ruling {
             | Binding::LegacyOnLoss
             | Binding::LegacyReal,
         ) => Ruling::Possible(fallback(Admission::Unnamed, unnamed(true))),
+        // A solid set refuses its member from the first header it reads,
+        // which may come before the chain is seen to run backwards.
+        (Naming::HexSwappedRar, any_binding!()) if container.is_solid_rar() => {
+            Ruling::Possible(fallback(
+                Admission::Named,
+                Expect::Demotes(|reason| {
+                    matches!(
+                        reason,
+                        DemotionReason::MemberIneligible(
+                            MemberIneligibility::Compressed
+                                | MemberIneligibility::Solid
+                                | MemberIneligibility::Encrypted
+                                | MemberIneligibility::MalformedChain
+                        )
+                    )
+                }),
+            ))
+        }
         // Names that admit a set whose headers then chain the other way
         // round: direct store demotes it as malformed.
         (
@@ -610,6 +685,31 @@ impl Fixture {
                 LOSES[0]
             };
             (split_volumes(&archive, count), expected, unmapped)
+        } else if let Some(format) = cell.container.solid_format(count) {
+            // The volumes go under the real names a stored set has; every
+            // naming renames posted files and leaves the members alone.
+            let parts: Vec<Vec<u8>> = match format.volumes() {
+                Some((_, parts)) => parts.into_iter().map(<[u8]>::to_vec).collect(),
+                None => vec![format.fixture().1.to_vec()],
+            };
+            assert_eq!(parts.len(), count, "{cell:?}");
+            let written = parts
+                .into_iter()
+                .enumerate()
+                .map(|(index, bytes)| {
+                    let name = if count == 1 {
+                        "silver.horizon.rar".to_string()
+                    } else {
+                        format!("silver.horizon.part{:02}.rar", index + 1)
+                    };
+                    (name, bytes)
+                })
+                .collect();
+            let expected = compressed_members(format)
+                .into_iter()
+                .map(|(name, bytes)| (&*name.leak(), bytes))
+                .collect();
+            (written, expected, LOSES[0])
         } else {
             let name = "nested/feature.mkv";
             let mut written = match cell.container {
@@ -650,7 +750,10 @@ impl Fixture {
         };
         spec.password = matches!(
             cell.container,
-            Container::Rar5Encrypted | Container::Rar5EncryptedHeaders
+            Container::Rar5Encrypted
+                | Container::Rar5EncryptedHeaders
+                | Container::Rar4SolidEncrypted
+                | Container::Rar5SolidEncrypted
         )
         .then(|| PASSWORD.to_string());
         Self {
@@ -1382,13 +1485,17 @@ const PROFILES: [ExtractionProfile; 3] = [
     ExtractionProfile::Conventional,
 ];
 
-pub(super) const CONTAINERS: [Container; 6] = [
+pub(super) const CONTAINERS: [Container; 10] = [
     Container::Rar4,
     Container::Rar5,
     Container::Rar5Encrypted,
     Container::Rar5EncryptedHeaders,
     Container::SevenZip,
     Container::SevenZipSolid,
+    Container::Rar4Solid,
+    Container::Rar4SolidEncrypted,
+    Container::Rar5Solid,
+    Container::Rar5SolidEncrypted,
 ];
 
 pub(super) const NAMINGS: [Naming; 15] = [
