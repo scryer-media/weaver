@@ -432,7 +432,19 @@ impl DirectSetPlan {
             let Some(file) = spec.files.get(file_index as usize) else {
                 return Err("the identity binding names a file the spec does not have");
             };
-            if !matches!(file.role, FileRole::Unknown | FileRole::SplitFile { .. }) {
+            // Live identity admission accepts a named continuation when its
+            // first volume is obfuscated. Restore must accept that same
+            // binding, while a complete named group remains name-owned.
+            let orphan_rar = binding.kind.format() == SetFormat::Rar
+                && matches!(file.role, FileRole::RarVolume { .. })
+                && !spec.files.iter().any(|candidate| {
+                    matches!(candidate.role, FileRole::RarVolume { volume_number: 0 })
+                        && weaver_model::files::archive_base_name(
+                            &candidate.filename,
+                            &candidate.role,
+                        ) == weaver_model::files::archive_base_name(&file.filename, &file.role)
+                });
+            if !matches!(file.role, FileRole::Unknown | FileRole::SplitFile { .. }) && !orphan_rar {
                 return Err("a bound file's name now classifies it");
             }
             if volumes.insert(volume_index, file_index).is_some() {

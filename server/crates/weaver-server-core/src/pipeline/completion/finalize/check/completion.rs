@@ -79,9 +79,19 @@ impl Pipeline {
         // on the spot. Parked as waiting on volume 0 it is a missing volume,
         // and the completion check that follows routes it to repair, or to a
         // failure that names what was seen.
+        // A live direct set owns its archive bytes even while a demoted
+        // neighbour extracts from disk. Its publication waits for that
+        // neighbour, but it must not enter the disk extraction fallback.
+        let direct_sets: HashSet<String> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .filter(|set| !set.is_demoted() && !set.is_finalized())
+            .map(|set| set.plan().set_name.clone())
+            .collect();
         let mut parked_without_first_volume = false;
         for set_name in &set_names {
-            if !extracted_archives.contains(set_name) {
+            if !extracted_archives.contains(set_name) && !direct_sets.contains(set_name) {
                 parked_without_first_volume |=
                     self.park_rar_set_waiting_for_first_volume(job_id, set_name);
             }
@@ -98,6 +108,10 @@ impl Pipeline {
             let mut impossible_sets = Vec::new();
 
             for set_name in &set_names {
+                if direct_sets.contains(set_name) {
+                    has_incomplete_sets = true;
+                    continue;
+                }
                 let set_state = self.rar_sets.get(&(job_id, set_name.clone()));
                 let set_complete = extracted_archives.contains(set_name)
                     || set_state
@@ -1130,6 +1144,17 @@ impl Pipeline {
         // refuse one that still has extraction it could start, or a recovery
         // verdict it still owes.
         if !has_crc_failures
+            // Missing payload needs recovery's delivery accounting. Already
+            // delivered and extracted sources may have been cleaned up.
+            && (!par2_may_still_rule
+                || self.jobs[&job_id].assembly.files().all(|file| {
+                    file.is_complete()
+                        || matches!(
+                            file.role(),
+                            weaver_model::files::FileRole::Par2 { .. }
+                                | weaver_model::files::FileRole::Par3 { .. }
+                        )
+                }))
             && self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id)
         {
             self.finalize_completed_archive_job(job_id).await;

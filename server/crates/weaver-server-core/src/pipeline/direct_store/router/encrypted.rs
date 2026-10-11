@@ -502,6 +502,49 @@ impl DirectSetRouter {
             .any(|part| part.volume == volume && part.logical_offset.is_none())
     }
 
+    // Before a missing earlier header gives this part its logical offset,
+    // retain the widest possible CBC seams from its physical neighbours.
+    // Repair writes can invalidate their shared plaintext backing, so the
+    // caller must capture these bounded windows before the first write.
+    pub(crate) fn cipher_unplaced_edge_reads_bounded(
+        &self,
+        volume: u32,
+        limit: usize,
+    ) -> Option<Vec<(u32, u64, u64)>> {
+        let mut reads = Vec::new();
+        for (index, member) in self.layout_members().iter().enumerate() {
+            if !self
+                .member_id_for_layout(index)
+                .and_then(|id| self.members.get(&id))
+                .is_some_and(|member| member.crypt.is_some())
+                || !member.parts.iter().any(|part| part.volume == volume)
+            {
+                continue;
+            }
+            for part in &member.parts {
+                let (offset, len) = if Some(part.volume) == volume.checked_sub(1) {
+                    let len = part.data_size.min(2 * AES_BLOCK - 1);
+                    (
+                        part.data_offset
+                            .checked_add(part.data_size.checked_sub(len)?)?,
+                        len,
+                    )
+                } else if Some(part.volume) == volume.checked_add(1) {
+                    (part.data_offset, part.data_size.min(AES_BLOCK - 1))
+                } else {
+                    continue;
+                };
+                if len != 0 {
+                    if reads.len() == limit {
+                        return None;
+                    }
+                    reads.push((part.volume, offset, len));
+                }
+            }
+        }
+        Some(reads)
+    }
+
     // CBC neighbours for complete replacement images, including part bytes
     // that never arrived. The layout supplies coordinates; the caller must
     // read them from verified outputs or generation-checked source coverage.
@@ -697,12 +740,14 @@ impl DirectSetRouter {
         crypt.retain_tail_padding(unpacked_size, cipher_offset, plain);
         let destination_len = unpacked_size.saturating_sub(cipher_offset).min(len);
         let part_relative = cipher_offset.saturating_sub(part_logical_offset);
+        let mut plain_gaps = Vec::new();
         if destination_len > 0 {
             let plain_crc = par2_rs::checksum::crc32(&plain[..destination_len as usize]);
             if replace {
-                crypt
-                    .plain_runs_mut()
-                    .overwrite(cipher_offset, destination_len, plain_crc);
+                plain_gaps =
+                    crypt
+                        .plain_runs_mut()
+                        .overwrite(cipher_offset, destination_len, plain_crc);
             } else {
                 crypt
                     .plain_runs_mut()
@@ -716,6 +761,12 @@ impl DirectSetRouter {
                 cipher_crc,
             );
             member.stale_gaps = subtract(&member.stale_gaps, cipher_offset, destination_len);
+            // Restart re-arm composes plaintext in larger runs than the
+            // cipher articles. Replacing a middle part can discard a whole
+            // plaintext run even when the cipher map has no stale edges.
+            for (start, end) in plain_gaps {
+                member.stale_gaps.insert(start, end.saturating_sub(start));
+            }
             for (start, end) in gaps {
                 member.stale_gaps.insert(
                     start.saturating_add(part_logical_offset),

@@ -304,6 +304,27 @@ mod uu_loss_smoke {
     use super::*;
 
     #[tokio::test]
+    async fn truncated_sevenz_part_reaches_par2_repair() {
+        run_cell(
+            UuCell {
+                style: 4,
+                shape: Shape::SetWithPar2,
+                damage: Some(Damage::Truncated),
+                container: Container::SevenZip,
+            },
+            ExtractionProfile::DirectStore,
+            vec![(
+                186399,
+                (
+                    vec![(0, 0), (0, 0), (0, 1), (1, 0), (1, 1)],
+                    Interruption::None,
+                ),
+            )],
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn standard_set_par2() {
         loss_smoke(UuCell {
             style: 0,

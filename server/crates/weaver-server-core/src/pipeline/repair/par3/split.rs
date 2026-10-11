@@ -315,6 +315,10 @@ impl Pipeline {
             .or_default()
             .superseded
             .extend(parts.iter().map(|(file, _)| *file));
+        if let Some(runtime) = self.par3_runtime.as_mut() {
+            let names: Vec<_> = parts.iter().map(|(_, name)| name.clone()).collect();
+            runtime.supersede_split_inputs(job, &names);
+        }
         self.par2_joined_split_sets
             .entry(job)
             .or_default()

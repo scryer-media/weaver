@@ -1267,10 +1267,23 @@ impl Pipeline {
             .enumerate()
             .any(|(index, set)| {
                 if set.is_demoted() {
-                    return !self
+                    let extracted = self
                         .extracted_archives
                         .get(&job_id)
-                        .is_some_and(|names| names.contains(set.set_name()));
+                        .is_some_and(|names| names.contains(set.set_name()))
+                        || self
+                            .rar_sets
+                            .get(&(job_id, set.set_name().to_owned()))
+                            .and_then(|state| state.plan.as_ref())
+                            .is_some_and(|plan| {
+                                // Incremental extraction records members before
+                                // the later job-level pass records the set name.
+                                !plan.member_names.is_empty()
+                                    && self.extracted_members.get(&job_id).is_some_and(|names| {
+                                        plan.member_names.iter().all(|name| names.contains(name))
+                                    })
+                            });
+                    return !extracted;
                 }
                 !set.is_finalized()
                     && (!set.ready_to_finalize()

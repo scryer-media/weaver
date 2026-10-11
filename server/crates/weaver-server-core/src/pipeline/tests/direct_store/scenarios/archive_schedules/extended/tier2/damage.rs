@@ -445,6 +445,69 @@ impl Cell for DamageCell {
 }
 
 #[tokio::test]
+async fn par3_demotion_refetch_reassesses_changed_source() {
+    run_cell(
+        DamageCell {
+            kind: Damage::CrcWrong,
+            location: Location::RecoveryVolume,
+            pattern: Pattern::TwelveAcrossThree,
+            recovery: Recovery::Par3,
+            container: Container::Rar5,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(
+            516269,
+            (
+                vec![(0, 0), (0, 1), (1, 0), (1, 1)],
+                Interruption::Demote(1),
+            ),
+        )],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn encrypted_par3_readback_crosses_missing_member_boundary() {
+    run_cell(
+        DamageCell {
+            kind: Damage::Recomputed,
+            location: Location::SliceStraddle,
+            pattern: Pattern::MemberAbsent,
+            recovery: Recovery::Par3,
+            container: Container::Rar5Encrypted,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(
+            2014677,
+            (vec![(0, 0), (0, 1), (1, 0), (1, 1)], Interruption::None),
+        )],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn encrypted_par3_duplicate_restart_settles() {
+    run_cell(
+        DamageCell {
+            kind: Damage::DifferingDuplicate,
+            location: Location::MidVolume,
+            pattern: Pattern::Two,
+            recovery: Recovery::Par3,
+            container: Container::Rar5Encrypted,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(
+            3542957,
+            (
+                vec![(0, 0), (0, 1), (1, 0), (1, 1)],
+                Interruption::Restart(3),
+            ),
+        )],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn swapped_encrypted_headers_repaired_after_restart() {
     run_cell(
         DamageCell {

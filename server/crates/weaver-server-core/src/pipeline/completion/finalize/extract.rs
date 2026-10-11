@@ -53,6 +53,18 @@ fn buffered_extraction_output<W: Write>(writer: W) -> std::io::BufWriter<W> {
     std::io::BufWriter::with_capacity(EXTRACT_WRITE_BUFFER_BYTES, writer)
 }
 
+fn read_sevenz_start_header(path: &std::path::Path) -> Option<[u8; 32]> {
+    use std::io::Read;
+    let mut head = [0u8; 32];
+    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    if head[..6] != [b'7', b'z', 0xbc, 0xaf, 0x27, 0x1c] || head[6] != 0 {
+        return None;
+    }
+    let mut crc = weaver_yenc::crc::Crc32::new();
+    crc.update(&head[12..]);
+    (crc.finalize() == u32::from_le_bytes(head[8..12].try_into().unwrap())).then_some(head)
+}
+
 // Resolve completed split candidates on the extraction worker. Inputs remain
 // untouched until the selected archive has passed entry length and CRC checks.
 fn verified_sevenz_part_paths(parts: &[(u32, PathBuf)]) -> Result<Vec<PathBuf>, String> {
@@ -64,21 +76,20 @@ fn verified_sevenz_part_paths(parts: &[(u32, PathBuf)]) -> Result<Vec<PathBuf>, 
     let first = groups.get(&0).ok_or("missing 7z part 1")?;
     let mut valid_heads = Vec::new();
     for path in first {
-        let mut head = [0u8; 32];
-        let Ok(mut file) = std::fs::File::open(path) else {
-            continue;
-        };
-        if file.read_exact(&mut head).is_err()
-            || head[..6] != [b'7', b'z', 0xbc, 0xaf, 0x27, 0x1c]
-            || head[6] != 0
-        {
-            continue;
-        }
-        let mut crc = weaver_yenc::crc::Crc32::new();
-        crc.update(&head[12..]);
-        if crc.finalize() == u32::from_le_bytes(head[8..12].try_into().unwrap()) {
+        if let Some(head) = read_sevenz_start_header(path) {
             valid_heads.push((*path, head));
         }
+    }
+    if valid_heads.is_empty()
+        && groups.range(1..).any(|(_, paths)| {
+            paths
+                .iter()
+                .any(|path| read_sevenz_start_header(path).is_some())
+        })
+    {
+        // A valid start in a later position contradicts the part ordering;
+        // it is not evidence of corrupt member bytes to refetch or repair.
+        return Err("7z start header belongs to a different part index".into());
     }
     let (_, header) = valid_heads
         .first()
@@ -2731,14 +2742,11 @@ impl Pipeline {
                     self.schedule_job_completion_check(job_id);
                     return Ok(0);
                 }
-                // Something is reading the set; the task below rules on it, as
-                // it did before this guard existed.
-                //
-                // `NotRar` joins it: this whole retirement path reasons in RAR
-                // terms, and a set it cannot describe must not be torn down by
-                // it. Falling through leaves the decision where it was before
-                // the guard existed, which is the conservative direction.
-                ArchiveSetRetirement::Busy | ArchiveSetRetirement::NotRar => {}
+                // The reader or topology refresh re-arms completion when it
+                // finishes. Retiring its tombstone and re-queuing ourselves
+                // here would starve the very result that releases it.
+                ArchiveSetRetirement::Busy => return Ok(0),
+                ArchiveSetRetirement::NotRar => {}
                 ArchiveSetRetirement::StillReferenced => {
                     // A claimed name with no runtime entry of its own is the
                     // shape retirement cannot reach and extraction cannot use:
@@ -3552,8 +3560,16 @@ impl Pipeline {
         });
         // PAR3 may still need this physical source for verification, content
         // identity, or a different file's repair even after archive extraction
-        // has consumed it. Keep it until the native job verdict settles.
-        let par3_verification_pending = self.par3_verification_pending(job_id);
+        // has consumed it. A late carrier reassesses even a currently complete
+        // set, so keep its sources while any posted PAR3 file is incomplete.
+        // Terminal job cleanup handles carriers that never become complete.
+        let par3_verification_pending = self.par3_verification_pending(job_id)
+            || self.jobs.get(&job_id).is_some_and(|state| {
+                state.assembly.files().any(|file| {
+                    !file.is_complete()
+                        && matches!(file.role(), weaver_model::files::FileRole::Par3 { .. })
+                })
+            });
         let mut deleted_now = Vec::new();
         let mut ownership_ready = Vec::new();
 

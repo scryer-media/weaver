@@ -6,6 +6,11 @@ use super::*;
 use crate::pipeline::direct_store::provider::HeldRun;
 
 impl DirectSetRouter {
+    pub(crate) fn first_rar_member(&self, volume_index: u32) -> Option<(String, bool, bool)> {
+        let member = self.volume_facts.get(&volume_index)?.members.first()?;
+        Some((member.name.clone(), member.split_before, member.split_after))
+    }
+
     // ---- Restart ----------------------------------------------------------
     //
     // A restarted set rebuilds its layout from the **cached volume facts**, not
@@ -747,9 +752,12 @@ impl DirectSetRouter {
         // member fold is what re-verifies the run, exactly as the re-arm
         // intends: the value comes from the bytes on disk now.
         if let Some(crypt) = member.crypt.as_mut() {
-            crypt.plain_runs_mut().overwrite(logical_offset, len, crc);
+            let gaps = crypt.plain_runs_mut().overwrite(logical_offset, len, crc);
             member.restart_seeded = subtract(&member.restart_seeded, logical_offset, len);
             member.stale_gaps = subtract(&member.stale_gaps, logical_offset, len);
+            for (start, end) in gaps {
+                member.stale_gaps.insert(start, end.saturating_sub(start));
+            }
             return self.try_verify_member(member_id);
         }
         // `overwrite`, not `insert`: a stale gap is by construction a *fragment*

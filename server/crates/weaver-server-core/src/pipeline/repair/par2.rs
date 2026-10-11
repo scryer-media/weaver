@@ -1230,21 +1230,21 @@ impl Pipeline {
         // Phase two: land each lifted part on its described name and record it.
         let mut settled = 0usize;
         for (_, identity, target, parked) in lifted {
-            if let Some(parked) = parked.as_ref() {
-                if let Err(error) = runtime_fs::rename_no_overwrite(
+            if let Some(parked) = parked.as_ref()
+                && let Err(error) = runtime_fs::rename_no_overwrite(
                     &working_dir.join(parked),
                     &working_dir.join(&target),
-                ) {
-                    warn!(
-                        job_id = job_id.0,
-                        from = %identity.current_filename,
-                        to = %target,
-                        error = %error,
-                        "could not settle PAR2 file identity before cleanup"
-                    );
-                    leftovers.push(parked.clone());
-                    continue;
-                }
+                )
+            {
+                warn!(
+                    job_id = job_id.0,
+                    from = %identity.current_filename,
+                    to = %target,
+                    error = %error,
+                    "could not settle PAR2 file identity before cleanup"
+                );
+                leftovers.push(parked.clone());
+                continue;
             }
             let old_current = identity.current_filename.clone();
             let mut settled_identity = identity;
@@ -1457,7 +1457,10 @@ impl Pipeline {
     // descriptions. Comparing a raw posted name to a sanitized one silently
     // loses the binding — and with it in-stream verification for that file —
     // for every name that needed sanitizing at all.
-    fn par2_binding_candidate_names(&self, file_id: NzbFileId) -> Option<HashSet<String>> {
+    pub(in crate::pipeline) fn par2_binding_candidate_names(
+        &self,
+        file_id: NzbFileId,
+    ) -> Option<HashSet<String>> {
         let state = self.jobs.get(&file_id.job_id)?;
         let file = state.assembly.file(file_id)?;
         let current_filename = self.current_filename_for_file(file_id.job_id, file);

@@ -255,7 +255,7 @@ impl Par3Cell {
                 for (set, files) in self.data_files(&post).into_iter().enumerate() {
                     let needed = tail_needed(&post, &files, &lost_now, self.block);
                     let blocks = recovery::blocks_for(self.margin, needed, killed[set], 2);
-                    let (least, most) = tail_surviving(&post, &files, &lost_now);
+                    let (least, most) = tail_surviving(&post, &files, &lost_now, false);
                     let after = if self.margin == Margin::OneShort {
                         tail_blocks[set].saturating_sub(most)
                     } else {
@@ -521,14 +521,38 @@ fn tail_surviving(
     post: &Post,
     files: &[usize],
     lost: &BTreeMap<usize, BTreeSet<u32>>,
+    require_metadata: bool,
 ) -> (usize, usize) {
     let none = BTreeSet::new();
-    let (_, offsets) = container_span(post, files);
+    let (tail, offsets) = container_span(post, files);
     let whole: Vec<u8> = files
         .iter()
         .flat_map(|&file| post.files[file].bytes.clone())
         .collect();
     let packets = recovery_packets(&whole);
+    // Recovery symbols are unusable without their authenticated layout and
+    // matrix. Count duplicate copies by packet hash, so any intact copy of
+    // each required description is sufficient.
+    let mut metadata = BTreeMap::<[u8; 16], Vec<Range<usize>>>::new();
+    let mut at = tail;
+    // Authoring sizes parity from packet loss alone. Metadata loss changes
+    // the verdict, not the authored layout or the article chosen for loss.
+    while require_metadata && at + 48 <= whole.len() {
+        assert!(whole[at..].starts_with(b"PAR3\0PKT"));
+        let length = u64::from_le_bytes(whole[at + 24..at + 32].try_into().unwrap()) as usize;
+        assert!(length >= 48 && at + length <= whole.len());
+        if matches!(
+            &whole[at + 40..at + 48],
+            b"PAR STA\0" | b"PAR CAU\0" | b"PAR FIL\0" | b"PAR ROO\0" | b"PAR EXT\0"
+        ) {
+            metadata
+                .entry(whole[at + 8..at + 24].try_into().unwrap())
+                .or_default()
+                .push(at..at + length);
+        }
+        at += length;
+    }
+    assert!(!require_metadata || !metadata.is_empty());
     let mut may_all = Vec::new();
     let mut must_all = Vec::new();
     for (at, &file) in files.iter().enumerate() {
@@ -547,16 +571,17 @@ fn tail_surviving(
             .iter()
             .any(|range| range.start < packet.end && packet.start < range.end)
     };
-    (
-        packets
-            .iter()
-            .filter(|packet| !hit(&may_all, packet))
-            .count(),
-        packets
-            .iter()
-            .filter(|packet| !hit(&must_all, packet))
-            .count(),
-    )
+    let usable = |damage: &[Range<usize>]| {
+        if metadata
+            .values()
+            .any(|copies| copies.iter().all(|copy| hit(damage, copy)))
+        {
+            0
+        } else {
+            packets.iter().filter(|packet| !hit(damage, packet)).count()
+        }
+    };
+    (usable(&may_all), usable(&must_all))
 }
 
 // What a 7z with a tail must end in under the loss: the tail mends the
@@ -573,7 +598,7 @@ fn tail_verdict(
     if upper == 0 {
         return Verdict::Completes;
     }
-    let (least, most) = tail_surviving(post, files, lost);
+    let (least, most) = tail_surviving(post, files, lost, true);
     if upper <= least {
         Verdict::Completes
     } else if lower > most {
@@ -636,6 +661,58 @@ par3_smokes! {
 
 mod par3_breadth_loss_smoke {
     use super::*;
+
+    #[tokio::test]
+    async fn embedded_replacement_retires_its_split_sidecar() {
+        for sets in [Sets::One, Sets::Two] {
+            let cell = Par3Cell {
+                placement: Placement::Both,
+                code: Code::Fft,
+                margin: Margin::With,
+                block: 4096,
+                entries: Entries::One,
+                sets,
+                index: Index::Present,
+                container: Container::SevenZip,
+            };
+            let interruption = Interruption::Starved { mask: 11 };
+            assert_eq!(cell.build(interruption).2, Some(Verdict::Completes));
+            for profile in PROFILES {
+                run_cell(
+                    cell,
+                    profile,
+                    vec![(441207, (vec![(0, 0), (0, 1), (1, 0), (1, 1)], interruption))],
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_recovery_requires_its_metadata() {
+        let cell = Par3Cell {
+            placement: Placement::Both,
+            code: Code::Fft,
+            margin: Margin::With,
+            block: 4096,
+            entries: Entries::One,
+            sets: Sets::One,
+            index: Index::Present,
+            container: Container::SevenZip,
+        };
+        for (mask, verdict) in [(1, Verdict::Completes), (8, Verdict::Fails)] {
+            let interruption = Interruption::Starved { mask };
+            assert_eq!(cell.build(interruption).2, Some(verdict));
+            for profile in PROFILES {
+                run_cell(
+                    cell,
+                    profile,
+                    vec![(441205, (vec![(0, 0), (0, 1), (1, 0), (1, 1)], interruption))],
+                )
+                .await;
+            }
+        }
+    }
 
     #[tokio::test]
     async fn sidecar_fft_rar5() {

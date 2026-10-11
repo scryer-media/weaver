@@ -893,6 +893,138 @@ impl Pipeline {
         }
     }
 
+    // A missing first article removes the prefix fingerprint, but surviving
+    // slices can still identify a volume. Bound the probe and require one
+    // description matching both checksums at every sampled physical offset.
+    async fn bind_direct_sources_by_par2_slices(
+        &mut self,
+        job_id: JobId,
+        recovery_set_id: par2_rs::RecoverySetId,
+    ) {
+        let Some(par2) = self.par2_set_for(job_id, recovery_set_id).cloned() else {
+            return;
+        };
+        let slice_size = par2.slice_size;
+        if slice_size == 0 || slice_size > 4 * 1024 * 1024 {
+            return;
+        }
+        let mut reads = Vec::new();
+        for set in self.direct_store.sets_for(job_id) {
+            if set.is_demoted() || set.is_finalized() {
+                continue;
+            }
+            let mut lengths = BTreeMap::new();
+            let mut wanted = Vec::new();
+            for (&volume, &file_index) in &set.plan().volumes {
+                let file_id = NzbFileId { job_id, file_index };
+                if self.resolve_par2_file_binding(file_id).is_some() {
+                    continue;
+                }
+                // Content can replace missing name evidence, but cannot
+                // override contradictory names already claimed by this set.
+                if self
+                    .par2_binding_candidate_names(file_id)
+                    .is_some_and(|names| {
+                        par2.files.values().any(|desc| {
+                            names.contains(&weaver_model::files::sanitize_download_filename(
+                                &desc.filename,
+                            ))
+                        })
+                    })
+                {
+                    continue;
+                }
+                let declared = self.file_declared_size.get(&file_id).copied();
+                let len = set.virtual_volume_len(volume, declared.unwrap_or(0));
+                if len == 0 {
+                    continue;
+                }
+                lengths.insert(volume, len);
+                wanted.push((file_id, volume, declared));
+            }
+            if !wanted.is_empty() {
+                reads.push((set.virtual_provider(&lengths), wanted));
+            }
+        }
+        if reads.is_empty() {
+            return;
+        }
+        let bound = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut bound = Vec::new();
+            for (provider, wanted) in reads {
+                for (file_id, volume, declared) in wanted {
+                    let Some(image) = provider.volume(volume) else {
+                        continue;
+                    };
+                    let Some(mut reader) = provider.open(volume) else {
+                        continue;
+                    };
+                    let offsets: Vec<_> = image
+                        .readable_ranges()
+                        .into_iter()
+                        .flat_map(|(start, end)| {
+                            (start.div_ceil(slice_size)..end / slice_size)
+                                .map(|index| index * slice_size)
+                        })
+                        .take(3)
+                        .collect();
+                    let mut candidates: Vec<_> = par2
+                        .files
+                        .iter()
+                        .filter(|(_, desc)| declared.is_none_or(|len| len == desc.length))
+                        .map(|(id, _)| *id)
+                        .collect();
+                    let mut sampled = false;
+                    let mut bytes = vec![0; slice_size as usize];
+                    for offset in offsets {
+                        if reader.seek(SeekFrom::Start(offset)).is_err()
+                            || reader.read_exact(&mut bytes).is_err()
+                        {
+                            candidates.clear();
+                            break;
+                        }
+                        if bytes.iter().all(|byte| *byte == 0) {
+                            continue;
+                        }
+                        sampled = true;
+                        let mut checksum = par2_rs::checksum::SliceChecksumState::new();
+                        checksum.update(&bytes);
+                        let (crc32, md5) = checksum.finalize(Some(slice_size));
+                        candidates.retain(|id| {
+                            par2.file_checksums(id)
+                                .and_then(|checksums| checksums.get((offset / slice_size) as usize))
+                                .is_some_and(|expected| {
+                                    expected.crc32 == crc32 && expected.md5 == md5
+                                })
+                        });
+                    }
+                    if sampled && candidates.len() == 1 {
+                        bound.push((
+                            file_id,
+                            par2.file_description(&candidates[0])
+                                .unwrap()
+                                .filename
+                                .clone(),
+                        ));
+                    }
+                }
+            }
+            bound
+        })
+        .await;
+        if let Ok(bound) = bound {
+            for (file_id, filename) in bound {
+                if let Some(mut identity) = self.effective_file_identity(job_id, file_id) {
+                    identity.canonical_filename = Some(filename);
+                    if let Err(error) = self.set_file_identity(job_id, identity) {
+                        warn!(job_id = job_id.0, %error, "failed to persist slice-proven archive identity");
+                    }
+                }
+            }
+        }
+    }
+
     // Demotes every live direct set of `job_id` holding a source volume that
     // cannot be bound, unambiguously, to a PAR2 description.
     //
@@ -952,6 +1084,8 @@ impl Pipeline {
             .await;
         }
         self.recapture_restored_direct_prefixes(job_id).await;
+        self.bind_direct_sources_by_par2_slices(job_id, recovery_set_id)
+            .await;
         let unbindable: Vec<(usize, u32)> = self
             .direct_store
             .sets_for(job_id)

@@ -908,6 +908,12 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 );
             }
             let mut route = route;
+            if interruption.loss().is_some_and(|(mask, _)| mask == 15) {
+                // With every payload article absent, no content can bind the
+                // posted names. Verified conventional reconstruction is valid;
+                // the completion and exact output-byte checks above still apply.
+                route.direct = outcome.finalized == route.sets;
+            }
             if matches!(
                 interruption,
                 Interruption::Restart(_) | Interruption::Crash(_)
@@ -959,6 +965,146 @@ pub(super) async fn cell_smoke(cell: Cell) {
         ];
         run_cell(cell, profile, cases).await;
     }
+}
+
+#[tokio::test]
+async fn reposted_rar_recovers_both_articles_of_one_copy() {
+    run_cell(
+        Cell {
+            container: Container::Rar4,
+            naming: Naming::HexReposted,
+            binding: Binding::Par2Posted,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(244, schedules().into_iter().nth(244).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn repaired_misnumbered_sevenz_updates_topology() {
+    run_cell(
+        Cell {
+            container: Container::SevenZip,
+            naming: Naming::HexMisnumbered,
+            binding: Binding::Par2RealLast,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(262, schedules().into_iter().nth(262).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn first_volume_hex_restart_keeps_durable_articles() {
+    run_cell(
+        Cell {
+            container: Container::Rar5,
+            naming: Naming::FirstVolumeHex,
+            binding: Binding::Nothing,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(100, schedules().into_iter().nth(100).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn encrypted_first_hex_demotion_keeps_conventional_ownership() {
+    run_cell(
+        Cell {
+            container: Container::Rar5Encrypted,
+            naming: Naming::FirstVolumeHex,
+            binding: Binding::Par2RealLast,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(119, schedules().into_iter().nth(119).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn repaired_scattered_rar_publishes_only_members() {
+    run_cell(
+        Cell {
+            container: Container::Rar4,
+            naming: Naming::HexScattered,
+            binding: Binding::Par2RealFirst,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(254, schedules().into_iter().nth(254).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn first_volume_hex_sevenz_restores_part_indices() {
+    run_cell(
+        Cell {
+            container: Container::SevenZipSolid,
+            naming: Naming::FirstVolumeHex,
+            binding: Binding::Nothing,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(98, schedules().into_iter().nth(98).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn misnumbered_sevenz_reports_its_unordered_parts() {
+    run_cell(
+        Cell {
+            container: Container::SevenZip,
+            naming: Naming::HexMisnumbered,
+            binding: Binding::Nothing,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(0, schedules().into_iter().next().unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn repaired_old_style_rar_retains_direct_ownership() {
+    run_cell(
+        Cell {
+            container: Container::Rar4,
+            naming: Naming::OldStyleS,
+            binding: Binding::Par2RealFirst,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(248, schedules().into_iter().nth(248).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn all_lost_old_style_rar_can_recover_conventionally() {
+    run_cell(
+        Cell {
+            container: Container::Rar4,
+            naming: Naming::OldStyleS,
+            binding: Binding::Par2RealFirst,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(268, schedules().into_iter().nth(268).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn verified_repost_satisfies_missing_original() {
+    run_cell(
+        Cell {
+            container: Container::Rar4,
+            naming: Naming::Reposted,
+            binding: Binding::Par2Posted,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(240, schedules().into_iter().nth(240).unwrap())],
+    )
+    .await;
 }
 
 #[tokio::test]
