@@ -864,12 +864,32 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
         )
         .await;
         let check = || {
-            // The schedule makes these articles unavailable on every source.
-            // SFV can identify intact files but cannot repair missing bytes;
-            // transport failure precedes the no-loss topology diagnostic.
-            let unrepairable = options.recovery == RecoveryFormat::Absent
-                && interruption.loss().is_some_and(|(mask, _)| mask != 0);
-            if interruption.fails() || unrepairable {
+            // An available article from a byte-identical repost supplies the
+            // same bytes. Otherwise a listing cannot repair missing data.
+            let unrepairable = (options.recovery == RecoveryFormat::Absent || interruption.fails())
+                && interruption.loss().is_some_and(|(mask, _)| {
+                    // Only named reposts identify an absent copy without its
+                    // content; opaque postings retain their existing contract.
+                    if cell.naming != Naming::Reposted {
+                        return mask != 0;
+                    }
+                    let articles_per_file = 4 / fixture.volumes.len();
+                    (0..4).any(|slot| {
+                        mask & (1 << slot) != 0
+                            && !fixture
+                                .volumes
+                                .iter()
+                                .enumerate()
+                                .any(|(copy, (_, bytes))| {
+                                    bytes == &fixture.volumes[slot / articles_per_file].1
+                                        && mask
+                                            & (1 << (copy * articles_per_file
+                                                + slot % articles_per_file))
+                                            == 0
+                                })
+                    })
+                });
+            if unrepairable {
                 profile.assert_rejected(&outcome, &wanted);
                 return;
             }
