@@ -10,7 +10,7 @@ import { RecordEditor } from "../../components/RecordEditor";
 import { PrimaryButton, SecondaryButton } from "../../components/controls";
 import { Cell } from "../../components/rows";
 import { countLabel } from "../../i18n/labels";
-import { FieldRows, PanelControls, SettingsBlocks, type SettingsBlock } from "../../pages/settings/framework";
+import { FieldRows, SettingsBlocks, type SettingsBlock } from "../../pages/settings/framework";
 import type { NetworkingAction, NetworkingData } from "./data";
 import { CheckRow, Hint, StatusMark } from "./presentation";
 
@@ -59,12 +59,7 @@ export function PoolsPage({
         "",
       ],
       empty: t("next.networking.pools.empty"),
-      emptyAction: { label: t("next.networking.pools.add"), onClick: () => open(null) },
-      footer: data.proxyPools.length ? (
-        <PrimaryButton icon="add" onClick={() => open(null)}>
-          {t("next.networking.pools.add")}
-        </PrimaryButton>
-      ) : undefined,
+      add: { label: t("next.networking.pools.add"), onClick: () => open(null) },
       onRowClick: (id) => {
         const pool = data.proxyPools.find((candidate) => String(candidate.id) === id);
         if (pool) {
@@ -104,9 +99,6 @@ export function PoolsPage({
 
   return (
     <>
-      <PanelControls>
-        <PrimaryButton icon="add" onClick={() => open(null)}>{t("next.networking.pools.add")}</PrimaryButton>
-      </PanelControls>
       <Hint>
         {t("next.networking.pools.note", {
           count: data.platformNetworking.maxWireguardInstances,

@@ -60,7 +60,7 @@ const jobRow = (page: Page, name: string) =>
   postProcessingJobs(page).getByRole("button").filter({ has: page.getByText(name, { exact: true }) });
 
 async function addJob(page: Page, script: string, name: string, inputs: Record<string, string> = {}) {
-  await page.getByRole("banner").getByRole("button", { name: "Add job", exact: true }).click();
+  await page.getByRole("main").getByRole("button", { name: "Add job", exact: true }).click();
   const editor = page.getByRole("dialog", { name: "Add job", exact: true });
   await choose(page, editor, "Script", script);
   await expect(editor.getByRole("button", { name: "Trigger", exact: true })).toHaveText("Post-processing");
@@ -199,7 +199,7 @@ test("Secrets are added with a value that is never shown again, and deleted", as
   const name = `uipp-secret-${token()}`;
   const value = `uipp-value-${token()}-never-shown`;
   await page.goto(SCRIPT_SECRETS);
-  await page.getByRole("banner").getByRole("button", { name: "Add secret", exact: true }).click();
+  await page.getByRole("main").getByRole("button", { name: "Add secret", exact: true }).click();
   const editor = page.getByRole("dialog", { name: "Add secret", exact: true });
   await editor.getByRole("textbox", { name: "Name", exact: true }).fill(name);
   await editor.getByLabel("Value", { exact: true }).fill(value);

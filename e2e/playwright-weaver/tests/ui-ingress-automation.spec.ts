@@ -48,7 +48,7 @@ function operationResponse(page: Page, operation: string) {
 }
 
 async function addFeed(page: Page, name: string, url: string): Promise<Locator> {
-  await page.getByRole("banner").getByRole("button", { name: "Add feed", exact: true }).click();
+  await page.getByRole("main").getByRole("button", { name: "Add feed", exact: true }).click();
   const form = page.getByRole("dialog", { name: "Add feed", exact: true });
   await form.getByRole("textbox", { name: "Name", exact: true }).fill(name);
   await form.getByRole("textbox", { name: "URL", exact: true }).fill(url);

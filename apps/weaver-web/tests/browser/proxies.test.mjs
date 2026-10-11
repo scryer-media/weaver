@@ -57,7 +57,7 @@ async function faults(scope, expected) {
   assert.deepEqual(await list.allTextContents(), expected);
 }
 async function adding(page) {
-  await action(page.locator("#controls"), "Add proxy").click();
+  await action(page.locator("main"), "Add proxy").click();
   const editor = page.getByRole("dialog", { name: "Add proxy", exact: true });
   await editor.waitFor();
   return editor;
@@ -253,30 +253,25 @@ test("a stored WireGuard proxy opens on its details, and a configuration can sti
   } finally { await page.close(); }
 });
 
-test("pools and proxies are each added from the top bar and from the right under their own table", async () => {
+test("pools and proxies are each added from the middle under their own table, and never from the top bar", async () => {
   const page = await open("?pools");
   try {
-    const bar = page.locator("#controls");
     const list = page.locator("main");
-    const primary = await action(bar, "Add proxy").evaluate((button) => getComputedStyle(button).backgroundColor);
     for (const name of ["Add pool", "Add proxy"]) {
-      await action(bar, name).waitFor();
       const under = action(list, name);
-      assert.equal(await under.count(), 1);
-      // Past the middle of the list, and the same button as the top bar's.
+      await under.waitFor();
+      assert.equal(await action(page, name).count(), 1);
+      // The button's middle is the list's middle, to the pixel either side.
       const [button, table] = [await under.boundingBox(), await list.boundingBox()];
-      assert.ok(button.x > table.x + table.width / 2, `${name} sits on the right`);
-      assert.equal(await under.evaluate((button) => getComputedStyle(button).backgroundColor), primary);
+      const off = button.x + button.width / 2 - (table.x + table.width / 2);
+      assert.ok(Math.abs(off) <= 1, `${name} is centred`);
       await under.click();
       const editor = page.getByRole("dialog", { name, exact: true });
       await editor.waitFor();
       await action(editor, "Cancel").click();
       await editor.waitFor({ state: "detached" });
-      await action(bar, name).click();
-      await editor.waitFor();
-      await action(editor, "Cancel").click();
-      await editor.waitFor({ state: "detached" });
     }
+    assert.equal(await page.locator("#controls").getByRole("button").count(), 0);
     await shot(page, "pools-and-proxies");
   } finally {
     await page.close();

@@ -16,7 +16,7 @@ import {
 import { useTranslate } from "@/lib/context/translate-context";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { PrimaryButton, SecondaryButton, Toggle } from "../../../components/controls";
+import { SecondaryButton, Toggle } from "../../../components/controls";
 import { Icon, type IconName } from "../../../components/icons";
 import { Cell } from "../../../components/rows";
 import { EM_DASH } from "../../../data/format";
@@ -715,7 +715,7 @@ export function ScriptListPanel() {
         "",
       ],
       empty: t("next.postProcessing.noInstances"),
-      emptyAction: { label: t("next.postProcessing.createInstance"), onClick: () => openEditor({ mode: "new" }) },
+      add: { label: t("next.postProcessing.createInstance"), onClick: () => openEditor({ mode: "new" }) },
       onRowClick: (id) => {
         const instance = instances.find((entry) => `i:${entry.id}` === id);
         if (instance) {
@@ -755,9 +755,6 @@ export function ScriptListPanel() {
         >
           {t("action.refresh")}
         </SecondaryButton>
-        <PrimaryButton icon="add" onClick={() => openEditor({ mode: "new" })}>
-          {t("next.postProcessing.createInstance")}
-        </PrimaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

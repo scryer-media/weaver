@@ -365,13 +365,12 @@ export interface SettingsTableModel {
   onRowClick?: (id: string) => void;
   empty?: string;
   /**
-   * The panel's "Add" for this list, repeated under the empty message. An
-   * empty panel's next step belongs where the eye already is, not only in the
-   * top bar's corner.
+   * This list's "Add", centred under the table whether or not it has rows.
+   * Every list is added to from the same place, so it is never in the top bar.
    */
-  emptyAction?: { label: string; onClick: () => void; disabled?: boolean };
+  add?: { label: string; onClick: () => void; disabled?: boolean };
   /**
-   * A trailing row of the table's own actions — "Add rule", "Clear history".
+   * A trailing row of the table's other actions, such as "Clear history".
    * The top bar carries a panel's actions; a table that owns more than one
    * list carries the ones that belong to that list.
    */
@@ -570,50 +569,59 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
     );
   };
   return (
-    <div className="min-w-0 overflow-x-auto">
-      <div className="min-w-[640px]">
-        <div
-          className="grid items-center gap-5 border-b border-wv-hairline px-4 sm:px-6 py-2"
-          style={{ gridTemplateColumns: block.columns }}
-        >
-          {block.headers.map((header, index) => (
-            <Eyebrow key={index} tone="rail" className="truncate">
-              {header}
-            </Eyebrow>
-          ))}
-        </div>
-        {block.rows.length === 0 && groups.length === 0 ? (
-          <div className="flex flex-col items-start gap-3 px-4 sm:px-6 py-5">
-            <span className="text-[13px] text-wv-muted">{block.empty ?? t("next.settings.nothingConfigured")}</span>
-            {block.emptyAction === undefined ? null : (
-              <PrimaryButton icon="add" onClick={block.emptyAction.onClick} disabled={block.emptyAction.disabled}>
-                {block.emptyAction.label}
-              </PrimaryButton>
-            )}
-          </div>
-        ) : (
-          <>
-            {block.rows.map(row)}
-            {groups.map((group) => (
-              <section key={group.id} aria-label={group.title}>
-                <div className="flex items-center gap-[10px] border-b border-wv-hairline px-4 sm:px-6 pb-2 pt-4">
-                  <Eyebrow>{group.title}</Eyebrow>
-                  {group.note === undefined ? null : (
-                    <span className="ml-auto truncate font-wv-mono text-[11px] text-wv-note">{group.note}</span>
-                  )}
-                </div>
-                {group.rows.map(row)}
-              </section>
+    <>
+      <div className="min-w-0 overflow-x-auto">
+        <div className="min-w-[640px]">
+          <div
+            className="grid items-center gap-5 border-b border-wv-hairline px-4 sm:px-6 py-2"
+            style={{ gridTemplateColumns: block.columns }}
+          >
+            {block.headers.map((header, index) => (
+              <Eyebrow key={index} tone="rail" className="truncate">
+                {header}
+              </Eyebrow>
             ))}
-          </>
-        )}
-        {block.footer === undefined ? null : (
-          <div className="flex flex-none items-center justify-end gap-[10px] border-b border-wv-hairline px-4 sm:px-6 py-[10px]">
-            {block.footer}
           </div>
-        )}
+          {block.rows.length === 0 && groups.length === 0 ? (
+            <div
+              className={`px-4 sm:px-6 py-5 text-[13px] text-wv-muted${
+                block.add === undefined ? "" : " border-b border-wv-hairline"
+              }`}
+            >
+              {block.empty ?? t("next.settings.nothingConfigured")}
+            </div>
+          ) : (
+            <>
+              {block.rows.map(row)}
+              {groups.map((group) => (
+                <section key={group.id} aria-label={group.title}>
+                  <div className="flex items-center gap-[10px] border-b border-wv-hairline px-4 sm:px-6 pb-2 pt-4">
+                    <Eyebrow>{group.title}</Eyebrow>
+                    {group.note === undefined ? null : (
+                      <span className="ml-auto truncate font-wv-mono text-[11px] text-wv-note">{group.note}</span>
+                    )}
+                  </div>
+                  {group.rows.map(row)}
+                </section>
+              ))}
+            </>
+          )}
+          {block.footer === undefined ? null : (
+            <div className="flex flex-none items-center justify-end gap-[10px] border-b border-wv-hairline px-4 sm:px-6 py-[10px]">
+              {block.footer}
+            </div>
+          )}
+        </div>
       </div>
-    </div>
+      {/* Outside the scroller, so it centres on the width in view and not on the table's. */}
+      {block.add === undefined ? null : (
+        <div className="flex flex-none justify-center px-4 sm:px-6 py-3">
+          <PrimaryButton icon="add" onClick={block.add.onClick} disabled={block.add.disabled}>
+            {block.add.label}
+          </PrimaryButton>
+        </div>
+      )}
+    </>
   );
 }
 

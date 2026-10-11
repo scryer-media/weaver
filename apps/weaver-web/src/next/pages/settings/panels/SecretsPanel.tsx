@@ -2,11 +2,10 @@ import { useMemo, useState } from "react";
 import { useQuery } from "urql";
 import { SECRETS_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
-import { PrimaryButton } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { formatDate } from "../../../data/format";
 import { sortedSecrets, usedByText, type Secret } from "../../../data/secrets";
-import { PanelControls, SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
+import { SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
 import { SecretEditor, type SecretEditorTarget } from "./SecretEditor";
 
 /**
@@ -34,8 +33,8 @@ export function SecretsPanel() {
       note: t("next.secrets.note"),
       columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 0.8fr)",
       headers: [t("next.secrets.name"), t("next.secrets.usedBy"), t("next.secrets.updated")],
-      // The top bar's Add is the list's only one.
       empty: t("next.secrets.empty"),
+      add: { label: t("next.secrets.add"), onClick: () => setTarget({ mode: "new" }) },
       onRowClick: (id) => {
         const secret = secrets.find((entry) => entry.id === id);
         if (secret) {
@@ -66,12 +65,6 @@ export function SecretsPanel() {
 
   return (
     <>
-      <PanelControls>
-        <PrimaryButton icon="add" onClick={() => setTarget({ mode: "new" })}>
-          {t("next.secrets.add")}
-        </PrimaryButton>
-      </PanelControls>
-
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       {target ? (

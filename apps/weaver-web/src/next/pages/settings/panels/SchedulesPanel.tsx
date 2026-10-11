@@ -11,7 +11,7 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
-import { PrimaryButton, Toggle } from "../../../components/controls";
+import { Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { SCHEDULE_TRACKS, type ScheduleTrack } from "../../../data/schedule-tracks";
 import {
@@ -19,7 +19,7 @@ import {
   type HardwareProfileName,
   type HardwareProfileSettings,
 } from "../../../data/hardware-profiles";
-import { PanelControls, SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
+import { SettingsBlocks, usePanelStatus, type SettingsBlock } from "../framework";
 import { scheduleActionFields, scheduleActionHelp, scheduleSpeedSections, scheduleTimingFields, useScheduleTargets } from "../../../components/ScheduleOptionsFields";
 import { NEW_SCHEDULE_OPTIONS, SCHEDULE_ACTIONS, SCHEDULE_DAYS, isOneShot, optionsFromSchedule, optionsInput, scheduleActionDetails, scheduleDaysLabel, scheduleTimeLabel, speedProblem, type ScheduleOptions, type ScheduleOptionsForm, type ScheduleTargets } from "../../../data/schedule-options";
 
@@ -233,6 +233,7 @@ export function SchedulesPanel() {
         "",
       ],
       empty: t("next.schedules.empty"),
+      add: { label: t("next.schedules.add"), onClick: () => open(null) },
       onRowClick: (id) => {
         const schedule = schedules.find((entry) => entry.id === id);
         if (schedule) {
@@ -263,10 +264,6 @@ export function SchedulesPanel() {
 
   return (
     <>
-      <PanelControls>
-        <PrimaryButton icon="add" onClick={() => open(null)}>{t("next.schedules.add")}</PrimaryButton>
-      </PanelControls>
-
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor

@@ -21,11 +21,10 @@ import {
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { PrimaryButton, SecondaryButton, Segmented, TextArea, TextField } from "../../../components/controls";
+import { SecondaryButton, Segmented, TextArea, TextField } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WV } from "../../../data/palette";
 import {
-  PanelControls,
   SettingsBlocks,
   type FieldControl,
   type FieldSpec,
@@ -259,10 +258,7 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
         "",
       ],
       empty: t("next.proxies.empty"),
-      emptyAction: { label: t("next.proxies.add"), onClick: () => setEditingId("new") },
-      footer: profiles.length ? (
-        <PrimaryButton icon="add" onClick={() => setEditingId("new")}>{t("next.proxies.add")}</PrimaryButton>
-      ) : undefined,
+      add: { label: t("next.proxies.add"), onClick: () => setEditingId("new") },
       onRowClick: (id) => {
         const profile = profiles.find((entry) => String(entry.id) === id);
         if (profile) {
@@ -301,10 +297,6 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
 
   return (
     <>
-      <PanelControls>
-        <PrimaryButton icon="add" onClick={() => setEditingId("new")}>{t("next.proxies.add")}</PrimaryButton>
-      </PanelControls>
-
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       {editingId === null ? null : (

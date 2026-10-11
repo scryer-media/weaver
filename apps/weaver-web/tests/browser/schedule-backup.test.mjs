@@ -25,8 +25,8 @@ async function choose(page, scope, name, option) {
   await page.getByRole("menuitemradio", { name: option, exact: true }).click();
 }
 const toggle = (scope, name) => scope.getByRole("switch", { name, exact: true });
-// The panel's own Add, which the settings shell puts in its top bar.
-const addSchedule = (page) => page.locator("#controls").getByRole("button", { name: "Add schedule", exact: true });
+// The list's own Add, centred under its table.
+const addSchedule = (page) => page.locator("main").getByRole("button", { name: "Add schedule", exact: true });
 async function open(query = "") {
   const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
   if (query.includes("automatic")) {
@@ -181,10 +181,10 @@ test("the schedules are one list with one Add, headed only by the groups that ho
     const list = page.getByRole("region", { name: "Schedules", exact: true });
     await list.getByText("No schedules yet. Weaver downloads whenever there is work.", { exact: true }).waitFor();
     assert.equal(await list.getByRole("region").count(), 0);
-    // The top bar's Add is the only one, with rules listed or without.
+    // The Add under the table is the only one, with rules listed or without, and the top bar has none.
     const everyAdd = page.getByRole("button", { name: "Add schedule", exact: true });
     assert.equal(await everyAdd.count(), 1);
-    assert.equal(await list.getByRole("button").count(), 0);
+    assert.equal(await page.locator("#controls").getByRole("button").count(), 0);
     await addSchedule(page).click();
     const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
     await form.getByLabel("Label", { exact: true }).fill("fixture hold");

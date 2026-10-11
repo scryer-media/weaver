@@ -276,7 +276,7 @@ async function createSourceMarkersThroughUI(
   await saveSettings(page);
 
   await page.goto("/settings/categories");
-  await page.getByRole("banner").getByRole("button", { name: "Add category", exact: true }).click();
+  await page.getByRole("main").getByRole("button", { name: "Add category", exact: true }).click();
   const categoryForm = page.getByRole("dialog", { name: "Add category", exact: true });
   await categoryForm.getByRole("textbox", { name: "Name", exact: true }).fill(matrix.categoryName);
   fs.mkdirSync(
@@ -297,7 +297,7 @@ async function createSourceMarkersThroughUI(
   ).toBeVisible();
 
   await page.goto("/settings/schedules");
-  await page.getByRole("banner").getByRole("button", { name: "Add schedule", exact: true }).click();
+  await page.getByRole("main").getByRole("button", { name: "Add schedule", exact: true }).click();
   const scheduleForm = page.getByRole("dialog", { name: "Add schedule", exact: true });
   await scheduleForm.getByLabel("Time", { exact: true }).fill("03:15");
   await scheduleForm.getByRole("textbox", { name: "Label", exact: true }).fill(matrix.scheduleName);
@@ -307,7 +307,7 @@ async function createSourceMarkersThroughUI(
   await expect(tableRow(page, "Downloads", matrix.scheduleName)).toBeVisible();
 
   await page.goto("/settings/servers");
-  await page.getByRole("banner").getByRole("button", { name: "Add provider", exact: true }).click();
+  await page.getByRole("main").getByRole("button", { name: "Add provider", exact: true }).click();
   const serverForm = page.getByRole("dialog", { name: "Add provider", exact: true });
   await serverForm.getByRole("textbox", { name: "Host", exact: true }).fill(matrix.serverHost);
   const tls = serverForm.getByRole("switch", { name: "TLS", exact: true });
@@ -325,7 +325,7 @@ async function createSourceMarkersThroughUI(
   await expect(tableRow(page, "Servers", matrix.serverHost)).toBeVisible();
 
   await page.goto("/settings/rss");
-  await page.getByRole("banner").getByRole("button", { name: "Add feed", exact: true }).click();
+  await page.getByRole("main").getByRole("button", { name: "Add feed", exact: true }).click();
   const feedForm = page.getByRole("dialog", { name: "Add feed", exact: true });
   await feedForm.getByRole("textbox", { name: "Name", exact: true }).fill(matrix.rssFeedName);
   await feedForm.getByRole("textbox", { name: "URL", exact: true }).fill("http://127.0.0.1:1/e2e-backup.xml");
@@ -368,7 +368,7 @@ async function createSourceMarkersThroughUI(
   await expect(historyRow(page, matrix.historyName)).toBeVisible();
 
   await page.goto("/settings/security");
-  await page.getByRole("banner").getByRole("button", { name: "Add API key", exact: true }).click();
+  await page.getByRole("main").getByRole("button", { name: "Add API key", exact: true }).click();
   const keyEditor = page.getByRole("dialog", { name: "New API key", exact: true });
   await keyEditor.getByRole("textbox", { name: "Name", exact: true }).fill(matrix.apiKeyName);
   await keyEditor.getByRole("button", { name: "Scope", exact: true }).click();

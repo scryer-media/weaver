@@ -125,7 +125,7 @@ test("provider edits keep the stored password masked and a disabled provider can
   await page.reload();
   await expect(serverRow.getByText("5", { exact: true })).toBeVisible();
 
-  await page.getByRole("banner").getByRole("button", { name: "Add provider", exact: true }).click();
+  await page.getByRole("main").getByRole("button", { name: "Add provider", exact: true }).click();
   const addForm = page.getByRole("dialog", { name: "Add provider", exact: true });
   await addForm.getByRole("textbox", { name: "Host", exact: true }).fill("e2e-ui.invalid");
   await addForm.getByRole("switch", { name: "TLS", exact: true }).click();
@@ -169,7 +169,7 @@ test("category create, edit, persistence, and delete are browser-owned", async (
   }
 
   const addCategory = async (name: string, aliases: string) => {
-    await page.getByRole("banner").getByRole("button", { name: "Add category", exact: true }).click();
+    await page.getByRole("main").getByRole("button", { name: "Add category", exact: true }).click();
     const form = page.getByRole("dialog", { name: "Add category", exact: true });
     await form.getByRole("textbox", { name: "Name", exact: true }).fill(name);
     await form.getByRole("textbox", { name: "Also known as", exact: true }).fill(aliases);
@@ -214,7 +214,7 @@ test("schedule rules support create, toggle, edit, and delete", async ({ cleanPa
   }
 
   const addSchedule = async (time: string, label: string) => {
-    await page.getByRole("banner").getByRole("button", { name: "Add schedule", exact: true }).click();
+    await page.getByRole("main").getByRole("button", { name: "Add schedule", exact: true }).click();
     const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
     await form.getByLabel("Time", { exact: true }).fill(time);
     await form.getByRole("textbox", { name: "Label", exact: true }).fill(label);
@@ -268,7 +268,7 @@ test("new schedule actions stay disabled and appear on their own tracks", async 
   ];
   for (const [action, track] of cases) {
     const label = `e2e-disabled-${action}`;
-    await page.getByRole("banner").getByRole("button", { name: "Add schedule", exact: true }).click();
+    await page.getByRole("main").getByRole("button", { name: "Add schedule", exact: true }).click();
     const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
     await form.getByRole("textbox", { name: "Label", exact: true }).fill(label);
     await form.getByRole("switch", { name: "Enabled", exact: true }).click();

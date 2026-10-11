@@ -71,7 +71,7 @@ test.describe.serial("security product behavior", () => {
     }
 
     await page.goto("/settings/security");
-    await page.getByRole("banner").getByRole("button", { name: "Add API key", exact: true }).click();
+    await page.getByRole("main").getByRole("button", { name: "Add API key", exact: true }).click();
     const editor = page.getByRole("dialog", { name: "New API key", exact: true });
     await editor.getByRole("textbox", { name: "Name", exact: true }).fill("e2e-release-key");
     await editor.getByRole("button", { name: "Scope", exact: true }).click();

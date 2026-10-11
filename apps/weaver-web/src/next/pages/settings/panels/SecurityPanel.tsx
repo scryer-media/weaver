@@ -35,7 +35,6 @@ import {
   type CheckedOutcome,
 } from "../../../features/PasswordCheckDialog";
 import {
-  PanelControls,
   SettingsBlocks,
   usePanelState,
   type FieldSpec,
@@ -849,7 +848,7 @@ function SecurityPanelBody({
         "",
       ],
       empty: t("next.security.keysEmpty"),
-      emptyAction: { label: t("next.security.addKey"), onClick: () => setKeyOpen(true) },
+      add: { label: t("next.security.addKey"), onClick: () => setKeyOpen(true) },
       rows: keys.map((key) => ({
         id: String(key.id),
         searchText: `${key.name} ${key.scope} ${scopeLabel(key.scope)}`,
@@ -883,10 +882,6 @@ function SecurityPanelBody({
 
   return (
     <>
-      <PanelControls>
-        <PrimaryButton icon="add" onClick={() => setKeyOpen(true)}>{t("next.security.addKey")}</PrimaryButton>
-      </PanelControls>
-
       {authenticated && !network.rememberedPolicyValid
         ? banner(t("next.security.policyInvalid"), WV.error, "text-wv-error-text")
         : null}

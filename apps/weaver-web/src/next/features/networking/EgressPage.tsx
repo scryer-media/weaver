@@ -8,7 +8,7 @@ import { Dialog } from "../../components/Dialog";
 import { RecordEditor } from "../../components/RecordEditor";
 import { PrimaryButton, SecondaryButton, TextField } from "../../components/controls";
 import { Cell } from "../../components/rows";
-import { FieldRows, PanelControls, SettingsBlocks, type FieldSpec, type SettingsBlock } from "../../pages/settings/framework";
+import { FieldRows, SettingsBlocks, type FieldSpec, type SettingsBlock } from "../../pages/settings/framework";
 import { quotaDraft, quotaFields, quotaInput, quotaProblem } from "../../pages/settings/quota";
 import { egressInput, liveAddresses, type NetworkingAction, type NetworkingData } from "./data";
 import { metered, quotaSummary } from "./egress-quota";
@@ -64,7 +64,7 @@ export function EgressPage({
         "",
       ],
       empty: t("next.networking.egress.empty"),
-      emptyAction: { label: t("next.networking.egress.add"), onClick: () => open(null) },
+      add: { label: t("next.networking.egress.add"), onClick: () => open(null) },
       onRowClick: (id) => {
         const egress = egresses.find((candidate) => String(candidate.id) === id);
         if (egress) {
@@ -122,11 +122,6 @@ export function EgressPage({
 
   return (
     <>
-      <PanelControls>
-        <PrimaryButton icon="add" onClick={() => open(null)}>
-          {t("next.networking.egress.add")}
-        </PrimaryButton>
-      </PanelControls>
       {data.platformNetworking.sourceAddressHint ? <Hint>{data.platformNetworking.sourceAddressHint}</Hint> : null}
       <SettingsBlocks blocks={blocks} />
       {editing ? (

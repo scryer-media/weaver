@@ -20,12 +20,12 @@ import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Icon } from "../../../components/icons";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { RouteView } from "../../../features/networking/RouteView";
-import { PrimaryButton, SecondaryButton, Toggle } from "../../../components/controls";
+import { SecondaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WorkingOverlay } from "../../../components/WorkingOverlay";
 import { WV } from "../../../data/palette";
 import { formatHostnames, formatLatency } from "../../../data/format";
-import { PanelControls, SettingsBlocks, useSettingsPanelActive, type SettingsBlock } from "../framework";
+import { SettingsBlocks, useSettingsPanelActive, type SettingsBlock } from "../framework";
 import { quotaDraft, quotaFields, quotaInput, trimNumber, type QuotaDraft } from "../quota";
 
 /**
@@ -450,7 +450,7 @@ export function ProvidersPanel() {
         "",
       ],
       empty: t("next.providers.empty"),
-      emptyAction: { label: t("next.providers.add"), onClick: addProvider },
+      add: { label: t("next.providers.add"), onClick: addProvider },
       onRowClick: (id) => {
         closeEditor();
         setForm(null);
@@ -676,12 +676,6 @@ export function ProvidersPanel() {
 
   return (
     <>
-      <PanelControls>
-        <PrimaryButton icon="add" onClick={addProvider}>
-          {t("next.providers.add")}
-        </PrimaryButton>
-      </PanelControls>
-
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor

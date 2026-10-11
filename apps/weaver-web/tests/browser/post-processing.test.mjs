@@ -55,15 +55,16 @@ test("configuration and scripts are two screens that share nothing but the setti
   const scripts = ["Jobs"];
   for (const [query, shown, absent, buttons] of [
     ["", configuration, scripts, []],
-    ["?scripts", scripts, configuration, ["Refresh", "Add job"]],
+    ["?scripts", scripts, configuration, ["Refresh"]],
   ]) {
     const page = await open(query);
     try {
       for (const name of shown) await region(page, name).waitFor();
       assert.equal(await page.locator("main > section").count(), shown.length);
       for (const name of absent) assert.equal(await region(page, name).count(), 0);
-      // Instances are created only where they are listed.
+      // Jobs are added only where they are listed, under their table.
       assert.deepEqual(await controls(page).getByRole("button").allTextContents(), buttons);
+      assert.equal(await action(page, "Add job").count(), buttons.length);
     } finally { await page.close(); }
   }
 });
@@ -254,10 +255,10 @@ test("the scripts screen is one table of instances, under a heading for each thi
     }
     // An instance alone under its heading has nowhere to go.
     for (const name of ["Move up", "Move down"]) assert.equal(await action(row(page, "Feed intake"), name).isDisabled(), true);
-    // One Create for the whole list, in the top bar.
-    assert.deepEqual(await controls(page).getByRole("button").allTextContents(), ["Refresh", "Add job"]);
-    assert.equal(await action(controls(page), "Add job").isDisabled(), false);
-    assert.equal(await action(table(page), "Add job").count(), 0);
+    // One Add for the whole list, under its table, and none in the top bar.
+    assert.deepEqual(await controls(page).getByRole("button").allTextContents(), ["Refresh"]);
+    assert.equal(await action(page, "Add job").count(), 1);
+    assert.equal(await action(table(page), "Add job").isDisabled(), false);
     // It is the list of jobs and nothing else: no script without one, and no file that could not be read.
     for (const file of ["archive.py", "plain.sh", "broken.py"]) assert.equal(await page.getByText(file, { exact: true }).count(), 0, file);
     assert.equal(await page.getByRole("main").getByRole("region").count(), 6);
@@ -271,7 +272,7 @@ test("a file that could not be read as a script is named where a script is chose
     await row(page, "Notify").waitFor();
     const unreadable = (scope) => scope.getByRole("group", { name: "Scripts that could not be read", exact: true });
     assert.equal(await unreadable(page).count(), 0);
-    await action(controls(page), "Add job").click();
+    await action(table(page), "Add job").click();
     const editor = creator(page);
     for (const text of ["broken.py", "option 3 declares an unknown type"]) await unreadable(editor).getByText(text, { exact: true }).waitFor();
     // There are scripts to choose from, so nothing says there are none.
@@ -301,7 +302,7 @@ test("a scripts directory that cannot be listed still shows every instance, and 
     assert.equal(await rows(table(page)).count(), 7);
     assert.equal(await table(page).getByText(problem, { exact: true }).count(), 7);
     // A job can still be started; its editor has no script to offer, so nothing can be saved.
-    await action(controls(page), "Add job").click();
+    await action(table(page), "Add job").click();
     const editor = creator(page);
     await editor.getByText("No scripts found. Put one in the scripts directory, then refresh.", { exact: true }).waitFor();
     assert.equal(await action(editor, "Save").isDisabled(), true);
@@ -315,17 +316,13 @@ test("with no jobs the table says so and offers the first, as the top bar always
     assert.equal(await page.getByRole("region").count(), 1);
     assert.equal(await rows(table(page)).count(), 0);
     assert.deepEqual(await table(page).getByRole("button").allTextContents(), ["Add job"]);
-    assert.equal(await action(controls(page), "Add job").isDisabled(), false);
+    assert.equal(await action(controls(page), "Add job").count(), 0);
     await shot(page, "scripts-empty");
-    // Either opens the new job's editor, which says there is no script for one to run yet.
+    // It opens the new job's editor, which says there is no script for one to run yet.
     await action(table(page), "Add job").click();
     const editor = creator(page);
     await editor.getByText("No scripts found. Put one in the scripts directory, then refresh.", { exact: true }).waitFor();
     assert.equal(await action(editor, "Save").isDisabled(), true);
-    await action(editor, "Cancel").click();
-    await editor.waitFor({ state: "detached" });
-    await action(controls(page), "Add job").click();
-    await editor.waitFor();
   } finally { await page.close(); }
 });
 
@@ -345,7 +342,7 @@ test("a new instance starts from what the chosen script's header declares", asyn
   const page = await open("?scripts");
   try {
     await row(page, "Notify").waitFor();
-    await action(controls(page), "Add job").click();
+    await action(table(page), "Add job").click();
     const editor = creator(page);
     await editor.getByText("new job", { exact: true }).waitFor();
     // Nothing can be saved until there is a script to run.
@@ -431,7 +428,7 @@ test("a queue instance names its event, and each input the header declares draws
   const page = await open("?scripts");
   try {
     await row(page, "Notify").waitFor();
-    await action(controls(page), "Add job").click();
+    await action(table(page), "Add job").click();
     const editor = creator(page);
     await pick(page, editor, "Script", "Archive · archive.py");
     await action(editor, "Script").getByText("Archive · archive.py", { exact: true }).waitFor();
@@ -462,7 +459,7 @@ test("a queue instance names its event, and each input the header declares draws
     assert.deepEqual(held.instances.at(-1).inputs, [{ name: "Target", value: "/fixture/archive", secretId: null }]);
 
     // Each input the header declares draws the control its header asks for.
-    await action(controls(page), "Add job").click();
+    await action(table(page), "Add job").click();
     await pick(page, editor, "Script", "Notify · notify.py");
     await action(editor, "Trigger").getByText("Post-processing", { exact: true }).waitFor();
     assert.equal(await field(editor, "Label").inputValue(), "");
@@ -527,7 +524,7 @@ test("a new job on the schedule is given when it runs, starting from the times i
   const page = await open("?scripts");
   try {
     await row(page, "Notify").waitFor();
-    await action(controls(page), "Add job").click();
+    await action(table(page), "Add job").click();
     const editor = creator(page);
     const times = field(editor, "Run times");
     const days = editor.getByRole("group", { name: "Days", exact: true });
@@ -587,7 +584,7 @@ test("a script whose header asks for no time starts with none, and a job may run
   const page = await open("?scripts");
   try {
     await row(page, "Notify").waitFor();
-    await action(controls(page), "Add job").click();
+    await action(table(page), "Add job").click();
     const editor = creator(page);
     // The header's times belong to its script: a script with none starts with none.
     await pick(page, editor, "Script", "Cleanup · cleanup.sh");
@@ -1041,7 +1038,7 @@ test("set up from header creates an instance for each trigger the header declare
   const page = await open("?scripts");
   try {
     await row(page, "Notify").waitFor();
-    await action(controls(page), "Add job").click();
+    await action(table(page), "Add job").click();
     const editor = creator(page);
     await pick(page, editor, "Script", "Archive · archive.py");
     await action(editor, "Set up jobs from header").click();
@@ -1062,7 +1059,7 @@ test("set up from header creates an instance for each trigger the header declare
     ]);
 
     // It is offered only while the chosen script has a declared trigger with no instance.
-    await action(controls(page), "Add job").click();
+    await action(table(page), "Add job").click();
     await action(editor, "Script").getByText("Choose a script", { exact: true }).waitFor();
     assert.equal(await action(editor, "Set up jobs from header").count(), 0);
     await pick(page, editor, "Script", "Nightly report · nightly.py");
@@ -1097,8 +1094,9 @@ test("the secrets screen is one table of names and who links them, with one way 
     assert.equal(await rows(secretsTable(page)).count(), 2);
     assert.equal(await secretRow(page, "Notify token").getByText("Notify", { exact: true }).count(), 1);
     assert.equal(await secretRow(page, "Spare key").getByText("Not used", { exact: true }).count(), 1);
-    // One Add for the whole list, in the top bar, and no value anywhere.
-    assert.deepEqual(await controls(page).getByRole("button").allTextContents(), ["Add secret"]);
+    // One Add for the whole list, under its table, and no value anywhere.
+    assert.equal(await controls(page).getByRole("button").count(), 0);
+    assert.equal(await action(page, "Add secret").count(), 1);
     assert.equal(await page.getByText("fixture-token").count(), 0);
     await shot(page, "secrets-table");
   } finally { await page.close(); }
@@ -1107,7 +1105,7 @@ test("the secrets screen is one table of names and who links them, with one way 
 test("a secret is added, renamed and given a new value without its value ever being shown", async () => {
   const page = await open("?secrets");
   try {
-    await action(controls(page), "Add secret").click();
+    await action(secretsTable(page), "Add secret").click();
     let editor = secretDialog(page, "Add secret");
     assert.deepEqual(await openToPasswordManagers(editor), []);
     assert.equal(await secretField(editor, "Value").getAttribute("type"), "password");
@@ -1200,7 +1198,7 @@ test("signed in, a secret is added without the password, and changing or deletin
     const check = page.getByRole("dialog", { name: "Confirm your password", exact: true });
 
     // Adding one is never held back.
-    await action(controls(page), "Add secret").click();
+    await action(secretsTable(page), "Add secret").click();
     let editor = secretDialog(page, "Add secret");
     await field(editor, "Name").fill("Mail token");
     await secretField(editor, "Value").fill("fixture-token-3");
@@ -1266,14 +1264,15 @@ test("signed in, deleting a secret asks for the password over the question, and 
   } finally { await page.close(); }
 });
 
-test("no secrets says so, and the top bar's Add is the only one", async () => {
+test("no secrets says so, and the Add under the table is the only one", async () => {
   const page = await open("?secrets&empty");
   try {
     await secretsTable(page).getByText("No secrets yet.", { exact: true }).waitFor();
     assert.equal(await rows(secretsTable(page)).count(), 0);
-    assert.equal(await secretsTable(page).getByRole("button").count(), 0);
+    assert.deepEqual(await page.getByRole("button", { name: /^Add\b/ }).allTextContents(), ["Add secret"]);
+    assert.equal(await controls(page).getByRole("button").count(), 0);
     await shot(page, "secrets-empty");
-    await action(controls(page), "Add secret").click();
+    await action(secretsTable(page), "Add secret").click();
     await secretDialog(page, "Add secret").waitFor();
   } finally { await page.close(); }
 });

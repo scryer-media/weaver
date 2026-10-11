@@ -11,11 +11,10 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
-import { PrimaryButton } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { useNextData } from "../../../data/next-data";
 import { categoryColor } from "../../../data/palette";
-import { PanelControls, SettingsBlocks, type SettingsBlock } from "../framework";
+import { SettingsBlocks, type SettingsBlock } from "../framework";
 
 /**
  * Categories: where a release lands, and the names an indexer may call it.
@@ -121,7 +120,7 @@ export function CategoriesPanel() {
       columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr)",
       headers: [t("next.categories.name"), t("next.categories.destination"), t("next.categories.aliases")],
       empty: t("next.categories.empty"),
-      emptyAction: { label: t("next.categories.add"), onClick: () => open(null) },
+      add: { label: t("next.categories.add"), onClick: () => open(null) },
       onRowClick: (id) => {
         const category = categories.find((entry) => String(entry.id) === id);
         if (category) {
@@ -149,10 +148,6 @@ export function CategoriesPanel() {
 
   return (
     <>
-      <PanelControls>
-        <PrimaryButton icon="add" onClick={() => open(null)}>{t("next.categories.add")}</PrimaryButton>
-      </PanelControls>
-
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor

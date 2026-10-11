@@ -18,7 +18,7 @@ import { refusalMessage } from "@/lib/refusal";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { PrimaryButton, SecondaryButton, Select } from "../../../components/controls";
+import { SecondaryButton, Select } from "../../../components/controls";
 import { Icon } from "../../../components/icons";
 import { RoutingState } from "../../../components/RoutingState";
 import { RouteView } from "../../../features/networking/RouteView";
@@ -482,7 +482,7 @@ export function RssPanel() {
         "",
       ],
       empty: t("next.rss.feedsEmpty"),
-      emptyAction: { label: t("next.rss.addFeed"), onClick: () => openFeed(null) },
+      add: { label: t("next.rss.addFeed"), onClick: () => openFeed(null) },
       onRowClick: (id) => {
         const feed = feeds.find((entry) => String(entry.id) === id);
         if (feed) {
@@ -532,17 +532,13 @@ export function RssPanel() {
       ],
       empty: t("next.rss.rulesEmpty"),
       // A rule belongs to a feed, so there is nothing to add one to before a feed exists.
-      emptyAction: { label: t("next.rss.addRule"), onClick: () => openRule(null), disabled: feeds.length === 0 },
+      add: { label: t("next.rss.addRule"), onClick: () => openRule(null), disabled: feeds.length === 0 },
       onRowClick: (id) => {
         const entry = rules.find((candidate) => String(candidate.rule.id) === id);
         if (entry) {
           openRule(entry.rule);
         }
       },
-      footer:
-        rules.length > 0 ? (
-          <PrimaryButton icon="add" onClick={() => openRule(null)}>{t("next.rss.addRule")}</PrimaryButton>
-        ) : undefined,
       rows: rules.map(({ rule, feed }) => ({
         id: String(rule.id),
         searchText: `${feed.name} ${rule.action} ${rule.titleRegex ?? ""} ${rule.categoryOverride ?? ""}`,
@@ -964,7 +960,6 @@ export function RssPanel() {
         <SecondaryButton icon="refresh" onClick={() => void sync()} disabled={feeds.length === 0}>
           {t("next.rss.pollAll")}
         </SecondaryButton>
-        <PrimaryButton icon="add" onClick={() => openFeed(null)}>{t("next.rss.addFeed")}</PrimaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
