@@ -56,9 +56,14 @@ impl Pool {
                 Self::Smoke => schedules().into_iter().enumerate().collect(),
                 Self::Combined => combined_schedule_cases(),
             };
+            // A withheld volume is a cell of the damage family, not a
+            // schedule every family samples: the runner posts what the
+            // cell's post holds.
             cases
                 .into_iter()
-                .filter(|(_, (_, interruption))| profile.includes(*interruption))
+                .filter(|(_, (_, interruption))| {
+                    profile.includes(*interruption) && interruption.withheld().is_none()
+                })
                 .collect()
         })
     }

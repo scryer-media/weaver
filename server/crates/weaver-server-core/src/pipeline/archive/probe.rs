@@ -4,7 +4,7 @@ use crate::jobs::assembly::{
 };
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
-use crate::pipeline::Pipeline;
+use crate::pipeline::{Pipeline, RarSetState};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::PathBuf;
@@ -1601,6 +1601,54 @@ impl Pipeline {
             sets.len(),
             seen.join(", ")
         ))
+    }
+
+    // For every RAR set of the job that opened but still waits on volumes it
+    // has never seen, which volume numbers those are and the last volume that
+    // was seen before each gap, so the operator can name the absent part.
+    pub(crate) fn missing_rar_volumes_report(&self, job_id: JobId) -> Option<String> {
+        let mut reports = Vec::new();
+        let mut sets: Vec<(&String, &RarSetState)> = self
+            .rar_sets
+            .iter()
+            .filter(|((set_job_id, _), _)| *set_job_id == job_id)
+            .map(|((_, set_name), state)| (set_name, state))
+            .collect();
+        sets.sort_by(|left, right| left.0.cmp(right.0));
+        for (set_name, state) in sets {
+            let Some(plan) = state.plan.as_ref() else {
+                continue;
+            };
+            let mut waiting: Vec<u32> = plan
+                .waiting_on_volumes
+                .iter()
+                .copied()
+                .filter(|volume| {
+                    !state.facts.contains_key(volume) && !state.volume_files.contains_key(volume)
+                })
+                .collect();
+            if waiting.is_empty() {
+                continue;
+            }
+            waiting.sort_unstable();
+            let described: Vec<String> = waiting
+                .iter()
+                .map(|volume| {
+                    let preceding = state
+                        .volume_files
+                        .range(..*volume)
+                        .next_back()
+                        .map(|(_, filename)| format!(" after '{filename}'"))
+                        .unwrap_or_default();
+                    format!("volume {volume}{preceding}")
+                })
+                .collect();
+            reports.push(format!(
+                "set '{set_name}' is missing RAR {}",
+                described.join(", ")
+            ));
+        }
+        (!reports.is_empty()).then(|| reports.join("; "))
     }
 }
 

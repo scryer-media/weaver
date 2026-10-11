@@ -797,6 +797,12 @@ impl Pipeline {
         let pending_rar_refresh = download_pipeline_exhausted
             && only_rar_archives
             && self.job_has_pending_rar_refresh_for_current_sets(job_id);
+        // A hole in a numbered part run that nothing listed can fill: a part
+        // the post never carried. Every listed file may be whole, so nothing
+        // else here reads as damage, yet the recovery set can rebuild the
+        // part, and only the authoritative pass names its blocks.
+        let numbered_archive_part_missing =
+            download_pipeline_exhausted && self.missing_numbered_archive_part(job_id).is_some();
 
         // Step 2: Check for CRC failures that need PAR2 repair.
         let clean_par2_integrity_gate = self.clean_par2_integrity_gate(job_id);
@@ -872,6 +878,7 @@ impl Pipeline {
             || has_crc_failures
             || (has_incomplete_data_files && download_pipeline_exhausted)
             || rar_waiting_for_missing_volumes
+            || numbered_archive_part_missing
             || matches!(current_status, JobStatus::Repairing)
             || matches!(
                 clean_par2_integrity_gate,
@@ -951,6 +958,7 @@ impl Pipeline {
             // own — swap correction, and the eager-delete retry frontier — and
             // forcing the authoritative pass there loses both.
             && !missing_archive_volume_par2_repair_ready
+            && !numbered_archive_part_missing
             && (!described_data_files_incomplete || !download_pipeline_exhausted)
             // The pass that consumes a parked damaged-path verdict is a second
             // entry into this gate: the first submitted the read and returned.

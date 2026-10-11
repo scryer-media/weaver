@@ -31,6 +31,13 @@ pub(super) enum Container {
     Rar5EncryptedHeaders,
     SevenZip,
     SevenZipSolid,
+    // Solid compressed sets a real archiver wrote, with the data encrypted
+    // under plain headers or not: direct store refuses every member, so
+    // they extract by the fallback route.
+    Rar4Solid,
+    Rar4SolidEncrypted,
+    Rar5Solid,
+    Rar5SolidEncrypted,
     // Codec and integrity variants the grouping cross does not vary; they
     // exist as cells only so their hand-named formats alias to one.
     Rar4Encrypted,
@@ -221,16 +228,59 @@ impl Container {
         matches!(self, Self::SevenZip | Self::SevenZipSolid)
     }
 
+    fn is_solid_rar(self) -> bool {
+        matches!(
+            self,
+            Self::Rar4Solid | Self::Rar4SolidEncrypted | Self::Rar5Solid | Self::Rar5SolidEncrypted
+        )
+    }
+
+    // The checked-in archive written as `volumes` volumes, if there is one.
+    fn solid_format(self, volumes: usize) -> Option<CompressedFormat> {
+        use CompressedFormat as F;
+        Some(match (self, volumes) {
+            (Self::Rar4Solid, 1) => F::Rar4Solid,
+            (Self::Rar4Solid, 2) => F::Rar4SolidTwoVolumes,
+            (Self::Rar4Solid, 4) => F::Rar4SolidFourVolumes,
+            (Self::Rar4SolidEncrypted, 1) => F::Rar4SolidEncrypted,
+            (Self::Rar4SolidEncrypted, 2) => F::Rar4SolidEncryptedTwoVolumes,
+            (Self::Rar4SolidEncrypted, 4) => F::Rar4SolidEncryptedFourVolumes,
+            (Self::Rar5Solid, 1) => F::Rar5Solid,
+            (Self::Rar5Solid, 2) => F::Rar5SolidTwoVolumes,
+            (Self::Rar5Solid, 4) => F::Rar5SolidFourVolumes,
+            (Self::Rar5SolidEncrypted, 1) => F::Rar5SolidEncrypted,
+            (Self::Rar5SolidEncrypted, 2) => F::Rar5SolidEncryptedTwoVolumes,
+            (Self::Rar5SolidEncrypted, 4) => F::Rar5SolidEncryptedFourVolumes,
+            _ => return None,
+        })
+    }
+
     // Whether the volumes' own readable headers chain the set, so a set no
     // name or index places is still admitted by content.
     fn headers_chain(self) -> bool {
-        matches!(self, Self::Rar5 | Self::Rar5Encrypted)
+        matches!(
+            self,
+            Self::Rar5 | Self::Rar5Encrypted | Self::Rar5Solid | Self::Rar5SolidEncrypted
+        )
     }
 
     // What direct store does with a set it has admitted.
     fn admitted(self) -> Expect {
         match self {
             Self::SevenZipSolid => Expect::Demotes(sevenz_coder),
+            Self::Rar4Solid
+            | Self::Rar4SolidEncrypted
+            | Self::Rar5Solid
+            | Self::Rar5SolidEncrypted => Expect::Demotes(|reason| {
+                matches!(
+                    reason,
+                    DemotionReason::MemberIneligible(
+                        MemberIneligibility::Compressed
+                            | MemberIneligibility::Solid
+                            | MemberIneligibility::Encrypted
+                    )
+                )
+            }),
             Self::Rar5UncheckedHeaders => Expect::Demotes(|reason| {
                 matches!(reason, DemotionReason::HeaderEncryptedRefused(_))
             }),
@@ -279,7 +329,11 @@ pub(super) fn rule(cell: Cell) -> Ruling {
         | Container::Rar5Encrypted
         | Container::Rar5EncryptedHeaders
         | Container::SevenZip
-        | Container::SevenZipSolid => crossed(cell),
+        | Container::SevenZipSolid
+        | Container::Rar4Solid
+        | Container::Rar4SolidEncrypted
+        | Container::Rar5Solid
+        | Container::Rar5SolidEncrypted => crossed(cell),
     }
 }
 
@@ -329,6 +383,9 @@ fn crossed(cell: Cell) -> Ruling {
     match (naming, binding) {
         (Naming::OldStyleS | Naming::HexSwappedRar, any_binding!()) if sevenz => {
             Ruling::Impossible("a RAR naming")
+        }
+        (Naming::HexNumberedGap, any_binding!()) if container.is_solid_rar() => {
+            Ruling::Impossible("no solid set was written as three volumes")
         }
         (Naming::BareFirstPart, any_binding!()) if !sevenz => Ruling::Impossible("a 7z naming"),
         (
@@ -381,6 +438,24 @@ fn crossed(cell: Cell) -> Ruling {
             | Binding::LegacyOnLoss
             | Binding::LegacyReal,
         ) => Ruling::Possible(fallback(Admission::Unnamed, unnamed(true))),
+        // A solid set refuses its member from the first header it reads,
+        // which may come before the chain is seen to run backwards.
+        (Naming::HexSwappedRar, any_binding!()) if container.is_solid_rar() => {
+            Ruling::Possible(fallback(
+                Admission::Named,
+                Expect::Demotes(|reason| {
+                    matches!(
+                        reason,
+                        DemotionReason::MemberIneligible(
+                            MemberIneligibility::Compressed
+                                | MemberIneligibility::Solid
+                                | MemberIneligibility::Encrypted
+                                | MemberIneligibility::MalformedChain
+                        )
+                    )
+                }),
+            ))
+        }
         // Names that admit a set whose headers then chain the other way
         // round: direct store demotes it as malformed.
         (
@@ -505,6 +580,17 @@ impl Naming {
         )
     }
 
+    // Whether leaving one posted volume out of the post says something the
+    // naming does not already: a repost carries every volume twice, so one
+    // copy left out withholds nothing, and a numbered gap is already a set
+    // missing a part.
+    fn withholds(self) -> bool {
+        !matches!(
+            self,
+            Self::Reposted | Self::HexReposted | Self::HexNumberedGap
+        )
+    }
+
     // The names each posted volume goes under, given each one's real name.
     fn posted(self, real: &[String]) -> Vec<String> {
         const STEM: &str = "5f0c9e2ab1d74c6e8a3f1b0d9c2e7a41";
@@ -599,6 +685,31 @@ impl Fixture {
                 LOSES[0]
             };
             (split_volumes(&archive, count), expected, unmapped)
+        } else if let Some(format) = cell.container.solid_format(count) {
+            // The volumes go under the real names a stored set has; every
+            // naming renames posted files and leaves the members alone.
+            let parts: Vec<Vec<u8>> = match format.volumes() {
+                Some((_, parts)) => parts.into_iter().map(<[u8]>::to_vec).collect(),
+                None => vec![format.fixture().1.to_vec()],
+            };
+            assert_eq!(parts.len(), count, "{cell:?}");
+            let written = parts
+                .into_iter()
+                .enumerate()
+                .map(|(index, bytes)| {
+                    let name = if count == 1 {
+                        "silver.horizon.rar".to_string()
+                    } else {
+                        format!("silver.horizon.part{:02}.rar", index + 1)
+                    };
+                    (name, bytes)
+                })
+                .collect();
+            let expected = compressed_members(format)
+                .into_iter()
+                .map(|(name, bytes)| (&*name.leak(), bytes))
+                .collect();
+            (written, expected, LOSES[0])
         } else {
             let name = "nested/feature.mkv";
             let mut written = match cell.container {
@@ -639,7 +750,10 @@ impl Fixture {
         };
         spec.password = matches!(
             cell.container,
-            Container::Rar5Encrypted | Container::Rar5EncryptedHeaders
+            Container::Rar5Encrypted
+                | Container::Rar5EncryptedHeaders
+                | Container::Rar4SolidEncrypted
+                | Container::Rar5SolidEncrypted
         )
         .then(|| PASSWORD.to_string());
         Self {
@@ -845,152 +959,204 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
         published.push("silver.horizon.sfv");
     }
     for (case, (order, interruption)) in cases {
-        if !profile.includes(interruption) {
+        if !profile.includes(interruption)
+            || !interruption.fits(fixture.volumes.len())
+            || (interruption.withheld().is_some() && !cell.naming.withholds())
+        {
             continue;
         }
-        let context = format!(
-            "{cell:?} profile={profile:?} case={case} order={order:?} interruption={interruption:?}"
-        );
-        eprintln!("{context}");
-        let outcome = run_schedule_with(
-            options,
-            profile,
-            fixture.spec.clone(),
-            &fixture.volumes,
-            described.as_deref(),
-            &order,
-            &wanted,
-            interruption,
-        )
-        .await;
-        let check = || {
-            // An available article from a byte-identical repost supplies the
-            // same bytes. Otherwise a listing cannot repair missing data.
-            let unrepairable = (options.recovery == RecoveryFormat::Absent || interruption.fails())
-                && interruption.loss().is_some_and(|(mask, _)| {
-                    // Names or posted PAR2 descriptions can identify the
-                    // absent copy. Parity is unnecessary when identical
-                    // source bytes remain available in another posting.
-                    let identifiable_copy = cell.naming == Naming::Reposted
-                        || (cell.naming == Naming::HexReposted
-                            && cell.binding == Binding::Par2Posted);
-                    if !identifiable_copy {
-                        return mask != 0;
-                    }
-                    let articles_per_file = 4 / fixture.volumes.len();
-                    (0..4).any(|slot| {
-                        mask & (1 << slot) != 0
-                            && !fixture
-                                .volumes
-                                .iter()
-                                .enumerate()
-                                .any(|(copy, (_, bytes))| {
-                                    bytes == &fixture.volumes[slot / articles_per_file].1
-                                        && mask
-                                            & (1 << (copy * articles_per_file
-                                                + slot % articles_per_file))
-                                            == 0
-                                })
-                    })
-                });
-            if unrepairable {
-                profile.assert_rejected(&outcome, &wanted);
-                return;
-            }
-            if let Expect::Fails(why) = expect {
-                profile.assert_rejected(&outcome, &wanted);
-                let Some(JobStatus::Failed { error }) = &outcome.status else {
-                    unreachable!("assert_rejected holds the job failed")
-                };
-                // A posted-name index authenticates the misleading numbering.
-                // After restart it can reach the bounded extraction retry;
-                // clean recovery data still cannot establish archive order.
-                let verified_but_unordered = why == UNORDERED_7Z
-                    && cell.binding == Binding::Par2Posted
-                    && error.contains(
-                        "clean PAR2 verification but extraction still failing after retry",
-                    );
-                assert!(
-                    error.contains(why) || verified_but_unordered,
-                    "{context}: {error}: {:?}",
-                    outcome.trace
-                );
-                return;
-            }
-            assert_eq!(
-                outcome.status,
-                Some(JobStatus::Complete),
-                "{context}: {:?}",
-                outcome.trace
+        // A repair also runs against the recovery set as posters lay it out,
+        // so the volumes it needs are promoted one by one.
+        let ladder = options.recovery == RecoveryFormat::Par2
+            && (interruption.loss().is_some() || interruption.withheld().is_some());
+        let ladder = ladder.then_some(ScheduleOptions {
+            recovery: RecoveryFormat::Par2Ladder,
+            ..options
+        });
+        for options in std::iter::once(options).chain(ladder) {
+            let context = format!(
+                "{cell:?} profile={profile:?} case={case} order={order:?} interruption={interruption:?} recovery={:?}",
+                options.recovery
             );
-            for (name, bytes) in &fixture.expected {
+            eprintln!("{context}");
+            let outcome = run_schedule_with(
+                options,
+                profile,
+                fixture.spec.clone(),
+                &fixture.volumes,
+                described.as_deref(),
+                &order,
+                &wanted,
+                interruption,
+            )
+            .await;
+            let check = || {
+                // An available article from a byte-identical repost supplies the
+                // same bytes. Otherwise a listing cannot repair missing data.
+                let unrepairable =
+                    (options.recovery == RecoveryFormat::Absent || interruption.fails())
+                        && interruption.loss().is_some_and(|(mask, _)| {
+                            // Names or posted PAR2 descriptions can identify the
+                            // absent copy. Parity is unnecessary when identical
+                            // source bytes remain available in another posting.
+                            let identifiable_copy = cell.naming == Naming::Reposted
+                                || (cell.naming == Naming::HexReposted
+                                    && cell.binding == Binding::Par2Posted);
+                            if !identifiable_copy {
+                                return mask != 0;
+                            }
+                            let articles_per_file = 4 / fixture.volumes.len();
+                            (0..4).any(|slot| {
+                                mask & (1 << slot) != 0
+                                    && !fixture.volumes.iter().enumerate().any(
+                                        |(copy, (_, bytes))| {
+                                            bytes == &fixture.volumes[slot / articles_per_file].1
+                                                && mask
+                                                    & (1 << (copy * articles_per_file
+                                                        + slot % articles_per_file))
+                                                    == 0
+                                        },
+                                    )
+                            })
+                        });
+                if unrepairable {
+                    profile.assert_rejected(&outcome, &wanted);
+                    return;
+                }
+                // A volume the post never carried comes back only from recovery
+                // blocks. Without them the job fails; a set that names its
+                // volumes says which part it is missing.
+                let withheld = interruption.withheld().is_some();
+                if withheld
+                    && (options.recovery == RecoveryFormat::Absent
+                        || matches!(expect, Expect::Fails(_)))
+                {
+                    profile.assert_rejected(&outcome, &wanted);
+                    let Some(JobStatus::Failed { error }) = &outcome.status else {
+                        unreachable!("assert_rejected holds the job failed")
+                    };
+                    // A withheld first volume reads as a set with no start, which
+                    // is its own diagnostic.
+                    if options.recovery == RecoveryFormat::Absent
+                        && cell.naming.names_place()
+                        && interruption
+                            .withheld()
+                            .is_some_and(|(volume, _)| volume > 0)
+                    {
+                        assert!(
+                            error.contains(MISSING_PART),
+                            "{context}: {error}: {:?}",
+                            outcome.trace
+                        );
+                    }
+                    return;
+                }
+                if let Expect::Fails(why) = expect {
+                    profile.assert_rejected(&outcome, &wanted);
+                    let Some(JobStatus::Failed { error }) = &outcome.status else {
+                        unreachable!("assert_rejected holds the job failed")
+                    };
+                    // A posted-name index authenticates the misleading numbering.
+                    // After restart it can reach the bounded extraction retry;
+                    // clean recovery data still cannot establish archive order.
+                    let verified_but_unordered = why == UNORDERED_7Z
+                        && cell.binding == Binding::Par2Posted
+                        && error.contains(
+                            "clean PAR2 verification but extraction still failing after retry",
+                        );
+                    assert!(
+                        error.contains(why) || verified_but_unordered,
+                        "{context}: {error}: {:?}",
+                        outcome.trace
+                    );
+                    return;
+                }
                 assert_eq!(
-                    outcome.files[*name].as_deref(),
-                    Some(bytes.as_slice()),
+                    outcome.status,
+                    Some(JobStatus::Complete),
                     "{context}: {:?}",
                     outcome.trace
                 );
-            }
-            let mut route = route;
-            if interruption.loss().is_some_and(|(mask, _)| mask == 15)
-                && !matches!(
-                    cell.naming,
-                    Naming::Conventional
-                        | Naming::ConventionalFour
-                        | Naming::Single
-                        | Naming::MixedCase
-                        | Naming::OldStyleS
-                )
-            {
-                // Recognizable posted names retain their direct identity even
-                // with every payload article absent. Obfuscated, reordered or
-                // reposted names need content evidence and rebuild on disk.
-                route.direct = false;
-            }
-            if matches!(
-                interruption,
-                Interruption::Restart(_) | Interruption::Crash(_)
-            ) && matches!(expect, Expect::Streams | Expect::Downloads)
-                && matches!(cell.container.admitted(), Expect::Direct)
-            {
-                // Retained index metadata can identify refetched parts before
-                // their arrivals after restart. Either route remains valid;
-                // direct admission still requires no unexpected demotion and
-                // no refetch of durable articles below.
-                route.direct = outcome.finalized == route.sets;
-            }
-            if cell.naming == Naming::HexSwappedRar
-                && matches!(cell.binding, Binding::Par2RealFirst | Binding::Par2RealLast)
-                && interruption
-                    .loss()
-                    .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
-            {
-                // A lost identity prefix can prevent binding before enough
-                // header evidence survives to prove the swapped chain.
-                route.shape_demotion = |reason| {
-                    matches!(
-                        reason,
-                        DemotionReason::Par2Unbindable
-                            | DemotionReason::MemberIneligible(MemberIneligibility::MalformedChain)
+                for (name, bytes) in &fixture.expected {
+                    assert_eq!(
+                        outcome.files[*name].as_deref(),
+                        Some(bytes.as_slice()),
+                        "{context}: {:?}",
+                        outcome.trace
+                    );
+                }
+                let mut route = route;
+                if interruption.loss().is_some_and(|(mask, _)| mask == 15)
+                    && !matches!(
+                        cell.naming,
+                        Naming::Conventional
+                            | Naming::ConventionalFour
+                            | Naming::Single
+                            | Naming::MixedCase
                     )
-                };
-            }
-            if cell.naming == Naming::OldStyleS
-                && interruption
-                    .loss()
-                    .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
-            {
-                // These posted names admit a RAR set but differ from the real
-                // PAR2 names. Without its content prefix a volume cannot be
-                // bound safely; repair must use materialized source files.
-                route.shape_demotion = |reason| reason == DemotionReason::Par2Unbindable;
-            }
-            profile.assert_delivery(&outcome, route, &published, interruption);
-            if matches!(interruption, Interruption::None) {
-                expect.assert_clean(&outcome, order.len() == 4, &context);
-            }
-        };
-        check();
+                {
+                    // Recognizable posted names retain their direct identity even
+                    // with every payload article absent. Obfuscated, reordered or
+                    // reposted names need content evidence and rebuild on disk, and
+                    // so do old-style names, which differ from the real PAR2 names
+                    // and bind only through a content prefix the loss took.
+                    route.direct = false;
+                }
+                if matches!(
+                    interruption,
+                    Interruption::Restart(_) | Interruption::Crash(_)
+                ) && matches!(expect, Expect::Streams | Expect::Downloads)
+                    && matches!(cell.container.admitted(), Expect::Direct)
+                {
+                    // Retained index metadata can identify refetched parts before
+                    // their arrivals after restart. Either route remains valid;
+                    // direct admission still requires no unexpected demotion and
+                    // no refetch of durable articles below.
+                    route.direct = outcome.finalized == route.sets;
+                }
+                if cell.naming == Naming::HexSwappedRar
+                    && matches!(cell.binding, Binding::Par2RealFirst | Binding::Par2RealLast)
+                    && interruption
+                        .loss()
+                        .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
+                {
+                    // A lost identity prefix can prevent binding before enough
+                    // header evidence survives to prove the swapped chain.
+                    route.shape_demotion = |reason| {
+                        matches!(
+                            reason,
+                            DemotionReason::Par2Unbindable
+                                | DemotionReason::MemberIneligible(
+                                    MemberIneligibility::MalformedChain
+                                )
+                        )
+                    };
+                }
+                if cell.naming == Naming::OldStyleS
+                    && interruption
+                        .loss()
+                        .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
+                {
+                    // These posted names admit a RAR set but differ from the real
+                    // PAR2 names. Without its content prefix a volume cannot be
+                    // bound safely; repair must use materialized source files.
+                    route.shape_demotion = |reason| reason == DemotionReason::Par2Unbindable;
+                }
+                if withheld {
+                    // The direct store repairs in place only volumes the job lists:
+                    // a repair target is keyed by its NZB file. A volume the post
+                    // never carried is damage outside every direct set, so the
+                    // whole set goes to the conventional repairer and completes
+                    // there.
+                    route.direct = false;
+                }
+                profile.assert_delivery(&outcome, route, &published, interruption);
+                if matches!(interruption, Interruption::None) {
+                    expect.assert_clean(&outcome, order.len() == 4, &context);
+                }
+            };
+            check();
+        }
     }
 }
 
@@ -1013,6 +1179,33 @@ pub(super) async fn cell_smoke(cell: Cell) {
             (1, (backward.clone(), Interruption::None)),
         ];
         run_cell(cell, profile, cases).await;
+    }
+}
+
+// A split part the post never carried, between two that it did: every listed
+// file is whole, so only the hole in the numbering says the recovery set
+// has work, and it rebuilds the part rather than the job failing on it.
+#[tokio::test]
+async fn a_withheld_middle_split_part_is_rebuilt_from_recovery() {
+    let case = schedules().into_iter().nth(361).unwrap();
+    assert_eq!(
+        case.1,
+        Interruption::Withheld {
+            volume: 2,
+            index_first: false,
+        }
+    );
+    for profile in PROFILES {
+        run_cell(
+            Cell {
+                container: Container::SevenZip,
+                naming: Naming::ConventionalFour,
+                binding: Binding::Par2RealLast,
+            },
+            profile,
+            vec![(361, case.clone())],
+        )
+        .await;
     }
 }
 
@@ -1438,13 +1631,17 @@ const PROFILES: [ExtractionProfile; 3] = [
     ExtractionProfile::Conventional,
 ];
 
-pub(super) const CONTAINERS: [Container; 6] = [
+pub(super) const CONTAINERS: [Container; 10] = [
     Container::Rar4,
     Container::Rar5,
     Container::Rar5Encrypted,
     Container::Rar5EncryptedHeaders,
     Container::SevenZip,
     Container::SevenZipSolid,
+    Container::Rar4Solid,
+    Container::Rar4SolidEncrypted,
+    Container::Rar5Solid,
+    Container::Rar5SolidEncrypted,
 ];
 
 pub(super) const NAMINGS: [Naming; 15] = [

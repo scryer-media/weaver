@@ -24,6 +24,7 @@ pub(super) fn totals() -> Vec<(&'static str, usize)> {
         ("index that lies", lies::family().total()),
         ("nesting", nesting::family().total()),
         ("scale", scale::family().total()),
+        ("withheld volume", withheld::family().total()),
         ("password", password::family().total()),
         ("wire", wire::family().total()),
         ("naming", naming::family().total()),
@@ -34,6 +35,7 @@ pub(super) fn totals() -> Vec<(&'static str, usize)> {
 pub(super) const TOTAL: usize = lies::TOTAL
     + nesting::TOTAL
     + scale::TOTAL
+    + withheld::TOTAL
     + password::TOTAL
     + wire::TOTAL
     + naming::TOTAL
@@ -820,6 +822,124 @@ pub(super) mod scale {
         use super::*;
 
         tier2_shards!(family, 300; h0 0 h1 1 h2 2);
+    }
+}
+
+// A volume the post never carried, at the field's volume size: the NZB lists
+// every volume but one, and a PAR2 set authored over all of them, cut into
+// doubling recovery volumes, is what rebuilds it.
+pub(super) mod withheld {
+    use super::*;
+
+    // The volume the post leaves out: an interior one.
+    const WITHHELD: usize = 2;
+
+    const CONTAINERS: [Container; 3] = [
+        Container::Rar5Encrypted,
+        Container::Rar4,
+        Container::SevenZip,
+    ];
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub(in super::super) struct WithheldCell {
+        pub container: Container,
+        // Volumes of 2 MiB over 8 KiB slices, or of 32 KiB over 4 KiB
+        // slices for the smoke.
+        pub field_size: bool,
+    }
+
+    pub(in super::super) fn cells() -> Vec<WithheldCell> {
+        CONTAINERS
+            .into_iter()
+            .map(|container| WithheldCell {
+                container,
+                field_size: true,
+            })
+            .collect()
+    }
+
+    // 3 cells under three profiles, 200 of the combined cases each.
+    breadth_family!(WithheldCell, cells(), Pool::Combined, 200, 1_800, 3);
+
+    impl WithheldCell {
+        // Bytes per article, articles per volume, PAR2 slice.
+        fn geometry(self) -> (usize, usize, usize) {
+            if self.field_size {
+                (64 * 1024, 32, 8 * 1024)
+            } else {
+                (4096, 8, 4096)
+            }
+        }
+    }
+
+    impl Cell for WithheldCell {
+        fn post(self, interruption: Interruption) -> Built {
+            let (article, per, slice) = self.geometry();
+            let payload = payload(79, VOLUMES * per * article - 512);
+            let set = stored(self.container, self.container.member(), &payload, VOLUMES);
+            let missing = set[WITHHELD].1.len().div_ceil(slice);
+            let mut carried = set.clone();
+            carried.remove(WITHHELD);
+            let mut post = data_post(
+                carried,
+                article,
+                vec![(self.container.member().to_string(), payload)],
+            );
+            post.password = self.container.password();
+            let geometry = Geometry {
+                block: slice,
+                packed: false,
+            };
+            let lost = run::lost_articles(&post, interruption);
+            let (upper, _) = recovery::needed(&post, geometry, &lost);
+            let blocks = missing + upper + 8;
+            recovery::post_set(
+                &mut post,
+                recovery::par2_set(&set, slice, blocks, Par2Volumes::Exponent),
+                article,
+            );
+            // The oracle counts only what the post carries; the withheld
+            // volume is known here, so the cell rules: enough recovery
+            // arrives unless the schedule starves it.
+            let ruling = if interruption.fails() {
+                Verdict::Fails
+            } else {
+                Verdict::Completes
+            };
+            Built {
+                post,
+                geometry: Some(geometry),
+                ruling: Some(ruling),
+            }
+        }
+
+        fn par2(self) -> bool {
+            true
+        }
+    }
+
+    // A rebuilt volume no posted file owns must reach the chase that waits
+    // on it. The consumption deadline is lifted out of reach, so a chase
+    // left parked on that volume holds the run until the test runner ends
+    // it, instead of being rescued by the deadline.
+    #[tokio::test]
+    async fn a_rebuilt_withheld_volume_reaches_the_chase() {
+        use crate::pipeline::direct_unpack::wiring::PENDING_CHASE_DEADLINE_OVERRIDE;
+        *PENDING_CHASE_DEADLINE_OVERRIDE.lock().unwrap() =
+            Some(std::time::Duration::from_secs(24 * 60 * 60));
+        loss_smoke(WithheldCell {
+            container: Container::Rar5Encrypted,
+            field_size: false,
+        })
+        .await;
+        *PENDING_CHASE_DEADLINE_OVERRIDE.lock().unwrap() = None;
+    }
+
+    // The campaign: 100 shards of eighteen cases.
+    mod combined_withheld {
+        use super::*;
+
+        tier2_shards!(family, 100; h0 0);
     }
 }
 

@@ -2735,6 +2735,42 @@ fn build_test_par2_with_recovery(
     stream
 }
 
+// The same recovery set laid out as posters lay it out: an index carrying the
+// descriptions alone, then volumes of exponentially growing block counts,
+// each carrying the descriptions again and its own run of recovery packets,
+// named `<base>.vol<first>+<count>.par2`. The last volume takes whatever the
+// ladder has left. The index comes first.
+fn build_test_par2_ladder(
+    files: &[(&str, &[u8])],
+    slice_size: u64,
+    recovery_block_count: usize,
+    base: &str,
+) -> Vec<(String, Vec<u8>)> {
+    let index = build_test_par2_index_for_files(files, slice_size);
+    let whole = build_test_par2_with_recovery(files, slice_size, recovery_block_count);
+    // Every recovery packet is a 64-byte header, the exponent and one slice.
+    let packet = 64 + 4 + slice_size as usize;
+    let packets = &whole[index.len()..];
+    assert_eq!(packets.len(), recovery_block_count * packet);
+    let digits = |value: usize| value.max(1).ilog10() as usize + 1;
+    let first_width = digits(recovery_block_count).max(3);
+    let count_width = digits(recovery_block_count).max(2);
+    let mut carriers = vec![(format!("{base}.par2"), index.clone())];
+    let (mut first, mut count) = (0, 1);
+    while first < recovery_block_count {
+        let count_here = count.min(recovery_block_count - first);
+        let mut bytes = index.clone();
+        bytes.extend_from_slice(&packets[first * packet..(first + count_here) * packet]);
+        carriers.push((
+            format!("{base}.vol{first:0first_width$}+{count_here:0count_width$}.par2"),
+            bytes,
+        ));
+        first += count_here;
+        count *= 2;
+    }
+    carriers
+}
+
 fn repairable_par2_index(volumes: &[(String, Vec<u8>)], recovery_blocks: usize) -> Vec<u8> {
     let described: Vec<(&str, &[u8])> = volumes
         .iter()

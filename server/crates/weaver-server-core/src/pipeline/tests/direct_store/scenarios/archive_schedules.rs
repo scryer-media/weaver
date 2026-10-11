@@ -321,6 +321,22 @@ impl ExtractionProfile {
                 // The unnamed volume belongs to no set, so its damage is
                 // damage no direct set can repair in place.
                 DemotionReason::Par2Damaged if unnamed => false,
+                // A volume the post never carried is outside every direct set:
+                // the set cannot name it from content, and its repair is
+                // damage no direct set owns.
+                DemotionReason::IdentityRosterUnfillable | DemotionReason::Par2Damaged
+                    if interruption.withheld().is_some() =>
+                {
+                    false
+                }
+                // The posted 7z parts stop short of the start header's total
+                // when the withheld part is the last one, so the direct set
+                // refuses the geometry before recovery rebuilds that part.
+                DemotionReason::SevenZip(SevenZipRefusal::VolumeSize)
+                    if interruption.withheld().is_some() =>
+                {
+                    false
+                }
                 reason => !(route.shape_demotion)(reason),
             })
             .collect();
@@ -437,6 +453,13 @@ pub(super) enum Interruption {
         second: BoundaryAction,
         second_at: usize,
     },
+    // A volume the post never carried: the NZB does not list it and no
+    // article of it arrives, while the recovery set and any listing still
+    // describe it. The index leads when `index_first`, else it trails.
+    Withheld {
+        volume: u32,
+        index_first: bool,
+    },
 }
 
 // Which slice of a campaign one test runs.
@@ -481,6 +504,26 @@ impl Interruption {
             } if mask != 0 => Some((mask, index_first)),
             _ => None,
         }
+    }
+
+    // The volume a withheld schedule leaves out of the post, and whether the
+    // recovery index leads.
+    pub(super) fn withheld(self) -> Option<(u32, bool)> {
+        match self {
+            Self::Withheld {
+                volume,
+                index_first,
+            } => Some((volume, index_first)),
+            _ => None,
+        }
+    }
+
+    // Whether the schedule can be run over a set of `volumes`: a withheld
+    // volume has to exist, and has to leave another posted, since a job that
+    // posts no volume at all is no archive job.
+    pub(super) fn fits(self, volumes: usize) -> bool {
+        self.withheld()
+            .is_none_or(|(volume, _)| volumes > 1 && (volume as usize) < volumes)
     }
 
     // The job cannot finish: what was lost is beyond the recovery it has.
@@ -542,7 +585,14 @@ pub(super) fn combined_schedules(shard: usize, shards: usize) -> Vec<(usize, Sch
 // A campaign's cases for one selection, by replay index.
 pub(super) fn selected_schedules(selection: Selection) -> Vec<(usize, Schedule)> {
     match selection {
-        Selection::Smoke => schedules().into_iter().enumerate().collect(),
+        // A withheld volume is the grouping cross's axis, where each cell
+        // rules what its binding makes of it; the hand-named layouts are
+        // aliases of cells and leave it there.
+        Selection::Smoke => schedules()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (_, interruption))| interruption.withheld().is_none())
+            .collect(),
         Selection::Case(index) => {
             let case = combined_schedule_cases()
                 .into_iter()
@@ -747,6 +797,21 @@ pub(super) fn schedules() -> Vec<(Vec<(u32, u32)>, Interruption)> {
     for mask in 1..16 {
         result.push((in_order_arrivals(2), Interruption::Starved { mask }));
     }
+    assert_eq!(result.len(), 357);
+    // Appended for the same reason: each volume a set can be written as,
+    // never posted, with the index leading and trailing. A volume beyond the
+    // set's own is skipped where the set is known.
+    for volume in 0..4 {
+        for index_first in [false, true] {
+            result.push((
+                in_order_arrivals(2),
+                Interruption::Withheld {
+                    volume,
+                    index_first,
+                },
+            ));
+        }
+    }
     if let Ok(case) = std::env::var("WEAVER_ARCHIVE_SCHEDULE_CASE") {
         let case = case
             .parse::<usize>()
@@ -878,7 +943,7 @@ async fn submit_schedule_recovery(
         file_index: recovery.index,
     };
     match recovery.format {
-        RecoveryFormat::Par2 => {
+        RecoveryFormat::Par2 | RecoveryFormat::Par2Ladder => {
             submit_decoded_segment(
                 pipeline,
                 file,
@@ -933,6 +998,10 @@ fn scheduled_demotion(order: &[(u32, u32)], step: usize, sets: usize) -> (usize,
 pub(super) enum RecoveryFormat {
     // One PAR2 file carrying the descriptions and every recovery block.
     Par2,
+    // The same blocks as a poster lays them out: an index of descriptions
+    // alone, then volumes of doubling block counts. The index arrives where
+    // the PAR2 file would; a volume arrives when the pipeline asks.
+    Par2Ladder,
     // A PAR3 index and its recovery volumes. The index arrives where the
     // PAR2 file would; a recovery volume arrives when the pipeline asks.
     Par3,
@@ -1062,11 +1131,41 @@ pub(super) async fn run_schedule_with(
         slot_layout(volumes.len(), layout.iter().sum()),
         "four or five scheduled article slots"
     );
-    let articles = |file: u32| layout[file as usize];
     let order: Vec<_> = order
         .iter()
         .map(|&(file, article)| slot_article(&layout, file * 2 + article))
         .collect();
+    // Every volume the set is written as: what a recovery set or a listing
+    // describes. `volumes` is rebound below to the ones the post carries.
+    let written = volumes;
+    let withheld = interruption.withheld();
+    let (posted, layout, order) = match withheld {
+        Some((volume, _)) => {
+            assert!(interruption.fits(written.len()), "{interruption:?}");
+            let at = volume as usize;
+            let removed = spec.files.remove(at);
+            spec.total_bytes -= removed
+                .segments
+                .iter()
+                .map(|segment| u64::from(segment.bytes))
+                .sum::<u64>();
+            let mut posted = written.to_vec();
+            posted.remove(at);
+            let mut layout = layout;
+            layout.remove(at);
+            // The withheld volume's slots name nothing; every later volume
+            // is one file earlier in the NZB.
+            let order = order
+                .into_iter()
+                .filter(|&(file, _)| file != volume)
+                .map(|(file, article)| (file - u32::from(file > volume), article))
+                .collect();
+            (posted, layout, order)
+        }
+        None => (written.to_vec(), layout, order),
+    };
+    let volumes = posted.as_slice();
+    let articles = |file: u32| layout[file as usize];
     let root = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
     profile.configure(&mut pipeline);
@@ -1083,16 +1182,20 @@ pub(super) async fn run_schedule_with(
     let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
     let loss = interruption.loss();
     let index_first = options.index_first
-        || (!options.index_last && loss.map_or(described.is_some(), |(_, first)| first));
+        || (!options.index_last
+            && loss
+                .map(|(_, first)| first)
+                .or(withheld.map(|(_, first)| first))
+                .unwrap_or(described.is_some()));
     let mut recovery = if matches!(
         options.recovery,
         RecoveryFormat::Embedded | RecoveryFormat::Absent
     ) {
         Vec::new()
-    } else if loss.is_some() || described.is_some() {
+    } else if loss.is_some() || withheld.is_some() || described.is_some() {
         // Keep several repair blocks per article even for larger compressed
         // fixtures, without turning extraction scheduling into a codec benchmark.
-        let slice = volumes
+        let slice = written
             .iter()
             .map(|(_, bytes)| bytes.len())
             .max()
@@ -1101,11 +1204,11 @@ pub(super) async fn run_schedule_with(
             .div_ceil(4)
             * 4;
         let slice = slice.max(PAR2_SLICE_BYTES as usize);
-        let blocks: usize = volumes
+        let blocks: usize = written
             .iter()
             .map(|(_, bytes)| bytes.len().div_ceil(slice))
             .sum();
-        let described: Vec<_> = volumes
+        let described: Vec<_> = written
             .iter()
             .enumerate()
             .map(|(index, (name, bytes))| {
@@ -1113,7 +1216,7 @@ pub(super) async fn run_schedule_with(
                 (name, bytes.as_slice())
             })
             .collect();
-        let blocks = if interruption.fails() || loss.is_none() {
+        let blocks = if interruption.fails() || (loss.is_none() && withheld.is_none()) {
             0
         } else {
             blocks
@@ -1128,6 +1231,21 @@ pub(super) async fn run_schedule_with(
                     bytes,
                     format: RecoveryFormat::Par2,
                 }]
+            }
+            RecoveryFormat::Par2Ladder => {
+                let carriers =
+                    build_test_par2_ladder(&described, slice as u64, blocks, "silver.horizon");
+                let indices = append_single_article_files(&mut spec, &carriers);
+                indices
+                    .into_iter()
+                    .zip(carriers)
+                    .map(|(index, (name, bytes))| ScheduleRecovery {
+                        index,
+                        name,
+                        bytes,
+                        format: RecoveryFormat::Par2Ladder,
+                    })
+                    .collect()
             }
             RecoveryFormat::Par3 => {
                 let described: Vec<_> = described
@@ -1157,7 +1275,7 @@ pub(super) async fn run_schedule_with(
     if options.sfv {
         // A listing checks content; it carries no recovery block and, posted
         // alone, it arrives where an index would.
-        let listing: String = volumes
+        let listing: String = written
             .iter()
             .enumerate()
             .map(|(index, (name, bytes))| {
@@ -2109,6 +2227,66 @@ grouping::grouping_cells! {
         reposted Reposted [par2_posted Par2Posted nothing Nothing]
         hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
         bare_first_part BareFirstPart [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+    }
+    smoke rar4_solid Rar4Solid {
+        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        reposted Reposted [par2_posted Par2Posted nothing Nothing]
+        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+    }
+    smoke rar4_solid_encrypted Rar4SolidEncrypted {
+        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        reposted Reposted [par2_posted Par2Posted nothing Nothing]
+        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+    }
+    smoke rar5_solid Rar5Solid {
+        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        reposted Reposted [par2_posted Par2Posted nothing Nothing]
+        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
+    }
+    smoke rar5_solid_encrypted Rar5SolidEncrypted {
+        conventional Conventional [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        conventional_four ConventionalFour [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        single Single [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        mixed_case MixedCase [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        old_style_s OldStyleS [par2_real_first Par2RealFirst par2_real_last Par2RealLast sfv Sfv nothing Nothing]
+        hex_bare HexBare [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_single HexSingle [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_misnumbered HexMisnumbered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_swapped_rar HexSwappedRar [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        hex_scattered HexScattered [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        first_volume_hex FirstVolumeHex [par2_real_first Par2RealFirst par2_real_last Par2RealLast par2_posted Par2Posted sfv Sfv nothing Nothing]
+        reposted Reposted [par2_posted Par2Posted nothing Nothing]
+        hex_reposted HexReposted [par2_posted Par2Posted nothing Nothing]
     }
 }
 
@@ -3308,11 +3486,8 @@ async fn compressed_conventional_campaign(format: CompressedFormat, selection: S
     compressed_campaign(format, selection, ExtractionProfile::Conventional).await;
 }
 
-async fn compressed_campaign(
-    format: CompressedFormat,
-    selection: Selection,
-    profile: ExtractionProfile,
-) {
+// A format's members, decoded from its fixture and pinned to the oracle.
+fn compressed_members(format: CompressedFormat) -> BTreeMap<String, Vec<u8>> {
     let (fixture_name, bytes, password) = format.fixture();
     let mut archive = match password {
         Some(password) => {
@@ -3356,6 +3531,17 @@ async fn compressed_campaign(
             oracle[name]["sha256"].as_str().unwrap()
         );
     }
+    expected
+}
+
+async fn compressed_campaign(
+    format: CompressedFormat,
+    selection: Selection,
+    profile: ExtractionProfile,
+) {
+    let (_, bytes, password) = format.fixture();
+    let expected = compressed_members(format);
+    let posted = format.volumes();
     let wanted = expected.keys().map(String::as_str).collect::<Vec<_>>();
     let volumes: Vec<(String, Vec<u8>)> = match posted {
         Some((_, parts)) => parts
