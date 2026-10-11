@@ -70,6 +70,7 @@ impl Pipeline {
         &self,
         job_id: JobId,
         set_name: &str,
+        members: &[String],
     ) -> Result<(), String> {
         let output_root = self
             .jobs
@@ -77,8 +78,9 @@ impl Pipeline {
             .and_then(|state| state.staging_dir.clone())
             .unwrap_or_else(|| self.deterministic_extraction_staging_dir(job_id));
         let output_root_for_error = output_root.clone();
+        let members = members.to_vec();
         tokio::task::spawn_blocking(move || {
-            crate::runtime::fs::normalize_extracted_tree(&output_root)
+            crate::runtime::fs::normalize_extracted_paths(&output_root, &members)
         })
         .await
         .map_err(|error| {
@@ -1265,7 +1267,7 @@ impl Pipeline {
                             return;
                         }
                         if let Err(error) = self
-                            .normalize_extraction_output_tree(job_id, &set_name)
+                            .normalize_extraction_output_tree(job_id, &set_name, &outcome.extracted)
                             .await
                         {
                             warn!(
@@ -1605,7 +1607,7 @@ impl Pipeline {
                         return;
                     }
                     if let Err(error) = self
-                        .normalize_extraction_output_tree(job_id, &set_name)
+                        .normalize_extraction_output_tree(job_id, &set_name, &outcome.extracted)
                         .await
                     {
                         warn!(
