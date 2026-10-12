@@ -206,7 +206,9 @@ export function RouteEditor({
               <Segmented
                 label={t("next.networking.route.path")}
                 value={path.kind}
-                onChange={(kind) => update(index, { ...leg, path: { kind, rungs: [], directFallback: false } })}
+                onChange={(kind) =>
+                  update(index, { ...leg, path: { kind, rungs: kind === "LADDER" ? [emptyRung()] : [], directFallback: false } })
+                }
                 className="self-start"
                 options={[
                   { value: "DIRECT", label: t("next.networking.route.direct") },
@@ -216,7 +218,7 @@ export function RouteEditor({
             </ControlLabel>
 
             {path.kind === "LADDER" ? (
-              <div className="flex min-w-0 flex-col gap-2">
+              <div className="flex min-w-0 flex-col">
                 <ol className="flex min-w-0 flex-col">
                   {path.rungs.map((rung, rungIndex) => (
                     <li key={rungIndex} className="flex min-w-0 flex-col">
@@ -258,6 +260,7 @@ export function RouteEditor({
                           <IconButton
                             icon="remove"
                             label={t("next.networking.route.removeRung")}
+                            disabled={path.rungs.length === 1}
                             onClick={() => setRungs(path.rungs.filter((_, n) => n !== rungIndex))}
                           />
                         </div>
@@ -330,21 +333,25 @@ export function RouteEditor({
                 {path.rungs.length === 0 ? (
                   <p className="text-[12px] text-wv-muted">{t("next.networking.route.noRungs")}</p>
                 ) : null}
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                  <SecondaryButton
-                    size="compact"
-                    icon="add"
-                    disabled={path.rungs.length >= MAX_RUNGS}
-                    onClick={() => setRungs([...path.rungs, emptyRung()])}
-                  >
-                    {t("next.networking.route.addRung")}
-                  </SecondaryButton>
+                <div className="flex justify-center py-1 text-wv-fg">
+                  <Icon name="moveDown" size={20} />
+                </div>
+                <div className="flex min-w-0 items-center border border-wv-control bg-wv-app px-3 py-[10px]">
                   <CheckRow
                     checked={path.directFallback}
                     onChange={(checked) => update(index, { ...leg, path: { ...path, directFallback: checked } })}
                     label={t("next.networking.route.directFallback")}
                   />
                 </div>
+                <SecondaryButton
+                  size="compact"
+                  icon="add"
+                  className="mt-3 self-start"
+                  disabled={path.rungs.length >= MAX_RUNGS}
+                  onClick={() => setRungs([...path.rungs, emptyRung()])}
+                >
+                  {t("next.networking.route.addRung")}
+                </SecondaryButton>
               </div>
             ) : null}
 
