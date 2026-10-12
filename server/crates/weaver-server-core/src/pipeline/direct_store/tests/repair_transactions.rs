@@ -8,6 +8,7 @@ fn transaction_set() -> DirectSet {
         volumes: [(0, 0), (1, 1)].into(),
         files: [(0, 0), (1, 1)].into(),
         identity: None,
+        unposted: Default::default(),
         working_dir: "/nonexistent".into(),
         destination_dir: "/nonexistent-staging".into(),
     };

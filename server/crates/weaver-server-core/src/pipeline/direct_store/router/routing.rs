@@ -2578,14 +2578,27 @@ impl DirectSetRouter {
         // many the container was split into. Two statements about one archive,
         // and a disagreement means the hint is wrong — caught here, before a
         // byte is routed against boundaries that are in the wrong places.
-        if self
-            .plan
-            .expected_volume_count()
-            .is_some_and(|planned| planned as u64 != geometry.parts)
+        //
+        // Fewer posted parts than the container has is not that disagreement
+        // when the job carries a recovery set: the parts past the last posted
+        // one may be described there and rebuilt in place. They are marked
+        // as the set's own and the map waits for them, exactly as it waits
+        // for a hole in the posted numbering.
+        if let Some(planned) = self.plan.expected_volume_count()
+            && planned as u64 != geometry.parts
         {
-            return Err(self.fail(DemotionReason::SevenZip(
-                sevenz::SevenZipRefusal::VolumeSize,
-            )));
+            let described_later = self.plan.identity.is_none()
+                && self.par2_available
+                && (planned as u64) < geometry.parts;
+            if !described_later {
+                return Err(self.fail(DemotionReason::SevenZip(
+                    sevenz::SevenZipRefusal::VolumeSize,
+                )));
+            }
+            for volume_index in planned as u64..geometry.parts {
+                self.plan.note_unposted_volume(volume_index as u32);
+            }
+            return Ok(());
         }
         // A volume can state its length, or finish decoding, before volume
         // zero's front arrives, and then there was no geometry to hold it

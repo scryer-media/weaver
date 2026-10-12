@@ -18,7 +18,7 @@
 // about. [`SetFormat`] carries the difference forward so the router can pick
 // the layout engine that reads the container's headers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use weaver_model::files::{FileRole, archive_base_name};
@@ -218,6 +218,12 @@ pub(crate) struct DirectSetPlan {
     pub(crate) files: HashMap<u32, u32>,
     // `Some` for a set admitted from PAR2 descriptions rather than filenames.
     pub(crate) identity: Option<IdentityPlanFacts>,
+    // Volumes of a name-admitted set that no posted file carries: a hole in
+    // the posted numbering, or a volume past the last posted one that the
+    // recovery set describes. Each is still one of the set's volumes, so the
+    // set is whole only once a recovery-set description has given it a file
+    // of its own and repair has rebuilt it. Always empty for an identity set.
+    pub(crate) unposted: BTreeSet<u32>,
     // The job's intermediate directory: envelopes, holds scratch, repair
     // scratch, and the volume files a demotion reconstructs.
     pub(crate) working_dir: PathBuf,
@@ -249,6 +255,14 @@ pub(crate) fn spec_carries_par2(spec: &JobSpec) -> bool {
     spec.files
         .iter()
         .any(|file| matches!(file.role, FileRole::Par2 { .. }))
+}
+
+// Whether the spec posts a file whose name gives no role at all, which may be
+// any volume of any set.
+pub(crate) fn spec_has_unnamed_file(spec: &JobSpec) -> bool {
+    spec.files
+        .iter()
+        .any(|file| matches!(file.role, FileRole::Unknown))
 }
 
 // A declared PAR3 carrier earns time for native verification before an
@@ -343,11 +357,18 @@ impl DirectSetPlan {
                 refused.push((set_name, AdmissionRefusal::DuplicateVolume));
                 continue;
             }
-            if volumes
-                .keys()
-                .enumerate()
-                .any(|(position, volume)| position as u32 != *volume)
-            {
+            // A hole in the numbering is a volume the post never carried. With
+            // a recovery set in the job it may still be described there and
+            // rebuilt in place, so the set is admitted with the hole marked;
+            // without one nothing can fill it and the set stays conventional.
+            // A file whose name says nothing may be the missing volume posted
+            // under another name, so then the hole is not known to be one and
+            // the set stays conventional as well.
+            let highest = volumes.keys().next_back().copied().unwrap_or_default();
+            let unposted: BTreeSet<u32> = (0..highest)
+                .filter(|volume| !volumes.contains_key(volume))
+                .collect();
+            if !unposted.is_empty() && (!spec_carries_par2(spec) || spec_has_unnamed_file(spec)) {
                 refused.push((set_name, AdmissionRefusal::VolumeGap));
                 continue;
             }
@@ -361,6 +382,7 @@ impl DirectSetPlan {
                 volumes,
                 files,
                 identity: None,
+                unposted,
                 working_dir: working_dir.to_path_buf(),
                 destination_dir: destination_dir.to_path_buf(),
             });
@@ -383,13 +405,16 @@ impl DirectSetPlan {
     // What a checkpoint records about an identity-admitted plan so a restart
     // can rebuild it exactly. `None` for a name-admitted plan, which the spec
     // rediscovers on its own.
-    // Every volume the set will ever have is bound. Always true for a set its
-    // file names admitted; an identity set is whole once its last expected
-    // volume binds.
+    // Every volume the set will ever have is bound. A set its file names
+    // admitted is whole once every volume the post left out has a file of its
+    // own, which for most sets is from the start; an identity set is whole
+    // once its last expected volume binds.
     pub(crate) fn is_whole(&self) -> bool {
-        self.identity
-            .and_then(|identity| identity.expected_volumes)
-            .is_none_or(|expected| self.volumes.len() as u32 == expected)
+        self.unposted.is_empty()
+            && self
+                .identity
+                .and_then(|identity| identity.expected_volumes)
+                .is_none_or(|expected| self.volumes.len() as u32 == expected)
     }
 
     pub(crate) fn identity_binding(&self) -> Option<super::snapshot::IdentityBinding> {
@@ -511,6 +536,7 @@ impl DirectSetPlan {
                 expected_volumes: binding.expected_volumes,
                 discriminator: binding.discriminator,
             }),
+            unposted: BTreeSet::new(),
             working_dir: working_dir.to_path_buf(),
             destination_dir: destination_dir.to_path_buf(),
         })
@@ -571,8 +597,34 @@ impl DirectSetPlan {
     pub(crate) fn expected_volume_count(&self) -> Option<usize> {
         match self.identity {
             Some(identity) => identity.expected_volumes.map(|count| count as usize),
-            None => Some(self.volumes.len()),
+            None => Some(self.volumes.len() + self.unposted.len()),
         }
+    }
+
+    // Marks a volume of a name-admitted set that no posted file carries. A
+    // no-op for a volume a posted file already holds, and refused for an
+    // identity set, whose roster states its own volumes.
+    pub(crate) fn note_unposted_volume(&mut self, volume_index: u32) -> bool {
+        if self.identity.is_some() {
+            return false;
+        }
+        if !self.volumes.contains_key(&volume_index) {
+            self.unposted.insert(volume_index);
+        }
+        true
+    }
+
+    // Gives an unposted volume the file a recovery-set description reserved
+    // for it. Refused for a volume that is not unposted or a file the set
+    // already maps.
+    pub(crate) fn bind_unposted_volume(&mut self, volume_index: u32, file_index: u32) -> bool {
+        if !self.unposted.contains(&volume_index) || self.files.contains_key(&file_index) {
+            return false;
+        }
+        self.unposted.remove(&volume_index);
+        self.volumes.insert(volume_index, file_index);
+        self.files.insert(file_index, volume_index);
+        true
     }
 
     // Closes an open identity set at `expected` volumes, learned from the

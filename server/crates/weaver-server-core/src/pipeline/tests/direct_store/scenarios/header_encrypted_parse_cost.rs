@@ -38,6 +38,7 @@ fn parse_cost_router(volumes: &[(String, Vec<u8>)]) -> DirectSetRouter {
             .map(|index| (index, index))
             .collect(),
         identity: None,
+        unposted: Default::default(),
         working_dir: std::path::PathBuf::from("/nonexistent"),
         destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     };

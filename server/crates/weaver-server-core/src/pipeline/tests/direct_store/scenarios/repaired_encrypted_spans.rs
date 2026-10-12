@@ -30,6 +30,7 @@ fn encrypted_router(volumes: &[(String, Vec<u8>)], password: &str) -> DirectSetR
             .map(|index| (index, index))
             .collect(),
         identity: None,
+        unposted: Default::default(),
         working_dir: std::path::PathBuf::from("/nonexistent"),
         destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     };
@@ -705,6 +706,7 @@ fn plain_router(volumes: &[(String, Vec<u8>)]) -> DirectSetRouter {
             .map(|index| (index, index))
             .collect(),
         identity: None,
+        unposted: Default::default(),
         working_dir: std::path::PathBuf::from("/nonexistent"),
         destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     })

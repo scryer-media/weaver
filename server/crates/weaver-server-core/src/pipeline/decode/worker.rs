@@ -2440,6 +2440,10 @@ impl Pipeline {
         }
         if prefix_complete {
             self.prove_direct_standalone_fingerprint(file_id);
+            // A posted volume whose name the recovery set does not use binds
+            // only now, by content, and only its binding says how the set's
+            // descriptions number the volumes the post left out.
+            self.bind_unposted_direct_volumes(file_id.job_id);
         }
     }
 

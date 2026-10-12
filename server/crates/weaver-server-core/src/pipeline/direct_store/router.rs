@@ -3473,6 +3473,16 @@ impl DirectSetRouter {
         self.plan.bind_identity_volume(volume_index, file_index)
     }
 
+    // See [`DirectSetPlan::note_unposted_volume`].
+    pub(crate) fn note_unposted_volume(&mut self, volume_index: u32) -> bool {
+        self.plan.note_unposted_volume(volume_index)
+    }
+
+    // See [`DirectSetPlan::bind_unposted_volume`].
+    pub(crate) fn bind_unposted_volume(&mut self, volume_index: u32, file_index: u32) -> bool {
+        self.plan.bind_unposted_volume(volume_index, file_index)
+    }
+
     // Installs the process-wide accountant this set charges its holds to.
     // Applied by the runtime to every set it admits, restore included; what
     // the set had charged elsewhere moves with it.
