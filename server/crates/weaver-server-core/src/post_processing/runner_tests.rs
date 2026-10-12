@@ -75,6 +75,7 @@ fn contract(request: &ScriptExecutionRequest) -> (Vec<String>, BTreeMap<String, 
 
 // The variables that tell a script how its job's download ended, across
 // both adapters.
+#[cfg(unix)]
 pub(crate) const STATUS_ENV: [&str; 9] = [
     "NZBPP_STATUS",
     "NZBPP_TOTALSTATUS",
@@ -89,6 +90,7 @@ pub(crate) const STATUS_ENV: [&str; 9] = [
 
 // What a script of either adapter handed `context` is told about how the
 // job's download ended.
+#[cfg(unix)]
 pub(crate) fn status_env(context: &JobExecutionContext) -> BTreeMap<String, String> {
     let mut status = BTreeMap::new();
     for adapter in [ScriptAdapter::Nzbget, ScriptAdapter::Sabnzbd] {
