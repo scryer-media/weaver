@@ -103,9 +103,13 @@ export function quotaDraft(quota: DownloadQuota | null | undefined): QuotaDraft 
 /** The quota as the API takes it. */
 export function quotaInput(draft: QuotaDraft): DownloadQuota {
   const unitBytes = draft.unit === "TB" ? TIB : GIB;
+  // Text that is not a number, or a number too large to send exactly, is no
+  // allowance at all: a switched-on quota then reports it as missing, and a
+  // switched-off one still saves.
+  const bytes = Math.round(Number(draft.limit || 0) * unitBytes);
   return {
     enabled: draft.quota.enabled,
-    limitBytes: Math.max(0, Math.round(Number(draft.limit || 0) * unitBytes)),
+    limitBytes: Number.isSafeInteger(bytes) ? Math.max(0, bytes) : 0,
     period: draft.quota.period,
     resetTimeMinutesLocal: timeToMinutes(draft.resetTime),
     weeklyResetWeekday: draft.quota.weeklyResetWeekday,
