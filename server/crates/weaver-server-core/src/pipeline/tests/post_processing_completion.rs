@@ -754,3 +754,47 @@ async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_fa
         finished.status
     );
 }
+
+// A job submitted by URL hands its scripts that URL: the terminal pass's
+// context carries what the submission recorded.
+#[tokio::test]
+async fn terminal_post_processing_context_carries_the_submission_url() {
+    use crate::post_processing::model::{PipelineOutcome, PostProcessingFacts};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(10074);
+    let payload = b"url payload".to_vec();
+    let mut spec = standalone_job_spec(
+        "Cobalt Ridge By Url",
+        &[("payload.bin".into(), payload.len() as u32)],
+    );
+    let url = "http://fixture.invalid/by-url.nzb";
+    spec.metadata.push((
+        crate::post_processing::scan::SOURCE_URL_KEY.into(),
+        url.into(),
+    ));
+    let nzb = format!(
+        r#"<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file poster="fixture" date="0" subject="&quot;payload.bin&quot;"><groups><group>alt.binaries.test</group></groups><segments><segment bytes="{}" number="1">segment-0@example.com</segment></segments></file></nzb>"#,
+        payload.len()
+    );
+    insert_active_job_with_persisted_nzb(
+        &mut pipeline,
+        job_id,
+        spec,
+        crate::ingest::compress_nzb_bytes(nzb.as_bytes()).unwrap(),
+    )
+    .await;
+
+    let context = pipeline
+        .terminal_post_processing_context(
+            job_id,
+            &PostProcessingFacts {
+                outcome: PipelineOutcome::Succeeded,
+                par_status: 0,
+                unpack_status: 0,
+            },
+        )
+        .unwrap();
+    assert_eq!(context.source_url.as_deref(), Some(url));
+}
