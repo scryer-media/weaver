@@ -1645,6 +1645,8 @@ export const nextJa: LocaleDictionary = {
   "next.networking.problem.rungCount": "プロキシラダーには1～8段が必要です。",
   "next.networking.problem.rungTarget": "すべての段にプロキシかプールを選んでください。",
   "next.networking.problem.chain": "チェーンには異なるプロキシが2～3個必要です。",
+  "next.networking.problem.egressDisabled": "このルートは無効な送信を使っています。",
+  "next.networking.problem.proxyRepeated": "プロキシラダーでは各プロキシを一度しか使えません。",
   "next.networking.overview.egresses": "送信インターフェース",
   "next.networking.overview.egressesUp": "{{count}} 稼働中",
   "next.networking.overview.proxies": "プロキシプロファイル",

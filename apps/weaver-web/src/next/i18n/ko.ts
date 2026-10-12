@@ -1645,6 +1645,8 @@ export const nextKo: LocaleDictionary = {
   "next.networking.problem.rungCount": "프록시 사다리에는 단계가 1개에서 8개 필요합니다.",
   "next.networking.problem.rungTarget": "모든 단계에 프록시 또는 풀을 선택하세요.",
   "next.networking.problem.chain": "체인에는 서로 다른 프록시가 2개 또는 3개 필요합니다.",
+  "next.networking.problem.egressDisabled": "이 경로는 비활성화된 송신를 사용합니다.",
+  "next.networking.problem.proxyRepeated": "프록시 사다리는 각 프록시를 한 번만 사용할 수 있습니다.",
   "next.networking.overview.egresses": "송신 인터페이스",
   "next.networking.overview.egressesUp": "{{count}}개 정상",
   "next.networking.overview.proxies": "프록시 프로필",

@@ -1645,6 +1645,8 @@ export const nextFr: LocaleDictionary = {
   "next.networking.problem.rungCount": "Une échelle de proxys nécessite un à huit échelons.",
   "next.networking.problem.rungTarget": "Choisissez un proxy ou un pool pour chaque échelon.",
   "next.networking.problem.chain": "Une chaîne nécessite deux ou trois proxys différents.",
+  "next.networking.problem.egressDisabled": "Cette route utilise une sortie désactivée.",
+  "next.networking.problem.proxyRepeated": "Une échelle ne peut utiliser chaque proxy qu'une fois.",
   "next.networking.overview.egresses": "Interfaces de sortie",
   "next.networking.overview.egressesUp": "{{count}} actives",
   "next.networking.overview.proxies": "Profils de proxy",

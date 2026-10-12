@@ -1645,6 +1645,8 @@ export const nextZh: LocaleDictionary = {
   "next.networking.problem.rungCount": "代理阶梯需要 1 到 8 级。",
   "next.networking.problem.rungTarget": "请为每一级选择代理或代理池。",
   "next.networking.problem.chain": "链需要两到三个不同的代理。",
+  "next.networking.problem.egressDisabled": "此路由使用了已停用的出口。",
+  "next.networking.problem.proxyRepeated": "一个阶梯中每个代理只能使用一次。",
   "next.networking.overview.egresses": "出口接口",
   "next.networking.overview.egressesUp": "{{count}} 个正常",
   "next.networking.overview.proxies": "代理配置",

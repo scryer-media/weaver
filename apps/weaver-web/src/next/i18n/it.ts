@@ -1645,6 +1645,8 @@ export const nextIt: LocaleDictionary = {
   "next.networking.problem.rungCount": "Una scala di proxy richiede da uno a otto gradini.",
   "next.networking.problem.rungTarget": "Scegli un proxy o un pool per ogni gradino.",
   "next.networking.problem.chain": "Una catena richiede due o tre proxy diversi.",
+  "next.networking.problem.egressDisabled": "Questo percorso usa un'uscita disattivata.",
+  "next.networking.problem.proxyRepeated": "Una scala può usare ogni proxy una sola volta.",
   "next.networking.overview.egresses": "Interfacce di uscita",
   "next.networking.overview.egressesUp": "{{count}} attive",
   "next.networking.overview.proxies": "Profili proxy",

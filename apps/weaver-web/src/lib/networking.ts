@@ -25,8 +25,14 @@ export function routeInput(route: NetworkRoute) {
   })) };
 }
 /** Why a route cannot be saved, as a code the interface words for itself. */
-export type RouteProblem = "legCount" | "weights" | "rungCount" | "rungTarget" | "chain";
-export function routeProblem(route: NetworkRoute): RouteProblem | null {
+export type RouteProblem = "legCount" | "weights" | "rungCount" | "rungTarget" | "chain" | "egressDisabled" | "proxyRepeated";
+/** The proxies a rung uses, a pool's members included. */
+export function rungProxyIds(rung: Rung, pools: ProxyPool[]): number[] {
+  if (rung.kind === "PROXY") return rung.proxyId === null ? [] : [rung.proxyId];
+  if (rung.kind === "POOL") return pools.find(pool => pool.id === rung.poolId)?.memberIds ?? [];
+  return rung.chainIds;
+}
+export function routeProblem(route: NetworkRoute, known: { egresses?: Egress[]; pools?: ProxyPool[] } = {}): RouteProblem | null {
   if (!route.legs.length || route.legs.length > 8) return "legCount";
   if (route.legs.some(l => !Number.isInteger(l.weight) || l.weight < 1 || l.weight > 100) || route.legs.reduce((sum,l) => sum+l.weight,0) !== 100) return "weights";
   for (const leg of route.legs) {
@@ -36,7 +42,10 @@ export function routeProblem(route: NetworkRoute): RouteProblem | null {
       if (rung.kind === "PROXY" && !rung.proxyId || rung.kind === "POOL" && !rung.poolId) return "rungTarget";
       if (rung.kind === "CHAIN" && (rung.chainIds.length < 2 || rung.chainIds.length > 3 || new Set(rung.chainIds).size !== rung.chainIds.length)) return "chain";
     }
+    const used = leg.path.rungs.flatMap(rung => rungProxyIds(rung, known.pools ?? []));
+    if (new Set(used).size !== used.length) return "proxyRepeated";
   }
+  if (route.legs.some(leg => known.egresses?.find(egress => egress.id === leg.egressId)?.enabled === false)) return "egressDisabled";
   return null;
 }
 export function allocation(weights: number[], cap: number): number[] {

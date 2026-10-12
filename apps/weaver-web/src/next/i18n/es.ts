@@ -1645,6 +1645,8 @@ export const nextEs: LocaleDictionary = {
   "next.networking.problem.rungCount": "Una escalera de proxies necesita de uno a ocho escalones.",
   "next.networking.problem.rungTarget": "Elige un proxy o grupo para cada escalón.",
   "next.networking.problem.chain": "Una cadena necesita dos o tres proxies distintos.",
+  "next.networking.problem.egressDisabled": "Esta ruta usa una salida desactivada.",
+  "next.networking.problem.proxyRepeated": "Una escalera solo puede usar cada proxy una vez.",
   "next.networking.overview.egresses": "Interfaces de salida",
   "next.networking.overview.egressesUp": "{{count}} activas",
   "next.networking.overview.proxies": "Perfiles de proxy",

@@ -1653,6 +1653,8 @@ export const nextEn: LocaleDictionary = {
   "next.networking.problem.rungCount": "A proxy ladder needs one to eight rungs.",
   "next.networking.problem.rungTarget": "Choose a proxy or pool for every rung.",
   "next.networking.problem.chain": "A chain needs two or three different proxies.",
+  "next.networking.problem.egressDisabled": "This route uses a disabled egress.",
+  "next.networking.problem.proxyRepeated": "A ladder can use each proxy only once.",
   "next.networking.overview.egresses": "Egress interfaces",
   "next.networking.overview.egressesUp": "{{count}} up",
   "next.networking.overview.proxies": "Proxy profiles",

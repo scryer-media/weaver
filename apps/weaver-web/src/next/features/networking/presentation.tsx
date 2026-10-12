@@ -120,6 +120,10 @@ export function routeProblemText(t: Translate, problem: RouteProblem): string {
       return t("next.networking.problem.rungTarget");
     case "chain":
       return t("next.networking.problem.chain");
+    case "egressDisabled":
+      return t("next.networking.problem.egressDisabled");
+    case "proxyRepeated":
+      return t("next.networking.problem.proxyRepeated");
   }
 }
 

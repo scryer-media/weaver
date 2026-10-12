@@ -6,6 +6,7 @@ import {
   removeLeg,
   routeProblem,
   routeTargets,
+  rungProxyIds,
   type Egress,
   type Leg,
   type LegFlow,
@@ -76,7 +77,7 @@ export function RouteEditor({
   const targets = routeTargets(value, cap, down);
   const assigned = targets.reduce((sum, target) => sum + target, 0);
   const weight = (index: number, next: number) => onChange({ ...value, legs: adjustWeight(value.legs, index, next) });
-  const problem = routeProblem(value);
+  const problem = routeProblem(value, { egresses, pools });
   const reorder = (legs: Leg[]) => {
     setDown(new Set());
     onChange({ ...value, legs });
@@ -84,18 +85,19 @@ export function RouteEditor({
   /** What the ladder's other rungs leave a chain on rung `own`: a ladder uses a proxy once. */
   const chainLimits = (rungs: Rung[], own: number): ChainLimits => ({
     needsDns: rss,
-    taken: new Set(
-      rungs.flatMap((rung, position) =>
-        position === own
-          ? []
-          : rung.kind === "PROXY"
-            ? (rung.proxyId === null ? [] : [rung.proxyId])
-            : rung.kind === "POOL"
-              ? (pools.find((pool) => pool.id === rung.poolId)?.memberIds ?? [])
-              : rung.chainIds,
-      ),
-    ),
+    taken: new Set(rungs.flatMap((rung, position) => (position === own ? [] : rungProxyIds(rung, pools)))),
   });
+  /** A feed resolves names through its proxies, so each one it uses needs DNS servers. */
+  const resolves = (id: number) => !rss || !!profiles.find((profile) => profile.id === id)?.dnsServers?.length;
+  /** What rung `own` may target besides its current choice: the daemon refuses a repeat or, for a feed, a proxy without DNS. */
+  const rungTargets = (rungs: Rung[], own: number) => {
+    const rung = rungs[own]!;
+    const { taken } = chainLimits(rungs, own);
+    const usable = (ids: number[]) => ids.every((id) => !taken?.has(id) && resolves(id));
+    return rung.kind === "PROXY"
+      ? profiles.filter((profile) => profile.id === rung.proxyId || usable([profile.id]))
+      : pools.filter((pool) => pool.id === rung.poolId || usable(pool.memberIds));
+  };
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
@@ -179,10 +181,12 @@ export function RouteEditor({
                   value={String(leg.egressId)}
                   onChange={(next) => update(index, { ...leg, egressId: Number(next) })}
                   className="w-full min-w-0"
-                  options={egresses.map((egress) => ({
-                    value: String(egress.id),
-                    label: egress.enabled ? egress.name : `${egress.name} · ${t("next.networking.disabled")}`,
-                  }))}
+                  options={egresses
+                    .filter((egress) => egress.enabled || egress.id === leg.egressId)
+                    .map((egress) => ({
+                      value: String(egress.id),
+                      label: egress.enabled ? egress.name : `${egress.name} · ${t("next.networking.disabled")}`,
+                    }))}
                 />
               </ControlLabel>
               <ControlLabel label={t("next.networking.route.weight")}>
@@ -307,7 +311,7 @@ export function RouteEditor({
                                 value: "",
                                 label: rung.kind === "PROXY" ? t("next.networking.route.chooseProxy") : t("next.networking.route.choosePool"),
                               },
-                              ...(rung.kind === "PROXY" ? profiles : pools).map((target) => ({
+                              ...rungTargets(path.rungs, rungIndex).map((target) => ({
                                 value: String(target.id),
                                 label: target.enabled ? target.name : `${target.name} · ${t("next.networking.disabled")}`,
                               })),
