@@ -100,18 +100,24 @@ pub fn build_job_support_report(
     environment: &ReportEnvironment,
     now_epoch_secs: u64,
 ) -> Result<SupportReport, SupportReportError> {
-    let (job, stored) = match live {
-        Some(info) => {
-            let stored = db.load_active_job_persisted_nzb(JobId(job_id))?;
-            (JobSection::from_live(&info), stored)
-        }
-        None => {
-            let row = db
-                .get_job_history(job_id)?
-                .ok_or(SupportReportError::NotFound(job_id))?;
-            let stored = db.load_history_job_persisted_nzb(job_id)?;
-            (JobSection::from_history(&row), stored)
-        }
+    // The scheduler also answers for finished jobs it still caches, whose
+    // NZB has moved to history; only an active row makes the job live here.
+    let active = match &live {
+        Some(_) => db.load_active_job_persisted_nzb(JobId(job_id))?,
+        None => None,
+    };
+    let (job, stored) = match (live, active) {
+        (Some(info), Some(stored)) => (JobSection::from_live(&info), Some(stored)),
+        (live, _) => match db.get_job_history(job_id)? {
+            Some(row) => {
+                let stored = db.load_history_job_persisted_nzb(job_id)?;
+                (JobSection::from_history(&row), stored)
+            }
+            None => match live {
+                Some(info) => (JobSection::from_live(&info), None),
+                None => return Err(SupportReportError::NotFound(job_id)),
+            },
+        },
     };
     let mut job = job;
     job.apply_events(&db.get_job_events(job_id)?);
