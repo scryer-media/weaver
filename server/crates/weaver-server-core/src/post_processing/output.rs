@@ -1223,6 +1223,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_an_instance_keeps_its_runs() {
+        let db = Database::open_in_memory().unwrap();
+        let instance = db
+            .create_script_instance(super::super::instances::ScriptInstanceDraft::new(
+                ScriptName::new("test.sh").unwrap(),
+                super::super::instances::InstanceTrigger::PostProcessing,
+            ))
+            .unwrap();
+        retain_output(
+            db.clone(),
+            None,
+            ScriptResult {
+                instance_id: Some(instance.id.clone()),
+                ..result(ScriptEventLabel::Scan)
+            },
+            b"kept".to_vec(),
+            EventScriptSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert!(db.delete_script_instance(&instance.id).unwrap());
+
+        let runs = db.script_runs(Default::default(), None, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            db.script_output(&runs[0].id).unwrap().as_deref(),
+            Some("kept")
+        );
+        let datastore = db.datastore();
+        let id = runs[0].id.clone();
+        let instance_id = db
+            .run_sql_blocking_read(async move {
+                SqlRuntime::fetch_optional(
+                    datastore.read_exec(),
+                    "SELECT instance_id FROM script_outputs WHERE id = {}",
+                    &[SqlArg::Text(id)],
+                )
+                .await?
+                .unwrap()
+                .opt_text("instance_id")
+            })
+            .unwrap();
+        assert_eq!(instance_id, None);
+    }
+
+    #[tokio::test]
     async fn runs_are_listed_latest_first_whatever_started_them() {
         let db = Database::open_in_memory().unwrap();
         feed(&db, 9);
