@@ -976,7 +976,7 @@ test("PP13 the web app's script documents run against the live schema", async ({
 
 const CONCURRENCY_STATE = "pp14-concurrency";
 
-test("PP14 concurrent scripts default to four and a lowered limit applies after a restart @restart", async ({ request }) => {
+test("PP14 concurrent scripts default to 32 and a lowered limit applies after a restart @restart", async ({ request }) => {
   const restarted = stage() !== "initial";
   const { tag } = restarted ? loadStageState<{ tag: string }>(CONCURRENCY_STATE) : { tag: `pp14-${token()}` };
   const runTag = `${tag}-${stage()}`;
@@ -985,7 +985,7 @@ test("PP14 concurrent scripts default to four and a lowered limit applies after 
   const jobs: number[] = [];
   try {
     if (!restarted) {
-      expect((await scriptSettings(request)).concurrency).toBe(4);
+      expect((await scriptSettings(request)).concurrency).toBe(32);
       jobs.push(await job(request, `${runTag}-a`), await job(request, `${runTag}-b`));
       await expect.poll(() => jobs.every(jobId => gateWaiting(gated, jobId)), { message: "both jobs' scripts run at once", timeout: 0 }).toBe(true);
       for (const jobId of jobs) await releaseGate(gated, jobId);
@@ -1009,7 +1009,7 @@ test("PP14 concurrent scripts default to four and a lowered limit applies after 
     for (const jobId of jobs) if (gateWaiting(gated, jobId)) await releaseGate(gated, jobId);
     await restore();
     if (restarted) {
-      await setScriptSettings(request, { concurrency: 4 });
+      await setScriptSettings(request, { concurrency: 32 });
       removeFixtureScripts([gated]);
     } else {
       // Applies at the next start-up, which is the restarted stage.

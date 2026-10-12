@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "./helpers";
@@ -110,9 +110,15 @@ test("archive passwords and the password file save, clear and persist without ec
   }
 
   await expect(clear).toHaveCount(0);
+  writeFileSync("/weaver-data/e2e-archive-passwords.txt", "fixture-password\n", { mode: 0o644 });
   await list.fill("first-secret\nsecond-secret");
-  await file.fill(passwordFile);
-  await file.press("Tab");
+  await file.click();
+  const picker = page.getByRole("dialog", { name: "Password file", exact: true });
+  await expect(picker).toBeVisible();
+  await picker.getByRole("button", { name: "e2e-archive-passwords.txt", exact: true }).click();
+  await picker.getByRole("button", { name: "Use this file", exact: true }).click();
+  await expect(picker).toBeHidden();
+  await expect(file).toHaveValue(passwordFile);
   await saveSettings(page);
   await page.reload();
   await expect(clear).toBeVisible();
