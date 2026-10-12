@@ -265,7 +265,7 @@ func TestClockWhileStoppedMatchesTheSpecHelper(t *testing.T) {
 func TestTwoNICConfigRequiresConfirmationAndEnvironment(t *testing.T) {
 	values := map[string]string{
 		"E2E_TWO_NIC_REMOTE":         "user@192.0.2.10",
-		"E2E_TWO_NIC_REMOTE_E2E_DIR": "/home/user/weaver/e2e",
+		"E2E_TWO_NIC_REMOTE_E2E_DIR": "/srv/weaver/e2e",
 		"E2E_TWO_NIC_STACK_HOST":     "192.0.2.10",
 		"E2E_TWO_NIC_EGRESSES":       "wifi=interface:en0,lan=interface:en7,src=source:192.0.2.20",
 		"E2E_TWO_NIC_CAPTURE_IFACES": "en0,en7",
