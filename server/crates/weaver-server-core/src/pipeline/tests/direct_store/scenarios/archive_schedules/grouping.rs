@@ -1121,15 +1121,31 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                         .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
                 {
                     // A lost identity prefix can prevent binding before enough
-                    // header evidence survives to prove the swapped chain.
-                    route.shape_demotion = |reason| {
-                        matches!(
-                            reason,
-                            DemotionReason::Par2Unbindable
-                                | DemotionReason::MemberIneligible(
-                                    MemberIneligibility::MalformedChain
-                                )
-                        )
+                    // header evidence survives to prove the swapped chain. Solid
+                    // members can be refused before that binding is attempted.
+                    route.shape_demotion = if cell.container.is_solid_rar() {
+                        |reason| {
+                            matches!(
+                                reason,
+                                DemotionReason::Par2Unbindable
+                                    | DemotionReason::MemberIneligible(
+                                        MemberIneligibility::Compressed
+                                            | MemberIneligibility::Solid
+                                            | MemberIneligibility::Encrypted
+                                            | MemberIneligibility::MalformedChain
+                                    )
+                            )
+                        }
+                    } else {
+                        |reason| {
+                            matches!(
+                                reason,
+                                DemotionReason::Par2Unbindable
+                                    | DemotionReason::MemberIneligible(
+                                        MemberIneligibility::MalformedChain
+                                    )
+                            )
+                        }
                     };
                 }
                 if cell.naming == Naming::HexSwappedRar
@@ -1160,7 +1176,22 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                     // These posted names admit a RAR set but differ from the real
                     // PAR2 names. Without its content prefix a volume cannot be
                     // bound safely; repair must use materialized source files.
-                    route.shape_demotion = |reason| reason == DemotionReason::Par2Unbindable;
+                    // Solid members may already have refused direct admission.
+                    route.shape_demotion = if cell.container.is_solid_rar() {
+                        |reason| {
+                            matches!(
+                                reason,
+                                DemotionReason::Par2Unbindable
+                                    | DemotionReason::MemberIneligible(
+                                        MemberIneligibility::Compressed
+                                            | MemberIneligibility::Solid
+                                            | MemberIneligibility::Encrypted
+                                    )
+                            )
+                        }
+                    } else {
+                        |reason| reason == DemotionReason::Par2Unbindable
+                    };
                 }
                 // A volume the post never carried is held to the route of the
                 // same volume posted and then lost whole: the set rebuilds it in
