@@ -1421,7 +1421,9 @@ impl Pipeline {
         };
         let mut file =
             crate::jobs::assembly::FileAssembly::repair_output(file_id, filename.to_owned());
-        file.mark_complete();
+        // The adopted file has no segments, so plain completion would record a
+        // zero length; the verified image on disk is its decoded length.
+        file.mark_complete_decoded(metadata.len());
         self.jobs
             .get_mut(&job_id)
             .ok_or("missing repair job")?

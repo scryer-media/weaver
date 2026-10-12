@@ -669,6 +669,15 @@ impl Pipeline {
         if paths.is_empty() {
             return;
         }
+        // A part the recovery set wrote has no download to overlap: the set is
+        // already whole on disk, so conventional extraction owns it. Arming a
+        // chase here would read the rebuilt part as an unfinished download.
+        if paths
+            .iter()
+            .any(|path| self.direct_unpack_part_is_rebuilt(job_id, path))
+        {
+            return;
+        }
         let is_split = self
             .jobs
             .get(&job_id)
@@ -1817,6 +1826,25 @@ impl Pipeline {
             return self.direct_unpack_rebuilt_part_len(job_id, path);
         };
         file.is_complete().then(|| file.received_bytes())
+    }
+
+    // Whether a part was written by the recovery set rather than downloaded:
+    // either an adopted repair-output file holds its name, or the unposted
+    // recovery outputs list it.
+    fn direct_unpack_part_is_rebuilt(&self, job_id: JobId, path: &std::path::Path) -> bool {
+        let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let adopted = self.jobs.get(&job_id).is_some_and(|state| {
+            state.assembly.files().any(|file| {
+                file.is_repair_output() && self.current_filename_for_file(job_id, file) == filename
+            })
+        });
+        adopted
+            || self
+                .recovery_unposted_outputs
+                .get(&job_id)
+                .is_some_and(|unposted| unposted.outputs.contains(filename))
     }
 
     // The length of a part no posted file owns: one the recovery set wrote
