@@ -851,13 +851,28 @@ impl Pipeline {
                     {
                         let effective_excludes =
                             self.effective_exclude_servers(job_id, &excluded_servers);
-                        let selection = self
+                        let mut selection = self
                             .nntp
                             .body_server_selection_with_estimate(
                                 &effective_excludes,
                                 rejection.requested_body_bytes,
                             )
                             .await;
+                        if egress_rejection.is_some()
+                            && let Some(runtime) = self.shared_state.proxy_runtime()
+                        {
+                            // A server whose every route leg is out of quota
+                            // cannot dial; retrying it would only queue work
+                            // no lane can take.
+                            let pool = self.nntp.pool();
+                            selection.eligible.retain(|server| {
+                                pool.stable_server_id(*server).is_none_or(|stable| {
+                                    runtime.network.has_leg_in_quota(
+                                        crate::proxies::Consumer::Server(stable.0),
+                                    )
+                                })
+                            });
+                        }
                         if selection.eligible.is_empty() {
                             if let Some(current) = selection.quota_blocked {
                                 retry_after = current.retry_at.map(|deadline| {

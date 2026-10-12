@@ -315,6 +315,22 @@ impl NetworkRuntime {
             .map(|snapshot| snapshot.stable_server_id.0)
             .collect()
     }
+    // Whether `consumer`'s route still has a leg on an egress whose download
+    // quota has room. A route whose every leg is out of quota cannot dial
+    // anything until a quota resets.
+    pub fn has_leg_in_quota(&self, consumer: Consumer) -> bool {
+        let quota_blocked = self.quota_blocked_egresses();
+        let config = self.configuration.read().expect("network configuration");
+        config
+            .policies
+            .get(&consumer.key())
+            .cloned()
+            .unwrap_or_default()
+            .route()
+            .legs
+            .iter()
+            .any(|leg| !quota_blocked.contains(&leg.egress_id))
+    }
     // The live download-quota usage of one egress, when this runtime
     // enforces download policies.
     pub fn egress_quota_usage(

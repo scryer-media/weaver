@@ -3990,3 +3990,135 @@ async fn article_not_found_that_learns_no_new_server_books_instead_of_retrying()
     );
     assert_eq!(pipeline.pending_retries_by_job.get(&job_id).copied(), None);
 }
+
+// A server reachable only through an egress whose quota is spent cannot dial,
+// so the work parks on that egress and the block names it, instead of being
+// retried at once onto a route that has no leg left to carry it.
+#[tokio::test]
+async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(21002);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Egress Quota Park", "egress-park.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+    pipeline.active_downloads = 1;
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+
+    let db = Database::open_in_memory().unwrap();
+    let mut system = db
+        .list_egress_interfaces()
+        .unwrap()
+        .into_iter()
+        .find(|egress| egress.id == crate::proxies::SYSTEM_EGRESS_ID)
+        .expect("the system egress is seeded");
+    system.download_quota = crate::servers::ServerDownloadQuotaConfig {
+        enabled: true,
+        limit_bytes: 128,
+        period: crate::servers::ServerDownloadQuotaPeriod::OneTime,
+        ..Default::default()
+    };
+    db.update_egress_interface(&system).unwrap();
+    let policy = std::sync::Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(db.clone(), &[])
+            .unwrap(),
+    );
+    let runtime = crate::proxies::ProxyRuntime::with_quota_policy(
+        db,
+        tokio::runtime::Handle::current(),
+        Some(policy.clone()),
+    )
+    .unwrap();
+    let (commands, _) = tokio::sync::mpsc::channel(1);
+    let (events, _) = tokio::sync::broadcast::channel(1);
+    let handle = crate::SchedulerHandle::new(commands, events, pipeline.shared_state.clone());
+    handle.set_proxy_runtime(runtime.clone());
+    pipeline.shared_state.set_server_transfer_policy(policy);
+
+    // The system egress spends its whole allowance, and the next body is
+    // turned away.
+    let egress = runtime
+        .network
+        .egress_controls
+        .control(weaver_nntp::transfer::StableServerId(
+            crate::proxies::SYSTEM_EGRESS_ID,
+        ));
+    let mut permit = egress.try_reserve(128).unwrap();
+    permit.record_blocking(128);
+    permit.finish();
+    let rejection = egress
+        .try_reserve(1)
+        .err()
+        .expect("the spent egress must refuse the next body");
+    assert_eq!(
+        rejection.scope,
+        weaver_nntp::transfer::TransferScope::Egress
+    );
+
+    // The only server takes the default route, whose one leg is that egress.
+    pipeline.nntp = std::sync::Arc::new(NntpClient::new(NntpClientConfig {
+        servers: vec![weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: "egress-park.example.com".to_string(),
+                ..Default::default()
+            },
+            stable_id: weaver_nntp::transfer::StableServerId(17),
+            transfer_control: None,
+            max_connections: 1,
+            group: 0,
+            backfill: false,
+            retention_days: 0,
+        }],
+        max_idle_age: Duration::from_secs(1),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    }));
+    let failure = DownloadFailure::from_lane_acquire_failure(Some(
+        &weaver_nntp::NntpError::quota_blocked(rejection),
+    ));
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id,
+            runtime_generation: 0,
+            segment_id,
+            data: Err(DownloadError::Fetch(failure)),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+            release_connection_slot: false,
+        })
+        .await;
+
+    assert_eq!(
+        pipeline.egress_quota_parked.get(&segment_id),
+        Some(&crate::proxies::SYSTEM_EGRESS_ID)
+    );
+    let block = pipeline.shared_state.download_block();
+    assert_eq!(
+        block.kind,
+        crate::jobs::handle::DownloadBlockKind::EgressQuota
+    );
+    assert_eq!(block.egress_id, Some(crate::proxies::SYSTEM_EGRESS_ID));
+    assert_eq!(block.used_bytes, 128);
+
+    pipeline.jobs.remove(&job_id);
+    pipeline.shared_state.publish_jobs(Vec::new());
+    runtime.network.shutdown().await;
+}
