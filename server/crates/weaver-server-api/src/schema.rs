@@ -17,7 +17,7 @@ use crate::categories::types::Category;
 use crate::history::timeline::build_job_timeline;
 use crate::history::types::history_item_from_row;
 use crate::history::types::{
-    EventKind, HistoryCategoryCount, HistoryItem, HistoryPage, HistoryPageCounts, HistoryPageInput,
+    HistoryCategoryCount, HistoryItem, HistoryPage, HistoryPageCounts, HistoryPageInput,
     HistorySortDirection, HistorySortField, HistoryStatusFilter, JobDetailSnapshot, JobEvent,
     JobTimeline,
 };

@@ -242,13 +242,7 @@ impl HistoryQuery {
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(events
             .into_iter()
-            .map(|e| JobEvent {
-                kind: e.kind.parse::<EventKind>().unwrap_or(EventKind::JobCreated),
-                job_id: e.job_id,
-                file_id: e.file_id,
-                message: e.message,
-                timestamp: e.timestamp as f64,
-            })
+            .filter_map(crate::history::types::job_event_from_core)
             .collect())
     }
 }
@@ -348,16 +342,7 @@ pub(crate) async fn load_job_detail_snapshot(
         .map(|job| build_job_timeline(&job, history.as_ref(), &events));
     let job_events = events
         .into_iter()
-        .map(|event| JobEvent {
-            kind: event
-                .kind
-                .parse::<EventKind>()
-                .unwrap_or(EventKind::JobCreated),
-            job_id: event.job_id,
-            file_id: event.file_id,
-            message: event.message,
-            timestamp: event.timestamp as f64,
-        })
+        .filter_map(crate::history::types::job_event_from_core)
         .collect();
 
     let elapsed = snapshot_started.elapsed();
