@@ -1135,3 +1135,52 @@ async fn stacking_on_a_wireguard_session_preserves_its_capacity_and_identity() {
         runtime.shutdown().await;
     }
 }
+
+// Two even legs sharing one connection: HOLD keeps the out-of-quota leg's
+// share, so the leg with quota is left with none; REDISTRIBUTE hands it on.
+#[test]
+fn a_held_share_on_an_out_of_quota_leg_leaves_no_leg_in_quota() {
+    let route = |failover| Route {
+        legs: [1, 2]
+            .into_iter()
+            .map(|egress_id| RouteLeg {
+                egress_id,
+                weight: 50,
+                path: LegPath::Direct,
+            })
+            .collect(),
+        failover,
+    };
+    let first_blocked = HashSet::from([1]);
+    let second_blocked = HashSet::from([2]);
+    assert!(!route_has_leg_in_quota(
+        &route(Failover::Hold),
+        Some(1),
+        &first_blocked
+    ));
+    assert!(route_has_leg_in_quota(
+        &route(Failover::Hold),
+        Some(1),
+        &second_blocked
+    ));
+    assert!(route_has_leg_in_quota(
+        &route(Failover::Hold),
+        Some(2),
+        &first_blocked
+    ));
+    assert!(route_has_leg_in_quota(
+        &route(Failover::Redistribute),
+        Some(1),
+        &first_blocked
+    ));
+    assert!(route_has_leg_in_quota(
+        &route(Failover::Hold),
+        None,
+        &first_blocked
+    ));
+    assert!(!route_has_leg_in_quota(
+        &route(Failover::Redistribute),
+        Some(4),
+        &HashSet::from([1, 2])
+    ));
+}

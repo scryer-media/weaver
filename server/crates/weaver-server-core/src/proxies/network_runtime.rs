@@ -315,21 +315,25 @@ impl NetworkRuntime {
             .map(|snapshot| snapshot.stable_server_id.0)
             .collect()
     }
-    // Whether `consumer`'s route still has a leg on an egress whose download
-    // quota has room. A route whose every leg is out of quota cannot dial
-    // anything until a quota resets.
+    // Whether `consumer`'s route still gives connections to a leg on an
+    // egress whose download quota has room. A route that gives none cannot
+    // dial anything until a quota resets.
     pub fn has_leg_in_quota(&self, consumer: Consumer) -> bool {
         let quota_blocked = self.quota_blocked_egresses();
         let config = self.configuration.read().expect("network configuration");
-        config
+        let route = config
             .policies
             .get(&consumer.key())
             .cloned()
             .unwrap_or_default()
-            .route()
-            .legs
-            .iter()
-            .any(|leg| !quota_blocked.contains(&leg.egress_id))
+            .route();
+        let cap = self
+            .routes
+            .lock()
+            .expect("network routes")
+            .get(&consumer.key())
+            .map(|live| live.cap.load(std::sync::atomic::Ordering::Acquire));
+        route_has_leg_in_quota(&route, cap, &quota_blocked)
     }
     // The live download-quota usage of one egress, when this runtime
     // enforces download policies.
@@ -1213,6 +1217,29 @@ fn configure_egress_rates(
                 quota: None,
             },
         );
+    }
+}
+
+// A leg counts only while its egress has quota left and the route still
+// allocates it connections. HOLD keeps an out-of-quota leg's share parked
+// instead of handing it on, so with a small cap the legs that have quota
+// can be left with none. Without a live route there is no cap to allocate,
+// and any leg with quota counts.
+fn route_has_leg_in_quota(route: &Route, cap: Option<u16>, quota_blocked: &HashSet<u32>) -> bool {
+    let in_quota: Vec<bool> = route
+        .legs
+        .iter()
+        .map(|leg| !quota_blocked.contains(&leg.egress_id))
+        .collect();
+    let Some(cap) = cap else {
+        return in_quota.contains(&true);
+    };
+    match route.targets(cap, &in_quota) {
+        Ok(targets) => targets
+            .iter()
+            .zip(&in_quota)
+            .any(|(target, in_quota)| *in_quota && *target > 0),
+        Err(_) => in_quota.contains(&true),
     }
 }
 
