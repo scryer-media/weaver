@@ -1346,6 +1346,20 @@ async fn reposted_rar_recovers_both_articles_of_one_copy() {
 }
 
 #[tokio::test]
+async fn repaired_solid_sevenz_preserves_missing_part_diagnostic() {
+    run_cell(
+        Cell {
+            container: Container::SevenZipSolid,
+            naming: Naming::HexNumberedGap,
+            binding: Binding::Par2RealFirst,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(242, schedules().into_iter().nth(242).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn repaired_misnumbered_sevenz_updates_topology() {
     run_cell(
         Cell {
