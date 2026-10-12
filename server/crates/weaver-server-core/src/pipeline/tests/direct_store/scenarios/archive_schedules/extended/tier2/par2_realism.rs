@@ -464,56 +464,72 @@ impl Cell for Par2Cell {
     }
 }
 
+#[tokio::test]
+async fn repaired_encrypted_restart_finishes_member_edges() {
+    run_cell(
+        Par2Cell {
+            slice: 5240,
+            redundancy: Redundancy::Ten,
+            margin: Margin::With,
+            band: Band::Hundreds,
+            alignment: Alignment::Aligned,
+            pattern: Pattern::MemberAbsent,
+            structure: Structure::Plain,
+            container: Container::Rar5EncryptedHeaders,
+            creator: 2,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(
+            941437,
+            (
+                vec![(0, 0), (0, 1), (0, 1)],
+                Interruption::Combined {
+                    mask: 12,
+                    index_first: false,
+                    action: BoundaryAction::Restart,
+                    at: 1,
+                },
+            ),
+        )],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn index_absent_restart_fetches_remaining_recovery() {
+    run_cell(
+        Par2Cell {
+            slice: 5240,
+            redundancy: Redundancy::Ten,
+            margin: Margin::With,
+            band: Band::Hundreds,
+            alignment: Alignment::Aligned,
+            pattern: Pattern::MemberAbsent,
+            structure: Structure::IndexAbsent,
+            container: Container::SevenZip,
+            creator: 2,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(
+            941713,
+            (
+                vec![(0, 0), (0, 1), (0, 1)],
+                Interruption::Combined {
+                    mask: 12,
+                    index_first: false,
+                    action: BoundaryAction::Restart,
+                    at: 3,
+                },
+            ),
+        )],
+    )
+    .await;
+}
+
 macro_rules! par2_smokes {
     ($($name:ident $slice:literal $redundancy:ident $margin:ident $band:ident $alignment:ident $pattern:ident $structure:ident $container:ident;)+) => {
-        mod par2_realism_smoke {
+        mod combined_par2_realism_smoke {
             use super::*;
-            #[tokio::test]
-            async fn repaired_encrypted_restart_finishes_member_edges() {
-                run_cell(
-                    Par2Cell {
-                        slice: 5240,
-                        redundancy: Redundancy::Ten,
-                        margin: Margin::With,
-                        band: Band::Hundreds,
-                        alignment: Alignment::Aligned,
-                        pattern: Pattern::MemberAbsent,
-                        structure: Structure::Plain,
-                        container: Container::Rar5EncryptedHeaders,
-                        creator: 2,
-                    },
-                    ExtractionProfile::DirectStore,
-                    vec![(941437, (vec![(0, 0), (0, 1), (0, 1)], Interruption::Combined {
-                        mask: 12,
-                        index_first: false,
-                        action: BoundaryAction::Restart,
-                        at: 1,
-                    }))],
-                ).await;
-            }
-            #[tokio::test]
-            async fn index_absent_restart_fetches_remaining_recovery() {
-                run_cell(
-                    Par2Cell {
-                        slice: 5240,
-                        redundancy: Redundancy::Ten,
-                        margin: Margin::With,
-                        band: Band::Hundreds,
-                        alignment: Alignment::Aligned,
-                        pattern: Pattern::MemberAbsent,
-                        structure: Structure::IndexAbsent,
-                        container: Container::SevenZip,
-                        creator: 2,
-                    },
-                    ExtractionProfile::DirectStore,
-                    vec![(941713, (vec![(0, 0), (0, 1), (0, 1)], Interruption::Combined {
-                        mask: 12,
-                        index_first: false,
-                        action: BoundaryAction::Restart,
-                        at: 3,
-                    }))],
-                ).await;
-            }
             $(
                 #[tokio::test]
                 async fn $name() {

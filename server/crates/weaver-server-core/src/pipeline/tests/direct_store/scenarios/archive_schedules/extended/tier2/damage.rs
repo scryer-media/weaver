@@ -531,7 +531,7 @@ async fn swapped_encrypted_headers_repaired_after_restart() {
 
 macro_rules! damage_smokes {
     ($($name:ident $kind:ident $location:ident $pattern:ident $recovery:expr, $container:ident;)+) => {
-        mod damage_smoke {
+        mod combined_damage_smoke {
             use super::*;
             $(
                 #[tokio::test]
@@ -564,60 +564,60 @@ damage_smokes! {
     trailing_junk_middle_hundred TrailingJunk MiddleVolumeHead Hundred Recovery::Par2(Margin::With), Rar4;
 }
 
-mod damage_loss_smoke {
-    use super::*;
+#[tokio::test]
+async fn par3_restart_retains_the_decoded_prefix_as_repair_input() {
+    run_cell(
+        DamageCell {
+            kind: Damage::CrcWrong,
+            location: Location::RecoveryIndex,
+            pattern: Pattern::MemberAbsent,
+            recovery: Recovery::Par3,
+            container: Container::SevenZip,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(
+            491760,
+            (
+                vec![(1, 1), (0, 0), (0, 1), (1, 0)],
+                Interruption::Restart(3),
+            ),
+        )],
+    )
+    .await;
+}
 
-    #[tokio::test]
-    async fn par3_restart_retains_the_decoded_prefix_as_repair_input() {
-        run_cell(
-            DamageCell {
-                kind: Damage::CrcWrong,
-                location: Location::RecoveryIndex,
-                pattern: Pattern::MemberAbsent,
-                recovery: Recovery::Par3,
-                container: Container::SevenZip,
-            },
-            ExtractionProfile::DirectStore,
-            vec![(
-                491760,
-                (
-                    vec![(1, 1), (0, 0), (0, 1), (1, 0)],
-                    Interruption::Restart(3),
-                ),
-            )],
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn encrypted_par3_restart_retains_the_first_volume() {
-        for profile in [
-            ExtractionProfile::DirectStore,
-            ExtractionProfile::Chase,
-            ExtractionProfile::Conventional,
-        ] {
-            for at in [2, 3] {
-                run_cell(
-                    DamageCell {
-                        kind: Damage::Swapped,
-                        location: Location::RecoveryVolume,
-                        pattern: Pattern::MemberAbsent,
-                        recovery: Recovery::Par3,
-                        container: Container::Rar5Encrypted,
-                    },
-                    profile,
-                    vec![(
-                        0,
-                        (
-                            vec![(1, 0), (1, 1), (0, 1), (0, 0)],
-                            Interruption::Restart(at),
-                        ),
-                    )],
-                )
-                .await;
-            }
+#[tokio::test]
+async fn encrypted_par3_restart_retains_the_first_volume() {
+    for profile in [
+        ExtractionProfile::DirectStore,
+        ExtractionProfile::Chase,
+        ExtractionProfile::Conventional,
+    ] {
+        for at in [2, 3] {
+            run_cell(
+                DamageCell {
+                    kind: Damage::Swapped,
+                    location: Location::RecoveryVolume,
+                    pattern: Pattern::MemberAbsent,
+                    recovery: Recovery::Par3,
+                    container: Container::Rar5Encrypted,
+                },
+                profile,
+                vec![(
+                    0,
+                    (
+                        vec![(1, 0), (1, 1), (0, 1), (0, 0)],
+                        Interruption::Restart(at),
+                    ),
+                )],
+            )
+            .await;
         }
     }
+}
+
+mod combined_damage_loss_smoke {
+    use super::*;
 
     #[tokio::test]
     async fn crc_wrong_mid_volume_par2() {

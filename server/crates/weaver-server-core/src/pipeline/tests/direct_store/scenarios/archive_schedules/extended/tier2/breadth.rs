@@ -386,7 +386,7 @@ pub(super) mod lies {
         }
     }
 
-    mod lies_smoke {
+    mod combined_lies_smoke {
         use super::*;
 
         #[tokio::test]
@@ -593,7 +593,7 @@ pub(super) mod nesting {
         }
     }
 
-    mod nesting_smoke {
+    mod combined_nesting_smoke {
         use super::*;
 
         #[tokio::test]
@@ -773,7 +773,7 @@ pub(super) mod scale {
         }
     }
 
-    mod scale_smoke {
+    mod combined_scale_smoke {
         use super::*;
 
         #[tokio::test]
@@ -1079,7 +1079,7 @@ pub(super) mod password {
         }
     }
 
-    mod password_smoke {
+    mod combined_password_smoke {
         use super::*;
 
         #[tokio::test]
@@ -1236,7 +1236,7 @@ pub(super) mod wire {
         }
     }
 
-    mod wire_smoke {
+    mod combined_wire_smoke {
         use super::*;
 
         #[tokio::test]
@@ -1432,7 +1432,7 @@ pub(super) mod naming {
         }
     }
 
-    mod naming_smoke {
+    mod combined_naming_smoke {
         use super::*;
 
         #[tokio::test]
@@ -1655,87 +1655,87 @@ pub(super) mod sets {
         }
     }
 
-    mod sets_smoke {
-        use super::*;
+    #[tokio::test]
+    async fn demoted_sevenz_extracts_before_healthy_neighbour_commits() {
+        run_cell(
+            SetsCell {
+                layout: Layout::TwoSetsFurniture,
+                container: Container::SevenZip,
+                recovery: Recovery::None,
+                stale_sfv: false,
+                volumes: 2,
+            },
+            ExtractionProfile::DirectStore,
+            vec![(
+                113487,
+                (
+                    vec![(0, 0), (0, 0), (0, 1), (1, 0), (1, 1)],
+                    Interruption::Demote(1),
+                ),
+            )],
+        )
+        .await;
+    }
 
-        #[tokio::test]
-        async fn demoted_sevenz_extracts_before_healthy_neighbour_commits() {
+    #[tokio::test]
+    async fn damaged_neighbour_keeps_healthy_set_unfinalized() {
+        let cell = SetsCell {
+            layout: Layout::TwoSets,
+            container: Container::Rar5,
+            recovery: Recovery::None,
+            stale_sfv: false,
+            volumes: 2,
+        };
+        let mut post = cell.post(Interruption::None).post;
+        post.files[3].wire.insert(
+            1,
+            super::post::Wire::Damaged(super::post::Damage::Recomputed),
+        );
+        let result = super::run::run(
+            &post,
+            ExtractionProfile::DirectStore,
+            &slot_arrivals(4),
+            Interruption::None,
+        )
+        .await;
+        result.assert(
+            &post,
+            ExtractionProfile::DirectStore,
+            Verdict::Fails,
+            "damaged neighbouring set",
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_job_keeps_healthy_set_in_staging() {
+        let cell = SetsCell {
+            layout: Layout::TwoSets,
+            container: Container::Rar5,
+            recovery: Recovery::None,
+            stale_sfv: false,
+            volumes: 2,
+        };
+        for profile in PROFILES {
             run_cell(
-                SetsCell {
-                    layout: Layout::TwoSetsFurniture,
-                    container: Container::SevenZip,
-                    recovery: Recovery::None,
-                    stale_sfv: false,
-                    volumes: 2,
-                },
-                ExtractionProfile::DirectStore,
+                cell,
+                profile,
                 vec![(
-                    113487,
+                    0,
                     (
-                        vec![(0, 0), (0, 0), (0, 1), (1, 0), (1, 1)],
-                        Interruption::Demote(1),
+                        slot_arrivals(4),
+                        Interruption::Loss {
+                            mask: 8,
+                            index_first: true,
+                        },
                     ),
                 )],
             )
             .await;
         }
+    }
 
-        #[tokio::test]
-        async fn damaged_neighbour_keeps_healthy_set_unfinalized() {
-            let cell = SetsCell {
-                layout: Layout::TwoSets,
-                container: Container::Rar5,
-                recovery: Recovery::None,
-                stale_sfv: false,
-                volumes: 2,
-            };
-            let mut post = cell.post(Interruption::None).post;
-            post.files[3].wire.insert(
-                1,
-                super::super::post::Wire::Damaged(super::super::post::Damage::Recomputed),
-            );
-            let result = super::super::run::run(
-                &post,
-                ExtractionProfile::DirectStore,
-                &slot_arrivals(4),
-                Interruption::None,
-            )
-            .await;
-            result.assert(
-                &post,
-                ExtractionProfile::DirectStore,
-                Verdict::Fails,
-                "damaged neighbouring set",
-            );
-        }
-
-        #[tokio::test]
-        async fn failed_job_keeps_healthy_set_in_staging() {
-            let cell = SetsCell {
-                layout: Layout::TwoSets,
-                container: Container::Rar5,
-                recovery: Recovery::None,
-                stale_sfv: false,
-                volumes: 2,
-            };
-            for profile in PROFILES {
-                run_cell(
-                    cell,
-                    profile,
-                    vec![(
-                        0,
-                        (
-                            slot_arrivals(4),
-                            Interruption::Loss {
-                                mask: 8,
-                                index_first: true,
-                            },
-                        ),
-                    )],
-                )
-                .await;
-            }
-        }
+    mod combined_sets_smoke {
+        use super::*;
 
         #[tokio::test]
         async fn furniture_par2() {

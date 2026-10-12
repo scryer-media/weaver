@@ -267,7 +267,7 @@ impl Cell for UuCell {
 
 macro_rules! uu_smokes {
     ($($name:ident $style:literal $shape:ident $damage:expr, $container:ident;)+) => {
-        mod uu_smoke {
+        mod combined_uu_smoke {
             use super::*;
             $(
                 #[tokio::test]
@@ -300,29 +300,29 @@ uu_smokes! {
     lenient_combo_par2 11 SetWithPar2 None, Rar5Encrypted;
 }
 
-mod uu_loss_smoke {
-    use super::*;
+#[tokio::test]
+async fn truncated_sevenz_part_reaches_par2_repair() {
+    run_cell(
+        UuCell {
+            style: 4,
+            shape: Shape::SetWithPar2,
+            damage: Some(Damage::Truncated),
+            container: Container::SevenZip,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(
+            186399,
+            (
+                vec![(0, 0), (0, 0), (0, 1), (1, 0), (1, 1)],
+                Interruption::None,
+            ),
+        )],
+    )
+    .await;
+}
 
-    #[tokio::test]
-    async fn truncated_sevenz_part_reaches_par2_repair() {
-        run_cell(
-            UuCell {
-                style: 4,
-                shape: Shape::SetWithPar2,
-                damage: Some(Damage::Truncated),
-                container: Container::SevenZip,
-            },
-            ExtractionProfile::DirectStore,
-            vec![(
-                186399,
-                (
-                    vec![(0, 0), (0, 0), (0, 1), (1, 0), (1, 1)],
-                    Interruption::None,
-                ),
-            )],
-        )
-        .await;
-    }
+mod combined_uu_loss_smoke {
+    use super::*;
 
     #[tokio::test]
     async fn standard_set_par2() {

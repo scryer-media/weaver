@@ -625,7 +625,7 @@ impl Cell for Par3Cell {
 
 macro_rules! par3_smokes {
     ($($name:ident $placement:ident $code:ident $margin:ident $block:literal $entries:ident $sets:ident $index:ident $container:ident;)+) => {
-        mod par3_breadth_smoke {
+        mod combined_par3_breadth_smoke {
             use super::*;
             $(
                 #[tokio::test]
@@ -659,60 +659,60 @@ par3_smokes! {
     both_fft_two_entries Both Fft OneShort 1024 Two One Present SevenZip;
 }
 
-mod par3_breadth_loss_smoke {
-    use super::*;
-
-    #[tokio::test]
-    async fn embedded_replacement_retires_its_split_sidecar() {
-        for sets in [Sets::One, Sets::Two] {
-            let cell = Par3Cell {
-                placement: Placement::Both,
-                code: Code::Fft,
-                margin: Margin::With,
-                block: 4096,
-                entries: Entries::One,
-                sets,
-                index: Index::Present,
-                container: Container::SevenZip,
-            };
-            let interruption = Interruption::Starved { mask: 11 };
-            assert_eq!(cell.build(interruption).2, Some(Verdict::Completes));
-            for profile in PROFILES {
-                run_cell(
-                    cell,
-                    profile,
-                    vec![(441207, (vec![(0, 0), (0, 1), (1, 0), (1, 1)], interruption))],
-                )
-                .await;
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn embedded_recovery_requires_its_metadata() {
+#[tokio::test]
+async fn embedded_replacement_retires_its_split_sidecar() {
+    for sets in [Sets::One, Sets::Two] {
         let cell = Par3Cell {
             placement: Placement::Both,
             code: Code::Fft,
             margin: Margin::With,
             block: 4096,
             entries: Entries::One,
-            sets: Sets::One,
+            sets,
             index: Index::Present,
             container: Container::SevenZip,
         };
-        for (mask, verdict) in [(1, Verdict::Completes), (8, Verdict::Fails)] {
-            let interruption = Interruption::Starved { mask };
-            assert_eq!(cell.build(interruption).2, Some(verdict));
-            for profile in PROFILES {
-                run_cell(
-                    cell,
-                    profile,
-                    vec![(441205, (vec![(0, 0), (0, 1), (1, 0), (1, 1)], interruption))],
-                )
-                .await;
-            }
+        let interruption = Interruption::Starved { mask: 11 };
+        assert_eq!(cell.build(interruption).2, Some(Verdict::Completes));
+        for profile in PROFILES {
+            run_cell(
+                cell,
+                profile,
+                vec![(441207, (vec![(0, 0), (0, 1), (1, 0), (1, 1)], interruption))],
+            )
+            .await;
         }
     }
+}
+
+#[tokio::test]
+async fn embedded_recovery_requires_its_metadata() {
+    let cell = Par3Cell {
+        placement: Placement::Both,
+        code: Code::Fft,
+        margin: Margin::With,
+        block: 4096,
+        entries: Entries::One,
+        sets: Sets::One,
+        index: Index::Present,
+        container: Container::SevenZip,
+    };
+    for (mask, verdict) in [(1, Verdict::Completes), (8, Verdict::Fails)] {
+        let interruption = Interruption::Starved { mask };
+        assert_eq!(cell.build(interruption).2, Some(verdict));
+        for profile in PROFILES {
+            run_cell(
+                cell,
+                profile,
+                vec![(441205, (vec![(0, 0), (0, 1), (1, 0), (1, 1)], interruption))],
+            )
+            .await;
+        }
+    }
+}
+
+mod combined_par3_breadth_loss_smoke {
+    use super::*;
 
     #[tokio::test]
     async fn sidecar_fft_rar5() {
