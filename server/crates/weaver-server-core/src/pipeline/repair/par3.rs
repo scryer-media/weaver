@@ -1666,3 +1666,17 @@ pub(in crate::pipeline) mod work;
 mod schedule_tests;
 #[cfg(test)]
 mod tests;
+
+// Rewrites `path` with `contents` until its modification time moves off the
+// value it had before the first write. A backing fence that reads timestamps
+// sees a same-length rewrite only once the file system's clock advances, and
+// some file systems advance it only at the system clock's granularity.
+#[cfg(test)]
+pub(in crate::pipeline) fn rewrite_until_modified(path: &std::path::Path, contents: &[u8]) {
+    let written = std::fs::metadata(path).unwrap().modified().unwrap();
+    std::fs::write(path, contents).unwrap();
+    while std::fs::metadata(path).unwrap().modified().unwrap() == written {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::fs::write(path, contents).unwrap();
+    }
+}
