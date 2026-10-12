@@ -250,7 +250,7 @@ impl Pipeline {
         // take over a file already in the working directory.
         match record
             .destination(&state.working_dir)
-            .map(|path| std::fs::symlink_metadata(path))
+            .map(std::fs::symlink_metadata)
         {
             Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
             _ => return None,

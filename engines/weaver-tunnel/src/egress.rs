@@ -131,7 +131,31 @@ impl SocketEgress {
 
     pub fn connect_blocking(&self, target: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
         let socket = self.tcp_socket(target)?;
-        socket.connect_timeout(&target.into(), timeout)?;
+        let result = socket.connect_timeout(&target.into(), timeout);
+        Self::finish_blocking_connect(socket, target, result)
+    }
+
+    fn finish_blocking_connect(
+        socket: Socket,
+        target: SocketAddr,
+        result: io::Result<()>,
+    ) -> io::Result<TcpStream> {
+        if let Err(error) = result {
+            // A peer can send its greeting and close before connect's poll
+            // wakes. socket2 reports POLLHUP without SO_ERROR as Other even
+            // though TCP connected and the reply remains readable. Keep that
+            // socket only when the kernel confirms the intended peer and no
+            // pending error; real connect errors retain their original cause.
+            let connected_hangup = error.kind() == io::ErrorKind::Other
+                && error.raw_os_error().is_none()
+                && socket.take_error().is_ok_and(|pending| pending.is_none())
+                && socket
+                    .peer_addr()
+                    .is_ok_and(|peer| peer.as_socket() == Some(target));
+            if !connected_hangup {
+                return Err(error);
+            }
+        }
         Ok(socket.into())
     }
 
@@ -157,6 +181,67 @@ impl SocketEgress {
         }
         socket.set_nonblocking(true)?;
         Ok(socket.into())
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn connected_hangup_preserves_the_peers_last_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.write_all(b"502 Too Many Connections\r\n").unwrap();
+        });
+        let socket = SocketEgress::System.tcp_socket(target).unwrap();
+        socket.connect(&target.into()).unwrap();
+        server.join().unwrap();
+
+        // Inject the connect poll's synthesized hangup after the peer has
+        // sent its reply and closed, without racing the operating system.
+        let mut stream = SocketEgress::finish_blocking_connect(
+            socket,
+            target,
+            Err(io::Error::other("no error set after POLLHUP")),
+        )
+        .unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, "502 Too Many Connections\r\n");
+    }
+
+    #[test]
+    fn an_unconnected_socket_does_not_hide_a_connect_error() {
+        let target = "127.0.0.1:1".parse().unwrap();
+        let socket = SocketEgress::System.tcp_socket(target).unwrap();
+        let error = SocketEgress::finish_blocking_connect(
+            socket,
+            target,
+            Err(io::Error::other("no error set after POLLHUP")),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "no error set after POLLHUP");
+    }
+
+    #[test]
+    fn a_connected_socket_does_not_hide_a_real_connect_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap();
+        let socket = SocketEgress::System.tcp_socket(target).unwrap();
+        socket.connect(&target.into()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let error = SocketEgress::finish_blocking_connect(
+            socket,
+            target,
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
     }
 }
 

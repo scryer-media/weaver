@@ -26,6 +26,7 @@ type unpackArticle struct {
 
 type unpackGate struct {
 	released chan struct{}
+	entered  chan struct{}
 	held     atomic.Int64
 }
 
@@ -131,6 +132,10 @@ func (s *unpackNNTP) serve(conn net.Conn) {
 			// STAT must not wait behind BODY requests: it only reports presence.
 			if ok && article.gate != nil && fields[0] != "STAT" {
 				article.gate.held.Add(1)
+				select {
+				case article.gate.entered <- struct{}{}:
+				default:
+				}
 				select {
 				case <-article.gate.released:
 				case <-s.done:

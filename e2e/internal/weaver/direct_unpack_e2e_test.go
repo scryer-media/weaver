@@ -93,7 +93,11 @@ func TestDirectUnpackE2E(t *testing.T) {
 						posted["payload.bin.001"] = first
 						minimumStaged = int64(len(first) + 64*1024)
 					}
-					gate := &unpackGate{released: make(chan struct{})}
+					requiresRecoveredPrefix := format == "split" && mode == "missing-first"
+					if requiresRecoveredPrefix {
+						minimumStaged = 0
+					}
+					gate := &unpackGate{released: make(chan struct{}), entered: make(chan struct{}, 1)}
 					var once sync.Once
 					release := func() { once.Do(func() { close(gate.released) }) }
 					defer release()
@@ -112,13 +116,21 @@ func TestDirectUnpackE2E(t *testing.T) {
 					stage := filepath.Join(root, "complete", ".weaver-direct-unpack", strconv.Itoa(job))
 					var stagedPath string
 					var stagedBytes int64
-					deadline := time.Now().Add(20 * time.Second)
-					for time.Now().Before(deadline) {
+					if requiresRecoveredPrefix {
+						// The sequential join cannot emit a prefix that was never
+						// posted. Observe this job's held article before releasing
+						// downloads so PAR2 can reconstruct the missing first part.
+						<-gate.entered
 						stagedPath, stagedBytes = unpackOutput(stage, outputName)
-						if stagedBytes >= minimumStaged && gate.held.Load() > 0 {
-							break
+					} else {
+						deadline := time.Now().Add(20 * time.Second)
+						for time.Now().Before(deadline) {
+							stagedPath, stagedBytes = unpackOutput(stage, outputName)
+							if stagedBytes >= minimumStaged && gate.held.Load() > 0 {
+								break
+							}
+							time.Sleep(20 * time.Millisecond)
 						}
-						time.Sleep(20 * time.Millisecond)
 					}
 					if stagedBytes < minimumStaged || gate.held.Load() == 0 {
 						t.Fatalf("no extraction while archive BODY responses are held: job=%d status=%s stage=%s bytes=%d held=%d log=%s", job, api.status(job), stagedPath, stagedBytes, gate.held.Load(), logPath)
@@ -129,8 +141,9 @@ func TestDirectUnpackE2E(t *testing.T) {
 					}
 					evidence := map[string]any{"jobId": job, "format": format, "mode": mode, "stagedPath": stagedPath, "stagedBytesBeforeRelease": stagedBytes, "heldBodies": gate.held.Load(), "statusBeforeRelease": statusBefore}
 					evidence["minimumStagedBytes"] = minimumStaged
+					evidence["requiresRecoveredPrefix"] = requiresRecoveredPrefix
 					release()
-					deadline = time.Now().Add(90 * time.Second)
+					deadline := time.Now().Add(90 * time.Second)
 					status := ""
 					for time.Now().Before(deadline) {
 						status = api.status(job)
@@ -156,7 +169,11 @@ func TestDirectUnpackE2E(t *testing.T) {
 						t.Fatal(err)
 					}
 					jobLog := unpackJobLog(string(raw), job)
-					if !strings.Contains(jobLog, directUnpackArmedMessage) {
+					if requiresRecoveredPrefix {
+						if !strings.Contains(jobLog, "split files joined") {
+							t.Fatal("recovered split job has no completed join evidence")
+						}
+					} else if !strings.Contains(jobLog, directUnpackArmedMessage) {
 						t.Fatal("no direct-unpack admission evidence")
 					}
 					if mode == "clean" && !strings.Contains(jobLog, directUnpackConsumedMessage) {
@@ -174,7 +191,7 @@ func TestDirectUnpackE2E(t *testing.T) {
 					if err := os.WriteFile(filepath.Join(fixtureDir, "evidence.json"), data, 0644); err != nil {
 						t.Fatal(err)
 					}
-					t.Logf("job=%d direct output=%d bytes before release; %s; BLAKE3=%x", job, stagedBytes, status, got)
+					t.Logf("job=%d output=%d bytes before release; %s; BLAKE3=%x", job, stagedBytes, status, got)
 				})
 			}
 		})

@@ -966,11 +966,11 @@ async fn all_async_fetch_families_keep_capacity_rejections_out_of_health() {
         64,
     ));
 
-    assert!(client.fetch_body("<test>").await.is_err());
+    let body_error = client.fetch_body("<test>").await.unwrap_err();
     assert_eq!(
         client.pool().health().lock().await.server(0).failure_count,
         0,
-        "BODY"
+        "BODY: {body_error:?}"
     );
     assert!(
         client

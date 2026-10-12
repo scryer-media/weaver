@@ -3061,6 +3061,25 @@ async fn postgres_post_processing_roundtrip_when_configured() {
             crate::post_processing::instances::InstanceTrigger::Feed,
         ))
         .unwrap();
+    db.insert_rss_feed(&RssFeedRow {
+        id: 7,
+        name: "fixture".into(),
+        url: "https://feed.invalid".into(),
+        enabled: true,
+        poll_interval_secs: 900,
+        scripts: Vec::new(),
+        username: None,
+        password: None,
+        default_category: None,
+        default_metadata: Vec::new(),
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    })
+    .unwrap();
     db.set_feed_script_instances(7, std::slice::from_ref(&feed_instance.id))
         .unwrap();
     assert_eq!(
