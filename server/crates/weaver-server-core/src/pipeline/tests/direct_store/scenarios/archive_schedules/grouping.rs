@@ -1346,6 +1346,20 @@ async fn reposted_rar_recovers_both_articles_of_one_copy() {
 }
 
 #[tokio::test]
+async fn solid_rar_restart_keeps_late_volume_refresh() {
+    run_cell(
+        Cell {
+            container: Container::Rar4Solid,
+            naming: Naming::HexScattered,
+            binding: Binding::Nothing,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(104, schedules().into_iter().nth(104).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn repaired_unposted_parts_join_header_named_archives() {
     for container in [
         Container::Rar4,

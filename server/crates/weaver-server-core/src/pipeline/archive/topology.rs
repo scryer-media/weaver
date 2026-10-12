@@ -2015,6 +2015,19 @@ impl Pipeline {
             .get(&key)
             .map(|set_state| set_state.facts.keys().copied().collect())
             .unwrap_or_default();
+        // A worker can read a newly arrived volume after its facts snapshot
+        // was taken. Its header view then includes that volume while its plan
+        // still calls it missing. Keep the queued rebuild until both views
+        // cover the live facts; the unchanged-input guard still bounds retries.
+        let plan_omits_live_facts = self
+            .rar_sets
+            .get(&key)
+            .and_then(|set_state| set_state.plan.as_ref())
+            .is_some_and(|plan| {
+                live_fact_volumes
+                    .iter()
+                    .any(|volume| !plan.topology.complete_volumes.contains(volume))
+            });
         // Everything a follow-up refresh could possibly compute from: the
         // facts (generation covers content changes under an unchanged key)
         // and the plan this refresh just installed. Two successive
@@ -2117,7 +2130,8 @@ impl Pipeline {
                 if success {
                     state.last_completion_fingerprint = Some(completion_fingerprint);
                 }
-                let unabsorbed_facts = !live_fact_volumes.is_subset(&state.refreshed_volumes);
+                let unabsorbed_facts =
+                    plan_omits_live_facts || !live_fact_volumes.is_subset(&state.refreshed_volumes);
                 let coverage_gap = success && !no_progress && unabsorbed_facts;
                 if success && no_progress && unabsorbed_facts {
                     debug!(
