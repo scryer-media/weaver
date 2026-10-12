@@ -901,10 +901,25 @@ impl Pipeline {
                         })
                 })
         });
+        // A direct verification ticket this gate itself submitted, still
+        // running or finished and parked. The terms above are read fresh on
+        // every lap, and the one that sent the authoritative pass down to
+        // start the ticket can lapse before the ticket answers: a file the
+        // recovery set describes binds while the read is out, say, and the
+        // next lap finds nothing unposted. Without this the skip below settles
+        // the set on the strong-decode claim while the read it asked for
+        // still stands registered, and nothing ever takes it: the job
+        // completes around a ticket that is never consumed, which a caller
+        // waiting on the ticket then waits on forever. Owed until taken, so
+        // the pass that started it is the pass that reads its answer.
+        let direct_verification_ticket_open =
+            self.direct_post_repair_in_flight.contains_key(&job_id)
+                || self.direct_post_repair_results.contains_key(&job_id);
         let authoritative_par2_verification_needed = par2_validation_needed
             && (authoritative_par2_verification_owed
                 || !direct_unpack_gated_sets.is_empty()
-                || parked_damaged_par2_verdict);
+                || parked_damaged_par2_verdict
+                || direct_verification_ticket_open);
         if authoritative_par2_verification_needed && !authoritative_par2_verification_owed {
             if direct_unpack_gated_sets.is_empty() {
                 info!(

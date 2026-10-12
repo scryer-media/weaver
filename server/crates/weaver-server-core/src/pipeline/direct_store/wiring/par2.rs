@@ -2073,6 +2073,15 @@ impl Pipeline {
                 "adjusted the quiet direct-set pass before attributing damage"
             );
         }
+        // A verdict reached here without going through the ticket — every
+        // file claimed in stream, or the session answering outright —
+        // supersedes any ticket still registered for this job: the read it
+        // was out on was asking the question this verdict has just answered,
+        // over the same bytes. Left registered it would be a ticket nothing
+        // ever takes, and a late done message finds no entry and is dropped;
+        // a fresh ticket's work id fences it either way.
+        self.direct_post_repair_in_flight.remove(&job_id);
+        self.direct_post_repair_results.remove(&job_id);
         #[cfg(test)]
         {
             self.last_direct_verdict = Some(verification.clone());
