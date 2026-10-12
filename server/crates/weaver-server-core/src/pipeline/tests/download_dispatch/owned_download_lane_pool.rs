@@ -4047,19 +4047,19 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
     handle.set_proxy_runtime(runtime.clone());
     pipeline.shared_state.set_server_transfer_policy(policy);
 
-    // The system egress spends its whole allowance, and the next body is
-    // turned away.
+    // The remaining allowance cannot fit the next body, even though the
+    // byte counter has not reached the quota limit.
     let egress = runtime
         .network
         .egress_controls
         .control(weaver_nntp::transfer::StableServerId(
             crate::proxies::SYSTEM_EGRESS_ID,
         ));
-    let mut permit = egress.try_reserve(128).unwrap();
-    permit.record_blocking(128);
+    let mut permit = egress.try_reserve(96).unwrap();
+    permit.record_blocking(96);
     permit.finish();
     let rejection = egress
-        .try_reserve(1)
+        .try_reserve(128)
         .err()
         .expect("the spent egress must refuse the next body");
     assert_eq!(
@@ -4116,7 +4116,50 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
         crate::jobs::handle::DownloadBlockKind::EgressQuota
     );
     assert_eq!(block.egress_id, Some(crate::proxies::SYSTEM_EGRESS_ID));
-    assert_eq!(block.used_bytes, 128);
+    assert_eq!(block.used_bytes, 96);
+
+    // A capacity notification is a prompt to reconsider, not proof that the
+    // exhausted route can carry the article. Reapplying the same policy
+    // wakes its waiter without giving the egress any additional allowance.
+    let mut capacity_wait = Box::pin(Pipeline::wait_for_egress_quota_capacity(
+        egress.subscribe_capacity_changes(),
+        runtime.clone(),
+        pipeline.nntp.clone(),
+        egress.quota_rejection_for_dispatch(128).unwrap(),
+        Vec::new(),
+    ));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(capacity_wait.as_mut(), &mut context).is_pending());
+    let snapshot = egress.snapshot();
+    egress.update_config(weaver_nntp::transfer::ServerTransferConfig {
+        rate_bytes_per_sec: 0,
+        quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+            limit_bytes: 128,
+            generation: snapshot.quota_generation,
+            retry_at: None,
+        }),
+    });
+    assert!(std::future::Future::poll(capacity_wait.as_mut(), &mut context).is_pending());
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::EgressQuota
+    );
+    egress.update_config(weaver_nntp::transfer::ServerTransferConfig {
+        rate_bytes_per_sec: 0,
+        quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+            limit_bytes: 256,
+            generation: snapshot.quota_generation,
+            retry_at: None,
+        }),
+    });
+    assert!(std::future::Future::poll(capacity_wait.as_mut(), &mut context).is_ready());
+    let retry = pipeline.retry_rx.recv().await.unwrap();
+    assert_eq!(retry.work.segment_id, segment_id);
+    pipeline.receive_retry_work(retry);
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::None
+    );
 
     pipeline.jobs.remove(&job_id);
     pipeline.shared_state.publish_jobs(Vec::new());

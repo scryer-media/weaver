@@ -256,6 +256,44 @@ impl Pipeline {
         true
     }
 
+    pub(in crate::pipeline) async fn wait_for_egress_quota_capacity(
+        mut changes: tokio::sync::watch::Receiver<u64>,
+        runtime: std::sync::Arc<crate::proxies::ProxyRuntime>,
+        nntp: std::sync::Arc<weaver_nntp::NntpClient>,
+        rejection: weaver_nntp::transfer::QuotaRejection,
+        excludes: Vec<usize>,
+    ) {
+        loop {
+            // A shared capacity revision can come from an unrelated transfer.
+            // Recheck admission before letting a notification unpark this work.
+            let control = runtime
+                .network
+                .egress_controls
+                .control(rejection.stable_server_id);
+            if control
+                .quota_rejection_for_dispatch(rejection.requested_body_bytes)
+                .is_none()
+            {
+                return;
+            }
+            let selection = nntp
+                .body_server_selection_with_estimate(&excludes, rejection.requested_body_bytes)
+                .await;
+            if selection.eligible.iter().any(|server| {
+                nntp.pool().stable_server_id(*server).is_none_or(|stable| {
+                    runtime
+                        .network
+                        .has_leg_in_quota(crate::proxies::Consumer::Server(stable.0))
+                })
+            }) {
+                return;
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     pub(in crate::pipeline::download::worker) fn schedule_download_work_without_retry_budget(
         &mut self,
         segment_id: SegmentId,
@@ -289,7 +327,18 @@ impl Pipeline {
             .as_ref()
             .zip(quota_rejection.as_ref())
             .is_none_or(|(policy, rejection)| policy.quota_rejection_is_current(rejection));
-        let mut delay = if rejection_is_current {
+        let egress_wait = quota_rejection
+            .filter(|rejection| rejection.scope == weaver_nntp::transfer::TransferScope::Egress)
+            .zip(self.shared_state.proxy_runtime())
+            .map(|(rejection, runtime)| {
+                (
+                    rejection,
+                    runtime,
+                    self.nntp.clone(),
+                    self.effective_exclude_servers(job_id, &work.exclude_servers),
+                )
+            });
+        let mut delay = if rejection_is_current || egress_wait.is_some() {
             delay
         } else {
             Some(Duration::ZERO)
@@ -316,7 +365,14 @@ impl Pipeline {
             };
             let wait_for_capacity = async move {
                 if let Some(mut changes) = server_capacity_changes {
-                    let _ = changes.changed().await;
+                    if let Some((rejection, runtime, nntp, excludes)) = egress_wait {
+                        Self::wait_for_egress_quota_capacity(
+                            changes, runtime, nntp, rejection, excludes,
+                        )
+                        .await;
+                    } else {
+                        let _ = changes.changed().await;
+                    }
                 } else {
                     std::future::pending::<()>().await;
                 }
