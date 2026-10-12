@@ -47,4 +47,17 @@ if [ "$retain_net_raw" = "true" ]; then
     exec setpriv --reuid "$PUID" --regid "$PGID" --clear-groups \
         --inh-caps=-all,+net_raw --ambient-caps=-all,+net_raw "$RUNTIME_BIN" "$@" </dev/null
 fi
-exec setpriv --reuid "$PUID" --regid "$PGID" --clear-groups "$RUNTIME_BIN" "$@" </dev/null
+# Changing to a non-root user clears every capability, but PUID=0 keeps the
+# ones the runtime granted, so NET_RAW is dropped from every set explicitly.
+# Lowering the bounding set needs CAP_SETPCAP; without it the bounding set is
+# left as the runtime gave it.
+drop_net_raw=""
+if [ -r /proc/self/status ]; then
+    while read -r capability_key capability_value capability_rest; do
+        if [ "$capability_key" = "CapEff:" ] && [ "$((0x$capability_value & 256))" -ne 0 ]; then
+            drop_net_raw="--bounding-set=-net_raw"
+        fi
+    done < /proc/self/status
+fi
+exec setpriv --reuid "$PUID" --regid "$PGID" --clear-groups \
+    --inh-caps=-net_raw --ambient-caps=-net_raw $drop_net_raw "$RUNTIME_BIN" "$@" </dev/null

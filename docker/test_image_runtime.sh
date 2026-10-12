@@ -161,6 +161,29 @@ groups=$(printf '%s\n' "$groups_output" | tail -n 1 | tr -d '\r')
     exit 1
 }
 
+cat >"$payload_dir/weaver-portable" <<'EOF'
+#!/bin/sh
+grep -E '^Cap(Inh|Prm|Eff|Bnd|Amb):' /proc/self/status
+EOF
+chmod +x "$payload_dir/weaver-portable"
+
+caps_output=$(
+    docker run --rm --platform "$PLATFORM" \
+        -e PUID=0 \
+        -e PGID=0 \
+        -e WEAVER_PAYLOAD_ROOT=/payload \
+        -e WEAVER_CPUINFO_PATH=/missing-cpuinfo \
+        -v "$payload_dir:/payload:ro" \
+        "$IMAGE_TAG"
+)
+printf '%s\n' "$caps_output" | grep -E '^Cap(Inh|Prm|Eff|Bnd|Amb):' | while read -r cap_key cap_value; do
+    if [ "$((0x$cap_value & 8192))" -ne 0 ]; then
+        printf 'assertion failed: PUID=0 without WEAVER_RETAIN_NET_RAW should drop NET_RAW\n%s\n' \
+            "$caps_output" >&2
+        exit 1
+    fi
+done
+
 sudo chown 65534:65534 "$tmpdir"
 docker run --rm --platform "$PLATFORM" \
     --user "$current_uid:$current_gid" \
