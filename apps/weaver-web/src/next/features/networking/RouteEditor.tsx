@@ -17,6 +17,7 @@ import {
 import { chainHopProfiles, proxyLabels, withChainHop, type ChainLimits, type ProxyProfile } from "@/lib/proxies";
 import { cn } from "@/lib/utils";
 import { Square } from "../../components/chrome";
+import { Icon } from "../../components/icons";
 import { NumberField, SecondaryButton, Segmented, Select } from "../../components/controls";
 import { WV } from "../../data/palette";
 import {
@@ -218,107 +219,111 @@ export function RouteEditor({
               <div className="flex min-w-0 flex-col gap-2">
                 <ol className="flex min-w-0 flex-col">
                   {path.rungs.map((rung, rungIndex) => (
-                    <li
-                      key={rungIndex}
-                      className="flex min-w-0 flex-wrap items-center gap-2 border-t border-wv-hairline py-[10px] first:border-t-0"
-                    >
-                      <span className="w-[52px] flex-none font-wv-mono text-[11px] text-wv-muted">
-                        {t("next.networking.route.rung", { position: rungIndex + 1 })}
-                      </span>
-                      <Segmented
-                        size="compact"
-                        label={t("next.networking.route.rungType", { leg: index + 1, rung: rungIndex + 1 })}
-                        value={rung.kind}
-                        onChange={(kind) =>
-                          setRungs(path.rungs.map((current, n) => (n === rungIndex ? { ...emptyRung(), kind } : current)))
-                        }
-                        options={[
-                          { value: "PROXY", label: t("next.networking.route.proxy") },
-                          { value: "POOL", label: t("next.networking.route.pool") },
-                          { value: "CHAIN", label: t("next.networking.route.chain") },
-                        ]}
-                      />
-                      <div className="ml-auto flex flex-none items-center gap-1">
-                        <IconButton
-                          icon="moveUp"
-                          label={t("next.networking.route.rungUp")}
-                          disabled={rungIndex === 0}
-                          onClick={() => setRungs(move(path.rungs, rungIndex, -1))}
-                        />
-                        <IconButton
-                          icon="moveDown"
-                          label={t("next.networking.route.rungDown")}
-                          disabled={rungIndex === path.rungs.length - 1}
-                          onClick={() => setRungs(move(path.rungs, rungIndex, 1))}
-                        />
-                        <IconButton
-                          icon="remove"
-                          label={t("next.networking.route.removeRung")}
-                          onClick={() => setRungs(path.rungs.filter((_, n) => n !== rungIndex))}
-                        />
-                      </div>
-                      {rung.kind === "CHAIN" ? (
-                        <div className="flex w-full min-w-0 flex-wrap gap-2">
-                          {[0, 1, 2].map((hop) => (
-                            <div key={hop} className="flex w-full min-w-0 flex-col gap-1 sm:w-[200px]">
-                              <Select
-                                label={t("next.networking.route.hop", { position: hop + 1 })}
-                                value={rung.chainIds[hop] == null ? "" : String(rung.chainIds[hop])}
-                                className="w-full min-w-0"
-                                disabled={hop > rung.chainIds.length}
-                                onChange={(next) => {
-                                  const chainIds = withChainHop(
-                                    profiles,
-                                    rung.chainIds,
-                                    hop,
-                                    next ? Number(next) : null,
-                                    chainLimits(path.rungs, rungIndex),
-                                  );
-                                  setRungs(path.rungs.map((current, n) => (n === rungIndex ? { ...current, chainIds } : current)));
-                                }}
-                                options={[
-                                  { value: "", label: t("next.networking.route.chooseProxy") },
-                                  ...chainHopProfiles(profiles, rung.chainIds, hop, chainLimits(path.rungs, rungIndex))
-                                    .map((profile) => ({
-                                      value: String(profile.id),
-                                      label: `${profile.name} · ${proxyLabels[profile.kind]}`,
-                                    })),
-                                ]}
-                              />
-                              <span className="font-wv-mono text-[11px] text-wv-muted">
-                                {hop < 2 ? t("next.networking.route.hopRequired") : t("next.networking.route.hopOptional")}
-                              </span>
-                            </div>
-                          ))}
+                    <li key={rungIndex} className="flex min-w-0 flex-col">
+                      {rungIndex > 0 ? (
+                        <div className="flex justify-center py-1 text-wv-fg">
+                          <Icon name="moveDown" size={20} />
                         </div>
-                      ) : (
-                        <div className="flex w-full min-w-0 flex-wrap gap-2">
-                          <Select
-                            label={t("next.networking.route.rungTarget", { leg: index + 1, rung: rungIndex + 1 })}
-                            value={String((rung.kind === "PROXY" ? rung.proxyId : rung.poolId) ?? "")}
-                            className="w-full min-w-0 sm:w-[200px]"
-                            onChange={(next) =>
-                              setRungs(
-                                path.rungs.map((current, n) =>
-                                  n === rungIndex
-                                    ? { ...current, [current.kind === "PROXY" ? "proxyId" : "poolId"]: next ? Number(next) : null }
-                                    : current,
-                                ),
-                              )
-                            }
-                            options={[
-                              {
-                                value: "",
-                                label: rung.kind === "PROXY" ? t("next.networking.route.chooseProxy") : t("next.networking.route.choosePool"),
-                              },
-                              ...rungTargets(path.rungs, rungIndex).map((target) => ({
-                                value: String(target.id),
-                                label: target.enabled ? target.name : `${target.name} · ${t("next.networking.disabled")}`,
-                              })),
-                            ]}
+                      ) : null}
+                      <div className="flex min-w-0 flex-wrap items-center gap-2 border border-wv-control bg-wv-app px-3 py-[10px]">
+                        <span className="w-[52px] flex-none font-wv-mono text-[11px] text-wv-muted">
+                          {t("next.networking.route.rung", { position: rungIndex + 1 })}
+                        </span>
+                        <Segmented
+                          size="compact"
+                          label={t("next.networking.route.rungType", { leg: index + 1, rung: rungIndex + 1 })}
+                          value={rung.kind}
+                          onChange={(kind) =>
+                            setRungs(path.rungs.map((current, n) => (n === rungIndex ? { ...emptyRung(), kind } : current)))
+                          }
+                          options={[
+                            { value: "PROXY", label: t("next.networking.route.proxy") },
+                            { value: "POOL", label: t("next.networking.route.pool") },
+                            { value: "CHAIN", label: t("next.networking.route.chain") },
+                          ]}
+                        />
+                        <div className="ml-auto flex flex-none items-center gap-1">
+                          <IconButton
+                            icon="moveUp"
+                            label={t("next.networking.route.rungUp")}
+                            disabled={rungIndex === 0}
+                            onClick={() => setRungs(move(path.rungs, rungIndex, -1))}
+                          />
+                          <IconButton
+                            icon="moveDown"
+                            label={t("next.networking.route.rungDown")}
+                            disabled={rungIndex === path.rungs.length - 1}
+                            onClick={() => setRungs(move(path.rungs, rungIndex, 1))}
+                          />
+                          <IconButton
+                            icon="remove"
+                            label={t("next.networking.route.removeRung")}
+                            onClick={() => setRungs(path.rungs.filter((_, n) => n !== rungIndex))}
                           />
                         </div>
-                      )}
+                        {rung.kind === "CHAIN" ? (
+                          <div className="flex w-full min-w-0 flex-wrap gap-2">
+                            {[0, 1, 2].map((hop) => (
+                              <div key={hop} className="flex w-full min-w-0 flex-col gap-1 sm:w-[200px]">
+                                <Select
+                                  label={t("next.networking.route.hop", { position: hop + 1 })}
+                                  value={rung.chainIds[hop] == null ? "" : String(rung.chainIds[hop])}
+                                  className="w-full min-w-0"
+                                  disabled={hop > rung.chainIds.length}
+                                  onChange={(next) => {
+                                    const chainIds = withChainHop(
+                                      profiles,
+                                      rung.chainIds,
+                                      hop,
+                                      next ? Number(next) : null,
+                                      chainLimits(path.rungs, rungIndex),
+                                    );
+                                    setRungs(path.rungs.map((current, n) => (n === rungIndex ? { ...current, chainIds } : current)));
+                                  }}
+                                  options={[
+                                    { value: "", label: t("next.networking.route.chooseProxy") },
+                                    ...chainHopProfiles(profiles, rung.chainIds, hop, chainLimits(path.rungs, rungIndex))
+                                      .map((profile) => ({
+                                        value: String(profile.id),
+                                        label: `${profile.name} · ${proxyLabels[profile.kind]}`,
+                                      })),
+                                  ]}
+                                />
+                                <span className="font-wv-mono text-[11px] text-wv-muted">
+                                  {hop < 2 ? t("next.networking.route.hopRequired") : t("next.networking.route.hopOptional")}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="flex w-full min-w-0 flex-wrap gap-2">
+                            <Select
+                              label={t("next.networking.route.rungTarget", { leg: index + 1, rung: rungIndex + 1 })}
+                              value={String((rung.kind === "PROXY" ? rung.proxyId : rung.poolId) ?? "")}
+                              className="w-full min-w-0 sm:w-[200px]"
+                              onChange={(next) =>
+                                setRungs(
+                                  path.rungs.map((current, n) =>
+                                    n === rungIndex
+                                      ? { ...current, [current.kind === "PROXY" ? "proxyId" : "poolId"]: next ? Number(next) : null }
+                                      : current,
+                                  ),
+                                )
+                              }
+                              options={[
+                                {
+                                  value: "",
+                                  label: rung.kind === "PROXY" ? t("next.networking.route.chooseProxy") : t("next.networking.route.choosePool"),
+                                },
+                                ...rungTargets(path.rungs, rungIndex).map((target) => ({
+                                  value: String(target.id),
+                                  label: target.enabled ? target.name : `${target.name} · ${t("next.networking.disabled")}`,
+                                })),
+                              ]}
+                            />
+                          </div>
+                        )}
+                      </div>
                     </li>
                   ))}
                 </ol>
