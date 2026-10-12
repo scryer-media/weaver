@@ -671,6 +671,7 @@ impl JobsMutation {
     async fn set_speed_limit(&self, ctx: &Context<'_>, bytes_per_sec: u64) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
         handle.set_speed_limit(bytes_per_sec).await?;
+        persist_operator_speed_limit(ctx, bytes_per_sec).await?;
         Ok(true)
     }
     /// Pause one queue item and return its updated facade state.
@@ -866,6 +867,7 @@ impl JobsMutation {
         let handle = ctx.data::<SchedulerHandle>()?;
         let config = ctx.data::<SharedConfig>()?;
         map_scheduler_result(handle.set_speed_limit(bytes_per_sec).await)?;
+        persist_operator_speed_limit(ctx, bytes_per_sec).await?;
         let cfg = config.read().await;
         Ok(QueueCommandResult {
             success: true,
@@ -1286,4 +1288,27 @@ async fn history_items_from_db(db: Database, live_jobs: HashSet<u64>) -> Result<
     .await
     .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
     .map_err(|e| graphql_error("INTERNAL", e.to_string()))
+}
+
+// The operator's speed limit is the saved global limit from now on: the queue
+// state reads it from the configuration, and a reload restores it, so the edit
+// lands in the settings as the settings screen's own edit would.
+async fn persist_operator_speed_limit(ctx: &Context<'_>, bytes_per_sec: u64) -> Result<()> {
+    let config = ctx.data::<SharedConfig>()?;
+    let db = ctx.data::<Database>()?.clone();
+    let persist = async move {
+        crate::observability::spawn_blocking_db(
+            "jobs.mutation.set_speed_limit.persist",
+            move || db.set_setting("max_download_speed", &bytes_per_sec.to_string()),
+        )
+        .await
+    };
+    crate::observability::persist_then_update_config(
+        config,
+        "jobs.mutation.set_speed_limit.apply",
+        persist,
+        move |cfg| cfg.max_download_speed = Some(bytes_per_sec),
+    )
+    .await?;
+    Ok(())
 }
