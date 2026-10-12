@@ -14,6 +14,9 @@ import { FieldRows, SettingsBlocks, type SettingsBlock } from "../../pages/setti
 import type { NetworkingAction, NetworkingData } from "./data";
 import { CheckRow, Hint, StatusMark } from "./presentation";
 
+/** The daemon pools two to sixteen proxies. */
+const MAX_POOL_MEMBERS = 16;
+
 const NEW_POOL: ProxyPool = { id: -1, name: "", kind: "SOCKS5", memberIds: [], enabled: true };
 
 /** WireGuard keeps a tunnel per member per egress, and each reserves this much memory. */
@@ -182,7 +185,7 @@ export function PoolEditor({
         error={error}
         busy={busy}
         saveLabel={t("next.networking.pools.save")}
-        saveDisabled={editing.memberIds.length < 2}
+        saveDisabled={editing.memberIds.length < 2 || editing.memberIds.length > MAX_POOL_MEMBERS}
         onSave={() => void save()}
         onDismiss={onClose}
         onDelete={editing.id >= 0 ? () => setDeleting(editing) : undefined}
@@ -229,6 +232,9 @@ export function PoolEditor({
                           label={profile.name}
                           detail={profile.enabled ? undefined : t("next.networking.disabled")}
                           checked={editing.memberIds.includes(profile.id)}
+                          disabled={
+                            !editing.memberIds.includes(profile.id) && editing.memberIds.length >= MAX_POOL_MEMBERS
+                          }
                           onChange={(checked) =>
                             patch({
                               memberIds: checked
