@@ -278,6 +278,13 @@ impl Pipeline {
             return self.fail_par2_repair(job_id, error);
         }
         stage_start = note_par2_repair_stage(job_id, "par2_repair.finish.reconcile", stage_start);
+        let discovered_files = match self
+            .register_verified_par2_content_outputs(job_id, &post_repair_verification)
+            .await
+        {
+            Ok(count) => count,
+            Err(error) => return self.fail_par2_repair(job_id, error),
+        };
         if let Err(error) =
             self.refresh_par3_after_par2_repair(job_id, par2_set.recovery_set_id, &rewritten)
         {
@@ -362,6 +369,7 @@ impl Pipeline {
         if has_crc_failures
             || adopted_numbered_parts > 0
             || registered_rar_outputs > 0
+            || discovered_files > 0
             || self.job_has_live_rar_waiting_for_missing_volumes(job_id)
         {
             self.retry_archive_extraction_after_verify_or_repair(job_id)
@@ -1315,6 +1323,114 @@ impl Pipeline {
             );
         }
         Ok(registration)
+    }
+
+    // Reconcile posted files first: a canonical repair can replace a damaged
+    // posted copy without creating another file identity. Only descriptions
+    // still unbound after that reconciliation need new membership.
+    async fn register_verified_par2_content_outputs(
+        &mut self,
+        job_id: JobId,
+        verification: &par2_rs::VerificationResult,
+    ) -> Result<usize, String> {
+        let bound: HashSet<_> = self
+            .jobs
+            .get(&job_id)
+            .ok_or("missing repair job")?
+            .assembly
+            .files()
+            .filter_map(|file| self.resolve_par2_file_binding(file.file_id()))
+            .map(|binding| binding.par2_file_id)
+            .collect();
+        let mut discovered = 0;
+        for file in &verification.files {
+            if !matches!(file.status, par2_rs::verify::FileStatus::Complete)
+                || bound.contains(&file.file_id)
+            {
+                continue;
+            }
+            if let Some(file_id) = self
+                .adopt_verified_par2_output(job_id, &file.filename)
+                .await?
+            {
+                self.refresh_archive_state_for_completed_file(job_id, file_id, true)
+                    .await;
+                discovered += 1;
+            }
+        }
+        Ok(discovered)
+    }
+
+    // A verified output can carry archive identity only in its bytes. Give it
+    // ordinary file membership so content probing and restart use the same
+    // path as a downloaded file, with one existing repair-output record.
+    async fn adopt_verified_par2_output(
+        &mut self,
+        job_id: JobId,
+        filename: &str,
+    ) -> Result<Option<NzbFileId>, String> {
+        let state = self.jobs.get(&job_id).ok_or("missing repair job")?;
+        if state
+            .assembly
+            .files()
+            .any(|file| self.current_filename_for_file(job_id, file) == filename)
+        {
+            return Ok(None);
+        }
+        let path = Path::new(filename);
+        if filename.is_empty()
+            || !path.is_relative()
+            || !path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "refusing unsafe PAR2-verified output path {filename:?}"
+            ));
+        }
+        let next = state
+            .assembly
+            .files()
+            .map(|file| u64::from(file.file_id().file_index) + 1)
+            .chain(
+                state
+                    .file_identities
+                    .keys()
+                    .map(|index| u64::from(*index) + 1),
+            )
+            .chain(std::iter::once(state.spec.files.len() as u64))
+            .max()
+            .unwrap_or(0);
+        let metadata = tokio::fs::symlink_metadata(state.working_dir.join(filename))
+            .await
+            .map_err(|error| error.to_string())?;
+        if !metadata.file_type().is_file() {
+            return Err(format!("verified output {filename} is not a regular file"));
+        }
+        let output = crate::jobs::repair_outputs::RepairOutput {
+            file_index: u32::try_from(next).map_err(|_| "repair output identity exhausted")?,
+            filename: filename.to_owned(),
+            expected_length: metadata.len(),
+        };
+        self.db
+            .reserve_repair_outputs(job_id, std::slice::from_ref(&output))
+            .map_err(|error| error.to_string())?;
+        let file_id = NzbFileId {
+            job_id,
+            file_index: output.file_index,
+        };
+        let mut file =
+            crate::jobs::assembly::FileAssembly::repair_output(file_id, filename.to_owned());
+        file.mark_complete();
+        self.jobs
+            .get_mut(&job_id)
+            .ok_or("missing repair job")?
+            .assembly
+            .add_file(file);
+        let mut identity = crate::jobs::repair_outputs::identity(&output);
+        identity.classification_source = crate::jobs::record::FileIdentitySource::Par2;
+        self.set_file_identity(job_id, identity)?;
+        Ok(Some(file_id))
     }
 
     // Adopt a numbered part the recovery set proved Complete into its set's

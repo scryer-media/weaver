@@ -1346,6 +1346,29 @@ async fn reposted_rar_recovers_both_articles_of_one_copy() {
 }
 
 #[tokio::test]
+async fn repaired_unposted_parts_join_header_named_archives() {
+    for container in [
+        Container::Rar4,
+        Container::Rar5EncryptedHeaders,
+        Container::SevenZipSolid,
+    ] {
+        run_cell(
+            Cell {
+                container,
+                naming: Naming::FirstVolumeHex,
+                binding: Binding::Par2Posted,
+            },
+            ExtractionProfile::DirectStore,
+            [357, 359]
+                .into_iter()
+                .map(|case| (case, schedules().into_iter().nth(case).unwrap()))
+                .collect(),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn solid_sevenz_uses_complete_reposted_part_after_article_loss() {
     run_cell(
         Cell {
