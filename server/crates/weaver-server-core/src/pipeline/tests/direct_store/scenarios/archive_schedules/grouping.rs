@@ -1027,6 +1027,37 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 // blocks. Without them the job fails; a set that names its
                 // volumes says which part it is missing.
                 let withheld = interruption.withheld().is_some();
+                // A 7z set no name or index places, with the one volume that
+                // carries its signature never posted and nothing describing
+                // it: the job holds files it has no reason to read as an
+                // archive, and completes them as posted.
+                if cell.container.is_sevenz()
+                    && matches!(
+                        cell.naming,
+                        Naming::HexBare | Naming::HexMisnumbered | Naming::HexScattered
+                    )
+                    && options.recovery == RecoveryFormat::Absent
+                    && interruption
+                        .withheld()
+                        .is_some_and(|(volume, _)| volume == 0)
+                {
+                    profile.assert_route(&outcome);
+                    assert_eq!(
+                        outcome.status,
+                        Some(JobStatus::Complete),
+                        "{context}: {:?}",
+                        outcome.trace
+                    );
+                    assert_eq!(outcome.finalized, 0, "{context}: {:?}", outcome.trace);
+                    assert!(
+                        outcome.files.values().all(Option::is_none)
+                            && wanted.iter().all(|name| !outcome.published.contains(*name)),
+                        "{context}: an unreadable set published a member {:?}: {:?}",
+                        outcome.published,
+                        outcome.trace
+                    );
+                    return;
+                }
                 if withheld
                     && (options.recovery == RecoveryFormat::Absent
                         || matches!(expect, Expect::Fails(_)))
