@@ -392,3 +392,18 @@ fn a_hand_edited_row_cannot_carry_names_into_the_report() {
         report.text
     );
 }
+
+// A finished job the scheduler still caches is reported from history, where
+// its NZB now lives.
+#[test]
+fn a_cached_finished_job_reports_from_history() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&active_job(14)).unwrap();
+    db.archive_job(JobId(14), &history_row(14, "failed"))
+        .unwrap();
+    let report = build_job_support_report(&db, Some(live_info(14)), 14, &ENVIRONMENT, NOW).unwrap();
+    assert_redacted(&report);
+    let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
+    assert_eq!(json["job"]["source"], "history");
+    assert_eq!(json["job"]["status"], "failed");
+}

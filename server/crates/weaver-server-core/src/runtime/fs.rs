@@ -282,7 +282,7 @@ pub(crate) fn normalize_extracted_paths(root: &Path, members: &[String]) -> io::
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn normalize_extracted_tree(path: &Path) -> io::Result<()> {
     normalize_extracted_path(path, true)
 }

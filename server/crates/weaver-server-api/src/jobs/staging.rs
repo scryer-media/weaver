@@ -430,6 +430,25 @@ pub(crate) fn normalize_uploaded_nzb_reader(
     )))
 }
 
+// Whether base64 text of `encoded_len` characters can decode to an NZB within
+// the inline limit. Checked before decoding so an oversized string is refused
+// without first being decoded in full.
+pub(crate) fn inline_nzb_base64_fits(encoded_len: usize) -> Result<(), SubmitNzbError> {
+    let limit = RuntimeSecurityConfig::from_env_or_default_for_tests().nzb_upload_limit_bytes;
+    if base64_len_within(encoded_len, limit) {
+        return Ok(());
+    }
+    Err(SubmitNzbError::Upload(Error::new(
+        ErrorKind::InvalidData,
+        format!("NZB upload exceeds {limit} bytes"),
+    )))
+}
+
+// Padded base64 spends four characters on every three bytes.
+fn base64_len_within(encoded_len: usize, limit: u64) -> bool {
+    (encoded_len as u64) <= limit.div_ceil(3).saturating_mul(4)
+}
+
 // Read NZB bytes that arrived inline, decompressing them when their magic
 // says gzip, zstd or xz. Inline bytes carry no filename or content type, so
 // the bytes themselves are the only evidence; the upload limits still apply.
@@ -477,6 +496,28 @@ mod tests {
     use std::io::Write;
 
     use lzma_rust2::{XzOptions, XzWriter};
+
+    #[test]
+    fn inline_base64_bound_matches_the_decoded_limit() {
+        use base64::Engine;
+        for limit in [0_u64, 1, 2, 3, 4, 5, 6, 7, 1024] {
+            let largest =
+                base64::engine::general_purpose::STANDARD.encode(vec![0_u8; limit as usize]);
+            assert!(base64_len_within(largest.len(), limit), "limit {limit}");
+            // Base64 length resolves bytes only to whole groups of three; the
+            // exact limit is applied to the decoded bytes.
+            let over = base64::engine::general_purpose::STANDARD.encode(vec![
+                0_u8;
+                limit.div_ceil(3)
+                    as usize
+                    * 3
+                    + 1
+            ]);
+            assert!(!base64_len_within(over.len(), limit), "limit {limit}");
+        }
+        assert!(inline_nzb_base64_fits(0).is_ok());
+        assert!(inline_nzb_base64_fits(usize::MAX).is_err());
+    }
 
     fn minimal_nzb(name: &str) -> String {
         format!(

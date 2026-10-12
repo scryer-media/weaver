@@ -330,7 +330,9 @@ async fn async_main() {
                 std::process::exit(1);
             }
         };
-    if matches!(&command, Command::Serve { .. })
+    // Every command that opens the database may have migrated it, so each one
+    // records the version it ran; the next start then backs up only a real upgrade.
+    if command.opens_database()
         && let Err(error) = weaver_server_core::operations::backup::record_started_version(&db)
     {
         error!("could not record the running version after database startup: {error}");

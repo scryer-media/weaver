@@ -17,6 +17,9 @@ import { NextShell } from "../shell/NextShell";
 /** What the picker offers. The daemon reads compression from the bytes, not the name. */
 const ANALYZER_ACCEPT = ".nzb,.gz,.zst,.xz";
 
+// The daemon's default inline NZB limit; a larger file is refused before it is read.
+const ANALYZER_MAX_BYTES = 268_435_456;
+
 /** Base64 in slices, since one `String.fromCharCode` call cannot take a whole NZB. */
 function toBase64(bytes: Uint8Array): string {
   const SLICE = 0x8000;
@@ -53,6 +56,12 @@ export function NzbAnalyzerPage() {
     setError(null);
     setNotice(null);
     setSource({ name: file.name, size: file.size });
+    if (file.size > ANALYZER_MAX_BYTES) {
+      setReport(null);
+      setError(t("next.analyzer.tooLarge", { size: formatSize(ANALYZER_MAX_BYTES) }));
+      setBusy(false);
+      return;
+    }
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
       const result = await analyzeNzb({ input: { nzbBase64: toBase64(bytes) } });

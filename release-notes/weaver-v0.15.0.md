@@ -76,7 +76,10 @@ enforced never-direct setting is planned for a later release.
   disabled backups. `--skip-upgrade-backup` explicitly skips preparation.
   With that skip flag, `--reset-automatic-backup-settings` disables
   automatic backups and discards their stored password for recovery.
-  Upgrade backups have no fixed execution timeout.
+  Upgrade backups have no fixed execution timeout. Every command that
+  opens the database records the version that started, so a one-shot
+  command that migrated does not cause a second pre-migration backup on
+  the next start.
 - Script output is kept by count, not by size. Each run keeps its last
   32 KB of output, stdout and stderr together in the order they arrived,
   compressed hard. A run that printed more shows a "Truncated" chip on the
@@ -86,8 +89,10 @@ enforced never-direct setting is planned for a later release.
   the same way per scan, schedule or feed. Lowering either count deletes
   the older runs in the background as soon as you save. The "captured
   output per run", "compressed output budget" and "compressed output cap
-  per run" settings are gone.
-- The NZB analyzer caps its input while reading instead of after.
+  per run" settings are gone. Deleting a script job keeps its runs.
+- The NZB analyzer caps its input while reading instead of after, and
+  refuses a file above the 256 MiB NZB limit before reading it. The server
+  refuses an inline NZB above that limit before decoding it.
 - A RAR chase counts the articles after a short first one.
 - On Windows, a route leg cannot bind to an interface by name; choose a
   source address instead, and Windows sends through the adapter that owns
@@ -130,11 +135,26 @@ enforced never-direct setting is planned for a later release.
   DNS lookup traffic is not bound to that egress and may use the default
   route. Use a routed resolver when DNS must follow a tunnel.
 - Containers drop `NET_RAW` unless `WEAVER_RETAIN_NET_RAW` explicitly opts
-  into retaining it.
+  into retaining it, including when `PUID` is 0.
 - The settings search box searches every settings panel, not only the open
   one. Matches show under a heading per panel; the open panel stays
   editable and another panel's result opens that panel with the query
   kept. Every word of the query must match, in any order.
+- A script job set to run at startup gets `WEAVER_API_URL` and
+  `WEAVER_RUN_TOKEN` on that first run.
+- A job waiting on its queue scripts is listed with the active downloads.
+- A support report for a job that has just finished is built from its
+  history entry.
+- The route editor offers only targets the route can use: an RSS route
+  lists only proxies and pools with DNS servers, a proxy already used
+  elsewhere in the route is not offered again, and a disabled egress is
+  not offered for a new leg. A route that repeats a proxy or uses a
+  disabled egress cannot be saved.
+- A proxy pool holds 2 to 16 members.
+- A quota allowance that is not a number is treated as missing, so the
+  quota cannot be switched on with it.
+- A job whose route keeps its only connections on a leg past its egress
+  quota parks as blocked by the quota instead of retrying.
 
 ## Removed
 
@@ -180,7 +200,7 @@ enforced never-direct setting is planned for a later release.
   once, on this upgrade, because an empty list could not be told apart from
   the old default. A list cleared after the upgrade stays cleared, and a
   list that already named extensions is kept.
-- The database moves from schema 50 to 56 in one step. The 0.14.7
+- The database moves from schema 50 to 59 in one step. The 0.14.7
   post-processing script lists, options and category assignments become
   post-processing script jobs. Other triggers in a script's header are
   not enabled by the upgrade. A pause or resume
@@ -190,7 +210,14 @@ enforced never-direct setting is planned for a later release.
   script. The upgrade stops with a message if the
   saved scripts directory exists but cannot be read; make it readable and
   start again. A script named in a list but missing from the directory is
-  carried over turned off, with a warning in the log.
+  carried over turned off, with a warning in the log. Schemas 57 and 58
+  record which post-processing scripts of a job have started and how its
+  download ended, so a pass interrupted by a restart resumes with the
+  scripts it had not started and tells them the same outcome. A saved
+  script concurrency below 32 is raised to 32, the new default, because
+  the setting now bounds every script weaver runs, not only the ones a
+  download waits for. Schema 59 keeps a script job's runs when the job is
+  deleted.
 - Category script lists that were empty, or had every script turned off, no
   longer keep scripts from running for that category. The log names each
   such category on upgrade.

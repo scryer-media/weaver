@@ -1128,6 +1128,8 @@ async fn submit_from_facade_input(
     let source_url = input.url.clone();
     let (nzb_bytes, upload, filename) = match (input.nzb_base64, input.url, input.nzb_upload) {
         (Some(b64), None, None) => {
+            crate::jobs::staging::inline_nzb_base64_fits(b64.len())
+                .map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(&b64)
                 .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid base64: {e}")))?;

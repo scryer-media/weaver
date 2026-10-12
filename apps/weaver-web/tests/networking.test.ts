@@ -50,3 +50,16 @@ test("weight editing adding and removing preserve integer shares",()=>{
   while(legs.length>1)legs=removeLeg(legs,legs.length-1);
   assert.equal(legs[0].weight,100);
 });
+
+test("a ladder that repeats a proxy, or a leg on a disabled egress, cannot be saved",()=>{
+  const ladder=(rungs:{kind:"PROXY"|"POOL"|"CHAIN";proxyId:number|null;poolId:number|null;chainIds:number[]}[])=>({failover:"HOLD" as const,legs:[{egressId:7,weight:100,path:{kind:"LADDER" as const,directFallback:false,rungs}}]});
+  const pools=[{id:5,name:"pool",kind:"SOCKS5" as const,memberIds:[1,2],enabled:true}];
+  const viaPool=ladder([{kind:"PROXY",proxyId:2,poolId:null,chainIds:[]},{kind:"POOL",proxyId:null,poolId:5,chainIds:[]}]);
+  assert.equal(routeProblem(viaPool,{pools}),"proxyRepeated");
+  assert.equal(routeProblem(ladder([{kind:"PROXY",proxyId:3,poolId:null,chainIds:[]},{kind:"CHAIN",proxyId:null,poolId:null,chainIds:[4,3]}])),"proxyRepeated");
+  assert.equal(routeProblem(ladder([{kind:"PROXY",proxyId:3,poolId:null,chainIds:[]},{kind:"POOL",proxyId:null,poolId:5,chainIds:[]}]),{pools}),null);
+  const egress=(enabled:boolean)=>[{id:7,name:"e",bindingKind:"INTERFACE" as const,interfaceName:"e0",sourceAddress:null,enabled,maxDownloadSpeed:0,health:"UP",reason:null}];
+  const direct={failover:"HOLD" as const,legs:[{...directLeg(),egressId:7}]};
+  assert.equal(routeProblem(direct,{egresses:egress(false)}),"egressDisabled");
+  assert.equal(routeProblem(direct,{egresses:egress(true)}),null);
+});

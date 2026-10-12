@@ -153,7 +153,7 @@ export function RouteDialog({
     }
   };
 
-  const problem = routeProblem(route);
+  const problem = routeProblem(route, { egresses: data.egressInterfaces, pools: data.proxyPools });
 
   return (
     <Dialog
