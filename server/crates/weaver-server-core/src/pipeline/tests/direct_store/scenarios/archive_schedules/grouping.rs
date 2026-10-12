@@ -1346,6 +1346,20 @@ async fn reposted_rar_recovers_both_articles_of_one_copy() {
 }
 
 #[tokio::test]
+async fn solid_sevenz_uses_complete_reposted_part_after_article_loss() {
+    run_cell(
+        Cell {
+            container: Container::SevenZipSolid,
+            naming: Naming::Reposted,
+            binding: Binding::Nothing,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(240, schedules().into_iter().nth(240).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn repaired_solid_sevenz_preserves_missing_part_diagnostic() {
     run_cell(
         Cell {
