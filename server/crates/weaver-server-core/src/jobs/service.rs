@@ -1203,9 +1203,8 @@ impl Pipeline {
             if let Some(password) = password.as_ref() {
                 spec.password = Some(password.clone());
             }
-            spec.metadata.retain(|(key, _)| {
-                key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
-            });
+            spec.metadata
+                .retain(|(key, _)| !crate::history::attributes::is_password_attribute_key(key));
             let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
 
             let working_dir = output_dir
@@ -1348,9 +1347,7 @@ impl Pipeline {
 
         if let Some(state) = self.jobs.get_mut(&job_id) {
             let mut metadata = state.spec.metadata.clone();
-            metadata.retain(|(key, _)| {
-                key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
-            });
+            metadata.retain(|(key, _)| !crate::history::attributes::is_password_attribute_key(key));
             let update = crate::jobs::JobUpdate {
                 password: password
                     .map(crate::jobs::FieldUpdate::Set)
@@ -1424,9 +1421,8 @@ impl Pipeline {
             if let Some(password) = password.clone() {
                 spec.password = Some(password);
             }
-            spec.metadata.retain(|(key, _)| {
-                key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
-            });
+            spec.metadata
+                .retain(|(key, _)| !crate::history::attributes::is_password_attribute_key(key));
             self.remove_redownload_artifacts(job_id, &working_dir, staging_dir.as_deref())
                 .await;
             self.purge_terminal_job_runtime(job_id);
@@ -1474,9 +1470,8 @@ impl Pipeline {
             if let Some(password) = password.clone() {
                 spec.password = Some(password);
             }
-            spec.metadata.retain(|(key, _)| {
-                key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
-            });
+            spec.metadata
+                .retain(|(key, _)| !crate::history::attributes::is_password_attribute_key(key));
             let working_dir = row
                 .output_dir
                 .as_deref()
@@ -1533,9 +1528,8 @@ impl Pipeline {
         if let Some(password) = password.clone() {
             spec.password = Some(password);
         }
-        spec.metadata.retain(|(key, _)| {
-            key != crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
-        });
+        spec.metadata
+            .retain(|(key, _)| !crate::history::attributes::is_password_attribute_key(key));
         let working_dir = history_row
             .as_ref()
             .and_then(|row| row.output_dir.as_ref())

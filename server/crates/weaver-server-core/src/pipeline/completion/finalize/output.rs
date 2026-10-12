@@ -1402,7 +1402,7 @@ impl Pipeline {
             nzb_filename: format!("{}.nzb", state.spec.name),
             category: state.spec.category.clone(),
             group: None,
-            source_url: None,
+            source_url: crate::post_processing::scan::source_url(&state.spec.metadata),
             working_directory: state.working_dir.clone(),
             final_directory: state.working_dir.clone(),
             pipeline_outcome: facts.outcome.clone(),

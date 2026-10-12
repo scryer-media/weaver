@@ -122,3 +122,47 @@ fn history_filter_supports_exact_attribute_matches() {
     };
     assert!(!matches_history_filter(&item, Some(&misses)));
 }
+
+// History reports a password for a job submitted with one as well as for one
+// whose archive password was validated, and none otherwise.
+#[test]
+fn history_item_has_password_for_a_submitted_or_validated_password() {
+    use weaver_server_core::history::attributes::{
+        SUBMITTED_PASSWORD_ATTRIBUTE_KEY, VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY,
+    };
+    let row = |metadata: Vec<(String, String)>| JobHistoryRow {
+        job_id: 79,
+        job_hash: None,
+        name: "Password History".to_string(),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 2_000,
+        downloaded_bytes: 2_000,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: Some(serde_json::to_string(&metadata).unwrap()),
+        server_attribution: None,
+    };
+    let marked = |key: &str| vec![(key.to_string(), "1".to_string())];
+    assert!(
+        history_item_from_row(&row(marked(SUBMITTED_PASSWORD_ATTRIBUTE_KEY)), None).has_password
+    );
+    assert!(
+        history_item_from_row(&row(marked(VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY)), None)
+            .has_password
+    );
+    let item = history_item_from_row(&row(marked("source")), None);
+    assert!(!item.has_password);
+    let item = history_item_from_row(&row(marked(SUBMITTED_PASSWORD_ATTRIBUTE_KEY)), None);
+    assert!(
+        item.attributes.is_empty(),
+        "the marker is not a public attribute"
+    );
+}

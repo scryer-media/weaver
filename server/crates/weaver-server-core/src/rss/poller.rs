@@ -427,6 +427,9 @@ impl RssService {
             .list_rss_rules(feed.id)
             .map_err(|e| RssServiceError::Http(e.to_string()))?;
         let compiled_rules = compile_rules(rules);
+        let accepts_any = compiled_rules
+            .iter()
+            .any(|rule| rule.row.action == RssRuleAction::Accept);
 
         let mut report = RssFeedSyncReport {
             feed_id: feed.id,
@@ -477,7 +480,13 @@ impl RssService {
                 }
                 None => {
                     report.items_ignored += 1;
-                    self.record_seen(feed.id, &item, "ignored", None, None)?;
+                    // Seen only once a rule could have taken it. A feed is
+                    // polled as soon as it is added, before its rules are;
+                    // recording its items then would leave them for good
+                    // before the first accept rule could ever see them.
+                    if accepts_any {
+                        self.record_seen(feed.id, &item, "ignored", None, None)?;
+                    }
                 }
             }
         }

@@ -1,5 +1,21 @@
 pub const CLIENT_REQUEST_ID_ATTRIBUTE_KEY: &str = "__weaver_client_request_id";
 pub const VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY: &str = "__weaver_validated_archive_password";
+// Set on a history row whose job was submitted with a password. The password
+// itself leaves with the active row; this keeps only that there was one.
+pub const SUBMITTED_PASSWORD_ATTRIBUTE_KEY: &str = "__weaver_submitted_with_password";
+
+// The attributes that speak for a job's password. A job started again from
+// its history row is told its password afresh, so it never inherits these.
+pub fn is_password_attribute_key(key: &str) -> bool {
+    key == VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY || key == SUBMITTED_PASSWORD_ATTRIBUTE_KEY
+}
+
+// Whether a history row's job had a password, submitted or validated.
+pub fn history_metadata_has_password(metadata: &[(String, String)]) -> bool {
+    metadata
+        .iter()
+        .any(|(key, _)| is_password_attribute_key(key))
+}
 
 pub fn parse_history_metadata(metadata: Option<&str>) -> Vec<(String, String)> {
     metadata

@@ -155,6 +155,18 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
     ]
 }
 
+fn mark_submitted_password(metadata: Option<&str>) -> Result<String, StateError> {
+    let key = crate::history::attributes::SUBMITTED_PASSWORD_ATTRIBUTE_KEY;
+    let mut parameters: Vec<(String, String)> = metadata
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| StateError::Database(error.to_string()))?
+        .unwrap_or_default();
+    parameters.retain(|(name, _)| name != key);
+    parameters.push((key.to_string(), "1".to_string()));
+    serde_json::to_string(&parameters).map_err(|error| StateError::Database(error.to_string()))
+}
+
 async fn archive_job_sql(
     datastore: StoreDatastore,
     job_id: JobId,
@@ -174,6 +186,18 @@ async fn archive_job_sql(
                 if history.status == "cancelled" && let Some(directory) = effects.directory {
                     history.output_dir = Some(directory.to_string_lossy().into_owned());
                 }
+            }
+            // The password leaves with the active row; the history row keeps
+            // only that the job was submitted with one.
+            let submitted_password = tx
+                .fetch_optional("SELECT password FROM active_jobs WHERE job_id = {}", &[SqlArg::I64(job_id.0 as i64)])
+                .await?
+                .map(|row| row.opt_text("password"))
+                .transpose()?
+                .flatten()
+                .is_some_and(|password| !password.is_empty());
+            if submitted_password {
+                history.metadata = Some(mark_submitted_password(history.metadata.as_deref())?);
             }
             let args = history_args(&history, job_id);
             let archived = tx

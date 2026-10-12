@@ -15,6 +15,14 @@ static SCAN_SCRATCH_ADMISSION: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock:
 pub const ADD_TO_TOP_KEY: &str = "weaver.submission.add_to_top";
 pub const SOURCE_URL_KEY: &str = "weaver.submission.source_url";
 
+// The URL a job was submitted from, as its submission recorded it.
+pub(crate) fn source_url(metadata: &[(String, String)]) -> Option<String> {
+    metadata
+        .iter()
+        .find(|(key, _)| key == SOURCE_URL_KEY)
+        .map(|(_, value)| value.clone())
+}
+
 pub(crate) fn numeric_priority(value: &str) -> i64 {
     value
         .parse()

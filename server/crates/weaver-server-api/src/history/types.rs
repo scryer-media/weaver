@@ -280,6 +280,14 @@ pub enum EventKind {
     GlobalPaused,
     GlobalResumed,
     PhaseProgressUpdated,
+    // One post-processing script run on the job, and what a script printed
+    // at each severity.
+    PostProcessingScript,
+    ScriptError,
+    ScriptWarning,
+    ScriptOutput,
+    ScriptDetail,
+    ScriptDebug,
 }
 
 impl std::str::FromStr for EventKind {
@@ -327,9 +335,36 @@ impl std::str::FromStr for EventKind {
             "SegmentFailedPermanent" => Ok(Self::SegmentFailedPermanent),
             "GlobalPaused" => Ok(Self::GlobalPaused),
             "GlobalResumed" => Ok(Self::GlobalResumed),
+            "PhaseProgressUpdated" => Ok(Self::PhaseProgressUpdated),
+            "PostProcessingScript" => Ok(Self::PostProcessingScript),
+            "ScriptError" => Ok(Self::ScriptError),
+            "ScriptWarning" => Ok(Self::ScriptWarning),
+            "ScriptOutput" => Ok(Self::ScriptOutput),
+            "ScriptDetail" => Ok(Self::ScriptDetail),
+            "ScriptDebug" => Ok(Self::ScriptDebug),
             _ => Err(()),
         }
     }
+}
+
+// A stored job event as the API reports it. A kind the API does not name is
+// left out with a warning rather than reported as some other kind.
+pub(crate) fn job_event_from_core(event: weaver_server_core::JobEvent) -> Option<JobEvent> {
+    let Ok(kind) = event.kind.parse::<EventKind>() else {
+        tracing::warn!(
+            job_id = event.job_id,
+            kind = %event.kind,
+            "job event of a kind the API does not name left out"
+        );
+        return None;
+    };
+    Some(JobEvent {
+        kind,
+        job_id: event.job_id,
+        file_id: event.file_id,
+        message: event.message,
+        timestamp: event.timestamp as f64,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
@@ -499,7 +534,9 @@ fn history_item_from_display(
         optional_recovery_downloaded_bytes: row.optional_recovery_downloaded_bytes,
         failed_bytes: row.failed_bytes,
         health: row.health,
-        has_password: parse_history_metadata(row.metadata.as_deref()).iter().any(|(key, _)| key == weaver_server_core::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY),
+        has_password: weaver_server_core::history::attributes::history_metadata_has_password(
+            &parse_history_metadata(row.metadata.as_deref()),
+        ),
         category: row.category.clone(),
         attributes,
         client_request_id,

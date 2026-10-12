@@ -17,12 +17,7 @@ impl Pipeline {
                 nzb_filename: format!("{}.nzb", state.spec.name),
                 category: state.spec.category.clone(),
                 group: None,
-                source_url: state
-                    .spec
-                    .metadata
-                    .iter()
-                    .find(|(key, _)| key == crate::post_processing::scan::SOURCE_URL_KEY)
-                    .map(|(_, value)| value.clone()),
+                source_url: crate::post_processing::scan::source_url(&state.spec.metadata),
                 working_directory: state.working_dir.clone(),
                 final_directory: state.working_dir.clone(),
                 pipeline_outcome: PipelineOutcome::Succeeded,
