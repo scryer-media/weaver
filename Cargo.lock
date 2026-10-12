@@ -2945,19 +2945,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "lzma-rust2"
-version = "0.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e2a88783b84d2d67ef2791778a9e76bfb68b8017aaf6c9d7d5f2626a478b16c"
-dependencies = [
- "sha2 0.11.0",
-]
-
-[[package]]
 name = "lzma-turbo"
-version = "0.6.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9062c1b910139b10dc12eb1a78aa90919aafed4124012fc7828dd29a7fdcce40"
+checksum = "9b9ccc3065ff5558e94314fcf941f2508a6ace67da9b2cdc85a6f4e436ab2f0b"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
@@ -3411,9 +3402,9 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "249654e24926ceee61ec11cd9b0bf4c9a8853278a690b43c3c4a498434922853"
+checksum = "21fef23eb6b2418ca36c1c795b80c88f8690811ee83aa9958da57010ee34e017"
 dependencies = [
  "blake3",
  "cap-std",
@@ -3693,10 +3684,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a6394b9e965e73d0a289ee54f589087e2c676aedf60885baf52c76b771e4958"
 
 [[package]]
-name = "ppmd-rust"
-version = "1.5.0"
+name = "ppmd-turbo"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "196a7c80b9a7652aba7cc070827516c2abe4ccdf53d128e1944003cf5726cff1"
+checksum = "d772f4b18e5af5cf5186a3661d5fc451c7366b2ce59da997179ed192bf12512b"
 
 [[package]]
 name = "ppv-lite86"
@@ -3952,9 +3943,9 @@ dependencies = [
 
 [[package]]
 name = "reedsolomon-rs"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054e5c6992bec77f14cd80b5922ff62c3bd0c405c97bf62264de66aa129a3d6c"
+checksum = "591306d5543b5932373935e6382e567711eb383e804fb74ba333e1371a28a8a9"
 dependencies = [
  "memmap2",
  "rayon",
@@ -4583,9 +4574,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.26.1"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef0b63767205ca00089473573d7172b94878631874f5f22183b9a411b436aedf"
+checksum = "4abe071a8b7d5f393996f6f7e1c210510ac014de56db49e0228a3a2ce8523a06"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -4598,7 +4589,7 @@ dependencies = [
  "js-sys",
  "lz4_flex",
  "lzma-turbo",
- "ppmd-rust",
+ "ppmd-turbo",
  "wasm-bindgen",
  "zeroize",
  "zstd 0.14.0",
@@ -5742,9 +5733,9 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.10.9"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9d40916ba3f8f77c52682361d7fff7e15b07f9fef79fb39867b79272e18ab0b"
+checksum = "374d56427700534ae07ae77280b6d95071ab11b02d1737493e02e425d20b00bf"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys",
@@ -5753,6 +5744,7 @@ dependencies = [
  "filetime",
  "libc",
  "memchr",
+ "ppmd-turbo",
  "rayon",
  "reedsolomon-rs",
  "rmp-serde",
@@ -6076,7 +6068,7 @@ dependencies = [
  "chrono",
  "flate2",
  "hex",
- "lzma-rust2",
+ "lzma-turbo",
  "regex",
  "reqwest",
  "scryer-release-parser",
@@ -6129,7 +6121,6 @@ dependencies = [
  "keyring",
  "keyring-core",
  "libc",
- "lzma-rust2",
  "lzma-turbo",
  "notify",
  "par2-rs",

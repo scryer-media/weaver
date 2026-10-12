@@ -2912,11 +2912,13 @@ fn sized_lzma2_archive(dictionary: u32, members: &[(String, Vec<u8>)]) -> Vec<u8
     options.set_dictionary_size(dictionary);
     writer.set_content_methods(vec![EncoderConfiguration::from(options)]);
     for (name, bytes) in members {
+        // A size hint the size of the dictionary stops the writer shrinking
+        // the folder's dictionary to the member; the push records the bytes
+        // actually read.
+        let mut entry = ArchiveEntry::new_file(name);
+        entry.size = u64::from(dictionary);
         writer
-            .push_archive_entry(
-                ArchiveEntry::new_file(name),
-                Some(std::io::Cursor::new(bytes.clone())),
-            )
+            .push_archive_entry(entry, Some(std::io::Cursor::new(bytes.clone())))
             .expect("entry");
     }
     writer.finish().expect("finish").into_inner()

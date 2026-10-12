@@ -267,8 +267,14 @@ pub(crate) fn apply_server_rar_limits_with_memory_limit(
             );
         });
     }
+    // A RAR3 PPMd block declares its model arena in the block header, not
+    // the member header this module sizes reservations from, so the arena is
+    // held to the same ceiling as a dictionary: a block asking for more fails
+    // before the arena is allocated instead of taking it on top of the
+    // reservation.
     let limits = unrar_rs::Limits {
         max_dict_size: resolved.max_dict_bytes,
+        max_ppmd_arena_size: resolved.max_dict_bytes,
         ..Default::default()
     };
     archive.set_limits(limits);

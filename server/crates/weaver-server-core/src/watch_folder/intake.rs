@@ -816,7 +816,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    use lzma_rust2::{XzOptions, XzWriter};
+    use lzma_turbo::{LzmaEncProps, XzWriter};
 
     fn minimal_nzb(name: &str) -> Vec<u8> {
         format!(
@@ -832,7 +832,8 @@ mod tests {
     }
 
     fn xz_compress(bytes: &[u8]) -> Vec<u8> {
-        let mut writer = XzWriter::new(Vec::new(), XzOptions::with_preset(0)).unwrap();
+        let props = LzmaEncProps::xz_preset(0, false).unwrap();
+        let mut writer = XzWriter::new(Vec::new(), &props).unwrap();
         writer.write_all(bytes).unwrap();
         writer.finish().unwrap()
     }

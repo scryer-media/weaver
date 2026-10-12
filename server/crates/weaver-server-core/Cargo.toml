@@ -37,7 +37,7 @@ par3-rs = { workspace = true }
 # Already in the graph through par2-rs; named directly so System info can read
 # the XOR-JIT gate, which par2-rs does not re-export. The RAR3 recovery-volume
 # tests also author their `.rev` fixture with its RS coder.
-reedsolomon-rs = { version = "0.4.9", default-features = false }
+reedsolomon-rs = { version = "0.4.10", default-features = false }
 unrar-rs = { workspace = true, features = [
     "crypto-aws-lc",
 ] }
@@ -123,7 +123,7 @@ application-updater = { git = "https://github.com/scryer-media/application-updat
 # `UpgradeManifestFetchOverrides::asset_base` is a `url::Url`; already in the
 # graph through reqwest, named here only so the test can build one.
 url = "2"
-lzma-rust2 = { workspace = true, features = ["encoder"] }
+lzma-turbo = { workspace = true, features = ["enc"] }
 
 [[bench]]
 name = "infrastructure_retry"

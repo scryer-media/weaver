@@ -2485,8 +2485,8 @@ async fn nested_single_stream_preserves_non_archive_sibling() {
     tokio::fs::write(staging_dir.join("sample.mkv"), media)
         .await
         .unwrap();
-    let mut xz =
-        lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(0)).unwrap();
+    let props = lzma_turbo::LzmaEncProps::xz_preset(0, false).unwrap();
+    let mut xz = lzma_turbo::XzWriter::new(Vec::new(), &props).unwrap();
     std::io::Write::write_all(&mut xz, notes).unwrap();
     tokio::fs::write(staging_dir.join("release.nfo.xz"), xz.finish().unwrap())
         .await

@@ -115,6 +115,19 @@ enforced never-direct setting is planned for a later release.
   longer gain a zero byte at every article boundary.
 - RAR3 recovery volumes are restored with a derived decode matrix applied
   to whole regions instead of one byte column at a time.
+- A conventional 7z extraction of a non-solid archive decodes its folders
+  on parallel workers when the hardware profile grants more than one thread,
+  reading the archive through a second handle charged to the same budget.
+  A chase keeps its single ordered reader.
+- 7z members are written straight from the decoder to the member file
+  while the CRC is taken, instead of through a copy buffer, on both the
+  conventional and chase paths.
+- A RAR member's PPMd model is bound to the same ceiling as its dictionary.
+  A block that asks for more fails before the model is allocated instead
+  of growing past the member's reservation.
+- The archive crates ship their current releases: sevenz 0.27, lzma 0.9,
+  unrar 0.11, par3 0.5.1 and reedsolomon 0.4.10. PPMd in RAR and 7z now
+  decodes through one shared engine, and lzma-rust2 is no longer linked.
 
 ## What changed
 

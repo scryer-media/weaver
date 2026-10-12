@@ -14,7 +14,7 @@ use tempfile::TempDir;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
-use lzma_rust2::{XzOptions, XzWriter, XzWriterMt};
+use lzma_turbo::{LzmaEncProps, XzWriter};
 
 static XZ_MT_DECODER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -35,8 +35,7 @@ fn sevenz_member_requires_declared_length_and_crc() {
                     ..Default::default()
                 };
                 let mut output = Vec::new();
-                let result =
-                    copy_verified_7z_member(&entry, &mut Cursor::new(payload), &mut output);
+                let result = copy_verified_7z_member(&entry, &mut &payload[..], &mut output);
                 let valid = size == payload.len() && (!has_crc || stored_crc == checksum);
                 assert_eq!(
                     result.is_ok(),
@@ -349,17 +348,20 @@ fn create_tar_with_entries(archive_path: &Path, entries: &[(&str, &[u8])]) {
 }
 
 fn xz_compress(bytes: &[u8], block_size: Option<NonZeroU64>) -> Vec<u8> {
-    let mut options = XzOptions::with_preset(0);
-    options.set_block_size(block_size);
-    let mut writer = XzWriter::new(Vec::new(), options).unwrap();
+    let props = LzmaEncProps::xz_preset(0, false).unwrap();
+    let mut writer = XzWriter::new(Vec::new(), &props).unwrap();
+    if let Some(block_size) = block_size {
+        writer.set_block_size(block_size.get());
+    }
     writer.write_all(bytes).unwrap();
     writer.finish().unwrap()
 }
 
 fn xz_compress_multiblock(bytes: &[u8]) -> Vec<u8> {
-    let mut options = XzOptions::with_preset(0);
-    options.set_block_size(NonZeroU64::new(options.lzma_options.dict_size.into()));
-    let mut writer = XzWriterMt::new(Vec::new(), options, 2).unwrap();
+    let props = LzmaEncProps::xz_preset(0, false).unwrap();
+    let mut writer = XzWriter::new(Vec::new(), &props).unwrap();
+    writer.set_block_size(u64::from(props.dict_size()));
+    writer.set_threads(2);
     writer.write_all(bytes).unwrap();
     writer.finish().unwrap()
 }
@@ -1073,11 +1075,15 @@ fn sevenz_archive_with_dictionary(dictionary: u32, members: &[(&str, &[u8])]) ->
     options.set_dictionary_size(dictionary);
     writer.set_content_methods(vec![EncoderConfiguration::from(options)]);
     for (name, bytes) in members {
+        // The writer shrinks a folder's dictionary to the bytes it is told
+        // the folder holds. The hint is read before the push and the pushed
+        // length is what the entry records, so a hint the size of the
+        // dictionary keeps the declared dictionary at `dictionary` without
+        // padding the member.
+        let mut entry = ArchiveEntry::new_file(name);
+        entry.size = u64::from(dictionary);
         writer
-            .push_archive_entry(
-                ArchiveEntry::new_file(name),
-                Some(Cursor::new(bytes.to_vec())),
-            )
+            .push_archive_entry(entry, Some(Cursor::new(bytes.to_vec())))
             .expect("entry");
     }
     writer.finish().expect("finish").into_inner()
@@ -1105,6 +1111,41 @@ fn conventional_7z_context(
             allowance_cap: u64::MAX,
         },
         decode_threads,
+    }
+}
+
+// The conventional path hands the reader a second handle on the archive, so
+// the folders of a non-solid archive decode on parallel workers. Every member
+// still arrives in archive order with its bytes intact.
+#[test]
+fn conventional_7z_extraction_decodes_non_solid_folders_on_parallel_workers() {
+    let temp = TempDir::new().unwrap();
+    let out_dir = temp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    let members: Vec<(String, Vec<u8>)> = (0..12u8)
+        .map(|index| {
+            let name = format!("Silver.Horizon/part-{index:02}.txt");
+            let bytes: Vec<u8> = (0..(64 * 1024 + usize::from(index)))
+                .map(|offset| (offset as u8).wrapping_mul(index.wrapping_add(3)))
+                .collect();
+            (name, bytes)
+        })
+        .collect();
+    let entries: Vec<(&str, &[u8])> = members
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let archive = sevenz_archive_with_dictionary(1024 * 1024, &entries);
+
+    let (root, budget) = test_extraction_security_with_memory(&out_dir, 256 * 1024 * 1024);
+    let context = conventional_7z_context(&out_dir, root, budget, &archive, 4);
+    let outcome = extract_7z_stream(&context, || Ok(Cursor::new(archive.clone())))
+        .expect("non-solid folders extract on parallel workers");
+
+    let expected: Vec<String> = members.iter().map(|(name, _)| name.clone()).collect();
+    assert_eq!(outcome.extracted, expected);
+    for (name, bytes) in &members {
+        assert_eq!(&fs::read(out_dir.join(name)).unwrap(), bytes, "{name}");
     }
 }
 
@@ -2021,6 +2062,7 @@ fn chase_decode_widens_on_a_backlog_of_complete_runs() {
         job_id,
         "silver_horizon.7z",
         Cursor::new(archive.clone()),
+        None,
         &out_dir,
         sevenz_turbo::Password::empty(),
         sevenz_archive_limits(&budget),

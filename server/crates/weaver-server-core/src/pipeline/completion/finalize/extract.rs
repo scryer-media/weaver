@@ -294,40 +294,69 @@ fn resolve_sevenz_parts(
     selected.ok_or(original_error)
 }
 
-// A decoder can reach EOF before its checksum reader reaches the declared
-// length. Verify both facts before committing the member or its counters.
-fn copy_verified_7z_member(
-    entry: &sevenz_turbo::ArchiveEntry,
-    reader: &mut dyn std::io::Read,
-    writer: &mut impl Write,
-) -> std::io::Result<u64> {
-    let mut crc = weaver_yenc::crc::Crc32::new();
-    let mut buffer = vec![0u8; EXTRACT_WRITE_BUFFER_BYTES];
-    let mut copied = 0u64;
-    loop {
-        let count = match reader.read(&mut buffer) {
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            result => result?,
-        };
-        if count == 0 {
-            break;
-        }
-        copied = copied.checked_add(count as u64).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "7z member length overflow")
-        })?;
-        if copied > entry.size() {
+// The sink a 7z member is written on through: it counts and checksums what
+// the decoder hands over, and refuses a byte past the declared size before
+// it reaches the file.
+struct VerifiedMemberSink<'a, W> {
+    entry: &'a sevenz_turbo::ArchiveEntry,
+    writer: &'a mut W,
+    crc: weaver_yenc::crc::Crc32,
+    copied: u64,
+}
+
+impl<W: Write> Write for VerifiedMemberSink<'_, W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let copied = self
+            .copied
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "7z member length overflow")
+            })?;
+        if copied > self.entry.size() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "7z member {} exceeds declared size {}",
-                    entry.name(),
-                    entry.size()
+                    self.entry.name(),
+                    self.entry.size()
                 ),
             ));
         }
-        crc.update(&buffer[..count]);
-        writer.write_all(&buffer[..count])?;
+        self.crc.update(buffer);
+        self.writer.write_all(buffer)?;
+        self.copied = copied;
+        Ok(buffer.len())
     }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+// A decoder can reach EOF before its checksum reader reaches the declared
+// length. Verify both facts before committing the member or its counters.
+//
+// The entry writes itself on from the decoder's own output, so the bytes are
+// handed over in the pieces the decoder made them in rather than read into a
+// buffer of this module's first.
+fn copy_verified_7z_member(
+    entry: &sevenz_turbo::ArchiveEntry,
+    reader: &mut dyn sevenz_turbo::EntryRead,
+    writer: &mut impl Write,
+) -> std::io::Result<u64> {
+    let mut sink = VerifiedMemberSink {
+        entry,
+        writer,
+        crc: weaver_yenc::crc::Crc32::new(),
+        copied: 0,
+    };
+    reader.write_rest(&mut sink)?;
+    let VerifiedMemberSink {
+        crc,
+        copied,
+        writer,
+        ..
+    } = sink;
     if copied != entry.size() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -1091,28 +1120,36 @@ fn note_adaptive_backlog(_job_id: JobId, _pending_runs: usize) {}
 // to the walk, so it is gone before this returns, whatever the walk's
 // outcome.
 #[allow(clippy::too_many_arguments)]
-fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
+fn decode_7z_streaming<R: std::io::Read + std::io::Seek + Send + 'static>(
     job_id: JobId,
     set_name: &str,
     reader: R,
+    positional: Option<R>,
     output_dir: &Path,
     password: sevenz_turbo::Password,
     limits: sevenz_turbo::ArchiveLimits,
     threads: SevenZipDecodeThreads,
     mut extract_fn: impl FnMut(
         &sevenz_turbo::ArchiveEntry,
-        &mut dyn std::io::Read,
+        &mut dyn sevenz_turbo::EntryRead,
         &PathBuf,
     ) -> Result<bool, sevenz_turbo::Error>,
 ) -> Result<SevenZipDecodeReport, sevenz_turbo::Error> {
     let mut archive_reader = sevenz_turbo::ArchiveReader::with_limits(reader, password, limits)?;
+    // A second handle on the same bytes lets the folders of a non-solid
+    // archive decode on parallel workers, each reading at its own offset.
+    // The reads take turns on the one handle; the decoding does not.
+    if let Some(positional) = positional {
+        archive_reader.set_positional_source(sevenz_turbo::SerialReadAt::new(positional));
+    }
     if !output_dir.exists() {
         std::fs::create_dir_all(output_dir)?;
     }
     let destination = output_dir.to_path_buf();
     let mut walk =
         |archive_reader: &mut sevenz_turbo::ArchiveReader<R>| -> Result<(), sevenz_turbo::Error> {
-            archive_reader.for_each_entries(|entry, reader| extract_fn(entry, reader, &destination))
+            archive_reader
+                .for_each_entries_direct(|entry, reader| extract_fn(entry, reader, &destination))
         };
 
     let (ceiling, widening, budget) = match threads {
@@ -1282,7 +1319,7 @@ pub(in crate::pipeline) fn extract_7z_stream<R, F>(
     mut open_reader: F,
 ) -> Result<FullSetExtractionOutcome, String>
 where
-    R: std::io::Read + std::io::Seek + Send,
+    R: std::io::Read + std::io::Seek + Send + 'static,
     F: FnMut() -> Result<R, String>,
 {
     let SevenZipExtractionContext {
@@ -1423,7 +1460,7 @@ where
     let budget_ref = budget;
 
     let extract_fn = |entry: &sevenz_turbo::ArchiveEntry,
-                      reader: &mut dyn std::io::Read,
+                      reader: &mut dyn sevenz_turbo::EntryRead,
                       _dest: &PathBuf|
      -> Result<bool, sevenz_turbo::Error> {
         let safe_path = root_ref
@@ -1516,12 +1553,21 @@ where
 
     let reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
     let mut limits = sevenz_archive_limits(budget);
+    let mut positional = None;
     let threads = match decode_memory {
         SevenZipDecodeMemory::ReservedForFixedThreads { .. } => {
             // What the decode reserved is what its decoder may hold: the
             // reader keeps a parallel decode's runs in flight within this,
             // and decodes on one thread if it leaves no room to widen.
             limits.memory_limit_bytes = decode_granted;
+            // Every byte is on disk, so the folders of a non-solid archive
+            // can decode on parallel workers reading at their own offsets.
+            // The workers are charged against the same limit. A chase gets
+            // no second handle: it reads at the download frontier, and its
+            // governor widens the one decoder from the backlog it sees.
+            if *decode_threads > 1 {
+                positional = Some(BudgetedReader::new(open_reader()?, Arc::clone(budget)));
+            }
             SevenZipDecodeThreads::Fixed(*decode_threads)
         }
         SevenZipDecodeMemory::ReservedPerPass { widening, .. } => {
@@ -1544,6 +1590,7 @@ where
         job_id,
         set_name,
         reader,
+        positional,
         output_dir,
         password.clone(),
         limits,

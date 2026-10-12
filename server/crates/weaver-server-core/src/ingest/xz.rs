@@ -78,9 +78,8 @@ pub(crate) fn xz_filesystem_decoder_kind<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read, Write};
-    use std::num::NonZeroU64;
 
-    use lzma_rust2::{XzOptions, XzWriter, XzWriterMt};
+    use lzma_turbo::{LzmaEncProps, XzWriter};
 
     use super::{
         XZ_DECODER_MEMORY_LIMIT_BYTES, XzFilesystemDecoderKind, xz_filesystem_decoder_kind,
@@ -88,15 +87,17 @@ mod tests {
     };
 
     fn xz_compress(bytes: &[u8]) -> Vec<u8> {
-        let mut writer = XzWriter::new(Vec::new(), XzOptions::with_preset(0)).unwrap();
+        let props = LzmaEncProps::xz_preset(0, false).unwrap();
+        let mut writer = XzWriter::new(Vec::new(), &props).unwrap();
         writer.write_all(bytes).unwrap();
         writer.finish().unwrap()
     }
 
     fn xz_compress_multiblock(bytes: &[u8]) -> Vec<u8> {
-        let mut options = XzOptions::with_preset(0);
-        options.set_block_size(NonZeroU64::new(options.lzma_options.dict_size.into()));
-        let mut writer = XzWriterMt::new(Vec::new(), options, 2).unwrap();
+        let props = LzmaEncProps::xz_preset(0, false).unwrap();
+        let mut writer = XzWriter::new(Vec::new(), &props).unwrap();
+        writer.set_block_size(u64::from(props.dict_size()));
+        writer.set_threads(2);
         writer.write_all(bytes).unwrap();
         writer.finish().unwrap()
     }

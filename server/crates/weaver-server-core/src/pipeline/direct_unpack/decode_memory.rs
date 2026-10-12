@@ -218,6 +218,16 @@ mod tests {
         archive_for_with_password(methods, members, solid, Password::empty())
     }
 
+    // The writer shrinks a folder's coders to the bytes its entries declare,
+    // and the members here are far smaller than the dictionaries under test.
+    // A hint past every tested dictionary keeps the requested dictionary; the
+    // push overwrites the hint with the bytes actually read.
+    fn sized_entry(name: &str) -> ArchiveEntry {
+        let mut entry = ArchiveEntry::new_file(name);
+        entry.size = 1 << 30;
+        entry
+    }
+
     fn archive_for_with_password(
         methods: Vec<EncoderConfiguration>,
         members: usize,
@@ -237,7 +247,7 @@ mod tests {
         if solid {
             let names = entries
                 .iter()
-                .map(|(name, _)| ArchiveEntry::new_file(name))
+                .map(|(name, _)| sized_entry(name))
                 .collect::<Vec<_>>();
             let readers = entries
                 .iter()
@@ -249,10 +259,7 @@ mod tests {
         } else {
             for (name, bytes) in &entries {
                 writer
-                    .push_archive_entry(
-                        ArchiveEntry::new_file(name),
-                        Some(io::Cursor::new(bytes.clone())),
-                    )
+                    .push_archive_entry(sized_entry(name), Some(io::Cursor::new(bytes.clone())))
                     .expect("entry");
             }
         }

@@ -20,7 +20,7 @@ pub(super) fn extract_7z_with_password_candidates<R, F>(
     mut open_reader: F,
 ) -> Result<FullSetExtractionOutcome, String>
 where
-    R: std::io::Read + std::io::Seek + Send,
+    R: std::io::Read + std::io::Seek + Send + 'static,
     F: FnMut() -> Result<R, String>,
 {
     let budget = Arc::clone(&context.budget);
@@ -101,6 +101,7 @@ where
             context.job_id,
             &context.set_name,
             BudgetedReader::new(open_reader()?, Arc::clone(&budget)),
+            None,
             &context.output_dir,
             password.clone(),
             limits,

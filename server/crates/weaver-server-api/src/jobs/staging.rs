@@ -495,7 +495,7 @@ mod tests {
     use std::fmt::Write as _;
     use std::io::Write;
 
-    use lzma_rust2::{XzOptions, XzWriter};
+    use lzma_turbo::{LzmaEncProps, XzWriter};
 
     #[test]
     fn inline_base64_bound_matches_the_decoded_limit() {
@@ -558,7 +558,8 @@ mod tests {
     }
 
     fn make_xz_upload(filename: &str, content_type: &str, name: &str) -> UploadValue {
-        let mut writer = XzWriter::new(Vec::new(), XzOptions::with_preset(0)).unwrap();
+        let props = LzmaEncProps::xz_preset(0, false).unwrap();
+        let mut writer = XzWriter::new(Vec::new(), &props).unwrap();
         writer.write_all(minimal_nzb(name).as_bytes()).unwrap();
         UploadValue {
             filename: filename.to_string(),
