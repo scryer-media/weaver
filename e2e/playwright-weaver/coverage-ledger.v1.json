@@ -664,47 +664,47 @@
     },
     {
       "name": "createEgressInterface",
-      "owner": "advanced-networking",
+      "owner": "advanced-networking-egress",
       "oracle": "api-metrics"
     },
     {
       "name": "updateEgressInterface",
-      "owner": "advanced-networking",
+      "owner": "advanced-networking-egress",
       "oracle": "api-metrics"
     },
     {
       "name": "deleteEgressInterface",
-      "owner": "advanced-networking",
+      "owner": "advanced-networking-egress",
       "oracle": "api-metrics"
     },
     {
       "name": "createProxyPool",
-      "owner": "advanced-networking",
+      "owner": "advanced-networking-pools",
       "oracle": "api-metrics"
     },
     {
       "name": "updateProxyPool",
-      "owner": "advanced-networking",
+      "owner": "advanced-networking-pools",
       "oracle": "api-metrics"
     },
     {
       "name": "deleteProxyPool",
-      "owner": "advanced-networking",
+      "owner": "advanced-networking-pools",
       "oracle": "api-metrics"
     },
     {
       "name": "saveNetworkRoute",
-      "owner": "advanced-networking",
+      "owner": "advanced-networking-routes",
       "oracle": "api-metrics"
     },
     {
       "name": "testEgressInterface",
-      "owner": "advanced-networking",
+      "owner": "advanced-networking-egress",
       "oracle": "api-metrics"
     },
     {
       "name": "testProxyPool",
-      "owner": "advanced-networking",
+      "owner": "advanced-networking-pools",
       "oracle": "api-metrics"
     }
   ],
@@ -745,8 +745,23 @@
       "oracle": "existing-pipeline"
     },
     {
-      "name": "egress-legs-ladders-pools-and-sessions",
-      "owner": "advanced-networking",
+      "name": "egress-legs-and-network-restart",
+      "owner": "advanced-networking-egress",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "ladders-sessions-and-routed-feeds",
+      "owner": "advanced-networking-routes",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "proxy-pool-members-and-failover",
+      "owner": "advanced-networking-pools",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "proxy-pool-delivery-reselection",
+      "owner": "advanced-networking-pool-reselection",
       "oracle": "api-metrics"
     },
     {

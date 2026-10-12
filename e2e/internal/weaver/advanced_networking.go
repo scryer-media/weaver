@@ -115,6 +115,22 @@ func advancedNetworkingReleaseFlow() weaverReleaseFlowSpec {
 	}
 }
 
+// Each partition owns a fresh stack. Pool reselection is separated because
+// it spends several minutes collecting delivery evidence before changing pins.
+func advancedNetworkingPartition(name string, files []string, restart bool) weaverReleaseFlowSpec {
+	spec := advancedNetworkingReleaseFlow()
+	spec.Name = "advanced-networking-" + name
+	spec.PlaywrightScript = spec.Name
+	spec.SpecFiles = files
+	spec.Stages = []string{"initial"}
+	spec.StageScripts = nil
+	if restart {
+		spec.Stages = append(spec.Stages, "restarted")
+		spec.StageScripts = map[string]string{"restarted": spec.Name + "-restarted"}
+	}
+	return spec
+}
+
 // The Bind refusal needs a Weaver without CAP_NET_RAW, which is a container
 // property, so it runs as its own single-network phase.
 func advancedNetworkingNoNetRawReleaseFlow() weaverReleaseFlowSpec {

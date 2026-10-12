@@ -150,7 +150,10 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 		Artifacts:  []string{"flow.log", "status.json", "fake-nntp-counters.json"},
 		Timeout:    12 * time.Minute,
 	},
-	advancedNetworkingReleaseFlow(),
+	advancedNetworkingPartition("egress", []string{"network-egress.spec.ts", "network-legs.spec.ts", "network-reload.spec.ts"}, true),
+	advancedNetworkingPartition("routes", []string{"network-ladders.spec.ts", "network-sessions.spec.ts", "network-rss.spec.ts"}, false),
+	advancedNetworkingPartition("pools", []string{"network-pools.spec.ts"}, false),
+	advancedNetworkingPartition("pool-reselection", []string{"network-pools.spec.ts"}, false),
 	advancedNetworkingNoNetRawReleaseFlow(),
 	advancedNetworkingExtendedReleaseFlow(),
 	eventScriptsReleaseFlow(),
@@ -573,6 +576,16 @@ func weaverReleaseNetworkCandidates(phases []*weaverReleasePhase) []string {
 func resolveWeaverReleaseGateSpecs(mode string) ([]weaverReleaseFlowSpec, error) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	switch mode {
+	case "advanced-networking":
+		var out []weaverReleaseFlowSpec
+		for _, name := range []string{"egress", "routes", "pools", "pool-reselection"} {
+			spec, ok := weaverReleaseFlowSpecFor("advanced-networking-" + name)
+			if !ok {
+				return nil, fmt.Errorf("missing advanced networking partition %q", name)
+			}
+			out = append(out, spec)
+		}
+		return out, nil
 	case "", "all", "datastore-matrix":
 		out := make([]weaverReleaseFlowSpec, 0, len(weaverReleaseFlowSpecs))
 		for _, spec := range weaverReleaseFlowSpecs {

@@ -347,8 +347,11 @@ func TestFetchableNetworkCandidatesAreOutsideTheBlockedRanges(t *testing.T) {
 
 func TestAdvancedNetworkingTimeScaleReachesOnlyItsFlows(t *testing.T) {
 	scaled := map[string]bool{
-		"advanced-networking":            true,
-		"advanced-networking-no-net-raw": true,
+		"advanced-networking-egress":           true,
+		"advanced-networking-routes":           true,
+		"advanced-networking-pools":            true,
+		"advanced-networking-pool-reselection": true,
+		"advanced-networking-no-net-raw":       true,
 	}
 	t.Setenv("E2E_WEAVER_NETWORK_TIME_SCALE", "99")
 	for _, spec := range weaverReleaseFlowSpecs {
@@ -360,6 +363,45 @@ func TestAdvancedNetworkingTimeScaleReachesOnlyItsFlows(t *testing.T) {
 		}
 		if got != want {
 			t.Errorf("%s: E2E_WEAVER_NETWORK_TIME_SCALE = %q, want %q", spec.Name, got, want)
+		}
+	}
+}
+
+func TestAdvancedNetworkingPartitionsPreserveCoverageAndRestart(t *testing.T) {
+	parts, err := resolveWeaverReleaseGateSpecs("advanced-networking")
+	if err != nil || len(parts) != 4 {
+		t.Fatalf("networking group = %#v, %v", parts, err)
+	}
+	all, err := resolveWeaverReleaseGateSpecs("all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]int{}
+	for _, part := range parts {
+		if !slices.ContainsFunc(all, func(spec weaverReleaseFlowSpec) bool { return spec.Name == part.Name }) {
+			t.Fatalf("%s missing from default gate", part.Name)
+		}
+		if !slices.Equal(part.Datastores, releaseDatastoreMatrix()) {
+			t.Fatalf("%s lost datastore coverage", part.Name)
+		}
+		for _, file := range part.SpecFiles {
+			seen[file]++
+		}
+		if part.Name == "advanced-networking-egress" {
+			if !slices.Equal(part.Stages, []string{"initial", "restarted"}) || part.StageScripts["restarted"] != "advanced-networking-egress-restarted" {
+				t.Fatal("egress/reload partition lost restart coverage")
+			}
+		} else if !slices.Equal(part.Stages, []string{"initial"}) {
+			t.Fatalf("%s has an unnecessary restart stage", part.Name)
+		}
+	}
+	for _, file := range advancedNetworkingSpecFiles {
+		want := 1
+		if file == "network-pools.spec.ts" {
+			want = 2 // complementary P02 and non-P02 selectors
+		}
+		if seen[file] != want {
+			t.Errorf("%s appears in %d partitions, want %d", file, seen[file], want)
 		}
 	}
 }
