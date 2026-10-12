@@ -60,6 +60,7 @@ test("T03 a legacy resume rule resumes downloads only", async ({ request }) => {
       expect(await watchFolderPaused(request), "watch intake stays paused: no pause_all rule was ever seen").toBe(true);
       expect(await setting("schedule_pause_all_used")).toBeUndefined();
     } finally {
+      await rules.clearAndSettle();
       await resumeAll(request);
       await disarmWatchFolder(request);
     }
@@ -85,6 +86,7 @@ test("T01 pause and resume rules hold downloads for their window", async ({ requ
       const released = await waitPaused(request, false, "T01 resumed at 10:30");
       expect(released.downloadBlock.kind).toBe("NONE");
     } finally {
+      await rules.clearAndSettle();
       await resumeAll(request);
     }
   });
@@ -113,6 +115,7 @@ test("T02 pause_all holds downloads, watch intake and RSS until resume", async (
       await waitPaused(request, false, "T02 downloads resumed at 10:30");
       await expect.poll(() => watchFolderPaused(request), { message: "T02 watch intake resumed", timeout: 0 }).toBe(false);
     } finally {
+      await rules.clearAndSettle();
       await resumeAll(request);
       await disarmWatchFolder(request);
     }
@@ -125,24 +128,29 @@ test("T04 post-processing pause defers completion until resume", async ({ reques
   const day = freshDay();
   setClock(at(day, 9, 59));
   await withRules(request, "t04", async rules => {
-    await rules.create({ actionType: "resume_post_processing", time: "10:30" });
-    const pause = await rules.create({ actionType: "pause_post_processing", time: "10:00" });
-    expect(pause.track).toBe("POST_PROCESSING");
-    setClock(at(day, 10, 0));
-    await witnessTick(request);
+    try {
+      await rules.create({ actionType: "resume_post_processing", time: "10:30" });
+      const pause = await rules.create({ actionType: "pause_post_processing", time: "10:00" });
+      expect(pause.track).toBe("POST_PROCESSING");
+      setClock(at(day, 10, 0));
+      await witnessTick(request);
 
-    const id = await startDownload(request, `t04-${token}`, { count: 4, partBytes: 32 * 1024 });
-    let item: QueueItem | null = null;
-    await expect.poll(async () => {
-      item = await queueItem(request, id);
-      return item !== null && item.remainingFileCount === 0;
-    }, { message: "T04 download finished", timeout: 0 }).toBe(true);
-    await witnessTick(request);
-    expect(await queueItem(request, id), "still queued while post-processing is paused").not.toBeNull();
-    expect(await jobState(request, id)).not.toBe("COMPLETED");
+      const id = await startDownload(request, `t04-${token}`, { count: 4, partBytes: 32 * 1024 });
+      let item: QueueItem | null = null;
+      await expect.poll(async () => {
+        item = await queueItem(request, id);
+        return item !== null && item.remainingFileCount === 0;
+      }, { message: "T04 download finished", timeout: 0 }).toBe(true);
+      await witnessTick(request);
+      expect(await queueItem(request, id), "still queued while post-processing is paused").not.toBeNull();
+      expect(await jobState(request, id)).not.toBe("COMPLETED");
 
-    setClock(at(day, 10, 30));
-    expect(await waitTerminal(request, id)).toBe("COMPLETED");
+      setClock(at(day, 10, 30));
+      expect(await waitTerminal(request, id)).toBe("COMPLETED");
+    } finally {
+      await rules.clearAndSettle();
+      await withControlKey(request, key => nzbgetRpc(request, key, "resumepost", []));
+    }
   });
 });
 
@@ -171,6 +179,7 @@ test("T05 watch-folder scanning pauses and resumes on schedule", async ({ reques
       await expect.poll(() => fs.existsSync(`${dropped}.queued`), { message: "T05 resume scans the folder", timeout: 0 }).toBe(true);
       expect(await watchFolderPaused(request)).toBe(false);
     } finally {
+      await rules.clearAndSettle();
       await disarmWatchFolder(request);
     }
   });
