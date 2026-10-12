@@ -409,6 +409,7 @@ export const nextPt: LocaleDictionary = {
   "next.analyzer.dropZone": "Solte um .nzb ou .nzb.gz aqui, ou clique para escolher um",
   "next.analyzer.analyzing": "Analisando…",
   "next.analyzer.failed": "Não foi possível analisar o NZB.",
+  "next.analyzer.tooLarge": "O NZB excede {{size}}.",
   "next.analyzer.emptyTitle": "Nenhum NZB analisado ainda",
   "next.analyzer.emptyBody": "O relatório mostra a estrutura e os sinais de alerta do NZB sem nomes, grupos ou IDs de mensagem, então pode ser compartilhado publicamente.",
   "next.analyzer.report": "Relatório",

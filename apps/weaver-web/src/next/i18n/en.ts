@@ -416,6 +416,7 @@ export const nextEn: LocaleDictionary = {
   "next.analyzer.dropZone": "Drop an .nzb or .nzb.gz here, or click to choose one",
   "next.analyzer.analyzing": "Analyzing…",
   "next.analyzer.failed": "The NZB could not be analyzed.",
+  "next.analyzer.tooLarge": "The NZB is larger than {{size}}.",
   "next.analyzer.emptyTitle": "No NZB analyzed yet",
   "next.analyzer.emptyBody": "The report lists the NZB's shape and red flags without names, groups or message IDs, so it is safe to paste in public.",
   "next.analyzer.report": "Report",

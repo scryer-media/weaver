@@ -409,6 +409,7 @@ export const nextDe: LocaleDictionary = {
   "next.analyzer.dropZone": "Eine .nzb oder .nzb.gz hier ablegen oder klicken, um eine auszuwählen",
   "next.analyzer.analyzing": "Wird analysiert…",
   "next.analyzer.failed": "Die NZB konnte nicht analysiert werden.",
+  "next.analyzer.tooLarge": "Die NZB ist größer als {{size}}.",
   "next.analyzer.emptyTitle": "Noch keine NZB analysiert",
   "next.analyzer.emptyBody": "Der Bericht zeigt Aufbau und Warnsignale der NZB ohne Namen, Gruppen oder Message-IDs und kann daher öffentlich geteilt werden.",
   "next.analyzer.report": "Bericht",

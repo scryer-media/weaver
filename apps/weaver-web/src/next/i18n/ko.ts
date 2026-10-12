@@ -409,6 +409,7 @@ export const nextKo: LocaleDictionary = {
   "next.analyzer.dropZone": ".nzb 또는 .nzb.gz 파일을 여기에 놓거나 클릭해 선택하세요",
   "next.analyzer.analyzing": "분석 중…",
   "next.analyzer.failed": "NZB를 분석하지 못했습니다.",
+  "next.analyzer.tooLarge": "NZB가 {{size}}를 초과합니다.",
   "next.analyzer.emptyTitle": "아직 분석한 NZB가 없습니다",
   "next.analyzer.emptyBody": "보고서는 이름, 그룹, 메시지 ID 없이 NZB의 구조와 경고 신호를 보여 주므로 공개적으로 붙여 넣어도 안전합니다.",
   "next.analyzer.report": "보고서",

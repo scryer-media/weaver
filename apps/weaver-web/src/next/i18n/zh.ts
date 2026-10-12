@@ -409,6 +409,7 @@ export const nextZh: LocaleDictionary = {
   "next.analyzer.dropZone": "将 .nzb 或 .nzb.gz 拖放到此处，或点击选择",
   "next.analyzer.analyzing": "正在分析…",
   "next.analyzer.failed": "无法分析该 NZB。",
+  "next.analyzer.tooLarge": "NZB 超过 {{size}}。",
   "next.analyzer.emptyTitle": "尚未分析任何 NZB",
   "next.analyzer.emptyBody": "报告列出 NZB 的结构和警示信号，不含名称、组或消息 ID，因此可以公开粘贴。",
   "next.analyzer.report": "报告",
