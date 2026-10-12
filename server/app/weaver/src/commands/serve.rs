@@ -251,11 +251,6 @@ pub(crate) async fn run(
                 db: Some(db.clone()),
             },
         );
-    weaver_server_core::post_processing::scheduler::spawn_script_evaluator(
-        db.clone(),
-        shared_config.clone(),
-    );
-
     let pipeline_config = shared_config.clone();
 
     // Spawn event persistence subscriber (records meaningful events to SQLite).
@@ -353,6 +348,13 @@ pub(crate) async fn run(
         Ok(bound) => db.set_script_api_url(script_api_url(bound, &base_url)),
         Err(error) => warn!(%error, "could not read the bound address; scripts cannot call back"),
     }
+    // Scheduled scripts start only once the callback address is installed: the
+    // evaluator's first tick launches startup jobs, and a job launched before
+    // this point would run without its API address and token.
+    weaver_server_core::post_processing::scheduler::spawn_script_evaluator(
+        db.clone(),
+        shared_config.clone(),
+    );
     let update_check = weaver_server_core::update_check::UpdateCheckService::new(db.clone())?;
 
     // The in-application upgrade. The installation is classified once, here,
