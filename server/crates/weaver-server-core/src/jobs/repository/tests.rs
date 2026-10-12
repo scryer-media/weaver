@@ -1666,3 +1666,69 @@ fn complete_files_chunks_beyond_sqlite_bind_limit() {
     );
     assert_eq!(count, 1500);
 }
+
+// A job submitted with a password says so on its history row, which keeps no
+// password; one submitted without says nothing.
+#[test]
+fn archive_job_records_that_the_job_had_a_submitted_password() {
+    use crate::history::attributes::{
+        SUBMITTED_PASSWORD_ATTRIBUTE_KEY, history_metadata_has_password,
+    };
+
+    let db = Database::open_in_memory().unwrap();
+    let mut with_password = sample_job(1);
+    with_password.password_override = Some("submitted-secret".into());
+    db.create_active_job(&with_password).unwrap();
+    let mut without_password = sample_job(2);
+    without_password.password_override = Some(String::new());
+    db.create_active_job(&without_password).unwrap();
+
+    for job_id in [1, 2] {
+        let history = JobHistoryRow {
+            job_id,
+            job_hash: None,
+            name: format!("test-{job_id}.nzb"),
+            status: "complete".to_string(),
+            error_message: None,
+            total_bytes: 1_000,
+            downloaded_bytes: 1_000,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1000,
+            category: None,
+            output_dir: Some(format!("/tmp/output_{job_id}")),
+            nzb_path: None,
+            created_at: 1700000001,
+            completed_at: 1700001000,
+            metadata: Some(
+                serde_json::to_string(&vec![("Origin".to_string(), "e2e".to_string())]).unwrap(),
+            ),
+            server_attribution: None,
+        };
+        db.archive_job(JobId(job_id), &history).unwrap();
+    }
+
+    let metadata = |job_id| {
+        crate::parse_history_metadata(
+            db.get_job_history(job_id)
+                .unwrap()
+                .unwrap()
+                .metadata
+                .as_deref(),
+        )
+    };
+    let first = metadata(1);
+    assert!(history_metadata_has_password(&first));
+    assert!(first.contains(&("Origin".to_string(), "e2e".to_string())));
+    assert!(first.contains(&(
+        SUBMITTED_PASSWORD_ATTRIBUTE_KEY.to_string(),
+        "1".to_string()
+    )));
+    assert!(
+        !first
+            .iter()
+            .any(|(_, value)| value.contains("submitted-secret"))
+    );
+    assert!(!history_metadata_has_password(&metadata(2)));
+}

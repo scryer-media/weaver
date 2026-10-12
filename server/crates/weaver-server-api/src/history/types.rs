@@ -534,7 +534,9 @@ fn history_item_from_display(
         optional_recovery_downloaded_bytes: row.optional_recovery_downloaded_bytes,
         failed_bytes: row.failed_bytes,
         health: row.health,
-        has_password: parse_history_metadata(row.metadata.as_deref()).iter().any(|(key, _)| key == weaver_server_core::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY),
+        has_password: weaver_server_core::history::attributes::history_metadata_has_password(
+            &parse_history_metadata(row.metadata.as_deref()),
+        ),
         category: row.category.clone(),
         attributes,
         client_request_id,
