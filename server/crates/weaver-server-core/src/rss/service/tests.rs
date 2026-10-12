@@ -1090,3 +1090,92 @@ async fn due_feed_selection_loads_only_the_due_feed() {
     // A due feed brings the next look forward to now, floored at a second.
     assert_eq!(service.next_due_sync_delay(), Some(Duration::from_secs(1)));
 }
+
+// The release gate's feed: one item, polled by the background sweep as soon
+// as the feed is added and before its accept rule exists. The item must still
+// be new when the rule arrives, so the operator's poll submits it.
+#[tokio::test]
+async fn a_new_feeds_first_sweep_leaves_its_items_for_the_rule_added_after_it() {
+    let temp = TempDir::new().unwrap();
+    let db = Database::open(&temp.path().join("rss-new-feed.sqlite")).unwrap();
+    let title = "Weaver E2E RSS Behavior Probe";
+    let fixture = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+  <title>Weaver E2E RSS fixture</title>
+  <item>
+    <title>Weaver E2E RSS Behavior Probe</title>
+    <guid isPermaLink="false">weaver-e2e-rss-behavior-probe</guid>
+    <link>{nzb}</link>
+    <pubDate>Fri, 14 Mar 2032 08:00:00 GMT</pubDate>
+    <enclosure url="{nzb}" length="1" type="application/x-nzb" />
+  </item>
+</channel></rss>"#;
+    // The server puts its own address where the body names localhost.
+    let state = TestHttpState {
+        feed_body: fixture.replace("{nzb}", "http://localhost/download.nzb"),
+        nzb_body: sample_nzb_bytes(),
+        etag: None,
+        require_auth: false,
+        feed_hold: None,
+        feed_requests: Arc::new(AtomicUsize::new(0)),
+        nzb_requests: Arc::new(AtomicUsize::new(0)),
+        auth_failures: Arc::new(AtomicUsize::new(0)),
+        conditional_hits: Arc::new(AtomicUsize::new(0)),
+    };
+    let (base_url, server_task) = start_test_server(state.clone()).await;
+    db.insert_rss_feed(&RssFeedRow {
+        scripts: Vec::new(),
+        id: 1,
+        name: "E2E Controlled Feed".to_string(),
+        url: format!("{base_url}/feed"),
+        enabled: true,
+        poll_interval_secs: 900,
+        username: None,
+        password: None,
+        default_category: None,
+        default_metadata: vec![],
+        etag: None,
+        last_modified: None,
+        last_polled_at: None,
+        last_success_at: None,
+        last_error: None,
+        consecutive_failures: 0,
+    })
+    .unwrap();
+    let submissions = Arc::new(StdMutex::new(Vec::new()));
+    let service = build_service(temp.path(), db.clone(), submissions.clone());
+
+    // The sweep the new feed wakes, before any rule.
+    let DueSyncOutcome::Completed(swept) = service.try_run_due_sync().await.unwrap() else {
+        panic!("the new feed is due at once");
+    };
+    assert_eq!((swept.feeds_polled, swept.items_fetched), (1, 1));
+    assert_eq!(swept.items_submitted, 0);
+
+    db.insert_rss_rule(&RssRuleRow {
+        id: 1,
+        feed_id: 1,
+        sort_order: 0,
+        enabled: true,
+        action: RssRuleAction::Accept,
+        title_regex: Some(title.to_string()),
+        item_categories: vec![],
+        min_size_bytes: None,
+        max_size_bytes: None,
+        category_override: None,
+        metadata: vec![],
+    })
+    .unwrap();
+
+    let first = service.run_feed_sync(1).await.unwrap();
+    assert_eq!(
+        (first.feeds_polled, first.items_new, first.items_submitted),
+        (1, 1, 1),
+        "{first:?}"
+    );
+    assert_eq!(submissions.lock().unwrap().len(), 1);
+    let again = service.run_feed_sync(1).await.unwrap();
+    assert_eq!((again.items_new, again.items_submitted), (0, 0));
+    assert_eq!(state.nzb_requests.load(Ordering::SeqCst), 1);
+    server_task.abort();
+}
