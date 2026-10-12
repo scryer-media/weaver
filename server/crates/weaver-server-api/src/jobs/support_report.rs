@@ -11,7 +11,9 @@ use weaver_server_core::support::{
 use weaver_server_core::{Database, SchedulerHandle};
 
 use crate::auth::graphql_error;
-use crate::jobs::staging::{normalize_uploaded_nzb_reader, read_inline_nzb_bytes};
+use crate::jobs::staging::{
+    inline_nzb_base64_fits, normalize_uploaded_nzb_reader, read_inline_nzb_bytes,
+};
 
 /// A report safe to paste in public: no names, paths, hosts or passwords.
 #[derive(Debug, Clone, SimpleObject)]
@@ -75,11 +77,16 @@ pub(crate) async fn resolve_analyze_nzb(
                 .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid upload: {e}")))?;
             Source::Upload(upload)
         }
-        (None, Some(encoded)) => Source::Inline(
-            base64::engine::general_purpose::STANDARD
-                .decode(encoded.trim())
-                .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid base64: {e}")))?,
-        ),
+        (None, Some(encoded)) => {
+            let encoded = encoded.trim();
+            inline_nzb_base64_fits(encoded.len())
+                .map_err(|e| graphql_error("INVALID_INPUT", e.to_string()))?;
+            Source::Inline(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid base64: {e}")))?,
+            )
+        }
         _ => {
             return Err(graphql_error(
                 "INVALID_INPUT",
