@@ -36,6 +36,17 @@ Everything below is new since 0.14.7. This is a pre-release.
 - Schedules control download and post-processing pauses, watch-folder and
   RSS pauses, speed limits, hardware profiles, quota metering, history
   pruning, and server activation. Script jobs carry their own schedules.
+- Archives that posters obfuscate, misnumber, repost or post short now
+  finish where 0.14 failed them. Hex-named RAR volumes are grouped by the
+  member chain their headers describe, obfuscated 7z parts are named by
+  their PAR2 descriptions and stay in direct store, a volume the post never
+  carried is rebuilt from the recovery set, a one-volume 7z repairs itself
+  from the PAR3 it carries, and an archive found inside a directly stored
+  7z is extracted instead of published as is. See "Archives and recovery".
+- Archive passwords have a home. Settings → General keeps a list of
+  passwords to try, encrypted, and a password file to read more from. An
+  encrypted archive is tried with the job's own password first, then the
+  NZB's password, then the filename convention, then the list and the file.
 - The legacy web UI is gone. The Next UI is the only interface.
 
 ## Kill switch
@@ -48,6 +59,62 @@ direct leg or a direct fallback, and weaver will follow the route as saved.
 If a server must never leave except through a VPN or proxy, keep its route
 free of direct legs and fallbacks, and check it after any change. An
 enforced never-direct setting is planned for a later release.
+
+## Archives and recovery
+
+- RAR volumes with no number in their names are placed by the member chain
+  their headers describe. A RAR5 volume that states no number is volume 0.
+  A set with no first volume waits for volumes instead of failing to open,
+  and two obfuscated sets a job cannot tell apart are never merged.
+- Split 7z parts that arrive under obfuscated names are held until the PAR2
+  descriptions name them, then laid out as a direct set. An obfuscated
+  single-file 7z is named by the PAR2 description whose hash matches its
+  first 16 KiB. A 7z set whose end header cannot arrive is demoted as soon
+  as that is known instead of holding every byte until the set settles.
+- A one-volume 7z that carries PAR3 recovery packets after its end header is
+  accepted, and a lost member article is repaired from that embedded set.
+  PAR3 embedded in a split 7z recovers across the parts, and a verified
+  PAR3 tail on the final part is accepted.
+- A volume the NZB never listed but the recovery set describes is taken on
+  by its set and rebuilt in place, the same as a volume lost after posting.
+  A hole in a run of numbered parts asks the recovery set for the part
+  instead of failing on it. A 7z set posted short of its part count waits
+  for the described tail.
+- The missing-part check waits for downloads to drain and for the restore
+  from recovery volumes (`.rev`) to have its turn, and it no longer counts a
+  part an eager extraction already consumed as missing. When an opened RAR
+  set still cannot finish, the failure names each awaited volume number and
+  the last volume seen before it.
+- Parts posted under one another's names, or under duplicate names, are
+  read by what PAR2 says they are. Every PAR2-identified archive input lands
+  on its described name before cleanup, so a completed job no longer shows
+  alias or duplicate names.
+- Malformed, truncated or wrongly signed RAR headers go to PAR2 repair
+  instead of ending the job. Encrypted-header RAR sets repair their
+  decryptable edges independently. A restored direct image is read before
+  it is trusted as verified.
+- A job with several archive sets fails as a whole when one set cannot be
+  recovered, and publishes nothing. A healthy direct set waits for a
+  demoted neighbour's conventional extraction before it finalizes.
+- A byte-identical repost never displaces a set that is already extracting.
+  A late decode write after delivery has started is rejected, and extracted
+  members alone get their permissions normalized.
+- After a restart, a file the previous process started conventionally is
+  never renamed onto a live direct set's volume, and PAR3 restored prefixes
+  are published for verification. A split 7z part rebuilt and named after
+  the topology was built is added to it instead of waiting forever.
+- A part the recovery set wrote is never chased by direct unpack; the set
+  is already whole on disk and is joined conventionally.
+- The hardware profile decides how a 7z chase widens once complete runs
+  pile up behind the decoding thread: Efficient adds a thread per waiting
+  run and looks every 200 ms, Balanced every 100 ms, Performance widens to
+  its ceiling on the first waiting run and looks every 50 ms. A profile put
+  in force reaches the next chase; a running chase keeps what it started
+  with.
+- uuencoded posts whose last line declares more bytes than it carries no
+  longer gain a zero byte at every article boundary.
+- RAR3 recovery volumes are restored with a derived decode matrix applied
+  to whole regions instead of one byte column at a time.
 
 ## What changed
 
@@ -154,7 +221,55 @@ enforced never-direct setting is planned for a later release.
 - A quota allowance that is not a number is treated as missing, so the
   quota cannot be switched on with it.
 - A job whose route keeps its only connections on a leg past its egress
-  quota parks as blocked by the quota instead of retrying.
+  quota parks as blocked by the quota instead of retrying. A retry that
+  exhausts its egress parks as well.
+- A `.go` file in the scripts directory runs as a script. It is built
+  offline into a cache under the data directory, so it may import the
+  standard library only. The `go` command sits beside the other
+  interpreters in the scripts settings.
+- A script cut off by a restart is recorded as interrupted, a status of its
+  own in the API, the NZBGet compatibility API and the Runs table. After a
+  restart, a failed job's unstarted scripts resume with the same outcome
+  they would have been told; a started script is never rerun.
+- A script that exits 95 leaves the previous script's status unchanged, so
+  the next script does not see SUCCESS after a skip.
+- A job that has queue-event script jobs but no post-processing job still
+  waits for its queue events before it leaves the queue.
+- A download submitted by URL passes that URL to its post-processing
+  scripts. Script job events keep their own event kinds in the API.
+- A script destination that does not exist, or a delivery worker that
+  fails, is reported as an operational failure instead of a security
+  refusal.
+- A one-shot schedule, such as a history prune, missed while weaver was
+  stopped runs once on the first tick after start. A schedule that names an
+  unknown weekday is refused instead of firing on the wrong days. A speed
+  limit set from the queue becomes the configured limit, so the queue
+  state reports it. A watch-folder resume that fails no longer leaves
+  scanning paused in memory.
+- A leg reads down while every rung of its ladder is cooling, so a revoked
+  route shows blocked instead of idle. A chain names the hop that could
+  not be reached rather than the hop that answered, and the flow reports
+  the first failing hop on each rung with its reason.
+- A WireGuard hop stacked on another WireGuard hop is sized to carry it: the
+  lower session runs at the MTU the carried tunnel needs, and a chain the
+  cap cannot carry at full size reports a warning on its leg. Saving refuses
+  a WireGuard proxy that reaches one egress by two different paths, since a
+  WireGuard server accepts one connection per key.
+- Leg throughput counts bytes once their rate wait is over, so a leg's
+  sample no longer reads above the egress limit.
+- A new feed is polled only once its route is installed. Items a feed
+  returned before it had any rule are not marked seen, so the first accept
+  rule still gets them.
+- The folder picker can pick a file. The archive password file field uses
+  it. GraphQL: `browseDirectories` takes `includeFiles` and returns `files`.
+- A job archived to History with a password is marked as having had one,
+  never with the secret. The password shows on the job page.
+- Prometheus: script run counts, durations and last-run gauges, slot
+  occupancy and queue-event backlog; schedule evaluations, actions, replays
+  and per-rule fire state; route leg, egress, pool, proxy-hop, DNS and
+  ladder families. The Grafana dashboard has a row for each.
+- Backup restore accepts an older bundle whose table set differs from the
+  current catalog. Newer-version backups are kept and failed ones pruned.
 
 ## Removed
 
