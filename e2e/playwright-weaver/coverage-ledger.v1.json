@@ -653,6 +653,11 @@
       "oracle": "browser"
     },
     {
+      "name": "updateArchivePasswordSettings",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
       "name": "updateAutoBackupSettings",
       "owner": "scheduling",
       "oracle": "api-metrics"

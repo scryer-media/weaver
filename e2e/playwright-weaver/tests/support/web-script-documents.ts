@@ -15,7 +15,6 @@ const POST_PROCESSING_SETTINGS_FIELDS = `
     scriptDirectory
     executionEnabled
     concurrency
-    eventScriptConcurrency
     eventScriptTimeoutSeconds
     fileDownloadedEventInterval
     scriptOutputRunsPerJob

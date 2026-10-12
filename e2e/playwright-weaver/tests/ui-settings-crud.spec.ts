@@ -94,6 +94,46 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
   await expect(editor).toBeHidden();
 });
 
+test("archive passwords and the password file save, clear and persist without echoing the list", async ({ cleanPage: page }) => {
+  await page.goto("/settings/general");
+  const section = page.getByRole("region", { name: "Archive passwords", exact: true });
+  const list = section.getByRole("textbox", { name: "Passwords (one per line)", exact: true });
+  const file = section.getByRole("textbox", { name: "Password file", exact: true });
+  const clear = section.getByRole("button", { name: "Clear", exact: true });
+  const passwordFile = "/data/e2e-archive-passwords.txt";
+  if (afterRestart) {
+    // The daemon reports only that a list is stored; the list never comes back.
+    await expect(clear).toBeVisible();
+    await expect(list).toHaveValue("");
+    await expect(file).toHaveValue(passwordFile);
+    return;
+  }
+
+  await expect(clear).toHaveCount(0);
+  await list.fill("first-secret\nsecond-secret");
+  await file.fill(passwordFile);
+  await file.press("Tab");
+  await saveSettings(page);
+  await page.reload();
+  await expect(clear).toBeVisible();
+  await expect(list).toHaveValue("");
+  await expect(file).toHaveValue(passwordFile);
+
+  // Clearing removes the stored list on save and keeps the file.
+  await clear.click();
+  await expect(section.getByRole("button", { name: "Keep", exact: true })).toBeVisible();
+  await saveSettings(page);
+  await page.reload();
+  await expect(clear).toHaveCount(0);
+  await expect(file).toHaveValue(passwordFile);
+
+  // Leave a list stored for the restart stage.
+  await list.fill("third-secret");
+  await saveSettings(page);
+  await page.reload();
+  await expect(clear).toBeVisible();
+});
+
 test("provider edits keep the stored password masked and a disabled provider can be added and removed", async ({ cleanPage: page }) => {
   await page.goto("/settings/servers");
   const serverRow = tableRow(page, "Servers", "nntp");
