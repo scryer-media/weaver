@@ -1392,3 +1392,51 @@ async fn a_resumed_job_whose_scripts_had_all_started_runs_none_of_them() {
     assert_eq!(report.summary, PostProcessingSummary::Interrupted);
     assert_eq!(db.job_post_processing_results(72).unwrap(), report.results);
 }
+
+// An exit-95 script (NONE) leaves the status the next script sees as it was,
+// so after only a skipped script that is still NONE.
+#[test]
+fn exit_95_leaves_the_previous_script_status_unchanged() {
+    use super::executor::previous_script_status;
+    use super::runner::NzbgetScriptStatus;
+    let result = |status, exit_code| ScriptResult {
+        script: script("chain.sh"),
+        instance_id: None,
+        instance_name: None,
+        event: Default::default(),
+        adapter: ScriptAdapter::Nzbget,
+        status,
+        exit_code: Some(exit_code),
+        duration_ms: 5,
+        output_tail: String::new(),
+        output_id: None,
+        background: false,
+        output_truncated: false,
+        error_message: None,
+        finished_at_epoch_ms: 1_000,
+    };
+    let skipped = result(ScriptStatus::Skipped, 95);
+    let failed = result(ScriptStatus::Failed, 94);
+    let succeeded = result(ScriptStatus::Succeeded, 93);
+
+    assert_eq!(
+        previous_script_status(NzbgetScriptStatus::None, &skipped),
+        NzbgetScriptStatus::None
+    );
+    assert_eq!(
+        previous_script_status(NzbgetScriptStatus::Failure, &skipped),
+        NzbgetScriptStatus::Failure
+    );
+    assert_eq!(
+        previous_script_status(NzbgetScriptStatus::None, &succeeded),
+        NzbgetScriptStatus::Success
+    );
+    assert_eq!(
+        previous_script_status(NzbgetScriptStatus::Failure, &succeeded),
+        NzbgetScriptStatus::Failure
+    );
+    assert_eq!(
+        previous_script_status(NzbgetScriptStatus::None, &failed),
+        NzbgetScriptStatus::Failure
+    );
+}

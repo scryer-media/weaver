@@ -949,14 +949,15 @@ impl PostProcessingExecutor {
 
 // Why execution is refused, or `None` when it may proceed.
 // How the next script sees the ones before it, in NZBGet's terms: a failure
-// anywhere stays a failure, and a script that never ran changes nothing.
-fn previous_script_status(
+// anywhere stays a failure, and a script that never ran or exited 95 (NONE)
+// changes nothing.
+pub(super) fn previous_script_status(
     previous: NzbgetScriptStatus,
     result: &ScriptResult,
 ) -> NzbgetScriptStatus {
     match result.status {
-        ScriptStatus::Skipped if result.exit_code.is_none() => previous,
-        ScriptStatus::Succeeded | ScriptStatus::Skipped => {
+        ScriptStatus::Skipped => previous,
+        ScriptStatus::Succeeded => {
             if previous == NzbgetScriptStatus::Failure {
                 NzbgetScriptStatus::Failure
             } else {
