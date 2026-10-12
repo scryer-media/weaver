@@ -1027,6 +1027,37 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                 // blocks. Without them the job fails; a set that names its
                 // volumes says which part it is missing.
                 let withheld = interruption.withheld().is_some();
+                // A 7z set no name or index places, with the one volume that
+                // carries its signature never posted and nothing describing
+                // it: the job holds files it has no reason to read as an
+                // archive, and completes them as posted.
+                if cell.container.is_sevenz()
+                    && matches!(
+                        cell.naming,
+                        Naming::HexBare | Naming::HexMisnumbered | Naming::HexScattered
+                    )
+                    && options.recovery == RecoveryFormat::Absent
+                    && interruption
+                        .withheld()
+                        .is_some_and(|(volume, _)| volume == 0)
+                {
+                    profile.assert_route(&outcome);
+                    assert_eq!(
+                        outcome.status,
+                        Some(JobStatus::Complete),
+                        "{context}: {:?}",
+                        outcome.trace
+                    );
+                    assert_eq!(outcome.finalized, 0, "{context}: {:?}", outcome.trace);
+                    assert!(
+                        outcome.files.values().all(Option::is_none)
+                            && wanted.iter().all(|name| !outcome.published.contains(*name)),
+                        "{context}: an unreadable set published a member {:?}: {:?}",
+                        outcome.published,
+                        outcome.trace
+                    );
+                    return;
+                }
                 if withheld
                     && (options.recovery == RecoveryFormat::Absent
                         || matches!(expect, Expect::Fails(_)))
@@ -1121,15 +1152,31 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                         .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
                 {
                     // A lost identity prefix can prevent binding before enough
-                    // header evidence survives to prove the swapped chain.
-                    route.shape_demotion = |reason| {
-                        matches!(
-                            reason,
-                            DemotionReason::Par2Unbindable
-                                | DemotionReason::MemberIneligible(
-                                    MemberIneligibility::MalformedChain
-                                )
-                        )
+                    // header evidence survives to prove the swapped chain. Solid
+                    // members can be refused before that binding is attempted.
+                    route.shape_demotion = if cell.container.is_solid_rar() {
+                        |reason| {
+                            matches!(
+                                reason,
+                                DemotionReason::Par2Unbindable
+                                    | DemotionReason::MemberIneligible(
+                                        MemberIneligibility::Compressed
+                                            | MemberIneligibility::Solid
+                                            | MemberIneligibility::Encrypted
+                                            | MemberIneligibility::MalformedChain
+                                    )
+                            )
+                        }
+                    } else {
+                        |reason| {
+                            matches!(
+                                reason,
+                                DemotionReason::Par2Unbindable
+                                    | DemotionReason::MemberIneligible(
+                                        MemberIneligibility::MalformedChain
+                                    )
+                            )
+                        }
                     };
                 }
                 if cell.naming == Naming::HexSwappedRar
@@ -1160,7 +1207,22 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                     // These posted names admit a RAR set but differ from the real
                     // PAR2 names. Without its content prefix a volume cannot be
                     // bound safely; repair must use materialized source files.
-                    route.shape_demotion = |reason| reason == DemotionReason::Par2Unbindable;
+                    // Solid members may already have refused direct admission.
+                    route.shape_demotion = if cell.container.is_solid_rar() {
+                        |reason| {
+                            matches!(
+                                reason,
+                                DemotionReason::Par2Unbindable
+                                    | DemotionReason::MemberIneligible(
+                                        MemberIneligibility::Compressed
+                                            | MemberIneligibility::Solid
+                                            | MemberIneligibility::Encrypted
+                                    )
+                            )
+                        }
+                    } else {
+                        |reason| reason == DemotionReason::Par2Unbindable
+                    };
                 }
                 // A volume the post never carried is held to the route of the
                 // same volume posted and then lost whole: the set rebuilds it in
@@ -1341,6 +1403,71 @@ async fn reposted_rar_recovers_both_articles_of_one_copy() {
         },
         ExtractionProfile::DirectStore,
         vec![(244, schedules().into_iter().nth(244).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn solid_rar_restart_keeps_late_volume_refresh() {
+    run_cell(
+        Cell {
+            container: Container::Rar4Solid,
+            naming: Naming::HexScattered,
+            binding: Binding::Nothing,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(104, schedules().into_iter().nth(104).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn repaired_unposted_parts_join_header_named_archives() {
+    for container in [
+        Container::Rar4,
+        Container::Rar5EncryptedHeaders,
+        Container::SevenZipSolid,
+    ] {
+        run_cell(
+            Cell {
+                container,
+                naming: Naming::FirstVolumeHex,
+                binding: Binding::Par2Posted,
+            },
+            ExtractionProfile::DirectStore,
+            [357, 359]
+                .into_iter()
+                .map(|case| (case, schedules().into_iter().nth(case).unwrap()))
+                .collect(),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn solid_sevenz_uses_complete_reposted_part_after_article_loss() {
+    run_cell(
+        Cell {
+            container: Container::SevenZipSolid,
+            naming: Naming::Reposted,
+            binding: Binding::Nothing,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(240, schedules().into_iter().nth(240).unwrap())],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn repaired_solid_sevenz_preserves_missing_part_diagnostic() {
+    run_cell(
+        Cell {
+            container: Container::SevenZipSolid,
+            naming: Naming::HexNumberedGap,
+            binding: Binding::Par2RealFirst,
+        },
+        ExtractionProfile::DirectStore,
+        vec![(242, schedules().into_iter().nth(242).unwrap())],
     )
     .await;
 }

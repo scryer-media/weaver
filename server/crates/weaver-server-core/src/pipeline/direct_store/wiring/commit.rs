@@ -1394,6 +1394,12 @@ impl Pipeline {
         if self.par2_bypassed.contains(&job_id) || self.par2_verified.contains(&job_id) {
             return false;
         }
+        // A failed index can leave a recovery carrier still awaiting promotion.
+        // Volume completion also enters this gate between completion checks;
+        // an empty download queue does not settle that discovery obligation.
+        if !self.par2_metadata_discovery_closed(job_id) {
+            return true;
+        }
         // The aggregate remains open until every servable recovery set has
         // settled, so any such set must retain direct source bytes for its own
         // pass rather than letting an earlier set commit them away.

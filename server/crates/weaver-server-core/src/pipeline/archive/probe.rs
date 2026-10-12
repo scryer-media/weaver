@@ -1482,6 +1482,7 @@ impl Pipeline {
         let state = self.jobs.get(&job_id)?;
         let par2_set = self.par2_set(job_id);
         let mut groups: BTreeMap<String, BTreeMap<u32, (String, usize, usize)>> = BTreeMap::new();
+        let mut names = Vec::new();
         for file in state.assembly.files() {
             if self.direct_set_already_installed(job_id, file)
                 || self.recovery_superseded_source(job_id, file.file_id())
@@ -1508,6 +1509,24 @@ impl Pipeline {
                         .and_then(|identity| identity.canonical_filename)
                 })
                 .unwrap_or_else(|| self.current_filename_for_file(job_id, file));
+            names.push(name);
+        }
+        // A repair can create a canonical part without a posted file binding.
+        // Those verified disk outputs still establish the archive's numbering;
+        // omitting them hides a real gap behind a generic readiness failure.
+        if self.par2_verified.contains(&job_id)
+            && let Some(set) = par2_set
+        {
+            names.extend(set.files.values().filter_map(|description| {
+                let name = sanitize_download_filename(&description.filename);
+                (matches!(
+                    FileRole::from_filename(&name),
+                    FileRole::RarVolume { .. } | FileRole::SevenZipSplit { .. }
+                ) && state.working_dir.join(&name).is_file())
+                .then_some(name)
+            }));
+        }
+        for name in names {
             let lower = name.to_ascii_lowercase();
             let end = if lower.ends_with(".rar") && lower.contains(".part") {
                 name.len() - 4

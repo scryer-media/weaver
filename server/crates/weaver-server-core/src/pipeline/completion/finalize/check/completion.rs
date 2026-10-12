@@ -271,6 +271,43 @@ impl Pipeline {
         self.finalize_completed_archive_job(job_id).await;
     }
 
+    // A complete alternate at every missing part position can reach extraction.
+    // The extraction worker still checks duplicate bytes, container bounds and
+    // every member's checksum before any output is published.
+    fn incomplete_sevenz_parts_have_alternates(&self, job_id: JobId) -> bool {
+        if self.job_spec_has_par2_file(job_id)
+            || self.job_has_pending_download_pipeline_work(job_id)
+        {
+            return false;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        state
+            .assembly
+            .files()
+            .filter(|file| !file.is_complete() && !file.role().is_recovery())
+            .all(|file| {
+                let weaver_model::files::FileRole::SevenZipSplit { number } =
+                    self.classified_role_for_file(job_id, file)
+                else {
+                    return false;
+                };
+                let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file) else {
+                    return false;
+                };
+                state.assembly.files().any(|alternate| {
+                    alternate.is_complete()
+                        && self.classified_role_for_file(job_id, alternate)
+                            == weaver_model::files::FileRole::SevenZipSplit { number }
+                        && self
+                            .classified_archive_set_name_for_file(job_id, alternate)
+                            .as_deref()
+                            == Some(&set_name)
+                })
+            })
+    }
+
     pub(in crate::pipeline) fn only_archive_residuals_or_loaded_par2_index_are_incomplete(
         &self,
         job_id: JobId,
@@ -444,6 +481,7 @@ impl Pipeline {
             })
         } else {
             complete_data_files < total_data_files
+                && !self.incomplete_sevenz_parts_have_alternates(job_id)
         };
 
         // Step 1: Are all data files (non-recovery) complete?
