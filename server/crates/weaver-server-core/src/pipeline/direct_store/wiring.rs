@@ -1153,6 +1153,9 @@ impl Pipeline {
             })
             .collect();
         self.direct_store.sets.insert(job_id, sets);
+        // A recovery set parsed before the first article already names any
+        // volume the post left out.
+        self.bind_unposted_direct_volumes(job_id);
     }
 
     // Arms identity admission for a job whose PAR2 metadata just parsed.
@@ -1986,6 +1989,7 @@ impl Pipeline {
                 // the derived minimum is not while the mapping grows.
                 discriminator: file_index,
             }),
+            unposted: Default::default(),
             working_dir,
             destination_dir,
         };
@@ -2517,6 +2521,7 @@ impl Pipeline {
                     expected_volumes: None,
                     discriminator: file_index,
                 }),
+                unposted: Default::default(),
                 working_dir,
                 destination_dir,
             };
@@ -2572,6 +2577,7 @@ impl Pipeline {
                 expected_volumes: Some(1),
                 discriminator: file_index,
             }),
+            unposted: Default::default(),
             working_dir,
             destination_dir,
         };
@@ -2614,6 +2620,7 @@ impl Pipeline {
                 expected_volumes: Some(1),
                 discriminator: file_index,
             }),
+            unposted: Default::default(),
             working_dir,
             destination_dir,
         };
@@ -3228,6 +3235,10 @@ impl Pipeline {
     // conventional set can see them, and completing the job would publish
     // the set's member partials and envelopes in place of its members. The
     // set demotes, its volumes materialize, and the job goes round again.
+    //
+    // A name-admitted set still missing a volume the post left out is the
+    // same: no recovery-set description gave that volume a file, so nothing
+    // will ever rebuild it in place.
     pub(crate) async fn demote_stranded_identity_sets(&mut self, job_id: JobId) -> bool {
         let stranded: Vec<usize> = self
             .direct_store
@@ -3235,7 +3246,9 @@ impl Pipeline {
             .iter()
             .enumerate()
             .filter(|(_, set)| {
-                set.plan().identity.is_some() && !set.is_demoted() && !set.is_finalized()
+                (set.plan().identity.is_some() || !set.plan().unposted.is_empty())
+                    && !set.is_demoted()
+                    && !set.is_finalized()
             })
             .map(|(set_index, _)| set_index)
             .collect();
@@ -3513,6 +3526,23 @@ impl Pipeline {
                     && !set.is_finalized()
                     && matches!(set.header_probe(), HeaderProbe::Container { .. })
             })
+            // A volume the post never carried places nothing until the
+            // recovery set describes it, and holds nothing until the repair
+            // rebuilds it, so a parse waiting on it is waiting on the repair,
+            // not on nothing. A hole that is never described demotes the set
+            // when the job settles.
+            .filter(|(_, set)| {
+                set.plan().unposted.is_empty()
+                    && !set.plan().volumes.values().any(|file_index| {
+                        state
+                            .assembly
+                            .file(NzbFileId {
+                                job_id,
+                                file_index: *file_index,
+                            })
+                            .is_some_and(|file| file.is_repair_output() && !file.is_complete())
+                    })
+            })
             .filter(|(_, set)| {
                 set.plan().volumes.values().all(|file_index| {
                     let file_id = NzbFileId {
@@ -3781,6 +3811,7 @@ mod commit;
 mod demotion;
 mod par2;
 mod placement;
+mod unposted;
 
 // One contiguous copy of a decoded span. Routing splits the span at
 // destination boundaries, which a batched chunk list cannot express.

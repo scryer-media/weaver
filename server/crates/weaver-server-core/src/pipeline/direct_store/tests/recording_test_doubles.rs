@@ -2557,6 +2557,7 @@ fn two_sets_of_one_job_never_share_a_derived_path() {
         volumes: [(0u32, 2u32), (1, 3)].into_iter().collect(),
         files: [(0u32, 2u32), (1, 3)].into_iter().collect(),
         identity: None,
+        unposted: Default::default(),
         working_dir: first.working_dir.clone(),
         destination_dir: first.destination_dir.clone(),
     };
@@ -2768,6 +2769,7 @@ fn destination_names_stay_inside_the_filename_ceiling_with_their_suffix() {
         volumes: [(0u32, 0u32), (7, 7)].into_iter().collect(),
         files: [(0u32, 0u32), (7, 7)].into_iter().collect(),
         identity: None,
+        unposted: Default::default(),
         working_dir: std::path::PathBuf::from("/tmp/silver-horizon"),
         destination_dir: std::path::PathBuf::from("/tmp/complete/.weaver-staging/1"),
     };

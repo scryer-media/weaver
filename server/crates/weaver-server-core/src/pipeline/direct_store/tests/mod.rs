@@ -416,6 +416,7 @@ fn envelope_plan() -> DirectSetPlan {
         volumes: [(0u32, 0u32), (1, 1)].into_iter().collect(),
         files: [(0u32, 0u32), (1, 1)].into_iter().collect(),
         identity: None,
+        unposted: Default::default(),
         working_dir: std::path::PathBuf::from("/tmp/silver-horizon"),
         destination_dir: std::path::PathBuf::from("/tmp/complete/.weaver-staging/1"),
     }
@@ -938,6 +939,7 @@ fn rearm_router() -> DirectSetRouter {
         volumes: [(0u32, 0u32), (1u32, 1u32)].into_iter().collect(),
         files: [(0u32, 0u32), (1u32, 1u32)].into_iter().collect(),
         identity: None,
+        unposted: Default::default(),
         working_dir: std::path::PathBuf::from("/nonexistent"),
         destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     };
@@ -1048,6 +1050,7 @@ fn straddle_router(member: &[u8], header_bytes: u64) -> (DirectSetRouter, u32) {
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
         identity: None,
+        unposted: Default::default(),
         working_dir: std::path::PathBuf::from("/nonexistent"),
         destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     };
@@ -1139,6 +1142,7 @@ fn encrypted_crypt_router_partial(
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
         identity: None,
+        unposted: Default::default(),
         working_dir: std::path::PathBuf::from("/nonexistent"),
         destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     };
@@ -1341,6 +1345,7 @@ fn straddle_router_in(dir: &Path, member: &[u8], header_bytes: u64) -> (DirectSe
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
         identity: None,
+        unposted: Default::default(),
         working_dir: dir.to_path_buf(),
         destination_dir: dir.join("staging"),
     };
@@ -1491,6 +1496,7 @@ fn layoutless_router() -> DirectSetRouter {
         volumes: [(0u32, 0u32)].into_iter().collect(),
         files: [(0u32, 0u32)].into_iter().collect(),
         identity: None,
+        unposted: Default::default(),
         working_dir: std::path::PathBuf::from("/nonexistent"),
         destination_dir: std::path::PathBuf::from("/nonexistent-staging"),
     })

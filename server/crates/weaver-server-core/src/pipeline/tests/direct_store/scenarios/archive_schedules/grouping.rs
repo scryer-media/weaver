@@ -1132,6 +1132,26 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                         )
                     };
                 }
+                if cell.naming == Naming::HexSwappedRar
+                    && !cell.container.is_solid_rar()
+                    && interruption.withheld().is_some()
+                {
+                    // These names number the pair the other way round from the
+                    // recovery set, so they cannot place the volume the post
+                    // left out, and with one volume of the pair the chain that
+                    // would show it runs backwards is never read. The missing
+                    // volume is damage no direct set owns, and the set goes
+                    // conventional, which its shape already sends it to.
+                    route.shape_demotion = |reason| {
+                        matches!(
+                            reason,
+                            DemotionReason::Par2Damaged
+                                | DemotionReason::MemberIneligible(
+                                    MemberIneligibility::MalformedChain
+                                )
+                        )
+                    };
+                }
                 if cell.naming == Naming::OldStyleS
                     && interruption
                         .loss()
@@ -1142,15 +1162,22 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                     // bound safely; repair must use materialized source files.
                     route.shape_demotion = |reason| reason == DemotionReason::Par2Unbindable;
                 }
-                if withheld {
-                    // The direct store repairs in place only volumes the job lists:
-                    // a repair target is keyed by its NZB file. A volume the post
-                    // never carried is damage outside every direct set, so the
-                    // whole set goes to the conventional repairer and completes
-                    // there.
-                    route.direct = false;
-                }
-                profile.assert_delivery(&outcome, route, &published, interruption);
+                // A volume the post never carried is held to the route of the
+                // same volume posted and then lost whole: the set rebuilds it in
+                // place, except where losing every article of that volume
+                // already leaves the set without its map or a volume without
+                // a name, and those exceptions are the loss's own.
+                let delivered = match interruption.withheld() {
+                    Some((volume, index_first)) => {
+                        let articles = 4 / fixture.volumes.len() as u32;
+                        Interruption::Loss {
+                            mask: (((1u32 << articles) - 1) << (volume * articles)) as u8,
+                            index_first,
+                        }
+                    }
+                    None => interruption,
+                };
+                profile.assert_delivery(&outcome, route, &published, delivered);
                 if matches!(interruption, Interruption::None) {
                     expect.assert_clean(&outcome, order.len() == 4, &context);
                 }

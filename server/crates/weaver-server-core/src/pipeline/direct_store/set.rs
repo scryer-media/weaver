@@ -489,6 +489,18 @@ impl DirectSet {
         self.router.bind_identity_volume(volume_index, file_index)
     }
 
+    // Marks a volume no posted file carries. See
+    // [`DirectSetPlan::note_unposted_volume`].
+    pub(crate) fn note_unposted_volume(&mut self, volume_index: u32) -> bool {
+        self.router.note_unposted_volume(volume_index)
+    }
+
+    // Gives an unposted volume its reserved file. See
+    // [`DirectSetPlan::bind_unposted_volume`].
+    pub(crate) fn bind_unposted_volume(&mut self, volume_index: u32, file_index: u32) -> bool {
+        self.router.bind_unposted_volume(volume_index, file_index)
+    }
+
     pub(crate) fn set_name(&self) -> &str {
         &self.router.plan().set_name
     }

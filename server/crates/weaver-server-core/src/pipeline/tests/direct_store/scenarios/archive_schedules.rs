@@ -321,22 +321,6 @@ impl ExtractionProfile {
                 // The unnamed volume belongs to no set, so its damage is
                 // damage no direct set can repair in place.
                 DemotionReason::Par2Damaged if unnamed => false,
-                // A volume the post never carried is outside every direct set:
-                // the set cannot name it from content, and its repair is
-                // damage no direct set owns.
-                DemotionReason::IdentityRosterUnfillable | DemotionReason::Par2Damaged
-                    if interruption.withheld().is_some() =>
-                {
-                    false
-                }
-                // The posted 7z parts stop short of the start header's total
-                // when the withheld part is the last one, so the direct set
-                // refuses the geometry before recovery rebuilds that part.
-                DemotionReason::SevenZip(SevenZipRefusal::VolumeSize)
-                    if interruption.withheld().is_some() =>
-                {
-                    false
-                }
                 reason => !(route.shape_demotion)(reason),
             })
             .collect();

@@ -311,6 +311,9 @@ impl Pipeline {
         // real volume names exist, so this is the moment direct-store can arm
         // admission for the sets the spec's filenames could not name.
         self.arm_direct_identity_admission(job_id).await;
+        // They are also where a volume the post left out is named, so a set
+        // admitted by its posted names can take it on as its own.
+        self.bind_unposted_direct_volumes(job_id);
 
         let _ = self
             .event_tx
