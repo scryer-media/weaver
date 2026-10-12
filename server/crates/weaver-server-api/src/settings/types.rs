@@ -729,12 +729,17 @@ impl ScheduleInput {
             },
             _ => return Err(format!("unknown schedule actionType: {}", self.action_type)),
         };
-        let days: Vec<Weekday> = self
+        // A day the rule names must be a weekday; dropping an unknown one
+        // would quietly widen or narrow when the rule fires.
+        let days = self
             .days
             .unwrap_or_default()
             .iter()
-            .filter_map(|d| Weekday::parse(&d.to_lowercase()))
-            .collect();
+            .map(|day| {
+                Weekday::parse(&day.to_lowercase())
+                    .ok_or_else(|| format!("unknown schedule day: {day}"))
+            })
+            .collect::<Result<Vec<Weekday>, String>>()?;
         Ok(weaver_server_core::bandwidth::ScheduleEntry {
             id: format!(
                 "sched-{:x}",

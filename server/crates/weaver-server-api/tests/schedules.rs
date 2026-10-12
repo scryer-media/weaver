@@ -360,6 +360,34 @@ async fn create_schedule_pause() {
 }
 
 #[tokio::test]
+async fn create_schedule_refuses_an_unknown_weekday() {
+    let h = TestHarness::new().await;
+    let before = h.execute(r#"{ schedules { id } }"#).await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                createSchedule(input: {
+                    enabled: false,
+                    label: "Funday pause",
+                    days: ["mon", "funday"],
+                    time: "03:00",
+                    actionType: "pause"
+                }) { id days }
+            }"#,
+        )
+        .await;
+    assert!(
+        resp.errors
+            .iter()
+            .any(|error| error.message.contains("unknown schedule day: funday")),
+        "{:?}",
+        resp.errors
+    );
+    let after = h.execute(r#"{ schedules { id } }"#).await;
+    assert_eq!(response_data(&after), response_data(&before));
+}
+
+#[tokio::test]
 async fn create_schedule_speed_limit() {
     let h = TestHarness::new().await;
     let resp = h
