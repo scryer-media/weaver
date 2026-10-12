@@ -1110,8 +1110,36 @@ pub(super) async fn run_described_schedule(
 }
 
 // [`run_described_schedule`] under `options`.
+//
+// The driver below is one future holding every step of a schedule, and it
+// outgrows the test thread's stack as the harness grows. Boxed, it lives on
+// the heap however large it gets, and the callers' campaigns stay small.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_schedule_with(
+    options: ScheduleOptions,
+    profile: ExtractionProfile,
+    spec: JobSpec,
+    volumes: &[(String, Vec<u8>)],
+    described: Option<&[String]>,
+    order: &[(u32, u32)],
+    wanted: &[&str],
+    interruption: Interruption,
+) -> Outcome {
+    Box::pin(drive_schedule(
+        options,
+        profile,
+        spec,
+        volumes,
+        described,
+        order,
+        wanted,
+        interruption,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_schedule(
     options: ScheduleOptions,
     profile: ExtractionProfile,
     mut spec: JobSpec,
