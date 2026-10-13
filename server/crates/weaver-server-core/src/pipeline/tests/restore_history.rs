@@ -1306,6 +1306,68 @@ async fn job_failed_event_publishes_after_history_archive_commits() {
 }
 
 #[tokio::test]
+async fn failed_history_row_keeps_why_the_job_failed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let cases = [
+        (
+            30051,
+            JobStatus::Repairing,
+            "not enough recovery blocks",
+            crate::history::HistoryFailureKind::Repair,
+        ),
+        (
+            30052,
+            JobStatus::Extracting,
+            "invalid password for encrypted archive",
+            crate::history::HistoryFailureKind::Password,
+        ),
+        (
+            30053,
+            JobStatus::Extracting,
+            "write failed: No space left on device (os error 28)",
+            crate::history::HistoryFailureKind::DiskFull,
+        ),
+        (
+            30054,
+            JobStatus::Extracting,
+            "unexpected end of archive",
+            crate::history::HistoryFailureKind::Unpack,
+        ),
+        (
+            30055,
+            JobStatus::Moving,
+            "could not move the output",
+            crate::history::HistoryFailureKind::Move,
+        ),
+        (
+            30056,
+            JobStatus::Downloading,
+            "too many articles are missing",
+            crate::history::HistoryFailureKind::Health,
+        ),
+    ];
+    for (id, status, error, expected) in cases {
+        let job_id = JobId(id);
+        let spec = standalone_job_spec(
+            &format!("Failure Kind {id}"),
+            &[(format!("failure-kind-{id}.mkv"), 123)],
+        );
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        pipeline.jobs.get_mut(&job_id).unwrap().status = status;
+        pipeline.fail_job(job_id, error.to_string());
+        wait_for_job_event(
+            &mut events,
+            |event| matches!(event, PipelineEvent::JobFailed { job_id: failed, .. } if *failed == job_id),
+        )
+        .await;
+        let states = pipeline.db.nzbget_history_states(&[id]).unwrap();
+        assert_eq!(states[&id].failure_kind, Some(expected), "{error}");
+    }
+}
+
+#[tokio::test]
 async fn restore_job_uses_per_file_progress_floor_for_reporting() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

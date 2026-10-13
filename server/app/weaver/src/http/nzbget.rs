@@ -18,6 +18,7 @@ use weaver_server_api::{
     submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
+use weaver_server_core::history::HistoryFailureKind;
 use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
@@ -1799,6 +1800,9 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
             let mut entry = nzbget_history_item(
                 &item,
                 &category,
+                facade_states
+                    .get(&row.job_id)
+                    .and_then(|state| state.failure_kind),
                 history_timings(stage_bounds.get(&row.job_id)),
             );
             // NZBGet lists a history entry kept only for duplicate checks
@@ -1922,46 +1926,96 @@ struct HistoryStatuses {
     status: &'static str,
 }
 
-fn history_statuses(cancelled: bool, failed: bool) -> HistoryStatuses {
+const NO_STATUSES: HistoryStatuses = HistoryStatuses {
+    par: "NONE",
+    unpack: "NONE",
+    mv: "NONE",
+    script: "NONE",
+    delete: "NONE",
+    status: "NONE",
+};
+
+// `failure` is None for a job that succeeded. Each failure kind sets the one
+// field NZBGet itself sets for that cause, so clients that judge history from
+// the per-stage fields (repair failures, bad passwords and unpack errors fail
+// the download; a full disk or a failed move only warns) read the same result.
+fn history_statuses(cancelled: bool, failure: Option<HistoryFailureKind>) -> HistoryStatuses {
     if cancelled {
+        // A job removed as a duplicate reports DUPE, any other removal MANUAL.
+        if failure == Some(HistoryFailureKind::Duplicate) {
+            return HistoryStatuses {
+                delete: "DUPE",
+                status: "DELETED/DUPE",
+                ..NO_STATUSES
+            };
+        }
         return HistoryStatuses {
-            par: "NONE",
-            unpack: "NONE",
-            mv: "NONE",
-            script: "NONE",
             delete: "MANUAL",
             status: "DELETED/MANUAL",
+            ..NO_STATUSES
         };
     }
-    if failed {
-        // Weaver exposes no per-stage failure cause here, so we must not assert a
-        // PAR failure (the old "FAILURE/PAR" + ParStatus=FAILURE steered clients
-        // and Sonarr to par/repair diagnostics for password/unpack/health/move
-        // failures alike). But Sonarr/Radarr decide failure ONLY from the granular
-        // status fields, never the compound `Status` string — all-NONE would be
-        // read as success and the failed release silently imported. So signal the
-        // failure through `DeleteStatus = "HEALTH"`, which is in both clients'
-        // delete-failed set and matches NZBGet's generic health-failure semantics,
-        // while leaving par/unpack/move/script NONE (no false stage claim).
+    let Some(failure) = failure else {
         return HistoryStatuses {
-            par: "NONE",
-            unpack: "NONE",
-            mv: "NONE",
+            par: "SUCCESS",
+            unpack: "SUCCESS",
+            mv: "SUCCESS",
+            // NZBGet reports NONE when no script ran; history() overrides it
+            // from the job's stored script results.
             script: "NONE",
-            delete: "HEALTH",
-            status: "FAILURE/HEALTH",
+            delete: "NONE",
+            status: "SUCCESS/ALL",
         };
+    };
+    match failure {
+        HistoryFailureKind::Repair => HistoryStatuses {
+            par: "FAILURE",
+            status: "FAILURE/PAR",
+            ..NO_STATUSES
+        },
+        HistoryFailureKind::Password => HistoryStatuses {
+            unpack: "PASSWORD",
+            status: "FAILURE/UNPACK",
+            ..NO_STATUSES
+        },
+        HistoryFailureKind::DiskFull => HistoryStatuses {
+            unpack: "SPACE",
+            status: "FAILURE/UNPACK",
+            ..NO_STATUSES
+        },
+        HistoryFailureKind::Unpack => HistoryStatuses {
+            unpack: "FAILURE",
+            status: "FAILURE/UNPACK",
+            ..NO_STATUSES
+        },
+        HistoryFailureKind::Move => HistoryStatuses {
+            mv: "FAILURE",
+            status: "FAILURE/MOVE",
+            ..NO_STATUSES
+        },
+        HistoryFailureKind::Health => HistoryStatuses {
+            delete: "HEALTH",
+            status: "DELETED/HEALTH",
+            ..NO_STATUSES
+        },
+        HistoryFailureKind::Duplicate => HistoryStatuses {
+            delete: "DUPE",
+            status: "DELETED/DUPE",
+            ..NO_STATUSES
+        },
     }
-    HistoryStatuses {
-        par: "SUCCESS",
-        unpack: "SUCCESS",
-        mv: "SUCCESS",
-        // NZBGet reports NONE when no script ran; history() overrides it from
-        // the job's stored script results.
-        script: "NONE",
-        delete: "NONE",
-        status: "SUCCESS/ALL",
-    }
+}
+
+// The failure kind for a failed job: the kept kind when there is one,
+// otherwise read from the error text (jobs that failed before weaver kept the
+// kind, and terminal jobs whose history row is not written yet).
+fn failure_kind_for(
+    failed: bool,
+    kept: Option<HistoryFailureKind>,
+    error: Option<&str>,
+    health: u32,
+) -> Option<HistoryFailureKind> {
+    failed.then(|| kept.unwrap_or_else(|| HistoryFailureKind::derive(None, None, error, health, 0)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2024,6 +2078,7 @@ fn nzbget_history_entry(
 fn nzbget_history_item(
     item: &weaver_server_api::HistoryItem,
     category: &str,
+    failure_kind: Option<HistoryFailureKind>,
     timings: HistoryTimings,
 ) -> Value {
     let cancelled = item
@@ -2038,7 +2093,14 @@ fn nzbget_history_item(
         item.total_bytes,
         &item.output_dir.clone().unwrap_or_default(),
         item.completed_at.timestamp(),
-        history_statuses(cancelled, failed),
+        history_statuses(
+            cancelled,
+            if cancelled {
+                failure_kind
+            } else {
+                failure_kind_for(failed, failure_kind, item.error.as_deref(), item.health)
+            },
+        ),
         timings,
         item.health,
         &item.error.clone().unwrap_or_default(),
@@ -2060,7 +2122,10 @@ fn nzbget_history_queue_item(item: &QueueItem, category: &str, timings: HistoryT
         // detection) and then jump backward once the row moved to DB history.
         // created_at is stable and never later than the eventual completed_at.
         item.created_at.timestamp(),
-        history_statuses(false, failed),
+        history_statuses(
+            false,
+            failure_kind_for(failed, None, item.error.as_deref(), item.health),
+        ),
         timings,
         item.health,
         &item.error.clone().unwrap_or_default(),

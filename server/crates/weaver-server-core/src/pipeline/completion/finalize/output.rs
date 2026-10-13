@@ -1583,6 +1583,13 @@ impl Pipeline {
                 None
             }
         };
+        // The failing stage survives the restart here too, so the history row
+        // still records why the job failed.
+        if let Some(crate::post_processing::model::PipelineOutcome::Failed { stage, .. }) =
+            facts.as_ref().map(|facts| &facts.outcome)
+        {
+            self.pipeline_failure_stages.entry(job_id).or_insert(*stage);
+        }
         let summary = self
             .db
             .job_post_processing_summary(job_id.0)

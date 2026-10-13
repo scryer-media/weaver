@@ -2451,6 +2451,10 @@ pub struct Pipeline {
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,
+    // The stage a failed job was in when it failed, kept until its history
+    // row records the failure kind.
+    pub(super) pipeline_failure_stages:
+        HashMap<JobId, crate::post_processing::model::PipelineFailureStage>,
     // Winning archive password candidate per job/RAR set, kept process-local and redacted.
     pub(super) archive_password_winners: HashMap<(JobId, String), ArchivePasswordCandidate>,
     // Job dispatch order (FIFO by submission). First Downloading job is active.

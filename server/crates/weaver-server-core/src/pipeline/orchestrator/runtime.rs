@@ -244,6 +244,7 @@ impl Pipeline {
             metrics,
             jobs: HashMap::new(),
             semantic_terminal_causes: HashMap::new(),
+            pipeline_failure_stages: HashMap::new(),
             archive_password_winners: HashMap::new(),
             job_order: Vec::new(),
             active_downloads: 0,

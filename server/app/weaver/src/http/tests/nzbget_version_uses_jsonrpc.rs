@@ -1264,12 +1264,10 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     assert_eq!(complete["UnpackStatus"], "SUCCESS");
     assert_eq!(complete["Parameters"][0]["Name"], "drone");
     assert_eq!(complete["Parameters"][0]["Value"], "drone-history");
-    // A failed job no longer claims a PAR failure it can't attribute. Sonarr/Radarr
-    // read failure only from the granular fields, so the failure is signaled via
-    // DeleteStatus="HEALTH" (their delete-failed set), not the compound Status;
-    // par/unpack stay NONE (no false stage claim).
+    // A row with no kept failure kind is read from its error text: missing
+    // articles at low health are a health failure, with no stage claim.
     assert_eq!(failed["ParStatus"], "NONE");
-    assert_eq!(failed["Status"], "FAILURE/HEALTH");
+    assert_eq!(failed["Status"], "DELETED/HEALTH");
     assert_eq!(failed["DeleteStatus"], "HEALTH");
     assert_eq!(failed["Message"], "article failures");
 }
@@ -2409,7 +2407,7 @@ async fn nzbget_history_reports_compound_status_history_time_and_stage_timings()
     assert_eq!(by_id(400)["DownloadTimeSec"], 300);
     assert_eq!(by_id(400)["RepairTimeSec"], 40);
     assert_eq!(by_id(400)["PostTotalTimeSec"], 40);
-    assert_eq!(by_id(401)["Status"], "FAILURE/HEALTH");
+    assert_eq!(by_id(401)["Status"], "DELETED/HEALTH");
     assert_eq!(by_id(401)["DownloadTimeSec"], 0);
     assert_eq!(by_id(402)["Status"], "DELETED/MANUAL");
     assert_eq!(by_id(402)["Deleted"], true);
@@ -4230,4 +4228,175 @@ async fn nzbget_history_delete_survives_reopening_the_database() {
     assert!(history_ids(&entries).is_empty());
     let entries = rpc_result(app, "history", serde_json::json!([true])).await;
     assert_eq!(history_ids(&entries), vec![601]);
+}
+
+#[tokio::test]
+async fn nzbget_history_reports_each_failure_cause_in_its_own_status_field() {
+    use weaver_server_core::history::HistoryFailureKind;
+
+    let db = Database::open_in_memory().unwrap();
+    // (id, kind, field, value, compound status)
+    let cases = [
+        (
+            701,
+            HistoryFailureKind::Repair,
+            "ParStatus",
+            "FAILURE",
+            "FAILURE/PAR",
+        ),
+        (
+            702,
+            HistoryFailureKind::Password,
+            "UnpackStatus",
+            "PASSWORD",
+            "FAILURE/UNPACK",
+        ),
+        (
+            703,
+            HistoryFailureKind::DiskFull,
+            "UnpackStatus",
+            "SPACE",
+            "FAILURE/UNPACK",
+        ),
+        (
+            704,
+            HistoryFailureKind::Unpack,
+            "UnpackStatus",
+            "FAILURE",
+            "FAILURE/UNPACK",
+        ),
+        (
+            705,
+            HistoryFailureKind::Move,
+            "MoveStatus",
+            "FAILURE",
+            "FAILURE/MOVE",
+        ),
+        (
+            706,
+            HistoryFailureKind::Health,
+            "DeleteStatus",
+            "HEALTH",
+            "DELETED/HEALTH",
+        ),
+        (
+            707,
+            HistoryFailureKind::Duplicate,
+            "DeleteStatus",
+            "DUPE",
+            "DELETED/DUPE",
+        ),
+    ];
+    for (id, kind, _, _, _) in cases {
+        db.insert_job_history(&nzbget_history_row(
+            id,
+            "failed",
+            1_700_000_000 + id as i64,
+            None,
+        ))
+        .unwrap();
+        assert!(db.set_history_failure_kind(id, Some(kind)).unwrap());
+    }
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let entries = rpc_result(app, "history", serde_json::json!([])).await;
+    let fields = [
+        "ParStatus",
+        "UnpackStatus",
+        "MoveStatus",
+        "ScriptStatus",
+        "DeleteStatus",
+    ];
+    for (id, kind, field, value, status) in cases {
+        let entry = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["NZBID"] == id)
+            .unwrap();
+        assert_eq!(entry["Status"], status, "{kind:?}");
+        // Only the field for this cause carries it; the others stay NONE so
+        // no client reads a stage that did not fail.
+        for other in fields {
+            let expected = if other == field { value } else { "NONE" };
+            assert_eq!(entry[other], expected, "{kind:?} {other}");
+        }
+        assert_eq!(entry["Deleted"], field == "DeleteStatus", "{kind:?}");
+    }
+}
+
+#[tokio::test]
+async fn nzbget_history_reads_the_failure_cause_from_text_when_none_was_kept() {
+    let db = Database::open_in_memory().unwrap();
+    let mut password = nzbget_history_row(711, "failed", 1_700_000_100, None);
+    password.error_message = Some("set 'a': invalid password for encrypted archive".into());
+    password.health = 1000;
+    password.failed_bytes = 0;
+    db.insert_job_history(&password).unwrap();
+    let mut repair = nzbget_history_row(712, "failed", 1_700_000_200, None);
+    repair.error_message = Some("par2 repair failed".into());
+    repair.health = 1000;
+    repair.failed_bytes = 0;
+    db.insert_job_history(&repair).unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let entries = rpc_result(app, "history", serde_json::json!([])).await;
+    let by_id = |id: u64| {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["NZBID"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by_id(711)["UnpackStatus"], "PASSWORD");
+    assert_eq!(by_id(711)["DeleteStatus"], "NONE");
+    assert_eq!(by_id(712)["ParStatus"], "FAILURE");
+}
+
+#[tokio::test]
+async fn nzbget_history_reports_a_job_removed_as_a_duplicate_as_dupe() {
+    use weaver_server_core::history::HistoryFailureKind;
+
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(721, "cancelled", 1_700_000_100, None))
+        .unwrap();
+    db.insert_job_history(&nzbget_history_row(722, "cancelled", 1_700_000_200, None))
+        .unwrap();
+    assert!(
+        db.set_history_failure_kind(721, Some(HistoryFailureKind::Duplicate))
+            .unwrap()
+    );
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let entries = rpc_result(app, "history", serde_json::json!([])).await;
+    let by_id = |id: u64| {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["NZBID"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by_id(721)["DeleteStatus"], "DUPE");
+    assert_eq!(by_id(721)["Status"], "DELETED/DUPE");
+    assert_eq!(by_id(722)["DeleteStatus"], "MANUAL");
+    assert_eq!(by_id(722)["Status"], "DELETED/MANUAL");
 }

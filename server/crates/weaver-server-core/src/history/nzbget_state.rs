@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use crate::StateError;
+use crate::history::HistoryFailureKind;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 
@@ -12,6 +13,8 @@ use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 pub struct NzbgetHistoryState {
     // Removed from the client's default history listing by HistoryDelete.
     pub hidden: bool,
+    // Why the job failed, when it failed and weaver kept the kind.
+    pub failure_kind: Option<HistoryFailureKind>,
 }
 
 impl Database {
@@ -37,6 +40,35 @@ impl Database {
         })
     }
 
+    // Record why a history row's job failed, or clear it. Returns false when
+    // no history row exists for the job.
+    pub fn set_history_failure_kind(
+        &self,
+        job_id: u64,
+        kind: Option<HistoryFailureKind>,
+    ) -> Result<bool, StateError> {
+        let job_id = i64::try_from(job_id)
+            .map_err(|_| StateError::Database("job id is too large".into()))?;
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_history_failure_kind", |tx| {
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "UPDATE job_history SET failure_kind = {} WHERE job_id = {}",
+                            &[
+                                SqlArg::OptText(kind.map(|kind| kind.as_str().to_string())),
+                                SqlArg::I64(job_id),
+                            ],
+                        )
+                        .await?;
+                    Ok(changed > 0)
+                })
+            })
+            .await
+        })
+    }
+
     // The facade-only state for each listed history row. Rows absent from the
     // map have no history row.
     pub fn nzbget_history_states(
@@ -52,7 +84,9 @@ impl Database {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!("SELECT job_id, nzbget_hidden FROM job_history WHERE job_id IN ({ids})");
+        let sql = format!(
+            "SELECT job_id, nzbget_hidden, failure_kind FROM job_history WHERE job_id IN ({ids})"
+        );
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
@@ -62,6 +96,10 @@ impl Database {
                     row.i64("job_id")? as u64,
                     NzbgetHistoryState {
                         hidden: row.i64("nzbget_hidden")? != 0,
+                        failure_kind: row
+                            .opt_text("failure_kind")?
+                            .as_deref()
+                            .and_then(HistoryFailureKind::from_persisted),
                     },
                 );
             }

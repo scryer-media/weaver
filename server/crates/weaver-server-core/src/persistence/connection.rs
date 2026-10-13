@@ -764,6 +764,7 @@ enum DbWriteCommand {
         job_id: crate::jobs::ids::JobId,
         history: Box<crate::history::JobHistoryRow>,
         typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
+        failure_kind: Option<crate::history::HistoryFailureKind>,
         // Fired once the archive transaction has committed and the row has
         // been re-cached, so callers can hold a terminal event until the
         // history row is queryable through the read paths.
@@ -857,6 +858,7 @@ async fn execute_write_command(
             job_id,
             history,
             typed_terminal_cause,
+            failure_kind,
             committed,
         } => {
             let writer = writer.clone();
@@ -870,6 +872,7 @@ async fn execute_write_command(
                     job_id,
                     history.as_ref(),
                     typed_terminal_cause,
+                    failure_kind,
                 ) {
                     Ok(Some(row)) => writer.cache_job_history_at(row, observed_generation),
                     Ok(None) => {}
@@ -1435,6 +1438,7 @@ impl Database {
             job_id,
             history: Box::new(history),
             typed_terminal_cause: None,
+            failure_kind: None,
             committed: None,
         };
         self.try_send_with_retry(command, "archive")
@@ -1449,6 +1453,7 @@ impl Database {
         job_id: crate::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
         typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
+        failure_kind: Option<crate::history::HistoryFailureKind>,
     ) -> Result<oneshot::Receiver<()>, StateError> {
         let (committed_tx, committed_rx) = oneshot::channel();
         self.try_send_with_retry(
@@ -1456,6 +1461,7 @@ impl Database {
                 job_id,
                 history: Box::new(history),
                 typed_terminal_cause,
+                failure_kind,
                 committed: Some(committed_tx),
             },
             "archive",
@@ -1585,6 +1591,7 @@ impl Database {
             job_id,
             history: Box::new(history),
             typed_terminal_cause: None,
+            failure_kind: None,
             committed: None,
         });
         self.writer_tx
