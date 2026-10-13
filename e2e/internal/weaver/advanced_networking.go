@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -140,7 +141,57 @@ func speedTestReleaseFlow() weaverReleaseFlowSpec {
 	spec.Timeout = 30 * time.Minute
 	// The reference posting a Usenet run is pointed at.
 	spec.SeedFixtures = []string{"speed-test-100mb"}
+	// The public endpoint a bandwidth run is pointed at.
+	spec.PublicTargets = []weaverPublicTarget{{Host: cloudflareSpeedHost, Port: 443}}
 	return spec
+}
+
+// A public host the proxy fixture forwards to and answers for.
+type weaverPublicTarget struct {
+	Host string
+	Port int
+}
+
+// The Cloudflare bandwidth test endpoint the speed test's bandwidth run uses.
+const cloudflareSpeedHost = "speed.cloudflare.com"
+
+// lookupPublicHostIPv4 resolves a public target on the host; the fixture
+// answers Weaver with these addresses and forwards to the first.
+var lookupPublicHostIPv4 = func(host string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	addresses, err := netLookupIPv4(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	return addresses, nil
+}
+
+func netLookupIPv4(ctx context.Context, host string) ([]string, error) {
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+	if err != nil {
+		return nil, err
+	}
+	addresses := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		addresses = append(addresses, ip.String())
+	}
+	return addresses, nil
+}
+
+func resolvePublicTargets(targets []weaverPublicTarget) ([]map[string]any, error) {
+	resolved := make([]map[string]any, 0, len(targets))
+	for _, target := range targets {
+		addresses, err := lookupPublicHostIPv4(target.Host)
+		if err != nil {
+			return nil, fmt.Errorf("resolve public target %s: %w", target.Host, err)
+		}
+		if len(addresses) == 0 {
+			return nil, fmt.Errorf("resolve public target %s: no IPv4 address", target.Host)
+		}
+		resolved = append(resolved, map[string]any{"host": target.Host, "port": target.Port, "addresses": addresses})
+	}
+	return resolved, nil
 }
 
 // The Bind refusal needs a Weaver without CAP_NET_RAW, which is a container
@@ -390,11 +441,20 @@ func advancedNetworkOverride(phase *weaverReleasePhase) (map[string]any, error) 
 	if layout == weaverNetworkLayoutEgress {
 		fixtureAddresses = append(fixtureAddresses, hostAddresses["proxy-fixture"]...)
 	}
-	service("proxy-fixture")["environment"] = map[string]any{
+	fixtureEnv := map[string]any{
 		"PROXY_FIXTURE_IP":        resolverIP,
 		"PROXY_FIXTURE_ADDRESSES": strings.Join(fixtureAddresses, ","),
 		"PROXY_FIXTURE_HOSTS":     string(fixtureHostsJSON),
 	}
+	if len(phase.Spec.PublicTargets) > 0 {
+		targets, err := resolvePublicTargets(phase.Spec.PublicTargets)
+		if err != nil {
+			return nil, err
+		}
+		targetsJSON, _ := json.Marshal(targets)
+		fixtureEnv["PROXY_FIXTURE_PUBLIC_TARGETS"] = string(targetsJSON)
+	}
+	service("proxy-fixture")["environment"] = fixtureEnv
 
 	resolverPath := filepath.Join(phase.RootDir, "proxy-resolv.conf")
 	if err := os.WriteFile(resolverPath, []byte("nameserver "+resolverIP+"\noptions timeout:1 attempts:1\n"), 0o644); err != nil {

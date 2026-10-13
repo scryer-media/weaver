@@ -83,7 +83,10 @@ export async function startProxyFixture(options = {}) {
   const extraRoutes = options.routes ?? parseRouteList(process.env.PROXY_FIXTURE_ROUTES);
   const addresses = options.addresses ?? parseAddressList(process.env.PROXY_FIXTURE_ADDRESSES, ip);
   const hosts = options.hosts ?? parseHostTable(process.env.PROXY_FIXTURE_HOSTS);
-  const publicTargets = parsePublicTargets(JSON.stringify(options.publicTargets ?? []));
+  // Public hosts the fixture forwards to and answers for, beside the fixture
+  // destinations; the relay runs with publicOnly and forwards nothing else.
+  const publicTargets = parsePublicTargets(options.publicTargets ? JSON.stringify(options.publicTargets) : process.env.PROXY_FIXTURE_PUBLIC_TARGETS);
+  const publicOnly = Boolean(options.publicOnly);
   const ports = {
     primary: 8081, secondary: 8082, tertiary: 8083, dns: 53, nntp: 119, http: 8089, control: 8090,
     ...Object.fromEntries(extraRoutes.map(name => [name, EXTRA_ROUTES[name].port])),
@@ -157,7 +160,7 @@ export async function startProxyFixture(options = {}) {
     const publicTarget = publicTargets.find(target => target.port === port
       && (target.host === host.toLowerCase() || target.addresses.includes(host)));
     const allowedHost = host === ip || addresses.includes(host) || /^[a-z0-9-]+\.proxy\.test$/.test(host);
-    const fixtureTarget = publicTargets.length === 0 && allowedHost && [ports.dns, ports.nntp, ports.http].includes(port);
+    const fixtureTarget = !publicOnly && allowedHost && [ports.dns, ports.nntp, ports.http].includes(port);
     const fixtureDns = (host === ip || addresses.includes(host)) && port === ports.dns;
     if ((!publicTarget && !fixtureTarget && !fixtureDns) || !routes[route].up) {
       reply(false); client.end(); return;

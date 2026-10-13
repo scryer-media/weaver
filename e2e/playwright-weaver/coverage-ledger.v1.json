@@ -785,6 +785,11 @@
       "oracle": "browser"
     },
     {
+      "name": "speed-test-bandwidth-run-against-cloudflare",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
       "name": "schedule-hold-and-one-shot-evaluators",
       "owner": "scheduling",
       "oracle": "api-metrics"

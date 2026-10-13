@@ -60,6 +60,9 @@ type weaverReleaseFlowSpec struct {
 	NetworkLayout weaverReleaseNetworkLayout
 	// DropNetRaw starts Weaver without CAP_NET_RAW.
 	DropNetRaw bool
+	// PublicTargets are the public hosts the proxy fixture resolves and
+	// forwards to, for a flow that reaches a real service.
+	PublicTargets []weaverPublicTarget
 	// Stages run the Playwright script once per stage, restarting Weaver
 	// between stages.
 	Stages []string
