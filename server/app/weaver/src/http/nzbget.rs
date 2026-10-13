@@ -410,13 +410,13 @@ fn basic_password_token(value: Option<&HeaderValue>) -> Result<Option<String>, S
         return Ok(None);
     };
     let value = value.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let Some(encoded) = value
-        .trim_start()
-        .strip_prefix("Basic ")
-        .or_else(|| value.trim_start().strip_prefix("basic "))
-    else {
+    // Auth schemes are case-insensitive (RFC 9110 11.1).
+    let Some((scheme, encoded)) = value.trim_start().split_once(char::is_whitespace) else {
         return Ok(None);
     };
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return Ok(None);
+    }
     let decoded = BASE64_STANDARD
         .decode(encoded.trim())
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
@@ -516,11 +516,20 @@ pub(super) async fn xmlrpc_handler(
 }
 
 pub(super) fn authentication_error_response(path: &str, status: StatusCode) -> Response {
-    if path.trim_end_matches('/').ends_with("/xmlrpc") {
+    let mut response = if path.trim_end_matches('/').ends_with("/xmlrpc") {
         xmlrpc_fault_response(status, RpcError::access_denied())
     } else {
         rpc_error_response(status, Value::Null, RpcError::access_denied())
+    };
+    // Clients that wait for a challenge before sending Basic credentials
+    // need one on every 401.
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"weaver\""),
+        );
     }
+    response
 }
 
 fn xml_local_name(name: &str) -> &str {

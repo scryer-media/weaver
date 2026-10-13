@@ -4661,3 +4661,57 @@ async fn nzbget_route_shapes_coexist_with_the_rest_of_the_router() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("16.0-weaver"));
 }
+
+#[tokio::test]
+async fn nzbget_401_carries_a_basic_challenge() {
+    let app = facade_with_control_key();
+    for request in [
+        json_post("/jsonrpc", None, "version"),
+        json_post("/jsonrpc", Some(&basic_auth("wrong-key")), "version"),
+        xml_post("/xmlrpc", None, "version"),
+        xml_post("/arr:wrong-key/xmlrpc/", None, "version"),
+        get_request("/jsonrpc/version", None),
+    ] {
+        let uri = request.uri().to_string();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            "Basic realm=\"weaver\"",
+            "{uri}"
+        );
+    }
+
+    // A 403 for a scope the key lacks is not a credentials challenge.
+    let read_app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("read-key", "read"),
+    );
+    let response = read_app
+        .oneshot(json_post(
+            "/jsonrpc",
+            Some("Bearer read-key"),
+            "pausedownload",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+}
+
+#[tokio::test]
+async fn nzbget_basic_scheme_is_matched_case_insensitively() {
+    use base64::Engine as _;
+
+    let app = facade_with_control_key();
+    let encoded = base64::engine::general_purpose::STANDARD.encode("arr:control-key");
+    for scheme in ["Basic", "basic", "BASIC", "bAsIc"] {
+        let auth = format!("{scheme} {encoded}");
+        let (status, body) =
+            send_raw(app.clone(), json_post("/jsonrpc", Some(&auth), "version")).await;
+        assert_eq!(status, StatusCode::OK, "{scheme}: {body}");
+        assert!(body.contains("16.0-weaver"), "{scheme}");
+    }
+}
