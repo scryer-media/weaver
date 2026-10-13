@@ -232,7 +232,8 @@ fn nzbget_variables_reach_a_script_alongside_the_positional_arguments() {
     assert_eq!(env.get("NZBOP_DestDir").unwrap(), "/data/complete");
     assert_eq!(env.get("NZBOP_TempDir").unwrap(), "/tmp");
     assert_eq!(env.get("NZBOP_AppDir").unwrap(), "/opt/weaver");
-    assert!(env.contains_key("NZBOP_Version"));
+    assert_eq!(env.get("NZBOP_Version").unwrap(), "16.0-weaver");
+    assert_eq!(env.get("NZBOP_VERSION").unwrap(), "16.0-weaver");
 }
 
 #[test]
@@ -358,6 +359,40 @@ fn a_run_is_told_which_instance_it_is_and_given_its_inputs() {
     let (_, env) = contract(&request);
     assert_eq!(env.get("WEAVER_API_URL").unwrap(), "http://127.0.0.1:6789");
     assert_eq!(env.get("WEAVER_RUN_TOKEN").unwrap(), "run-token");
+}
+
+#[test]
+fn an_nzbget_run_that_can_call_back_is_told_the_control_address() {
+    let mut request = request(ScriptAdapter::Nzbget);
+    let (_, env) = contract(&request);
+    for name in [
+        "NZBOP_ControlIP",
+        "NZBOP_ControlPort",
+        "NZBOP_ControlUsername",
+        "NZBOP_ControlPassword",
+    ] {
+        assert!(!env.contains_key(name), "{name}");
+    }
+
+    request.identity.api_url = Some("http://127.0.0.1:6789/weaver/graphql".into());
+    request.identity.token = Some("run-token".into());
+    let (_, env) = contract(&request);
+    assert_eq!(env.get("NZBOP_ControlIP").unwrap(), "127.0.0.1");
+    assert_eq!(env.get("NZBOP_CONTROLIP").unwrap(), "127.0.0.1");
+    assert_eq!(env.get("NZBOP_ControlPort").unwrap(), "6789");
+    assert_eq!(env.get("NZBOP_ControlUsername").unwrap(), "weaver");
+    assert_eq!(env.get("NZBOP_ControlPassword").unwrap(), "run-token");
+    assert_eq!(env.get("NZBOP_CONTROLPASSWORD").unwrap(), "run-token");
+
+    request.identity.api_url = Some("http://[::1]:6789/graphql".into());
+    let (_, env) = contract(&request);
+    assert_eq!(env.get("NZBOP_ControlIP").unwrap(), "[::1]");
+
+    // An address without a token gives the script nothing to call back with.
+    request.identity.token = None;
+    let (_, env) = contract(&request);
+    assert!(!env.contains_key("NZBOP_ControlPassword"));
+    assert!(!env.contains_key("NZBOP_ControlIP"));
 }
 
 #[test]

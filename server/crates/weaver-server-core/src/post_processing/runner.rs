@@ -393,7 +393,7 @@ pub async fn execute_spec_tapped(
     } else {
         None
     };
-    insert_nzbget_global_options(&mut env, &spec.facts)?;
+    insert_nzbget_global_options(&mut env, &spec.facts, &spec.identity)?;
     insert_compat_options(&mut env, "NZBPO", &spec.options)?;
     insert_options(&mut env, "SAB_OPTION_", &spec.options)?;
     insert_weaver_env(&mut env, &spec.identity, &spec.facts, &spec.options)?;
@@ -919,7 +919,7 @@ fn adapter_environment_and_args(
         &context.compatibility.critical_health_milli.to_string(),
     )?;
     insert_compat_options(env, "NZBPO", &request.options)?;
-    insert_nzbget_global_options(env, &context.compatibility)?;
+    insert_nzbget_global_options(env, &context.compatibility, &request.identity)?;
     insert_parameters(env, &context.compatibility.parameters, &request.manifest)?;
     let final_directory = context
         .compatibility
@@ -1045,11 +1045,35 @@ fn insert_parameters(
     Ok(())
 }
 
+// The version the NZBGet facade reports, so a script that compares it
+// against a minimum sees the same answer its `version` call would.
+pub const NZBGET_COMPAT_VERSION: &str = "16.0-weaver";
+
+// The user name a script is told to call the facade back with. The facade
+// ignores the name; the password is the run's token.
+const NZBGET_CONTROL_USERNAME: &str = "weaver";
+
 fn insert_nzbget_global_options(
     env: &mut BTreeMap<OsStringWire, OsStringWire>,
     facts: &CompatibilityFacts,
+    identity: &RunIdentity,
 ) -> Result<(), RunnerError> {
-    insert_special_env(env, "NZBOP", "Version", env!("CARGO_PKG_VERSION"))?;
+    insert_special_env(env, "NZBOP", "Version", NZBGET_COMPAT_VERSION)?;
+    // A script that calls weaver back through the facade builds its address
+    // from these. They are set only for a run that holds a token, and the
+    // token stops working when the run ends.
+    if let (Some(url), Some(token)) = (identity.api_url.as_deref(), identity.token.as_deref())
+        && let Some((host, port)) = control_endpoint(url)
+    {
+        for (name, value) in [
+            ("ControlIP", host.as_str()),
+            ("ControlPort", port.as_str()),
+            ("ControlUsername", NZBGET_CONTROL_USERNAME),
+            ("ControlPassword", token),
+        ] {
+            insert_special_env(env, "NZBOP", name, value)?;
+        }
+    }
     for (name, value) in [
         ("AppDir", facts.app_dir.as_deref()),
         ("MainDir", facts.data_dir.as_deref()),
@@ -1062,6 +1086,16 @@ fn insert_nzbget_global_options(
         }
     }
     Ok(())
+}
+
+// The host and port of the address scripts reach this server at. An IPv6
+// host keeps its brackets so that `http://{ip}:{port}/` stays a valid URL.
+fn control_endpoint(api_url: &str) -> Option<(String, String)> {
+    let url = reqwest::Url::parse(api_url).ok()?;
+    // The serialized host, which keeps an IPv6 address in brackets.
+    let host = url.host_str()?.to_string();
+    let port = url.port_or_known_default()?;
+    Some((host, port.to_string()))
 }
 
 fn sanitized_platform_environment() -> Result<BTreeMap<OsStringWire, OsStringWire>, RunnerError> {

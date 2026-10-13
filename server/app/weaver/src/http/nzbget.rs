@@ -338,7 +338,9 @@ async fn dispatch_method(
     params: Option<Value>,
 ) -> Result<Value, RpcError> {
     match method {
-        "version" => Ok(json!("16.0-weaver")),
+        "version" => Ok(json!(
+            weaver_server_core::post_processing::runner::NZBGET_COMPAT_VERSION
+        )),
         "append" => append(ctx, params).await,
         "appendurl" => append_url(ctx, params).await,
         "status" => status(ctx).await,
@@ -380,6 +382,15 @@ pub(super) async fn resolve_scope_for_facade(
     // The compatibility facade is machine-only: it deliberately accepts only
     // persistent API keys, never either browser cookie.
     headers.remove(header::COOKIE);
+    // A script calling back with its run's token, given to it as the control
+    // password. It may control the queue for as long as its run lasts, and
+    // the token is worth nothing once the run has ended.
+    if super::auth::resolve_script_run(&ctx.db, &headers)
+        .await
+        .is_some()
+    {
+        return Ok(CallerScope::Control);
+    }
     super::auth::resolve_caller(
         &ctx.db,
         &ctx.auth_cache,

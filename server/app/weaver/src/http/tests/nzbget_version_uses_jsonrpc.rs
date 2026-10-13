@@ -342,6 +342,72 @@ async fn nzbget_auth_accepts_basic_password_as_persistent_api_key() {
 }
 
 #[tokio::test]
+async fn nzbget_takes_a_running_scripts_token_as_its_control_password() {
+    use weaver_server_core::post_processing::model::ScriptEventLabel;
+    use weaver_server_core::post_processing::runner::RunIdentity;
+
+    let db = Database::open_in_memory().unwrap();
+    db.set_script_api_url("http://127.0.0.1:6789/graphql");
+    let mut identity = RunIdentity {
+        run_id: "run-1".into(),
+        instance_id: "instance-1".into(),
+        ..Default::default()
+    };
+    let run = db.open_script_run(
+        &mut identity,
+        Some(7),
+        &ScriptEventLabel::PostProcessing,
+        None,
+        false,
+    );
+    let token = identity.token.clone().unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+    let writelog = serde_json::json!({
+        "method": "writelog",
+        "params": ["INFO", "from the script"],
+        "id": "script"
+    });
+
+    // While the run lasts its token is a control credential, sent the way a
+    // script told NZBOP_ControlPassword sends it.
+    let (status, payload) = post_nzbget(app.clone(), writelog.clone(), &basic_auth(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["result"], true);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/weaver:{token}/jsonrpc"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(writelog.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // It controls the queue and nothing more.
+    let (status, _) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "loadextensions", "params": [], "id": "admin"}),
+        &basic_auth(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Once the run has ended the token opens nothing.
+    drop(run);
+    let (status, payload) = post_nzbget(app, writelog, &basic_auth(&token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["error"]["code"], 401);
+}
+
+#[tokio::test]
 async fn nzbget_auth_rejects_missing_and_invalid_basic_auth() {
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
