@@ -19,6 +19,18 @@ impl DraftNetworkRoute {
     pub fn leg_count(&self) -> usize {
         self.legs.len()
     }
+    // The dialing stage of one leg, as drafted.
+    pub fn leg_stage(&self, position: usize) -> Result<Arc<dyn Dialer>, String> {
+        Ok(self
+            .legs
+            .get(position)
+            .ok_or("draft leg does not exist")?
+            .stage
+            .clone())
+    }
+    pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
+        &self.handle
+    }
     pub fn nntp_dialer_for_leg(
         &self,
         position: usize,
@@ -173,10 +185,30 @@ impl NetworkRuntime {
         policy: RoutingPolicy,
         timeout: Duration,
     ) -> Result<Arc<DraftNetworkRoute>, String> {
+        self.draft_route_without_members(consumer, policy, timeout, &[])
+    }
+    // A draft whose pools leave out `removed` proxies. Only the draft's own
+    // copy of the configuration changes.
+    pub fn draft_route_without_members(
+        &self,
+        consumer: Consumer,
+        policy: RoutingPolicy,
+        timeout: Duration,
+        removed: &[u32],
+    ) -> Result<Arc<DraftNetworkRoute>, String> {
         self.validate_policy(consumer, &policy)?;
         // Drafts share unchanged live carriers. Carried tunnels are sized
         // by the provider in the same way before and after saving the route.
         let isolated = self.isolated_probe_runtime();
+        if !removed.is_empty() {
+            let mut config = isolated
+                .configuration
+                .write()
+                .expect("network configuration");
+            for pool in config.pools.values_mut() {
+                pool.member_ids.retain(|id| !removed.contains(id));
+            }
+        }
         let config = isolated
             .configuration
             .read()

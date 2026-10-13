@@ -152,6 +152,12 @@ pub fn build_schema_with_backup(
         )
     });
 
+    let speed_test = weaver_server_core::speed_test::SpeedTestService::for_handle(
+        &context.handle,
+        context.config.clone(),
+        context.db.clone(),
+        context.security.rss_allow_private_network,
+    );
     let schema = apply_graphql_query_guards(Schema::build(
         QueryRoot::default(),
         MutationRoot::default(),
@@ -177,7 +183,8 @@ pub fn build_schema_with_backup(
     .data(context.nntp_pool)
     .data(replay)
     .data(history_delete_manager)
-    .data(staged_upload_manager);
+    .data(staged_upload_manager)
+    .data(speed_test);
     let schema = schema.data(post_processing_executor);
     schema.finish()
 }

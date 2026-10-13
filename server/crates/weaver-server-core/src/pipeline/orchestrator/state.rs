@@ -185,9 +185,7 @@ impl Pipeline {
     }
 
     pub(crate) fn publish_active_stage_metrics(&self) {
-        self.metrics
-            .active_downloads
-            .store(self.active_downloads, Ordering::Relaxed);
+        self.metrics.set_active_downloads(self.active_downloads);
         self.metrics.active_decodes.store(
             self.active_decodes_by_job.values().sum::<usize>(),
             Ordering::Relaxed,

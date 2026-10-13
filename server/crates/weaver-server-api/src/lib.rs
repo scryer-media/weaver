@@ -13,6 +13,7 @@ pub mod scalars;
 pub mod schema;
 pub mod servers;
 pub mod settings;
+pub mod speed_test;
 pub mod system;
 
 pub use auth::types::*;

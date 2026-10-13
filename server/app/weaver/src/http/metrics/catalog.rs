@@ -497,6 +497,12 @@ metric_families! {
         "Connections a ladder made on a rung past the first, by the rung that connected.");
     NETWORK_LEG_REVOCATIONS = ("weaver_network_leg_revocations_total", Counter, [],
         "Route stages revoked, closing the connections that ran over them.");
+
+    // ---- speed tests -------------------------------------------------------
+    SPEED_TEST_RUNS = ("weaver_speed_test_runs_total", Counter, ["kind", "status"],
+        "Speed tests that finished, by kind and final status. Every combination is emitted, so the series pre-exist at zero.");
+    SPEED_TEST_LAST_BPS = ("weaver_speed_test_last_bps", Gauge, ["consumer", "kind"],
+        "Average bytes per second of the last completed speed test, by consumer and kind; absent until one completes.");
     TUNNEL_STREAMS = ("weaver_tunnel_streams_total", Counter, ["kind", "result"],
         "Streams opened through a proxy hop, by proxy kind and result.");
     TUNNEL_SESSION_PREPARES = ("weaver_tunnel_session_prepares_total", Counter, ["kind", "result"],

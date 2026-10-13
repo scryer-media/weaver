@@ -67,6 +67,7 @@ import {
   Workflow,
   Wrench,
   X,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
 
@@ -121,6 +122,7 @@ export const ICONS = {
   proxies: Waypoints,
   routes: Route,
   bandwidth: Gauge,
+  speedTest: Zap,
   schedules: CalendarClock,
   postProcessing: SquareTerminal,
   scriptConfiguration: Wrench,

@@ -350,6 +350,44 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "PROXY_HOST_KEY_NOT_SSH",
             "only SSH profiles have host-key trust",
         ),
+        (
+            R::SpeedTestAlreadyRunning { run: 4 },
+            "SPEED_TEST_ALREADY_RUNNING",
+            "speed test 4 is still running; cancel it or wait for it to finish",
+        ),
+        (
+            R::SpeedTestQueueBusy,
+            "SPEED_TEST_QUEUE_BUSY",
+            "the previous speed test is still giving the queue back; start again once it has",
+        ),
+        (
+            R::SpeedTestUsenetNeedsServer,
+            "SPEED_TEST_USENET_NEEDS_SERVER",
+            "a Usenet speed test runs on a server; a feed can run a bandwidth test only",
+        ),
+        (
+            R::SpeedTestLegDownAll,
+            "SPEED_TEST_LEG_DOWN_ALL",
+            "every leg of the route would be down; leave at least one leg up",
+        ),
+        (
+            R::SpeedTestQuotaBlocked {
+                holder: super::SpeedTestQuotaHolder::Egress,
+                id: 3,
+                name: "Uplink".into(),
+            },
+            "SPEED_TEST_QUOTA_BLOCKED",
+            "egress Uplink has used its download quota, and a speed test books its bytes against it",
+        ),
+        (
+            R::SpeedTestLeaseRefused {
+                server: 2,
+                name: "Primary".into(),
+                reason: "its health tracker has it out of service".into(),
+            },
+            "SPEED_TEST_LEASE_REFUSED",
+            "server Primary cannot lend its connections: its health tracker has it out of service",
+        ),
     ]
 }
 
@@ -428,9 +466,15 @@ fn slot(refusal: &R) -> usize {
         R::ProxyInPool => 68,
         R::ProxyInUse => 69,
         R::ProxyHostKeyNotSsh => 70,
+        R::SpeedTestAlreadyRunning { .. } => 71,
+        R::SpeedTestQueueBusy => 72,
+        R::SpeedTestUsenetNeedsServer => 73,
+        R::SpeedTestLegDownAll => 74,
+        R::SpeedTestQuotaBlocked { .. } => 75,
+        R::SpeedTestLeaseRefused { .. } => 76,
     }
 }
-const SLOTS: usize = 71;
+const SLOTS: usize = 77;
 
 #[test]
 fn every_refusal_keeps_its_code_and_its_sentence() {
@@ -512,6 +556,21 @@ fn only_the_sentences_that_name_values_carry_them() {
             "WIREGUARD_INSTANCE_LIMIT" => assert_eq!(
                 params,
                 serde_json::json!({ "required": 3, "limit": 2, "instanceMib": 516 })
+            ),
+            "SPEED_TEST_ALREADY_RUNNING" => {
+                assert_eq!(params, serde_json::json!({ "runId": 4 }))
+            }
+            "SPEED_TEST_QUOTA_BLOCKED" => assert_eq!(
+                params,
+                serde_json::json!({ "scope": "egress", "id": 3, "name": "Uplink" })
+            ),
+            "SPEED_TEST_LEASE_REFUSED" => assert_eq!(
+                params,
+                serde_json::json!({
+                    "serverId": 2,
+                    "name": "Primary",
+                    "reason": "its health tracker has it out of service",
+                })
             ),
             _ => assert_eq!(params, serde_json::json!({}), "{code}"),
         }

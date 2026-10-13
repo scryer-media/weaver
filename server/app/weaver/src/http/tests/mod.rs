@@ -1650,6 +1650,18 @@ impl CollectionFixtures {
 
 // Build the most complete render the exporter can produce, so the catalogue
 // comparison sees every family.
+fn sample_speed_tests() -> weaver_server_core::speed_test::SpeedTestMetricsSnapshot {
+    use weaver_server_core::speed_test::SpeedTestKindLabel;
+    let mut metrics = weaver_server_core::speed_test::SpeedTestMetricsSnapshot::default();
+    metrics.runs[SpeedTestKindLabel::Usenet.index()][0] = 3;
+    metrics.runs[SpeedTestKindLabel::Bandwidth.index()][1] = 1;
+    metrics.last_bps.insert(
+        ("server:4".into(), SpeedTestKindLabel::Usenet),
+        125_000_000.0,
+    );
+    metrics
+}
+
 fn fully_populated_render() -> String {
     let snapshot = populated_metrics_snapshot();
     let block = manual_pause_block();
@@ -1664,6 +1676,7 @@ fn fully_populated_render() -> String {
     let schedules = sample_schedules();
     let network = sample_network();
     let tunnel = sample_tunnel();
+    let speed_tests = sample_speed_tests();
     let collection = CollectionFixtures::new();
 
     let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
@@ -1679,6 +1692,7 @@ fn fully_populated_render() -> String {
     input.schedules = Some(&schedules);
     input.network = Some(&network);
     input.tunnel = Some(&tunnel);
+    input.speed_tests = Some(&speed_tests);
     input.runtime_generation = 3;
     input.start_time_seconds = 1_700_000_000.0;
     collection.apply(&mut input);

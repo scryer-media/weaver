@@ -7,3 +7,6 @@ pub mod dns;
 pub mod http3;
 #[path = "test_support/proxy.rs"]
 pub mod proxy;
+#[cfg(feature = "test-support")]
+#[path = "test_support/tls.rs"]
+pub mod tls;

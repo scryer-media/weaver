@@ -2,11 +2,14 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import {
   closedPath,
+  isDown,
+  type DownTarget,
   type Egress,
   type FailingHop,
   type LegFlow,
   type NetworkFlow as Flow,
   type NetworkRoute,
+  type PathOverride,
   type PoolMemberFlow,
   type ProxyPool,
   type Rung,
@@ -77,6 +80,9 @@ const COMPACT: Lanes = {
 const LEG_HEIGHT = 64;
 const BOX_HEIGHT = 44;
 const NOTE_LINE = 12;
+/** The row a box makes for its Down switch while a speed test is being set up. */
+const TOGGLE_ROW = 22;
+const TOGGLE_WIDTH = 44;
 const EGRESS_PAGE = "/settings/networking/egress";
 const PROXIES_PAGE = "/settings/networking/proxies";
 const routePage = (consumer: string) => `/settings/networking/routes?consumer=${encodeURIComponent(consumer)}`;
@@ -213,6 +219,9 @@ function rungStatus(leg: LegFlow, rungIndex: number, direct: boolean): string {
     return "PROBING";
   }
   const state = leg.rungStates?.[rungIndex];
+  if (state === "DOWN") {
+    return "DOWN";
+  }
   if (state === "COOLDOWN") {
     return "COOLDOWN";
   }
@@ -328,6 +337,7 @@ function HopBox({
   label,
   note = [],
   active,
+  toggle,
 }: {
   x: number;
   y: number;
@@ -340,10 +350,21 @@ function HopBox({
   label: string;
   note?: string[];
   active: boolean;
+  /** The box's Down switch, drawn in the row the layout made for it at the foot of the box. */
+  toggle?: (x: number, y: number) => ReactNode;
 }) {
+  const down = state === "DOWN";
   return (
     <g opacity={state === "DISABLED" ? 0.6 : 1}>
-      <rect x={x} y={y} width={width} height={height} fill={active ? INK.rowActive : INK.card} stroke={INK.line} />
+      <rect
+        x={x}
+        y={y}
+        width={width}
+        height={height}
+        fill={active ? INK.rowActive : INK.card}
+        stroke={down ? stateColor("DOWN") : INK.line}
+        strokeDasharray={down ? "4 4" : undefined}
+      />
       <StateBar x={x} y={y} height={height} state={state} />
       <text x={x + 14} y={y + 18} fill={INK.fg} fontSize="11">
         {fit(title, width - 26 - (aside ? aside.length * 6 + 10 : 0), 11)}
@@ -355,6 +376,51 @@ function HopBox({
       ) : null}
       <StateText x={x + 14} y={y + 35} size={9.5} state={state} label={fit(label, width - 39, 9.5)} />
       <Note x={x + 14} y={y + BOX_HEIGHT + 5} lines={note} />
+      {toggle ? toggle(x + 14, y + height - TOGGLE_ROW + 2) : null}
+    </g>
+  );
+}
+
+/** A Down switch drawn inside a box: what a speed test leaves out of the route it measures. */
+function DownToggle({
+  x,
+  y,
+  down,
+  label,
+  word,
+  onToggle,
+}: {
+  x: number;
+  y: number;
+  down: boolean;
+  label: string;
+  word: string;
+  onToggle: () => void;
+}) {
+  const color = stateColor("DOWN");
+  return (
+    <g
+      role="switch"
+      aria-checked={down}
+      aria-label={label}
+      tabIndex={0}
+      style={{ cursor: "pointer" }}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onToggle();
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onToggle();
+        }
+      }}
+    >
+      <rect x={x} y={y} width={TOGGLE_WIDTH} height="16" fill={down ? color : INK.row} stroke={down ? color : INK.control} />
+      <text x={x + TOGGLE_WIDTH / 2} y={y + 11.5} textAnchor="middle" fontSize="9" fill={down ? INK.ground : INK.muted}>
+        {word}
+      </text>
     </g>
   );
 }
@@ -391,6 +457,7 @@ export function NetworkFlow({
   consumers,
   onEdit,
   compact = false,
+  toggles,
 }: {
   flow: Flow;
   egresses: Egress[];
@@ -399,6 +466,12 @@ export function NetworkFlow({
   consumers: FlowConsumer[];
   onEdit?: (target: FlowTarget) => void;
   compact?: boolean;
+  /**
+   * What a speed test leaves out, and with `onToggle` a Down switch on every
+   * egress, leg, rung, chain hop and pool member to change it. Downed proxies
+   * are drawn down here; the caller draws downed legs and rungs into `flow`.
+   */
+  toggles?: { overrides: PathOverride; onToggle?: (target: DownTarget) => void };
 }) {
   const t = useTranslate();
   const svg = useRef<SVGSVGElement>(null);
@@ -407,6 +480,9 @@ export function NetworkFlow({
   const [group, setGroup] = useState<number | null>(null);
   const counts = useMeasurements(flow.legs);
   const lanes = compact ? COMPACT : FULL;
+  const onToggle = toggles?.onToggle;
+  const overrides = toggles?.overrides;
+  const toggleRow = onToggle ? TOGGLE_ROW : 0;
   const { EGRESS, LEGS, PROXY, ENDPOINTS, WIDTH, HOP_GAP } = lanes;
   // An egress no route leaves through is not part of the flow, so it has no card.
   const used = useMemo(
@@ -436,15 +512,18 @@ export function NetworkFlow({
           const measured =
             member != null && (member.handshakeMs != null || member.connectMs != null || member.bytesPerSecond != null);
           const said = member?.blocked ?? (failing?.proxyId === id ? failing.reason : null);
-          const note = said ? wrap(said, lanes.PROXY.width - 45, 9.5, 2) : [];
+          const note = said ? wrap(said, lanes.PROXY.width - 45 - (toggleRow ? TOGGLE_WIDTH : 0), 9.5, 2) : [];
           return {
             id,
             live: member,
-            state: memberState(
-              member,
-              live?.pinnedMember === id,
-              profiles.find((profile) => profile.id === id)?.enabled !== false,
-            ),
+            state:
+              overrides && isDown(overrides, { kind: "proxy", id })
+                ? "DOWN"
+                : memberState(
+                    member,
+                    live?.pinnedMember === id,
+                    profiles.find((profile) => profile.id === id)?.enabled !== false,
+                  ),
             measured,
             note,
             height: (measured ? 32 : 20) + note.length * NOTE_LINE,
@@ -462,6 +541,7 @@ export function NetworkFlow({
         const height =
           BOX_HEIGHT +
           noteHeight(note.length) +
+          toggleRow +
           members.reduce((sum, member) => sum + member.height, 0) +
           (members.length ? 8 : 0);
         const top = bottom;
@@ -481,7 +561,7 @@ export function NetworkFlow({
     });
     const bottom = Math.max(offset - 16, used.length * 128 + 38, compact ? 0 : cardsBottom);
     return { rows, height: compact ? bottom + 12 : Math.max(bottom + 52, 260) };
-  }, [flow.legs, flow.pools, filter, grouped, group, pools, profiles, used.length, cardsBottom, lanes, compact]);
+  }, [flow.legs, flow.pools, filter, grouped, group, pools, profiles, used.length, cardsBottom, lanes, compact, toggleRow, overrides]);
 
   const width = scale(Math.max(1, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
   const profile = (id: number | null) => profiles.find((candidate) => candidate.id === id);
@@ -553,6 +633,21 @@ export function NetworkFlow({
     );
   }
   const proxyTarget = (id: number | null): FlowTarget | null => (id == null ? null : { kind: "proxy", id });
+  /** The Down switch for one box, while a speed test is being set up. */
+  const toggle = (target: DownTarget, label: string) =>
+    toggles && onToggle
+      ? (x: number, y: number) => (
+          <DownToggle
+            x={x}
+            y={y}
+            down={isDown(toggles.overrides, target)}
+            label={label}
+            word={t("next.networking.speed.downSwitch")}
+            onToggle={() => onToggle(target)}
+          />
+        )
+      : undefined;
+  const proxyDown = (id: number) => !!toggles && isDown(toggles.overrides, { kind: "proxy", id });
 
   /** One rung of a leg's ladder, drawn in the proxy lane. */
   function rungBlock(leg: LegFlow, rowY: number, block: Block) {
@@ -575,7 +670,7 @@ export function NetworkFlow({
           {ground}
           {rung.chainIds.map((id, position) => {
             const x = PROXY.x + position * (hopWidth + HOP_GAP);
-            const state = hopState(position, failingAt, status, profile(id)?.enabled !== false);
+            const state = proxyDown(id) ? "DOWN" : hopState(position, failingAt, status, profile(id)?.enabled !== false);
             return (
               <g key={id}>
                 <title>{[name(id), ...(failing && position === failingAt ? [failing.reason] : [])].join(" · ")}</title>
@@ -592,6 +687,7 @@ export function NetworkFlow({
                     label={stateLabel(t, state)}
                     note={position === Math.max(0, failingAt) ? block.note : []}
                     active={isActive}
+                    toggle={toggle({ kind: "proxy", id }, t("next.networking.speed.boxDown", { name: name(id) }))}
                   />,
                 )}
                 {position + 1 < rung.chainIds.length ? (
@@ -610,7 +706,7 @@ export function NetworkFlow({
       const configured = pools.find((pool) => pool.id === rung.poolId);
       const state = configured?.enabled === false ? "DISABLED" : status;
       const held = members.reduce((sum, member) => sum + (member.live?.open ?? 0), 0);
-      const head = BOX_HEIGHT + noteHeight(block.note.length);
+      const head = BOX_HEIGHT + noteHeight(block.note.length) + toggleRow;
       let memberY = y + head;
       return (
         <g key={rungIndex} {...way}>
@@ -630,6 +726,10 @@ export function NetworkFlow({
               label={`${stateLabel(t, state)}${block.pinned != null ? ` · ${t("next.networking.flow.pinnedTo", { name: name(block.pinned) })}` : ""}`}
               note={block.note}
               active={isActive}
+              toggle={toggle(
+                { kind: "rung", leg: leg.position, rung: rungIndex },
+                t("next.networking.speed.rungDown", { leg: leg.position + 1, rung: rungIndex + 1 }),
+              )}
             />,
           )}
           <StateBar x={PROXY.x} y={y} height={block.height} state={state} />
@@ -671,6 +771,10 @@ export function NetworkFlow({
                     </text>
                   ) : null}
                   <Note x={PROXY.x + 29} y={top + (member.measured ? 37 : 25)} lines={member.note} />
+                  {toggle({ kind: "proxy", id: member.id }, t("next.networking.speed.boxDown", { name: name(member.id) }))?.(
+                    PROXY.end - 16 - TOGGLE_WIDTH,
+                    top + 2,
+                  )}
                 </g>,
                 undefined,
                 member.id,
@@ -682,7 +786,14 @@ export function NetworkFlow({
     }
 
     const hop = profile(rung.proxyId);
-    const state = hop?.enabled === false ? "DISABLED" : failing && status !== "COOLDOWN" ? "FAILING" : status;
+    const state =
+      hop?.enabled === false
+        ? "DISABLED"
+        : status === "DOWN"
+          ? "DOWN"
+          : failing && status !== "COOLDOWN"
+            ? "FAILING"
+            : status;
     return (
       <g key={rungIndex} {...way}>
         {failing ? <title>{failing.reason}</title> : null}
@@ -700,6 +811,10 @@ export function NetworkFlow({
             label={stateLabel(t, state)}
             note={block.note}
             active={isActive}
+            toggle={toggle(
+              { kind: "rung", leg: leg.position, rung: rungIndex },
+              t("next.networking.speed.rungDown", { leg: leg.position + 1, rung: rungIndex + 1 }),
+            )}
           />,
         )}
       </g>
@@ -869,8 +984,12 @@ export function NetworkFlow({
                     <rect x={EGRESS.x} y={y} width={EGRESS.width} height="108" fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} strokeDasharray={down ? "4 4" : undefined} />
                     <StateBar x={EGRESS.x} y={y} height={108} state={egress.health} />
                     <text x={x} y={y + 24} fill={INK.fg} fontSize="13" fontFamily={TITLE_FONT} fontWeight="600">
-                      {fit(egress.name, room, 13)}
+                      {fit(egress.name, room - (onToggle ? TOGGLE_WIDTH + 6 : 0), 13)}
                     </text>
+                    {toggle({ kind: "egress", id: egress.id }, t("next.networking.speed.boxDown", { name: egress.name }))?.(
+                      EGRESS.end - 12 - TOGGLE_WIDTH,
+                      y + 10,
+                    )}
                     <StateText x={x} y={y + 46} state={egress.health} label={stateLabel(t, egress.health)} />
                     <text x={x} y={y + 66} fill={INK.muted} fontSize="10">
                       {fit(
@@ -956,6 +1075,10 @@ export function NetworkFlow({
                       </text>
                     )}
                     <Note x={x} y={y + LEG_HEIGHT + 4} lines={note} />
+                    {toggle(
+                      { kind: "leg", position: leg.position },
+                      t("next.networking.speed.legDown", { position: leg.position + 1 }),
+                    )?.(LEGS.end - 12 - TOGGLE_WIDTH, y + 8)}
                   </>,
                   t("next.networking.flow.editLeg", { name: consumerName(leg), position: leg.position + 1 }),
                 )}

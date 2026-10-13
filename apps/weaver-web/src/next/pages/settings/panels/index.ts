@@ -114,6 +114,14 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     Component: NetworkingPanel,
   },
   {
+    slug: "networking/speed",
+    group: "networking",
+    label: "next.networking.speed.title",
+    note: "settings.networkingDesc",
+    icon: "speedTest",
+    Component: NetworkingPanel,
+  },
+  {
     slug: "networking/bandwidth",
     group: "networking",
     label: "next.settings.panel.bandwidth",

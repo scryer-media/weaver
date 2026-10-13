@@ -74,6 +74,7 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) schedules: Option<&'a ScheduleMetricsSnapshot>,
     pub(crate) network: Option<&'a NetworkMetricsSnapshot>,
     pub(crate) tunnel: Option<&'a TunnelMetricsSnapshot>,
+    pub(crate) speed_tests: Option<&'a weaver_server_core::speed_test::SpeedTestMetricsSnapshot>,
     pub(crate) build: BuildInfo,
     pub(crate) start_time_seconds: f64,
     pub(crate) per_job_series: PerJobSeries,
@@ -116,6 +117,7 @@ impl<'a> PrometheusRenderInput<'a> {
             schedules: None,
             network: None,
             tunnel: None,
+            speed_tests: None,
             build: BuildInfo {
                 version: env!("CARGO_PKG_VERSION"),
                 commit: option_env!("WEAVER_GIT_COMMIT").unwrap_or("unknown"),
@@ -177,6 +179,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         schedules,
         network,
         tunnel,
+        speed_tests,
         build,
         start_time_seconds,
         per_job_series,
@@ -288,6 +291,9 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     }
     if let Some(metrics) = tunnel {
         render_tunnel(&mut out, metrics);
+    }
+    if let Some(metrics) = speed_tests {
+        render_speed_tests(&mut out, metrics);
     }
 
     out.finish()
@@ -2166,4 +2172,32 @@ pub(crate) fn render_tunnel(out: &mut Encoder, metrics: &TunnelMetricsSnapshot) 
         out.sample(&f::NETWORK_RUNG_FALLBACKS, &[("rung", &rung)], *count);
     }
     out.sample(&f::NETWORK_LEG_REVOCATIONS, &[], metrics.revocations);
+}
+
+// Speed tests. The run counter's label set comes from the kind and status
+// enums, so a new variant cannot drop a series without a compile error.
+pub(crate) fn render_speed_tests(
+    out: &mut Encoder,
+    metrics: &weaver_server_core::speed_test::SpeedTestMetricsSnapshot,
+) {
+    use weaver_server_core::speed_test::{SpeedTestKindLabel, SpeedTestStatus};
+    for kind in SpeedTestKindLabel::ALL {
+        for status in SpeedTestStatus::FINISHED {
+            let Some(index) = status.finished_index() else {
+                continue;
+            };
+            out.sample(
+                &f::SPEED_TEST_RUNS,
+                &[("kind", kind.as_str()), ("status", status.as_str())],
+                metrics.runs[kind.index()][index],
+            );
+        }
+    }
+    for ((consumer, kind), bps) in &metrics.last_bps {
+        out.sample_f64(
+            &f::SPEED_TEST_LAST_BPS,
+            &[("consumer", consumer.as_str()), ("kind", kind.as_str())],
+            *bps,
+        );
+    }
 }
