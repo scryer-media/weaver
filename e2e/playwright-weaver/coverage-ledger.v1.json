@@ -82,6 +82,11 @@
       "oracle": "browser"
     },
     {
+      "path": "/settings/networking/speed",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
       "path": "/settings/rss",
       "owner": "ui-ingress-automation",
       "oracle": "browser"
@@ -706,6 +711,16 @@
       "name": "testProxyPool",
       "owner": "advanced-networking-pools",
       "oracle": "api-metrics"
+    },
+    {
+      "name": "startSpeedTest",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
+      "name": "cancelSpeedTest",
+      "owner": "speed-test",
+      "oracle": "browser"
     }
   ],
   "behaviors": [
@@ -763,6 +778,11 @@
       "name": "proxy-pool-delivery-reselection",
       "owner": "advanced-networking-pool-reselection",
       "oracle": "api-metrics"
+    },
+    {
+      "name": "speed-test-route-overrides-queue-gate-and-job-agreement",
+      "owner": "speed-test",
+      "oracle": "browser"
     },
     {
       "name": "schedule-hold-and-one-shot-evaluators",
