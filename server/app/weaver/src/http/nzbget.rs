@@ -18,6 +18,7 @@ use weaver_server_api::{
     submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
+use weaver_server_core::history::{HistoryFailureKind, NzbgetMarkStatus};
 use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
@@ -178,26 +179,133 @@ pub(super) async fn jsonrpc_handler(
     };
 
     let id = request.id.clone().unwrap_or(Value::Null);
-    let method = request.method.to_ascii_lowercase();
+    run_jsonrpc(&ctx, scope, id, &request.method, request.params, None).await
+}
+
+// GET /jsonrpc/<method>?<p1>&<p2>...: the method comes from the path and the
+// positional parameters from the query string. Only read methods answer over
+// GET, so a cross-site link or image cannot change anything with credentials
+// the browser has cached for this host.
+pub(super) async fn jsonrpc_get_handler(
+    Extension(ctx): Extension<NzbgetFacadeContext>,
+    Extension(NzbgetCallerScope(scope)): Extension<NzbgetCallerScope>,
+    axum::extract::Path(params): axum::extract::Path<HashMap<String, String>>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    let method = params.get("method").cloned().unwrap_or_default();
+    let params = query.as_deref().map(get_query_params).unwrap_or_default();
+    let params = (!params.is_empty()).then_some(Value::Array(params));
+    run_jsonrpc(
+        &ctx,
+        scope,
+        Value::Null,
+        &method,
+        params,
+        Some(RequiredScope::Read),
+    )
+    .await
+}
+
+async fn run_jsonrpc(
+    ctx: &NzbgetFacadeContext,
+    scope: CallerScope,
+    id: Value,
+    requested_method: &str,
+    params: Option<Value>,
+    allowed: Option<RequiredScope>,
+) -> Response {
+    let method = requested_method.to_ascii_lowercase();
     let required = method_required_scope(&method);
-    if required.is_none() {
+    let Some(required) =
+        required.filter(|required| allowed.is_none_or(|allowed| *required == allowed))
+    else {
         return rpc_error_response(
             StatusCode::OK,
             id,
-            RpcError::invalid_procedure(&request.method),
+            RpcError::invalid_procedure(requested_method),
         );
-    }
-    if required == Some(RequiredScope::Control) && !scope.can_control() {
+    };
+    if required == RequiredScope::Control && !scope.can_control() {
         return rpc_error_response(StatusCode::FORBIDDEN, id, RpcError::access_denied());
     }
-    if required == Some(RequiredScope::Admin) && !scope.is_admin() {
+    if required == RequiredScope::Admin && !scope.is_admin() {
         return rpc_error_response(StatusCode::FORBIDDEN, id, RpcError::access_denied());
     }
 
-    match dispatch_method(&ctx, &method, request.params).await {
+    match dispatch_method(ctx, &method, params).await {
         Ok(result) => rpc_success_response(id, result),
         Err(error) => rpc_error_response(StatusCode::OK, id, error),
     }
+}
+
+// Query-string parameters for a GET call, in order. Each `name=value` pair
+// contributes its value (a bare item contributes itself); `true`/`false` and
+// integers are typed, everything else is a string.
+fn get_query_params(query: &str) -> Vec<Value> {
+    query
+        .split('&')
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            let raw = item.split_once('=').map_or(item, |(_, value)| value);
+            let value = percent_decode(&raw.replace('+', " "));
+            if value.eq_ignore_ascii_case("true") {
+                Value::Bool(true)
+            } else if value.eq_ignore_ascii_case("false") {
+                Value::Bool(false)
+            } else if let Ok(number) = value.parse::<i64>() {
+                json!(number)
+            } else {
+                Value::String(value)
+            }
+        })
+        .collect()
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(hex) = value.get(index + 1..index + 3)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+// NZBGet also takes credentials as a leading path segment:
+// `/<user>:<pass>/jsonrpc` or `/<user>:<pass>/xmlrpc`. As with Basic auth the
+// user name is ignored and the password is the API key. The segment is turned
+// into a bearer header before any authentication runs and before the body is
+// read; it is never logged.
+pub(super) fn apply_path_credentials(
+    path: &str,
+    headers: &mut HeaderMap,
+) -> Result<(), StatusCode> {
+    let segments = path.split('/').collect::<Vec<_>>();
+    let Some(credentials) = segments
+        .windows(2)
+        .find(|pair| matches!(pair[1], "jsonrpc" | "xmlrpc") && pair[0].contains(':'))
+        .map(|pair| pair[0])
+    else {
+        return Ok(());
+    };
+    let credentials = percent_decode(credentials);
+    let (_user, password) = credentials
+        .split_once(':')
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let password = password.trim();
+    if password.is_empty() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    insert_bearer(headers, password.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,13 +338,15 @@ async fn dispatch_method(
     params: Option<Value>,
 ) -> Result<Value, RpcError> {
     match method {
-        "version" => Ok(json!("16.0-weaver")),
+        "version" => Ok(json!(
+            weaver_server_core::post_processing::runner::NZBGET_COMPAT_VERSION
+        )),
         "append" => append(ctx, params).await,
         "appendurl" => append_url(ctx, params).await,
         "status" => status(ctx).await,
         "listgroups" => listgroups(ctx).await,
         "listfiles" => listfiles(ctx, params).await,
-        "history" => history(ctx).await,
+        "history" => history(ctx, params).await,
         // NZBGet distinguishes current values (`config`) from on-disk values
         // (`loadconfig`); weaver has a single live config. nzb360 reads its
         // category list from `loadconfig`.
@@ -272,6 +382,15 @@ pub(super) async fn resolve_scope_for_facade(
     // The compatibility facade is machine-only: it deliberately accepts only
     // persistent API keys, never either browser cookie.
     headers.remove(header::COOKIE);
+    // A script calling back with its run's token, given to it as the control
+    // password. It may control the queue for as long as its run lasts, and
+    // the token is worth nothing once the run has ended.
+    if super::auth::resolve_script_run(&ctx.db, &headers)
+        .await
+        .is_some()
+    {
+        return Ok(CallerScope::Control);
+    }
     super::auth::resolve_caller(
         &ctx.db,
         &ctx.auth_cache,
@@ -302,13 +421,13 @@ fn basic_password_token(value: Option<&HeaderValue>) -> Result<Option<String>, S
         return Ok(None);
     };
     let value = value.to_str().map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let Some(encoded) = value
-        .trim_start()
-        .strip_prefix("Basic ")
-        .or_else(|| value.trim_start().strip_prefix("basic "))
-    else {
+    // Auth schemes are case-insensitive (RFC 9110 11.1).
+    let Some((scheme, encoded)) = value.trim_start().split_once(char::is_whitespace) else {
         return Ok(None);
     };
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return Ok(None);
+    }
     let decoded = BASE64_STANDARD
         .decode(encoded.trim())
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
@@ -408,11 +527,20 @@ pub(super) async fn xmlrpc_handler(
 }
 
 pub(super) fn authentication_error_response(path: &str, status: StatusCode) -> Response {
-    if path.ends_with("/xmlrpc") {
+    let mut response = if path.trim_end_matches('/').ends_with("/xmlrpc") {
         xmlrpc_fault_response(status, RpcError::access_denied())
     } else {
         rpc_error_response(status, Value::Null, RpcError::access_denied())
+    };
+    // Clients that wait for a challenge before sending Basic credentials
+    // need one on every 401.
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"weaver\""),
+        );
     }
+    response
 }
 
 fn xml_local_name(name: &str) -> &str {
@@ -766,13 +894,18 @@ fn write_xmlrpc_value(out: &mut String, value: &Value) {
             out.push_str("</boolean>");
         }
         Value::Number(value) => {
-            // NZBGet emits unsigned 32-bit Lo/Hi counters as <i4> beyond the
-            // signed 32-bit range; established clients parse them as 64-bit,
-            // so mirroring that keeps large sizes intact.
+            // `<i4>` is a signed 32-bit integer. A value outside that range
+            // goes out as `<i8>`, which keeps it exact; clamping would
+            // silently corrupt a size rebuilt from its Lo and Hi halves.
             if let Some(int) = value.as_i64() {
-                let _ = write!(out, "<i4>{int}</i4>");
-            } else if let Some(int) = value.as_u64() {
-                let _ = write!(out, "<i4>{int}</i4>");
+                if i32::try_from(int).is_ok() {
+                    let _ = write!(out, "<i4>{int}</i4>");
+                } else {
+                    let _ = write!(out, "<i8>{int}</i8>");
+                }
+            } else if value.is_u64() {
+                // Beyond even a signed 64-bit integer.
+                let _ = write!(out, "<double>{}</double>", value.as_f64().unwrap_or(0.0));
             } else {
                 let _ = write!(out, "<double>{}</double>", value.as_f64().unwrap_or(0.0));
             }
@@ -925,6 +1058,21 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
             metadata.push((name.clone(), value.clone()));
         }
     }
+    // An unresolvable category is refused by the submission itself; only a
+    // category that resolves carries a label.
+    let canonical_category = weaver_server_core::ingest::resolve_submission_category(
+        &ctx.config,
+        request.category.as_deref(),
+    )
+    .await
+    .ok()
+    .flatten();
+    record_submitted_category(
+        &mut metadata,
+        request.category.as_deref(),
+        canonical_category.as_deref(),
+    );
+    record_submitted_priority(&mut metadata, request.priority);
     if is_http_url(&request.content_or_url) {
         metadata.push((
             weaver_server_core::post_processing::scan::SOURCE_URL_KEY.into(),
@@ -1068,6 +1216,43 @@ fn nzbget_duplicate_mode(
 #[allow(clippy::items_after_test_module)]
 mod append_rejection_tests {
     use super::*;
+
+    #[test]
+    fn xmlrpc_integers_outside_i32_go_out_as_i8() {
+        let write = |value: Value| {
+            let mut out = String::new();
+            write_xmlrpc_value(&mut out, &value);
+            out
+        };
+        for (value, expected) in [
+            (json!(0), "<value><i4>0</i4></value>"),
+            (json!(i32::MAX), "<value><i4>2147483647</i4></value>"),
+            (json!(i32::MIN), "<value><i4>-2147483648</i4></value>"),
+            (
+                json!(2_147_483_648_u64),
+                "<value><i8>2147483648</i8></value>",
+            ),
+            (json!(u32::MAX), "<value><i8>4294967295</i8></value>"),
+            (
+                json!(-2_147_483_649_i64),
+                "<value><i8>-2147483649</i8></value>",
+            ),
+            (
+                json!(i64::MAX),
+                "<value><i8>9223372036854775807</i8></value>",
+            ),
+        ] {
+            assert_eq!(write(value.clone()), expected, "{value}");
+        }
+        // Read back, an `<i8>` is the same number.
+        let call = concat!(
+            "<methodCall><methodName>rate</methodName><params>",
+            "<param><value><i8>4294967295</i8></value></param>",
+            "</params></methodCall>",
+        );
+        let call = parse_xmlrpc_call(call.as_bytes()).unwrap();
+        assert_eq!(call.params, vec![json!(4_294_967_295_u64)]);
+    }
 
     #[test]
     fn parse_xmlrpc_call_resolves_entity_references() {
@@ -1395,7 +1580,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         "PostJobCount": post_job_count,
         "UrlCount": 0,
         "UpTimeSec": uptime_secs,
-        "DownloadTimeSec": uptime_secs,
+        "DownloadTimeSec": ctx.handle.download_time().as_secs(),
         "ServerTime": unix_now_secs(),
         "ResumeTime": resume_time,
         "ServerPaused": download_paused,
@@ -1430,20 +1615,72 @@ fn queue_item_state_in_post_processing(state: QueueItemState) -> bool {
 }
 
 async fn listgroups(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let groups = ctx
-        .handle
-        .list_jobs()
+    let jobs = ctx.handle.list_jobs();
+    let items = jobs
         .iter()
-        .map(queue_item_from_job)
-        .filter(|item| {
+        .map(|job| (queue_item_from_job(job), job))
+        .filter(|(item, _)| {
             !matches!(
                 item.state,
                 QueueItemState::Completed | QueueItemState::Failed
             )
         })
-        .map(|item| nzbget_group(&item))
+        .collect::<Vec<_>>();
+    let post_started = post_started_at(
+        ctx,
+        items
+            .iter()
+            .filter(|(item, _)| queue_item_state_in_post_processing(item.state))
+            .map(|(item, _)| item.id)
+            .collect(),
+    )
+    .await;
+    let groups = items
+        .iter()
+        .map(|(item, job)| {
+            nzbget_group(
+                item,
+                &reported_category(job.category.as_deref(), &job.metadata),
+                nzbget_priority(&job.metadata),
+                post_started.get(&item.id).copied(),
+            )
+        })
         .collect::<Vec<_>>();
     Ok(Value::Array(groups))
+}
+
+// Events that mark a job's post-processing under way.
+const POST_START_KINDS: &[&str] = &[
+    "JobVerificationStarted",
+    "VerificationStarted",
+    "RepairStarted",
+    "ExtractionReady",
+    "MoveToCompleteStarted",
+];
+
+// When each of `ids` began post-processing, in epoch milliseconds: the
+// earliest post-stage event recorded for it. A job with none is left out.
+async fn post_started_at(ctx: &NzbgetFacadeContext, ids: Vec<u64>) -> HashMap<u64, i64> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    let db = ctx.db.clone();
+    let bounds =
+        tokio::task::spawn_blocking(move || db.get_job_event_stage_bounds(&ids, POST_START_KINDS))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+    bounds
+        .into_iter()
+        .filter_map(|(id, kinds)| {
+            kinds
+                .iter()
+                .map(|(_, first_ts, _)| *first_ts)
+                .min()
+                .map(|start| (id, start))
+        })
+        .collect()
 }
 
 fn nzbget_release_name<'a>(original_title: &'a str, fallback_name: &'a str) -> &'a str {
@@ -1455,7 +1692,12 @@ fn nzbget_release_name<'a>(original_title: &'a str, fallback_name: &'a str) -> &
     }
 }
 
-fn nzbget_group(item: &QueueItem) -> Value {
+fn nzbget_group(
+    item: &QueueItem,
+    category: &str,
+    priority: i64,
+    post_started_at: Option<i64>,
+) -> Value {
     let total = item.total_bytes;
     let downloaded = item.downloaded_bytes;
     let remaining = total.saturating_sub(downloaded);
@@ -1468,9 +1710,8 @@ fn nzbget_group(item: &QueueItem) -> Value {
     let (remaining_lo, remaining_hi) = size_parts(remaining);
     let (paused_lo, paused_hi) = size_parts(paused);
     let (downloaded_lo, downloaded_hi) = size_parts(downloaded);
-    let priority = nzbget_priority(&item.attributes);
     let output_dir = item.output_dir.clone().unwrap_or_default();
-    let post_info = post_progress_info(item);
+    let post_info = post_progress_info(item, post_started_at);
     let critical_health = critical_health(item);
     let release_name = nzbget_release_name(&item.original_title, &item.name);
 
@@ -1486,7 +1727,7 @@ fn nzbget_group(item: &QueueItem) -> Value {
         "NZBFilename": release_name,
         "DestDir": output_dir,
         "FinalDir": output_dir,
-        "Category": item.category.clone().unwrap_or_default(),
+        "Category": category,
         "FileSizeLo": file_lo,
         "FileSizeHi": file_hi,
         "FileSizeMB": bytes_to_mib(total),
@@ -1549,7 +1790,10 @@ struct PostProgressInfo {
 
 // Derive NZBGet-style post-processing progress from weaver's phase progress
 // entries. Returns "NONE" text when the job is not in a post stage.
-fn post_progress_info(item: &QueueItem) -> PostProgressInfo {
+// `post_started_at` is when the job's post-processing began, in epoch
+// milliseconds: the total time runs from there, the stage time from the
+// current stage's start.
+fn post_progress_info(item: &QueueItem, post_started_at: Option<i64>) -> PostProgressInfo {
     let phase = match item.state {
         QueueItemState::Repairing => Some(QueuePhase::Repairing),
         QueueItemState::Extracting => Some(QueuePhase::Extracting),
@@ -1590,10 +1834,20 @@ fn post_progress_info(item: &QueueItem) -> PostProgressInfo {
         }
         _ => label.to_string(),
     };
+    // Measured to the same moment as the stage time, so the total never
+    // reads less than the stage it contains.
+    let observed_at = progress.map_or_else(
+        || unix_now_secs() as f64 * 1000.0,
+        |entry| entry.updated_at_epoch_ms,
+    );
+    let total_time_sec = post_started_at
+        .map(|start| ((observed_at - start as f64) / 1000.0).max(0.0) as u64)
+        .unwrap_or(0)
+        .max(stage_time_sec);
     PostProgressInfo {
         text,
         stage_progress,
-        total_time_sec: stage_time_sec,
+        total_time_sec,
         stage_time_sec,
     }
 }
@@ -1601,13 +1855,66 @@ fn post_progress_info(item: &QueueItem) -> PostProgressInfo {
 // NZBGet's CriticalHealth: the health floor below which the download cannot
 // be repaired. Approximated from the recovery volume share of the job.
 fn critical_health(item: &QueueItem) -> u64 {
-    if item.total_bytes == 0 {
+    critical_health_of(item.total_bytes, item.optional_recovery_bytes)
+}
+
+fn critical_health_of(total_bytes: u64, optional_recovery_bytes: u64) -> u64 {
+    if total_bytes == 0 {
         return 1000;
     }
-    let payload = item
-        .total_bytes
-        .saturating_sub(item.optional_recovery_bytes);
-    (payload * 1000) / item.total_bytes
+    let payload = total_bytes.saturating_sub(optional_recovery_bytes);
+    (payload * 1000) / total_bytes
+}
+
+// The category string an NZBGet client submitted, kept beside the canonical
+// category it resolved to. NZBGet clients match their downloads by exact,
+// case-sensitive category equality, so the facade reports the string the
+// client sent while routing keeps using the configured category. The second
+// key pins which canonical category the label belongs to: once the job is
+// recategorised by any other path the label no longer speaks for it.
+const SUBMITTED_CATEGORY_KEY: &str = "weaver.nzbget.category";
+const SUBMITTED_CATEGORY_FOR_KEY: &str = "weaver.nzbget.category_for";
+
+// Replace the submitted-category label in `metadata` for a job whose
+// canonical category is `canonical`. A label equal to the canonical name
+// needs no entry.
+fn record_submitted_category(
+    metadata: &mut Vec<(String, String)>,
+    submitted: Option<&str>,
+    canonical: Option<&str>,
+) {
+    metadata.retain(|(key, _)| key != SUBMITTED_CATEGORY_KEY && key != SUBMITTED_CATEGORY_FOR_KEY);
+    let submitted = submitted.map(str::trim).filter(|value| !value.is_empty());
+    if let (Some(submitted), Some(canonical)) = (submitted, canonical)
+        && submitted != canonical
+    {
+        metadata.push((SUBMITTED_CATEGORY_KEY.to_string(), submitted.to_string()));
+        metadata.push((
+            SUBMITTED_CATEGORY_FOR_KEY.to_string(),
+            canonical.to_string(),
+        ));
+    }
+}
+
+// The category the facade reports for a job: the string the client
+// submitted when it still belongs to the job's category, otherwise the
+// canonical category.
+fn reported_category(category: Option<&str>, metadata: &[(String, String)]) -> String {
+    let lookup = |wanted: &str| {
+        metadata
+            .iter()
+            .rev()
+            .find(|(key, _)| key == wanted)
+            .map(|(_, value)| value.as_str())
+    };
+    match (
+        category,
+        lookup(SUBMITTED_CATEGORY_KEY),
+        lookup(SUBMITTED_CATEGORY_FOR_KEY),
+    ) {
+        (Some(category), Some(label), Some(owner)) if owner == category => label.to_string(),
+        (category, _, _) => category.unwrap_or_default().to_string(),
+    }
 }
 
 fn attribute_value(attributes: &[Attribute], key: &str) -> Option<String> {
@@ -1617,17 +1924,29 @@ fn attribute_value(attributes: &[Attribute], key: &str) -> Option<String> {
         .map(|attribute| attribute.value.clone())
 }
 
-async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
+async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
+    // history(Hidden): rows a client removed with HistoryDelete are listed
+    // only when the first parameter is true.
+    let include_hidden = optional_bool_param(&positional_params(params)?, 0)?.unwrap_or(false);
     let db = ctx.db.clone();
-    let rows = tokio::task::spawn_blocking(move || {
-        db.list_job_history(&HistoryFilter {
+    let (mut rows, facade_states) = tokio::task::spawn_blocking(move || {
+        let rows = db.list_job_history(&HistoryFilter {
             limit: Some(1000),
             ..HistoryFilter::default()
-        })
+        })?;
+        let ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
+        let states = db.nzbget_history_states(&ids)?;
+        Ok::<_, weaver_server_core::StateError>((rows, states))
     })
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
+    // A hidden row still shadows its in-memory terminal job below.
+    let persisted_ids = rows.iter().map(|row| row.job_id).collect::<HashSet<_>>();
+    let is_hidden = |job_id: u64| facade_states.get(&job_id).is_some_and(|state| state.hidden);
+    if !include_hidden {
+        rows.retain(|row| !is_hidden(row.job_id));
+    }
     let db = ctx.db.clone();
     let history_job_ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
     let post_processing_results = tokio::task::spawn_blocking(move || {
@@ -1647,8 +1966,13 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .handle
         .list_jobs()
         .iter()
-        .map(queue_item_from_job)
-        .filter(|item| {
+        .map(|job| {
+            (
+                queue_item_from_job(job),
+                reported_category(job.category.as_deref(), &job.metadata),
+            )
+        })
+        .filter(|(item, _)| {
             matches!(
                 item.state,
                 QueueItemState::Completed | QueueItemState::Failed
@@ -1658,7 +1982,7 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
 
     let ids: Vec<u64> = terminal_items
         .iter()
-        .map(|item| item.id)
+        .map(|(item, _)| item.id)
         .chain(rows.iter().map(|row| row.job_id))
         .collect();
     let db = ctx.db.clone();
@@ -1669,12 +1993,13 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
     .unwrap_or_default();
 
-    let persisted_ids = rows.iter().map(|row| row.job_id).collect::<HashSet<_>>();
     let mut seen_terminal_ids = HashSet::with_capacity(terminal_items.len());
     let mut items = terminal_items
         .iter()
-        .filter(|item| !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id))
-        .map(|item| nzbget_history_queue_item(item, history_timings(stage_bounds.get(&item.id))))
+        .filter(|(item, _)| !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id))
+        .map(|(item, category)| {
+            nzbget_history_queue_item(item, category, history_timings(stage_bounds.get(&item.id)))
+        })
         .collect::<Vec<_>>();
 
     // DB-row-derived entries are the immutable-parse path: a history row's
@@ -1704,10 +2029,39 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
                 cache.insert(row.job_id, (row.completed_at, item.clone()));
                 item
             });
-            items.push(nzbget_history_item(
+            let category = reported_category(
+                row.category.as_deref(),
+                &weaver_server_core::history::parse_history_metadata(row.metadata.as_deref()),
+            );
+            let mut entry = nzbget_history_item(
                 &item,
+                &category,
+                facade_states
+                    .get(&row.job_id)
+                    .and_then(|state| state.failure_kind),
                 history_timings(stage_bounds.get(&row.job_id)),
-            ));
+            );
+            // NZBGet lists a history entry kept only for duplicate checks
+            // with Kind DUP.
+            if is_hidden(row.job_id)
+                && let Some(object) = entry.as_object_mut()
+            {
+                object.insert("Kind".to_string(), json!("DUP"));
+            }
+            if let Some(mark) = facade_states.get(&row.job_id).and_then(|state| state.mark)
+                && let Some(object) = entry.as_object_mut()
+            {
+                // The per-stage fields keep what happened; the mark only
+                // changes MarkStatus and the compound Status.
+                let status = match mark {
+                    NzbgetMarkStatus::Bad => "FAILURE/BAD",
+                    NzbgetMarkStatus::Good => "SUCCESS/GOOD",
+                    NzbgetMarkStatus::Success => "SUCCESS/MARK",
+                };
+                object.insert("MarkStatus".to_string(), json!(mark.as_str()));
+                object.insert("Status".to_string(), json!(status));
+            }
+            items.push(entry);
         }
     }
     for item in &mut items {
@@ -1821,59 +2175,110 @@ struct HistoryStatuses {
     status: &'static str,
 }
 
-fn history_statuses(cancelled: bool, failed: bool) -> HistoryStatuses {
+const NO_STATUSES: HistoryStatuses = HistoryStatuses {
+    par: "NONE",
+    unpack: "NONE",
+    mv: "NONE",
+    script: "NONE",
+    delete: "NONE",
+    status: "NONE",
+};
+
+// `failure` is None for a job that succeeded. Each failure kind sets the one
+// field NZBGet itself sets for that cause, so clients that judge history from
+// the per-stage fields (repair failures, bad passwords and unpack errors fail
+// the download; a full disk or a failed move only warns) read the same result.
+fn history_statuses(cancelled: bool, failure: Option<HistoryFailureKind>) -> HistoryStatuses {
     if cancelled {
+        // A job removed as a duplicate reports DUPE, any other removal MANUAL.
+        if failure == Some(HistoryFailureKind::Duplicate) {
+            return HistoryStatuses {
+                delete: "DUPE",
+                status: "DELETED/DUPE",
+                ..NO_STATUSES
+            };
+        }
         return HistoryStatuses {
-            par: "NONE",
-            unpack: "NONE",
-            mv: "NONE",
-            script: "NONE",
             delete: "MANUAL",
             status: "DELETED/MANUAL",
+            ..NO_STATUSES
         };
     }
-    if failed {
-        // Weaver exposes no per-stage failure cause here, so we must not assert a
-        // PAR failure (the old "FAILURE/PAR" + ParStatus=FAILURE steered clients
-        // and Sonarr to par/repair diagnostics for password/unpack/health/move
-        // failures alike). But Sonarr/Radarr decide failure ONLY from the granular
-        // status fields, never the compound `Status` string — all-NONE would be
-        // read as success and the failed release silently imported. So signal the
-        // failure through `DeleteStatus = "HEALTH"`, which is in both clients'
-        // delete-failed set and matches NZBGet's generic health-failure semantics,
-        // while leaving par/unpack/move/script NONE (no false stage claim).
+    let Some(failure) = failure else {
         return HistoryStatuses {
-            par: "NONE",
-            unpack: "NONE",
-            mv: "NONE",
+            par: "SUCCESS",
+            unpack: "SUCCESS",
+            mv: "SUCCESS",
+            // NZBGet reports NONE when no script ran; history() overrides it
+            // from the job's stored script results.
             script: "NONE",
-            delete: "HEALTH",
-            status: "FAILURE/HEALTH",
+            delete: "NONE",
+            status: "SUCCESS/ALL",
         };
+    };
+    match failure {
+        HistoryFailureKind::Repair => HistoryStatuses {
+            par: "FAILURE",
+            status: "FAILURE/PAR",
+            ..NO_STATUSES
+        },
+        HistoryFailureKind::Password => HistoryStatuses {
+            unpack: "PASSWORD",
+            status: "FAILURE/UNPACK",
+            ..NO_STATUSES
+        },
+        HistoryFailureKind::DiskFull => HistoryStatuses {
+            unpack: "SPACE",
+            status: "FAILURE/UNPACK",
+            ..NO_STATUSES
+        },
+        HistoryFailureKind::Unpack => HistoryStatuses {
+            unpack: "FAILURE",
+            status: "FAILURE/UNPACK",
+            ..NO_STATUSES
+        },
+        HistoryFailureKind::Move => HistoryStatuses {
+            mv: "FAILURE",
+            status: "FAILURE/MOVE",
+            ..NO_STATUSES
+        },
+        HistoryFailureKind::Health => HistoryStatuses {
+            delete: "HEALTH",
+            status: "DELETED/HEALTH",
+            ..NO_STATUSES
+        },
+        HistoryFailureKind::Duplicate => HistoryStatuses {
+            delete: "DUPE",
+            status: "DELETED/DUPE",
+            ..NO_STATUSES
+        },
     }
-    HistoryStatuses {
-        par: "SUCCESS",
-        unpack: "SUCCESS",
-        mv: "SUCCESS",
-        // NZBGet reports NONE when no script ran; history() overrides it from
-        // the job's stored script results.
-        script: "NONE",
-        delete: "NONE",
-        status: "SUCCESS/ALL",
-    }
+}
+
+// The failure kind for a failed job: the kept kind when there is one,
+// otherwise read from the error text (jobs that failed before weaver kept the
+// kind, and terminal jobs whose history row is not written yet).
+fn failure_kind_for(
+    failed: bool,
+    kept: Option<HistoryFailureKind>,
+    error: Option<&str>,
+    health: u32,
+) -> Option<HistoryFailureKind> {
+    failed.then(|| kept.unwrap_or_else(|| HistoryFailureKind::derive(None, None, error, health, 0)))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn nzbget_history_entry(
     id: u64,
     name: &str,
-    category: Option<&str>,
+    category: &str,
     total_bytes: u64,
     output_dir: &str,
     history_time: i64,
     statuses: HistoryStatuses,
     timings: HistoryTimings,
     health: u32,
+    critical_health: u64,
     message: &str,
     client_request_id: Option<&str>,
     attributes: &[Attribute],
@@ -1888,7 +2293,7 @@ fn nzbget_history_entry(
         "NZBName": name,
         "NZBNicename": name,
         "NZBFilename": name,
-        "Category": category.unwrap_or_default(),
+        "Category": category,
         "FileSizeLo": file_lo,
         "FileSizeHi": file_hi,
         "FileSizeMB": bytes_to_mib(total_bytes),
@@ -1909,7 +2314,7 @@ fn nzbget_history_entry(
         "UrlStatus": "NONE",
         "Status": statuses.status,
         "Health": health,
-        "CriticalHealth": 1000,
+        "CriticalHealth": critical_health,
         "Deleted": statuses.delete != "NONE",
         "RetryData": false,
         "Message": message,
@@ -1920,7 +2325,12 @@ fn nzbget_history_entry(
     })
 }
 
-fn nzbget_history_item(item: &weaver_server_api::HistoryItem, timings: HistoryTimings) -> Value {
+fn nzbget_history_item(
+    item: &weaver_server_api::HistoryItem,
+    category: &str,
+    failure_kind: Option<HistoryFailureKind>,
+    timings: HistoryTimings,
+) -> Value {
     let cancelled = item
         .attention
         .as_ref()
@@ -1929,25 +2339,33 @@ fn nzbget_history_item(item: &weaver_server_api::HistoryItem, timings: HistoryTi
     nzbget_history_entry(
         item.id,
         nzbget_release_name(&item.original_title, &item.name),
-        item.category.as_deref(),
+        category,
         item.total_bytes,
         &item.output_dir.clone().unwrap_or_default(),
         item.completed_at.timestamp(),
-        history_statuses(cancelled, failed),
+        history_statuses(
+            cancelled,
+            if cancelled {
+                failure_kind
+            } else {
+                failure_kind_for(failed, failure_kind, item.error.as_deref(), item.health)
+            },
+        ),
         timings,
         item.health,
+        critical_health_of(item.total_bytes, item.optional_recovery_bytes),
         &item.error.clone().unwrap_or_default(),
         item.client_request_id.as_deref(),
         &item.attributes,
     )
 }
 
-fn nzbget_history_queue_item(item: &QueueItem, timings: HistoryTimings) -> Value {
+fn nzbget_history_queue_item(item: &QueueItem, category: &str, timings: HistoryTimings) -> Value {
     let failed = item.state == QueueItemState::Failed;
     nzbget_history_entry(
         item.id,
         nzbget_release_name(&item.original_title, &item.name),
-        item.category.as_deref(),
+        category,
         item.total_bytes,
         &item.output_dir.clone().unwrap_or_default(),
         // Stable per-poll timestamp. Using unix_now_secs() here made HistoryTime
@@ -1955,9 +2373,13 @@ fn nzbget_history_queue_item(item: &QueueItem, timings: HistoryTimings) -> Value
         // detection) and then jump backward once the row moved to DB history.
         // created_at is stable and never later than the eventual completed_at.
         item.created_at.timestamp(),
-        history_statuses(false, failed),
+        history_statuses(
+            false,
+            failure_kind_for(failed, None, item.error.as_deref(), item.health),
+        ),
         timings,
         item.health,
+        critical_health_of(item.total_bytes, item.optional_recovery_bytes),
         &item.error.clone().unwrap_or_default(),
         item.client_request_id.as_deref(),
         &item.attributes,
@@ -2185,20 +2607,11 @@ fn parse_editqueue_params(params: Option<Value>) -> Result<EditQueueRequest, Rpc
 fn is_unsupported_editqueue_command(command: &str) -> bool {
     matches!(
         command,
-        // Anchor-relative moves and sorting have no weaver equivalent; the
-        // absolute moves (top/bottom/offset) map to the manual queue order.
-        "groupmovebefore" | "groupmoveafter" | "groupsort"
-        // Job renaming is not supported; names come from the NZB.
-        | "groupsetname" | "historysetname"
         // Weaver has no per-file scheduling surface.
-        | "filepause" | "fileresume" | "filedelete" | "filesetpriority" | "filemoveoffset"
+        "filepause" | "fileresume" | "filedelete" | "filesetpriority" | "filemoveoffset"
         | "filemovetop" | "filemovebottom" | "filepauseallpars" | "filepauseextrapars"
-        // History rows are immutable snapshots in weaver.
-        | "historysetcategory" | "historysetparameter" | "historysetdupekey"
-        | "historysetdupescore" | "historysetdupemode"
-        // Weaver's duplicate arbitration handles bad-marking through its own
-        // UI flow (candidate promotion), which this facade does not drive.
-        | "historymarkbad" | "historymarksuccess"
+        // Duplicate settings on a finished job have nothing left to steer.
+        | "historysetdupekey" | "historysetdupescore" | "historysetdupemode"
     )
 }
 
@@ -2207,6 +2620,10 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     let command = request.command.to_ascii_lowercase();
     if is_unsupported_editqueue_command(&command) {
         return Ok(json!(false));
+    }
+    // GroupSort with no ids sorts the whole queue.
+    if command == "groupsort" {
+        return sort_groups(ctx, &request).await;
     }
     if request.ids.is_empty() {
         return Ok(json!(false));
@@ -2221,6 +2638,12 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         "groupmovetop" | "groupmovebottom" | "groupmoveoffset" => {
             return reorder_groups(ctx, &request, &command).await;
         }
+        "groupmovebefore" | "groupmoveafter" => {
+            return move_groups_next_to(ctx, &request, command == "groupmoveafter").await;
+        }
+        "groupsetname" | "historysetname" if request.param.trim().is_empty() => {
+            return Ok(json!(false));
+        }
         _ => {}
     }
 
@@ -2228,8 +2651,16 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         let result = match command.as_str() {
             "grouppause" => ctx.handle.pause_job(job_id).await,
             "groupresume" => ctx.handle.resume_job(job_id).await,
-            "groupdelete" | "groupparkdelete" | "groupdupedelete" => {
-                ctx.handle.cancel_job(job_id).await
+            "groupdelete" => ctx.handle.cancel_job(job_id).await,
+            // A parked job keeps what it downloaded.
+            "groupparkdelete" => ctx.handle.cancel_job_keeping_files(job_id).await,
+            "groupdupedelete" => delete_as_duplicate(ctx, job_id).await,
+            "groupsetname" => {
+                let update = JobUpdate {
+                    name: Some(request.param.trim().to_string()),
+                    ..JobUpdate::default()
+                };
+                ctx.handle.update_job(job_id, update).await
             }
             "groupfinaldelete" => group_final_delete(ctx, job_id).await,
             "groupsetcategory" | "groupapplycategory" => {
@@ -2258,12 +2689,35 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
             "groupsetdupemode" => {
                 set_job_parameter(ctx, job_id, "nzbget.dupe_mode", &request.param).await
             }
-            "historydelete" | "historyfinaldelete" => {
-                ctx.handle.delete_history(job_id, false).await.map(|_| ())
-            }
+            "historydelete" => hide_history(ctx, job_id).await,
+            "historyfinaldelete" => ctx.handle.delete_history(job_id, false).await.map(|_| ()),
             "historyreturn" | "historyredownload" => ctx.handle.redownload_job(job_id).await,
             "historyprocess" => ctx.handle.reprocess_job(job_id).await,
-            "historymarkgood" => mark_history_good(ctx, job_id).await,
+            "historymarkgood" => mark_history(ctx, job_id, NzbgetMarkStatus::Good).await,
+            "historymarkbad" => mark_history(ctx, job_id, NzbgetMarkStatus::Bad).await,
+            "historymarksuccess" => mark_history(ctx, job_id, NzbgetMarkStatus::Success).await,
+            // Weaver cannot fetch only the articles that failed, so a retry
+            // fetches the job again.
+            "historyretryfailed" => ctx.handle.redownload_job(job_id).await,
+            "historysetname" => {
+                let update = JobUpdate {
+                    name: Some(request.param.trim().to_string()),
+                    ..JobUpdate::default()
+                };
+                update_history(ctx, job_id, update).await
+            }
+            "historysetcategory" => set_history_category(ctx, job_id, &request.param).await,
+            "historysetparameter" => {
+                let (name, value) = request.param.split_once('=').ok_or_else(|| {
+                    RpcError::invalid_parameter("HistorySetParameter expects Name=Value")
+                })?;
+                // A finished job's password belongs to the reprocess that
+                // uses it, not to its stored parameters.
+                if name.trim().eq_ignore_ascii_case("*Unpack:Password") {
+                    return Ok(json!(false));
+                }
+                set_history_parameter(ctx, job_id, name, value).await
+            }
             other => return Err(RpcError::invalid_action(other)),
         };
         match result {
@@ -2279,6 +2733,22 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     }
 
     Ok(json!(true))
+}
+
+// HistoryDelete hides the row from the client's default history listing but
+// keeps it, so duplicate checks still see the release. HistoryFinalDelete
+// erases it.
+async fn hide_history(ctx: &NzbgetFacadeContext, job_id: JobId) -> Result<(), SchedulerError> {
+    let db = ctx.db.clone();
+    let found = tokio::task::spawn_blocking(move || db.set_nzbget_history_hidden(job_id.0, true))
+        .await
+        .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
+        .map_err(SchedulerError::from)?;
+    if found {
+        Ok(())
+    } else {
+        Err(SchedulerError::JobNotFound(job_id))
+    }
 }
 
 async fn group_final_delete(
@@ -2331,14 +2801,18 @@ async fn reorder_groups(
 async fn set_job_category(
     ctx: &NzbgetFacadeContext,
     job_id: JobId,
-    category: &str,
+    requested: &str,
 ) -> Result<(), SchedulerError> {
     let category =
-        weaver_server_core::ingest::resolve_submission_category(&ctx.config, Some(category))
+        weaver_server_core::ingest::resolve_submission_category(&ctx.config, Some(requested))
             .await
             .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?;
+    let mut metadata = ctx.handle.get_job(job_id)?.metadata;
+    let submitted = category.as_ref().map(|_| requested);
+    record_submitted_category(&mut metadata, submitted, category.as_deref());
     let update = JobUpdate {
         category: category.map_or(FieldUpdate::Clear, FieldUpdate::Set),
+        metadata: FieldUpdate::Set(metadata),
         ..JobUpdate::default()
     };
     ctx.handle.update_job(job_id, update).await
@@ -2365,20 +2839,21 @@ async fn set_job_priority(
     job_id: JobId,
     param: &str,
 ) -> Result<(), SchedulerError> {
-    // NZBGet priorities are numbers (-100 very low .. 900 force); weaver keeps
-    // the three-level label, which genuinely biases dispatch. Some clients
-    // send the level name instead of a number; FORCE collapses to HIGH.
-    let trimmed = param.trim();
-    let label = if let Ok(numeric) = trimmed.parse::<i64>() {
-        priority_label(numeric)
-    } else if trimmed.eq_ignore_ascii_case("force") || trimmed.eq_ignore_ascii_case("high") {
-        "HIGH"
-    } else if trimmed.eq_ignore_ascii_case("low") {
-        "LOW"
-    } else {
-        "NORMAL"
+    // Weaver dispatches by a three-level label; the number the client set is
+    // kept beside it and reported back. Force dispatches as HIGH.
+    let priority = parse_nzbget_priority(param);
+    let mut metadata = ctx.handle.get_job(job_id)?.metadata;
+    metadata.retain(|(key, _)| !key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY));
+    metadata.push((
+        PRIORITY_ATTRIBUTE_KEY.to_string(),
+        priority_label(priority).to_string(),
+    ));
+    record_submitted_priority(&mut metadata, priority);
+    let update = JobUpdate {
+        metadata: FieldUpdate::Set(metadata),
+        ..JobUpdate::default()
     };
-    upsert_job_metadata(ctx, job_id, PRIORITY_ATTRIBUTE_KEY, Some(label.to_string())).await
+    ctx.handle.update_job(job_id, update).await
 }
 
 async fn set_job_parameter(
@@ -2391,25 +2866,32 @@ async fn set_job_parameter(
     if name.is_empty() {
         return Ok(());
     }
-    // NZBGet exposes the drone id as a plain post-processing parameter, but
-    // weaver stores it under the canonical client-request-id metadata key.
-    let key = if name.eq_ignore_ascii_case("drone") {
-        CLIENT_REQUEST_ID_ATTRIBUTE_KEY
+    let key = parameter_metadata_key(name)?;
+    let value = parameter_metadata_value(name, value);
+    let update = if value.is_empty() { None } else { Some(value) };
+    upsert_job_metadata(ctx, job_id, key, update).await
+}
+
+// NZBGet exposes the drone id as a plain post-processing parameter, but
+// weaver stores it under the canonical client-request-id metadata key.
+fn parameter_metadata_key(name: &str) -> Result<&str, SchedulerError> {
+    if name.eq_ignore_ascii_case("drone") {
+        Ok(CLIENT_REQUEST_ID_ATTRIBUTE_KEY)
+    } else if weaver_server_core::is_public_history_attribute_key(name) {
+        Ok(name)
     } else {
-        if !weaver_server_core::is_public_history_attribute_key(name) {
-            return Err(SchedulerError::InvalidInput(
-                "reserved parameter name".into(),
-            ));
-        }
-        name
-    };
-    let value = if name.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY) {
+        Err(SchedulerError::InvalidInput(
+            "reserved parameter name".into(),
+        ))
+    }
+}
+
+fn parameter_metadata_value(name: &str, value: &str) -> String {
+    if name.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY) {
         normalize_priority_value(value).unwrap_or_else(|_| value.to_string())
     } else {
         value.to_string()
-    };
-    let update = if value.is_empty() { None } else { Some(value) };
-    upsert_job_metadata(ctx, job_id, key, update).await
+    }
 }
 
 // Replace (or remove, when `value` is None) one metadata entry on a job,
@@ -2432,17 +2914,324 @@ async fn upsert_job_metadata(
     ctx.handle.update_job(job_id, update).await
 }
 
-async fn mark_history_good(ctx: &NzbgetFacadeContext, job_id: JobId) -> Result<(), SchedulerError> {
+async fn mark_history(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+    mark: NzbgetMarkStatus,
+) -> Result<(), SchedulerError> {
+    if !history_row_exists(ctx, job_id).await? {
+        return Err(SchedulerError::JobNotFound(job_id));
+    }
     let db = ctx.db.clone();
-    // A missing semantic candidate is not an error: NZBGet lets any history
-    // item be marked good, and for ordinary items there is nothing to record.
+    // A missing duplicate candidate is not an error: NZBGet lets any history
+    // item be marked, and for ordinary items only the mark is recorded.
     tokio::task::spawn_blocking(move || {
-        weaver_server_core::post_processing::hooks::mark_history_good(&db, job_id)
+        weaver_server_core::post_processing::hooks::mark_history(&db, job_id, mark)
     })
     .await
     .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
     .map_err(SchedulerError::from)?;
     Ok(())
+}
+
+async fn history_row(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+) -> Result<Option<weaver_server_core::JobHistoryRow>, SchedulerError> {
+    let db = ctx.db.clone();
+    tokio::task::spawn_blocking(move || db.get_job_history(job_id.0))
+        .await
+        .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
+        .map_err(SchedulerError::from)
+}
+
+async fn history_row_exists(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+) -> Result<bool, SchedulerError> {
+    Ok(history_row(ctx, job_id).await?.is_some())
+}
+
+async fn update_history(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+    update: JobUpdate,
+) -> Result<(), SchedulerError> {
+    let result = ctx.handle.update_history(job_id, update).await;
+    // The parsed row is memoized by completion time, which an edit leaves
+    // alone.
+    ctx.history_cache.lock().await.remove(&job_id.0);
+    result
+}
+
+async fn set_history_category(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+    requested: &str,
+) -> Result<(), SchedulerError> {
+    let Some(row) = history_row(ctx, job_id).await? else {
+        return Err(SchedulerError::JobNotFound(job_id));
+    };
+    let category =
+        weaver_server_core::ingest::resolve_submission_category(&ctx.config, Some(requested))
+            .await
+            .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?;
+    let mut metadata = weaver_server_core::history::parse_history_metadata(row.metadata.as_deref());
+    let submitted = category.as_ref().map(|_| requested);
+    record_submitted_category(&mut metadata, submitted, category.as_deref());
+    let update = JobUpdate {
+        category: category.map_or(FieldUpdate::Clear, FieldUpdate::Set),
+        metadata: FieldUpdate::Set(metadata),
+        ..JobUpdate::default()
+    };
+    update_history(ctx, job_id, update).await
+}
+
+async fn set_history_parameter(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+    name: &str,
+    value: &str,
+) -> Result<(), SchedulerError> {
+    let Some(row) = history_row(ctx, job_id).await? else {
+        return Err(SchedulerError::JobNotFound(job_id));
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+    let key = parameter_metadata_key(name)?;
+    let mut metadata = weaver_server_core::history::parse_history_metadata(row.metadata.as_deref());
+    metadata.retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
+    let value = parameter_metadata_value(name, value);
+    if !value.is_empty() {
+        metadata.push((key.to_string(), value));
+    }
+    let update = JobUpdate {
+        metadata: FieldUpdate::Set(metadata),
+        ..JobUpdate::default()
+    };
+    update_history(ctx, job_id, update).await
+}
+
+// GroupDupeDelete: the job is removed and its history row says it was
+// removed as a duplicate.
+async fn delete_as_duplicate(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+) -> Result<(), SchedulerError> {
+    ctx.handle.cancel_job(job_id).await?;
+    let db = ctx.db.clone();
+    // The cancel archives the row before it answers.
+    tokio::task::spawn_blocking(move || {
+        db.set_history_failure_kind(job_id.0, Some(HistoryFailureKind::Duplicate))
+    })
+    .await
+    .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
+    .map_err(SchedulerError::from)?;
+    ctx.history_cache.lock().await.remove(&job_id.0);
+    Ok(())
+}
+
+// The live queue in listing order, with each job's reported category and
+// priority.
+fn queue_order(ctx: &NzbgetFacadeContext) -> Vec<(QueueItem, String, i64)> {
+    ctx.handle
+        .list_jobs()
+        .iter()
+        .map(|job| {
+            (
+                queue_item_from_job(job),
+                reported_category(job.category.as_deref(), &job.metadata),
+                nzbget_priority(&job.metadata),
+            )
+        })
+        .filter(|(item, _, _)| {
+            !matches!(
+                item.state,
+                QueueItemState::Completed | QueueItemState::Failed
+            )
+        })
+        .collect()
+}
+
+// The offset moves that turn `current` into `target`, applied in order the
+// way the scheduler applies a batch of moves.
+fn moves_to_reach(
+    current: &[JobId],
+    target: &[JobId],
+) -> Vec<(JobId, weaver_server_core::QueueMoveTarget)> {
+    let mut order = current.to_vec();
+    let mut moves = Vec::new();
+    for (index, job_id) in target.iter().enumerate() {
+        let Some(position) = order.iter().position(|id| id == job_id) else {
+            continue;
+        };
+        if position == index {
+            continue;
+        }
+        let id = order.remove(position);
+        order.insert(index, id);
+        moves.push((
+            *job_id,
+            weaver_server_core::QueueMoveTarget::Offset(index as i64 - position as i64),
+        ));
+    }
+    moves
+}
+
+async fn apply_queue_order(
+    ctx: &NzbgetFacadeContext,
+    current: &[JobId],
+    target: &[JobId],
+    command: &str,
+) -> Result<Value, RpcError> {
+    let moves = moves_to_reach(current, target);
+    if moves.is_empty() {
+        return Ok(json!(true));
+    }
+    match ctx.handle.reorder_jobs(moves).await {
+        Ok(()) => Ok(json!(true)),
+        Err(SchedulerError::JobNotFound(_)) => Ok(json!(false)),
+        Err(error) => Err(RpcError::invalid_parameter(format!(
+            "{command} failed: {error}"
+        ))),
+    }
+}
+
+// GroupMoveBefore / GroupMoveAfter: the listed jobs, in the order given, land
+// next to the job named by Param.
+async fn move_groups_next_to(
+    ctx: &NzbgetFacadeContext,
+    request: &EditQueueRequest,
+    after: bool,
+) -> Result<Value, RpcError> {
+    let Ok(anchor) = request.param.trim().parse::<u64>().map(JobId) else {
+        return Ok(json!(false));
+    };
+    let current = queue_order(ctx)
+        .into_iter()
+        .map(|(item, _, _)| JobId(item.id))
+        .collect::<Vec<_>>();
+    let mut moved = Vec::new();
+    for job_id in &request.ids {
+        if *job_id == anchor || moved.contains(job_id) {
+            continue;
+        }
+        if !current.contains(job_id) {
+            return Ok(json!(false));
+        }
+        moved.push(*job_id);
+    }
+    let mut target = current
+        .iter()
+        .copied()
+        .filter(|id| !moved.contains(id))
+        .collect::<Vec<_>>();
+    let Some(anchor_index) = target.iter().position(|id| *id == anchor) else {
+        return Ok(json!(false));
+    };
+    let insert_at = if after {
+        anchor_index + 1
+    } else {
+        anchor_index
+    };
+    target.splice(insert_at..insert_at, moved);
+    apply_queue_order(ctx, &current, &target, &request.command).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortDirection {
+    Ascending,
+    Descending,
+    // No suffix: ascending, unless the jobs already are, then descending.
+    Toggle,
+}
+
+// GroupSort: Param names the key (name, size, left, priority, category, age)
+// with an optional + (ascending) or - (descending). The listed jobs, or the
+// whole queue when none are listed, are sorted within the places they hold.
+// Ascending is A to Z for name and category, smallest first for size and
+// left, highest first for priority, and newest first for age.
+async fn sort_groups(
+    ctx: &NzbgetFacadeContext,
+    request: &EditQueueRequest,
+) -> Result<Value, RpcError> {
+    let param = request.param.trim().to_ascii_lowercase();
+    let (key, direction) = if let Some(key) = param.strip_suffix('+') {
+        (key, SortDirection::Ascending)
+    } else if let Some(key) = param.strip_suffix('-') {
+        (key, SortDirection::Descending)
+    } else {
+        (param.as_str(), SortDirection::Toggle)
+    };
+    if !matches!(
+        key,
+        "name" | "size" | "left" | "priority" | "category" | "age"
+    ) {
+        return Ok(json!(false));
+    }
+    let queue = queue_order(ctx);
+    let current = queue
+        .iter()
+        .map(|(item, _, _)| JobId(item.id))
+        .collect::<Vec<_>>();
+    let selected = |id: u64| request.ids.is_empty() || request.ids.contains(&JobId(id));
+    let mut picked = queue
+        .iter()
+        .filter(|(item, _, _)| selected(item.id))
+        .collect::<Vec<_>>();
+    if picked.len() != request.ids.len() && !request.ids.is_empty() {
+        return Ok(json!(false));
+    }
+    let compare = |left: &&(QueueItem, String, i64), right: &&(QueueItem, String, i64)| {
+        let (left, left_category, left_priority) = left;
+        let (right, right_category, right_priority) = right;
+        let ordering = match key {
+            "name" => nzbget_release_name(&left.original_title, &left.name)
+                .to_lowercase()
+                .cmp(&nzbget_release_name(&right.original_title, &right.name).to_lowercase()),
+            "size" => left.total_bytes.cmp(&right.total_bytes),
+            "left" => left
+                .total_bytes
+                .saturating_sub(left.downloaded_bytes)
+                .cmp(&right.total_bytes.saturating_sub(right.downloaded_bytes)),
+            "priority" => right_priority.cmp(left_priority),
+            "category" => left_category
+                .to_lowercase()
+                .cmp(&right_category.to_lowercase()),
+            "age" => right.created_at.cmp(&left.created_at),
+            _ => return None,
+        };
+        Some(ordering)
+    };
+    let ascending_order = |picked: &mut Vec<&(QueueItem, String, i64)>| {
+        picked.sort_by(|left, right| compare(left, right).unwrap_or(std::cmp::Ordering::Equal));
+    };
+    let already_ascending = picked
+        .windows(2)
+        .all(|pair| compare(&pair[0], &pair[1]) != Some(std::cmp::Ordering::Greater));
+    ascending_order(&mut picked);
+    let descending = match direction {
+        SortDirection::Ascending => false,
+        SortDirection::Descending => true,
+        SortDirection::Toggle => already_ascending,
+    };
+    if descending {
+        picked.reverse();
+    }
+    let mut sorted = picked.into_iter().map(|(item, _, _)| JobId(item.id));
+    let target = current
+        .iter()
+        .map(|id| {
+            if selected(id.0) {
+                sorted.next().unwrap_or(*id)
+            } else {
+                *id
+            }
+        })
+        .collect::<Vec<_>>();
+    apply_queue_order(ctx, &current, &target, &request.command).await
 }
 
 // Synthetic per-file IDs live above the NZBID range so they never collide
@@ -2561,8 +3350,8 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
                     .saturating_mul(1000)
                     .checked_div(total)
                     .unwrap_or(1000),
-                "Priority": nzbget_priority(&item.attributes),
-                "Category": item.category.clone().unwrap_or_default(),
+                "Priority": nzbget_priority(&info.metadata),
+                "Category": reported_category(info.category.as_deref(), &info.metadata),
             }));
         }
     }
@@ -2570,7 +3359,7 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
 }
 
 async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let entries = ctx
+    let items = ctx
         .handle
         .list_jobs()
         .iter()
@@ -2581,8 +3370,12 @@ async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
                 )
         })
         .map(queue_item_from_job)
+        .collect::<Vec<_>>();
+    let post_started = post_started_at(ctx, items.iter().map(|item| item.id).collect()).await;
+    let entries = items
+        .into_iter()
         .map(|item| {
-            let info = post_progress_info(&item);
+            let info = post_progress_info(&item, post_started.get(&item.id).copied());
             let stage = match item.state {
                 QueueItemState::Checking | QueueItemState::Verifying => "VERIFYING_SOURCES",
                 QueueItemState::Repairing => "REPAIRING",
@@ -3237,16 +4030,58 @@ fn priority_label(priority: i64) -> &'static str {
     }
 }
 
-fn nzbget_priority(attributes: &[Attribute]) -> i64 {
-    attributes
+// The NZBGet priority a client set, kept beside weaver's three-level label.
+const SUBMITTED_PRIORITY_KEY: &str = "weaver.nzbget.priority";
+const FORCE_PRIORITY: i64 = 900;
+
+fn record_submitted_priority(metadata: &mut Vec<(String, String)>, priority: i64) {
+    metadata.retain(|(key, _)| key != SUBMITTED_PRIORITY_KEY);
+    metadata.push((SUBMITTED_PRIORITY_KEY.to_string(), priority.to_string()));
+}
+
+// The priority the facade reports: the number the client set while it still
+// agrees with the job's label, otherwise the label's own number. A label
+// changed elsewhere wins.
+fn nzbget_priority(metadata: &[(String, String)]) -> i64 {
+    let label = metadata
         .iter()
-        .find(|attribute| attribute.key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY))
-        .map(|attribute| match attribute.value.as_str() {
-            value if value.eq_ignore_ascii_case("HIGH") => 50,
-            value if value.eq_ignore_ascii_case("LOW") => -50,
+        .rev()
+        .find(|(key, _)| key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY))
+        .map(|(_, value)| value.to_ascii_uppercase())
+        .unwrap_or_else(|| "NORMAL".to_string());
+    let submitted = metadata
+        .iter()
+        .rev()
+        .find(|(key, _)| key == SUBMITTED_PRIORITY_KEY)
+        .and_then(|(_, value)| value.parse::<i64>().ok());
+    match submitted {
+        Some(priority) if priority_label(priority) == label => priority,
+        _ => match label.as_str() {
+            "HIGH" => 50,
+            "LOW" => -50,
             _ => 0,
-        })
-        .unwrap_or(0)
+        },
+    }
+}
+
+// A priority as a number or one of NZBGet's level names.
+fn parse_nzbget_priority(param: &str) -> i64 {
+    let trimmed = param.trim();
+    if let Ok(numeric) = trimmed.parse::<i64>() {
+        return numeric;
+    }
+    match trimmed
+        .to_ascii_lowercase()
+        .replace([' ', '_', '-'], "")
+        .as_str()
+    {
+        "force" => FORCE_PRIORITY,
+        "veryhigh" => 100,
+        "high" => 50,
+        "low" => -50,
+        "verylow" => -100,
+        _ => 0,
+    }
 }
 
 fn active_downloads(item: &QueueItem) -> u32 {

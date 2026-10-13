@@ -542,6 +542,9 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     };
                     let _ = reply.send(result);
                 }
+                SchedulerCommand::UpdateHistory { job_id, reply, .. } => {
+                    let _ = reply.send(Err(SchedulerError::JobNotFound(job_id)));
+                }
                 SchedulerCommand::ReorderJob { job_id, reply, .. } => {
                     let result = if jobs.contains_key(&job_id) {
                         Ok(())
@@ -801,6 +804,7 @@ async fn update_job_applies_explicit_patch() {
                 category: FieldUpdate::Set("movies".to_string()),
                 metadata: FieldUpdate::Set(vec![("priority".to_string(), "high".to_string())]),
                 password: FieldUpdate::Unchanged,
+                name: None,
             },
         )
         .await
@@ -820,6 +824,7 @@ async fn update_job_applies_explicit_patch() {
                 category: FieldUpdate::Clear,
                 metadata: FieldUpdate::Clear,
                 password: FieldUpdate::Unchanged,
+                name: None,
             },
         )
         .await

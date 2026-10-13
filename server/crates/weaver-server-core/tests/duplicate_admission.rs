@@ -218,6 +218,43 @@ fn user_history_deletion_forgets_identity_and_allows_resubmission() {
 }
 
 #[test]
+fn nzbget_hidden_history_keeps_duplicate_identity() {
+    let db = Database::open_in_memory().unwrap();
+    let original = spec(vec![vec![("hidden@example", 10)]]);
+    let (job_id, _) = accepted(
+        db.admit_duplicate_submission(&request(&original, 13))
+            .unwrap(),
+    );
+    db.activate_duplicate_admission(job_id).unwrap();
+    db.insert_job_history(&history(job_id.0, "complete"))
+        .unwrap();
+
+    assert!(db.set_nzbget_history_hidden(job_id.0, true).unwrap());
+    assert!(
+        !db.set_nzbget_history_hidden(job_id.0 + 1_000, true)
+            .unwrap()
+    );
+    let states = db.nzbget_history_states(&[job_id.0]).unwrap();
+    assert!(states[&job_id.0].hidden);
+
+    // The hidden row is still history: the web listing keeps it and the
+    // duplicate identity it owns still blocks the same release.
+    assert!(db.get_job_history(job_id.0).unwrap().is_some());
+    assert!(db.duplicate_snapshot(job_id).unwrap().is_some());
+    assert!(matches!(
+        db.admit_duplicate_submission(&request(&original, 14))
+            .unwrap(),
+        DuplicateAdmission::Blocked { .. }
+    ));
+
+    assert!(
+        db.delete_job_history_and_forget_duplicate_identity(job_id.0)
+            .unwrap()
+    );
+    assert!(db.nzbget_history_states(&[job_id.0]).unwrap().is_empty());
+}
+
+#[test]
 fn user_delete_all_history_forgets_only_history_identities() {
     let db = Database::open_in_memory().unwrap();
     let first_spec = spec(vec![vec![("one@example", 10)]]);

@@ -1389,6 +1389,11 @@ impl Pipeline {
                 _ => crate::post_processing::model::PipelineFailureStage::Download,
             })
             .unwrap_or(crate::post_processing::model::PipelineFailureStage::Download);
+        // The first failure wins: a later fail_job for the same job comes
+        // from cleanup, not from the stage that broke.
+        self.pipeline_failure_stages
+            .entry(job_id)
+            .or_insert(failure_stage);
         // Scripts run on failure too, so the job's own failure survives them:
         // the primary failure is carried through and re-applied afterwards.
         let scripts_may_run = self

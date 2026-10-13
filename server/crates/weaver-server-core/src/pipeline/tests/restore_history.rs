@@ -1306,6 +1306,253 @@ async fn job_failed_event_publishes_after_history_archive_commits() {
 }
 
 #[tokio::test]
+async fn failed_history_row_keeps_why_the_job_failed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let cases = [
+        (
+            30051,
+            JobStatus::Repairing,
+            "not enough recovery blocks",
+            crate::history::HistoryFailureKind::Repair,
+        ),
+        (
+            30052,
+            JobStatus::Extracting,
+            "invalid password for encrypted archive",
+            crate::history::HistoryFailureKind::Password,
+        ),
+        (
+            30053,
+            JobStatus::Extracting,
+            "write failed: No space left on device (os error 28)",
+            crate::history::HistoryFailureKind::DiskFull,
+        ),
+        (
+            30054,
+            JobStatus::Extracting,
+            "unexpected end of archive",
+            crate::history::HistoryFailureKind::Unpack,
+        ),
+        (
+            30055,
+            JobStatus::Moving,
+            "could not move the output",
+            crate::history::HistoryFailureKind::Move,
+        ),
+        (
+            30056,
+            JobStatus::Downloading,
+            "too many articles are missing",
+            crate::history::HistoryFailureKind::Health,
+        ),
+    ];
+    for (id, status, error, expected) in cases {
+        let job_id = JobId(id);
+        let spec = standalone_job_spec(
+            &format!("Failure Kind {id}"),
+            &[(format!("failure-kind-{id}.mkv"), 123)],
+        );
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        pipeline.jobs.get_mut(&job_id).unwrap().status = status;
+        pipeline.fail_job(job_id, error.to_string());
+        wait_for_job_event(
+            &mut events,
+            |event| matches!(event, PipelineEvent::JobFailed { job_id: failed, .. } if *failed == job_id),
+        )
+        .await;
+        let states = pipeline.db.nzbget_history_states(&[id]).unwrap();
+        assert_eq!(states[&id].failure_kind, Some(expected), "{error}");
+    }
+}
+
+async fn update_job(pipeline: &mut Pipeline, job_id: JobId, update: crate::jobs::JobUpdate) {
+    let (reply, done) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::UpdateJob {
+            job_id,
+            update,
+            reply,
+        })
+        .await;
+    done.await.unwrap().unwrap();
+}
+
+fn rename(name: &str) -> crate::jobs::JobUpdate {
+    crate::jobs::JobUpdate {
+        name: Some(name.to_string()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn renaming_a_job_moves_only_an_unwritten_working_dir() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    for (id, written) in [(30061, false), (30062, true)] {
+        let job_id = JobId(id);
+        let spec = standalone_job_spec(
+            &format!("Before Rename {id}"),
+            &[(format!("rename-{id}.mkv"), 123)],
+        );
+        let old_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+        crate::jobs::working_dir::mark_weaver_owned_working_dir(
+            &intermediate_dir,
+            &old_dir,
+            job_id,
+        )
+        .unwrap();
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.status = JobStatus::Queued;
+        state.download_state = crate::jobs::model::DownloadState::Queued;
+        if written {
+            std::fs::write(old_dir.join("rename.part"), b"written").unwrap();
+        }
+
+        let new_name = format!("After Rename {id}");
+        update_job(&mut pipeline, job_id, rename(&new_name)).await;
+
+        let state = &pipeline.jobs[&job_id];
+        assert_eq!(state.spec.name, new_name);
+        assert_eq!(
+            crate::ingest::completed_folder_name(&state.spec.name, &state.spec.metadata),
+            new_name
+        );
+        if written {
+            assert_eq!(state.working_dir, old_dir);
+            assert!(old_dir.join("rename.part").exists());
+        } else {
+            assert_eq!(state.working_dir, intermediate_dir.join(&new_name));
+            assert!(!old_dir.exists());
+            assert!(crate::jobs::working_dir::is_weaver_owned_working_dir(
+                &state.working_dir
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_rename_survives_restore_through_the_metadata() {
+    let mut metadata = vec![("drone".to_string(), "abc".to_string())];
+    crate::ingest::set_renamed_title(&mut metadata, "Renamed Release");
+    let nzb = weaver_nzb::parse_nzb(&sample_nzb_bytes()).unwrap();
+    let spec =
+        crate::ingest::nzb_to_spec(&nzb, std::path::Path::new("Original.nzb"), None, metadata);
+    assert_eq!(spec.name, "Renamed Release");
+    assert_eq!(
+        crate::ingest::original_release_title(&spec.name, &spec.metadata),
+        "Renamed Release"
+    );
+}
+
+#[tokio::test]
+async fn parking_a_job_keeps_its_working_dir() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30063);
+    let spec = standalone_job_spec("Parked Job", &[("parked.mkv".to_string(), 123)]);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    std::fs::write(working_dir.join("parked.part"), b"kept").unwrap();
+    let (reply, done) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::CancelJob {
+            job_id,
+            origin: crate::jobs::handle::CancellationOrigin::UserKeepingFiles,
+            reply,
+        })
+        .await;
+    done.await.unwrap().unwrap();
+    assert!(!pipeline.jobs.contains_key(&job_id));
+    assert_eq!(
+        pipeline
+            .db
+            .get_job_history(job_id.0)
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+    // Nothing was scheduled to remove the directory.
+    assert!(working_dir.join("parked.part").exists());
+}
+
+#[tokio::test]
+async fn updating_history_edits_the_row_and_the_finished_job() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30064);
+    let spec = standalone_job_spec("Finished Job", &[("finished.mkv".to_string(), 123)]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.fail_job(job_id, "too many articles are missing".to_string());
+    wait_for_job_event(
+        &mut events,
+        |event| matches!(event, PipelineEvent::JobFailed { job_id: failed, .. } if *failed == job_id),
+    )
+    .await;
+
+    let update = crate::jobs::JobUpdate {
+        name: Some("Renamed Finished".to_string()),
+        category: crate::jobs::FieldUpdate::Set("tv".to_string()),
+        ..Default::default()
+    };
+    let (reply, done) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::UpdateHistory {
+            job_id,
+            update,
+            reply,
+        })
+        .await;
+    done.await.unwrap().unwrap();
+
+    let row = pipeline.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(row.name, "Renamed Finished");
+    assert_eq!(row.category.as_deref(), Some("tv"));
+    let metadata = crate::history::parse_history_metadata(row.metadata.as_deref());
+    assert_eq!(
+        crate::ingest::renamed_title(&metadata),
+        Some("Renamed Finished")
+    );
+    let finished = pipeline
+        .finished_jobs
+        .iter()
+        .find(|job| job.job_id == job_id)
+        .unwrap();
+    assert_eq!(finished.name, "Renamed Finished");
+    assert_eq!(finished.category.as_deref(), Some("tv"));
+
+    // A job still in the queue is not a history row; an unknown id is not
+    // found.
+    let queued = JobId(30065);
+    let spec = standalone_job_spec("Still Queued", &[("queued.mkv".to_string(), 123)]);
+    insert_active_job(&mut pipeline, queued, spec).await;
+    for (id, conflict) in [(queued, true), (JobId(30066), false)] {
+        let (reply, done) = oneshot::channel();
+        pipeline
+            .handle_command(SchedulerCommand::UpdateHistory {
+                job_id: id,
+                update: rename("Nope"),
+                reply,
+            })
+            .await;
+        let error = done.await.unwrap().unwrap_err();
+        if conflict {
+            assert!(
+                matches!(error, crate::SchedulerError::Conflict(_)),
+                "{error}"
+            );
+        } else {
+            assert!(
+                matches!(error, crate::SchedulerError::JobNotFound(_)),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn restore_job_uses_per_file_progress_floor_for_reporting() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

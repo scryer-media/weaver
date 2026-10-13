@@ -1352,6 +1352,7 @@ async fn postgres_lanes_commit_an_archive_after_its_jobs_earlier_writes() {
             job_id,
             history: Box::new(postgres_sample_history(job_id)),
             typed_terminal_cause: None,
+            failure_kind: None,
             committed: Some(committed_tx),
         },
     })
@@ -1545,6 +1546,7 @@ async fn postgres_lanes_run_attribution_alongside_job_writes_but_before_the_arch
             job_id,
             history: Box::new(postgres_sample_history(job_id)),
             typed_terminal_cause: None,
+            failure_kind: None,
             committed: Some(committed_tx),
         },
     })
@@ -2387,7 +2389,12 @@ async fn postgres_job_lane_writes_keep_order_and_archive_last_when_configured() 
     }
     let job_id = crate::jobs::ids::JobId(jobs[0]);
     let committed = db
-        .try_queue_archive_job_with_terminal_cause(job_id, postgres_sample_history(job_id), None)
+        .try_queue_archive_job_with_terminal_cause(
+            job_id,
+            postgres_sample_history(job_id),
+            None,
+            None,
+        )
         .unwrap();
     committed.await.unwrap();
     assert!(db.get_job_history(job_id.0).unwrap().is_some());

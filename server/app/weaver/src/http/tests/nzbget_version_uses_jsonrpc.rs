@@ -342,6 +342,72 @@ async fn nzbget_auth_accepts_basic_password_as_persistent_api_key() {
 }
 
 #[tokio::test]
+async fn nzbget_takes_a_running_scripts_token_as_its_control_password() {
+    use weaver_server_core::post_processing::model::ScriptEventLabel;
+    use weaver_server_core::post_processing::runner::RunIdentity;
+
+    let db = Database::open_in_memory().unwrap();
+    db.set_script_api_url("http://127.0.0.1:6789/graphql");
+    let mut identity = RunIdentity {
+        run_id: "run-1".into(),
+        instance_id: "instance-1".into(),
+        ..Default::default()
+    };
+    let run = db.open_script_run(
+        &mut identity,
+        Some(7),
+        &ScriptEventLabel::PostProcessing,
+        None,
+        false,
+    );
+    let token = identity.token.clone().unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+    let writelog = serde_json::json!({
+        "method": "writelog",
+        "params": ["INFO", "from the script"],
+        "id": "script"
+    });
+
+    // While the run lasts its token is a control credential, sent the way a
+    // script told NZBOP_ControlPassword sends it.
+    let (status, payload) = post_nzbget(app.clone(), writelog.clone(), &basic_auth(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["result"], true);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/weaver:{token}/jsonrpc"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(writelog.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // It controls the queue and nothing more.
+    let (status, _) = post_nzbget(
+        app.clone(),
+        serde_json::json!({"method": "loadextensions", "params": [], "id": "admin"}),
+        &basic_auth(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Once the run has ended the token opens nothing.
+    drop(run);
+    let (status, payload) = post_nzbget(app, writelog, &basic_auth(&token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["error"]["code"], 401);
+}
+
+#[tokio::test]
 async fn nzbget_auth_rejects_missing_and_invalid_basic_auth() {
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
@@ -626,71 +692,191 @@ async fn nzbget_append_accepts_base64_payload_with_embedded_whitespace() {
     assert_eq!(handle.list_jobs().len(), 1);
 }
 
-#[tokio::test]
-async fn nzbget_append_canonicalizes_submitted_category_for_facade() {
+fn tv_category_config() -> SharedConfig {
+    let config = test_config();
+    config
+        .try_write()
+        .unwrap()
+        .categories
+        .push(weaver_server_core::categories::CategoryConfig {
+            id: 1,
+            name: "TV".into(),
+            dest_dir: None,
+            aliases: "sonarr, tv-*".into(),
+        });
+    config
+}
+
+async fn append_with_category(app: Router, release: &str, category: &str) -> u64 {
     use base64::Engine as _;
 
-    let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_mock_commands(vec![]);
-    let config = test_config();
-    {
-        let mut config_write = config.write().await;
-        config_write
-            .categories
-            .push(weaver_server_core::categories::CategoryConfig {
-                id: 1,
-                name: "TV".into(),
-                dest_dir: None,
-                aliases: String::new(),
-            });
-    }
-    let app = nzbget_test_router(
-        db,
-        handle.clone(),
-        config,
-        api_key_cache("control-key", "control"),
-    );
-    let nzb_b64 =
-        base64::engine::general_purpose::STANDARD.encode(minimal_nzb("Case.Category.Release"));
-
+    let nzb_b64 = base64::engine::general_purpose::STANDARD.encode(minimal_nzb(release));
     let (status, payload) = post_nzbget(
-        app.clone(),
+        app,
         serde_json::json!({
             "method": "append",
             "params": [
-                "Case.Category.Release.nzb",
+                format!("{release}.nzb"),
                 nzb_b64,
-                "tv",
+                category,
                 0,
                 false,
                 false,
                 "",
                 0,
                 "all",
-                ["drone", "case-category"]
+                ["drone", release]
             ],
             "id": "append-category"
         }),
         "Bearer control-key",
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    payload["result"].as_u64().unwrap()
+}
 
-    assert_eq!(status, StatusCode::OK);
-    assert!(payload["result"].as_u64().unwrap() >= 10_000);
-    assert_eq!(handle.list_jobs()[0].category.as_deref(), Some("TV"));
-
-    let (status, groups_payload) = post_nzbget(
+async fn rpc_result(app: Router, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let (status, payload) = post_nzbget(
         app,
-        serde_json::json!({
-            "method": "listgroups",
-            "params": [],
-            "id": "listgroups"
-        }),
+        serde_json::json!({ "method": method, "params": params, "id": method }),
         "Bearer control-key",
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(groups_payload["result"][0]["Category"], "TV");
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert!(payload.get("error").is_none(), "{payload}");
+    payload["result"].clone()
+}
+
+fn category_of(entries: &serde_json::Value, id: u64) -> String {
+    entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["NZBID"] == id)
+        .unwrap_or_else(|| panic!("{id} missing from {entries}"))["Category"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn nzbget_append_echoes_submitted_category_while_routing_by_the_configured_one() {
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        tv_category_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    // Each spelling an *arr app may be configured with: a case variant of the
+    // configured name, a literal alias, a glob alias, and the name itself.
+    let mut submitted = Vec::new();
+    for (release, category) in [
+        ("Lower.Case", "tv"),
+        ("Mixed.Case", "Tv"),
+        ("Literal.Alias", "sonarr"),
+        ("Glob.Alias", "tv-uhd"),
+        ("Exact.Name", "TV"),
+    ] {
+        let id = append_with_category(app.clone(), release, category).await;
+        submitted.push((id, category));
+    }
+
+    // Routing, output folders and scripts keep using the configured category.
+    for job in handle.list_jobs() {
+        assert_eq!(job.category.as_deref(), Some("TV"), "{}", job.name);
+    }
+    // The client sees exactly the string it sent, which is what its
+    // case-sensitive queue filter compares against.
+    let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+    for (id, category) in &submitted {
+        assert_eq!(category_of(&groups, *id), *category);
+    }
+    // The label stays internal: it is not one of the job's parameters.
+    for group in groups.as_array().unwrap() {
+        for parameter in group["Parameters"].as_array().unwrap() {
+            assert!(
+                !parameter["Name"].as_str().unwrap().contains("weaver."),
+                "{parameter}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn nzbget_category_echo_survives_into_history_and_follows_group_set_category() {
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let app = nzbget_test_router(
+        db,
+        handle.clone(),
+        tv_category_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let recategorised = append_with_category(app.clone(), "Recategorised", "Movies").await;
+    let archived = append_with_category(app.clone(), "Archived", "tv").await;
+
+    // GroupSetCategory resolves like append and echoes the new string.
+    assert_eq!(
+        rpc_result(
+            app.clone(),
+            "editqueue",
+            serde_json::json!(["GroupSetCategory", 0, "sonarr", recategorised]),
+        )
+        .await,
+        true
+    );
+    let job = handle
+        .list_jobs()
+        .into_iter()
+        .find(|job| job.job_id.0 == recategorised)
+        .unwrap();
+    assert_eq!(job.category.as_deref(), Some("TV"));
+    let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+    assert_eq!(category_of(&groups, recategorised), "sonarr");
+
+    // The history row carries the label the job was submitted with.
+    assert_eq!(
+        rpc_result(
+            app.clone(),
+            "editqueue",
+            serde_json::json!(["GroupDelete", 0, "", archived]),
+        )
+        .await,
+        true
+    );
+    let history = rpc_result(app.clone(), "history", serde_json::json!([])).await;
+    assert_eq!(category_of(&history, archived), "tv");
+}
+
+#[tokio::test]
+async fn nzbget_category_label_yields_once_the_job_is_recategorised_elsewhere() {
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        tv_category_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let id = append_with_category(app.clone(), "Moved.Elsewhere", "tv").await;
+
+    // A recategorisation from the web UI changes the category but not the
+    // facade's label; the label must not keep claiming the old category.
+    handle
+        .update_job(
+            weaver_server_core::JobId(id),
+            weaver_server_core::JobUpdate {
+                category: weaver_server_core::FieldUpdate::Set("Movies".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let groups = rpc_result(app, "listgroups", serde_json::json!([])).await;
+    assert_eq!(category_of(&groups, id), "Movies");
 }
 
 #[tokio::test]
@@ -1144,12 +1330,10 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     assert_eq!(complete["UnpackStatus"], "SUCCESS");
     assert_eq!(complete["Parameters"][0]["Name"], "drone");
     assert_eq!(complete["Parameters"][0]["Value"], "drone-history");
-    // A failed job no longer claims a PAR failure it can't attribute. Sonarr/Radarr
-    // read failure only from the granular fields, so the failure is signaled via
-    // DeleteStatus="HEALTH" (their delete-failed set), not the compound Status;
-    // par/unpack stay NONE (no false stage claim).
+    // A row with no kept failure kind is read from its error text: missing
+    // articles at low health are a health failure, with no stage claim.
     assert_eq!(failed["ParStatus"], "NONE");
-    assert_eq!(failed["Status"], "FAILURE/HEALTH");
+    assert_eq!(failed["Status"], "DELETED/HEALTH");
     assert_eq!(failed["DeleteStatus"], "HEALTH");
     assert_eq!(failed["Message"], "article failures");
 }
@@ -1783,7 +1967,7 @@ async fn nzbget_editqueue_maps_arr_actions() {
         app.clone(),
         serde_json::json!({
             "method": "editqueue",
-            "params": ["HistoryDelete", 0, "", 77],
+            "params": ["HistoryFinalDelete", 0, "", 77],
             "id": "history-delete"
         }),
         "Bearer control-key",
@@ -1939,7 +2123,9 @@ async fn nzbget_editqueue_category_priority_and_parameter_updates() {
     assert_eq!(status, StatusCode::OK);
     let group = &groups["result"][0];
     assert_eq!(group["Category"], "movies");
-    assert_eq!(group["MaxPriority"], 50);
+    // Force is reported as set, though it dispatches as HIGH.
+    assert_eq!(group["MinPriority"], 900);
+    assert_eq!(group["MaxPriority"], 900);
 
     // Generic parameters round-trip into the Parameters list.
     let (status, payload) = post_nzbget(
@@ -2016,7 +2202,7 @@ async fn nzbget_editqueue_unsupported_commands_return_false_without_fault() {
         api_key_cache("control-key", "control"),
     );
 
-    for command in ["GroupMoveBefore", "GroupSetName", "FilePause", "GroupSort"] {
+    for command in ["FilePause", "FileDelete", "HistorySetDupeKey"] {
         let (status, payload) = post_nzbget(
             app.clone(),
             serde_json::json!({
@@ -2246,8 +2432,12 @@ async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
 #[tokio::test]
 async fn nzbget_history_reports_compound_status_history_time_and_stage_timings() {
     let db = Database::open_in_memory().unwrap();
-    db.insert_job_history(&nzbget_history_row(400, "complete", 1_700_000_400, None))
-        .unwrap();
+    // A fifth of the job was optional recovery data, so it stays repairable
+    // down to 80% health.
+    let mut complete = nzbget_history_row(400, "complete", 1_700_000_400, None);
+    complete.total_bytes = 1_000;
+    complete.optional_recovery_bytes = 200;
+    db.insert_job_history(&complete).unwrap();
     db.insert_job_history(&nzbget_history_row(401, "failed", 1_700_000_500, None))
         .unwrap();
     db.insert_job_history(&nzbget_history_row(402, "cancelled", 1_700_000_600, None))
@@ -2289,7 +2479,9 @@ async fn nzbget_history_reports_compound_status_history_time_and_stage_timings()
     assert_eq!(by_id(400)["DownloadTimeSec"], 300);
     assert_eq!(by_id(400)["RepairTimeSec"], 40);
     assert_eq!(by_id(400)["PostTotalTimeSec"], 40);
-    assert_eq!(by_id(401)["Status"], "FAILURE/HEALTH");
+    assert_eq!(by_id(400)["CriticalHealth"], 800);
+    assert_eq!(by_id(401)["CriticalHealth"], 1000);
+    assert_eq!(by_id(401)["Status"], "DELETED/HEALTH");
     assert_eq!(by_id(401)["DownloadTimeSec"], 0);
     assert_eq!(by_id(402)["Status"], "DELETED/MANUAL");
     assert_eq!(by_id(402)["Deleted"], true);
@@ -2398,12 +2590,17 @@ async fn nzbget_postqueue_and_group_post_fields_report_stage_progress() {
     );
     queued.post_state = weaver_server_core::PostState::QueuedPostProcessing;
     let handle = scheduler_handle_with_mock_commands(vec![job, queued]);
-    let app = nzbget_test_router(
-        Database::open_in_memory().unwrap(),
-        handle,
-        test_config(),
-        ApiKeyCache::default(),
-    );
+    // Post-processing began with verification 10 s before the repair stage.
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_events(&[weaver_server_core::history::timeline::JobEvent {
+        job_id: 60,
+        timestamp: 1_699_999_990_000,
+        kind: "JobVerificationStarted".into(),
+        message: String::new(),
+        file_id: None,
+    }])
+    .unwrap();
+    let app = nzbget_test_router(db, handle, test_config(), ApiKeyCache::default());
 
     let (status, payload) = post_nzbget(
         app.clone(),
@@ -2417,6 +2614,7 @@ async fn nzbget_postqueue_and_group_post_fields_report_stage_progress() {
     assert_eq!(entry["Stage"], "REPAIRING");
     assert_eq!(entry["StageProgress"], 500);
     assert_eq!(entry["StageTimeSec"], 4);
+    assert_eq!(entry["TotalTimeSec"], 14);
     assert_eq!(payload["result"][1]["NZBID"], 61);
     assert_eq!(payload["result"][1]["Stage"], "QUEUED");
 
@@ -2427,6 +2625,8 @@ async fn nzbget_postqueue_and_group_post_fields_report_stage_progress() {
     )
     .await;
     assert_eq!(status_payload["result"]["PostJobCount"], 2);
+    // Nothing has been downloaded, however long the server has been up.
+    assert_eq!(status_payload["result"]["DownloadTimeSec"], 0);
 
     let (_, groups) = post_nzbget(
         app,
@@ -2438,6 +2638,8 @@ async fn nzbget_postqueue_and_group_post_fields_report_stage_progress() {
     assert_eq!(group["Status"], "REPAIRING");
     assert_eq!(group["PostStageProgress"], 500);
     assert_eq!(group["PostInfoText"], "Repairing (50%)");
+    assert_eq!(group["PostStageTimeSec"], 4);
+    assert_eq!(group["PostTotalTimeSec"], 14);
 }
 
 #[tokio::test]
@@ -3998,4 +4200,1009 @@ async fn loadextensions_reports_all_declared_kinds_and_event_metadata() {
     }
     assert_eq!(script["QueueEvents"], "NZB_DOWNLOADED,NZB_DELETED");
     assert_eq!(script["TaskTime"], "*:30;04:15");
+}
+
+fn history_ids(entries: &serde_json::Value) -> Vec<u64> {
+    entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["NZBID"].as_u64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn nzbget_history_delete_hides_the_row_and_final_delete_erases_it() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(501, "complete", 1_700_000_100, None))
+        .unwrap();
+    db.insert_job_history(&nzbget_history_row(502, "complete", 1_700_000_200, None))
+        .unwrap();
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let app = nzbget_test_router(
+        db.clone(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    // Sonarr removes an imported item with the pre-v13 shape and a scalar id.
+    let hidden = rpc_result(
+        app.clone(),
+        "editqueue",
+        serde_json::json!(["HistoryDelete", 0, "", 501]),
+    )
+    .await;
+    assert_eq!(hidden, true);
+
+    // The default listing and history(false) leave the hidden row out.
+    for params in [serde_json::json!([]), serde_json::json!([false])] {
+        let entries = rpc_result(app.clone(), "history", params).await;
+        assert_eq!(history_ids(&entries), vec![502]);
+    }
+    // history(true) lists it as a duplicate-check entry.
+    let entries = rpc_result(app.clone(), "history", serde_json::json!([true])).await;
+    let mut ids = history_ids(&entries);
+    ids.sort_unstable();
+    assert_eq!(ids, vec![501, 502]);
+    let hidden_entry = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["NZBID"] == 501)
+        .unwrap();
+    assert_eq!(hidden_entry["Kind"], "DUP");
+    // The row itself is untouched for the web UI and duplicate checks.
+    assert!(db.get_job_history(501).unwrap().is_some());
+
+    // HistoryFinalDelete, in the v13+ shape, erases the row outright.
+    let erased = rpc_result(
+        app.clone(),
+        "editqueue",
+        serde_json::json!(["HistoryFinalDelete", "", [501]]),
+    )
+    .await;
+    assert_eq!(erased, true);
+    assert!(db.get_job_history(501).unwrap().is_none());
+    let entries = rpc_result(app.clone(), "history", serde_json::json!([true])).await;
+    assert_eq!(history_ids(&entries), vec![502]);
+
+    // An id with no history row reports failure instead of hiding nothing.
+    let missing = rpc_result(
+        app,
+        "editqueue",
+        serde_json::json!(["HistoryDelete", 0, "", 999]),
+    )
+    .await;
+    assert_eq!(missing, false);
+}
+
+#[tokio::test]
+async fn nzbget_history_delete_survives_reopening_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("weaver.db");
+    {
+        let db = Database::open(&path).unwrap();
+        db.insert_job_history(&nzbget_history_row(601, "complete", 1_700_000_100, None))
+            .unwrap();
+        let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+        let app = nzbget_test_router(
+            db,
+            handle,
+            test_config(),
+            api_key_cache("control-key", "control"),
+        );
+        let hidden = rpc_result(
+            app,
+            "editqueue",
+            serde_json::json!(["HistoryDelete", 0, "", 601]),
+        )
+        .await;
+        assert_eq!(hidden, true);
+    }
+    let db = Database::open(&path).unwrap();
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let app = nzbget_test_router(
+        db,
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let entries = rpc_result(app.clone(), "history", serde_json::json!([])).await;
+    assert!(history_ids(&entries).is_empty());
+    let entries = rpc_result(app, "history", serde_json::json!([true])).await;
+    assert_eq!(history_ids(&entries), vec![601]);
+}
+
+#[tokio::test]
+async fn nzbget_history_reports_each_failure_cause_in_its_own_status_field() {
+    use weaver_server_core::history::HistoryFailureKind;
+
+    let db = Database::open_in_memory().unwrap();
+    // (id, kind, field, value, compound status)
+    let cases = [
+        (
+            701,
+            HistoryFailureKind::Repair,
+            "ParStatus",
+            "FAILURE",
+            "FAILURE/PAR",
+        ),
+        (
+            702,
+            HistoryFailureKind::Password,
+            "UnpackStatus",
+            "PASSWORD",
+            "FAILURE/UNPACK",
+        ),
+        (
+            703,
+            HistoryFailureKind::DiskFull,
+            "UnpackStatus",
+            "SPACE",
+            "FAILURE/UNPACK",
+        ),
+        (
+            704,
+            HistoryFailureKind::Unpack,
+            "UnpackStatus",
+            "FAILURE",
+            "FAILURE/UNPACK",
+        ),
+        (
+            705,
+            HistoryFailureKind::Move,
+            "MoveStatus",
+            "FAILURE",
+            "FAILURE/MOVE",
+        ),
+        (
+            706,
+            HistoryFailureKind::Health,
+            "DeleteStatus",
+            "HEALTH",
+            "DELETED/HEALTH",
+        ),
+        (
+            707,
+            HistoryFailureKind::Duplicate,
+            "DeleteStatus",
+            "DUPE",
+            "DELETED/DUPE",
+        ),
+    ];
+    for (id, kind, _, _, _) in cases {
+        db.insert_job_history(&nzbget_history_row(
+            id,
+            "failed",
+            1_700_000_000 + id as i64,
+            None,
+        ))
+        .unwrap();
+        assert!(db.set_history_failure_kind(id, Some(kind)).unwrap());
+    }
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let entries = rpc_result(app, "history", serde_json::json!([])).await;
+    let fields = [
+        "ParStatus",
+        "UnpackStatus",
+        "MoveStatus",
+        "ScriptStatus",
+        "DeleteStatus",
+    ];
+    for (id, kind, field, value, status) in cases {
+        let entry = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["NZBID"] == id)
+            .unwrap();
+        assert_eq!(entry["Status"], status, "{kind:?}");
+        // Only the field for this cause carries it; the others stay NONE so
+        // no client reads a stage that did not fail.
+        for other in fields {
+            let expected = if other == field { value } else { "NONE" };
+            assert_eq!(entry[other], expected, "{kind:?} {other}");
+        }
+        assert_eq!(entry["Deleted"], field == "DeleteStatus", "{kind:?}");
+    }
+}
+
+#[tokio::test]
+async fn nzbget_history_reads_the_failure_cause_from_text_when_none_was_kept() {
+    let db = Database::open_in_memory().unwrap();
+    let mut password = nzbget_history_row(711, "failed", 1_700_000_100, None);
+    password.error_message = Some("set 'a': invalid password for encrypted archive".into());
+    password.health = 1000;
+    password.failed_bytes = 0;
+    db.insert_job_history(&password).unwrap();
+    let mut repair = nzbget_history_row(712, "failed", 1_700_000_200, None);
+    repair.error_message = Some("par2 repair failed".into());
+    repair.health = 1000;
+    repair.failed_bytes = 0;
+    db.insert_job_history(&repair).unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let entries = rpc_result(app, "history", serde_json::json!([])).await;
+    let by_id = |id: u64| {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["NZBID"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by_id(711)["UnpackStatus"], "PASSWORD");
+    assert_eq!(by_id(711)["DeleteStatus"], "NONE");
+    assert_eq!(by_id(712)["ParStatus"], "FAILURE");
+}
+
+#[tokio::test]
+async fn nzbget_history_reports_a_job_removed_as_a_duplicate_as_dupe() {
+    use weaver_server_core::history::HistoryFailureKind;
+
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(721, "cancelled", 1_700_000_100, None))
+        .unwrap();
+    db.insert_job_history(&nzbget_history_row(722, "cancelled", 1_700_000_200, None))
+        .unwrap();
+    assert!(
+        db.set_history_failure_kind(721, Some(HistoryFailureKind::Duplicate))
+            .unwrap()
+    );
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let entries = rpc_result(app, "history", serde_json::json!([])).await;
+    let by_id = |id: u64| {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["NZBID"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by_id(721)["DeleteStatus"], "DUPE");
+    assert_eq!(by_id(721)["Status"], "DELETED/DUPE");
+    assert_eq!(by_id(722)["DeleteStatus"], "MANUAL");
+    assert_eq!(by_id(722)["Status"], "DELETED/MANUAL");
+}
+
+async fn send_raw(app: Router, request: Request<Body>) -> (StatusCode, String) {
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+fn json_post(uri: &str, auth: Option<&str>, method: &str) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(auth) = auth {
+        builder = builder.header(header::AUTHORIZATION, auth);
+    }
+    builder
+        .body(Body::from(
+            serde_json::json!({"method": method, "params": [], "id": 1}).to_string(),
+        ))
+        .unwrap()
+}
+
+fn xml_post(uri: &str, auth: Option<&str>, method: &str) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "text/xml");
+    if let Some(auth) = auth {
+        builder = builder.header(header::AUTHORIZATION, auth);
+    }
+    builder
+        .body(Body::from(format!(
+            "<?xml version=\"1.0\"?><methodCall><methodName>{method}</methodName><params></params></methodCall>"
+        )))
+        .unwrap()
+}
+
+fn get_request(uri: &str, auth: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().method("GET").uri(uri);
+    if let Some(auth) = auth {
+        builder = builder.header(header::AUTHORIZATION, auth);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+fn facade_with_control_key() -> Router {
+    nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    )
+}
+
+#[tokio::test]
+async fn nzbget_answers_every_endpoint_shape_clients_use() {
+    let app = facade_with_control_key();
+    let basic = basic_auth("control-key");
+
+    // JSON-RPC: trailing slash with Basic, and credentials in the path with
+    // and without the slash. Path credentials need no header at all.
+    for (uri, auth) in [
+        ("/jsonrpc/", Some(basic.as_str())),
+        ("/arr:control-key/jsonrpc", None),
+        ("/arr:control-key/jsonrpc/", None),
+        ("/arr:control%2Dkey/jsonrpc", None),
+    ] {
+        let (status, body) = send_raw(app.clone(), json_post(uri, auth, "version")).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(payload["result"], "16.0-weaver", "{uri}");
+    }
+
+    // XML-RPC: the same three shapes.
+    for (uri, auth) in [
+        ("/xmlrpc/", Some(basic.as_str())),
+        ("/arr:control-key/xmlrpc", None),
+        ("/arr:control-key/xmlrpc/", None),
+    ] {
+        let (status, body) = send_raw(app.clone(), xml_post(uri, auth, "version")).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(body.contains("16.0-weaver"), "{uri}: {body}");
+    }
+
+    // GET /jsonrpc/<method>, with Basic or path credentials, and positional
+    // parameters from the query string.
+    for (uri, auth) in [
+        ("/jsonrpc/version", Some(basic.as_str())),
+        ("/arr:control-key/jsonrpc/version", None),
+    ] {
+        let (status, body) = send_raw(app.clone(), get_request(uri, auth)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(payload["result"], "16.0-weaver", "{uri}");
+    }
+    let (status, body) = send_raw(
+        app.clone(),
+        get_request("/jsonrpc/history?Hidden=true", Some(basic.as_str())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(payload["result"].is_array(), "{body}");
+    let (_, body) = send_raw(
+        app.clone(),
+        get_request("/jsonrpc/history?Hidden=maybe", Some(basic.as_str())),
+    )
+    .await;
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["error"]["code"], 2, "{body}");
+
+    // A GET call cannot change anything, even with control credentials.
+    let (status, body) = send_raw(
+        app.clone(),
+        get_request("/arr:control-key/jsonrpc/pausedownload", None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["error"]["code"], 1, "{body}");
+}
+
+#[tokio::test]
+async fn nzbget_rejects_wrong_path_credentials_without_reading_the_body() {
+    let app = facade_with_control_key();
+    for uri in [
+        "/arr:wrong-key/jsonrpc",
+        "/arr:/jsonrpc",
+        "/arr:wrong-key/xmlrpc/",
+    ] {
+        let (_writer, reader) = tokio::io::duplex(1);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from_stream(tokio_util::io::ReaderStream::new(reader)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+    let (status, body) = send_raw(app, get_request("/arr:wrong-key/jsonrpc/version", None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogs;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn nzbget_path_credentials_never_reach_the_logs() {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::info!("capture started");
+
+    let app = facade_with_control_key();
+    for request in [
+        json_post("/arr:control-key/jsonrpc", None, "status"),
+        json_post("/arr:wrong-secret-value/jsonrpc", None, "status"),
+        xml_post("/arr:control-key/xmlrpc/", None, "listgroups"),
+        get_request("/arr:control-key/jsonrpc/history?true", None),
+    ] {
+        let _ = send_raw(app.clone(), request).await;
+    }
+
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(captured.contains("capture started"));
+    assert!(!captured.contains("control-key"), "{captured}");
+    assert!(!captured.contains("wrong-secret-value"), "{captured}");
+}
+
+#[tokio::test]
+async fn nzbget_route_shapes_coexist_with_the_rest_of_the_router() {
+    // The same static and parameterised paths the production router
+    // registers, merged with the facade routes. Building it must not panic,
+    // and each side must still answer its own paths.
+    let marker = |name: &'static str| axum::routing::get(move || async move { name });
+    let app = Router::new()
+        .route("/metrics", marker("metrics"))
+        .route("/healthz", marker("healthz"))
+        .route("/readyz", marker("readyz"))
+        .merge(facade_with_control_key())
+        .route("/graphql", axum::routing::post(|| async { "graphql" }))
+        .route("/graphql/ws", marker("graphql-ws"))
+        .route("/api/jobs/{job_id}/nzb", marker("job-nzb"))
+        .route("/api/jobs/{job_id}/output-file", marker("job-output"))
+        .merge(routes::build_backup_routes(1024))
+        .route(
+            "/api/system/restart",
+            axum::routing::post(|| async { "restart" }),
+        )
+        .route("/api/system/diagnostics", marker("diagnostics"))
+        .route("/api/auth/setup", axum::routing::post(|| async { "setup" }))
+        .route("/api/login", axum::routing::post(|| async { "login" }))
+        .route(
+            "/api/auth/verify",
+            axum::routing::post(|| async { "verify" }),
+        )
+        .route(
+            "/api/auth/signout-all",
+            axum::routing::post(|| async { "signout" }),
+        )
+        .route("/api/logout", axum::routing::post(|| async { "logout" }))
+        .route("/api/auth/csrf", marker("csrf"))
+        .route("/api/auth/status", marker("auth-status"))
+        .route("/", marker("index"))
+        .fallback(marker("static"));
+
+    for (uri, expected) in [
+        ("/api/jobs/7/nzb", "job-nzb"),
+        ("/graphql/ws", "graphql-ws"),
+        ("/api/auth/status", "auth-status"),
+        ("/assets/index.js", "static"),
+    ] {
+        let (status, body) = send_raw(app.clone(), get_request(uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(body, expected, "{uri}");
+    }
+    let (status, body) = send_raw(
+        app.clone(),
+        json_post("/arr:control-key/jsonrpc", None, "version"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("16.0-weaver"));
+    let (status, body) = send_raw(
+        app,
+        get_request("/jsonrpc/version", Some(&basic_auth("control-key"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("16.0-weaver"));
+}
+
+#[tokio::test]
+async fn nzbget_401_carries_a_basic_challenge() {
+    let app = facade_with_control_key();
+    for request in [
+        json_post("/jsonrpc", None, "version"),
+        json_post("/jsonrpc", Some(&basic_auth("wrong-key")), "version"),
+        xml_post("/xmlrpc", None, "version"),
+        xml_post("/arr:wrong-key/xmlrpc/", None, "version"),
+        get_request("/jsonrpc/version", None),
+    ] {
+        let uri = request.uri().to_string();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            "Basic realm=\"weaver\"",
+            "{uri}"
+        );
+    }
+
+    // A 403 for a scope the key lacks is not a credentials challenge.
+    let read_app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("read-key", "read"),
+    );
+    let response = read_app
+        .oneshot(json_post(
+            "/jsonrpc",
+            Some("Bearer read-key"),
+            "pausedownload",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+}
+
+#[tokio::test]
+async fn nzbget_basic_scheme_is_matched_case_insensitively() {
+    use base64::Engine as _;
+
+    let app = facade_with_control_key();
+    let encoded = base64::engine::general_purpose::STANDARD.encode("arr:control-key");
+    for scheme in ["Basic", "basic", "BASIC", "bAsIc"] {
+        let auth = format!("{scheme} {encoded}");
+        let (status, body) =
+            send_raw(app.clone(), json_post("/jsonrpc", Some(&auth), "version")).await;
+        assert_eq!(status, StatusCode::OK, "{scheme}: {body}");
+        assert!(body.contains("16.0-weaver"), "{scheme}");
+    }
+}
+
+fn sort_test_job(job_id: u64, name: &str, total: u64, priority: &str, created_ms: f64) -> JobInfo {
+    let mut job = reorder_test_job(job_id);
+    job.name = name.to_string();
+    job.total_bytes = total;
+    job.metadata = vec![("priority".to_string(), priority.to_string())];
+    job.created_at_epoch_ms = created_ms;
+    job
+}
+
+async fn editqueue(app: Router, params: serde_json::Value) -> serde_json::Value {
+    rpc_result(app, "editqueue", params).await
+}
+
+#[tokio::test]
+async fn nzbget_group_set_name_renames_the_job() {
+    let handle = scheduler_handle_with_mock_commands(vec![reorder_test_job(1)]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let renamed = editqueue(
+        app.clone(),
+        serde_json::json!(["GroupSetName", "Renamed.Release.2024", [1]]),
+    )
+    .await;
+    assert_eq!(renamed, true);
+    let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+    assert_eq!(groups[0]["NZBName"], "Renamed.Release.2024");
+    assert_eq!(
+        handle.get_job(JobId(1)).unwrap().name,
+        "Renamed.Release.2024"
+    );
+
+    // An empty name changes nothing.
+    let refused = editqueue(app.clone(), serde_json::json!(["GroupSetName", " ", [1]])).await;
+    assert_eq!(refused, false);
+    let groups = rpc_result(app, "listgroups", serde_json::json!([])).await;
+    assert_eq!(groups[0]["NZBName"], "Renamed.Release.2024");
+}
+
+#[tokio::test]
+async fn nzbget_group_sort_orders_by_each_key_and_direction() {
+    let handle = scheduler_handle_with_mock_commands(vec![
+        sort_test_job(1, "Charlie", 300, "NORMAL", 1_000.0),
+        sort_test_job(2, "alpha", 100, "LOW", 3_000.0),
+        sort_test_job(3, "Bravo", 200, "HIGH", 2_000.0),
+    ]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    for (param, expected) in [
+        ("name+", vec![2, 3, 1]),
+        ("name-", vec![1, 3, 2]),
+        ("size+", vec![2, 3, 1]),
+        ("size-", vec![1, 3, 2]),
+        ("left+", vec![2, 3, 1]),
+        ("priority+", vec![3, 1, 2]),
+        ("priority-", vec![2, 1, 3]),
+        ("age+", vec![2, 3, 1]),
+        ("age-", vec![1, 3, 2]),
+        ("category+", vec![1, 3, 2]),
+    ] {
+        // No ids: the whole queue is sorted.
+        let sorted = editqueue(app.clone(), serde_json::json!(["GroupSort", param, []])).await;
+        assert_eq!(sorted, true, "{param}");
+        assert_eq!(listgroups_ids(app.clone()).await, expected, "{param}");
+    }
+
+    // With no direction a sorted queue flips.
+    editqueue(app.clone(), serde_json::json!(["GroupSort", "name+", []])).await;
+    editqueue(app.clone(), serde_json::json!(["GroupSort", "name", []])).await;
+    assert_eq!(listgroups_ids(app.clone()).await, vec![1, 3, 2]);
+    editqueue(app.clone(), serde_json::json!(["GroupSort", "name", []])).await;
+    assert_eq!(listgroups_ids(app.clone()).await, vec![2, 3, 1]);
+
+    // Listed ids are sorted within the places they hold.
+    editqueue(
+        app.clone(),
+        serde_json::json!(["GroupSort", "size-", [2, 1]]),
+    )
+    .await;
+    assert_eq!(listgroups_ids(app.clone()).await, vec![1, 3, 2]);
+
+    let unknown = editqueue(app.clone(), serde_json::json!(["GroupSort", "colour", []])).await;
+    assert_eq!(unknown, false);
+    let missing = editqueue(app.clone(), serde_json::json!(["GroupSort", "name", [99]])).await;
+    assert_eq!(missing, false);
+    assert_eq!(listgroups_ids(app).await, vec![1, 3, 2]);
+}
+
+#[tokio::test]
+async fn nzbget_group_move_before_and_after_land_next_to_the_anchor() {
+    let handle =
+        scheduler_handle_with_mock_commands((1..=5).map(reorder_test_job).collect::<Vec<_>>());
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let moved = editqueue(
+        app.clone(),
+        serde_json::json!(["GroupMoveBefore", "2", [5, 4]]),
+    )
+    .await;
+    assert_eq!(moved, true);
+    assert_eq!(listgroups_ids(app.clone()).await, vec![1, 5, 4, 2, 3]);
+
+    // Legacy shape: the anchor id rides in Param.
+    let moved = editqueue(
+        app.clone(),
+        serde_json::json!(["GroupMoveAfter", 0, "3", [1]]),
+    )
+    .await;
+    assert_eq!(moved, true);
+    assert_eq!(listgroups_ids(app.clone()).await, vec![5, 4, 2, 3, 1]);
+
+    for params in [
+        serde_json::json!(["GroupMoveAfter", "99", [1]]),
+        serde_json::json!(["GroupMoveAfter", "nope", [1]]),
+        serde_json::json!(["GroupMoveBefore", "2", [98]]),
+    ] {
+        assert_eq!(editqueue(app.clone(), params).await, false);
+    }
+    assert_eq!(listgroups_ids(app).await, vec![5, 4, 2, 3, 1]);
+}
+
+fn history_entry(entries: &serde_json::Value, id: u64) -> serde_json::Value {
+    entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["NZBID"] == id)
+        .unwrap_or_else(|| panic!("{id} missing from {entries}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn nzbget_history_marks_are_kept_and_reported() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("weaver.db");
+    let db = Database::open(&path).unwrap();
+    for id in [601, 602, 603] {
+        db.insert_job_history(&nzbget_history_row(
+            id,
+            "failed",
+            1_700_000_000 + id as i64,
+            None,
+        ))
+        .unwrap();
+    }
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let app = nzbget_test_router(
+        db.clone(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    for (command, id) in [
+        ("HistoryMarkBad", 601),
+        ("HistoryMarkGood", 602),
+        ("HistoryMarkSuccess", 603),
+    ] {
+        assert_eq!(
+            editqueue(app.clone(), serde_json::json!([command, "", [id]])).await,
+            true
+        );
+    }
+    assert_eq!(
+        editqueue(
+            app.clone(),
+            serde_json::json!(["HistoryMarkBad", "", [699]])
+        )
+        .await,
+        false
+    );
+    drop(app);
+    drop(db);
+
+    // The marks are kept on the rows.
+    let db = Database::open(&path).unwrap();
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let app = nzbget_test_router(
+        db,
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let entries = rpc_result(app, "history", serde_json::json!([])).await;
+    for (id, mark, status) in [
+        (601, "BAD", "FAILURE/BAD"),
+        (602, "GOOD", "SUCCESS/GOOD"),
+        (603, "SUCCESS", "SUCCESS/MARK"),
+    ] {
+        let entry = history_entry(&entries, id);
+        assert_eq!(entry["MarkStatus"], mark, "{entry}");
+        assert_eq!(entry["Status"], status, "{entry}");
+        // What happened to the job stays in the per-stage fields.
+        assert_eq!(entry["DeleteStatus"], "HEALTH", "{entry}");
+    }
+}
+
+#[tokio::test]
+async fn nzbget_history_rows_can_be_renamed_recategorised_and_reparameterised() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(701, "complete", 1_700_000_000, None))
+        .unwrap();
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let app = nzbget_test_router(
+        db.clone(),
+        handle,
+        tv_category_config(),
+        api_key_cache("control-key", "control"),
+    );
+    // Prime the parsed-row memo so the edits must refresh it.
+    rpc_result(app.clone(), "history", serde_json::json!([])).await;
+
+    for params in [
+        serde_json::json!(["HistorySetName", "Edited.Release", [701]]),
+        serde_json::json!(["HistorySetCategory", "sonarr", [701]]),
+        serde_json::json!(["HistorySetParameter", "drone=abc-123", [701]]),
+        serde_json::json!(["HistorySetParameter", "Custom=Value", [701]]),
+    ] {
+        assert_eq!(
+            editqueue(app.clone(), params.clone()).await,
+            true,
+            "{params}"
+        );
+    }
+    let entry = history_entry(
+        &rpc_result(app.clone(), "history", serde_json::json!([])).await,
+        701,
+    );
+    assert_eq!(entry["NZBName"], "Edited.Release");
+    assert_eq!(entry["Category"], "sonarr");
+    let parameters = entry["Parameters"].as_array().unwrap();
+    assert!(
+        parameters
+            .iter()
+            .any(|p| p["Name"] == "drone" && p["Value"] == "abc-123"),
+        "{entry}"
+    );
+    assert!(
+        parameters
+            .iter()
+            .any(|p| p["Name"] == "Custom" && p["Value"] == "Value"),
+        "{entry}"
+    );
+    let row = db.get_job_history(701).unwrap().unwrap();
+    assert_eq!(row.category.as_deref(), Some("TV"));
+
+    // A finished job's password is not a stored parameter; unknown ids fail.
+    for params in [
+        serde_json::json!(["HistorySetParameter", "*Unpack:Password=secret", [701]]),
+        serde_json::json!(["HistorySetName", "Other", [799]]),
+        serde_json::json!(["HistorySetCategory", "tv", [799]]),
+    ] {
+        assert_eq!(
+            editqueue(app.clone(), params.clone()).await,
+            false,
+            "{params}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn nzbget_dupe_and_park_deletes_report_how_the_job_left() {
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands_and_db(
+        vec![
+            reorder_test_job(801),
+            reorder_test_job(802),
+            reorder_test_job(803),
+        ],
+        db.clone(),
+    );
+    let app = nzbget_test_router(
+        db,
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    for (command, id) in [
+        ("GroupDupeDelete", 801),
+        ("GroupParkDelete", 802),
+        ("GroupDelete", 803),
+    ] {
+        assert_eq!(
+            editqueue(app.clone(), serde_json::json!([command, "", [id]])).await,
+            true
+        );
+    }
+    let entries = rpc_result(app.clone(), "history", serde_json::json!([])).await;
+    for (id, delete, status) in [
+        (801, "DUPE", "DELETED/DUPE"),
+        (802, "MANUAL", "DELETED/MANUAL"),
+        (803, "MANUAL", "DELETED/MANUAL"),
+    ] {
+        let entry = history_entry(&entries, id);
+        assert_eq!(entry["DeleteStatus"], delete, "{entry}");
+        assert_eq!(entry["Status"], status, "{entry}");
+    }
+
+    // A retry of a failed job fetches it again.
+    assert_eq!(
+        editqueue(app, serde_json::json!(["HistoryRetryFailed", "", [801]])).await,
+        true
+    );
+}
+
+fn group_priority(groups: &serde_json::Value, id: u64) -> (i64, i64) {
+    let group = history_entry(groups, id);
+    (
+        group["MinPriority"].as_i64().unwrap(),
+        group["MaxPriority"].as_i64().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn nzbget_priority_reports_the_value_the_client_set() {
+    use base64::Engine as _;
+
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let nzb_b64 = base64::engine::general_purpose::STANDARD.encode(minimal_nzb("Priority.Release"));
+    let id = rpc_result(
+        app.clone(),
+        "append",
+        serde_json::json!([
+            "Priority.Release.nzb",
+            nzb_b64,
+            "",
+            100,
+            false,
+            false,
+            "",
+            0,
+            "all",
+            []
+        ]),
+    )
+    .await
+    .as_u64()
+    .unwrap();
+    let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+    assert_eq!(group_priority(&groups, id), (100, 100));
+
+    for (param, expected, label) in [
+        ("-100", -100, "LOW"),
+        ("-50", -50, "LOW"),
+        ("0", 0, "NORMAL"),
+        ("50", 50, "HIGH"),
+        ("100", 100, "HIGH"),
+        ("900", 900, "HIGH"),
+        ("Force", 900, "HIGH"),
+        ("very low", -100, "LOW"),
+    ] {
+        let set = editqueue(
+            app.clone(),
+            serde_json::json!(["GroupSetPriority", param, [id]]),
+        )
+        .await;
+        assert_eq!(set, true, "{param}");
+        let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+        assert_eq!(group_priority(&groups, id), (expected, expected), "{param}");
+        let job = handle.get_job(JobId(id)).unwrap();
+        let dispatch = job
+            .metadata
+            .iter()
+            .find(|(key, _)| key == "priority")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(dispatch, Some(label), "{param}");
+    }
+
+    // A label changed outside the facade wins over the stored number.
+    let mut metadata = handle.get_job(JobId(id)).unwrap().metadata;
+    metadata.retain(|(key, _)| key != "priority");
+    metadata.push(("priority".to_string(), "HIGH".to_string()));
+    handle
+        .update_job(
+            JobId(id),
+            weaver_server_core::JobUpdate {
+                metadata: weaver_server_core::FieldUpdate::Set(metadata),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let groups = rpc_result(app, "listgroups", serde_json::json!([])).await;
+    assert_eq!(group_priority(&groups, id), (50, 50));
 }

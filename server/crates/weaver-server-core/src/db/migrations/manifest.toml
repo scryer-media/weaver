@@ -649,3 +649,54 @@ kind = "sql"
 file = "migrations/0059_script_outputs_keep_runs/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 60
+description = "history rows hidden from NZBGet-compatible clients"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0060_nzbget_hidden_history/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0060_nzbget_hidden_history/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 61
+description = "failure kind kept on failed history rows"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0061_history_failure_kind/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0061_history_failure_kind/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 62
+description = "mark status kept on history rows for NZBGet-compatible clients"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0062_nzbget_mark_status/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0062_nzbget_mark_status/postgres.sql"
+engine = "postgres"
+scope = "all"

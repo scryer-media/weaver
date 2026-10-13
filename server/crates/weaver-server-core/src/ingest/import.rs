@@ -51,10 +51,14 @@ pub fn nzb_to_spec(
         nzb.meta.title.as_deref(),
     );
 
-    let name = derive_release_name(
-        nzb_path.file_stem().and_then(|stem| stem.to_str()),
-        nzb.meta.title.as_deref(),
-    );
+    let name = crate::ingest::renamed_title(&metadata)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            derive_release_name(
+                nzb_path.file_stem().and_then(|stem| stem.to_str()),
+                nzb.meta.title.as_deref(),
+            )
+        });
 
     let password = first_password_candidate(nzb, nzb_path, None);
 

@@ -207,11 +207,17 @@ pub struct JobUpdate {
     // Archive/unpack password override. `Clear` removes a password even when
     // the NZB itself carries one; the override persists across restarts.
     pub password: FieldUpdate<String>,
+    // A new job name. It is kept in the metadata so a restore, which parses
+    // the NZB again, keeps it too.
+    pub name: Option<String>,
 }
 
 impl JobUpdate {
     pub fn is_empty(&self) -> bool {
-        self.category.is_unchanged() && self.metadata.is_unchanged() && self.password.is_unchanged()
+        self.category.is_unchanged()
+            && self.metadata.is_unchanged()
+            && self.password.is_unchanged()
+            && self.name.is_none()
     }
 
     pub fn apply_to_spec(&self, spec: &mut JobSpec) {
@@ -231,6 +237,11 @@ impl JobUpdate {
             FieldUpdate::Unchanged => {}
             FieldUpdate::Clear => spec.password = None,
             FieldUpdate::Set(password) => spec.password = Some(password.clone()),
+        }
+
+        if let Some(name) = &self.name {
+            spec.name = name.clone();
+            crate::ingest::set_renamed_title(&mut spec.metadata, name);
         }
     }
 }

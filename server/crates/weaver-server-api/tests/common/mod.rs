@@ -920,6 +920,10 @@ fn spawn_test_scheduler(
                     };
                     let _ = reply.send(result);
                 }
+                SchedulerCommand::UpdateHistory { job_id, reply, .. } => {
+                    let _ =
+                        reply.send(Err(weaver_server_core::SchedulerError::JobNotFound(job_id)));
+                }
                 SchedulerCommand::ReorderJob { job_id, reply, .. } => {
                     let result = if jobs.contains_key(&job_id) {
                         Ok(())

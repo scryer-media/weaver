@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -266,6 +266,11 @@ struct SpeedTracker {
     segments_downloaded: RateSeries,
     bytes_decoded: RateSeries,
     last: CurrentRates,
+    // Time spent downloading: the sum of the tick intervals in which bytes
+    // arrived. Idle and paused stretches add nothing.
+    download_time: Duration,
+    // The previous tick and the downloaded total it saw.
+    previous: Option<(Instant, u64)>,
 }
 
 impl SpeedTracker {
@@ -275,6 +280,8 @@ impl SpeedTracker {
             segments_downloaded: RateSeries::new(),
             bytes_decoded: RateSeries::new(),
             last: CurrentRates::default(),
+            download_time: Duration::ZERO,
+            previous: None,
         }
     }
 
@@ -286,6 +293,12 @@ impl SpeedTracker {
         segments_downloaded: u64,
         bytes_decoded: u64,
     ) -> CurrentRates {
+        if let Some((at, downloaded)) = self.previous
+            && bytes_downloaded > downloaded
+        {
+            self.download_time += now.saturating_duration_since(at);
+        }
+        self.previous = Some((now, bytes_downloaded));
         // The byte rate keeps its historical rounding: sub-1 B/s reads as idle.
         let download_bytes = self.bytes_downloaded.update(now, bytes_downloaded);
         let download_bytes = if download_bytes < 1.0 {
@@ -870,6 +883,12 @@ impl PipelineMetrics {
         let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
         let rates = self.speed_tracker.lock().unwrap().last();
         self.snapshot_with_speed(bytes_downloaded, rates)
+    }
+
+    // How long this process has spent downloading, counted on the metrics
+    // tick: only the intervals in which bytes arrived.
+    pub fn download_time(&self) -> Duration {
+        self.speed_tracker.lock().unwrap().download_time
     }
 
     // Forget every rate sample, so a test can start the global window at a
