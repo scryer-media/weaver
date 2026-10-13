@@ -4400,3 +4400,264 @@ async fn nzbget_history_reports_a_job_removed_as_a_duplicate_as_dupe() {
     assert_eq!(by_id(722)["DeleteStatus"], "MANUAL");
     assert_eq!(by_id(722)["Status"], "DELETED/MANUAL");
 }
+
+async fn send_raw(app: Router, request: Request<Body>) -> (StatusCode, String) {
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+fn json_post(uri: &str, auth: Option<&str>, method: &str) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(auth) = auth {
+        builder = builder.header(header::AUTHORIZATION, auth);
+    }
+    builder
+        .body(Body::from(
+            serde_json::json!({"method": method, "params": [], "id": 1}).to_string(),
+        ))
+        .unwrap()
+}
+
+fn xml_post(uri: &str, auth: Option<&str>, method: &str) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "text/xml");
+    if let Some(auth) = auth {
+        builder = builder.header(header::AUTHORIZATION, auth);
+    }
+    builder
+        .body(Body::from(format!(
+            "<?xml version=\"1.0\"?><methodCall><methodName>{method}</methodName><params></params></methodCall>"
+        )))
+        .unwrap()
+}
+
+fn get_request(uri: &str, auth: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().method("GET").uri(uri);
+    if let Some(auth) = auth {
+        builder = builder.header(header::AUTHORIZATION, auth);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+fn facade_with_control_key() -> Router {
+    nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    )
+}
+
+#[tokio::test]
+async fn nzbget_answers_every_endpoint_shape_clients_use() {
+    let app = facade_with_control_key();
+    let basic = basic_auth("control-key");
+
+    // JSON-RPC: trailing slash with Basic, and credentials in the path with
+    // and without the slash. Path credentials need no header at all.
+    for (uri, auth) in [
+        ("/jsonrpc/", Some(basic.as_str())),
+        ("/arr:control-key/jsonrpc", None),
+        ("/arr:control-key/jsonrpc/", None),
+        ("/arr:control%2Dkey/jsonrpc", None),
+    ] {
+        let (status, body) = send_raw(app.clone(), json_post(uri, auth, "version")).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(payload["result"], "16.0-weaver", "{uri}");
+    }
+
+    // XML-RPC: the same three shapes.
+    for (uri, auth) in [
+        ("/xmlrpc/", Some(basic.as_str())),
+        ("/arr:control-key/xmlrpc", None),
+        ("/arr:control-key/xmlrpc/", None),
+    ] {
+        let (status, body) = send_raw(app.clone(), xml_post(uri, auth, "version")).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        assert!(body.contains("16.0-weaver"), "{uri}: {body}");
+    }
+
+    // GET /jsonrpc/<method>, with Basic or path credentials, and positional
+    // parameters from the query string.
+    for (uri, auth) in [
+        ("/jsonrpc/version", Some(basic.as_str())),
+        ("/arr:control-key/jsonrpc/version", None),
+    ] {
+        let (status, body) = send_raw(app.clone(), get_request(uri, auth)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(payload["result"], "16.0-weaver", "{uri}");
+    }
+    let (status, body) = send_raw(
+        app.clone(),
+        get_request("/jsonrpc/history?Hidden=true", Some(basic.as_str())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(payload["result"].is_array(), "{body}");
+    let (_, body) = send_raw(
+        app.clone(),
+        get_request("/jsonrpc/history?Hidden=maybe", Some(basic.as_str())),
+    )
+    .await;
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["error"]["code"], 2, "{body}");
+
+    // A GET call cannot change anything, even with control credentials.
+    let (status, body) = send_raw(
+        app.clone(),
+        get_request("/arr:control-key/jsonrpc/pausedownload", None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(payload["error"]["code"], 1, "{body}");
+}
+
+#[tokio::test]
+async fn nzbget_rejects_wrong_path_credentials_without_reading_the_body() {
+    let app = facade_with_control_key();
+    for uri in [
+        "/arr:wrong-key/jsonrpc",
+        "/arr:/jsonrpc",
+        "/arr:wrong-key/xmlrpc/",
+    ] {
+        let (_writer, reader) = tokio::io::duplex(1);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from_stream(tokio_util::io::ReaderStream::new(reader)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+    let (status, body) = send_raw(app, get_request("/arr:wrong-key/jsonrpc/version", None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogs;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn nzbget_path_credentials_never_reach_the_logs() {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::info!("capture started");
+
+    let app = facade_with_control_key();
+    for request in [
+        json_post("/arr:control-key/jsonrpc", None, "status"),
+        json_post("/arr:wrong-secret-value/jsonrpc", None, "status"),
+        xml_post("/arr:control-key/xmlrpc/", None, "listgroups"),
+        get_request("/arr:control-key/jsonrpc/history?true", None),
+    ] {
+        let _ = send_raw(app.clone(), request).await;
+    }
+
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(captured.contains("capture started"));
+    assert!(!captured.contains("control-key"), "{captured}");
+    assert!(!captured.contains("wrong-secret-value"), "{captured}");
+}
+
+#[tokio::test]
+async fn nzbget_route_shapes_coexist_with_the_rest_of_the_router() {
+    // The same static and parameterised paths the production router
+    // registers, merged with the facade routes. Building it must not panic,
+    // and each side must still answer its own paths.
+    let marker = |name: &'static str| axum::routing::get(move || async move { name });
+    let app = Router::new()
+        .route("/metrics", marker("metrics"))
+        .route("/healthz", marker("healthz"))
+        .route("/readyz", marker("readyz"))
+        .merge(facade_with_control_key())
+        .route("/graphql", axum::routing::post(|| async { "graphql" }))
+        .route("/graphql/ws", marker("graphql-ws"))
+        .route("/api/jobs/{job_id}/nzb", marker("job-nzb"))
+        .route("/api/jobs/{job_id}/output-file", marker("job-output"))
+        .merge(routes::build_backup_routes(1024))
+        .route(
+            "/api/system/restart",
+            axum::routing::post(|| async { "restart" }),
+        )
+        .route("/api/system/diagnostics", marker("diagnostics"))
+        .route("/api/auth/setup", axum::routing::post(|| async { "setup" }))
+        .route("/api/login", axum::routing::post(|| async { "login" }))
+        .route(
+            "/api/auth/verify",
+            axum::routing::post(|| async { "verify" }),
+        )
+        .route(
+            "/api/auth/signout-all",
+            axum::routing::post(|| async { "signout" }),
+        )
+        .route("/api/logout", axum::routing::post(|| async { "logout" }))
+        .route("/api/auth/csrf", marker("csrf"))
+        .route("/api/auth/status", marker("auth-status"))
+        .route("/", marker("index"))
+        .fallback(marker("static"));
+
+    for (uri, expected) in [
+        ("/api/jobs/7/nzb", "job-nzb"),
+        ("/graphql/ws", "graphql-ws"),
+        ("/api/auth/status", "auth-status"),
+        ("/assets/index.js", "static"),
+    ] {
+        let (status, body) = send_raw(app.clone(), get_request(uri, None)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(body, expected, "{uri}");
+    }
+    let (status, body) = send_raw(
+        app.clone(),
+        json_post("/arr:control-key/jsonrpc", None, "version"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("16.0-weaver"));
+    let (status, body) = send_raw(
+        app,
+        get_request("/jsonrpc/version", Some(&basic_auth("control-key"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("16.0-weaver"));
+}

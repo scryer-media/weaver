@@ -72,7 +72,7 @@ async fn enforce_http_host(security: &RuntimeSecurityConfig, req: Request, next:
     }
 }
 
-fn build_backup_routes(backup_request_limit: usize) -> Router {
+pub(super) fn build_backup_routes(backup_request_limit: usize) -> Router {
     let uploads = Router::new()
         .route("/inspect", post(super::backup::backup_inspect_handler))
         .route("/restore", post(super::backup::backup_restore_handler))
@@ -306,9 +306,28 @@ pub(super) fn build_nzbget_rpc_routes(
     // fully-buffered RPC surface bounded independently of the core upload cap.
     let rpc_buffer_gate = Arc::new(tokio::sync::Semaphore::new(6));
     let nzbget_auth_context = nzbget_context.clone();
-    Router::new()
-        .route("/jsonrpc", post(super::nzbget::jsonrpc_handler))
-        .route("/xmlrpc", post(super::nzbget::xmlrpc_handler))
+    let mut router = Router::new();
+    // NZBGet answers with and without a trailing slash, and with the
+    // credentials as a leading path segment; JSON-RPC also answers GET with
+    // the method as a trailing segment.
+    for prefix in ["", "/{credentials}"] {
+        for slash in ["", "/"] {
+            router = router
+                .route(
+                    &format!("{prefix}/jsonrpc{slash}"),
+                    post(super::nzbget::jsonrpc_handler),
+                )
+                .route(
+                    &format!("{prefix}/xmlrpc{slash}"),
+                    post(super::nzbget::xmlrpc_handler),
+                );
+        }
+        router = router.route(
+            &format!("{prefix}/jsonrpc/{{method}}"),
+            get(super::nzbget::jsonrpc_get_handler),
+        );
+    }
+    router
         .route_layer(axum::extract::DefaultBodyLimit::max(
             NZBGET_RPC_BODY_LIMIT_BYTES,
         ))
@@ -316,6 +335,11 @@ pub(super) fn build_nzbget_rpc_routes(
             let rpc_buffer_gate = Arc::clone(&rpc_buffer_gate);
             let nzbget_auth_context = nzbget_auth_context.clone();
             async move {
+                let path = req.uri().path().to_owned();
+                if let Err(status) = super::nzbget::apply_path_credentials(&path, req.headers_mut())
+                {
+                    return super::nzbget::authentication_error_response(&path, status);
+                }
                 let scope = match super::nzbget::resolve_scope_for_facade(
                     &nzbget_auth_context,
                     req.headers(),

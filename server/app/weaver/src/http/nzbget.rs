@@ -179,26 +179,133 @@ pub(super) async fn jsonrpc_handler(
     };
 
     let id = request.id.clone().unwrap_or(Value::Null);
-    let method = request.method.to_ascii_lowercase();
+    run_jsonrpc(&ctx, scope, id, &request.method, request.params, None).await
+}
+
+// GET /jsonrpc/<method>?<p1>&<p2>...: the method comes from the path and the
+// positional parameters from the query string. Only read methods answer over
+// GET, so a cross-site link or image cannot change anything with credentials
+// the browser has cached for this host.
+pub(super) async fn jsonrpc_get_handler(
+    Extension(ctx): Extension<NzbgetFacadeContext>,
+    Extension(NzbgetCallerScope(scope)): Extension<NzbgetCallerScope>,
+    axum::extract::Path(params): axum::extract::Path<HashMap<String, String>>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    let method = params.get("method").cloned().unwrap_or_default();
+    let params = query.as_deref().map(get_query_params).unwrap_or_default();
+    let params = (!params.is_empty()).then_some(Value::Array(params));
+    run_jsonrpc(
+        &ctx,
+        scope,
+        Value::Null,
+        &method,
+        params,
+        Some(RequiredScope::Read),
+    )
+    .await
+}
+
+async fn run_jsonrpc(
+    ctx: &NzbgetFacadeContext,
+    scope: CallerScope,
+    id: Value,
+    requested_method: &str,
+    params: Option<Value>,
+    allowed: Option<RequiredScope>,
+) -> Response {
+    let method = requested_method.to_ascii_lowercase();
     let required = method_required_scope(&method);
-    if required.is_none() {
+    let Some(required) =
+        required.filter(|required| allowed.is_none_or(|allowed| *required == allowed))
+    else {
         return rpc_error_response(
             StatusCode::OK,
             id,
-            RpcError::invalid_procedure(&request.method),
+            RpcError::invalid_procedure(requested_method),
         );
-    }
-    if required == Some(RequiredScope::Control) && !scope.can_control() {
+    };
+    if required == RequiredScope::Control && !scope.can_control() {
         return rpc_error_response(StatusCode::FORBIDDEN, id, RpcError::access_denied());
     }
-    if required == Some(RequiredScope::Admin) && !scope.is_admin() {
+    if required == RequiredScope::Admin && !scope.is_admin() {
         return rpc_error_response(StatusCode::FORBIDDEN, id, RpcError::access_denied());
     }
 
-    match dispatch_method(&ctx, &method, request.params).await {
+    match dispatch_method(ctx, &method, params).await {
         Ok(result) => rpc_success_response(id, result),
         Err(error) => rpc_error_response(StatusCode::OK, id, error),
     }
+}
+
+// Query-string parameters for a GET call, in order. Each `name=value` pair
+// contributes its value (a bare item contributes itself); `true`/`false` and
+// integers are typed, everything else is a string.
+fn get_query_params(query: &str) -> Vec<Value> {
+    query
+        .split('&')
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            let raw = item.split_once('=').map_or(item, |(_, value)| value);
+            let value = percent_decode(&raw.replace('+', " "));
+            if value.eq_ignore_ascii_case("true") {
+                Value::Bool(true)
+            } else if value.eq_ignore_ascii_case("false") {
+                Value::Bool(false)
+            } else if let Ok(number) = value.parse::<i64>() {
+                json!(number)
+            } else {
+                Value::String(value)
+            }
+        })
+        .collect()
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(hex) = value.get(index + 1..index + 3)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+// NZBGet also takes credentials as a leading path segment:
+// `/<user>:<pass>/jsonrpc` or `/<user>:<pass>/xmlrpc`. As with Basic auth the
+// user name is ignored and the password is the API key. The segment is turned
+// into a bearer header before any authentication runs and before the body is
+// read; it is never logged.
+pub(super) fn apply_path_credentials(
+    path: &str,
+    headers: &mut HeaderMap,
+) -> Result<(), StatusCode> {
+    let segments = path.split('/').collect::<Vec<_>>();
+    let Some(credentials) = segments
+        .windows(2)
+        .find(|pair| matches!(pair[1], "jsonrpc" | "xmlrpc") && pair[0].contains(':'))
+        .map(|pair| pair[0])
+    else {
+        return Ok(());
+    };
+    let credentials = percent_decode(credentials);
+    let (_user, password) = credentials
+        .split_once(':')
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let password = password.trim();
+    if password.is_empty() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    insert_bearer(headers, password.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,7 +516,7 @@ pub(super) async fn xmlrpc_handler(
 }
 
 pub(super) fn authentication_error_response(path: &str, status: StatusCode) -> Response {
-    if path.ends_with("/xmlrpc") {
+    if path.trim_end_matches('/').ends_with("/xmlrpc") {
         xmlrpc_fault_response(status, RpcError::access_denied())
     } else {
         rpc_error_response(status, Value::Null, RpcError::access_denied())
