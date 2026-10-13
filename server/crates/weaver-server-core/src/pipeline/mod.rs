@@ -127,46 +127,41 @@ pub(crate) fn persisted_nzb_password_candidates(
     Ok(crate::ingest::nzb_password_candidates(&nzb, nzb_path, None))
 }
 
-impl Pipeline {
-    pub(super) fn archive_password_candidates_for_job(
-        &self,
-        job_id: JobId,
-    ) -> Vec<ArchivePasswordCandidate> {
-        let mut candidates = self.harvest_archive_password_candidates(job_id).0;
-        match self.db.global_archive_password_candidates() {
-            Ok(global) => {
-                for candidate in global {
-                    if !candidates
-                        .iter()
-                        .any(|existing| existing.value() == candidate.value())
-                    {
-                        candidates.push(candidate);
-                    }
-                }
-            }
-            Err(_) => warn!(job_id = job_id.0, "could not load global archive passwords"),
-        }
-        candidates
-    }
+// A job's archive-password candidates, and whether every source behind them
+// was actually read.
+pub(crate) struct ArchivePasswordHarvest {
+    // In trial order: `Explicit` (the spec's password), then the persisted
+    // NZB's `NzbMeta` and `FilenameConvention`, then the global `Settings`
+    // list and the `PasswordFile`. De-duplicated by value, the earliest source
+    // keeping its label.
+    pub(crate) candidates: Vec<ArchivePasswordCandidate>,
+    // `false` when the persisted NZB or the global list could not be read this
+    // time. Both of those warn and continue without their half, so an empty or
+    // short list is two different facts: "the job carries nothing more", which
+    // is permanent, and "a read failed this once", which is not. A caller that
+    // memoizes the list must not remember an incomplete one.
+    pub(crate) complete: bool,
+}
 
-    // [`Self::archive_password_candidates_for_job`] plus whether the job's
-    // persisted NZB was actually **read**.
+impl Pipeline {
+    // The one place a job's archive-password candidate list is built. Every
+    // consumer takes it from here: the direct store's `-hp` and `-mhe` header
+    // admission, the restart seam, archive probe and topology, finalize and
+    // nested extraction.
     //
-    // The harvest's two halves fail differently. `spec.password` is already in
-    // memory and cannot fail; the NZB half is a database read followed by a
-    // parse, and both of those warn-and-continue with an empty list. So an
-    // empty result is two different facts — *"this job carries no password
-    // anywhere"*, which is permanent, and *"the read failed this once"*, which
-    // is not — and any caller that **memoizes** the harvest has to tell them
-    // apart. `false` here means the second: nothing about the job was learned,
-    // so nothing about it may be remembered.
-    fn harvest_archive_password_candidates(
+    // The NZB half is a database read and a parse, memoized per job in
+    // `nzb_password_candidates` once it has been read (a missing row or NZB is
+    // remembered as empty, a failed read or parse is retried). The global half
+    // is read fresh on every call, so a caller on a per-article path must
+    // memoize the result itself; the direct store keeps it per job in
+    // `header_harvest`.
+    pub(crate) fn archive_password_candidates_for_job(
         &self,
         job_id: JobId,
-    ) -> (Vec<ArchivePasswordCandidate>, bool) {
+    ) -> ArchivePasswordHarvest {
         let state = self.jobs.get(&job_id);
         let spec_password = state.and_then(|state| state.spec.password.as_deref());
-        let (mut candidates, harvested) =
+        let (mut candidates, mut complete) =
             match state.and_then(|state| state.nzb_password_candidates.get()) {
                 Some(cached) => (cached.clone(), true),
                 None => {
@@ -190,7 +185,27 @@ impl Pipeline {
             );
         }
 
-        (candidates, harvested)
+        match self.db.global_archive_password_candidates() {
+            Ok(global) => {
+                for candidate in global {
+                    if !candidates
+                        .iter()
+                        .any(|existing| existing.value() == candidate.value())
+                    {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+            Err(_) => {
+                warn!(job_id = job_id.0, "could not load global archive passwords");
+                complete = false;
+            }
+        }
+
+        ArchivePasswordHarvest {
+            candidates,
+            complete,
+        }
     }
 
     // The NZB half of the harvest, read from the database: the candidates,
@@ -224,6 +239,7 @@ impl Pipeline {
 
     pub(super) fn primary_archive_password_for_job(&self, job_id: JobId) -> Option<String> {
         self.archive_password_candidates_for_job(job_id)
+            .candidates
             .into_iter()
             .next()
             .map(|candidate| candidate.value().to_string())
@@ -234,7 +250,7 @@ impl Pipeline {
         job_id: JobId,
         set_name: &str,
     ) -> Vec<ArchivePasswordCandidate> {
-        let candidates = self.archive_password_candidates_for_job(job_id);
+        let candidates = self.archive_password_candidates_for_job(job_id).candidates;
         let Some(winner) = self
             .archive_password_winners
             .get(&(job_id, set_name.to_string()))

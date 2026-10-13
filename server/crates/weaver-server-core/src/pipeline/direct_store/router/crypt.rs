@@ -244,17 +244,20 @@ impl HeaderCryptRefusal {
 // # Why this is a candidate *list* and not the one password `KeyRing` holds
 //
 // `KeyRing` is fed `spec.password`, which is the job's *first* candidate. The
-// `-hp` gate is offered the whole harvest — `Explicit`, `NzbMeta`,
-// `FilenameConvention`, at most one each — because a set whose header key is
-// the NZB-meta password but whose spec carries an operator's guess would
-// otherwise refuse for a password that was sitting right there. The list is
-// bounded by construction at three, so the KDF work is bounded at three
-// derivations however deep the archive asks for.
+// `-hp` gate is offered the job's archive-password list — `Explicit`,
+// `NzbMeta`, `FilenameConvention`, then the global `Settings` list and the
+// password file — because a set whose header key is any of the others but
+// whose spec carries an operator's guess would otherwise refuse for a password
+// that was sitting right there. The ring does not bound itself: the direct
+// store's offer seam caps the list at
+// `MAX_DIRECT_HEADER_PASSWORD_CANDIDATES`, plus the spec's password if
+// it changes before the first parse, and the KDF work here is one derivation
+// per held candidate.
 //
 // # The password is never persisted
 //
 // It lives here, in memory, for the life of the set. A restart re-harvests the
-// candidates from the job's NZB and re-proves them; nothing is carried across.
+// candidates and re-proves them; nothing is carried across.
 pub(crate) struct HeaderKeyRing {
     // In offer order, which is the harvest's own priority order.
     candidates: Vec<HeaderPasswordCandidate>,

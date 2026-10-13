@@ -1274,6 +1274,204 @@ async fn a_header_encrypted_set_admitted_after_the_harvest_ran_still_gets_it() {
     );
 }
 
+// The global half of the job's password list reaches the `-hp` gate.
+//
+// The key lives only in the `Settings` list or only in the password file; the
+// spec and the NZB name nothing. Finalize has always tried that list, and the
+// direct store is now offered the same one, so the set routes direct instead
+// of demoting and redownloading to be opened conventionally. The no-candidate
+// twin of this job demotes under `NoPassword`, which
+// `a_header_encrypted_set_with_no_password_demotes_by_name` pins.
+#[tokio::test]
+async fn a_header_encrypted_set_keys_from_a_global_password() {
+    let member_name = "Silver.Horizon.S04E15.mkv";
+    let payload: Vec<u8> = (0..2200u32).map(|index| (index % 181) as u8).collect();
+    let volumes = header_encrypted_store_set(
+        member_name,
+        &payload,
+        2,
+        "moonlit-harbour",
+        HeaderCheck::For("moonlit-harbour"),
+    );
+    let arrivals = in_order_arrivals(volumes.len());
+
+    for (label, job_id, global) in [
+        (
+            "a settings password",
+            JobId(45141),
+            GlobalPasswords {
+                settings: &["not-the-password", "moonlit-harbour"],
+                file_lines: None,
+            },
+        ),
+        (
+            "a password-file entry",
+            JobId(45142),
+            GlobalPasswords {
+                settings: &[],
+                file_lines: Some(&["also-wrong", "moonlit-harbour"]),
+            },
+        ),
+    ] {
+        let direct = run_hp_gate_with_global(
+            DirectStoreGate::Enabled,
+            job_id,
+            member_name,
+            &volumes,
+            &arrivals,
+            None,
+            sample_nzb_zstd(),
+            None,
+            global,
+        )
+        .await;
+        assert!(
+            !direct.volume_file_seen,
+            "{label}: a `-hp` set keyed from the global list must route direct"
+        );
+        assert_eq!(
+            direct.member.as_deref(),
+            Some(payload.as_slice()),
+            "{label}: the member must come out of the direct set"
+        );
+        assert_eq!(direct.member_location, Some("complete"), "{label}");
+        assert!(
+            matches!(direct.status, Some(JobStatus::Complete)),
+            "{label}: got {:?}",
+            direct.status
+        );
+    }
+}
+
+// Every source in one job, with values repeated across them. The canonical
+// list keeps the priority `Explicit`, `NzbMeta`, `FilenameConvention`,
+// `Settings`, `PasswordFile` and de-duplicates by value with the earliest
+// source keeping its label; the `-hp` ring is offered exactly that order and
+// those labels.
+#[tokio::test]
+async fn a_header_encrypted_set_is_offered_the_whole_list_in_priority_order() {
+    let member_name = "Silver.Horizon.S04E16.mkv";
+    let payload: Vec<u8> = (0..1600u32).map(|index| (index % 173) as u8).collect();
+    let volumes = header_encrypted_store_set(
+        member_name,
+        &payload,
+        2,
+        "moonlit-harbour",
+        HeaderCheck::For("moonlit-harbour"),
+    );
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(45151);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    seed_global_passwords(
+        &pipeline,
+        temp_dir.path(),
+        GlobalPasswords {
+            settings: &["spec-key", "settings-key", "meta-key"],
+            file_lines: Some(&["file-key", "settings-key", "harbour-key"]),
+        },
+    );
+    let mut spec = direct_store_job_spec("Silver Horizon", &volumes);
+    spec.password = Some("spec-key".to_string());
+    insert_active_job_with_persisted_nzb_named(
+        &mut pipeline,
+        job_id,
+        spec,
+        sample_nzb_zstd_with_password("meta-key"),
+        Some("Silver Horizon {{harbour-key}}.nzb"),
+    )
+    .await;
+
+    let harvest = pipeline.archive_password_candidates_for_job(job_id);
+    assert!(harvest.complete);
+    assert_eq!(
+        harvest
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.source().as_str(), candidate.value()))
+            .collect::<Vec<_>>(),
+        [
+            ("explicit", "spec-key"),
+            ("nzb_meta", "meta-key"),
+            ("filename_convention", "harbour-key"),
+            ("settings", "settings-key"),
+            ("password_file", "file-key"),
+        ]
+    );
+
+    // The payload article only: enough to run the harvest, not enough for the
+    // type-4 record to have been read, so the ring still holds every offer.
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the job must carry its direct set");
+    assert!(set.router.wants_header_password());
+    assert_eq!(
+        set.router.header_candidate_sources(),
+        [
+            "explicit",
+            "nzb_meta",
+            "filename_convention",
+            "settings",
+            "password_file"
+        ]
+    );
+}
+
+// A global list longer than the direct store's cap reaches the ring only up
+// to the cap, in priority order; finalize still holds the whole list.
+#[tokio::test]
+async fn a_header_encrypted_set_is_offered_at_most_the_capped_list() {
+    use crate::pipeline::direct_store::wiring::MAX_DIRECT_HEADER_PASSWORD_CANDIDATES;
+    let member_name = "Silver.Horizon.S04E17.mkv";
+    let payload: Vec<u8> = (0..1600u32).map(|index| (index % 167) as u8).collect();
+    let volumes = header_encrypted_store_set(
+        member_name,
+        &payload,
+        2,
+        "moonlit-harbour",
+        HeaderCheck::For("moonlit-harbour"),
+    );
+    let values: Vec<String> = (0..MAX_DIRECT_HEADER_PASSWORD_CANDIDATES + 4)
+        .map(|index| format!("candidate-{index}"))
+        .collect();
+    let settings: Vec<&str> = values.iter().map(String::as_str).collect();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(45161);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    seed_global_passwords(
+        &pipeline,
+        temp_dir.path(),
+        GlobalPasswords {
+            settings: &settings,
+            file_lines: None,
+        },
+    );
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    insert_active_job_with_persisted_nzb(&mut pipeline, job_id, spec, sample_nzb_zstd()).await;
+
+    assert_eq!(
+        pipeline
+            .archive_password_candidates_for_job(job_id)
+            .candidates
+            .len(),
+        values.len(),
+        "the canonical list itself is not capped"
+    );
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the job must carry its direct set");
+    assert!(set.router.wants_header_password());
+    assert_eq!(
+        set.router.header_candidate_count(),
+        MAX_DIRECT_HEADER_PASSWORD_CANDIDATES
+    );
+}
+
 #[tokio::test]
 async fn a_par2_bearing_header_encrypted_job_verifies_and_completes_byte_identically() {
     // The commonest real `-hp` shape, and the one every other test here builds

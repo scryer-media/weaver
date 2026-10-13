@@ -976,9 +976,11 @@ pub(super) enum ParseOutcome {
 // entirely, so the no-key attempt is not a special case so much as the first
 // candidate.
 //
-// The list is bounded at four by construction — `Explicit`, `NzbMeta`,
-// `FilenameConvention`, at most one each, plus the no-key attempt — so the
-// work this loop can do is bounded however many times the reader is asked.
+// Every keyed attempt costs the reader a key derivation, and this loop runs on
+// every parse attempt until the container opens, so its length is the cost.
+// The list is the set's header ring, which the direct store's offer seam caps
+// at `MAX_DIRECT_HEADER_PASSWORD_CANDIDATES` harvest entries, plus the
+// spec's password and the no-key attempt.
 pub(super) fn parse_container(
     mut image: ContainerImage,
     total: u64,

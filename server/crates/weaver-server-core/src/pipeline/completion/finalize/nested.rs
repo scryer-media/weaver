@@ -511,7 +511,7 @@ impl Pipeline {
             .await
             .map_err(|error| format!("extraction root link scan task failed: {error}"))??;
         }
-        let password_candidates = self.archive_password_candidates_for_job(job_id);
+        let password_candidates = self.archive_password_candidates_for_job(job_id).candidates;
         let scanned_files = Self::scan_extraction_root(&scan_root, password_candidates).await?;
         let nested_archives: Vec<NestedArchiveFile> = scanned_files
             .iter()
