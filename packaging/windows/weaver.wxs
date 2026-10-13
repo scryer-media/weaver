@@ -91,7 +91,11 @@
     </InstallExecuteSequence>
 
     <!-- These commands affect only the uninstalling user: their HKCU Run entry, the
-         tray process they own, and their Weaver profile. -->
+         tray process they own, and their Weaver profile. A major upgrade removes the old
+         product as part of installing the new one; UPGRADINGPRODUCTCODE is set only in that
+         removal, so the startup preference and the profile both survive an upgrade and are
+         cleared only by a real uninstall. The Run entry points at the install path, which
+         the upgrade keeps. -->
     <CustomAction
         Id="StopTrayBeforeRemoval"
         FileRef="WeaverTrayExe"
@@ -119,7 +123,7 @@
         Impersonate="yes" />
     <InstallExecuteSequence>
       <Custom Action="StopTrayBeforeRemoval" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
-      <Custom Action="RemoveTrayStartupBeforeRemoval" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="RemoveTrayStartupBeforeRemoval" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="RemoveProfileOnUninstall" After="StopTrayBeforeRemoval" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
   </Package>
