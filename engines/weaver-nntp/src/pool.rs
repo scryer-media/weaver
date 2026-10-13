@@ -1601,6 +1601,27 @@ impl NntpPool {
         &self.configs
     }
 
+    // The pool position of the server with this stable id.
+    pub fn server_for_stable_id(&self, id: StableServerId) -> Option<ServerId> {
+        self.stable_ids
+            .iter()
+            .position(|stable| *stable == id)
+            .map(ServerId)
+    }
+
+    // Lend `count` of this server's connections out of the pool until the
+    // loan is dropped. The budget is shared across client generations, so a
+    // rebuilt pool keeps the loan.
+    pub fn lend_connections(
+        &self,
+        server: ServerId,
+        count: usize,
+    ) -> Option<crate::socket_budget::ConnectionLoan> {
+        let budget = self.socket_budgets.get(server.0)?.clone();
+        budget.lend(count);
+        Some(crate::socket_budget::ConnectionLoan::new(budget, count))
+    }
+
     pub fn stable_server_id(&self, server: ServerId) -> Option<StableServerId> {
         self.stable_ids.get(server.0).copied()
     }

@@ -41,6 +41,10 @@ struct Entry {
 #[derive(Default)]
 struct State {
     limit: usize,
+    // The limit the pool asked for, before any connections are lent out.
+    base: usize,
+    // Connections lent to something outside the pool; the limit excludes them.
+    lent: usize,
     leg_targets: Option<Vec<u16>>,
     next_id: u64,
     entries: BTreeMap<u64, Entry>,
@@ -58,6 +62,7 @@ impl SocketBudget {
         Arc::new(Self {
             state: Mutex::new(State {
                 limit,
+                base: limit,
                 ..State::default()
             }),
             changed: watch::channel(0).0,
@@ -76,6 +81,8 @@ impl SocketBudget {
     pub(crate) fn configure(&self, limit: usize) {
         let recalls = {
             let mut state = self.state.lock().expect("socket budget poisoned");
+            state.base = limit;
+            let limit = limit.saturating_sub(state.lent);
             state.limit = limit;
             state
                 .entries
@@ -102,7 +109,9 @@ impl SocketBudget {
     pub(crate) fn configure_legs(&self, targets: &[u16]) {
         let (changed, recalls) = {
             let mut state = self.state.lock().expect("socket budget poisoned");
-            let limit = targets.iter().map(|target| usize::from(*target)).sum();
+            let base: usize = targets.iter().map(|target| usize::from(*target)).sum();
+            state.base = base;
+            let limit = base.saturating_sub(state.lent);
             let changed = state.limit != limit || state.leg_targets.as_deref() != Some(targets);
             // Socket phase notifications need no entry scan while every leg is available.
             if !changed && targets.iter().all(|target| *target > 0) {
@@ -157,6 +166,35 @@ impl SocketBudget {
         if changed || recalled {
             self.publish();
         }
+    }
+
+    // Lend `count` connections to something outside the pool, or with zero
+    // take every lent connection back. Idle sockets above the lowered limit
+    // are recalled at once; busy ones close when their work ends.
+    pub(crate) fn lend(&self, count: usize) {
+        let recalls = {
+            let mut state = self.state.lock().expect("socket budget poisoned");
+            state.lent = count;
+            let limit = state.base.saturating_sub(count);
+            state.limit = limit;
+            state
+                .entries
+                .iter_mut()
+                .filter(|(_, entry)| !entry.replacement && entry.phase != SocketPhase::Closing)
+                .skip(limit)
+                .filter_map(|(&id, entry)| {
+                    entry.retiring.store(true, Ordering::Release);
+                    entry.recall.take().map(|recall| {
+                        entry.phase = SocketPhase::Closing;
+                        (id, recall)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for (id, recall) in recalls {
+            recall(id);
+        }
+        self.publish();
     }
 
     pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<SocketSlot> {
@@ -280,6 +318,44 @@ impl SocketBudget {
             }
         }
         snapshot
+    }
+}
+
+// Connections a server's pool has lent out. Dropping it gives them back.
+pub struct ConnectionLoan {
+    budget: Arc<SocketBudget>,
+    count: usize,
+}
+
+impl ConnectionLoan {
+    pub(crate) fn new(budget: Arc<SocketBudget>, count: usize) -> Self {
+        Self { budget, count }
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    // Sockets the pool holds open, counting those still closing.
+    pub fn open(&self) -> usize {
+        self.budget.snapshot().physical
+    }
+
+    // Wait until the pool holds at most `open` sockets. It wakes on every
+    // socket change, so nothing here depends on time.
+    pub async fn wait_open_at_most(&self, open: usize) {
+        let mut changed = self.budget.subscribe();
+        while self.budget.snapshot().physical > open {
+            if changed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionLoan {
+    fn drop(&mut self) {
+        self.budget.lend(0);
     }
 }
 

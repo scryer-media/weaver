@@ -459,7 +459,7 @@ pub enum NetworkConsumerKind {
     Rss,
 }
 impl NetworkConsumerKind {
-    fn consumer(self, id: u32) -> core::Consumer {
+    pub(crate) fn consumer(self, id: u32) -> core::Consumer {
         match self {
             Self::Server => core::Consumer::Server(id),
             Self::Rss => core::Consumer::Rss(id),

@@ -1266,6 +1266,12 @@ impl BodyTransferPermit {
         let _ = self.control.reserve_rate(bytes);
     }
 
+    // Charge bytes against the quota without pacing or rate debt, for
+    // transfers the speed limits do not apply to.
+    pub fn record_unpaced(&mut self, bytes: usize) {
+        self.record_bytes(bytes as u64);
+    }
+
     // Charge bytes and wait on the shared blocking aggregate limiter.
     pub fn record_blocking(&mut self, bytes: usize) -> Duration {
         let bytes = bytes as u64;

@@ -269,7 +269,8 @@ export function Segmented<T extends string>({
   className,
 }: {
   value: T;
-  options: readonly { value: T; label: string }[];
+  /** An option can be shown and not offered, such as a test a feed cannot run. */
+  options: readonly { value: T; label: string; disabled?: boolean }[];
   onChange: (next: T) => void;
   label: string;
   /** `compact` is the 28px mono variant the pagination bar's row count takes. */
@@ -295,9 +296,11 @@ export function Segmented<T extends string>({
             type="button"
             role="radio"
             aria-checked={active}
+            disabled={option.disabled}
             onClick={() => onChange(option.value)}
             className={cn(
-              "flex cursor-pointer items-center whitespace-nowrap hover:text-wv-strong",
+              "flex items-center whitespace-nowrap",
+              option.disabled ? "cursor-default opacity-50" : "cursor-pointer hover:text-wv-strong",
               compact
                 ? "h-[28px] px-[11px] font-wv-mono text-[11.5px]"
                 : "h-8 px-[13px] text-[12.5px]",

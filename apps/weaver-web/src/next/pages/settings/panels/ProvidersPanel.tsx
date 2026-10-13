@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router";
+import { Link, useSearchParams } from "react-router";
 import { useClient, useMutation, useQuery } from "urql";
 import {
   ADD_SERVER_MUTATION,
@@ -19,6 +19,7 @@ import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Icon } from "../../../components/icons";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
+import { speedPage } from "../../../features/networking/data";
 import { RouteView } from "../../../features/networking/RouteView";
 import { SecondaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
@@ -441,12 +442,13 @@ export function ProvidersPanel() {
       id: "servers",
       title: t("next.providers.servers"),
       note: t("next.settings.panel.serversNote"),
-      columns: "minmax(0, 1fr) 132px 190px 150px 44px",
+      columns: "minmax(0, 1fr) 132px 190px 150px 92px 44px",
       headers: [
         t("next.providers.host"),
         t("next.providers.connections"),
         t("next.providers.transport"),
         t("next.providers.role"),
+        "",
         "",
       ],
       empty: t("next.providers.empty"),
@@ -473,6 +475,15 @@ export function ProvidersPanel() {
             {transportLabel(t, server)}
           </Cell>,
           <Cell key="role">{roleLabel(t, server)}</Cell>,
+          <span key="speed" onClick={(event) => event.stopPropagation()}>
+            <Link
+              to={speedPage(`server:${server.id}`)}
+              aria-label={t("next.networking.speed.testServer", { host: server.host })}
+              className="font-wv-mono text-[12px] text-wv-accent hover:underline"
+            >
+              {t("next.networking.speed.title")}
+            </Link>
+          </span>,
           <span key="active" onClick={(event) => event.stopPropagation()}>
             <Toggle
               size="table"
@@ -668,6 +679,7 @@ export function ProvidersPanel() {
             <RouteView
               consumer={typeof editingId === "number" ? `server:${editingId}` : undefined}
               killSwitch={values.killSwitch}
+              speedLink
             />
           ),
         },

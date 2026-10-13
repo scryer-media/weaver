@@ -43,8 +43,11 @@ export type Consumer = {
   route: NetworkRoute | null;
 };
 
-export const NETWORKING_PAGES = ["overview", "egress", "proxies", "routes", "bandwidth"] as const;
+export const NETWORKING_PAGES = ["overview", "egress", "proxies", "routes", "speed", "bandwidth"] as const;
 export type NetworkingPage = (typeof NETWORKING_PAGES)[number];
+
+/** The speed test page with a server or feed selected. */
+export const speedPage = (consumer: string) => `/settings/networking/speed?consumer=${encodeURIComponent(consumer)}`;
 
 /** Run a mutation; resolves to the failure message, or null once it has landed. */
 export type NetworkingAction = (document: DocumentNode, variables: Record<string, unknown>) => Promise<string | null>;

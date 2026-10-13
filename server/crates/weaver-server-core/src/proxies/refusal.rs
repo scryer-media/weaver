@@ -93,6 +93,31 @@ pub enum NetworkRefusal {
     ProxyInPool,
     ProxyInUse,
     ProxyHostKeyNotSsh,
+
+    // Speed tests.
+    SpeedTestAlreadyRunning {
+        run: u32,
+    },
+    SpeedTestQueueBusy,
+    SpeedTestUsenetNeedsServer,
+    SpeedTestLegDownAll,
+    SpeedTestQuotaBlocked {
+        holder: SpeedTestQuotaHolder,
+        id: u32,
+        name: String,
+    },
+    SpeedTestLeaseRefused {
+        server: u32,
+        name: String,
+        reason: String,
+    },
+}
+
+// Whose download quota keeps a speed test from starting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedTestQuotaHolder {
+    Server,
+    Egress,
 }
 
 impl NetworkRefusal {
@@ -174,6 +199,13 @@ impl NetworkRefusal {
             Self::ProxyInPool => "PROXY_IN_POOL",
             Self::ProxyInUse => "PROXY_IN_USE",
             Self::ProxyHostKeyNotSsh => "PROXY_HOST_KEY_NOT_SSH",
+
+            Self::SpeedTestAlreadyRunning { .. } => "SPEED_TEST_ALREADY_RUNNING",
+            Self::SpeedTestQueueBusy => "SPEED_TEST_QUEUE_BUSY",
+            Self::SpeedTestUsenetNeedsServer => "SPEED_TEST_USENET_NEEDS_SERVER",
+            Self::SpeedTestLegDownAll => "SPEED_TEST_LEG_DOWN_ALL",
+            Self::SpeedTestQuotaBlocked { .. } => "SPEED_TEST_QUOTA_BLOCKED",
+            Self::SpeedTestLeaseRefused { .. } => "SPEED_TEST_LEASE_REFUSED",
         }
     }
 
@@ -190,6 +222,20 @@ impl NetworkRefusal {
                 "limit": limit,
                 "instanceMib": super::WIREGUARD_INSTANCE_BYTES / (1024 * 1024),
             }),
+            Self::SpeedTestAlreadyRunning { run } => serde_json::json!({ "runId": run }),
+            Self::SpeedTestQuotaBlocked { holder, id, name } => serde_json::json!({
+                "scope": match holder {
+                    SpeedTestQuotaHolder::Server => "server",
+                    SpeedTestQuotaHolder::Egress => "egress",
+                },
+                "id": id,
+                "name": name,
+            }),
+            Self::SpeedTestLeaseRefused {
+                server,
+                name,
+                reason,
+            } => serde_json::json!({ "serverId": server, "name": name, "reason": reason }),
             _ => return serde_json::Map::new(),
         };
         match value {
@@ -315,6 +361,35 @@ impl std::fmt::Display for NetworkRefusal {
             Self::ProxyInPool => "proxy belongs to a pool; remove it from the pool first",
             Self::ProxyInUse => "proxy is referenced by a server or RSS feed",
             Self::ProxyHostKeyNotSsh => "only SSH profiles have host-key trust",
+
+            Self::SpeedTestAlreadyRunning { run } => {
+                return write!(
+                    f,
+                    "speed test {run} is still running; cancel it or wait for it to finish"
+                );
+            }
+            Self::SpeedTestQueueBusy => {
+                "the previous speed test is still giving the queue back; start again once it has"
+            }
+            Self::SpeedTestUsenetNeedsServer => {
+                "a Usenet speed test runs on a server; a feed can run a bandwidth test only"
+            }
+            Self::SpeedTestLegDownAll => {
+                "every leg of the route would be down; leave at least one leg up"
+            }
+            Self::SpeedTestQuotaBlocked { holder, name, .. } => {
+                let holder = match holder {
+                    SpeedTestQuotaHolder::Server => "server",
+                    SpeedTestQuotaHolder::Egress => "egress",
+                };
+                return write!(
+                    f,
+                    "{holder} {name} has used its download quota, and a speed test books its bytes against it"
+                );
+            }
+            Self::SpeedTestLeaseRefused { name, reason, .. } => {
+                return write!(f, "server {name} cannot lend its connections: {reason}");
+            }
         };
         f.write_str(sentence)
     }

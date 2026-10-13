@@ -1,15 +1,16 @@
 import { useState } from "react";
-import { useLocation } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 import { SAVE_ROUTE } from "@/graphql/networking";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { routeInput, routeProblem, type NetworkFlow, type NetworkRoute } from "@/lib/networking";
+import { noOverrides, routeInput, routeProblem, type NetworkFlow, type NetworkRoute } from "@/lib/networking";
 import { Dialog } from "../../components/Dialog";
 import { PrimaryButton, SecondaryButton } from "../../components/controls";
 import { Cell } from "../../components/rows";
 import { countLabel } from "../../i18n/labels";
 import { SettingsBlocks, type SettingsBlock } from "../../pages/settings/framework";
-import { defaultRoute, type Consumer, type NetworkingAction, type NetworkingData } from "./data";
+import { defaultRoute, speedPage, type Consumer, type NetworkingAction, type NetworkingData } from "./data";
 import { RouteEditor } from "./RouteEditor";
+import { defaultForm, SpeedTestRunner, TestControls, useSpeedTestData, useSpeedTestRun, type TestForm } from "./SpeedTest";
 import { stateLabel, StatusMark } from "./presentation";
 
 /** "20 NNTP connections · 2 legs": what a consumer is, and how its route splits it. */
@@ -47,6 +48,7 @@ export function RoutesPage({
 }) {
   const t = useTranslate();
   const location = useLocation();
+  const navigate = useNavigate();
   const requested = new URLSearchParams(location.search).get("consumer");
   const preselected = consumers.find((consumer) => consumer.key === requested) ?? null;
   const [editing, setEditing] = useState<Consumer | null>(preselected);
@@ -57,7 +59,7 @@ export function RoutesPage({
       id: "routes",
       title: t("next.networking.routes.title"),
       note: t("next.networking.routes.note"),
-      columns: "minmax(0, 1.2fr) minmax(0, 1.4fr) minmax(0, 1fr) 112px",
+      columns: "minmax(0, 1.2fr) minmax(0, 1.4fr) minmax(0, 1fr) 216px",
       headers: [
         t("next.networking.routes.consumer"),
         t("next.networking.routes.route"),
@@ -91,7 +93,10 @@ export function RoutesPage({
               label={stateLabel(t, state)}
               detail={consumer.kind === "SERVER" ? `${openCount} / ${consumer.cap}` : undefined}
             />,
-            <span key="edit" className="ml-auto" onClick={(event) => event.stopPropagation()}>
+            <span key="edit" className="ml-auto flex gap-2" onClick={(event) => event.stopPropagation()}>
+              <SecondaryButton size="compact" onClick={() => void navigate(speedPage(consumer.key))}>
+                {t("next.networking.speed.title")}
+              </SecondaryButton>
               <SecondaryButton size="compact" onClick={() => setEditing(consumer)}>
                 {t("next.networking.routes.edit")}
               </SecondaryButton>
@@ -143,6 +148,7 @@ export function RouteDialog({
   const t = useTranslate();
   const [route, setRoute] = useState<NetworkRoute>(consumer.route ?? defaultRoute());
   const [error, setError] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
 
   const save = async () => {
     const failure = await action(SAVE_ROUTE, { kind: consumer.kind, id: consumer.id, input: routeInput(route) });
@@ -164,6 +170,9 @@ export function RouteDialog({
       onDismiss={onClose}
       footer={
         <>
+          <SecondaryButton icon="speedTest" disabled={problem !== null} onClick={() => setTesting(!testing)} className="mr-auto">
+            {t("next.networking.speed.title")}
+          </SecondaryButton>
           <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
           <PrimaryButton icon="save" disabled={busy || problem !== null} onClick={() => void save()}>
             {busy ? t("settings.saving") : t("next.networking.routes.save")}
@@ -183,11 +192,29 @@ export function RouteDialog({
           status={flow.legs.filter((leg) => leg.consumer === consumer.key)}
         />
       </div>
+      {testing && problem === null ? <DraftSpeedTest consumer={consumer} route={route} /> : null}
       {error ? (
         <div role="alert" className="flex-none border-t border-wv-hairline px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">
           {error}
         </div>
       ) : null}
     </Dialog>
+  );
+}
+
+/**
+ * The route dialog's speed test: the draft as it stands, unsaved, through the
+ * same controls and the same progress strip as the speed test page.
+ */
+function DraftSpeedTest({ consumer, route }: { consumer: Consumer; route: NetworkRoute }) {
+  const t = useTranslate();
+  const { providers, refresh } = useSpeedTestData();
+  const speedTest = useSpeedTestRun(refresh);
+  const [form, setForm] = useState<TestForm>(() => defaultForm(consumer));
+  return (
+    <section aria-label={t("next.networking.speed.title")} className="flex flex-none flex-col border-t border-wv-hairline">
+      <TestControls form={form} onChange={setForm} consumer={consumer} providers={providers} />
+      <SpeedTestRunner consumer={consumer} route={route} overrides={noOverrides()} form={form} providers={providers} speedTest={speedTest} />
+    </section>
   );
 }

@@ -340,6 +340,8 @@ pub struct PipelineMetrics {
     // Queue depths
     pub download_queue_depth: AtomicUsize,
     pub active_downloads: AtomicUsize,
+    // Woken when `active_downloads` is published at zero after being above it.
+    pub downloads_drained: tokio::sync::Notify,
     pub active_decodes: AtomicUsize,
     // Raw article bodies waiting for decode scheduling.
     pub decode_pending: AtomicUsize,
@@ -500,6 +502,27 @@ pub struct PipelineMetrics {
 }
 
 impl PipelineMetrics {
+    // Publish the in-flight article count; waiters on a drain wake at zero.
+    pub fn set_active_downloads(&self, active: usize) {
+        let previous = self.active_downloads.swap(active, Ordering::AcqRel);
+        if active == 0 && previous != 0 {
+            self.downloads_drained.notify_waiters();
+        }
+    }
+
+    // Wait until no article is in flight. The gauge is the condition.
+    pub async fn wait_downloads_drained(&self) {
+        loop {
+            let drained = self.downloads_drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if self.active_downloads.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            drained.await;
+        }
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             bytes_downloaded: AtomicU64::new(0),
@@ -507,6 +530,7 @@ impl PipelineMetrics {
             bytes_committed: AtomicU64::new(0),
             download_queue_depth: AtomicUsize::new(0),
             active_downloads: AtomicUsize::new(0),
+            downloads_drained: tokio::sync::Notify::new(),
             active_decodes: AtomicUsize::new(0),
             decode_pending: AtomicUsize::new(0),
             decode_pending_bytes: AtomicU64::new(0),

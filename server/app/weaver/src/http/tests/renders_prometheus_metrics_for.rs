@@ -1540,3 +1540,41 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
     assert!(rendered.contains("weaver_network_proxies{kind=\"wireguard\",enabled=\"true\"} 1"));
     assert!(rendered.contains("weaver_network_leg_revocations_total 3"));
 }
+
+#[test]
+fn speed_tests_render_every_kind_and_status_and_the_last_rate() {
+    let speed_tests = sample_speed_tests();
+    let (snapshot, block) = (populated_metrics_snapshot(), DownloadBlockState::default());
+    let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
+    input.speed_tests = Some(&speed_tests);
+    let rendered = render_area(&input);
+
+    use weaver_server_core::speed_test::{SpeedTestKindLabel, SpeedTestStatus};
+    let kinds: Vec<&str> = SpeedTestKindLabel::ALL.iter().map(|k| k.as_str()).collect();
+    let statuses: Vec<&str> = SpeedTestStatus::FINISHED
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    assert_label_set(&rendered, "weaver_speed_test_runs_total", "kind", &kinds);
+    assert_label_set(
+        &rendered,
+        "weaver_speed_test_runs_total",
+        "status",
+        &statuses,
+    );
+    assert!(
+        rendered.contains("weaver_speed_test_runs_total{kind=\"usenet\",status=\"completed\"} 3")
+    );
+    assert!(
+        rendered
+            .contains("weaver_speed_test_runs_total{kind=\"bandwidth\",status=\"cancelled\"} 1")
+    );
+    assert!(
+        rendered.contains("weaver_speed_test_runs_total{kind=\"bandwidth\",status=\"failed\"} 0")
+    );
+    assert!(
+        rendered.contains(
+            "weaver_speed_test_last_bps{consumer=\"server:4\",kind=\"usenet\"} 125000000"
+        )
+    );
+}

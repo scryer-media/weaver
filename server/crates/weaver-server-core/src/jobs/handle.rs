@@ -151,6 +151,8 @@ pub struct SharedPipelineState {
     // persistence, the queue replay producer) was woken for each one only to
     // discard it. Nothing is even built here unless someone is listening.
     segment_events: broadcast::Sender<PipelineEvent>,
+    // The speed test service, held weakly: the service holds this handle.
+    speed_test: Arc<std::sync::Mutex<std::sync::Weak<crate::speed_test::ServiceInner>>>,
     // Metrics snapshot refreshes, counted so tests can observe the cadence of
     // the orchestrator's periodic tick.
     #[cfg(test)]
@@ -209,6 +211,7 @@ impl SharedPipelineState {
             hardware_profile: Arc::new(RwLock::new(None)),
             job_cancellations: JobCancellationRegistry::default(),
             segment_events,
+            speed_test: Arc::new(std::sync::Mutex::new(std::sync::Weak::new())),
             #[cfg(test)]
             metrics_refreshes: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -1372,6 +1375,11 @@ impl SchedulerHandle {
         self.state.metrics_snapshot()
     }
 
+    // The live pipeline counters the download workers book into.
+    pub fn pipeline_metrics(&self) -> Arc<PipelineMetrics> {
+        Arc::clone(self.state.metrics())
+    }
+
     // How long this process has spent downloading.
     pub fn download_time(&self) -> std::time::Duration {
         self.state.metrics().download_time()
@@ -1639,6 +1647,30 @@ impl SchedulerHandle {
         &self,
     ) -> Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>> {
         self.state.server_transfer_policy()
+    }
+
+    // The speed test service while something holds it.
+    pub fn speed_test_service(&self) -> Option<crate::speed_test::SpeedTestService> {
+        self.state
+            .speed_test
+            .lock()
+            .expect("speed test slot")
+            .upgrade()
+            .map(crate::speed_test::SpeedTestService::from_inner)
+    }
+
+    // The speed test service, created by `init` when none is held.
+    pub fn speed_test_service_or_init(
+        &self,
+        init: impl FnOnce() -> crate::speed_test::SpeedTestService,
+    ) -> crate::speed_test::SpeedTestService {
+        let mut slot = self.state.speed_test.lock().expect("speed test slot");
+        if let Some(inner) = slot.upgrade() {
+            return crate::speed_test::SpeedTestService::from_inner(inner);
+        }
+        let service = init();
+        *slot = service.downgrade();
+        service
     }
 
     pub fn set_proxy_runtime(&self, runtime: Arc<crate::proxies::ProxyRuntime>) {

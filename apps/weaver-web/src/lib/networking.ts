@@ -83,3 +83,90 @@ export function removeLeg(legs:Leg[],position:number):Leg[] {
   const neighbor=position===0?1:position-1;
   return legs.map((leg,i)=>i===neighbor?{...leg,weight:leg.weight+legs[position]!.weight}:leg).filter((_,i)=>i!==position);
 }
+
+/** What the operator took down for one speed test. Positions index the route as it is tested. */
+export type PathOverride = { downLegs: number[]; downRungs: { leg: number; rung: number }[]; downProxies: number[]; downEgresses: number[] };
+export const noOverrides = (): PathOverride => ({ downLegs: [], downRungs: [], downProxies: [], downEgresses: [] });
+/** One box a speed test can take down: a leg, a rung inside its leg, a proxy wherever it is used, or an egress. */
+export type DownTarget = { kind: "leg"; position: number } | { kind: "rung"; leg: number; rung: number } | { kind: "proxy"; id: number } | { kind: "egress"; id: number };
+export function isDown(overrides: PathOverride, target: DownTarget): boolean {
+  switch (target.kind) {
+    case "leg": return overrides.downLegs.includes(target.position);
+    case "rung": return overrides.downRungs.some(r => r.leg === target.leg && r.rung === target.rung);
+    case "proxy": return overrides.downProxies.includes(target.id);
+    case "egress": return overrides.downEgresses.includes(target.id);
+  }
+}
+export function toggleDown(overrides: PathOverride, target: DownTarget): PathOverride {
+  const flip = (ids: number[], id: number) => ids.includes(id) ? ids.filter(x => x !== id) : [...ids, id].sort((a,b) => a-b);
+  switch (target.kind) {
+    case "leg": return { ...overrides, downLegs: flip(overrides.downLegs, target.position) };
+    case "proxy": return { ...overrides, downProxies: flip(overrides.downProxies, target.id) };
+    case "egress": return { ...overrides, downEgresses: flip(overrides.downEgresses, target.id) };
+    case "rung": return { ...overrides, downRungs: isDown(overrides, target)
+      ? overrides.downRungs.filter(r => r.leg !== target.leg || r.rung !== target.rung)
+      : [...overrides.downRungs, { leg: target.leg, rung: target.rung }].sort((a,b) => a.leg-b.leg || a.rung-b.rung) };
+  }
+}
+/**
+ * The route as a speed test takes it with these boxes down: which legs are down and
+ * which rungs each leg loses. A pool rung is down when every member is, a chain when
+ * any hop is, and a leg when it is downed, its egress is, or its ladder loses every
+ * rung with no going direct.
+ */
+export function testedPlan(route: NetworkRoute, overrides: PathOverride, pools: ProxyPool[]): { legDown: boolean[]; rungDown: boolean[][] } {
+  const proxyDown = (id: number | null) => id !== null && overrides.downProxies.includes(id);
+  const rungDown = route.legs.map((leg, position) => (leg.path.kind === "DIRECT" ? [] : leg.path.rungs).map((rung, index) => {
+    if (isDown(overrides, { kind: "rung", leg: position, rung: index })) return true;
+    if (rung.kind === "PROXY") return proxyDown(rung.proxyId);
+    if (rung.kind === "CHAIN") return rung.chainIds.some(proxyDown);
+    const members = pools.find(pool => pool.id === rung.poolId)?.memberIds ?? [];
+    return members.length > 0 && members.every(proxyDown);
+  }));
+  const legDown = route.legs.map((leg, position) =>
+    overrides.downLegs.includes(position) || overrides.downEgresses.includes(leg.egressId) ||
+    (leg.path.kind === "LADDER" && !leg.path.directFallback && rungDown[position]!.every(Boolean)));
+  return { legDown, rungDown };
+}
+/** Bandwidth streams over the healthy legs by weight, at least one each. */
+export function streamTargets(route: NetworkRoute, streams: number, down: ReadonlySet<number>): number[] {
+  const healthy = route.legs.filter((_, i) => !down.has(i)).length;
+  const targets = allocation(route.legs.map((leg, i) => down.has(i) ? 0 : leg.weight), Math.max(streams, healthy));
+  return targets.map((target, i) => down.has(i) ? 0 : Math.max(1, target));
+}
+export type SpeedTestKind = "BANDWIDTH" | "USENET";
+export type SpeedTestStatus = "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED";
+export type SabTestSize = "MB_100" | "GB_1" | "GB_10";
+/** `maxBytes` caps what one stream may ask for; null for a provider of fixed sizes. */
+export type BandwidthProvider = { id: string; name: string; fixedSizes: number[]; anySize: boolean; maxBytes: number | null; needsServer: boolean };
+export type BandwidthProviderServer = { id: string; name: string; location: string | null; host: string };
+export type SpeedTestInput = {
+  kind: "SERVER" | "RSS"; id: number; route?: ReturnType<typeof routeInput> | null; overrides?: PathOverride | null;
+  bandwidth?: { providerId?: string | null; server?: string | null; customUrl?: string | null; bytes: number; streams: number } | null;
+  usenet?: { sabSize?: SabTestSize | null; nzbUrl?: string | null; connections?: number | null } | null;
+  maxDurationSeconds: number;
+};
+export type TestedLeg = { position: number; egressId: number; weight: number; down: boolean; downReason: string | null; path: Leg["path"]; target: number };
+export type SpeedTestResult = {
+  bytes: number; elapsedMs: number; averageBps: number; peakBps: number;
+  legs: { position: number; bytes: number; averageBps: number; peakBps: number; connections: number; sourceAddresses: string[] }[];
+  connections: { leg: number; connectMs: number; path: { egressId: number; rung: number | null; poolId: number | null; memberId: number | null; proxyIds: number[] }; sourceAddress: string | null; bytes: number; error: string | null }[];
+  usenet: { articlesRequested: number; delivered: number; missing: number; failed: number; declaredBytes: number; decodedBytes: number; pipelining: boolean; tls: boolean; tlsCipherSuite: string | null } | null;
+  bandwidth: { providerId: string | null; server: string | null; url: string; streams: number } | null;
+  samples: { atMs: number; leg: number; bytes: number }[];
+};
+/** What a run was asked for, as the daemon kept it: exactly one of bandwidth and usenet. `bytes` is per stream. */
+export type SpeedTestRequest = {
+  bandwidth: { providerId: string | null; server: string | null; customUrl: string | null; bytes: number; streams: number } | null;
+  usenet: { sabSize: SabTestSize | null; nzbUrl: string | null; connections: number | null } | null;
+  maxDurationSeconds: number;
+};
+export type SpeedTestRun = {
+  id: number; consumer: string; consumerName: string; kind: SpeedTestKind; request: SpeedTestRequest; status: SpeedTestStatus; phase: string | null;
+  /** Epoch milliseconds. */
+  startedAt: number; finishedAt: number | null; error: string | null;
+  tested: { legs: TestedLeg[]; failover: NetworkRoute["failover"]; overrides: PathOverride; names: { kind: string; id: number; name: string }[] };
+  result: SpeedTestResult | null;
+};
+/** The route a run took, as a route again: what "Run again" sends. */
+export const testedRoute = (run: SpeedTestRun): NetworkRoute => ({ failover: run.tested.failover, legs: run.tested.legs.map(leg => ({ egressId: leg.egressId, weight: leg.weight, path: leg.path })) });

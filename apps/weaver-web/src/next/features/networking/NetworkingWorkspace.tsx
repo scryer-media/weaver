@@ -26,6 +26,7 @@ import { FlowEditor } from "./FlowEditor";
 import { NetworkFlow, type FlowTarget } from "./NetworkFlow";
 import { PoolsPage } from "./PoolsPage";
 import { RoutesPage } from "./RoutesPage";
+import { SpeedPage } from "./SpeedPage";
 import { formatRate, Hint, MIB, NoticeBand } from "./presentation";
 
 export type { NetworkingData } from "./data";
@@ -172,6 +173,7 @@ export function NetworkingWorkspace({
           {page === "routes" ? (
             <RoutesPage key={location.search} data={data} consumers={consumers} flow={flow} action={action} busy={busy} />
           ) : null}
+          {page === "speed" ? <SpeedPage key={location.search} data={data} consumers={consumers} /> : null}
           {page === "bandwidth" ? (
             <>
               {bandwidth}
