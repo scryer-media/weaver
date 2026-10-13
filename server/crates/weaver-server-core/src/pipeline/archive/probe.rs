@@ -721,7 +721,7 @@ impl Pipeline {
             return;
         }
 
-        let password_candidates = self.archive_password_candidates_for_job(job_id);
+        let password_candidates = self.archive_password_candidates_for_job(job_id).candidates;
         let identity = match self
             .probe_archive_candidate(job_id, &candidate, password_candidates)
             .await

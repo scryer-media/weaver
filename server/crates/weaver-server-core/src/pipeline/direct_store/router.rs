@@ -2911,6 +2911,12 @@ impl DirectSetRouter {
         self.header_crypt.candidate_count()
     }
 
+    // The sources of this set's `-hp` candidates, in trial order.
+    #[cfg(test)]
+    pub(crate) fn header_candidate_sources(&self) -> Vec<&'static str> {
+        self.header_crypt.offered_sources()
+    }
+
     // The key ring's own `Debug`, for the test that proves a password cannot
     // reach a log through it. The router's `Debug` does not print the ring at
     // all, so this is the only way to assert on the type that holds the

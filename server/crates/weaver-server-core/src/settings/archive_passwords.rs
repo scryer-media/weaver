@@ -9,6 +9,13 @@ const PASSWORDS: &str = "archive_passwords";
 const PASSWORD_FILE: &str = "archive_password_file";
 const MAX_PASSWORD_BYTES: usize = 64 * 1024;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
+// The most global archive passwords any consumer is handed, Settings list and
+// password file together. Every candidate an archive gate tries costs a key
+// derivation, so this is the one place the list is bounded: the Settings list
+// refuses to save past it, and the password file fills whatever the Settings
+// list leaves. Every consumer, direct store and finalize alike, tries the
+// whole bounded list.
+pub(crate) const MAX_ARCHIVE_PASSWORDS: usize = 50;
 
 impl Database {
     pub fn archive_password_settings(&self) -> Result<(bool, Option<String>), StateError> {
@@ -24,6 +31,11 @@ impl Database {
         let sealed = passwords
             .map(|passwords| {
                 let passwords = ordered_passwords(passwords);
+                if passwords.len() > MAX_ARCHIVE_PASSWORDS {
+                    return Err(StateError::Conflict(format!(
+                        "archive password list holds more than {MAX_ARCHIVE_PASSWORDS} entries"
+                    )));
+                }
                 let value = serde_json::to_string(&passwords)
                     .map_err(|_| StateError::Conflict("invalid archive passwords".into()))?;
                 if value.len() > MAX_PASSWORD_BYTES {
@@ -100,6 +112,7 @@ impl Database {
         let (passwords, file) = self.load_archive_password_settings()?;
         let mut candidates: Vec<_> = passwords
             .into_iter()
+            .take(MAX_ARCHIVE_PASSWORDS)
             .map(|password| {
                 ArchivePasswordCandidate::new(ArchivePasswordSource::Settings, password)
             })
@@ -108,6 +121,9 @@ impl Database {
             match read_password_file(&file) {
                 Ok(passwords) => {
                     for password in passwords {
+                        if candidates.len() >= MAX_ARCHIVE_PASSWORDS {
+                            break;
+                        }
                         if !candidates
                             .iter()
                             .any(|candidate| candidate.value() == password)
@@ -203,5 +219,52 @@ mod tests {
         db.save_archive_password_settings(Some(vec![]), Some(None))
             .unwrap();
         assert_eq!(db.archive_password_settings().unwrap(), (false, None));
+    }
+
+    #[test]
+    fn archive_passwords_are_bounded_at_fifty_across_both_sources() {
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passwords.txt");
+        let numbered = |prefix: &str, count: usize| -> Vec<String> {
+            (0..count)
+                .map(|index| format!("{prefix}-{index}"))
+                .collect()
+        };
+
+        let too_many = numbered("settings", MAX_ARCHIVE_PASSWORDS + 1);
+        let error = db
+            .save_archive_password_settings(Some(too_many), None)
+            .unwrap_err();
+        assert!(matches!(error, StateError::Conflict(_)));
+
+        // Duplicates and blanks are dropped before the count is taken.
+        let mut padded = numbered("settings", MAX_ARCHIVE_PASSWORDS);
+        padded.push("settings-0".into());
+        padded.push("   ".into());
+        db.save_archive_password_settings(Some(padded), None)
+            .unwrap();
+        assert_eq!(
+            db.global_archive_password_candidates().unwrap().len(),
+            MAX_ARCHIVE_PASSWORDS
+        );
+
+        // The file fills what the Settings list leaves, and no more.
+        std::fs::write(&path, numbered("file", 40).join("\n")).unwrap();
+        db.save_archive_password_settings(
+            Some(numbered("settings", 30)),
+            Some(Some(path.to_str().unwrap().into())),
+        )
+        .unwrap();
+        let candidates = db.global_archive_password_candidates().unwrap();
+        assert_eq!(candidates.len(), MAX_ARCHIVE_PASSWORDS);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.source() == ArchivePasswordSource::PasswordFile)
+                .count(),
+            MAX_ARCHIVE_PASSWORDS - 30
+        );
+        assert_eq!(candidates.last().unwrap().value(), "file-19");
     }
 }

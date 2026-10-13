@@ -2426,7 +2426,7 @@ impl Pipeline {
     }
 
     pub(crate) async fn restore_rar_state_for_job(&mut self, job_id: JobId) {
-        let password_candidates = self.archive_password_candidates_for_job(job_id);
+        let password_candidates = self.archive_password_candidates_for_job(job_id).candidates;
         match self
             .db_blocking(move |db| db.load_all_archive_headers(job_id))
             .await

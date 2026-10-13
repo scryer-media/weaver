@@ -767,6 +767,40 @@ fn header_encrypted_rar4_set(volume_count: usize, body_bytes: usize) -> Vec<(Str
         .collect()
 }
 
+// The global half of a job's archive-password list: the `Settings` passwords
+// and, when `file_lines` is `Some`, a password file holding those lines.
+#[derive(Default, Clone, Copy)]
+struct GlobalPasswords<'a> {
+    settings: &'a [&'a str],
+    file_lines: Option<&'a [&'a str]>,
+}
+
+// Stores `global` as the pipeline's archive-password settings, writing the
+// password file under `dir`. A default `GlobalPasswords` stores nothing.
+fn seed_global_passwords(pipeline: &Pipeline, dir: &std::path::Path, global: GlobalPasswords<'_>) {
+    if global.settings.is_empty() && global.file_lines.is_none() {
+        return;
+    }
+    let file = global.file_lines.map(|lines| {
+        let path = dir.join("archive-passwords.txt");
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path.to_str().unwrap().to_owned()
+    });
+    pipeline
+        .db
+        .save_archive_password_settings(
+            Some(
+                global
+                    .settings
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect(),
+            ),
+            Some(file),
+        )
+        .unwrap();
+}
+
 // The `-hp` gate runner: [`run_gate_with_password`] plus the two candidate
 // sources that do not live on the job spec.
 //
@@ -787,9 +821,38 @@ async fn run_hp_gate(
     nzb_zstd: Vec<u8>,
     nzb_file_name: Option<&str>,
 ) -> GateOutcome {
+    run_hp_gate_with_global(
+        gate,
+        job_id,
+        member_name,
+        volumes,
+        arrivals,
+        spec_password,
+        nzb_zstd,
+        nzb_file_name,
+        GlobalPasswords::default(),
+    )
+    .await
+}
+
+// [`run_hp_gate`] with the global `Settings` list and password file seeded
+// before the job is added.
+#[allow(clippy::too_many_arguments)]
+async fn run_hp_gate_with_global(
+    gate: DirectStoreGate,
+    job_id: JobId,
+    member_name: &str,
+    volumes: &[(String, Vec<u8>)],
+    arrivals: &[(u32, u32)],
+    spec_password: Option<&str>,
+    nzb_zstd: Vec<u8>,
+    nzb_file_name: Option<&str>,
+    global: GlobalPasswords<'_>,
+) -> GateOutcome {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(gate);
+    seed_global_passwords(&pipeline, temp_dir.path(), global);
 
     let mut spec = direct_store_job_spec("Silver Horizon", volumes);
     spec.password = spec_password.map(str::to_owned);

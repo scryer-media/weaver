@@ -2189,6 +2189,25 @@ async fn header_encrypted_verdict(
     spec_password: Option<&str>,
     nzb_zstd: Vec<u8>,
 ) -> String {
+    header_encrypted_verdict_with_global(
+        job_id,
+        archive_password,
+        spec_password,
+        nzb_zstd,
+        GlobalPasswords::default(),
+    )
+    .await
+}
+
+// [`header_encrypted_verdict`] with the global `Settings` list and password
+// file seeded before the job is added.
+async fn header_encrypted_verdict_with_global(
+    job_id: JobId,
+    archive_password: &str,
+    spec_password: Option<&str>,
+    nzb_zstd: Vec<u8>,
+    global: GlobalPasswords<'_>,
+) -> String {
     let member = payload(59, 30_000);
     let archive = build_7z_shaped(
         &[Entry::file(MEMBER, member)],
@@ -2200,6 +2219,7 @@ async fn header_encrypted_verdict(
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    seed_global_passwords(&pipeline, temp_dir.path(), global);
     let mut spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
     spec.password = spec_password.map(str::to_owned);
     insert_active_job_with_persisted_nzb(&mut pipeline, job_id, spec, nzb_zstd).await;
@@ -2269,6 +2289,56 @@ async fn sevenz_store_refuses_a_container_no_candidate_opens() {
     assert!(
         !sets.contains("EncryptedContent"),
         "a header nothing opened states nothing about its content\nsets: {sets}"
+    );
+}
+
+// The key lives only in the global `Settings` list, and the spec and NZB name
+// nothing. The direct store is offered the same list finalize tries, so the
+// header opens here rather than the set demoting to be opened there.
+#[tokio::test]
+async fn sevenz_store_opens_a_container_keyed_by_a_settings_password() {
+    let sets = header_encrypted_verdict_with_global(
+        JobId(9_614),
+        "horizon",
+        None,
+        sample_nzb_zstd(),
+        GlobalPasswords {
+            settings: &["not-the-password", "horizon"],
+            file_lines: None,
+        },
+    )
+    .await;
+    assert!(
+        sets.contains("EncryptedContent"),
+        "a settings password must open the header\nsets: {sets}"
+    );
+    assert!(
+        !sets.contains("EncryptedHeader"),
+        "a container the settings list opens must not refuse\nsets: {sets}"
+    );
+}
+
+// The key lives only in the password file.
+#[tokio::test]
+async fn sevenz_store_opens_a_container_keyed_by_the_password_file() {
+    let sets = header_encrypted_verdict_with_global(
+        JobId(9_615),
+        "horizon",
+        None,
+        sample_nzb_zstd(),
+        GlobalPasswords {
+            settings: &[],
+            file_lines: Some(&["also-wrong", "horizon"]),
+        },
+    )
+    .await;
+    assert!(
+        sets.contains("EncryptedContent"),
+        "a password-file entry must open the header\nsets: {sets}"
+    );
+    assert!(
+        !sets.contains("EncryptedHeader"),
+        "a container the password file opens must not refuse\nsets: {sets}"
     );
 }
 
