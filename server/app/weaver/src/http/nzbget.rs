@@ -1056,6 +1056,7 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
         request.category.as_deref(),
         canonical_category.as_deref(),
     );
+    record_submitted_priority(&mut metadata, request.priority);
     if is_http_url(&request.content_or_url) {
         metadata.push((
             weaver_server_core::post_processing::scan::SOURCE_URL_KEY.into(),
@@ -1576,6 +1577,7 @@ async fn listgroups(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
             nzbget_group(
                 &item,
                 &reported_category(job.category.as_deref(), &job.metadata),
+                nzbget_priority(&job.metadata),
             )
         })
         .collect::<Vec<_>>();
@@ -1591,7 +1593,7 @@ fn nzbget_release_name<'a>(original_title: &'a str, fallback_name: &'a str) -> &
     }
 }
 
-fn nzbget_group(item: &QueueItem, category: &str) -> Value {
+fn nzbget_group(item: &QueueItem, category: &str, priority: i64) -> Value {
     let total = item.total_bytes;
     let downloaded = item.downloaded_bytes;
     let remaining = total.saturating_sub(downloaded);
@@ -1604,7 +1606,6 @@ fn nzbget_group(item: &QueueItem, category: &str) -> Value {
     let (remaining_lo, remaining_hi) = size_parts(remaining);
     let (paused_lo, paused_hi) = size_parts(paused);
     let (downloaded_lo, downloaded_hi) = size_parts(downloaded);
-    let priority = nzbget_priority(&item.attributes);
     let output_dir = item.output_dir.clone().unwrap_or_default();
     let post_info = post_progress_info(item);
     let critical_health = critical_health(item);
@@ -2716,20 +2717,21 @@ async fn set_job_priority(
     job_id: JobId,
     param: &str,
 ) -> Result<(), SchedulerError> {
-    // NZBGet priorities are numbers (-100 very low .. 900 force); weaver keeps
-    // the three-level label, which genuinely biases dispatch. Some clients
-    // send the level name instead of a number; FORCE collapses to HIGH.
-    let trimmed = param.trim();
-    let label = if let Ok(numeric) = trimmed.parse::<i64>() {
-        priority_label(numeric)
-    } else if trimmed.eq_ignore_ascii_case("force") || trimmed.eq_ignore_ascii_case("high") {
-        "HIGH"
-    } else if trimmed.eq_ignore_ascii_case("low") {
-        "LOW"
-    } else {
-        "NORMAL"
+    // Weaver dispatches by a three-level label; the number the client set is
+    // kept beside it and reported back. Force dispatches as HIGH.
+    let priority = parse_nzbget_priority(param);
+    let mut metadata = ctx.handle.get_job(job_id)?.metadata;
+    metadata.retain(|(key, _)| !key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY));
+    metadata.push((
+        PRIORITY_ATTRIBUTE_KEY.to_string(),
+        priority_label(priority).to_string(),
+    ));
+    record_submitted_priority(&mut metadata, priority);
+    let update = JobUpdate {
+        metadata: FieldUpdate::Set(metadata),
+        ..JobUpdate::default()
     };
-    upsert_job_metadata(ctx, job_id, PRIORITY_ATTRIBUTE_KEY, Some(label.to_string())).await
+    ctx.handle.update_job(job_id, update).await
 }
 
 async fn set_job_parameter(
@@ -2909,8 +2911,9 @@ async fn delete_as_duplicate(
     Ok(())
 }
 
-// The live queue in listing order, with each job's reported category.
-fn queue_order(ctx: &NzbgetFacadeContext) -> Vec<(QueueItem, String)> {
+// The live queue in listing order, with each job's reported category and
+// priority.
+fn queue_order(ctx: &NzbgetFacadeContext) -> Vec<(QueueItem, String, i64)> {
     ctx.handle
         .list_jobs()
         .iter()
@@ -2918,9 +2921,10 @@ fn queue_order(ctx: &NzbgetFacadeContext) -> Vec<(QueueItem, String)> {
             (
                 queue_item_from_job(job),
                 reported_category(job.category.as_deref(), &job.metadata),
+                nzbget_priority(&job.metadata),
             )
         })
-        .filter(|(item, _)| {
+        .filter(|(item, _, _)| {
             !matches!(
                 item.state,
                 QueueItemState::Completed | QueueItemState::Failed
@@ -2985,7 +2989,7 @@ async fn move_groups_next_to(
     };
     let current = queue_order(ctx)
         .into_iter()
-        .map(|(item, _)| JobId(item.id))
+        .map(|(item, _, _)| JobId(item.id))
         .collect::<Vec<_>>();
     let mut moved = Vec::new();
     for job_id in &request.ids {
@@ -3048,19 +3052,19 @@ async fn sort_groups(
     let queue = queue_order(ctx);
     let current = queue
         .iter()
-        .map(|(item, _)| JobId(item.id))
+        .map(|(item, _, _)| JobId(item.id))
         .collect::<Vec<_>>();
     let selected = |id: u64| request.ids.is_empty() || request.ids.contains(&JobId(id));
     let mut picked = queue
         .iter()
-        .filter(|(item, _)| selected(item.id))
+        .filter(|(item, _, _)| selected(item.id))
         .collect::<Vec<_>>();
     if picked.len() != request.ids.len() && !request.ids.is_empty() {
         return Ok(json!(false));
     }
-    let compare = |left: &&(QueueItem, String), right: &&(QueueItem, String)| {
-        let (left, left_category) = left;
-        let (right, right_category) = right;
+    let compare = |left: &&(QueueItem, String, i64), right: &&(QueueItem, String, i64)| {
+        let (left, left_category, left_priority) = left;
+        let (right, right_category, right_priority) = right;
         let ordering = match key {
             "name" => nzbget_release_name(&left.original_title, &left.name)
                 .to_lowercase()
@@ -3070,9 +3074,7 @@ async fn sort_groups(
                 .total_bytes
                 .saturating_sub(left.downloaded_bytes)
                 .cmp(&right.total_bytes.saturating_sub(right.downloaded_bytes)),
-            "priority" => {
-                nzbget_priority(&right.attributes).cmp(&nzbget_priority(&left.attributes))
-            }
+            "priority" => right_priority.cmp(left_priority),
             "category" => left_category
                 .to_lowercase()
                 .cmp(&right_category.to_lowercase()),
@@ -3081,7 +3083,7 @@ async fn sort_groups(
         };
         Some(ordering)
     };
-    let ascending_order = |picked: &mut Vec<&(QueueItem, String)>| {
+    let ascending_order = |picked: &mut Vec<&(QueueItem, String, i64)>| {
         picked.sort_by(|left, right| compare(left, right).unwrap_or(std::cmp::Ordering::Equal));
     };
     let already_ascending = picked
@@ -3096,7 +3098,7 @@ async fn sort_groups(
     if descending {
         picked.reverse();
     }
-    let mut sorted = picked.into_iter().map(|(item, _)| JobId(item.id));
+    let mut sorted = picked.into_iter().map(|(item, _, _)| JobId(item.id));
     let target = current
         .iter()
         .map(|id| {
@@ -3226,7 +3228,7 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
                     .saturating_mul(1000)
                     .checked_div(total)
                     .unwrap_or(1000),
-                "Priority": nzbget_priority(&item.attributes),
+                "Priority": nzbget_priority(&info.metadata),
                 "Category": reported_category(info.category.as_deref(), &info.metadata),
             }));
         }
@@ -3902,16 +3904,58 @@ fn priority_label(priority: i64) -> &'static str {
     }
 }
 
-fn nzbget_priority(attributes: &[Attribute]) -> i64 {
-    attributes
+// The NZBGet priority a client set, kept beside weaver's three-level label.
+const SUBMITTED_PRIORITY_KEY: &str = "weaver.nzbget.priority";
+const FORCE_PRIORITY: i64 = 900;
+
+fn record_submitted_priority(metadata: &mut Vec<(String, String)>, priority: i64) {
+    metadata.retain(|(key, _)| key != SUBMITTED_PRIORITY_KEY);
+    metadata.push((SUBMITTED_PRIORITY_KEY.to_string(), priority.to_string()));
+}
+
+// The priority the facade reports: the number the client set while it still
+// agrees with the job's label, otherwise the label's own number. A label
+// changed elsewhere wins.
+fn nzbget_priority(metadata: &[(String, String)]) -> i64 {
+    let label = metadata
         .iter()
-        .find(|attribute| attribute.key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY))
-        .map(|attribute| match attribute.value.as_str() {
-            value if value.eq_ignore_ascii_case("HIGH") => 50,
-            value if value.eq_ignore_ascii_case("LOW") => -50,
+        .rev()
+        .find(|(key, _)| key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY))
+        .map(|(_, value)| value.to_ascii_uppercase())
+        .unwrap_or_else(|| "NORMAL".to_string());
+    let submitted = metadata
+        .iter()
+        .rev()
+        .find(|(key, _)| key == SUBMITTED_PRIORITY_KEY)
+        .and_then(|(_, value)| value.parse::<i64>().ok());
+    match submitted {
+        Some(priority) if priority_label(priority) == label => priority,
+        _ => match label.as_str() {
+            "HIGH" => 50,
+            "LOW" => -50,
             _ => 0,
-        })
-        .unwrap_or(0)
+        },
+    }
+}
+
+// A priority as a number or one of NZBGet's level names.
+fn parse_nzbget_priority(param: &str) -> i64 {
+    let trimmed = param.trim();
+    if let Ok(numeric) = trimmed.parse::<i64>() {
+        return numeric;
+    }
+    match trimmed
+        .to_ascii_lowercase()
+        .replace([' ', '_', '-'], "")
+        .as_str()
+    {
+        "force" => FORCE_PRIORITY,
+        "veryhigh" => 100,
+        "high" => 50,
+        "low" => -50,
+        "verylow" => -100,
+        _ => 0,
+    }
 }
 
 fn active_downloads(item: &QueueItem) -> u32 {

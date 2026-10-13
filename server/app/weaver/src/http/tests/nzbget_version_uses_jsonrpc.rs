@@ -2057,7 +2057,9 @@ async fn nzbget_editqueue_category_priority_and_parameter_updates() {
     assert_eq!(status, StatusCode::OK);
     let group = &groups["result"][0];
     assert_eq!(group["Category"], "movies");
-    assert_eq!(group["MaxPriority"], 50);
+    // Force is reported as set, though it dispatches as HIGH.
+    assert_eq!(group["MinPriority"], 900);
+    assert_eq!(group["MaxPriority"], 900);
 
     // Generic parameters round-trip into the Parameters list.
     let (status, payload) = post_nzbget(
@@ -5034,4 +5036,91 @@ async fn nzbget_dupe_and_park_deletes_report_how_the_job_left() {
         editqueue(app, serde_json::json!(["HistoryRetryFailed", "", [801]])).await,
         true
     );
+}
+
+fn group_priority(groups: &serde_json::Value, id: u64) -> (i64, i64) {
+    let group = history_entry(groups, id);
+    (
+        group["MinPriority"].as_i64().unwrap(),
+        group["MaxPriority"].as_i64().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn nzbget_priority_reports_the_value_the_client_set() {
+    use base64::Engine as _;
+
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let nzb_b64 = base64::engine::general_purpose::STANDARD.encode(minimal_nzb("Priority.Release"));
+    let id = rpc_result(
+        app.clone(),
+        "append",
+        serde_json::json!([
+            "Priority.Release.nzb",
+            nzb_b64,
+            "",
+            100,
+            false,
+            false,
+            "",
+            0,
+            "all",
+            []
+        ]),
+    )
+    .await
+    .as_u64()
+    .unwrap();
+    let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+    assert_eq!(group_priority(&groups, id), (100, 100));
+
+    for (param, expected, label) in [
+        ("-100", -100, "LOW"),
+        ("-50", -50, "LOW"),
+        ("0", 0, "NORMAL"),
+        ("50", 50, "HIGH"),
+        ("100", 100, "HIGH"),
+        ("900", 900, "HIGH"),
+        ("Force", 900, "HIGH"),
+        ("very low", -100, "LOW"),
+    ] {
+        let set = editqueue(
+            app.clone(),
+            serde_json::json!(["GroupSetPriority", param, [id]]),
+        )
+        .await;
+        assert_eq!(set, true, "{param}");
+        let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+        assert_eq!(group_priority(&groups, id), (expected, expected), "{param}");
+        let job = handle.get_job(JobId(id)).unwrap();
+        let dispatch = job
+            .metadata
+            .iter()
+            .find(|(key, _)| key == "priority")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(dispatch, Some(label), "{param}");
+    }
+
+    // A label changed outside the facade wins over the stored number.
+    let mut metadata = handle.get_job(JobId(id)).unwrap().metadata;
+    metadata.retain(|(key, _)| key != "priority");
+    metadata.push(("priority".to_string(), "HIGH".to_string()));
+    handle
+        .update_job(
+            JobId(id),
+            weaver_server_core::JobUpdate {
+                metadata: weaver_server_core::FieldUpdate::Set(metadata),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let groups = rpc_result(app, "listgroups", serde_json::json!([])).await;
+    assert_eq!(group_priority(&groups, id), (50, 50));
 }
