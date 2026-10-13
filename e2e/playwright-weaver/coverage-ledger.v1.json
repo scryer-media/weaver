@@ -790,6 +790,31 @@
       "oracle": "browser"
     },
     {
+      "name": "speed-test-leg-split-leg-down-all-down-refusal-and-compare",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
+      "name": "speed-test-seeded-100mb-posting-plaintext-direct",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
+      "name": "speed-test-failed-nzb-fetch",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
+      "name": "speed-test-max-duration-deadline",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
+      "name": "speed-test-server-quota-booking-and-refusal",
+      "owner": "speed-test",
+      "oracle": "browser"
+    },
+    {
       "name": "schedule-hold-and-one-shot-evaluators",
       "owner": "scheduling",
       "oracle": "api-metrics"
