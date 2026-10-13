@@ -306,7 +306,9 @@ jobs:
           sccache --start-server || true
           sccache --zero-stats || true
       - name: Run Rust tests
-        run: cargo nextest run --workspace --locked --no-fail-fast -E 'not (test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_))'
+        # The default nextest profile excludes every schedule family; it is
+        # the single source of truth, so no filter is repeated here.
+        run: cargo nextest run --workspace --locked --no-fail-fast
       - name: Build the archive e2e binary
         run: cargo build --locked -p weaver
       - name: Prove direct unpack and PAR2 recovery for every sequential format
@@ -471,11 +473,9 @@ jobs:
           name: ${{ env.WEB_ARTIFACT_NAME }}
           path: apps/weaver-web/dist
       - name: Run Rust tests
-        run: >-
-          cargo nextest run --workspace --locked --no-fail-fast
-          -E 'not (test(archive_schedules::) | test(sevenz_store::schedules::) |
-          test(par2::tests::schedules::) | test(direct_store::tests::par2_schedules::) |
-          test(par2_completion::schedules::))'
+        # The default nextest profile excludes every schedule family; it is
+        # the single source of truth, so no filter is repeated here.
+        run: cargo nextest run --workspace --locked --no-fail-fast
 
   rust-test-arm:
     name: rust-test-arm-yenc
@@ -687,8 +687,8 @@ jobs:
       AWS_LC_SYS_STATIC: "1"
       AWS_LC_SYS_SMALL: "0"
       AWS_LC_SYS_CMAKE_BUILDER: "0"
-      CFLAGS_x86_64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
-      CXXFLAGS_x86_64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_x86_64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -784,8 +784,8 @@ jobs:
       # libgcc's lse-init.o into every link that touches an atomic. That object
       # calls __getauxval, which glibc has and musl does not, so the link fails
       # and any configure probe using atomics reports the feature missing.
-      CFLAGS_aarch64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
-      CXXFLAGS_aarch64_unknown_linux_musl: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
+      CFLAGS_aarch64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
+      CXXFLAGS_aarch64_unknown_linux_musl: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden -mno-outline-atomics"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -879,8 +879,8 @@ jobs:
       AWS_LC_SYS_STATIC: "1"
       AWS_LC_SYS_SMALL: "0"
       AWS_LC_SYS_CMAKE_BUILDER: "0"
-      CFLAGS_x86_64_apple_darwin: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
-      CXXFLAGS_x86_64_apple_darwin: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -1148,8 +1148,8 @@ jobs:
       AWS_LC_SYS_STATIC: "1"
       AWS_LC_SYS_SMALL: "0"
       AWS_LC_SYS_CMAKE_BUILDER: "0"
-      CFLAGS_aarch64_apple_darwin: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
-      CXXFLAGS_aarch64_apple_darwin: "-O3 -DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      CXXFLAGS_aarch64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G
       SCCACHE_DIR: ${{ github.workspace }}/.sccache

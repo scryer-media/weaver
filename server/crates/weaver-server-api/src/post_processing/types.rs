@@ -1,17 +1,33 @@
 use async_graphql::{Enum, InputObject, MaybeUndefined, SimpleObject};
-use weaver_server_core::post_processing::listing::{DiscoveredScript, ScriptProblem};
-use weaver_server_core::post_processing::model::{
-    OptionName, OptionValue, PostProcessingSettings, ResolvedOption, ScriptAdapter, ScriptList,
-    ScriptListEntry, ScriptLists, ScriptName, ScriptOption, ScriptOptionType, ScriptResult,
-    ScriptSelectValue, SecretOptionValue,
+use chrono::{DateTime, TimeZone, Utc};
+use weaver_server_core::post_processing::instances::{
+    InstanceInputDraft, InstanceTrigger, ScriptInstance, ScriptInstanceDraft,
 };
+use weaver_server_core::post_processing::listing::{
+    DiscoveredScript, ScriptListing, ScriptProblem,
+};
+use weaver_server_core::post_processing::model::{
+    GlobalScriptsRun, OptionValue, PostProcessingSettings, ScriptAdapter, ScriptName, ScriptOption,
+    ScriptOptionType, ScriptResult, ScriptSelectValue,
+};
+use weaver_server_core::post_processing::output::ScriptRun;
+use weaver_server_core::post_processing::preset::ScriptPreset;
+use weaver_server_core::post_processing::secrets::{Secret, SecretRef};
+use weaver_server_core::post_processing::test_run::ScriptTestSnapshot;
 
-/// Placeholder shown instead of a stored secret. Secrets leave the process only
-/// as environment values for the script that declared them.
+// Placeholder shown instead of a stored secret. Secrets leave the process only
+// as environment values for the script that declared them.
 pub const MASKED_SECRET: &str = "[REDACTED]";
 
 #[derive(Debug, Clone, SimpleObject)]
 pub struct PostProcessingSettingsGql {
+    pub event_script_timeout_seconds: u64,
+    pub file_downloaded_event_interval: i64,
+    /// The newest runs kept for each download (or each scan, schedule or feed
+    /// for runs that belong to no download).
+    pub script_output_runs_per_job: u32,
+    /// Failed runs kept beyond the newest, so failures stay inspectable.
+    pub script_output_failed_runs_per_job: u32,
     pub script_directory: String,
     pub execution_enabled: bool,
     pub concurrency: u8,
@@ -19,46 +35,92 @@ pub struct PostProcessingSettingsGql {
     pub python_interpreter: Option<String>,
     pub powershell_interpreter: Option<String>,
     pub batch_interpreter: Option<String>,
+    pub go_interpreter: Option<String>,
     pub unacceptable_extensions: Vec<String>,
     /// True when `WEAVER_STRICT_SECURITY` refuses script execution outright.
     pub strict_security_refuses_execution: bool,
-    /// Global default list plus every per-category override.
-    pub lists: ScriptListsGql,
+    /// Whether script jobs for every category also run for a category that has
+    /// script jobs of its own.
+    pub global_scripts_run: GlobalScriptsRunGql,
+}
+
+/// When script jobs that are not narrowed to a category run.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Enum)]
+#[graphql(name = "GlobalScriptsRun")]
+pub enum GlobalScriptsRunGql {
+    /// For every download, ahead of the ones for its category.
+    Always,
+    /// Only for a download whose category has no script jobs of its own.
+    OnlyWithoutCategoryScripts,
+}
+
+impl From<GlobalScriptsRun> for GlobalScriptsRunGql {
+    fn from(value: GlobalScriptsRun) -> Self {
+        match value {
+            GlobalScriptsRun::Always => Self::Always,
+            GlobalScriptsRun::OnlyWithoutCategoryScripts => Self::OnlyWithoutCategoryScripts,
+        }
+    }
+}
+
+impl From<GlobalScriptsRunGql> for GlobalScriptsRun {
+    fn from(value: GlobalScriptsRunGql) -> Self {
+        match value {
+            GlobalScriptsRunGql::Always => Self::Always,
+            GlobalScriptsRunGql::OnlyWithoutCategoryScripts => Self::OnlyWithoutCategoryScripts,
+        }
+    }
 }
 
 impl PostProcessingSettingsGql {
     pub fn from_settings(
         value: PostProcessingSettings,
-        lists: ScriptLists,
         script_directory: impl Into<String>,
         strict_security: bool,
     ) -> Self {
         Self {
             script_directory: script_directory.into(),
+            event_script_timeout_seconds: value.event_scripts.event_script_timeout_seconds,
+            file_downloaded_event_interval: value.event_scripts.file_downloaded_event_interval,
+            script_output_runs_per_job: value.event_scripts.script_output_runs_per_job,
+            script_output_failed_runs_per_job: value
+                .event_scripts
+                .script_output_failed_runs_per_job,
             execution_enabled: value.execution_enabled,
             concurrency: value.concurrency,
             termination_grace_seconds: value.termination_grace_seconds,
             python_interpreter: value.python_interpreter,
             powershell_interpreter: value.powershell_interpreter,
             batch_interpreter: value.batch_interpreter,
+            go_interpreter: value.go_interpreter,
             unacceptable_extensions: value.unacceptable_extensions,
             strict_security_refuses_execution: strict_security,
-            lists: lists.into(),
+            global_scripts_run: value.global_scripts_run.into(),
         }
     }
 }
 
 #[derive(Debug, Clone, InputObject)]
 pub struct PostProcessingSettingsInput {
+    pub event_script_timeout_seconds: Option<u64>,
+    pub file_downloaded_event_interval: Option<i64>,
+    /// Lowering it deletes older runs soon after the save. Omission keeps it.
+    pub script_output_runs_per_job: Option<u32>,
+    /// Lowering it deletes older failed runs soon after the save. Omission
+    /// keeps it.
+    pub script_output_failed_runs_per_job: Option<u32>,
     pub execution_enabled: bool,
     pub concurrency: u8,
     pub termination_grace_seconds: u64,
     pub python_interpreter: Option<String>,
     pub powershell_interpreter: Option<String>,
     pub batch_interpreter: Option<String>,
+    pub go_interpreter: Option<String>,
     /// Omission preserves the existing policy; a supplied empty list disables
     /// it. `null` is deliberately distinguishable and refused by the mutation.
     pub unacceptable_extensions: MaybeUndefined<Vec<String>>,
+    /// Omission keeps the present choice.
+    pub global_scripts_run: Option<GlobalScriptsRunGql>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Enum)]
@@ -108,8 +170,6 @@ pub struct ScriptOptionGql {
     pub required: bool,
     /// Manifest default, already masked when the option is secret.
     pub default_value: Option<String>,
-    /// Operator-supplied value, masked when the option is secret.
-    pub value: Option<String>,
 }
 
 fn select_text(value: &ScriptSelectValue) -> String {
@@ -129,11 +189,7 @@ pub fn option_value_text(value: &OptionValue) -> String {
     }
 }
 
-fn script_option_gql(declaration: &ScriptOption, stored: &[ResolvedOption]) -> ScriptOptionGql {
-    let value = stored
-        .iter()
-        .find(|option| option.name() == declaration.name())
-        .map(|option| option_value_text(option.value()));
+fn script_option_gql(declaration: &ScriptOption) -> ScriptOptionGql {
     ScriptOptionGql {
         name: declaration.name().as_str().to_string(),
         section: declaration.section().map(str::to_string),
@@ -143,7 +199,6 @@ fn script_option_gql(declaration: &ScriptOption, stored: &[ResolvedOption]) -> S
         select: declaration.select().iter().map(select_text).collect(),
         required: declaration.required(),
         default_value: declaration.default().map(option_value_text),
-        value,
     }
 }
 
@@ -152,22 +207,49 @@ pub struct ScriptGql {
     pub name: String,
     pub display_name: String,
     pub adapter: ScriptAdapterGql,
+    pub kinds: Vec<ScriptKindGql>,
+    pub queue_events: Vec<QueueEventGql>,
+    pub task_times: Vec<String>,
     pub version: Option<String>,
+    /// What the header declares about each input, for drawing a form.
     pub options: Vec<ScriptOptionGql>,
+    /// What the header offers as a starting point for a script job.
+    pub preset: ScriptPresetGql,
 }
 
 impl ScriptGql {
-    pub fn new(script: &DiscoveredScript, stored_options: &[ResolvedOption]) -> Self {
+    pub fn new(script: &DiscoveredScript) -> Self {
         Self {
+            preset: ScriptPreset::of(&script.manifest).into(),
             name: script.name.as_str().to_string(),
             display_name: script.manifest.display_name().to_string(),
             adapter: script.manifest.adapter().into(),
+            kinds: script
+                .manifest
+                .kinds()
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
+            queue_events: script
+                .manifest
+                .queue_events()
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
+            task_times: script
+                .manifest
+                .task_times()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             version: script.manifest.version().map(str::to_string),
             options: script
                 .manifest
                 .options()
                 .iter()
-                .map(|declaration| script_option_gql(declaration, stored_options))
+                .map(script_option_gql)
                 .collect(),
         }
     }
@@ -196,141 +278,408 @@ pub struct ScriptListingGql {
     pub problems: Vec<ScriptProblemGql>,
 }
 
+/// One saved input: a value, a link to a named secret, or a secret of the
+/// script job's own. A secret's value is never read back out.
 #[derive(Debug, Clone, SimpleObject)]
-pub struct ScriptListEntryGql {
-    pub script: String,
-    pub enabled: bool,
-    pub timeout_seconds: Option<u64>,
+#[graphql(name = "ScriptInstanceValue")]
+pub struct ScriptInstanceValueGql {
+    pub name: String,
+    /// Empty when the input is a secret, linked or the script job's own.
+    pub value: String,
+    /// The named secret the input is linked to, or null.
+    pub secret: Option<SecretRefGql>,
+    /// The input is a secret of the script job's own: kept encrypted with the
+    /// script job, write-only, and not among the named secrets.
+    pub sealed: bool,
 }
 
-impl From<&ScriptListEntry> for ScriptListEntryGql {
-    fn from(value: &ScriptListEntry) -> Self {
+/// A named secret an input is linked to.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "SecretRef")]
+pub struct SecretRefGql {
+    pub id: String,
+    pub name: String,
+}
+
+impl From<SecretRef> for SecretRefGql {
+    fn from(value: SecretRef) -> Self {
         Self {
-            script: value.script.as_str().to_string(),
-            enabled: value.enabled,
-            timeout_seconds: value.timeout_seconds,
+            id: value.id,
+            name: value.name,
         }
     }
 }
 
+/// A script job that links a secret.
 #[derive(Debug, Clone, SimpleObject)]
-pub struct ScriptCategoryListGql {
-    pub category: String,
-    pub entries: Vec<ScriptListEntryGql>,
+#[graphql(name = "ScriptInstanceRef")]
+pub struct ScriptInstanceRefGql {
+    pub id: String,
+    pub name: String,
 }
 
+/// A value kept encrypted under its own name, for script inputs to link.
+/// The value is write-only.
 #[derive(Debug, Clone, SimpleObject)]
-pub struct ScriptListsGql {
-    pub global: Vec<ScriptListEntryGql>,
-    pub categories: Vec<ScriptCategoryListGql>,
+#[graphql(name = "Secret")]
+pub struct SecretGql {
+    pub id: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// The script jobs that link it, by name.
+    pub used_by: Vec<ScriptInstanceRefGql>,
 }
 
-impl From<ScriptLists> for ScriptListsGql {
-    fn from(value: ScriptLists) -> Self {
+fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(ms).single().unwrap_or_default()
+}
+
+impl From<Secret> for SecretGql {
+    fn from(value: Secret) -> Self {
         Self {
-            global: value.global.entries().iter().map(Into::into).collect(),
-            categories: value
-                .categories
-                .iter()
-                .map(|(category, list)| ScriptCategoryListGql {
-                    category: category.clone(),
-                    entries: list.entries().iter().map(Into::into).collect(),
+            id: value.id,
+            name: value.name,
+            created_at: ms_to_datetime(value.created_at_ms),
+            updated_at: ms_to_datetime(value.updated_at_ms),
+            used_by: value
+                .used_by
+                .into_iter()
+                .map(|usage| ScriptInstanceRefGql {
+                    id: usage.instance_id,
+                    name: usage.instance_name,
                 })
                 .collect(),
         }
     }
 }
 
-#[derive(Debug, Clone, InputObject)]
-pub struct ScriptListEntryInput {
-    pub script: String,
-    #[graphql(default = true)]
-    pub enabled: bool,
-    pub timeout_seconds: Option<u64>,
+/// One input a script's header declares, at its default. A secret input has
+/// no value: it is filled by linking a secret.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptPresetValue")]
+pub struct ScriptPresetValueGql {
+    pub name: String,
+    pub value: String,
+    pub secret: bool,
 }
 
-#[derive(Debug, Clone, InputObject)]
-pub struct ScriptCategoryListInput {
-    pub category: String,
-    pub entries: Vec<ScriptListEntryInput>,
+/// A trigger a script's header declares.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptPresetTrigger")]
+pub struct ScriptPresetTriggerGql {
+    pub trigger: ScriptKindGql,
+    /// Set when `trigger` is `QUEUE`.
+    pub queue_event: Option<QueueEventGql>,
 }
 
-#[derive(Debug, Clone, InputObject)]
-pub struct ScriptListsInput {
-    #[graphql(default)]
-    pub global: Vec<ScriptListEntryInput>,
-    #[graphql(default)]
-    pub categories: Vec<ScriptCategoryListInput>,
+/// What a script's header offers as a starting point. It fills a form and
+/// nothing more: a saved script job never follows the header.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptPreset")]
+pub struct ScriptPresetGql {
+    /// One per script job the header asks for.
+    pub triggers: Vec<ScriptPresetTriggerGql>,
+    /// When a schedule script job is meant to run.
+    pub task_times: Vec<String>,
+    /// Every declared input at its default. A secret has no value.
+    pub inputs: Vec<ScriptPresetValueGql>,
 }
 
-fn script_list(entries: Vec<ScriptListEntryInput>) -> Result<ScriptList, String> {
-    let entries = entries
-        .into_iter()
-        .map(|entry| {
-            Ok(ScriptListEntry {
-                script: ScriptName::new(entry.script).map_err(|error| error.to_string())?,
-                enabled: entry.enabled,
-                timeout_seconds: entry.timeout_seconds,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    ScriptList::new(entries).map_err(|error| error.to_string())
+fn trigger_parts(trigger: InstanceTrigger) -> (ScriptKindGql, Option<QueueEventGql>) {
+    let event = match trigger {
+        InstanceTrigger::Queue(event) => Some(event.into()),
+        _ => None,
+    };
+    (trigger.kind().into(), event)
 }
 
-impl ScriptListsInput {
-    pub(crate) fn into_domain(self) -> Result<ScriptLists, String> {
-        let mut categories = std::collections::BTreeMap::new();
-        for entry in self.categories {
-            let category = entry.category.trim().to_string();
-            if category.is_empty() {
-                return Err("category name cannot be empty".to_string());
-            }
-            if categories
-                .insert(category, script_list(entry.entries)?)
-                .is_some()
-            {
-                return Err("category appears more than once".to_string());
-            }
+impl From<ScriptPreset> for ScriptPresetGql {
+    fn from(value: ScriptPreset) -> Self {
+        Self {
+            triggers: value
+                .triggers
+                .into_iter()
+                .map(|trigger| {
+                    let (trigger, queue_event) = trigger_parts(trigger);
+                    ScriptPresetTriggerGql {
+                        trigger,
+                        queue_event,
+                    }
+                })
+                .collect(),
+            task_times: value.task_times.iter().map(ToString::to_string).collect(),
+            inputs: value
+                .inputs
+                .into_iter()
+                .map(|input| ScriptPresetValueGql {
+                    value: if input.secret {
+                        String::new()
+                    } else {
+                        input.value
+                    },
+                    name: input.name,
+                    secret: input.secret,
+                })
+                .collect(),
         }
-        Ok(ScriptLists {
-            global: script_list(self.global)?,
-            categories,
+    }
+}
+
+/// A script wired to one trigger, with the inputs and run policy saved for it.
+/// What is saved here is what runs.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptInstance")]
+pub struct ScriptInstanceGql {
+    pub id: String,
+    pub name: String,
+    pub script: String,
+    pub trigger: ScriptKindGql,
+    /// Set when `trigger` is `QUEUE`.
+    pub queue_event: Option<QueueEventGql>,
+    pub inputs: Vec<ScriptInstanceValueGql>,
+    /// Empty runs for every category. Only post-processing and queue script jobs
+    /// can be narrowed.
+    pub categories: Vec<String>,
+    pub enabled: bool,
+    /// Whether whatever raised the trigger waits for the script. One that is
+    /// not waited for is started and left to finish on its own, and its result
+    /// changes nothing.
+    pub blocking: bool,
+    /// Null runs under the default timeout of its trigger.
+    pub timeout_seconds: Option<u64>,
+    /// When a schedule script job runs. Empty for every other trigger.
+    pub schedule: ScriptInstanceScheduleGql,
+    pub run_order: i64,
+    /// Why the script cannot run as things stand, such as its file having gone
+    /// from the scripts directory. Null when it can.
+    pub script_problem: Option<String>,
+    /// The script's header no longer declares the inputs this script job holds.
+    pub header_drift: bool,
+}
+
+/// When a schedule script job runs.
+#[derive(Debug, Clone, Default, SimpleObject, InputObject)]
+#[graphql(
+    name = "ScriptInstanceSchedule",
+    input_name = "ScriptInstanceScheduleInput"
+)]
+pub struct ScriptInstanceScheduleGql {
+    /// `mon` to `sun`. Empty runs every day.
+    #[graphql(default)]
+    pub days: Vec<String>,
+    /// Each `HH:MM`, or `*:MM` for that minute of every hour.
+    #[graphql(default)]
+    pub times: Vec<String>,
+    /// Also run once each time Weaver starts.
+    #[graphql(default)]
+    pub run_at_startup: bool,
+}
+
+impl From<weaver_server_core::post_processing::instances::InstanceSchedule>
+    for ScriptInstanceScheduleGql
+{
+    fn from(schedule: weaver_server_core::post_processing::instances::InstanceSchedule) -> Self {
+        Self {
+            days: schedule
+                .days
+                .iter()
+                .map(|day| day.as_str().to_string())
+                .collect(),
+            times: schedule.times,
+            run_at_startup: schedule.run_at_startup,
+        }
+    }
+}
+
+impl TryFrom<ScriptInstanceScheduleGql>
+    for weaver_server_core::post_processing::instances::InstanceSchedule
+{
+    type Error = String;
+
+    fn try_from(schedule: ScriptInstanceScheduleGql) -> Result<Self, String> {
+        let days = schedule
+            .days
+            .iter()
+            .map(|day| {
+                weaver_server_core::bandwidth::Weekday::parse(&day.trim().to_lowercase())
+                    .ok_or_else(|| format!("'{day}' is not a day; use mon to sun"))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            days,
+            times: schedule.times,
+            run_at_startup: schedule.run_at_startup,
         })
     }
 }
 
-#[derive(Debug, Clone, InputObject)]
-pub struct ScriptOptionInput {
-    pub name: String,
-    pub option_type: ScriptOptionTypeGql,
-    pub value: String,
+// The scripts directory as it is now, for judging saved script jobs against.
+pub(crate) struct ScriptDirectoryView {
+    listing: Result<ScriptListing, String>,
 }
 
-impl ScriptOptionInput {
-    pub(crate) fn into_domain(self) -> Result<ResolvedOption, String> {
-        let name = OptionName::new(self.name).map_err(|error| error.to_string())?;
-        let value = match self.option_type {
-            ScriptOptionTypeGql::String => OptionValue::String(self.value),
-            ScriptOptionTypeGql::Integer => OptionValue::Integer(
-                self.value
-                    .parse()
-                    .map_err(|_| "invalid integer option value".to_string())?,
-            ),
-            ScriptOptionTypeGql::Number => OptionValue::Number(
-                self.value
-                    .parse()
-                    .map_err(|_| "invalid numeric option value".to_string())?,
-            ),
-            ScriptOptionTypeGql::Boolean => OptionValue::Boolean(
-                self.value
-                    .parse()
-                    .map_err(|_| "invalid boolean option value".to_string())?,
-            ),
-            ScriptOptionTypeGql::Secret => {
-                OptionValue::Secret(SecretOptionValue::from_admin_input(self.value))
-            }
+impl ScriptDirectoryView {
+    pub(crate) fn new(listing: Result<ScriptListing, String>) -> Self {
+        Self { listing }
+    }
+
+    pub(crate) fn instance(&self, instance: ScriptInstance) -> ScriptInstanceGql {
+        let (script_problem, header_drift) = match &self.listing {
+            Err(error) => (Some(error.clone()), false),
+            Ok(listing) => match listing
+                .scripts
+                .iter()
+                .find(|script| script.name == instance.script)
+            {
+                Some(script) => (
+                    None,
+                    ScriptPreset::of(&script.manifest).drifted_from(&instance),
+                ),
+                None => (
+                    Some(
+                        listing
+                            .problems
+                            .iter()
+                            .find(|problem| problem.name == instance.script.as_str())
+                            .map(|problem| problem.message.clone())
+                            .unwrap_or_else(|| {
+                                "the script is no longer in the scripts directory".to_string()
+                            }),
+                    ),
+                    false,
+                ),
+            },
         };
-        Ok(ResolvedOption::new(name, value))
+        let (trigger, queue_event) = trigger_parts(instance.trigger);
+        ScriptInstanceGql {
+            id: instance.id,
+            name: instance.name,
+            script: instance.script.as_str().to_string(),
+            trigger,
+            queue_event,
+            inputs: instance
+                .inputs
+                .into_iter()
+                .map(|input| ScriptInstanceValueGql {
+                    name: input.name.as_str().to_string(),
+                    value: if input.is_secret() {
+                        String::new()
+                    } else {
+                        input.value
+                    },
+                    secret: input.secret.map(Into::into),
+                    sealed: input.sealed,
+                })
+                .collect(),
+            categories: instance.categories,
+            enabled: instance.enabled,
+            blocking: instance.blocking,
+            timeout_seconds: instance.timeout_seconds,
+            schedule: instance.schedule.into(),
+            run_order: instance.run_order,
+            script_problem,
+            header_drift,
+        }
+    }
+}
+
+#[derive(Clone, InputObject)]
+#[graphql(name = "ScriptInstanceValueInput")]
+pub struct ScriptInstanceValueInput {
+    pub name: String,
+    /// A plain value, or with `secret` the value to keep as a secret of the
+    /// script job's own. Give this or `secretId`, not both.
+    pub value: Option<String>,
+    /// The named secret to link. Give this or `value`, not both, and never
+    /// with `secret`.
+    pub secret_id: Option<String>,
+    /// True makes the input a secret of the script job's own: `value` is kept
+    /// encrypted with the script job, is never read back, and does not become a
+    /// named secret. On an update, true with no `value` keeps the secret the
+    /// script job already holds under this name. Omitted means false.
+    pub secret: Option<bool>,
+}
+
+// A value sent to be kept as a secret is not printed.
+impl std::fmt::Debug for ScriptInstanceValueInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match &self.value {
+            Some(_) if self.secret == Some(true) => Some("<sealed>"),
+            value => value.as_deref(),
+        };
+        formatter
+            .debug_struct("ScriptInstanceValueInput")
+            .field("name", &self.name)
+            .field("value", &value)
+            .field("secret_id", &self.secret_id)
+            .field("secret", &self.secret)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, InputObject)]
+#[graphql(name = "ScriptInstanceInput")]
+pub struct ScriptInstanceInput {
+    /// Empty takes the script's name.
+    #[graphql(default)]
+    pub name: String,
+    pub script: String,
+    pub trigger: ScriptKindGql,
+    /// Required when `trigger` is `QUEUE`, ignored otherwise.
+    pub queue_event: Option<QueueEventGql>,
+    #[graphql(default)]
+    pub inputs: Vec<ScriptInstanceValueInput>,
+    /// Empty runs for every category.
+    #[graphql(default)]
+    pub categories: Vec<String>,
+    #[graphql(default = true)]
+    pub enabled: bool,
+    #[graphql(default = true)]
+    pub blocking: bool,
+    pub timeout_seconds: Option<u64>,
+    /// When a schedule script job runs; ignored for every other trigger.
+    /// Omitted on an update, the saved one is kept.
+    pub schedule: Option<ScriptInstanceScheduleGql>,
+}
+
+impl ScriptInstanceInput {
+    pub(crate) fn into_draft(self) -> Result<ScriptInstanceDraft, String> {
+        let trigger = match self.trigger {
+            ScriptKindGql::PostProcessing => InstanceTrigger::PostProcessing,
+            ScriptKindGql::Queue => InstanceTrigger::Queue(
+                self.queue_event
+                    .ok_or("a queue instance needs the event it runs on")?
+                    .into(),
+            ),
+            ScriptKindGql::Scan => InstanceTrigger::Scan,
+            ScriptKindGql::Scheduler => InstanceTrigger::Schedule,
+            ScriptKindGql::Feed => InstanceTrigger::Feed,
+        };
+        Ok(ScriptInstanceDraft {
+            name: self.name,
+            script: ScriptName::new(self.script).map_err(|error| error.to_string())?,
+            trigger,
+            inputs: self
+                .inputs
+                .into_iter()
+                .map(|input| InstanceInputDraft {
+                    name: input.name,
+                    value: input.value,
+                    secret_id: input.secret_id,
+                    sealed: input.secret.unwrap_or(false),
+                })
+                .collect(),
+            categories: self.categories,
+            enabled: self.enabled,
+            blocking: self.blocking,
+            timeout_seconds: self.timeout_seconds,
+            schedule: self
+                .schedule
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
+        })
     }
 }
 
@@ -342,6 +691,7 @@ pub enum ScriptStatusGql {
     Failed,
     TimedOut,
     Cancelled,
+    Interrupted,
 }
 
 impl From<weaver_server_core::post_processing::model::ScriptStatus> for ScriptStatusGql {
@@ -354,13 +704,37 @@ impl From<weaver_server_core::post_processing::model::ScriptStatus> for ScriptSt
             ScriptStatus::Failed => Self::Failed,
             ScriptStatus::TimedOut => Self::TimedOut,
             ScriptStatus::Cancelled => Self::Cancelled,
+            ScriptStatus::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
+impl From<ScriptStatusGql> for weaver_server_core::post_processing::model::ScriptStatus {
+    fn from(value: ScriptStatusGql) -> Self {
+        match value {
+            ScriptStatusGql::Succeeded => Self::Succeeded,
+            ScriptStatusGql::Skipped => Self::Skipped,
+            ScriptStatusGql::Warning => Self::Warning,
+            ScriptStatusGql::Failed => Self::Failed,
+            ScriptStatusGql::TimedOut => Self::TimedOut,
+            ScriptStatusGql::Cancelled => Self::Cancelled,
+            ScriptStatusGql::Interrupted => Self::Interrupted,
         }
     }
 }
 
 #[derive(Debug, Clone, SimpleObject)]
 pub struct ScriptResultGql {
+    pub output_id: Option<String>,
+    pub output_retained: bool,
     pub script: String,
+    /// The script job that ran, when the run came from one.
+    pub instance_id: Option<String>,
+    /// The script job's name as it was when it ran.
+    pub instance_name: Option<String>,
+    pub event: String,
+    /// The run was started without anything waiting for it.
+    pub background: bool,
     pub adapter: ScriptAdapterGql,
     pub status: ScriptStatusGql,
     pub exit_code: Option<i32>,
@@ -374,7 +748,13 @@ pub struct ScriptResultGql {
 impl From<ScriptResult> for ScriptResultGql {
     fn from(value: ScriptResult) -> Self {
         Self {
+            output_id: value.output_id,
+            output_retained: false,
             script: value.script.as_str().to_string(),
+            instance_id: value.instance_id,
+            instance_name: value.instance_name,
+            event: value.event.to_string(),
+            background: value.background,
             adapter: value.adapter.into(),
             status: value.status.into(),
             exit_code: value.exit_code,
@@ -384,5 +764,253 @@ impl From<ScriptResult> for ScriptResultGql {
             error_message: value.error_message,
             finished_at_epoch_ms: value.finished_at_epoch_ms,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Enum)]
+#[graphql(name = "ScriptKind")]
+pub enum ScriptKindGql {
+    PostProcessing,
+    Queue,
+    Scan,
+    Scheduler,
+    Feed,
+}
+
+/// One recorded run of a script, whatever started it.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptRun")]
+pub struct ScriptRunGql {
+    /// Names the run's kept output for `scriptOutput`, when `outputRetained`.
+    pub id: String,
+    pub job_id: Option<u64>,
+    /// Known once the job has reached history.
+    pub job_name: Option<String>,
+    pub script: String,
+    /// The script job that ran, when the run came from one.
+    pub instance_id: Option<String>,
+    /// The script job's name as it was when it ran.
+    pub instance_name: Option<String>,
+    pub event: String,
+    pub kind: ScriptKindGql,
+    /// The run was started without anything waiting for it.
+    pub background: bool,
+    pub adapter: ScriptAdapterGql,
+    pub status: ScriptStatusGql,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    pub output_tail: String,
+    pub output_truncated: bool,
+    pub output_retained: bool,
+    pub error_message: Option<String>,
+    pub finished_at_epoch_ms: i64,
+}
+
+impl From<ScriptRun> for ScriptRunGql {
+    fn from(value: ScriptRun) -> Self {
+        let result = value.result;
+        Self {
+            id: value.id,
+            job_id: value.job_id,
+            job_name: value.job_name,
+            script: result.script.as_str().to_string(),
+            instance_id: result.instance_id,
+            instance_name: result.instance_name,
+            kind: result.event.kind().into(),
+            event: result.event.to_string(),
+            background: result.background,
+            adapter: result.adapter.into(),
+            status: result.status.into(),
+            exit_code: result.exit_code,
+            duration_ms: result.duration_ms,
+            output_tail: result.output_tail,
+            output_truncated: result.output_truncated,
+            output_retained: value.output_retained,
+            error_message: result.error_message,
+            finished_at_epoch_ms: result.finished_at_epoch_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptRunPage")]
+pub struct ScriptRunPageGql {
+    /// Latest first.
+    pub runs: Vec<ScriptRunGql>,
+    /// Pass as `before` for the runs that follow; absent on the last page.
+    pub next_before: Option<String>,
+    /// How many runs the filter matches across every page.
+    pub total: u64,
+    /// How the runs the filter matches ended, leaving its own `status` out.
+    /// A status no run ended with is absent.
+    pub status_counts: Vec<ScriptRunStatusCountGql>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptRunStatusCount")]
+pub struct ScriptRunStatusCountGql {
+    pub status: ScriptStatusGql,
+    pub count: u64,
+}
+
+impl From<ScriptKindGql> for weaver_server_core::post_processing::model::ScriptKind {
+    fn from(value: ScriptKindGql) -> Self {
+        match value {
+            ScriptKindGql::PostProcessing => Self::PostProcessing,
+            ScriptKindGql::Queue => Self::Queue,
+            ScriptKindGql::Scan => Self::Scan,
+            ScriptKindGql::Scheduler => Self::Scheduler,
+            ScriptKindGql::Feed => Self::Feed,
+        }
+    }
+}
+
+impl From<weaver_server_core::post_processing::model::ScriptKind> for ScriptKindGql {
+    fn from(value: weaver_server_core::post_processing::model::ScriptKind) -> Self {
+        use weaver_server_core::post_processing::model::ScriptKind;
+        match value {
+            ScriptKind::PostProcessing => Self::PostProcessing,
+            ScriptKind::Queue => Self::Queue,
+            ScriptKind::Scan => Self::Scan,
+            ScriptKind::Scheduler => Self::Scheduler,
+            ScriptKind::Feed => Self::Feed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Enum)]
+#[graphql(name = "ScriptQueueEvent")]
+pub enum QueueEventGql {
+    FileDownloaded,
+    UrlCompleted,
+    NzbMarked,
+    NzbAdded,
+    NzbNamed,
+    NzbDownloaded,
+    NzbDeleted,
+}
+
+impl From<weaver_server_core::post_processing::model::QueueEvent> for QueueEventGql {
+    fn from(value: weaver_server_core::post_processing::model::QueueEvent) -> Self {
+        use weaver_server_core::post_processing::model::QueueEvent;
+        match value {
+            QueueEvent::FileDownloaded => Self::FileDownloaded,
+            QueueEvent::UrlCompleted => Self::UrlCompleted,
+            QueueEvent::NzbMarked => Self::NzbMarked,
+            QueueEvent::NzbAdded => Self::NzbAdded,
+            QueueEvent::NzbNamed => Self::NzbNamed,
+            QueueEvent::NzbDownloaded => Self::NzbDownloaded,
+            QueueEvent::NzbDeleted => Self::NzbDeleted,
+        }
+    }
+}
+
+impl From<QueueEventGql> for weaver_server_core::post_processing::model::QueueEvent {
+    fn from(value: QueueEventGql) -> Self {
+        match value {
+            QueueEventGql::FileDownloaded => Self::FileDownloaded,
+            QueueEventGql::UrlCompleted => Self::UrlCompleted,
+            QueueEventGql::NzbMarked => Self::NzbMarked,
+            QueueEventGql::NzbAdded => Self::NzbAdded,
+            QueueEventGql::NzbNamed => Self::NzbNamed,
+            QueueEventGql::NzbDownloaded => Self::NzbDownloaded,
+            QueueEventGql::NzbDeleted => Self::NzbDeleted,
+        }
+    }
+}
+
+/// One variable made up for a script under test.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptTestInput")]
+pub struct ScriptTestInputGql {
+    pub name: String,
+    pub value: String,
+}
+
+/// A script job run against made-up inputs, as it stands.
+#[derive(Debug, Clone, SimpleObject)]
+#[graphql(name = "ScriptTestRun")]
+pub struct ScriptTestRunGql {
+    pub id: String,
+    pub instance_id: String,
+    pub instance_name: String,
+    pub script: String,
+    pub event: String,
+    pub kind: ScriptKindGql,
+    pub adapter: ScriptAdapterGql,
+    pub started_at_epoch_ms: i64,
+    /// The run is ended after this long.
+    pub timeout_seconds: u64,
+    /// False once the script has ended, when `status` is set.
+    pub running: bool,
+    pub status: Option<ScriptStatusGql>,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+    pub error_message: Option<String>,
+    /// What the script has printed so far, or all of it once the run has ended.
+    pub log: String,
+    pub log_truncated: bool,
+    /// The variables made up for this run, in name order. The script job's own
+    /// inputs are left out.
+    pub inputs: Vec<ScriptTestInputGql>,
+    /// The arguments made up for this run, in order.
+    pub arguments: Vec<String>,
+    /// Commands the script issued, in order. A test run applies none of them.
+    pub commands: Vec<String>,
+    pub commands_truncated: bool,
+}
+
+impl From<ScriptTestSnapshot> for ScriptTestRunGql {
+    fn from(value: ScriptTestSnapshot) -> Self {
+        let outcome = value.outcome;
+        Self {
+            id: value.id,
+            instance_id: value.instance_id,
+            instance_name: value.instance_name,
+            script: value.script.as_str().to_string(),
+            kind: value.event.kind().into(),
+            event: value.event.to_string(),
+            adapter: value.adapter.into(),
+            started_at_epoch_ms: value.started_at_epoch_ms,
+            timeout_seconds: value.timeout_seconds,
+            running: outcome.is_none(),
+            status: outcome.as_ref().map(|outcome| outcome.status.into()),
+            exit_code: outcome.as_ref().and_then(|outcome| outcome.exit_code),
+            duration_ms: outcome.as_ref().map(|outcome| outcome.duration_ms),
+            error_message: outcome.and_then(|outcome| outcome.error_message),
+            log: value.log,
+            log_truncated: value.log_truncated,
+            inputs: value
+                .inputs
+                .into_iter()
+                .map(|(name, value)| ScriptTestInputGql { name, value })
+                .collect(),
+            arguments: value.arguments,
+            commands: value.commands,
+            commands_truncated: value.commands_truncated,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ScriptInstanceValueInput;
+
+    #[test]
+    fn a_value_sent_to_be_kept_as_a_secret_is_not_printed() {
+        let sent = |secret| {
+            format!(
+                "{:?}",
+                ScriptInstanceValueInput {
+                    name: "Token".to_string(),
+                    value: Some("hunter2".to_string()),
+                    secret_id: None,
+                    secret,
+                }
+            )
+        };
+        assert!(!sent(Some(true)).contains("hunter2"));
+        assert!(sent(Some(false)).contains("hunter2"));
+        assert!(sent(None).contains("hunter2"));
     }
 }

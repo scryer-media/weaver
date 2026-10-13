@@ -249,13 +249,16 @@ async fn download_block_queryable_after_pause() {
     let h = TestHarness::new().await;
     h.execute("mutation { pauseAll }").await;
 
-    let resp = h.execute("{ downloadBlock { kind capEnabled } }").await;
+    let resp = h
+        .execute("{ downloadBlock { kind egressId egressName } }")
+        .await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
     // The mock scheduler's pauseAll only updates the paused flag, not the download block.
     // This test verifies the query is valid and returns correct types.
     assert!(data["downloadBlock"]["kind"].is_string());
-    assert!(data["downloadBlock"]["capEnabled"].is_boolean());
+    assert!(data["downloadBlock"]["egressId"].is_null());
+    assert!(data["downloadBlock"]["egressName"].is_null());
 }
 
 #[tokio::test]

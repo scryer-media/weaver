@@ -1,28 +1,174 @@
-//! An explicitly owned, revocable loopback bridge for socket-based consumers.
+// An explicitly owned, revocable loopback bridge for socket-based consumers.
 use crate::{NoopTunnelObserver, TunnelError, TunnelProvider, socks5::Socks5Front};
 use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
-/// Protocol-aware feedback for one connection, independent of other streams.
+type ReadCallback = Arc<dyn Fn(usize) + Send + Sync>;
+
+// Protocol-aware feedback for one connection, independent of other streams.
 #[derive(Default)]
 pub struct ConnectionOutcome {
-    failure: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    callbacks: Mutex<OutcomeCallbacks>,
+    reads: OnceLock<Arc<[ReadCallback]>>,
+}
+#[derive(Default)]
+struct OutcomeCallbacks {
+    failed: bool,
+    closed: bool,
+    retiring: bool,
+    failure: Vec<Box<dyn Fn() + Send + Sync>>,
+    close: Vec<Box<dyn Fn() + Send + Sync>>,
+    retire: Vec<Box<dyn Fn() + Send + Sync>>,
+    reads: Vec<ReadCallback>,
+    deliveries: Vec<Arc<dyn Fn(u64, Duration) + Send + Sync>>,
+    latencies: Vec<Arc<dyn Fn(Duration) + Send + Sync>>,
+}
+impl std::fmt::Debug for ConnectionOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionOutcome").finish_non_exhaustive()
+    }
 }
 impl ConnectionOutcome {
-    pub fn on_failure(&self, callback: impl Fn() + Send + Sync + 'static) {
-        *self.failure.lock().expect("connection outcome") = Some(Box::new(callback));
+    // Recall an idle socket now, or a busy socket at its next article boundary.
+    pub fn on_retire(&self, callback: impl Fn() + Send + Sync + 'static) {
+        let mut callbacks = self.callbacks.lock().expect("connection outcome");
+        if callbacks.retiring {
+            drop(callbacks);
+            callback();
+        } else if !callbacks.closed {
+            callbacks.retire.push(Box::new(callback));
+        }
     }
-    pub fn failed(&self) {
-        if let Some(callback) = self.failure.lock().expect("connection outcome").take() {
+    pub fn retire(&self) {
+        let callbacks = {
+            let mut callbacks = self.callbacks.lock().expect("connection outcome");
+            if callbacks.retiring || callbacks.closed {
+                return;
+            }
+            callbacks.retiring = true;
+            std::mem::take(&mut callbacks.retire)
+        };
+        for callback in callbacks {
             callback();
         }
+    }
+    pub fn on_body_latency(&self, callback: impl Fn(Duration) + Send + Sync + 'static) {
+        self.callbacks
+            .lock()
+            .expect("connection outcome")
+            .latencies
+            .push(Arc::new(callback));
+    }
+    pub fn body_latency(&self, elapsed: Duration) {
+        let callbacks = self
+            .callbacks
+            .lock()
+            .expect("connection outcome")
+            .latencies
+            .clone();
+        for callback in callbacks {
+            callback(elapsed);
+        }
+    }
+
+    // Register during connection setup, before the first read seals the callbacks.
+    pub fn on_read(&self, callback: impl Fn(usize) + Send + Sync + 'static) {
+        debug_assert!(
+            self.reads.get().is_none(),
+            "read callbacks register before I/O"
+        );
+        self.callbacks
+            .lock()
+            .expect("connection outcome")
+            .reads
+            .push(Arc::new(callback));
+    }
+    pub fn read(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let callbacks = self.reads.get_or_init(|| {
+            std::mem::take(&mut self.callbacks.lock().expect("connection outcome").reads).into()
+        });
+        for callback in callbacks.iter() {
+            callback(bytes);
+        }
+    }
+    pub fn on_delivery(&self, callback: impl Fn(u64, Duration) + Send + Sync + 'static) {
+        self.callbacks
+            .lock()
+            .expect("connection outcome")
+            .deliveries
+            .push(Arc::new(callback));
+    }
+    pub fn delivered(&self, bytes: u64, wire: Duration) {
+        let callbacks = self
+            .callbacks
+            .lock()
+            .expect("connection outcome")
+            .deliveries
+            .clone();
+        for callback in callbacks {
+            callback(bytes, wire);
+        }
+    }
+    pub fn on_failure(&self, callback: impl Fn() + Send + Sync + 'static) {
+        let mut callbacks = self.callbacks.lock().expect("connection outcome");
+        if callbacks.failed {
+            drop(callbacks);
+            callback();
+        } else if !callbacks.closed {
+            callbacks.failure.push(Box::new(callback));
+        }
+    }
+    pub fn on_close(&self, callback: impl Fn() + Send + Sync + 'static) {
+        let mut callbacks = self.callbacks.lock().expect("connection outcome");
+        if callbacks.closed {
+            drop(callbacks);
+            callback();
+        } else {
+            callbacks.close.push(Box::new(callback));
+        }
+    }
+    pub fn failed(&self) {
+        let callbacks = {
+            let mut callbacks = self.callbacks.lock().expect("connection outcome");
+            if callbacks.failed || callbacks.closed {
+                return;
+            }
+            callbacks.failed = true;
+            std::mem::take(&mut callbacks.failure)
+        };
+        for callback in callbacks {
+            callback();
+        }
+    }
+    // The socket owner reports closure independently of failure evidence.
+    pub fn closed(&self) {
+        let callbacks = {
+            let mut callbacks = self.callbacks.lock().expect("connection outcome");
+            if callbacks.closed {
+                return;
+            }
+            callbacks.closed = true;
+            callbacks.failure.clear();
+            std::mem::take(&mut callbacks.close)
+        };
+        for callback in callbacks {
+            callback();
+        }
+    }
+}
+impl Drop for ConnectionOutcome {
+    fn drop(&mut self) {
+        self.closed();
     }
 }
 pub(crate) type Outcomes = Arc<Mutex<HashMap<SocketAddr, Weak<ConnectionOutcome>>>>;
@@ -104,8 +250,8 @@ impl Bridge {
         }))
     }
 
-    /// Dial on the owning runtime and hand the stream directly to an in-process
-    /// consumer. Dropping this future cancels establishment; no relay is used.
+    // Dial on the owning runtime and hand the stream directly to an in-process
+    // consumer. Dropping this future cancels establishment; no relay is used.
     pub async fn dial(
         &self,
         host: &str,

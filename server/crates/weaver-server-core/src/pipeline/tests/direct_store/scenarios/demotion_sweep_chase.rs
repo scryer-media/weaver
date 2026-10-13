@@ -1,13 +1,13 @@
-//! A demoted set whose reconstruction sweep is still running, and the chase
-//! that set's handback could arm while it is.
+// A demoted set whose reconstruction sweep is still running, and the chase
+// that set's handback could arm while it is.
 
 use super::*;
 use crate::pipeline::direct_unpack::settings::{DirectUnpackGate, DirectUnpackSettings};
 use crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime;
 
-/// Two articles of one volume, the first carrying a damaged payload byte. The
-/// article's own CRC agrees with what was posted, so only the member's CRC —
-/// checked when the second article closes the chain — refuses the set.
+// Two articles of one volume, the first carrying a damaged payload byte. The
+// article's own CRC agrees with what was posted, so only the member's CRC —
+// checked when the second article closes the chain — refuses the set.
 fn damaged_single_volume_set(member_name: &str) -> Vec<(String, Vec<u8>)> {
     let payload: Vec<u8> = (0..3000u32).map(|index| (index % 181) as u8).collect();
     let mut volumes = single_member_store_set(member_name, &payload, 1);
@@ -16,8 +16,8 @@ fn damaged_single_volume_set(member_name: &str) -> Vec<(String, Vec<u8>)> {
     volumes
 }
 
-/// [`submit_volume_article`] without settling the demotion it may cause, so
-/// the test can hand the sweep's messages to the actor one at a time.
+// [`submit_volume_article`] without settling the demotion it may cause, so
+// the test can hand the sweep's messages to the actor one at a time.
 async fn decode_article_leaving_the_sweep_unsettled(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -75,8 +75,8 @@ async fn decode_article_leaving_the_sweep_unsettled(
     settle_direct_verification_read(pipeline, job_id).await;
 }
 
-/// Receives the sweep's next message and hands it to the actor, returning
-/// which volume it reported, or `None` for the finish.
+// Receives the sweep's next message and hands it to the actor, returning
+// which volume it reported, or `None` for the finish.
 async fn hand_back_next_swept_message(pipeline: &mut Pipeline) -> Option<u32> {
     let done = pipeline
         .direct_demotion_done_rx

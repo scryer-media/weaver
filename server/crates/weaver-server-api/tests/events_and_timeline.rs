@@ -194,3 +194,56 @@ async fn job_detail_snapshot_names_the_servers_that_served_an_archived_job() {
     assert_eq!(contributions[1]["serverId"].as_u64(), Some(stale_server_id));
     assert!(contributions[1]["serverHost"].is_null());
 }
+
+// A script's job event keeps its own kind; it is never reported as the job's
+// creation, and a kind the API does not name is left out rather than relabelled.
+#[tokio::test]
+async fn script_job_events_keep_their_own_kind() {
+    use weaver_server_core::post_processing::directives::ScriptLogLevel;
+    use weaver_server_core::post_processing::executor::SCRIPT_EVENT_KIND;
+
+    let h = TestHarness::new().await;
+    let job_id = 424_242;
+    let stored = [
+        (SCRIPT_EVENT_KIND, "POST_PROCESSING_SCRIPT"),
+        (ScriptLogLevel::Error.event_kind(), "SCRIPT_ERROR"),
+        (ScriptLogLevel::Warning.event_kind(), "SCRIPT_WARNING"),
+        (ScriptLogLevel::Info.event_kind(), "SCRIPT_OUTPUT"),
+        (ScriptLogLevel::Detail.event_kind(), "SCRIPT_DETAIL"),
+        (ScriptLogLevel::Debug.event_kind(), "SCRIPT_DEBUG"),
+    ];
+    let db = h.db.clone();
+    tokio::task::spawn_blocking(move || {
+        for (index, (kind, _)) in stored.iter().enumerate() {
+            db.insert_job_event(job_id, 1_000 + index as i64, kind, kind, None)
+                .unwrap();
+        }
+        db.insert_job_event(job_id, 2_000, "NotAKindTheApiNames", "unnamed", None)
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    for query in [
+        format!(r#"{{ jobEvents(jobId: {job_id}) {{ kind message }} }}"#),
+        format!(r#"{{ jobDetailSnapshot(jobId: {job_id}) {{ jobEvents {{ kind message }} }} }}"#),
+    ] {
+        let resp = h.execute(&query).await;
+        assert_no_errors(&resp);
+        let data = response_data(&resp);
+        let events = data["jobEvents"]
+            .as_array()
+            .or_else(|| data["jobDetailSnapshot"]["jobEvents"].as_array())
+            .unwrap();
+        let kinds: Vec<(&str, &str)> = events
+            .iter()
+            .map(|event| {
+                (
+                    event["message"].as_str().unwrap(),
+                    event["kind"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(kinds, stored.to_vec(), "{query}");
+    }
+}

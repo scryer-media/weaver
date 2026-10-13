@@ -1,4 +1,4 @@
-//! `tests` tests, part of a mechanical split of the original file.
+// `tests` tests, part of a mechanical split of the original file.
 
 use super::*;
 
@@ -494,6 +494,84 @@ async fn nzbget_append_accepts_arr_v16_base64_payload_and_preserves_drone() {
         jobs[0].metadata.iter().any(|(key, value)| key
             == weaver_server_api::PRIORITY_ATTRIBUTE_KEY
             && value == "HIGH")
+    );
+}
+
+#[tokio::test]
+async fn nzbget_append_takes_a_script_switch_as_a_plain_parameter_and_still_runs_instances() {
+    use base64::Engine as _;
+    use weaver_server_core::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
+    use weaver_server_core::post_processing::model::{ScriptEventLabel, ScriptName};
+
+    let db = Database::open_in_memory().unwrap();
+    let tidy = db
+        .create_script_instance(ScriptInstanceDraft {
+            categories: vec!["tv".into()],
+            ..ScriptInstanceDraft::new(
+                ScriptName::new("tidy.sh").unwrap(),
+                InstanceTrigger::PostProcessing,
+            )
+        })
+        .unwrap();
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        db.clone(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let nzb_b64 = base64::engine::general_purpose::STANDARD.encode(minimal_nzb("Switch.Release"));
+
+    // A client that once picked scripts per download sends `<name>:=no`.
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "append",
+            "params": [
+                "Switch.Release.nzb",
+                nzb_b64,
+                "tv",
+                0,
+                false,
+                false,
+                "",
+                0,
+                "all",
+                ["tidy.sh:", "no"]
+            ],
+            "id": "append"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["result"].as_u64().unwrap() >= 10_000);
+    let jobs = handle.list_jobs();
+    assert_eq!(jobs.len(), 1);
+    // Kept as the parameter it was sent as, and nothing more.
+    assert!(
+        jobs[0]
+            .metadata
+            .iter()
+            .any(|(key, value)| key == "tidy.sh:" && value == "no")
+    );
+    assert!(
+        jobs[0]
+            .metadata
+            .iter()
+            .all(|(key, _)| !key.contains("script_override")),
+        "{:?}",
+        jobs[0].metadata
+    );
+    // What runs for the download is still its category's instances.
+    assert_eq!(
+        db.script_instances_for(&ScriptEventLabel::PostProcessing, Some("tv"))
+            .unwrap()
+            .into_iter()
+            .map(|instance| instance.id)
+            .collect::<Vec<_>>(),
+        [tidy.id]
     );
 }
 
@@ -1077,6 +1155,68 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
 }
 
 #[tokio::test]
+async fn nzbget_history_reports_the_folder_named_after_the_original_title() {
+    let original = "Copper.Meadow.S11E42-E43.720p.HDTV.x264-GRP";
+    let metadata = vec![(
+        weaver_server_core::ingest::ORIGINAL_TITLE_METADATA_KEY.to_string(),
+        original.to_string(),
+    )];
+    let display = weaver_server_core::ingest::derive_release_name(Some(original), None);
+    let folder = weaver_server_core::ingest::completed_folder_name(&display, &metadata);
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&weaver_server_core::JobHistoryRow {
+        job_id: 110,
+        job_hash: None,
+        name: display.clone(),
+        status: "complete".into(),
+        error_message: None,
+        total_bytes: 123,
+        downloaded_bytes: 123,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: Some("tv".into()),
+        output_dir: Some(format!("/downloads/tv/{folder}")),
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: Some(serde_json::to_string(&metadata).unwrap()),
+        server_attribution: None,
+    })
+    .unwrap();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "history", "params": [], "id": "history"}),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let item = payload["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["ID"] == 110)
+        .unwrap();
+    assert_ne!(display, original);
+    for field in ["DestDir", "FinalDir"] {
+        let reported = item[field].as_str().unwrap();
+        assert!(
+            reported.ends_with(&format!("/{original}")),
+            "{field} = {reported}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn nzbget_history_includes_terminal_memory_items_missing_from_db() {
     let job = nzbget_test_job(
         202,
@@ -1241,6 +1381,165 @@ async fn nzbget_history_maps_cancelled_db_rows_to_manual_delete() {
     assert_eq!(item["HistoryTime"], 1_700_000_500);
 }
 
+fn nzbget_script_result(
+    instance_name: Option<&str>,
+    event: weaver_server_core::post_processing::model::ScriptEventLabel,
+    background: bool,
+    status: weaver_server_core::post_processing::model::ScriptStatus,
+) -> weaver_server_core::post_processing::model::ScriptResult {
+    use weaver_server_core::post_processing::model::{ScriptAdapter, ScriptName, ScriptResult};
+    ScriptResult {
+        script: ScriptName::new("hook.sh").unwrap(),
+        instance_id: instance_name.map(|_| "instance".to_string()),
+        instance_name: instance_name.map(str::to_string),
+        event,
+        output_id: None,
+        background,
+        adapter: ScriptAdapter::Nzbget,
+        status,
+        exit_code: Some(0),
+        duration_ms: 1,
+        output_tail: String::new(),
+        output_truncated: false,
+        error_message: None,
+        finished_at_epoch_ms: 1,
+    }
+}
+
+#[tokio::test]
+async fn nzbget_history_script_status_counts_only_blocking_post_processing() {
+    use weaver_server_core::post_processing::model::{
+        PostProcessingSummary, QueueEvent, ScriptEventLabel, ScriptStatus,
+    };
+    let db = Database::open_in_memory().unwrap();
+    let jobs: [(u64, Vec<_>); 6] = [
+        (
+            501,
+            vec![
+                nzbget_script_result(
+                    Some("Tidy up"),
+                    ScriptEventLabel::PostProcessing,
+                    false,
+                    ScriptStatus::Succeeded,
+                ),
+                nzbget_script_result(
+                    Some("Notify"),
+                    ScriptEventLabel::PostProcessing,
+                    true,
+                    ScriptStatus::Failed,
+                ),
+            ],
+        ),
+        (
+            502,
+            vec![nzbget_script_result(
+                None,
+                ScriptEventLabel::PostProcessing,
+                false,
+                ScriptStatus::Failed,
+            )],
+        ),
+        (
+            503,
+            vec![nzbget_script_result(
+                Some("On add"),
+                ScriptEventLabel::Queue(QueueEvent::NzbAdded),
+                false,
+                ScriptStatus::Failed,
+            )],
+        ),
+        (504, vec![]),
+        (
+            505,
+            vec![
+                nzbget_script_result(
+                    Some("Tidy up"),
+                    ScriptEventLabel::PostProcessing,
+                    false,
+                    ScriptStatus::Succeeded,
+                ),
+                nzbget_script_result(
+                    Some("Notify"),
+                    ScriptEventLabel::PostProcessing,
+                    false,
+                    ScriptStatus::Warning,
+                ),
+            ],
+        ),
+        (
+            506,
+            vec![nzbget_script_result(
+                Some("Tidy up"),
+                ScriptEventLabel::PostProcessing,
+                false,
+                ScriptStatus::Skipped,
+            )],
+        ),
+    ];
+    for (job_id, results) in &jobs {
+        db.insert_job_history(&nzbget_history_row(
+            *job_id,
+            "complete",
+            1_700_000_000 + *job_id as i64,
+            None,
+        ))
+        .unwrap();
+        if !results.is_empty() {
+            db.save_job_post_processing_results(*job_id, PostProcessingSummary::Succeeded, results)
+                .unwrap();
+        }
+    }
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        ApiKeyCache::default(),
+    );
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "history", "params": [], "id": "history-scripts"}),
+        "Bearer session-token",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let items = payload["result"].as_array().unwrap();
+    let item = |id: u64| items.iter().find(|item| item["ID"] == id).unwrap();
+    // The list holds the same runs the rollup counts: the fire-and-forget
+    // Notify run is not listed, so it cannot fail the download either.
+    assert_eq!(item(501)["ScriptStatus"], "SUCCESS");
+    assert_eq!(
+        item(501)["ScriptStatuses"],
+        serde_json::json!([{"Name": "Tidy up", "Status": "SUCCESS"}])
+    );
+    assert_eq!(item(502)["ScriptStatus"], "FAILURE");
+    assert_eq!(
+        item(502)["ScriptStatuses"],
+        serde_json::json!([{"Name": "hook.sh", "Status": "FAILURE"}])
+    );
+    // A queue-event script is not a post-processing script.
+    assert_eq!(item(503)["ScriptStatus"], "NONE");
+    assert_eq!(item(503)["ScriptStatuses"], serde_json::json!([]));
+    assert_eq!(item(504)["ScriptStatus"], "NONE");
+    assert_eq!(item(504)["ScriptStatuses"], serde_json::json!([]));
+    // A warning is a FAILURE in NZBGet, and one FAILURE fails the job.
+    assert_eq!(item(505)["ScriptStatus"], "FAILURE");
+    assert_eq!(
+        item(505)["ScriptStatuses"],
+        serde_json::json!([
+            {"Name": "Tidy up", "Status": "SUCCESS"},
+            {"Name": "Notify", "Status": "FAILURE"}
+        ])
+    );
+    // A skipped script is NONE, and a job whose only script skipped is NONE.
+    assert_eq!(item(506)["ScriptStatus"], "NONE");
+    assert_eq!(
+        item(506)["ScriptStatuses"],
+        serde_json::json!([{"Name": "Tidy up", "Status": "NONE"}])
+    );
+}
+
 #[tokio::test]
 async fn nzbget_history_repeat_poll_is_memo_transparent() {
     let db = Database::open_in_memory().unwrap();
@@ -1327,6 +1626,21 @@ async fn nzbget_config_exposes_real_categories_and_keep_history() {
     assert_eq!(value_for("Category1.Name"), "tv");
     assert_eq!(value_for("Category1.DestDir"), "/media/tv");
     assert_eq!(value_for("Category1.Aliases"), "series,shows");
+    assert_eq!(value_for("Category1.Unpack"), "yes");
+    // Sonarr and Radarr never read script entries, so none are sent.
+    for name in [
+        "Extensions",
+        "ScriptOrder",
+        "ScriptDir",
+        "EventInterval",
+        "Category1.Extensions",
+        "Category1.DefScript",
+    ] {
+        assert!(
+            entries.iter().all(|entry| entry["Name"] != name),
+            "{name} must not be emitted"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2630,6 +2944,7 @@ async fn nzbget_scheduleresume_persists_and_recovers_across_restart() {
 async fn nzbget_feed_bridge_exposes_weaver_rss() {
     let db = Database::open_in_memory().unwrap();
     db.insert_rss_feed(&weaver_server_core::RssFeedRow {
+        scripts: Vec::new(),
         id: 1,
         name: "indexer".into(),
         url: "https://indexer.example/rss".into(),
@@ -3050,6 +3365,7 @@ async fn resolve_scope_accepts_cached_api_key_without_db_lookup() {
 
 #[tokio::test]
 async fn login_handler_rejects_legacy_scrypt_hash() {
+    let _turn = login_turn().await;
     let db = Database::open_in_memory().unwrap();
     let legacy_hash =
         "$scrypt$ln=16,r=8,p=1$MDAwMDAwMDAwMDAwMDAwMA$MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA"
@@ -3081,6 +3397,7 @@ async fn login_handler_rejects_legacy_scrypt_hash() {
 
 #[tokio::test]
 async fn login_handler_wrong_password_keeps_argon2_hash_and_cache() {
+    let _turn = login_turn().await;
     let db = Database::open_in_memory().unwrap();
     let argon2_hash = hash_password(&test_password()).unwrap();
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
@@ -3111,6 +3428,7 @@ async fn login_handler_wrong_password_keeps_argon2_hash_and_cache() {
 
 #[tokio::test]
 async fn login_handler_wrong_username_with_valid_password_is_unauthorized() {
+    let _turn = login_turn().await;
     let db = Database::open_in_memory().unwrap();
     let argon2_hash = hash_password(&test_password()).unwrap();
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
@@ -3141,6 +3459,7 @@ async fn login_handler_wrong_username_with_valid_password_is_unauthorized() {
 
 #[tokio::test]
 async fn login_handler_rate_limits_repeated_failures() {
+    let _turn = login_turn().await;
     let db = Database::open_in_memory().unwrap();
     let argon2_hash = hash_password(&test_password()).unwrap();
     db.set_auth_credentials("admin", &argon2_hash).unwrap();
@@ -3196,6 +3515,7 @@ async fn login_handler_rate_limits_repeated_failures() {
 
 #[tokio::test]
 async fn login_handler_malformed_hash_fails_cleanly() {
+    let _turn = login_turn().await;
     let db = Database::open_in_memory().unwrap();
     db.set_auth_credentials("admin", "not-a-phc-hash").unwrap();
     let auth_cache = LoginAuthCache::from_credentials(
@@ -3615,4 +3935,67 @@ async fn job_output_file_download_handler_streams_history_file() {
     assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body, Bytes::from_static(b"video-bytes"));
+}
+
+#[tokio::test]
+async fn loadextensions_reports_all_declared_kinds_and_event_metadata() {
+    let db = Database::open_in_memory().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = db
+        .initialize_post_processing_script_directory(temp.path(), None)
+        .unwrap();
+    let package = root.join("events");
+    std::fs::create_dir(&package).unwrap();
+    std::fs::write(package.join("run.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::write(
+        package.join("manifest.json"),
+        serde_json::json!({
+        "name": "events", "main": "run.sh", "kind": "POST-PROCESSING/QUEUE/SCAN/SCHEDULER/FEED",
+        "displayName": "Events", "version": "1.0", "author": "Test fixture",
+        "homepage": "https://example.invalid", "license": "MIT", "about": "Event declarations",
+        "description": [], "requirements": [], "options": [],
+            "queueEvents": "NZB_DOWNLOADED,NZB_DELETED", "taskTime": "*:30;04:15"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let key = test_password();
+    let app = nzbget_test_router(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache(&key, "admin"),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/jsonrpc")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, basic_auth(&key))
+                .body(Body::from(
+                    serde_json::json!({"method": "loadextensions", "params": [true]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(payload["error"].is_null(), "{payload}");
+    let scripts = payload["result"].as_array().unwrap();
+    assert_eq!(scripts.len(), 1);
+    let script = &scripts[0];
+    for key in [
+        "PostScript",
+        "QueueScript",
+        "ScanScript",
+        "SchedulerScript",
+        "FeedScript",
+    ] {
+        assert_eq!(script[key], true, "{key}");
+    }
+    assert_eq!(script["QueueEvents"], "NZB_DOWNLOADED,NZB_DELETED");
+    assert_eq!(script["TaskTime"], "*:30;04:15");
 }

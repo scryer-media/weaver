@@ -2,7 +2,7 @@ use crate::StateError;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 
-/// A row in the `api_keys` table.
+// A row in the `api_keys` table.
 #[derive(Debug, Clone)]
 pub struct ApiKeyRow {
     pub id: i64,
@@ -20,7 +20,7 @@ pub struct ApiKeyAuthRow {
 }
 
 impl Database {
-    /// Insert a new API key. Returns the new row ID.
+    // Insert a new API key. Returns the new row ID.
     pub fn insert_api_key(
         &self,
         name: &str,
@@ -57,7 +57,7 @@ impl Database {
         })
     }
 
-    /// Look up an API key by its SHA-256 hash.
+    // Look up an API key by its SHA-256 hash.
     pub fn lookup_api_key(&self, key_hash: &[u8; 32]) -> Result<Option<ApiKeyRow>, StateError> {
         let datastore = self.datastore();
         let key_hash = key_hash.to_vec();
@@ -74,7 +74,7 @@ impl Database {
         })
     }
 
-    /// List all API keys (without hashes).
+    // List all API keys (without hashes).
     pub fn list_api_keys(&self) -> Result<Vec<ApiKeyRow>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -117,7 +117,7 @@ impl Database {
         })
     }
 
-    /// Delete an API key by ID. Returns true if a row was deleted.
+    // Delete an API key by ID. Returns true if a row was deleted.
     pub fn delete_api_key(&self, id: i64) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -131,7 +131,7 @@ impl Database {
         })
     }
 
-    /// Update last_used_at timestamp for an API key.
+    // Update last_used_at timestamp for an API key.
     pub fn touch_api_key_last_used(&self, id: i64, now: i64) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {

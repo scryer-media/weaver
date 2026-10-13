@@ -52,7 +52,6 @@ impl Harness {
             categories: vec![],
             retry: None,
             max_download_speed: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             cleanup_after_extract: Some(true),
             watch_folder: WatchFolderConfig::default(),

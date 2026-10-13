@@ -46,8 +46,8 @@ impl fmt::Display for BootstrapLoginError {
 
 impl std::error::Error for BootstrapLoginError {}
 
-/// Create the initial login only when no credentials are already persisted.
-/// Environment bootstrap input is deliberately ignored once login is configured.
+// Create the initial login only when no credentials are already persisted.
+// Environment bootstrap input is deliberately ignored once login is configured.
 pub(crate) async fn bootstrap_login_if_needed(
     db: &Database,
 ) -> Result<BootstrapLoginOutcome, BootstrapLoginError> {
@@ -225,9 +225,9 @@ pub(crate) fn apply_core_env_seed(
     Ok(seeded)
 }
 
-/// Seed the servers from the environment, and return the distance each
-/// reachable seeded server answered from, which the download runtime wants
-/// before its lanes pick a first pipelining depth.
+// Seed the servers from the environment, and return the distance each
+// reachable seeded server answered from, which the download runtime wants
+// before its lanes pick a first pipelining depth.
 pub(crate) async fn apply_server_env_seed(
     db: &Database,
     config: &mut Config,
@@ -384,7 +384,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),

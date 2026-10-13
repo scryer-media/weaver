@@ -9,28 +9,28 @@ pub(crate) use safety::{
     MemoryPermit, ProcessMemoryBudget,
 };
 
-/// Re-exported so the direct-store coverage snapshot gates its destination
-/// paths with the same validator RAR extraction gates member paths with, rather
-/// than growing a second, subtly different one.
+// Re-exported so the direct-store coverage snapshot gates its destination
+// paths with the same validator RAR extraction gates member paths with, rather
+// than growing a second, subtly different one.
 pub(crate) use rar::validate_sanitized_rar_member_path;
 
-/// Same reasoning for the decode ceilings: direct-store's small-member
-/// tolerance opens an archive of its own to extract the tolerated members, and
-/// it must open it under the operator's configured limits rather than the
-/// library defaults.
+// Same reasoning for the decode ceilings: direct-store's small-member
+// tolerance opens an archive of its own to extract the tolerated members, and
+// it must open it under the operator's configured limits rather than the
+// library defaults.
 pub(crate) use rar::{
     apply_server_rar_limits_with_memory_limit, ensure_rar_dictionary_within_limit,
     rar_decoder_memory_bytes, rar_member_decoder_memory_bytes,
 };
 
-/// And for the extraction itself: the tolerated members are taken under the
-/// same options plumbing as every other RAR member weaver extracts.
+// And for the extraction itself: the tolerated members are taken under the
+// same options plumbing as every other RAR member weaver extracts.
 pub(crate) use rar::rar_entry_via;
 
-/// A directory member of a direct set is created at finalization rather than
-/// extracted, and it must end up indistinguishable from one the conventional
-/// extractor produced — same times, same mode, from the same function. One
-/// restore, one stance.
+// A directory member of a direct set is created at finalization rather than
+// extracted, and it must end up indistinguishable from one the conventional
+// extractor produced — same times, same mode, from the same function. One
+// restore, one stance.
 pub(crate) use rar::apply_rar_member_filesystem_metadata;
 
 #[cfg(test)]

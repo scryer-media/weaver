@@ -12,7 +12,7 @@ fn file(index: u32) -> NzbFileId {
     }
 }
 
-/// Deterministic xorshift64*: every fixture below is a pure function of a seed.
+// Deterministic xorshift64*: every fixture below is a pure function of a seed.
 struct Rng(u64);
 
 impl Rng {
@@ -43,8 +43,8 @@ fn block(size: u64) -> NonZeroU64 {
     NonZeroU64::new(size).expect("non-zero block size")
 }
 
-/// Run one article's bytes through the real decoder's checkpointing CRC pass,
-/// returning what the decoder would hand the collector.
+// Run one article's bytes through the real decoder's checkpointing CRC pass,
+// returning what the decoder would hand the collector.
 fn decode_article_segments(
     data: &[u8],
     file_offset: u64,
@@ -107,10 +107,10 @@ fn fold_tiling_rejects_gaps_overlaps_and_short_tilings() {
     assert_eq!(fold_tiling(&[a, empty], 0, 10), None, "zero-length record");
 }
 
-/// Gate 1 over the collector rather than the primitive: derived block CRC32s
-/// must equal a direct CRC over the block's bytes, for random files split into
-/// random articles at random offsets against random block sizes, including
-/// articles that straddle several boundaries and the short final block.
+// Gate 1 over the collector rather than the primitive: derived block CRC32s
+// must equal a direct CRC over the block's bytes, for random files split into
+// random articles at random offsets against random block sizes, including
+// articles that straddle several boundaries and the short final block.
 #[test]
 fn derived_block_crcs_match_direct_over_random_article_tilings() {
     let mut blocks_checked = 0usize;
@@ -591,10 +591,10 @@ fn fixture_set(filename: &str, data: &[u8], slice_size: u64) -> par2_rs::Par2Fil
     }
 }
 
-/// Encode `payload` into multi-part yEnc articles and decode them back through
-/// the production streaming decoder with the recovery set's block size
-/// declared, so this exercises decode -> segments -> collector rather than a
-/// hand-built segment list.
+// Encode `payload` into multi-part yEnc articles and decode them back through
+// the production streaming decoder with the recovery set's block size
+// declared, so this exercises decode -> segments -> collector rather than a
+// hand-built segment list.
 fn decode_articles_into(
     collector: &mut BlockCrcCollector,
     file_id: NzbFileId,
@@ -646,8 +646,8 @@ fn decode_articles_into(
     collector.note_file_len(file_id, payload.len() as u64);
 }
 
-/// Gate 4: a damaged article flows decode -> segments -> collector -> verdicts,
-/// and the blocks it damaged are named exactly, with no read-back of any block.
+// Gate 4: a damaged article flows decode -> segments -> collector -> verdicts,
+// and the blocks it damaged are named exactly, with no read-back of any block.
 #[test]
 fn a_damaged_article_is_localised_to_exactly_its_blocks_with_no_read_back() {
     // 9500 bytes over 1024-byte blocks: 9 full blocks and a 316-byte final one,
@@ -721,8 +721,8 @@ fn a_damaged_article_is_localised_to_exactly_its_blocks_with_no_read_back() {
     );
 }
 
-/// The clean counterpart: with no damage every block is intact, and the derived
-/// verdicts agree with a direct CRC of every block.
+// The clean counterpart: with no damage every block is intact, and the derived
+// verdicts agree with a direct CRC of every block.
 #[test]
 fn an_undamaged_download_claims_every_block_intact() {
     let payload = random_bytes(0x5a5a, 7000);
@@ -751,10 +751,10 @@ fn an_undamaged_download_claims_every_block_intact() {
     );
 }
 
-/// Articles decoded before the recovery set was parsed carry one segment each,
-/// so they claim only the blocks their own boundaries happen to tile, and the
-/// rest stay unclaimed for settle-time verification. Never delayed, never
-/// re-decoded.
+// Articles decoded before the recovery set was parsed carry one segment each,
+// so they claim only the blocks their own boundaries happen to tile, and the
+// rest stay unclaimed for settle-time verification. Never delayed, never
+// re-decoded.
 #[test]
 fn pre_block_size_articles_claim_only_what_they_tile() {
     let payload = random_bytes(0x7e57, 4096);
@@ -797,7 +797,7 @@ fn pre_block_size_articles_claim_only_what_they_tile() {
     }
 }
 
-/// Add `count` recovery slices over `data` so a fixture set can actually repair.
+// Add `count` recovery slices over `data` so a fixture set can actually repair.
 fn with_recovery_slices(
     mut set: par2_rs::Par2FileSet,
     data: &[u8],
@@ -830,13 +830,13 @@ fn with_recovery_slices(
     set
 }
 
-/// Gate 4, end to end: a damaged-article fixture flows decode -> segments ->
-/// collector -> verdicts -> slice evidence -> repair session -> repair.
-///
-/// The session is access-backed and never scans, so everything it concludes
-/// comes from the in-stream evidence alone. It must identify exactly the blocks
-/// the damaged articles touched, repair those from recovery data, and produce
-/// the true payload — with no MD5 computed anywhere on the download path.
+// Gate 4, end to end: a damaged-article fixture flows decode -> segments ->
+// collector -> verdicts -> slice evidence -> repair session -> repair.
+//
+// The session is access-backed and never scans, so everything it concludes
+// comes from the in-stream evidence alone. It must identify exactly the blocks
+// the damaged articles touched, repair those from recovery data, and produce
+// the true payload — with no MD5 computed anywhere on the download path.
 #[test]
 fn a_damaged_article_flows_from_evidence_through_a_session_to_repair() {
     // The fixture of `a_damaged_article_is_localised_to_exactly_its_blocks_with_no_read_back`:
@@ -970,9 +970,9 @@ fn a_damaged_article_flows_from_evidence_through_a_session_to_repair() {
 // pCRC-gated independent coverage + duplicate/replay invalidation.
 // ---------------------------------------------------------------------------
 
-/// A recovery set whose IFSC entries are computed from the given bytes, so
-/// verdicts against it are `Intact` exactly when the collector derived the
-/// true CRC of those bytes.
+// A recovery set whose IFSC entries are computed from the given bytes, so
+// verdicts against it are `Intact` exactly when the collector derived the
+// true CRC of those bytes.
 fn set_for_bytes(bytes: &[u8], block_size: u64) -> (par2_rs::Par2FileSet, par2_rs::FileId) {
     let set = fixture_set("payload", bytes, block_size);
     let par2_file_id = par2_file_id("payload", bytes);
@@ -1109,10 +1109,10 @@ fn identical_replay_of_a_partial_contribution_leaves_the_block_unclaimed() {
     );
 }
 
-/// Not a correctness gate: measures `verdicts_against` at a large-file
-/// shape so the completion-time cost of building the verdict map twice
-/// (damage veto + grid match) is a number rather than a guess. Run with
-/// `--release -- --nocapture` for meaningful output.
+// Not a correctness gate: measures `verdicts_against` at a large-file
+// shape so the completion-time cost of building the verdict map twice
+// (damage veto + grid match) is a number rather than a guess. Run with
+// `--release -- --nocapture` for meaningful output.
 #[test]
 fn verdict_map_construction_cost_at_large_file_shape() {
     let block_size = block(1024);

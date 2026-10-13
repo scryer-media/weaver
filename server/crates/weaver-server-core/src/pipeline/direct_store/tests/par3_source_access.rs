@@ -6,9 +6,9 @@ use std::io::Read;
 
 const SOURCE: SourceId = SourceId(7);
 
-/// Handles a freshness check holds while it runs. On Windows it opens the
-/// backing file to read its fence, so an idle reader can keep only what leaves
-/// the check room.
+// Handles a freshness check holds while it runs. On Windows it opens the
+// backing file to read its fence, so an idle reader can keep only what leaves
+// the check room.
 const SNAPSHOT_CHECK_HANDLES: usize = if cfg!(windows) { 1 } else { 0 };
 
 fn access(
@@ -149,7 +149,7 @@ fn par3_virtual_publication_detects_same_length_backing_changes() {
     let partial = fixture.volume.partials.values().next().unwrap();
     let mut bytes = std::fs::read(partial).unwrap();
     bytes[0] ^= 1;
-    std::fs::write(partial, bytes).unwrap();
+    crate::pipeline::repair::par3::rewrite_until_modified(partial, &bytes);
     assert!(matches!(
         EngineError::from(source.snapshot(SOURCE).unwrap_err()),
         EngineError::SourceChanged(SOURCE)

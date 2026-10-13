@@ -1,14 +1,14 @@
-//! Operation boundary for native repair engines, above their block I/O paths.
-//!
-//! Each backend keeps its own evidence, assessment, recovery geometry, errors,
-//! and installation request. The coordinator must choose a concrete backend
-//! before running blocking work; this contract adds no virtual calls to reads
-//! and does not translate checksum proofs between formats.
+// Operation boundary for native repair engines, above their block I/O paths.
+//
+// Each backend keeps its own evidence, assessment, recovery geometry, errors,
+// and installation request. The coordinator must choose a concrete backend
+// before running blocking work; this contract adds no virtual calls to reads
+// and does not translate checksum proofs between formats.
 
 use std::path::Path;
 
-/// Native facts that permit trying another repair format. An unclassified
-/// failure (including I/O and cancellation) never gains eligibility from text.
+// Native facts that permit trying another repair format. An unclassified
+// failure (including I/O and cancellation) never gains eligibility from text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::pipeline) enum AlternateRepairReason {
     InsufficientRecovery,

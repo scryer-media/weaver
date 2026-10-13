@@ -11,10 +11,10 @@ use crate::jobs::{
 use weaver_model::files::{FileRole, unique_download_filenames};
 use weaver_nzb::{Nzb, parse_nzb};
 
-/// Global counter for generating unique job IDs.
+// Global counter for generating unique job IDs.
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Import an NZB file and return a JobId + JobSpec ready for the scheduler.
+// Import an NZB file and return a JobId + JobSpec ready for the scheduler.
 pub fn import_nzb(nzb_bytes: &[u8], nzb_path: &Path) -> Result<(JobId, JobSpec), ImportError> {
     let nzb = parse_nzb(nzb_bytes).map_err(ImportError::Parse)?;
 
@@ -37,8 +37,8 @@ pub fn import_nzb(nzb_bytes: &[u8], nzb_path: &Path) -> Result<(JobId, JobSpec),
     Ok((job_id, spec))
 }
 
-/// Convert a parsed NZB into a JobSpec. Reused by both fresh imports and
-/// recovery (re-parsing an NZB to rebuild the spec for a recovered job).
+// Convert a parsed NZB into a JobSpec. Reused by both fresh imports and
+// recovery (re-parsing an NZB to rebuild the spec for a recovered job).
 pub fn nzb_to_spec(
     nzb: &Nzb,
     nzb_path: &Path,
@@ -104,18 +104,8 @@ pub fn nzb_to_spec(
 }
 
 pub fn normalize_archive_password_candidate(raw: Option<&str>) -> Option<String> {
-    let value = raw?.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let normalized = value.to_ascii_lowercase();
-    if matches!(
-        normalized.as_str(),
-        "0" | "1" | "true" | "false" | "yes" | "no" | "passworded" | "protected"
-    ) {
-        return None;
-    }
-    Some(value.to_string())
+    raw.filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
 }
 
 pub fn nzb_password_candidates(
@@ -134,6 +124,13 @@ pub fn nzb_password_candidates(
         ArchivePasswordSource::NzbMeta,
         nzb.meta.password.as_deref(),
     );
+    for password in &nzb.meta.passwords {
+        push_password_candidate(
+            &mut candidates,
+            ArchivePasswordSource::NzbMeta,
+            Some(password),
+        );
+    }
 
     if let Some(stem) = nzb_path.file_stem().and_then(|segment| segment.to_str())
         && let Some(start) = stem.find("{{")

@@ -22,8 +22,8 @@ pub struct RecoveredServerState {
 
 pub struct RestoreCandidate {
     pub job_id: crate::jobs::ids::JobId,
-    /// Manual queue-order position persisted at reorder time; `None` sorts by
-    /// job id (creation order).
+    // Manual queue-order position persisted at reorder time; `None` sorts by
+    // job id (creation order).
     pub queue_position: Option<i64>,
     pub request: RestoreJobRequest,
 }
@@ -365,19 +365,19 @@ pub async fn recover_server_state(
     })
 }
 
-/// Archives a job that stopped between its terminal status and its history row.
-///
-/// A job reaches a terminal status through one queued write and moves into
-/// `job_history` through a second one behind it, so a process that stops in
-/// between leaves the job terminal in `active_jobs` and absent from history.
-/// That job is then invisible from both ends: the queue no longer holds it
-/// because it finished, and every public history lookup reads `job_history`,
-/// which has nothing. Recovery is the one place that still sees both halves, so
-/// it finishes the archive the process did not get to.
-///
-/// The active row is all that survives, and it carries no byte counters, so the
-/// synthesized row states what is known and leaves the rest at the same zeros
-/// the recovered runtime entry already reports rather than inventing figures.
+// Archives a job that stopped between its terminal status and its history row.
+//
+// A job reaches a terminal status through one queued write and moves into
+// `job_history` through a second one behind it, so a process that stops in
+// between leaves the job terminal in `active_jobs` and absent from history.
+// That job is then invisible from both ends: the queue no longer holds it
+// because it finished, and every public history lookup reads `job_history`,
+// which has nothing. Recovery is the one place that still sees both halves, so
+// it finishes the archive the process did not get to.
+//
+// The active row is all that survives, and it carries no byte counters, so the
+// synthesized row states what is known and leaves the rest at the same zeros
+// the recovered runtime entry already reports rather than inventing figures.
 fn archive_unfinished_terminal_job(
     db: &Database,
     job_id: crate::jobs::ids::JobId,
@@ -675,9 +675,9 @@ mod tests {
         assert_eq!(request.post_state, Some(crate::PostState::Finalizing));
     }
 
-    /// Terminal status and history archival are two separate writes, so a
-    /// process can stop holding only the first. The job must not come back
-    /// invisible to every public surface.
+    // Terminal status and history archival are two separate writes, so a
+    // process can stop holding only the first. The job must not come back
+    // invisible to every public surface.
     #[tokio::test]
     async fn recovery_archives_a_terminal_job_that_never_reached_history() {
         let temp = TempDir::new().unwrap();
@@ -724,8 +724,8 @@ mod tests {
         );
     }
 
-    /// The archive is an upsert, so a job that already has a history row must
-    /// keep the figures that row carries.
+    // The archive is an upsert, so a job that already has a history row must
+    // keep the figures that row carries.
     #[tokio::test]
     async fn recovery_keeps_an_existing_history_row_for_a_terminal_active_job() {
         let temp = TempDir::new().unwrap();

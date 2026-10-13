@@ -4,6 +4,107 @@ use common::{BlockingDbOperation, TestHarness, assert_no_errors, local_request, 
 use weaver_server_core::auth::CallerScope;
 
 #[tokio::test]
+async fn create_schedule_refuses_a_client_supplied_id_and_generates_one() {
+    let h = TestHarness::new().await;
+    let data_dir = std::path::PathBuf::from(&h.config.read().await.data_dir);
+    h.db.initialize_post_processing_script_directory(&data_dir, None)
+        .unwrap();
+    let rejected = h.execute(r#"mutation {
+        createSchedule(input: { id: "implicit-script:task.sh:12:00", time: "12:00", actionType: "pause" }) { id }
+    }"#).await;
+    assert!(
+        rejected.errors.iter().any(|error| error
+            .message
+            .contains("unknown field \"id\" of type \"ScheduleInput\"")),
+        "unexpected schema errors: {:?}",
+        rejected.errors
+    );
+    assert!(h.db.list_schedules().unwrap().is_empty());
+
+    let created = h.execute(r#"mutation {
+        createSchedule(input: { label: "implicit-script:display-only", time: "12:00", actionType: "pause" }) { id label }
+    }"#).await;
+    assert_no_errors(&created);
+    let data = response_data(&created);
+    let entry = &data["createSchedule"][0];
+    assert!(entry["id"].as_str().unwrap().starts_with("sched-"));
+    assert_eq!(entry["label"], "implicit-script:display-only");
+    assert_eq!(
+        h.db.list_schedules().unwrap()[0].id,
+        entry["id"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn the_schedules_screen_takes_no_script_rules() {
+    let h = TestHarness::new().await;
+    for refused in [
+        r#"time: "03:30", actionType: "run_script""#,
+        r#"time: "03:30", actionType: "run_script", instanceId: "nope""#,
+    ] {
+        let response = h
+            .execute(&format!(
+                "mutation {{ createSchedule(input: {{ {refused} }}) {{ id }} }}"
+            ))
+            .await;
+        assert!(
+            !response.errors.is_empty(),
+            "{refused} was saved: {:?}",
+            response.data
+        );
+        assert!(h.db.list_schedules().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn archive_password_settings_never_return_passwords_and_support_replace_clear() {
+    let h = TestHarness::new().await;
+    let saved = h.execute(r#"mutation { updateArchivePasswordSettings(passwords: ["synthetic-key", "enc:v1:literal"], passwordFile: "/fixture/passwords") { hasPasswords passwordFile } }"#).await;
+    assert_no_errors(&saved);
+    assert_eq!(
+        response_data(&saved)["updateArchivePasswordSettings"]["hasPasswords"],
+        true
+    );
+    assert!(!response_data(&saved).to_string().contains("synthetic-key"));
+    assert!(
+        !h.db
+            .get_setting("archive_passwords")
+            .unwrap()
+            .unwrap()
+            .contains("synthetic-key")
+    );
+    let kept = h.execute(r#"mutation { updateArchivePasswordSettings(passwordFile: null) { hasPasswords passwordFile } }"#).await;
+    assert_no_errors(&kept);
+    assert_eq!(
+        response_data(&kept)["updateArchivePasswordSettings"]["hasPasswords"],
+        true
+    );
+    assert!(response_data(&kept)["updateArchivePasswordSettings"]["passwordFile"].is_null());
+    let cleared = h
+        .execute(r#"mutation { updateArchivePasswordSettings(passwords: []) { hasPasswords } }"#)
+        .await;
+    assert_no_errors(&cleared);
+    assert_eq!(
+        response_data(&cleared)["updateArchivePasswordSettings"]["hasPasswords"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn archive_password_settings_and_reveal_require_admin() {
+    let h = TestHarness::new().await;
+    for scope in [CallerScope::Read, CallerScope::Control] {
+        for query in [
+            "{ archivePasswordSettings { hasPasswords passwordFile } }",
+            "mutation { updateArchivePasswordSettings(passwords: [\"synthetic\"]) { hasPasswords } }",
+            "{ validatedArchivePassword(id: 1) }",
+        ] {
+            assert!(!h.execute_as(query, scope).await.errors.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn get_settings_defaults() {
     let h = TestHarness::new().await;
     let resp = h
@@ -634,9 +735,9 @@ async fn a_profile_the_machine_cannot_honour_is_refused_by_name() {
     assert!(h.db.load_config().unwrap().hardware_profile.is_none());
 }
 
-/// A choice saved on a machine that could honour it, read back on one that no
-/// longer can, is not what runs: startup falls back to the recommendation, and
-/// the answer says so rather than naming a profile it does not offer.
+// A choice saved on a machine that could honour it, read back on one that no
+// longer can, is not what runs: startup falls back to the recommendation, and
+// the answer says so rather than naming a profile it does not offer.
 #[tokio::test]
 async fn a_saved_profile_the_machine_can_no_longer_honour_reads_as_not_chosen() {
     let h = TestHarness::new().await;

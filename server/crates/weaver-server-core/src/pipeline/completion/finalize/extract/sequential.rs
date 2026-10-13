@@ -1,4 +1,4 @@
-//! Sequential archive adapters shared by download-time and completed-file extraction.
+// Sequential archive adapters shared by download-time and completed-file extraction.
 
 use super::*;
 use std::io::Read;
@@ -42,8 +42,8 @@ pub(super) fn extract_file(
     extract_sequential_stream(file, context)
 }
 
-/// The caller owns decoder memory. Input may block on download coverage; it
-/// must report EOF only when the entire source has actually been committed.
+// The caller owns decoder memory. Input may block on download coverage; it
+// must report EOF only when the entire source has actually been committed.
 pub(in crate::pipeline) fn extract_sequential_stream<R: Read>(
     reader: R,
     context: &SequentialExtractionContext<'_>,
@@ -147,9 +147,9 @@ pub(in crate::pipeline) fn extract_sequential_stream<R: Read>(
     )
 }
 
-/// Decoder memory for one sequential stream. The archive is passed so the
-/// formats that declare what their decoder will hold are sized from the file
-/// instead of from the process ceiling.
+// Decoder memory for one sequential stream. The archive is passed so the
+// formats that declare what their decoder will hold are sized from the file
+// instead of from the process ceiling.
 pub(in crate::pipeline) fn decoder_memory_bytes(
     kind: SimpleArchiveKind,
     path: Option<&Path>,

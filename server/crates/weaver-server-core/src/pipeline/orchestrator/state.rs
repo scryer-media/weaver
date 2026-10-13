@@ -7,14 +7,14 @@ impl Pipeline {
             .join(job_id.0.to_string())
     }
 
-    /// The job's staging root, registered on the job state so completion,
-    /// cancel and failure treat it as the job's output.
-    ///
-    /// Only names the directory: nothing here touches the filesystem, since
-    /// this runs on the pipeline task and the root sits under the complete
-    /// directory. Whatever writes into it creates it — [`ExtractionRoot::open`]
-    /// for extraction, the placement task for direct-store destinations — and
-    /// every reader of an unwritten root treats it as empty.
+    // The job's staging root, registered on the job state so completion,
+    // cancel and failure treat it as the job's output.
+    //
+    // Only names the directory: nothing here touches the filesystem, since
+    // this runs on the pipeline task and the root sits under the complete
+    // directory. Whatever writes into it creates it — [`ExtractionRoot::open`]
+    // for extraction, the placement task for direct-store destinations — and
+    // every reader of an unwritten root treats it as empty.
     pub(crate) fn extraction_staging_dir(&mut self, job_id: JobId) -> PathBuf {
         if let Some(state) = self.jobs.get(&job_id)
             && let Some(ref staging) = state.staging_dir
@@ -297,15 +297,15 @@ impl Pipeline {
         self.normalization_retried.remove(&job_id);
     }
 
-    /// Record that an archive set's source bytes are known wrong.
-    ///
-    /// Two seams record this today: a direct-store demotion whose reason is
-    /// damage (`DemotionReason::is_source_damage`), and a direct-unpack part
-    /// completing with in-stream damage reported against it. The fact is
-    /// deliberately not tied to either: any path that establishes a volume
-    /// is damaged before a recovery set has ruled — an in-place repair of a
-    /// mismatched part included — records it here, and the completion gate
-    /// keeps answering correctly without learning a new vocabulary.
+    // Record that an archive set's source bytes are known wrong.
+    //
+    // Two seams record this today: a direct-store demotion whose reason is
+    // damage (`DemotionReason::is_source_damage`), and a direct-unpack part
+    // completing with in-stream damage reported against it. The fact is
+    // deliberately not tied to either: any path that establishes a volume
+    // is damaged before a recovery set has ruled — an in-place repair of a
+    // mismatched part included — records it here, and the completion gate
+    // keeps answering correctly without learning a new vocabulary.
     pub(in crate::pipeline) fn note_known_archive_set_damage(
         &mut self,
         job_id: JobId,
@@ -325,22 +325,22 @@ impl Pipeline {
         }
     }
 
-    /// Whether extraction for this job must wait for the recovery set's
-    /// verdict because damage is already on record.
-    ///
-    /// PAR3 publications must settle before known damaged sources are extracted.
-    /// PAR2 keeps its existing four release conditions below.
-    /// Four releases, and a job with none of them would never extract at all,
-    /// which is why each is checked rather than assumed: no recovery set to
-    /// ask, a set the job has bypassed, a verdict already in hand
-    /// (`par2_verified` is set by both the clean pass and the tail of a
-    /// repair), and a served set that has *settled* — asked and answered, even
-    /// when the answer was one it could not act on. Without that last one an
-    /// unrepairable set would hold its own undamaged members hostage waiting
-    /// for a second verdict that is never coming.
-    ///
-    /// A clean job records nothing and is not touched by this — the
-    /// extract-first path stays exactly as it is, with no hash pass added.
+    // Whether extraction for this job must wait for the recovery set's
+    // verdict because damage is already on record.
+    //
+    // PAR3 publications must settle before known damaged sources are extracted.
+    // PAR2 keeps its existing four release conditions below.
+    // Four releases, and a job with none of them would never extract at all,
+    // which is why each is checked rather than assumed: no recovery set to
+    // ask, a set the job has bypassed, a verdict already in hand
+    // (`par2_verified` is set by both the clean pass and the tail of a
+    // repair), and a served set that has *settled* — asked and answered, even
+    // when the answer was one it could not act on. Without that last one an
+    // unrepairable set would hold its own undamaged members hostage waiting
+    // for a second verdict that is never coming.
+    //
+    // A clean job records nothing and is not touched by this — the
+    // extract-first path stays exactly as it is, with no hash pass added.
     pub(in crate::pipeline) fn archive_extraction_held_for_known_damage(
         &self,
         job_id: JobId,

@@ -1,33 +1,33 @@
-//! Whether direct unpack is switched on, resolved once.
-//!
-//! Precedence is **environment, then config, then default** — the same rule and
-//! the same vocabulary as direct-store, so an operator who has learned one knob
-//! has learned both. The default is **on**: the feature shipped dark as a
-//! preview and was switched on once the direct-unpack e2e corpus held, so the
-//! only remaining knob is the opt-out.
+// Whether direct unpack is switched on, resolved once.
+//
+// Precedence is **environment, then config, then default** — the same rule and
+// the same vocabulary as direct-store, so an operator who has learned one knob
+// has learned both. The default is **on**: the feature shipped dark as a
+// preview and was switched on once the direct-unpack e2e corpus held, so the
+// only remaining knob is the opt-out.
 
 use std::sync::OnceLock;
 
 use super::super::direct_store::parse_enabled;
 
-/// Env override for direct unpack.
-///
-/// Config is the durable operator surface; this exists for incident response,
-/// when turning the feature off has to be possible without editing config and
-/// waiting for a reload.
+// Env override for direct unpack.
+//
+// Config is the durable operator surface; this exists for incident response,
+// when turning the feature off has to be possible without editing config and
+// waiting for a reload.
 pub const DIRECT_UNPACK_ENV: &str = "WEAVER_DIRECT_UNPACK";
 
-/// Whether the env override forces direct unpack on or off, if it says anything
-/// at all. Read once, like the direct-store gate.
+// Whether the env override forces direct unpack on or off, if it says anything
+// at all. Read once, like the direct-store gate.
 pub fn env_override() -> Option<bool> {
     static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
     *OVERRIDE.get_or_init(|| parse_enabled(std::env::var(DIRECT_UNPACK_ENV).ok().as_deref()))
 }
 
-/// Resolved gate value, passed explicitly so callers and tests do not race the
-/// process-wide `OnceLock`.
-///
-/// **Defaults on.**
+// Resolved gate value, passed explicitly so callers and tests do not race the
+// process-wide `OnceLock`.
+//
+// **Defaults on.**
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DirectUnpackGate {
     #[default]
@@ -36,25 +36,25 @@ pub enum DirectUnpackGate {
 }
 
 impl DirectUnpackGate {
-    /// Whether a set may be admitted to the chase.
+    // Whether a set may be admitted to the chase.
     pub fn is_enabled(self) -> bool {
         matches!(self, Self::Enabled)
     }
 }
 
-/// Everything direct unpack reads out of configuration, resolved once at
-/// pipeline construction.
-///
-/// Resolved up front rather than at each read point for the same reason
-/// direct-store does it: a set admitted under an enabled gate must not find the
-/// gate disabled partway through, with a decoder already chasing its bytes.
+// Everything direct unpack reads out of configuration, resolved once at
+// pipeline construction.
+//
+// Resolved up front rather than at each read point for the same reason
+// direct-store does it: a set admitted under an enabled gate must not find the
+// gate disabled partway through, with a decoder already chasing its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DirectUnpackSettings {
     pub gate: DirectUnpackGate,
 }
 
 impl DirectUnpackSettings {
-    /// Resolves against a loaded config, with the environment winning.
+    // Resolves against a loaded config, with the environment winning.
     pub fn resolve(config: &crate::settings::Config) -> Self {
         Self::resolve_parts(
             config.direct_unpack.as_ref().and_then(|cfg| cfg.enabled),
@@ -62,8 +62,8 @@ impl DirectUnpackSettings {
         )
     }
 
-    /// The precedence rule itself, with the environment passed in so it is
-    /// testable without mutating process state.
+    // The precedence rule itself, with the environment passed in so it is
+    // testable without mutating process state.
     pub fn resolve_parts(config_enabled: Option<bool>, env_enabled: Option<bool>) -> Self {
         let enabled = env_enabled.or(config_enabled).unwrap_or(true);
         Self {
@@ -133,7 +133,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: crate::jobs::DuplicatePolicy::default(),

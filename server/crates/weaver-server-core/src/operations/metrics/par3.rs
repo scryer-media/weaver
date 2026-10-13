@@ -1,29 +1,29 @@
-//! PAR3 recovery telemetry: relaxed atomics only, fixed storage, no allocation.
-//!
-//! Every field here is written from either the pipeline actor or a blocking
-//! PAR3 worker's handback. Nothing in this module may be touched from a
-//! per-byte, per-block or per-stripe loop: the engine already counts those in
-//! its own relaxed atomics, and this layer only folds in the deltas once a
-//! work unit is handed back. The single exception is the progress handler,
-//! which is capped at two relaxed atomic operations per event.
+// PAR3 recovery telemetry: relaxed atomics only, fixed storage, no allocation.
+//
+// Every field here is written from either the pipeline actor or a blocking
+// PAR3 worker's handback. Nothing in this module may be touched from a
+// per-byte, per-block or per-stripe loop: the engine already counts those in
+// its own relaxed atomics, and this layer only folds in the deltas once a
+// work unit is handed back. The single exception is the progress handler,
+// which is capped at two relaxed atomic operations per event.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-/// Work slots the coordinator can keep busy at once. This mirrors the
-/// coordinator's own in-flight bound; a third job waiting for a slot reuses
-/// the least recently advanced entry rather than growing this array.
+// Work slots the coordinator can keep busy at once. This mirrors the
+// coordinator's own in-flight bound; a third job waiting for a slot reuses
+// the least recently advanced entry rather than growing this array.
 pub const PAR3_SLOTS: usize = 2;
 
-/// A non-idle phase whose last progress is older than this counts as a stall.
+// A non-idle phase whose last progress is older than this counts as a stall.
 pub const PAR3_STALL_THRESHOLD_MS: u64 = 30_000;
 
-/// What a PAR3 job is currently waiting on or doing, as an exported code.
-///
-/// The numeric encoding is part of the `/metrics` contract: the exporter emits
-/// one series per phase and the code is what a stored gauge round-trips
-/// through. Never renumber an existing variant.
+// What a PAR3 job is currently waiting on or doing, as an exported code.
+//
+// The numeric encoding is part of the `/metrics` contract: the exporter emits
+// one series per phase and the code is what a stored gauge round-trips
+// through. Never renumber an existing variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Par3Phase {
@@ -119,26 +119,26 @@ impl Par3Phase {
     }
 }
 
-/// Which admission budget refused a PAR3 reservation.
-///
-/// Indexes a fixed array; the order is the exported label order and must not
-/// change once released.
+// Which admission budget refused a PAR3 reservation.
+//
+// Indexes a fixed array; the order is the exported label order and must not
+// change once released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Par3AdmissionReason {
-    /// The engine's own retained native state (stripes, matrices, decoders).
+    // The engine's own retained native state (stripes, matrices, decoders).
     RetainedState,
-    /// Authenticated metadata and layout storage.
+    // Authenticated metadata and layout storage.
     ResolvedMetadata,
-    /// The host-side copy of one assessment.
+    // The host-side copy of one assessment.
     AssessmentView,
-    /// Free space for the disk fallback of a refused in-memory image.
+    // Free space for the disk fallback of a refused in-memory image.
     DiskFallbackSpace,
-    /// Per-job carrier count.
+    // Per-job carrier count.
     CarrierCount,
-    /// Per-job authenticated set count.
+    // Per-job authenticated set count.
     SetCount,
-    /// Any other resource ceiling the engine named.
+    // Any other resource ceiling the engine named.
     Other,
 }
 
@@ -180,30 +180,30 @@ impl Par3AdmissionReason {
     }
 }
 
-/// Memory categories the engine's ledger is divided into. The count is the
-/// engine's, so a new category is a compile error here rather than a silently
-/// dropped series.
+// Memory categories the engine's ledger is divided into. The count is the
+// engine's, so a new category is a compile error here rather than a silently
+// dropped series.
 pub const PAR3_MEMORY_CATEGORIES: usize = par3_rs::runtime::MEMORY_CATEGORIES;
 
-/// The engine's own stable category names, in ledger order. These are the
-/// exported label values: the engine owns the vocabulary, weaver only carries
-/// it, so a rename travels with the engine rather than being mirrored here.
+// The engine's own stable category names, in ledger order. These are the
+// exported label values: the engine owns the vocabulary, weaver only carries
+// it, so a rename travels with the engine rather than being mirrored here.
 pub fn par3_memory_category_names() -> [&'static str; PAR3_MEMORY_CATEGORIES] {
     par3_rs::runtime::MemoryCategory::ALL.map(|category| category.name())
 }
 
-/// How the engine classified an admission it refused.
-///
-/// Indexes a fixed array; the order is the exported label order and must not
-/// change once released.
+// How the engine classified an admission it refused.
+//
+// Indexes a fixed array; the order is the exported label order and must not
+// change once released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Par3EngineRefusal {
-    /// The request does not fit this session's own ceiling.
+    // The request does not fit this session's own ceiling.
     ExceedsLimit,
-    /// The same request fits once another reservation releases.
+    // The same request fits once another reservation releases.
     PeerContention,
-    /// A ceiling that was never expressed in bytes.
+    // A ceiling that was never expressed in bytes.
     Unmeasured,
 }
 
@@ -230,17 +230,17 @@ impl Par3EngineRefusal {
     }
 }
 
-/// Which width had to give when a stage ran narrower than it was configured
-/// to. These are not stalls: the engine never blocks on memory, it proceeds at
-/// the width it could admit.
+// Which width had to give when a stage ran narrower than it was configured
+// to. These are not stalls: the engine never blocks on memory, it proceeds at
+// the width it could admit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Par3EngineNarrowing {
-    /// A codec stripe admitted below the configured stripe size.
+    // A codec stripe admitted below the configured stripe size.
     Stripe,
-    /// A worker pool that could not be admitted, so the stage ran serially.
+    // A worker pool that could not be admitted, so the stage ran serially.
     Workers,
-    /// A verification batch cut short because the next file was not admitted.
+    // A verification batch cut short because the next file was not admitted.
     VerifyBatch,
 }
 
@@ -266,8 +266,8 @@ impl Par3EngineNarrowing {
     }
 }
 
-/// Engine stages this layer folds back at handback. Deliberately a subset of
-/// the engine's stage list: creation-only stages never run on the repair path.
+// Engine stages this layer folds back at handback. Deliberately a subset of
+// the engine's stage list: creation-only stages never run on the repair path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Par3Stage {
@@ -318,8 +318,8 @@ impl Par3Stage {
     }
 }
 
-/// Terminal classes a PAR3 job's assessment can reach. Indexes a fixed array;
-/// the order is the exported label order.
+// Terminal classes a PAR3 job's assessment can reach. Indexes a fixed array;
+// the order is the exported label order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Par3OutcomeClass {
@@ -382,40 +382,40 @@ impl Par3OutcomeClass {
     }
 }
 
-/// One PAR3 work slot's live phase: an opaque owner id beside an encoded
-/// state.
+// One PAR3 work slot's live phase: an opaque owner id beside an encoded
+// state.
 #[derive(Debug, Default)]
 pub struct Par3Slot {
-    /// Owning job id, or zero when the slot is free.
+    // Owning job id, or zero when the slot is free.
     pub job_id: AtomicU64,
-    /// [`Par3Phase`] code.
+    // [`Par3Phase`] code.
     pub phase: AtomicUsize,
-    /// Milliseconds since `PipelineMetrics::start_time` at the phase change.
+    // Milliseconds since `PipelineMetrics::start_time` at the phase change.
     pub phase_entered_ms: AtomicU64,
-    /// Milliseconds since `PipelineMetrics::start_time` at the last progress.
+    // Milliseconds since `PipelineMetrics::start_time` at the last progress.
     pub last_progress_ms: AtomicU64,
-    /// Start of the stall in progress, or zero when this slot is not stalled.
-    /// Written only by the snapshot tick.
+    // Start of the stall in progress, or zero when this slot is not stalled.
+    // Written only by the snapshot tick.
     stall_started_ms: AtomicU64,
 }
 
-/// A slot's phase as read by the snapshot tick.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+// A slot's phase as read by the snapshot tick.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Par3SlotSnapshot {
     pub job_id: u64,
     pub phase: Par3Phase,
     pub phase_entered_ms: u64,
     pub last_progress_ms: u64,
-    /// Time in the current phase as of this snapshot, whether or not the
-    /// phase has reported progress.
+    // Time in the current phase as of this snapshot, whether or not the
+    // phase has reported progress.
     #[serde(default)]
     pub phase_age_ms: u64,
-    /// Age of the stall in progress; zero when this slot is not stalled.
+    // Age of the stall in progress; zero when this slot is not stalled.
     pub current_stall_ms: u64,
 }
 
-/// Live PAR3 counters. Every field is a relaxed atomic; there is no lock, no
-/// string, no allocation and no bucket search anywhere in this struct.
+// Live PAR3 counters. Every field is a relaxed atomic; there is no lock, no
+// string, no allocation and no bucket search anywhere in this struct.
 #[derive(Debug, Default)]
 pub struct Par3Metrics {
     // ---- memory admission ------------------------------------------------
@@ -426,9 +426,9 @@ pub struct Par3Metrics {
     pub reserved_bytes: AtomicU64,
     pub retained_bytes: AtomicU64,
     pub reserved_peak_bytes: AtomicU64,
-    /// Stripe size the coordinator asked the engine to use for the last work
-    /// unit. The engine reports the width it actually admitted separately, in
-    /// `engine_admitted_stripe_bytes`; the two differ under contention.
+    // Stripe size the coordinator asked the engine to use for the last work
+    // unit. The engine reports the width it actually admitted separately, in
+    // `engine_admitted_stripe_bytes`; the two differ under contention.
     pub effective_stripe_bytes: AtomicU64,
 
     // ---- engine memory ledger --------------------------------------------
@@ -489,8 +489,8 @@ pub struct Par3Metrics {
     pub reassessments_total: AtomicU64,
     pub reassessments_zero_read_total: AtomicU64,
     pub reverify_generation_changed_total: AtomicU64,
-    /// Work units the coordinator had to re-run alone because a shared-CPU
-    /// attempt hit native pressure.
+    // Work units the coordinator had to re-run alone because a shared-CPU
+    // attempt hit native pressure.
     pub verify_serial_fallback_total: AtomicU64,
     pub encrypted_reader_cache_hits_total: AtomicU64,
     pub encrypted_reader_cache_evictions_total: AtomicU64,
@@ -539,8 +539,8 @@ impl Par3Metrics {
         std::array::from_fn(|index| self.admission_refused[index].load(Ordering::Relaxed))
     }
 
-    /// Publish the engine's categorised ledger. Called once per work-unit
-    /// handback: two relaxed stores per category and nothing else.
+    // Publish the engine's categorised ledger. Called once per work-unit
+    // handback: two relaxed stores per category and nothing else.
     pub fn store_ledger(
         &self,
         current: [u64; PAR3_MEMORY_CATEGORIES],
@@ -560,7 +560,7 @@ impl Par3Metrics {
         std::array::from_fn(|index| self.ledger_peak_bytes[index].load(Ordering::Relaxed))
     }
 
-    /// Fold one handback's refused admissions in, by cause.
+    // Fold one handback's refused admissions in, by cause.
     pub fn note_engine_refusals(&self, deltas: [u64; Par3EngineRefusal::COUNT]) {
         for cause in Par3EngineRefusal::ALL {
             let delta = deltas[cause.index()];
@@ -574,7 +574,7 @@ impl Par3Metrics {
         std::array::from_fn(|index| self.engine_refusals[index].load(Ordering::Relaxed))
     }
 
-    /// Fold one handback's narrowed admissions in, by the width that gave.
+    // Fold one handback's narrowed admissions in, by the width that gave.
     pub fn note_engine_narrowed(&self, deltas: [u64; Par3EngineNarrowing::COUNT]) {
         for width in Par3EngineNarrowing::ALL {
             let delta = deltas[width.index()];
@@ -596,8 +596,8 @@ impl Par3Metrics {
         std::array::from_fn(|index| self.outcomes[index].load(Ordering::Relaxed))
     }
 
-    /// Fold one engine stage delta in. Called once per work-unit handback,
-    /// never inside the engine's own loops.
+    // Fold one engine stage delta in. Called once per work-unit handback,
+    // never inside the engine's own loops.
     pub fn note_stage_delta(&self, stage: Par3Stage, calls: u64, millis: u64) {
         if calls != 0 {
             self.stage_calls[stage.index()].fetch_add(calls, Ordering::Relaxed);
@@ -615,8 +615,8 @@ impl Par3Metrics {
         std::array::from_fn(|index| self.stage_ms[index].load(Ordering::Relaxed))
     }
 
-    /// The slot this job already owns, otherwise a free one, otherwise the
-    /// slot whose phase is oldest. Claiming never allocates and never blocks.
+    // The slot this job already owns, otherwise a free one, otherwise the
+    // slot whose phase is oldest. Claiming never allocates and never blocks.
     fn slot_for(&self, job_id: u64) -> &Par3Slot {
         let mut free: Option<&Par3Slot> = None;
         let mut oldest: Option<&Par3Slot> = None;
@@ -635,8 +635,8 @@ impl Par3Metrics {
         free.or(oldest).unwrap_or(&self.slots[0])
     }
 
-    /// Record a job's current phase. `now_ms` comes from
-    /// [`super::PipelineMetrics::now_ms`] so every timestamp shares one origin.
+    // Record a job's current phase. `now_ms` comes from
+    // [`super::PipelineMetrics::now_ms`] so every timestamp shares one origin.
     pub fn store_phase(&self, job_id: u64, phase: Par3Phase, now_ms: u64) {
         let slot = self.slot_for(job_id);
         if phase.is_idle() {
@@ -656,7 +656,7 @@ impl Par3Metrics {
         }
     }
 
-    /// Note that a job's current phase made progress without changing phase.
+    // Note that a job's current phase made progress without changing phase.
     pub fn note_progress(&self, job_id: u64, now_ms: u64) {
         for slot in &self.slots {
             if slot.job_id.load(Ordering::Relaxed) == job_id {
@@ -666,9 +666,9 @@ impl Par3Metrics {
         }
     }
 
-    /// The progress handler's phase store: exactly two relaxed atomic writes
-    /// on a slot this job already owns, and nothing at all otherwise. It takes
-    /// no lock, logs nothing, allocates nothing and cannot panic.
+    // The progress handler's phase store: exactly two relaxed atomic writes
+    // on a slot this job already owns, and nothing at all otherwise. It takes
+    // no lock, logs nothing, allocates nothing and cannot panic.
     pub fn note_engine_phase(&self, job_id: u64, phase: Par3Phase, now_ms: u64) {
         for slot in &self.slots {
             if slot.job_id.load(Ordering::Relaxed) == job_id {
@@ -687,8 +687,8 @@ impl Par3Metrics {
         }
     }
 
-    /// Advance the stall model and return the per-slot view. Called once per
-    /// snapshot tick; there is no timer thread and no background task.
+    // Advance the stall model and return the per-slot view. Called once per
+    // snapshot tick; there is no timer thread and no background task.
     pub(super) fn observe(&self, now_ms: u64) -> [Par3SlotSnapshot; PAR3_SLOTS] {
         let mut current = 0u64;
         let view = std::array::from_fn(|index| {
@@ -821,15 +821,15 @@ impl Par3Metrics {
         }
     }
 
-    /// Drive the stall model at a chosen instant, so a test can reach the
-    /// stall threshold without sleeping for it.
+    // Drive the stall model at a chosen instant, so a test can reach the
+    // stall threshold without sleeping for it.
     #[cfg(test)]
     pub fn observe_for_test(&self, now_ms: u64) -> [Par3SlotSnapshot; PAR3_SLOTS] {
         self.observe(now_ms)
     }
 
-    /// Rewind a slot's last-progress mark so a test can reach the stall
-    /// threshold without sleeping.
+    // Rewind a slot's last-progress mark so a test can reach the stall
+    // threshold without sleeping.
     #[cfg(test)]
     pub fn set_last_progress_for_test(&self, job_id: u64, now_ms: u64) {
         for slot in &self.slots {
@@ -840,9 +840,9 @@ impl Par3Metrics {
     }
 }
 
-/// Point-in-time PAR3 counters. Plain integers and fixed-size arrays only, so
-/// the enclosing snapshot stays a fixed-size struct copy with no heap fields.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+// Point-in-time PAR3 counters. Plain integers and fixed-size arrays only, so
+// the enclosing snapshot stays a fixed-size struct copy with no heap fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Par3MetricsSnapshot {
     pub admission_refused: [u64; Par3AdmissionReason::COUNT],
     pub waiting_for_memory_active: usize,
@@ -918,7 +918,7 @@ pub struct Par3MetricsSnapshot {
     pub slots: [Par3SlotSnapshot; PAR3_SLOTS],
     pub stalls_total: u64,
     pub stall_duration_ms: u64,
-    /// Oldest stall in progress across the slots; zero when nothing is stalled.
+    // Oldest stall in progress across the slots; zero when nothing is stalled.
     pub current_stall_ms: u64,
 }
 
@@ -926,11 +926,11 @@ pub struct Par3MetricsSnapshot {
 mod tests {
     use super::*;
 
-    /// Deliverable: the snapshot stays a fixed-size struct copy.
-    ///
-    /// `Copy` is the load-bearing bound: no `String`, `Vec`, `Box`, `Arc` or
-    /// map can appear in a `Copy` type, so this fails to compile the moment a
-    /// heap field is added. `needs_drop` pins the same property at runtime.
+    // Deliverable: the snapshot stays a fixed-size struct copy.
+    //
+    // `Copy` is the load-bearing bound: no `String`, `Vec`, `Box`, `Arc` or
+    // map can appear in a `Copy` type, so this fails to compile the moment a
+    // heap field is added. `needs_drop` pins the same property at runtime.
     #[test]
     fn the_snapshot_has_no_heap_fields() {
         fn requires_copy<T: Copy>(value: T) -> T {
@@ -948,11 +948,11 @@ mod tests {
         assert_eq!(snapshot.slots.len(), PAR3_SLOTS);
     }
 
-    /// Deliverable: the progress handler allocates nothing.
-    ///
-    /// Both handler entry points are driven far more often than any real
-    /// engine callback would be, against an owned slot and an unowned one, and
-    /// the process allocation counter must not move at all.
+    // Deliverable: the progress handler allocates nothing.
+    //
+    // Both handler entry points are driven far more often than any real
+    // engine callback would be, against an owned slot and an unowned one, and
+    // the process allocation counter must not move at all.
     #[test]
     fn the_progress_handler_does_not_allocate() {
         let metrics = Par3Metrics::default();
@@ -976,10 +976,10 @@ mod tests {
         );
     }
 
-    /// Deliverable: a phase's age is its own. The engine's phase handler
-    /// changes the phase a slot reports, so it has to stamp when that phase
-    /// was entered; inheriting the previous phase's mark makes every later
-    /// phase read as old as the job.
+    // Deliverable: a phase's age is its own. The engine's phase handler
+    // changes the phase a slot reports, so it has to stamp when that phase
+    // was entered; inheriting the previous phase's mark makes every later
+    // phase read as old as the job.
     #[test]
     fn an_engine_phase_change_stamps_its_own_entry() {
         let metrics = Par3Metrics::default();
@@ -1003,7 +1003,7 @@ mod tests {
         );
     }
 
-    /// Deliverable: the phase/stall model mirrors `download_pressure_*`.
+    // Deliverable: the phase/stall model mirrors `download_pressure_*`.
     #[test]
     fn a_slot_stalls_once_and_credits_its_whole_duration_when_it_clears() {
         let metrics = Par3Metrics::default();
@@ -1047,8 +1047,8 @@ mod tests {
         assert_eq!(metrics.current_stall_ms.load(Ordering::Relaxed), 0);
     }
 
-    /// Re-announcing the same phase is not progress; a wait path that keeps
-    /// saying the same thing must not be able to hide its own stall.
+    // Re-announcing the same phase is not progress; a wait path that keeps
+    // saying the same thing must not be able to hide its own stall.
     #[test]
     fn repeating_a_phase_does_not_refresh_the_progress_mark() {
         let metrics = Par3Metrics::default();
@@ -1071,8 +1071,8 @@ mod tests {
         assert_eq!(view[0].current_stall_ms, 0);
     }
 
-    /// An idle store releases the slot so a later job can claim it, and a job
-    /// that does not own the slot cannot release someone else's.
+    // An idle store releases the slot so a later job can claim it, and a job
+    // that does not own the slot cannot release someone else's.
     #[test]
     fn only_the_owner_releases_a_slot() {
         let metrics = Par3Metrics::default();
@@ -1092,7 +1092,7 @@ mod tests {
         assert_eq!(view[0].phase, Par3Phase::Idle);
     }
 
-    /// Deliverable: an admission refusal lands in the slot the budget names.
+    // Deliverable: an admission refusal lands in the slot the budget names.
     #[test]
     fn a_refusal_lands_in_its_own_slot_only() {
         let metrics = Par3Metrics::default();
@@ -1110,8 +1110,8 @@ mod tests {
         }
     }
 
-    /// Every exported code round-trips and every label is distinct, because
-    /// both are part of the `/metrics` contract.
+    // Every exported code round-trips and every label is distinct, because
+    // both are part of the `/metrics` contract.
     #[test]
     fn the_exported_codes_and_labels_are_stable() {
         for phase in Par3Phase::ALL {

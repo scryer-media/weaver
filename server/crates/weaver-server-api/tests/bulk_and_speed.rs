@@ -15,6 +15,27 @@ async fn set_speed_limit() {
 }
 
 #[tokio::test]
+async fn set_speed_limit_becomes_the_configured_limit() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(r#"mutation { setSpeedLimit(bytesPerSec: 2097161) }"#)
+        .await;
+    assert_no_errors(&resp);
+    let resp = h.execute(r#"{ settings { maxDownloadSpeed } }"#).await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["settings"]["maxDownloadSpeed"],
+        2097161
+    );
+    let resp = h
+        .execute(r#"mutation { setSpeedLimit(bytesPerSec: 0) }"#)
+        .await;
+    assert_no_errors(&resp);
+    let resp = h.execute(r#"{ settings { maxDownloadSpeed } }"#).await;
+    assert_eq!(response_data(&resp)["settings"]["maxDownloadSpeed"], 0);
+}
+
+#[tokio::test]
 async fn set_speed_limit_unlimited() {
     let h = TestHarness::new().await;
     let resp = h

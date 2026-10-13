@@ -13,12 +13,15 @@ import {
   UPDATE_RSS_RULE_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { directRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
-import { BetaTag, Square } from "../../../components/chrome";
+import { blockedRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
+import { refusalMessage } from "@/lib/refusal";
+import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { PrimaryButton, SecondaryButton } from "../../../components/controls";
-import { RoutingEditor, RoutingState } from "../../../components/RoutingEditor";
+import { SecondaryButton, Select } from "../../../components/controls";
+import { Icon } from "../../../components/icons";
+import { RoutingState } from "../../../components/RoutingState";
+import { RouteView } from "../../../features/networking/RouteView";
 import { Cell } from "../../../components/rows";
 import { formatDate, formatSize } from "../../../data/format";
 import { WV } from "../../../data/palette";
@@ -35,7 +38,7 @@ import {
  * RSS: the feeds weaver polls, the rules that decide what it takes from them,
  * and what it has already seen.
  *
- * Three tables rather than the classic page's nested cards: a rule belongs to
+ * Three tables rather than nested cards: a rule belongs to
  * a feed, but it reads as one flat list of decisions, and the feed it belongs
  * to is just its first column.
  */
@@ -62,6 +65,8 @@ interface RssRule {
 }
 
 interface RssFeed {
+  /** The feed instances that run on this feed, in the order they run. */
+  scriptInstanceIds: string[];
   routing: RoutingPolicy | null;
   routingStatus?: RoutingStatus;
   id: number;
@@ -107,10 +112,12 @@ interface RssData {
   rssFeeds: RssFeed[];
   rssSeenItems: SeenItem[];
   categories: { id: number; name: string }[];
+  /** Every script instance; a feed can only run one whose trigger is the feed. */
+  scriptInstances?: { id: string; name: string; script: string; trigger: string; enabled: boolean }[];
 }
 
 interface FeedForm {
-  routing: RoutingPolicy;
+  scriptInstanceIds: string[];
   name: string;
   url: string;
   enabled: boolean;
@@ -120,6 +127,11 @@ interface FeedForm {
   clearPassword: boolean;
   defaultCategory: string;
   metadata: string;
+  /**
+   * A new feed only: save it switched off behind a route nothing can take, so
+   * it cannot poll before its route is set under Networking.
+   */
+  killSwitch: boolean;
 }
 
 interface RuleForm {
@@ -138,7 +150,7 @@ interface RuleForm {
 const NO_CATEGORY = "";
 
 const NEW_FEED: FeedForm = {
-  routing: directRouting,
+  scriptInstanceIds: [],
   name: "",
   url: "",
   enabled: true,
@@ -148,6 +160,7 @@ const NEW_FEED: FeedForm = {
   clearPassword: false,
   defaultCategory: NO_CATEGORY,
   metadata: "",
+  killSwitch: false,
 };
 
 const NEW_RULE: Omit<RuleForm, "feedId"> = {
@@ -325,16 +338,17 @@ export function RssPanel() {
     setFeedForm(
       feed
         ? {
-            routing: feed.routing ?? directRouting,
             name: feed.name,
             url: feed.url,
             enabled: feed.enabled,
             pollIntervalSecs: feed.pollIntervalSecs,
+            scriptInstanceIds: feed.scriptInstanceIds ?? [],
             username: feed.username ?? "",
             password: "",
             clearPassword: false,
             defaultCategory: feed.defaultCategory ?? NO_CATEGORY,
             metadata: metadataText(feed.defaultMetadata),
+            killSwitch: false,
           }
         : NEW_FEED,
     );
@@ -378,12 +392,13 @@ export function RssPanel() {
       setError(t("next.rss.urlRequired"));
       return;
     }
+    // The route is left out: it is set under Networking, and saving a feed keeps the one it has.
     const input = {
-      routing: { proxyIds: feedForm.routing.proxyIds, allowDirect: feedForm.routing.allowDirect },
       name: feedForm.name.trim(),
       url: feedForm.url.trim(),
       enabled: feedForm.enabled,
       pollIntervalSecs: Math.max(30, Math.round(feedForm.pollIntervalSecs || 900)),
+      scriptInstanceIds: feedForm.scriptInstanceIds,
       username: feedForm.username.trim(),
       // A blank password keeps the stored one; clearing it is explicit.
       password: feedForm.clearPassword ? "" : feedForm.password.trim() || null,
@@ -392,10 +407,14 @@ export function RssPanel() {
     };
     setBusy(true);
     const result =
-      feedId === "new" ? await addFeed({ input }) : await updateFeed({ id: feedId, input });
+      feedId === "new"
+        ? await addFeed({
+            input: feedForm.killSwitch ? { ...input, enabled: false, routing: blockedRouting } : input,
+          })
+        : await updateFeed({ id: feedId, input });
     setBusy(false);
     if (result.error) {
-      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      setError(refusalMessage(t, result.error));
       return;
     }
     setError(null);
@@ -426,7 +445,7 @@ export function RssPanel() {
         : await updateRule({ id: ruleId, input });
     setBusy(false);
     if (result.error) {
-      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      setError(refusalMessage(t, result.error));
       return;
     }
     setError(null);
@@ -440,7 +459,7 @@ export function RssPanel() {
     const result = await runSync({ feedId: feed ? feed.id : null });
     if (result.error) {
       setStatus(null);
-      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      setError(refusalMessage(t, result.error));
       return;
     }
     const report = result.data?.runRssSync as SyncReport | undefined;
@@ -463,7 +482,7 @@ export function RssPanel() {
         "",
       ],
       empty: t("next.rss.feedsEmpty"),
-      emptyAction: { label: t("next.rss.addFeed"), onClick: () => openFeed(null) },
+      add: { label: t("next.rss.addFeed"), onClick: () => openFeed(null) },
       onRowClick: (id) => {
         const feed = feeds.find((entry) => String(entry.id) === id);
         if (feed) {
@@ -512,16 +531,14 @@ export function RssPanel() {
         t("next.rss.filesInto"),
       ],
       empty: t("next.rss.rulesEmpty"),
+      // A rule belongs to a feed, so there is nothing to add one to before a feed exists.
+      add: { label: t("next.rss.addRule"), onClick: () => openRule(null), disabled: feeds.length === 0 },
       onRowClick: (id) => {
         const entry = rules.find((candidate) => String(candidate.rule.id) === id);
         if (entry) {
           openRule(entry.rule);
         }
       },
-      footer:
-        feeds.length > 0 ? (
-          <SecondaryButton icon="add" onClick={() => openRule(null)}>{t("next.rss.addRule")}</SecondaryButton>
-        ) : undefined,
       rows: rules.map(({ rule, feed }) => ({
         id: String(rule.id),
         searchText: `${feed.name} ${rule.action} ${rule.titleRegex ?? ""} ${rule.categoryOverride ?? ""}`,
@@ -602,6 +619,77 @@ export function RssPanel() {
     },
   ];
 
+  // The scripts a feed runs are feed instances, attached in the order they run.
+  const feedInstances = (data?.scriptInstances ?? []).filter((instance) => instance.trigger === "FEED");
+  const feedInstanceName = (id: string) => feedInstances.find((instance) => instance.id === id)?.name ?? id;
+  const attached = feedForm.scriptInstanceIds;
+  const attachable = feedInstances.filter((instance) => !attached.includes(instance.id));
+  const moveAttached = (from: number, to: number) => {
+    const next = [...attached];
+    const [moved] = next.splice(from, 1);
+    if (moved !== undefined) {
+      next.splice(to, 0, moved);
+    }
+    patchFeed({ scriptInstanceIds: next });
+  };
+  const feedScripts = (
+    <div className="flex w-[340px] max-w-full flex-col gap-2">
+      {attached.map((id, index) => (
+        <div key={id} role="group" aria-label={feedInstanceName(id)} className="flex min-w-0 items-center gap-2">
+          <span className="w-4 flex-none font-wv-mono text-[11px] text-wv-faint">{index + 1}</span>
+          <span className="min-w-0 flex-1 truncate text-[12.5px] text-wv-fg" title={feedInstanceName(id)}>
+            {feedInstanceName(id)}
+          </span>
+          <SecondaryButton
+            className="h-7 px-2"
+            title={t("next.postProcessing.moveUp")}
+            disabled={index === 0}
+            onClick={() => moveAttached(index, index - 1)}
+          >
+            <Icon name="moveUp" size={13} />
+          </SecondaryButton>
+          <SecondaryButton
+            className="h-7 px-2"
+            title={t("next.postProcessing.moveDown")}
+            disabled={index === attached.length - 1}
+            onClick={() => moveAttached(index, index + 1)}
+          >
+            <Icon name="moveDown" size={13} />
+          </SecondaryButton>
+          <SecondaryButton
+            className="h-7 px-2"
+            title={t("next.common.remove")}
+            onClick={() => patchFeed({ scriptInstanceIds: attached.filter((entry) => entry !== id) })}
+          >
+            <Icon name="remove" size={13} />
+          </SecondaryButton>
+        </div>
+      ))}
+      {attachable.length > 0 ? (
+        <Select
+          label={t("next.rss.attachScript")}
+          value=""
+          className="w-full min-w-0"
+          options={[
+            { value: "", label: t("next.rss.attachScript") },
+            ...attachable.map((instance) => ({
+              value: instance.id,
+              label: instance.name === instance.script ? instance.name : `${instance.name} · ${instance.script}`,
+            })),
+          ]}
+          onChange={(next) => {
+            if (next) {
+              patchFeed({ scriptInstanceIds: [...attached, next] });
+            }
+          }}
+        />
+      ) : null}
+      {feedInstances.length === 0 ? (
+        <span className="text-[12px] leading-[1.45] text-wv-muted">{t("next.rss.noFeedInstances")}</span>
+      ) : null}
+    </div>
+  );
+
   const feedSections: EditorSection[] = [
     {
       id: "feed",
@@ -634,7 +722,8 @@ export function RssPanel() {
           help: t("next.rss.enabledHelp"),
           control: {
             kind: "toggle",
-            value: feedForm.enabled,
+            value: feedForm.enabled && !feedForm.killSwitch,
+            disabled: feedForm.killSwitch,
             onChange: (next) => patchFeed({ enabled: next }),
           },
         },
@@ -662,6 +751,13 @@ export function RssPanel() {
             options: categoryOptions,
             onChange: (next) => patchFeed({ defaultCategory: next }),
           },
+        },
+        {
+          id: "scriptInstanceIds",
+          label: t("next.rss.feedScripts"),
+          help: t("next.rss.feedScriptsHelp"),
+          keywords: feedForm.scriptInstanceIds.map(feedInstanceName).join(" "),
+          control: { kind: "custom", control: feedScripts },
         },
         {
           id: "metadata",
@@ -722,23 +818,24 @@ export function RssPanel() {
     {
       id: "routing",
       title: t("next.providers.networkRoute"),
-      tag: <BetaTag />,
-      fields: [
-        {
-          id: "routing",
-          label: t("next.providers.proxyRoute"),
-          help: t("next.rss.proxyRouteHelp"),
-          control: {
-            kind: "custom",
-            control: (
-              <RoutingEditor
-                value={feedForm.routing}
-                onChange={(next) => patchFeed({ routing: next })}
-              />
-            ),
-          },
-        },
-      ],
+      fields:
+        feedId === "new"
+          ? [
+              {
+                id: "killSwitch",
+                label: t("next.networking.killSwitch"),
+                help: t("next.rss.killSwitchHelp"),
+                control: {
+                  kind: "toggle",
+                  value: feedForm.killSwitch,
+                  onChange: (next) => patchFeed({ killSwitch: next }),
+                },
+              },
+            ]
+          : [],
+      body: (
+        <RouteView consumer={editingFeed ? `rss:${editingFeed.id}` : undefined} killSwitch={feedForm.killSwitch} />
+      ),
     },
   ];
 
@@ -863,7 +960,6 @@ export function RssPanel() {
         <SecondaryButton icon="refresh" onClick={() => void sync()} disabled={feeds.length === 0}>
           {t("next.rss.pollAll")}
         </SecondaryButton>
-        <PrimaryButton icon="add" onClick={() => openFeed(null)}>{t("next.rss.addFeed")}</PrimaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />

@@ -5,13 +5,13 @@ use serde::{Deserialize, Serialize};
 use crate::runtime::hardware_profile::{HardwareProfile, ProfileTuning};
 use crate::runtime::system_profile::SystemProfile;
 
-/// IOPS threshold for "fast" storage (SSD/NVMe). Above this, disk is not the
-/// bottleneck and we can use all configured connections. Below this, we
-/// throttle to avoid disk contention.
+// IOPS threshold for "fast" storage (SSD/NVMe). Above this, disk is not the
+// bottleneck and we can use all configured connections. Below this, we
+// throttle to avoid disk contention.
 const FAST_STORAGE_IOPS: f64 = 1_000.0;
 const MAX_CONCURRENT_EXTRACTIONS_ENV: &str = "WEAVER_MAX_CONCURRENT_EXTRACTIONS";
 
-/// Runtime limits derived from the system profile and the configured servers.
+// Runtime limits derived from the system profile and the configured servers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunedParameters {
     pub max_concurrent_downloads: usize,
@@ -19,37 +19,37 @@ pub struct TunedParameters {
     pub extract_thread_count: usize,
 }
 
-/// Holds the system profile and the limits derived from it. They move at
-/// runtime when the hardware profile in force changes, and the extraction
-/// concurrency also follows the measured disk once the startup benchmark
-/// lands.
+// Holds the system profile and the limits derived from it. They move at
+// runtime when the hardware profile in force changes, and the extraction
+// concurrency also follows the measured disk once the startup benchmark
+// lands.
 pub struct RuntimeTuner {
     profile: SystemProfile,
     current: TunedParameters,
     max_concurrent_extractions_override: Option<usize>,
-    /// Total connections across all configured servers (hard ceiling).
+    // Total connections across all configured servers (hard ceiling).
     total_connections: usize,
-    /// The chosen hardware profile's limits.
+    // The chosen hardware profile's limits.
     tuning: ProfileTuning,
 }
 
 impl RuntimeTuner {
-    /// Create with initial parameters derived from system profile.
-    /// `total_connections` is the sum of all configured server connections —
-    /// the tuner will never exceed this since the pool can't open more.
+    // Create with initial parameters derived from system profile.
+    // `total_connections` is the sum of all configured server connections —
+    // the tuner will never exceed this since the pool can't open more.
     pub fn new(profile: SystemProfile) -> Self {
         Self::with_connection_limit(profile, usize::MAX)
     }
 
-    /// Create with an explicit connection limit (from config), under the
-    /// profile this machine is recommended.
+    // Create with an explicit connection limit (from config), under the
+    // profile this machine is recommended.
     pub fn with_connection_limit(profile: SystemProfile, total_connections: usize) -> Self {
         let tuning = HardwareProfile::recommended(&profile).tuning(&profile);
         Self::with_profile_tuning(profile, total_connections, tuning)
     }
 
-    /// Create with an explicit connection limit and an explicitly chosen
-    /// hardware profile's limits.
+    // Create with an explicit connection limit and an explicitly chosen
+    // hardware profile's limits.
     pub fn with_profile_tuning(
         profile: SystemProfile,
         total_connections: usize,
@@ -74,27 +74,27 @@ impl RuntimeTuner {
         }
     }
 
-    /// Whether the detected storage is fast enough that disk I/O is not the
-    /// bottleneck (SSD/NVMe). Based on measured IOPS, not storage class enum,
-    /// so it works correctly in Docker and other environments where
-    /// `/sys/block` detection fails.
+    // Whether the detected storage is fast enough that disk I/O is not the
+    // bottleneck (SSD/NVMe). Based on measured IOPS, not storage class enum,
+    // so it works correctly in Docker and other environments where
+    // `/sys/block` detection fails.
     fn is_fast_storage(&self) -> bool {
         self.profile.disk.random_read_iops >= FAST_STORAGE_IOPS
     }
 
-    /// Get current tuned parameters.
+    // Get current tuned parameters.
     pub fn params(&self) -> &TunedParameters {
         &self.current
     }
 
-    /// Upper limit for max_concurrent_downloads based on the configured
-    /// connection count and the chosen profile's cap.
+    // Upper limit for max_concurrent_downloads based on the configured
+    // connection count and the chosen profile's cap.
     fn max_downloads_limit(&self) -> usize {
         profile_download_limit(self.total_connections, &self.tuning)
     }
 
-    /// Update the connection limit (e.g. after adding/removing a server) and
-    /// recalculate `max_concurrent_downloads` so downloads can use the new capacity.
+    // Update the connection limit (e.g. after adding/removing a server) and
+    // recalculate `max_concurrent_downloads` so downloads can use the new capacity.
     pub fn set_connection_limit(&mut self, total_connections: usize) {
         self.total_connections = total_connections;
         let limit = self.max_downloads_limit();
@@ -103,9 +103,9 @@ impl RuntimeTuner {
         self.current.max_concurrent_downloads = limit;
     }
 
-    /// Put another hardware profile's limits in force. Every limit here is read
-    /// where it is used, so work already running keeps what it started with
-    /// and the next download, decode or pool build sees the new values.
+    // Put another hardware profile's limits in force. Every limit here is read
+    // where it is used, so work already running keeps what it started with
+    // and the next download, decode or pool build sees the new values.
     pub fn set_profile_tuning(&mut self, tuning: ProfileTuning) {
         self.tuning = tuning;
         self.current = TunedParameters {
@@ -115,32 +115,32 @@ impl RuntimeTuner {
         };
     }
 
-    /// The hardware profile limits in force.
+    // The hardware profile limits in force.
     pub fn profile_tuning(&self) -> ProfileTuning {
         self.tuning
     }
 
-    /// The machine the limits are resolved against.
+    // The machine the limits are resolved against.
     pub fn system_profile(&self) -> &SystemProfile {
         &self.profile
     }
 
-    /// Apply the asynchronous startup disk measurement without disrupting
-    /// active work. Extraction admission reads this value on each promotion.
+    // Apply the asynchronous startup disk measurement without disrupting
+    // active work. Extraction admission reads this value on each promotion.
     pub fn set_random_read_iops(&mut self, random_read_iops: f64) {
         self.profile.disk.random_read_iops = random_read_iops;
     }
 
-    /// Maximum concurrent streaming member extractions, adaptive to disk type
-    /// and bounded by the hardware profile in force.
-    ///
-    /// SSD: no seek penalty, scale with CPU cores from 2 up to the profile's
-    /// cap (2, 4 or 6).
-    /// HDD: seeking between concurrent read positions kills throughput (1-2).
-    /// Network/Unknown: moderate (2).
-    ///
-    /// The environment override is the operator's explicit number and wins
-    /// over every profile.
+    // Maximum concurrent streaming member extractions, adaptive to disk type
+    // and bounded by the hardware profile in force.
+    //
+    // SSD: no seek penalty, scale with CPU cores from 2 up to the profile's
+    // cap (2, 4 or 6).
+    // HDD: seeking between concurrent read positions kills throughput (1-2).
+    // Network/Unknown: moderate (2).
+    //
+    // The environment override is the operator's explicit number and wins
+    // over every profile.
     pub fn max_concurrent_extractions(&self) -> usize {
         if let Some(override_value) = self.max_concurrent_extractions_override {
             return override_value;
@@ -163,19 +163,19 @@ impl RuntimeTuner {
     }
 }
 
-/// Downloads that may be in flight at once.
-///
-/// Every configured connection is a download connection. Memory pressure
-/// changes where decoded bytes go (the write backlog spills to disk), never
-/// how many articles are requested: a connection count that ratchets down on
-/// pressure turns a transient backlog into a lasting speed loss that only a
-/// restart undoes.
-///
-/// A profile's cap is not that. It is a value the operator chose along with
-/// the profile — live per-job memory scales with the number of downloads in
-/// flight, so a machine that asked for the smallest footprint gets fewer of
-/// them — and it moves only when the profile in force does, never in response
-/// to pressure. Only the efficient profile sets one.
+// Downloads that may be in flight at once.
+//
+// Every configured connection is a download connection. Memory pressure
+// changes where decoded bytes go (the write backlog spills to disk), never
+// how many articles are requested: a connection count that ratchets down on
+// pressure turns a transient backlog into a lasting speed loss that only a
+// restart undoes.
+//
+// A profile's cap is not that. It is a value the operator chose along with
+// the profile — live per-job memory scales with the number of downloads in
+// flight, so a machine that asked for the smallest footprint gets fewer of
+// them — and it moves only when the profile in force does, never in response
+// to pressure. Only the efficient profile sets one.
 fn profile_download_limit(total_connections: usize, tuning: &ProfileTuning) -> usize {
     match tuning.max_concurrent_downloads_cap {
         Some(cap) => total_connections.min(cap),

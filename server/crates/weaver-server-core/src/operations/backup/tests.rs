@@ -51,7 +51,7 @@ fn sample_config() -> Config {
                 limit_bytes: 10_000_000,
                 period: crate::servers::ServerDownloadQuotaPeriod::Daily,
                 reset_time_minutes_local: 60,
-                weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Mon,
+                weekly_reset_weekday: crate::bandwidth::QuotaWeekday::Mon,
                 monthly_reset_day: 1,
             },
             tls_ca_cert: None,
@@ -68,7 +68,6 @@ fn sample_config() -> Config {
             multiplier: Some(2.0),
         }),
         max_download_speed: Some(42),
-        isp_bandwidth_cap: None,
         propagation_delay_secs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -104,6 +103,8 @@ fn backup_temp_directory_is_owner_only() {
 async fn export_and_import_stable_state_roundtrip() {
     let src = Database::open_in_memory().unwrap();
     src.save_config(&sample_config()).unwrap();
+    src.add_metered_bandwidth_usage_minutes(&[(42, true, 120), (42, false, 300)])
+        .unwrap();
     let usage_updated_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
     src.upsert_server_download_usage(&crate::servers::ServerDownloadUsage {
         server_id: 1,
@@ -150,6 +151,7 @@ async fn export_and_import_stable_state_roundtrip() {
     }])
     .unwrap();
     src.insert_rss_feed(&RssFeedRow {
+        scripts: Vec::new(),
         id: 1,
         name: "feed".into(),
         url: "https://example.com/rss".into(),
@@ -224,6 +226,11 @@ async fn export_and_import_stable_state_roundtrip() {
     let dest = Database::open_in_memory().unwrap();
     assert!(dest.restore_target_is_pristine().unwrap());
     dest.import_stable_state(temp.path()).unwrap();
+    assert_eq!(dest.sum_bandwidth_usage_minutes(42, 43).unwrap(), 420);
+    assert_eq!(
+        dest.sum_metered_bandwidth_usage_minutes(42, 43).unwrap(),
+        120
+    );
 
     let restored = dest.load_config().unwrap();
     assert_eq!(restored.data_dir, "/old/data");

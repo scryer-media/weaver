@@ -50,14 +50,46 @@ const MAX_BUNDLE_CUMULATIVE_PATH_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BUNDLE_LONG_NAME_BYTES: usize =
     MAX_BUNDLE_CUMULATIVE_PATH_BYTES + MAX_BUNDLE_ARCHIVE_ENTRIES;
 const MAX_BACKUP_ZSTD_WINDOW_LOG: u32 = 26;
-/// Top-level directory pre-0.9 bundles used for extension packages. Weaver no
-/// longer writes it; the name survives only to recognize and skip those entries.
+// Top-level directory pre-0.9 bundles used for extension packages. Weaver no
+// longer writes it; the name survives only to recognize and skip those entries.
 const LEGACY_MANAGED_PACKAGE_DIR: &str = "managed-extensions";
+
+#[derive(Clone, Default)]
+pub(super) struct BackupCancellation {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl BackupCancellation {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+    pub(super) fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(super) async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 struct AtomicOutputWriter {
     temp: tempfile::NamedTempFile,
     writer: BufWriter<File>,
     destination: PathBuf,
+    cancellation: super::archive::BackupCancellation,
 }
 
 impl AtomicOutputWriter {
@@ -73,10 +105,14 @@ impl AtomicOutputWriter {
             temp,
             writer,
             destination: destination.to_path_buf(),
+            cancellation: super::archive::BackupCancellation::new(),
         })
     }
 
     fn finish(mut self) -> Result<(), std::io::Error> {
+        if self.cancellation.is_cancelled() {
+            return Err(std::io::Error::other("backup cancelled"));
+        }
         self.writer.flush()?;
         let file = self
             .writer
@@ -84,6 +120,9 @@ impl AtomicOutputWriter {
             .map_err(|error| error.into_error())?;
         file.sync_all()?;
         drop(file);
+        if self.cancellation.is_cancelled() {
+            return Err(std::io::Error::other("backup cancelled"));
+        }
         self.temp
             .persist(&self.destination)
             .map_err(|error| error.error)?;
@@ -97,6 +136,9 @@ impl AtomicOutputWriter {
 
 impl Write for AtomicOutputWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.cancellation.is_cancelled() {
+            return Err(std::io::Error::other("backup cancelled"));
+        }
         self.writer.write(bytes)
     }
 
@@ -448,13 +490,29 @@ fn bundle_write_entries(staging_root: &Path) -> Result<Vec<BundleWriteEntry>, st
     Ok(entries)
 }
 
+#[cfg(test)]
 pub(crate) fn write_bundle_archive(
     destination: &Path,
     password: &str,
     staging_root: &Path,
 ) -> Result<(), std::io::Error> {
+    write_bundle_archive_cancellable(
+        destination,
+        password,
+        staging_root,
+        super::archive::BackupCancellation::new(),
+    )
+}
+
+pub(crate) fn write_bundle_archive_cancellable(
+    destination: &Path,
+    password: &str,
+    staging_root: &Path,
+    cancellation: super::archive::BackupCancellation,
+) -> Result<(), std::io::Error> {
     let entries = bundle_write_entries(staging_root)?;
-    let atomic = AtomicOutputWriter::new(destination)?;
+    let mut atomic = AtomicOutputWriter::new(destination)?;
+    atomic.cancellation = cancellation;
     let encrypted = BundleChunkWriter::new(atomic, password)?;
     let encoder = zstd::stream::write::Encoder::new(encrypted, 3)?;
     let mut archive = tar::Builder::new(encoder);
@@ -601,13 +659,13 @@ fn is_windows_device_name(component: &str) -> bool {
     })
 }
 
-/// Whether this entry is an extension package from a pre-0.9 bundle.
-///
-/// Those entries are recognized so they can be skipped rather than rejected as
-/// undeclared: the rest of the bundle is the operator's real data, and refusing
-/// the whole restore over a payload nothing reads any more would cost them far
-/// more than the packages are worth. Path safety is already enforced for every
-/// entry before this is consulted.
+// Whether this entry is an extension package from a pre-0.9 bundle.
+//
+// Those entries are recognized so they can be skipped rather than rejected as
+// undeclared: the rest of the bundle is the operator's real data, and refusing
+// the whole restore over a payload nothing reads any more would cost them far
+// more than the packages are worth. Path safety is already enforced for every
+// entry before this is consulted.
 fn is_legacy_managed_package_path(path: &Path) -> bool {
     path.components().next()
         == Some(Component::Normal(std::ffi::OsStr::new(
@@ -918,7 +976,7 @@ fn bundle_aad(metadata: &[u8; BUNDLE_METADATA_SIZE], index: u64) -> Vec<u8> {
     aad
 }
 
-/// File format: `WEAVER_ENC\0` (10 bytes) + salt (32 bytes) + nonce (12 bytes) + ciphertext+tag
+// File format: `WEAVER_ENC\0` (10 bytes) + salt (32 bytes) + nonce (12 bytes) + ciphertext+tag
 const ENCRYPT_MAGIC: &[u8; 10] = b"WEAVER_ENC";
 const SALT_LEN: usize = 32;
 const PBKDF2_ROUNDS: u32 = 600_000;
@@ -1140,6 +1198,20 @@ fn is_encrypted(path: &Path) -> Result<bool, BackupServiceError> {
 mod bundle_envelope_tests {
     use super::*;
 
+    #[test]
+    fn cancelled_archive_never_publishes_and_removes_its_temporary_file() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("cancelled.enc");
+        let mut output = AtomicOutputWriter::new(&destination).unwrap();
+        output.write_all(b"partial archive").unwrap();
+        let cancellation = output.cancellation.clone();
+        cancellation.cancel();
+        assert!(output.write_all(b"more").is_err());
+        assert!(output.finish().is_err());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
     const HEADER_SIZE: usize =
         BUNDLE_MAGIC.len() + 1 + std::mem::size_of::<u32>() + BUNDLE_METADATA_SIZE;
 
@@ -1289,8 +1361,8 @@ mod bundle_envelope_tests {
         assert!(entries.next().is_none());
     }
 
-    /// A bundle written before extension packages were removed, complete with
-    /// the `managed-extensions/` payload and the inventory that declared it.
+    // A bundle written before extension packages were removed, complete with
+    // the `managed-extensions/` payload and the inventory that declared it.
     fn legacy_package_bundle() -> Vec<u8> {
         use super::super::manifest::{BACKUP_FORMAT_VERSION, BACKUP_SCOPE};
 

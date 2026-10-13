@@ -212,6 +212,105 @@ test("subscription loss polls and reconnects without losing the visible applicat
   await expect(page.getByRole("main")).toBeVisible();
 });
 
+test("the NZB analyzer renders and downloads a redacted report without queueing", async ({ cleanPage: page }) => {
+  await page.goto(weaverRoute("/tools/nzb-analyzer"));
+  await expect(page.getByRole("heading", { name: "NZB analyzer", exact: true })).toBeVisible();
+  const sentinel = "e2e-analyzer-private";
+  const nzb = `<?xml version="1.0" encoding="UTF-8"?>
+    <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+      <head><meta type="password">${sentinel}</meta></head>
+      <file poster="${sentinel}@e2e.invalid" date="1700000000" subject="${sentinel}.bin">
+        <groups><group>alt.binaries.${sentinel}</group></groups>
+        <segments><segment bytes="1024" number="1">${sentinel}@e2e.invalid</segment></segments>
+      </file>
+    </nzb>`;
+  const chooser = page.waitForEvent("filechooser");
+  await page.getByRole("button", { name: "Drop an .nzb or .nzb.gz here, or click to choose one", exact: true }).click();
+  await (await chooser).setFiles({ name: "analysis-probe.nzb", mimeType: "application/x-nzb", buffer: Buffer.from(nzb) });
+  const report = page.getByRole("region", { name: "Report", exact: true });
+  await expect(report).toContainText("fingerprint ");
+  await expect(report).not.toContainText(sentinel);
+  const downloadPromise = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Download JSON", exact: true }).click();
+  const download = await downloadPromise;
+  const stream = await download.createReadStream();
+  if (!stream) throw new Error("the analyzer did not retain its download");
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  const json = Buffer.concat(chunks).toString("utf8");
+  expect(json).not.toContain(sentinel);
+  const parsed = JSON.parse(json);
+  expect(parsed.nzb.shape.file_count).toBe(1);
+  expect(parsed.job).toBeNull();
+  await page.goto(weaverRoute("/"));
+  await expect(page.getByRole("main")).toContainText("No active downloads");
+});
+
+test("stored backup storage, download and deletion are browser-owned", async ({ cleanPage: page }) => {
+  await page.goto(weaverRoute("/settings/backup"));
+  const storage = page.getByRole("region", { name: "Backup storage", exact: true });
+  const path = storage.getByRole("textbox", { name: "Custom backup path", exact: true });
+  await expect(path).toBeVisible();
+  const originalPath = await path.inputValue();
+  const customPath = `/data/e2e-backups-${configuredBasePath.replaceAll("/", "-") || "root"}`;
+  const savePath = async (value: string) => {
+    // Focusing a path opens its picker; cancel it before typing a path directly.
+    await path.click();
+    const picker = page.getByRole("dialog", { name: "Custom backup path", exact: true });
+    await picker.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(picker).toBeHidden();
+    await path.fill(value);
+    const saved = page.waitForResponse((response) =>
+      response.request().method() === "POST"
+      && response.request().postData()?.includes("mutation UpdateBackupSettings") === true,
+    );
+    await storage.getByRole("button", { name: "Save changes", exact: true }).click();
+    expect((await saved).ok()).toBeTruthy();
+    await page.reload();
+    await expect(path).toHaveValue(value);
+  };
+  await savePath(customPath);
+  try {
+    const stored = page.getByRole("region", { name: "Stored backups", exact: true });
+    await expect(stored.getByRole("button", { name: "Download", exact: true })).toHaveCount(0);
+    const backup = page.getByRole("region", { name: "Backup", exact: true });
+    await backup.getByLabel("Password", { exact: true }).fill("e2e-stored-backup-key");
+    await backup.getByLabel("Confirm password", { exact: true }).fill("e2e-stored-backup-key");
+    const created = page.waitForResponse((response) =>
+      new URL(response.url()).pathname.endsWith("/api/backup/create")
+      && response.request().method() === "POST",
+    );
+    await page.getByRole("button", { name: "Create without downloading", exact: true }).click();
+    const response = await created;
+    expect(response.status()).toBe(202);
+    const info = await response.json() as { filename: string };
+    await expect(stored.getByTitle(info.filename, { exact: true })).toBeVisible();
+    const downloadButton = stored.getByRole("button", { name: "Download", exact: true });
+    await expect(downloadButton).toHaveCount(1);
+    await expect(downloadButton).toBeEnabled();
+    await expect(stored.getByText("Ready", { exact: true })).toBeVisible();
+    const downloadPromise = page.waitForEvent("download");
+    await downloadButton.click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe(info.filename);
+    const stream = await download.createReadStream();
+    if (!stream) throw new Error("the stored backup did not retain its download");
+    let bytes = 0;
+    for await (const chunk of stream) bytes += chunk.length;
+    expect(bytes).toBeGreaterThan(0);
+    await stored.getByRole("button", { name: "Delete backup", exact: true }).click();
+    const confirm = page.getByRole("dialog", { name: "Delete backup", exact: true });
+    await expect(confirm).toContainText(info.filename);
+    await confirm.getByRole("button", { name: "Delete backup", exact: true }).click();
+    await expect(confirm).toBeHidden();
+    await expect(stored.getByTitle(info.filename, { exact: true })).toHaveCount(0);
+    await page.reload();
+    await expect(stored.getByRole("button", { name: "Download", exact: true })).toHaveCount(0);
+  } finally {
+    await savePath(originalPath);
+  }
+});
+
 test("every public GraphQL mutation has a release-gate owner", async ({ request }) => {
   const schemaMutations = await introspectPublicMutationNames(request);
   const ledgerMutations = coverageLedger.mutations

@@ -290,6 +290,13 @@ func Run(args []string, programName string) {
 		os.Exit(1)
 	}
 
+	if args[0] == "full" && len(args) > 1 && args[1] == "real-usenet" {
+		if err := cmdRealUsenet(args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	switch args[0] {
 	case "doctor":
 		if err := cmdDoctor(os.Stdout); err != nil {
@@ -348,6 +355,8 @@ func Run(args []string, programName string) {
 		cmdWeaverReleaseFlow(args[1:])
 	case "release-finalize":
 		cmdWeaverReleaseFinalize(args[1:])
+	case "two-nic":
+		cmdTwoNIC(args[1:])
 	case "test-all":
 		cmdTestAll()
 	case "test":
@@ -398,8 +407,10 @@ Commands:
   status                Check health of all e2e services
   scenarios             List all available test scenarios
   full                  Seed fixtures, then run functional, chaos, Docker restart, and managed restart phases
+  full real-usenet      Opt-in real-provider downloads; private/real-network holds .env, eight WG configs, and the SAB test NZB
   release-gate [flow]   Run the independent Weaver product-behavior release gate
   release-console [run] Serve the latest or selected Weaver release-gate artifacts
+  two-nic <M|L>         Run the two-NIC lanes against real interfaces (see two-nic with no lane for its environment)
   test <slug> [slug...] Run specific test(s) by slug
   test-all              Submit all NZBs, poll all simultaneously
   pgo [slug...]         Run representative managed-Weaver flows for LLVM PGO data

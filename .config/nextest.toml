@@ -1,9 +1,9 @@
 [profile.default]
-# The archive matrix is opt-in, and so is everything the extended campaigns
-# schedule: their shards and their smokes alike run only from the manually
-# dispatched workflow. The extended modules keep their small regression tests
-# in the default suite; only their schedule smokes and reason campaigns leave.
-default-filter = 'not (test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_) | ((test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & (test(/::combined_/) | test(/_schedules$/) | test(/demotion_reasons_/))))'
+# Every schedule family is opt-in: nothing under the archive schedule modules,
+# the 7z store schedules, or the PAR2 schedule modules runs in the default
+# suite, smokes and single-case regressions included. They run only from the
+# manually dispatched workflow or the matrix profiles below.
+default-filter = 'not (test(archive_schedules::) | test(sevenz_store::schedules::) | test(par2::tests::schedules::) | test(direct_store::tests::par2_schedules::) | test(par2_completion::schedules::))'
 # A test that leaves a child holding stdout or stderr open is a test failure.
 leak-timeout = { period = "2s", result = "fail" }
 # Tests wait on the events they check rather than racing a deadline of their
@@ -24,18 +24,20 @@ leak-timeout = { period = "2s", result = "pass" }
 # The archive campaigns run whole schedules per test, so a healthy one can take
 # minutes on a shared runner: flag it every five minutes, kill it after twenty.
 
+# The archive matrix: every schedule family except the extended modules.
 # Run with: cargo nextest run --profile archive-matrix --run-ignored all --no-fail-fast
 [profile.archive-matrix]
-default-filter = 'test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_)'
+default-filter = '(test(archive_schedules::) | test(sevenz_store::schedules::) | test(par2::tests::schedules::) | test(direct_store::tests::par2_schedules::) | test(par2_completion::schedules::)) & not (test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::))'
 slow-timeout = { period = "300s", terminate-after = 12 }
 
-# The extended campaigns are a separate, manually dispatched run.
+# The extended campaigns are a separate, manually dispatched run: the whole of
+# the extended modules, smokes included.
 # Run with: cargo nextest run --profile archive-matrix-extended --run-ignored all --no-fail-fast
 [profile.archive-matrix-extended]
-default-filter = '(test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & (test(/::combined_/) | test(/_schedules$/) | test(/demotion_reasons_/))'
+default-filter = 'test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)'
 slow-timeout = { period = "300s", terminate-after = 12 }
 
 # The archive matrix and the extended campaigns together, as CI partitions them.
 [profile.archive-matrix-all]
-default-filter = 'test(archive_schedules::combined_) | test(sevenz_store::schedules::combined_) | ((test(archive_schedules::extended::) | test(sevenz_store::schedules::extended::)) & (test(/::combined_/) | test(/_schedules$/) | test(/demotion_reasons_/)))'
+default-filter = 'test(archive_schedules::) | test(sevenz_store::schedules::) | test(par2::tests::schedules::) | test(direct_store::tests::par2_schedules::) | test(par2_completion::schedules::)'
 slow-timeout = { period = "300s", terminate-after = 12 }

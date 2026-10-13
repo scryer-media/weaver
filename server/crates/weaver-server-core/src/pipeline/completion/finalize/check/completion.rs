@@ -1,20 +1,30 @@
-//! Continuation of the `impl Pipeline` block from `finalize/check.rs`.
-//! Split out mechanically to keep the parent file readable; no behavior lives here
-//! that is not simply a method of the same type.
+// Continuation of the `impl Pipeline` block from `finalize/check.rs`.
+// Split out mechanically to keep the parent file readable; no behavior lives here
+// that is not simply a method of the same type.
 
 use super::*;
 use crate::pipeline::repair::backend::AlternateRepairReason;
 
 impl Pipeline {
-    /// Whether the job has archive extraction to run once its PAR2 verdict
-    /// lands.
-    ///
-    /// Asked again after a clean verdict's deobfuscation rather than read from
-    /// the start of the pass: an obfuscated volume the repair completed was
-    /// never classified by its content, so until the verdict names it the job
-    /// looks like it has no archive at all. Answering from that stale view
-    /// sends a job whose only archive was just named to reconciliation instead
-    /// of extraction, and leaves it verifying with nothing left to verify.
+    // The recovery-volume restore runs only once no extraction task is
+    // active, so while one is, a hole in a RAR set that carries `.rev` files
+    // is not yet a verdict: an eager extraction of the members around the
+    // hole can still be running when the downloads drain.
+    fn rar_recovery_restore_pending(&self, job_id: JobId) -> bool {
+        self.job_has_only_rar_archives(job_id)
+            && self.job_has_active_extraction_tasks(job_id)
+            && self.job_has_rar_recovery_volume_files(job_id)
+    }
+
+    // Whether the job has archive extraction to run once its PAR2 verdict
+    // lands.
+    //
+    // Asked again after a clean verdict's deobfuscation rather than read from
+    // the start of the pass: an obfuscated volume the repair completed was
+    // never classified by its content, so until the verdict names it the job
+    // looks like it has no archive at all. Answering from that stale view
+    // sends a job whose only archive was just named to reconciliation instead
+    // of extraction, and leaves it verifying with nothing left to verify.
     fn archive_extraction_applicable(&self, job_id: JobId) -> bool {
         self.extraction_readiness_for_job(job_id) != ExtractionReadiness::NotApplicable
             || self.job_has_only_rar_archives(job_id)
@@ -24,6 +34,22 @@ impl Pipeline {
         let set_names = self.rar_set_names_for_job(job_id);
         if set_names.is_empty() {
             return;
+        }
+
+        // Recovery can replace an entirely lost posted roster under a new
+        // name. Once the replacement is verified and extracted, its empty
+        // predecessor must not keep waiting for an archive it never received.
+        if self.par2_verified.contains(&job_id)
+            && self.par2_verdict_delivered_unposted_payload(job_id)
+            && !self.job_has_pending_download_pipeline_work(job_id)
+        {
+            for set_name in &set_names {
+                if matches!(self.classify_unmaterialized_archive_set(job_id, set_name),
+                    crate::pipeline::completion::finalize::rar::UnmaterializedArchiveSet::ConsumedBy(_))
+                {
+                    self.extracted_archives.entry(job_id).or_default().insert(set_name.clone());
+                }
+            }
         }
 
         // A full-set extraction of a set with no runtime state of its own (a
@@ -63,6 +89,37 @@ impl Pipeline {
             .get(&job_id)
             .cloned()
             .unwrap_or_default();
+
+        // A set that has never had a first volume would otherwise fall back to
+        // a full-set extraction, which cannot open it and used to end the job
+        // on the spot. Parked as waiting on volume 0 it is a missing volume,
+        // and the completion check that follows routes it to repair, or to a
+        // failure that names what was seen.
+        // A live direct set owns its archive bytes even while a demoted
+        // neighbour extracts from disk. Its publication waits for that
+        // neighbour, but it must not enter the disk extraction fallback.
+        let direct_sets: HashSet<String> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .filter(|set| {
+                !set.is_demoted()
+                    && !set.is_finalized()
+                    && !extracted_archives.contains(&set.plan().set_name)
+            })
+            .map(|set| set.plan().set_name.clone())
+            .collect();
+        let mut parked_without_first_volume = false;
+        for set_name in &set_names {
+            if !extracted_archives.contains(set_name) && !direct_sets.contains(set_name) {
+                parked_without_first_volume |=
+                    self.park_rar_set_waiting_for_first_volume(job_id, set_name);
+            }
+        }
+        if parked_without_first_volume {
+            self.schedule_job_completion_check(job_id);
+            return;
+        }
         let mut forced_recompute = false;
         let (fallback_sets, has_incomplete_sets, has_ready_incremental_work) = loop {
             let mut fallback_sets = Vec::new();
@@ -71,6 +128,10 @@ impl Pipeline {
             let mut impossible_sets = Vec::new();
 
             for set_name in &set_names {
+                if direct_sets.contains(set_name) {
+                    has_incomplete_sets = true;
+                    continue;
+                }
                 let set_state = self.rar_sets.get(&(job_id, set_name.clone()));
                 let set_complete = extracted_archives.contains(set_name)
                     || set_state
@@ -210,6 +271,43 @@ impl Pipeline {
         self.finalize_completed_archive_job(job_id).await;
     }
 
+    // A complete alternate at every missing part position can reach extraction.
+    // The extraction worker still checks duplicate bytes, container bounds and
+    // every member's checksum before any output is published.
+    fn incomplete_sevenz_parts_have_alternates(&self, job_id: JobId) -> bool {
+        if self.job_spec_has_par2_file(job_id)
+            || self.job_has_pending_download_pipeline_work(job_id)
+        {
+            return false;
+        }
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        state
+            .assembly
+            .files()
+            .filter(|file| !file.is_complete() && !file.role().is_recovery())
+            .all(|file| {
+                let weaver_model::files::FileRole::SevenZipSplit { number } =
+                    self.classified_role_for_file(job_id, file)
+                else {
+                    return false;
+                };
+                let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file) else {
+                    return false;
+                };
+                state.assembly.files().any(|alternate| {
+                    alternate.is_complete()
+                        && self.classified_role_for_file(job_id, alternate)
+                            == weaver_model::files::FileRole::SevenZipSplit { number }
+                        && self
+                            .classified_archive_set_name_for_file(job_id, alternate)
+                            .as_deref()
+                            == Some(&set_name)
+                })
+            })
+    }
+
     pub(in crate::pipeline) fn only_archive_residuals_or_loaded_par2_index_are_incomplete(
         &self,
         job_id: JobId,
@@ -253,7 +351,25 @@ impl Pipeline {
         };
         let mut saw_incomplete = false;
 
+        // A repaired archive may have no posted file bound to its canonical
+        // name. Superseding its damaged inputs does not discharge extraction
+        // of the verified replacement.
+        if let Some(unposted) = self.recovery_unposted_outputs.get(&job_id) {
+            for name in &unposted.outputs {
+                let role = weaver_model::files::FileRole::from_filename(name);
+                if let Some(set_name) = weaver_model::files::archive_base_name(name, &role)
+                    && !set_is_extracted(&set_name)
+                {
+                    return false;
+                }
+            }
+        }
+
         for file in state.assembly.files() {
+            if self.recovery_superseded_source(job_id, file.file_id()) {
+                saw_incomplete |= !file.is_complete();
+                continue;
+            }
             if file.is_complete() {
                 // A volume that arrived intact still has to be opened. Skipping
                 // every complete file meant this read "nothing is left to do"
@@ -293,13 +409,17 @@ impl Pipeline {
         saw_incomplete
     }
 
-    /// Check if all data files in a job are complete, and trigger post-processing.
-    ///
-    /// PAR2 is treated as a repair tool only — damage is detected via yEnc CRC
-    /// (per-segment) and RAR CRC (per-member extraction). If
-    /// CRC failures occur, recovery files are promoted for download and repair
-    /// runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
+    // Check if all data files in a job are complete, and trigger post-processing.
+    //
+    // PAR2 is treated as a repair tool only — damage is detected via yEnc CRC
+    // (per-segment) and RAR CRC (per-member extraction). If
+    // CRC failures occur, recovery files are promoted for download and repair
+    // runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
     pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
+        if self.shared_state.is_post_processing_paused() {
+            self.deferred_post_processing.insert(job_id);
+            return;
+        }
         // A container set whose map nothing left in flight could read holds its
         // volumes off the conventional path forever, and holding them is
         // exactly what keeps this gate from ruling. Asked here because this is
@@ -307,6 +427,9 @@ impl Pipeline {
         // end a download without completing a file. One iteration over the
         // job's direct sets, and nothing at all for a job with no container set
         // still routing.
+        if self.has_direct_end_header_verdicts() {
+            self.settle_direct_end_header_verdicts().await;
+        }
         self.demote_direct_sets_with_an_unreadable_map(job_id).await;
         let current_status = {
             let Some(state) = self.jobs.get(&job_id) else {
@@ -358,6 +481,7 @@ impl Pipeline {
             })
         } else {
             complete_data_files < total_data_files
+                && !self.incomplete_sevenz_parts_have_alternates(job_id)
         };
 
         // Step 1: Are all data files (non-recovery) complete?
@@ -384,6 +508,9 @@ impl Pipeline {
             }
         }
 
+        if self.queue_script_completion_gate(job_id, !has_incomplete_data_files) {
+            return;
+        }
         self.maybe_prefetch_par3_recovery(job_id);
         let working_dir = self.jobs[&job_id].working_dir.clone();
         match self
@@ -597,6 +724,11 @@ impl Pipeline {
         // that finds the set clean retries extraction once and then fails the
         // job, and a repair clears the failed set before its retry.
         let par2_verdict_stale_after_failed_extraction = self.par2_verified.contains(&job_id)
+            && self.par2_runtime(job_id).is_some_and(|runtime| {
+                runtime
+                    .served()
+                    .is_some_and(|set_runtime| set_runtime.settled_via_strong_decode)
+            })
             && has_crc_failures
             && (self.job_has_live_rar_waiting_for_absent_volumes(job_id)
                 || self.job_has_failed_sevenz_set_with_all_volumes(job_id));
@@ -703,6 +835,12 @@ impl Pipeline {
         let pending_rar_refresh = download_pipeline_exhausted
             && only_rar_archives
             && self.job_has_pending_rar_refresh_for_current_sets(job_id);
+        // A hole in a numbered part run that nothing listed can fill: a part
+        // the post never carried. Every listed file may be whole, so nothing
+        // else here reads as damage, yet the recovery set can rebuild the
+        // part, and only the authoritative pass names its blocks.
+        let numbered_archive_part_missing =
+            download_pipeline_exhausted && self.missing_numbered_archive_part(job_id).is_some();
 
         // Step 2: Check for CRC failures that need PAR2 repair.
         let clean_par2_integrity_gate = self.clean_par2_integrity_gate(job_id);
@@ -742,12 +880,43 @@ impl Pipeline {
         });
         let known_archive_damage =
             self.archive_extraction_held_for_known_damage(job_id) || known_file_crc_damage;
+        // Successful decoding only covers posted files. Recovery metadata can
+        // describe an absent volume before the archive topology discovers it.
+        let unposted_protected_payload = par2_validation_needed
+            && self.par2_set(job_id).is_some_and(|set| {
+                let bound: HashSet<_> = self.jobs[&job_id]
+                    .assembly
+                    .files()
+                    .filter_map(|file| {
+                        self.resolve_par2_file_binding_in_set(file.file_id(), set.recovery_set_id)
+                            .map(|binding| binding.par2_file_id)
+                    })
+                    .collect();
+                let ignored = self.par2_ignore_extensions();
+                set.recovery_file_ids.iter().any(|id| {
+                    !bound.contains(id)
+                        && set.file_description(id).is_none_or(|description| {
+                            !par2_damage_ignorable(&description.filename, &ignored)
+                        })
+                })
+            });
         let authoritative_par2_verification_owed = rar_par2_repair_ready
+            || unposted_protected_payload
             || self.par3_requires_authoritative_par2(job_id)
             || known_archive_damage
+            // Completed transport is not proof that a restored direct image
+            // decoded successfully. Its member gates must pass before the
+            // strong-decode shortcut can replace an authoritative read.
+            || self.direct_store.sets_for(job_id).iter().any(|set| {
+                !set.is_demoted()
+                    && !set.is_finalized()
+                    && set.all_volumes_complete()
+                    && !set.ready_to_finalize()
+            })
             || has_crc_failures
             || (has_incomplete_data_files && download_pipeline_exhausted)
             || rar_waiting_for_missing_volumes
+            || numbered_archive_part_missing
             || matches!(current_status, JobStatus::Repairing)
             || matches!(
                 clean_par2_integrity_gate,
@@ -770,10 +939,25 @@ impl Pipeline {
                         })
                 })
         });
+        // A direct verification ticket this gate itself submitted, still
+        // running or finished and parked. The terms above are read fresh on
+        // every lap, and the one that sent the authoritative pass down to
+        // start the ticket can lapse before the ticket answers: a file the
+        // recovery set describes binds while the read is out, say, and the
+        // next lap finds nothing unposted. Without this the skip below settles
+        // the set on the strong-decode claim while the read it asked for
+        // still stands registered, and nothing ever takes it: the job
+        // completes around a ticket that is never consumed, which a caller
+        // waiting on the ticket then waits on forever. Owed until taken, so
+        // the pass that started it is the pass that reads its answer.
+        let direct_verification_ticket_open =
+            self.direct_post_repair_in_flight.contains_key(&job_id)
+                || self.direct_post_repair_results.contains_key(&job_id);
         let authoritative_par2_verification_needed = par2_validation_needed
             && (authoritative_par2_verification_owed
                 || !direct_unpack_gated_sets.is_empty()
-                || parked_damaged_par2_verdict);
+                || parked_damaged_par2_verdict
+                || direct_verification_ticket_open);
         if authoritative_par2_verification_needed && !authoritative_par2_verification_owed {
             if direct_unpack_gated_sets.is_empty() {
                 info!(
@@ -827,6 +1011,7 @@ impl Pipeline {
             // own — swap correction, and the eager-delete retry frontier — and
             // forcing the authoritative pass there loses both.
             && !missing_archive_volume_par2_repair_ready
+            && !numbered_archive_part_missing
             && (!described_data_files_incomplete || !download_pipeline_exhausted)
             // The pass that consumes a parked damaged-path verdict is a second
             // entry into this gate: the first submitted the read and returned.
@@ -1021,6 +1206,31 @@ impl Pipeline {
             return;
         }
 
+        // Recovery volumes have had their opportunity above. With no PAR2
+        // verdict still owed, report the actual missing part before a generic
+        // exhausted-work failure obscures the topology defect.
+        if download_pipeline_exhausted
+            && (par2_bypassed
+                || !self.job_spec_has_par2_file(job_id)
+                || (!par2_verdict_open && self.par2_gate_settlement_complete(job_id)))
+            && !self.rar_recovery_restore_pending(job_id)
+            && let Some(mut error) = self.missing_numbered_archive_part(job_id).or_else(|| {
+                (!has_crc_failures
+                    && rar_waiting_for_missing_volumes
+                    && self.job_has_live_rar_waiting_for_absent_volumes(job_id))
+                .then(|| {
+                    self.missing_first_rar_volume_report(job_id)
+                        .unwrap_or_else(|| "missing RAR volume after recovery settled".to_string())
+                })
+            })
+        {
+            if !self.job_spec_has_par2_file(job_id) {
+                error.push_str("; no PAR2 metadata is available for repair");
+            }
+            self.fail_job(job_id, error);
+            return;
+        }
+
         if let Some(error) = self.ownerless_live_rar_plan_error_for_job(job_id) {
             self.fail_job(job_id, error);
             return;
@@ -1060,6 +1270,17 @@ impl Pipeline {
         // refuse one that still has extraction it could start, or a recovery
         // verdict it still owes.
         if !has_crc_failures
+            // Missing payload needs recovery's delivery accounting. Already
+            // delivered and extracted sources may have been cleaned up.
+            && (!par2_may_still_rule
+                || self.jobs[&job_id].assembly.files().all(|file| {
+                    file.is_complete()
+                        || matches!(
+                            file.role(),
+                            weaver_model::files::FileRole::Par2 { .. }
+                                | weaver_model::files::FileRole::Par3 { .. }
+                        )
+                }))
             && self.only_archive_residuals_or_loaded_par2_index_are_incomplete(job_id)
         {
             self.finalize_completed_archive_job(job_id).await;
@@ -1735,25 +1956,44 @@ impl Pipeline {
                                 return;
                             }
                         };
-                        // The scan is a second read of a directory the analysis
-                        // described a moment ago, and it is the one this arm
-                        // stands its verdict on. If the two disagree —
-                        // `verify_all` cannot report misplacement, so a
-                        // disagreement is damage or an absence that appeared in
-                        // between — then "placement only" was concluded from a
-                        // state that no longer holds, and marking the set
-                        // verified on it would accept a verdict nothing re-read.
-                        // Nothing is moved and the gate is re-armed instead: the
-                        // next lap analyses the disk as it is now and takes
-                        // whichever ladder that answer deserves.
+                        // The rename-only proposal cannot express copying one
+                        // intact repost onto multiple described names. A scan
+                        // disagreement therefore needs the repairer's verified
+                        // installation, not another identical analysis loop.
+                        // The repairer also revalidates its sources if the
+                        // directory changed between these two reads.
                         if par2_verification_needs_repair(&scanned) {
                             warn!(
                                 job_id = job_id.0,
                                 damaged = scanned.total_missing_blocks,
-                                "PAR2 placement pass disagreed with the analysis it stood in \
-                                 for — re-checking before placing anything"
+                                "PAR2 placement needs verified installation instead of renames"
                             );
-                            self.schedule_job_completion_check(job_id);
+                            if !self.maybe_start_repair(job_id).await {
+                                return;
+                            }
+                            match self
+                                .run_par2_repairer(
+                                    job_id,
+                                    Arc::clone(&par2_set),
+                                    working_dir.clone(),
+                                    true,
+                                    Some(verification),
+                                )
+                                .await
+                            {
+                                Ok(outcome) => {
+                                    self.finish_par2_repair(
+                                        job_id,
+                                        Arc::clone(&par2_set),
+                                        working_dir.clone(),
+                                        verification,
+                                        outcome,
+                                        has_crc_failures,
+                                    )
+                                    .await;
+                                }
+                                Err(message) => self.fail_par2_repair(job_id, message),
+                            }
                             return;
                         }
                         self.try_deobfuscate_files_with_par2(job_id).await;
@@ -1825,6 +2065,12 @@ impl Pipeline {
                             )
                             .await;
 
+                        if download_pipeline_exhausted
+                            && let Some(error) = self.missing_numbered_archive_part(job_id)
+                        {
+                            self.fail_job(job_id, error);
+                            return;
+                        }
                         if !self.par2_verified.contains(&job_id) {
                             self.schedule_job_completion_check(job_id);
                             return;
@@ -2428,6 +2674,12 @@ impl Pipeline {
                         )
                         .await;
 
+                    if download_pipeline_exhausted
+                        && let Some(error) = self.missing_numbered_archive_part(job_id)
+                    {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
                     if !self.par2_verified.contains(&job_id) {
                         self.schedule_job_completion_check(job_id);
                         return;
@@ -2734,6 +2986,14 @@ impl Pipeline {
                     }
                 }
                 if rar_waiting_for_missing_volumes {
+                    // The missing volume may be one an identity set holds
+                    // virtually. With every article in and no PAR2 verdict
+                    // coming, that set can never finish; handing its volumes
+                    // over is what the waiting set needs.
+                    if self.demote_stranded_identity_sets(job_id).await {
+                        self.schedule_job_completion_check(job_id);
+                        return;
+                    }
                     let reason = self.invalid_rar_retry_frontier_reason(job_id).unwrap_or_else(|| {
                         "RAR extraction stalled waiting for missing volumes after downloads finished"
                             .to_string()
@@ -2823,8 +3083,28 @@ impl Pipeline {
         //  - before the terminal transition records history, so a verdict
         //    reaches history and the UI through the same family PAR2 verdicts
         //    use rather than arriving after the job is already filed.
+        // A hole in the numbering is only a verdict once nothing else can
+        // fill it. While downloads are still draining, the part may yet
+        // arrive, and once they drain the recovery-volume restore above gets
+        // its turn first; failing here before then condemned sets whose
+        // `.rev` files would have rebuilt the missing part.
+        if download_pipeline_exhausted
+            && !self.rar_recovery_restore_pending(job_id)
+            && let Some(error) = self.missing_numbered_archive_part(job_id)
+        {
+            self.fail_job(job_id, error);
+            return;
+        }
         if let Some(error) = self.verify_par2_less_job_with_sfv(job_id).await {
             self.fail_job(job_id, error);
+            return;
+        }
+
+        // Every branch below dispatches the job onward, so an identity set
+        // still routing here would never finalize, and its volumes, held only
+        // virtually, would reach neither an extractor nor the output.
+        if self.demote_stranded_identity_sets(job_id).await {
+            self.schedule_job_completion_check(job_id);
             return;
         }
 
@@ -2868,7 +3148,21 @@ impl Pipeline {
                 // and a volume a repair rebuilt for it is spent once the set
                 // is finalized.
                 self.cleanup_installed_direct_set_volumes(job_id).await;
-                // No archives — move to complete and finish.
+                // Direct installation can expose another archive just as an
+                // extractor does. Settle that layer before publishing output.
+                match self.maybe_start_nested_extraction(job_id).await {
+                    Ok(NestedExtractionDecision::Deferred | NestedExtractionDecision::Started) => {
+                        return;
+                    }
+                    Ok(
+                        NestedExtractionDecision::NoNestedArchives
+                        | NestedExtractionDecision::PreserveOutputsAtDepthLimit,
+                    ) => {}
+                    Err(error) => {
+                        self.fail_job(job_id, error);
+                        return;
+                    }
+                }
                 if let Err(error) = self.start_move_to_complete(job_id).await {
                     self.fail_job(job_id, error);
                 }
@@ -2958,6 +3252,7 @@ impl Pipeline {
                     }
                 };
                 match nested_decision {
+                    NestedExtractionDecision::Deferred => return,
                     NestedExtractionDecision::Started
                     | NestedExtractionDecision::NoNestedArchives => {
                         let mut removed = 0u32;
@@ -3007,15 +3302,23 @@ impl Pipeline {
                 }
             }
             ExtractionReadiness::Blocked { reason } => {
-                if reason.starts_with("archive topology not yet available") {
+                if reason.starts_with("archive topology not yet available")
+                    && (self.job_has_pending_download_pipeline_work(job_id)
+                        || self.job_has_active_extraction_tasks(job_id))
+                {
                     info!(
                         job_id = job_id.0,
                         reason = %reason,
                         "deferring completion until archive topology is available"
                     );
-                    self.schedule_job_completion_check(job_id);
+                    // The pending download or extraction re-arms completion
+                    // when it changes the topology. Re-queuing ourselves here
+                    // can monopolize the actor before that work is serviced.
                     return;
                 }
+                // Downloads, placement and recovery have settled above. With
+                // no producer left, another completion check cannot supply a
+                // missing topology: refusal must terminate the job.
                 self.fail_job(job_id, reason);
             }
             ExtractionReadiness::Partial {

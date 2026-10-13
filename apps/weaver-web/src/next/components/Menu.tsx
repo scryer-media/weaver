@@ -42,16 +42,19 @@ export function Menu({
         onDismiss();
       }
     };
+    // Escape shuts the menu and nothing behind it: heard first and kept from
+    // the dialog the menu is open in, which would otherwise close with it.
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
+        event.stopPropagation();
         onDismiss();
       }
     };
     document.addEventListener("pointerdown", onPointerDown, true);
-    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("keydown", onKeyDown, true);
     return () => {
       document.removeEventListener("pointerdown", onPointerDown, true);
-      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("keydown", onKeyDown, true);
     };
   }, [onDismiss, open]);
 
@@ -98,6 +101,43 @@ export function MenuItem({
         className,
       )}
     >
+      {children}
+    </button>
+  );
+}
+
+/**
+ * An entry that is ticked or not, for a menu where several can be chosen. It
+ * leads with the selection square a list row has, and choosing it leaves the
+ * menu open.
+ */
+export function MenuCheckItem({
+  checked,
+  onToggle,
+  children,
+  className,
+}: {
+  checked: boolean;
+  onToggle: () => void;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitemcheckbox"
+      aria-checked={checked}
+      onClick={onToggle}
+      className={cn(
+        "flex cursor-pointer items-center gap-[10px] px-3 py-[9px] text-left text-[12.5px] hover:bg-wv-menu-hover",
+        checked ? "text-wv-strong" : "text-wv-secondary",
+        className,
+      )}
+    >
+      <span
+        aria-hidden="true"
+        className={cn("size-3.5 flex-none border", checked ? "!border-wv-accent bg-wv-accent" : "!border-wv-faint")}
+      />
       {children}
     </button>
   );

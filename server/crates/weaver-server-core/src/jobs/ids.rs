@@ -3,33 +3,33 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-/// Monotonically increasing job identifier. One NZB submission = one job.
+// Monotonically increasing job identifier. One NZB submission = one job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct JobId(pub u64);
 
-/// Identifies a file within an NZB (index into the NZB's `<file>` list).
+// Identifies a file within an NZB (index into the NZB's `<file>` list).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NzbFileId {
     pub job_id: JobId,
     pub file_index: u32,
 }
 
-/// Identifies a segment (article) within an NZB file.
+// Identifies a segment (article) within an NZB file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SegmentId {
     pub file_id: NzbFileId,
     pub segment_number: u32,
 }
 
-/// NNTP article message-id (shared, immutable).
+// NNTP article message-id (shared, immutable).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageId(pub Arc<str>);
 
-/// Server identifier (index into the server config list).
+// Server identifier (index into the server config list).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ServerId(pub u16);
 
-/// Connection identifier within a server pool.
+// Connection identifier within a server pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId {
     pub server: ServerId,
@@ -77,13 +77,13 @@ impl MessageId {
         Self(Arc::from(id))
     }
 
-    /// The RFC 3977 wire form, `<id>`.
-    ///
-    /// The stored `Arc<str>` is the *bare* id — the NZB parser strips the
-    /// angle brackets — so every NNTP command argument must go through this,
-    /// never through `&*message_id.0`. A bare argument is a legal article
-    /// *number* reference, which a server with a group selected answers with
-    /// 430 for every single article.
+    // The RFC 3977 wire form, `<id>`.
+    //
+    // The stored `Arc<str>` is the *bare* id — the NZB parser strips the
+    // angle brackets — so every NNTP command argument must go through this,
+    // never through `&*message_id.0`. A bare argument is a legal article
+    // *number* reference, which a server with a group selected answers with
+    // 430 for every single article.
     pub fn wire_form(&self) -> String {
         self.to_string()
     }

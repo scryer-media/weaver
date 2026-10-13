@@ -1,42 +1,42 @@
-//! Facts about one server that only its own answers can establish.
-//!
-//! A download lane's connect exchange is pure latency: every command in it is
-//! a round trip that runs before the first article byte can be asked for. The
-//! minimum RFC 3977/4643 needs for `BODY <message-id>` is the greeting and
-//! AUTHINFO USER/PASS — four round trips including the TCP handshake. Nothing
-//! else is ever sent at setup, and in particular `MODE READER` never is: it is
-//! only meaningful to a dual-mode (transit + reader) server that starts in
-//! transit mode, weaver never posts or feeds, and paying a fifth round trip on
-//! every connection to every provider to guard against that is a bad trade.
-//!
-//! What is recorded here instead is the far narrower set of things a server
-//! can only tell us by refusing something:
-//!
-//! - It insists on a selected group even for a message-id fetch (412), which
-//!   RFC 3977 does not require of it. Later connections then spend the GROUP
-//!   round trip, and only for that server.
-//! - It does not implement `STAT`, or does not implement `HEAD` (500).
-//!   The existence probe uses whichever of the two the server does answer, and
-//!   settles for the one verdict when only one is available.
-//!
-//! Refusals of this kind are answers, not faults: the connection that received
-//! one is still perfectly healthy and keeps being used.
-//!
-//! The map is process-lifetime and deliberately not persisted: it is a
-//! property of the server as it is answering right now, cheap to relearn, and
-//! wrong to carry across a restart that may have moved the endpoint.
+// Facts about one server that only its own answers can establish.
+//
+// A download lane's connect exchange is pure latency: every command in it is
+// a round trip that runs before the first article byte can be asked for. The
+// minimum RFC 3977/4643 needs for `BODY <message-id>` is the greeting and
+// AUTHINFO USER/PASS — four round trips including the TCP handshake. Nothing
+// else is ever sent at setup, and in particular `MODE READER` never is: it is
+// only meaningful to a dual-mode (transit + reader) server that starts in
+// transit mode, weaver never posts or feeds, and paying a fifth round trip on
+// every connection to every provider to guard against that is a bad trade.
+//
+// What is recorded here instead is the far narrower set of things a server
+// can only tell us by refusing something:
+//
+// - It insists on a selected group even for a message-id fetch (412), which
+//   RFC 3977 does not require of it. Later connections then spend the GROUP
+//   round trip, and only for that server.
+// - It does not implement `STAT`, or does not implement `HEAD` (500).
+//   The existence probe uses whichever of the two the server does answer, and
+//   settles for the one verdict when only one is available.
+//
+// Refusals of this kind are answers, not faults: the connection that received
+// one is still perfectly healthy and keeps being used.
+//
+// The map is process-lifetime and deliberately not persisted: it is a
+// property of the server as it is answering right now, cheap to relearn, and
+// wrong to carry across a restart that may have moved the endpoint.
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
-/// What one server has proven about itself.
+// What one server has proven about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerCapabilities {
-    /// The server refused a message-id fetch for want of a selected group.
+    // The server refused a message-id fetch for want of a selected group.
     pub requires_group: bool,
-    /// The server answers `STAT`. Assumed until it says otherwise.
+    // The server answers `STAT`. Assumed until it says otherwise.
     pub stat: bool,
-    /// The server answers `HEAD`. Assumed until it says otherwise.
+    // The server answers `HEAD`. Assumed until it says otherwise.
     pub head: bool,
 }
 
@@ -50,21 +50,21 @@ impl Default for ServerCapabilities {
     }
 }
 
-/// Whether `code` is a server saying it does not implement the command at all,
-/// rather than answering it.
-///
-/// Only 500, "command not recognized", says that. Every other refusal is about
-/// the one request, the article or the session, not about the command, and
-/// none of them may retire `STAT` or `HEAD` for the rest of the process:
-///
-/// - 501 is a syntax error in the request just sent. A server that implements
-///   the command perfectly well answers it to a message-id it cannot parse,
-///   so one odd id in a batch must not push every later probe onto the
-///   slower path.
-/// - 502 is admission — a connection limit or an access denial.
-/// - 480 is authentication, in both directions.
-/// - 430 is simply the article not being here.
-/// - 412 is the missing group, which is recorded separately.
+// Whether `code` is a server saying it does not implement the command at all,
+// rather than answering it.
+//
+// Only 500, "command not recognized", says that. Every other refusal is about
+// the one request, the article or the session, not about the command, and
+// none of them may retire `STAT` or `HEAD` for the rest of the process:
+//
+// - 501 is a syntax error in the request just sent. A server that implements
+//   the command perfectly well answers it to a message-id it cannot parse,
+//   so one odd id in a batch must not push every later probe onto the
+//   slower path.
+// - 502 is admission — a connection limit or an access denial.
+// - 480 is authentication, in both directions.
+// - 430 is simply the article not being here.
+// - 412 is the missing group, which is recorded separately.
 pub fn is_command_unsupported(code: u16) -> bool {
     code == 500
 }
@@ -76,7 +76,7 @@ fn registry() -> &'static CapabilityMap {
     REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// What this host has proven. Unknown servers start fully capable.
+// What this host has proven. Unknown servers start fully capable.
 pub fn capabilities_for(host: &str, port: u16) -> ServerCapabilities {
     // A poisoned lock only means some thread panicked while holding it; the
     // map itself is a plain value, so reading through the poison is safe and
@@ -90,24 +90,24 @@ pub fn capabilities_for(host: &str, port: u16) -> ServerCapabilities {
         .unwrap_or_default()
 }
 
-/// Whether this host has proven it refuses message-id fetches without a
-/// selected group. Lanes skip the GROUP round trip unless it has.
+// Whether this host has proven it refuses message-id fetches without a
+// selected group. Lanes skip the GROUP round trip unless it has.
 pub fn requires_group_selection(host: &str, port: u16) -> bool {
     capabilities_for(host, port).requires_group
 }
 
-/// Whether `STAT` is worth sending to this host.
+// Whether `STAT` is worth sending to this host.
 pub fn supports_stat(host: &str, port: u16) -> bool {
     capabilities_for(host, port).stat
 }
 
-/// Whether `HEAD` is worth sending to this host.
+// Whether `HEAD` is worth sending to this host.
 pub fn supports_head(host: &str, port: u16) -> bool {
     capabilities_for(host, port).head
 }
 
-/// Record that this host must have a group selected before a message-id
-/// fetch. Returns true the first time, so the caller can log it exactly once.
+// Record that this host must have a group selected before a message-id
+// fetch. Returns true the first time, so the caller can log it exactly once.
 pub fn note_group_required(host: &str, port: u16) -> bool {
     update(host, port, |caps| {
         let changed = !caps.requires_group;
@@ -116,8 +116,8 @@ pub fn note_group_required(host: &str, port: u16) -> bool {
     })
 }
 
-/// Record that this host does not implement `STAT`. Returns true the first
-/// time.
+// Record that this host does not implement `STAT`. Returns true the first
+// time.
 pub fn note_stat_unsupported(host: &str, port: u16) -> bool {
     update(host, port, |caps| {
         let changed = caps.stat;
@@ -126,8 +126,8 @@ pub fn note_stat_unsupported(host: &str, port: u16) -> bool {
     })
 }
 
-/// Record that this host does not implement `HEAD`. Returns true the first
-/// time.
+// Record that this host does not implement `HEAD`. Returns true the first
+// time.
 pub fn note_head_unsupported(host: &str, port: u16) -> bool {
     update(host, port, |caps| {
         let changed = caps.head;
@@ -145,8 +145,8 @@ fn update(host: &str, port: u16, apply: impl FnOnce(&mut ServerCapabilities) -> 
     apply(entry)
 }
 
-/// Forget what a host proved. Tests own a port for their lifetime, so this
-/// keeps one scripted server's verdict out of the next test's connect.
+// Forget what a host proved. Tests own a port for their lifetime, so this
+// keeps one scripted server's verdict out of the next test's connect.
 #[cfg(test)]
 pub(crate) fn forget(host: &str, port: u16) {
     let mut map = match registry().write() {

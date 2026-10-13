@@ -1,4 +1,4 @@
-use crate::bandwidth::IspBandwidthCapWeekday;
+use crate::bandwidth::QuotaWeekday;
 use crate::servers::{ServerConfig, ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +21,7 @@ pub(crate) struct ServerRecord {
     pub download_quota_limit_bytes: u64,
     pub download_quota_period: ServerDownloadQuotaPeriod,
     pub download_quota_reset_time_minutes_local: u16,
-    pub download_quota_weekly_reset_weekday: IspBandwidthCapWeekday,
+    pub download_quota_weekly_reset_weekday: QuotaWeekday,
     pub download_quota_monthly_reset_day: u8,
     pub tls_ca_cert: Option<String>,
     pub tls_name_mismatch_certificate_der: Option<Vec<u8>>,
@@ -88,27 +88,27 @@ impl ServerRecord {
     }
 }
 
-pub(crate) fn quota_weekday_str(value: IspBandwidthCapWeekday) -> &'static str {
+pub(crate) fn quota_weekday_str(value: QuotaWeekday) -> &'static str {
     match value {
-        IspBandwidthCapWeekday::Mon => "mon",
-        IspBandwidthCapWeekday::Tue => "tue",
-        IspBandwidthCapWeekday::Wed => "wed",
-        IspBandwidthCapWeekday::Thu => "thu",
-        IspBandwidthCapWeekday::Fri => "fri",
-        IspBandwidthCapWeekday::Sat => "sat",
-        IspBandwidthCapWeekday::Sun => "sun",
+        QuotaWeekday::Mon => "mon",
+        QuotaWeekday::Tue => "tue",
+        QuotaWeekday::Wed => "wed",
+        QuotaWeekday::Thu => "thu",
+        QuotaWeekday::Fri => "fri",
+        QuotaWeekday::Sat => "sat",
+        QuotaWeekday::Sun => "sun",
     }
 }
 
-pub(crate) fn parse_quota_weekday(value: &str) -> Option<IspBandwidthCapWeekday> {
+pub(crate) fn parse_quota_weekday(value: &str) -> Option<QuotaWeekday> {
     match value {
-        "mon" => Some(IspBandwidthCapWeekday::Mon),
-        "tue" => Some(IspBandwidthCapWeekday::Tue),
-        "wed" => Some(IspBandwidthCapWeekday::Wed),
-        "thu" => Some(IspBandwidthCapWeekday::Thu),
-        "fri" => Some(IspBandwidthCapWeekday::Fri),
-        "sat" => Some(IspBandwidthCapWeekday::Sat),
-        "sun" => Some(IspBandwidthCapWeekday::Sun),
+        "mon" => Some(QuotaWeekday::Mon),
+        "tue" => Some(QuotaWeekday::Tue),
+        "wed" => Some(QuotaWeekday::Wed),
+        "thu" => Some(QuotaWeekday::Thu),
+        "fri" => Some(QuotaWeekday::Fri),
+        "sat" => Some(QuotaWeekday::Sat),
+        "sun" => Some(QuotaWeekday::Sun),
         _ => None,
     }
 }

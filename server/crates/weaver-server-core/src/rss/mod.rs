@@ -2,6 +2,7 @@ mod model;
 mod persistence;
 mod poller;
 mod queries;
+pub(crate) use queries::ScheduleCache;
 mod record;
 pub mod repository;
 mod routing;

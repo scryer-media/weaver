@@ -166,8 +166,8 @@ impl Database {
             .is_some_and(|name| name.ends_with(".toml.migrated"))
     }
 
-    /// If the database is empty and a `weaver.toml` file exists at the given path,
-    /// import its settings and servers, then rename it to `weaver.toml.migrated`.
+    // If the database is empty and a `weaver.toml` file exists at the given path,
+    // import its settings and servers, then rename it to `weaver.toml.migrated`.
     pub fn migrate_from_toml(&self, toml_path: &Path) -> Result<bool, StateError> {
         if !self.is_empty()? {
             return Ok(false);
@@ -209,11 +209,11 @@ impl Database {
         Ok(true)
     }
 
-    /// Migrate an existing binary journal into the active_* SQLite tables.
-    ///
-    /// Reads the journal, replays it via `recover()`, inserts the recovered
-    /// state into SQLite, then renames the journal to `.journal.migrated`.
-    /// Returns `true` if a migration was performed.
+    // Migrate an existing binary journal into the active_* SQLite tables.
+    //
+    // Reads the journal, replays it via `recover()`, inserts the recovered
+    // state into SQLite, then renames the journal to `.journal.migrated`.
+    // Returns `true` if a migration was performed.
     pub fn migrate_from_journal(&self, journal_path: &Path) -> Result<bool, StateError> {
         if !journal_path.exists() {
             return Ok(false);
@@ -338,8 +338,8 @@ impl Database {
     }
 }
 
-/// Read a binary journal file synchronously.
-/// Format: repeated [4-byte LE length][payload][4-byte LE CRC32].
+// Read a binary journal file synchronously.
+// Format: repeated [4-byte LE length][payload][4-byte LE CRC32].
 fn read_journal_sync(path: &Path) -> Result<Vec<JournalEntry>, StateError> {
     let data = std::fs::read(path).map_err(StateError::Io)?;
     let mut entries = Vec::new();

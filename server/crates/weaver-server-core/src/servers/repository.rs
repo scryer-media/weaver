@@ -103,6 +103,67 @@ impl Database {
             ))
         })
     }
+
+    // Download usage counted against an egress. The egress id is carried in
+    // `server_id`.
+    pub fn egress_download_usage(
+        &self,
+        egress_id: u32,
+    ) -> Result<Option<ServerDownloadUsage>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT egress_id AS server_id, lifetime_bytes, quota_baseline_bytes,
+                        window_start_epoch_seconds, window_end_epoch_seconds,
+                        updated_at_epoch_seconds
+                   FROM egress_download_usage
+                  WHERE egress_id = {}",
+                &[SqlArg::I64(i64::from(egress_id))],
+            )
+            .await?
+            .map(server_download_usage_from_row)
+            .transpose()
+        })
+    }
+
+    // Store download usage counted against an egress, whose id is carried
+    // in `server_id`. Usage for an egress that no longer exists is dropped.
+    pub fn upsert_egress_download_usage(
+        &self,
+        usage: &ServerDownloadUsage,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let args = server_download_usage_args(usage)?;
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "INSERT INTO egress_download_usage
+                    (egress_id, lifetime_bytes, quota_baseline_bytes,
+                     window_start_epoch_seconds, window_end_epoch_seconds,
+                     updated_at_epoch_seconds)
+                 SELECT id, {}, {}, {}, {}, {}
+                   FROM egress_interfaces
+                  WHERE id = {}
+                 ON CONFLICT(egress_id) DO UPDATE SET
+                    lifetime_bytes = excluded.lifetime_bytes,
+                    quota_baseline_bytes = excluded.quota_baseline_bytes,
+                    window_start_epoch_seconds = excluded.window_start_epoch_seconds,
+                    window_end_epoch_seconds = excluded.window_end_epoch_seconds,
+                    updated_at_epoch_seconds = excluded.updated_at_epoch_seconds",
+                &[
+                    args[1].clone(),
+                    args[2].clone(),
+                    args[3].clone(),
+                    args[4].clone(),
+                    args[5].clone(),
+                    args[0].clone(),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    }
 }
 
 fn server_download_usage_from_row(row: SqlRow) -> Result<ServerDownloadUsage, StateError> {

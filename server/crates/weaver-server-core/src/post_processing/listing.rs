@@ -1,38 +1,38 @@
-//! Live listing of the configured scripts directory.
-//!
-//! Nothing here is persisted: a script is whatever is in the directory when the
-//! listing runs, which is also when execution resolves it. Editing or renaming a
-//! script is editing or renaming a script.
+// Live listing of the configured scripts directory.
+//
+// Nothing here is persisted: a script is whatever is in the directory when the
+// listing runs, which is also when execution resolves it. Editing or renaming a
+// script is editing or renaming a script.
 
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use super::manifest::{
-    ManifestError, NZBGET_MANIFEST_FILE, detect_bare_script_adapter, parse_nzbget_manifest,
+    MAX_LEGACY_METADATA_BYTES, ManifestError, NZBGET_MANIFEST_FILE, apply_bare_script_declarations,
+    bare_script_options, detect_bare_script_adapter, go_script_header, parse_nzbget_manifest,
 };
 use super::model::{PostProcessingValidationError, ScriptAdapter, ScriptManifest, ScriptName};
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
-const SHEBANG_PREFIX_BYTES: u64 = 8 * 1024;
 
-/// A script that is present and parseable right now.
+// A script that is present and parseable right now.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DiscoveredScript {
     pub name: ScriptName,
-    /// Package directory for a manifest package, or the scripts directory for a bare script.
+    // Package directory for a manifest package, or the scripts directory for a bare script.
     pub root: PathBuf,
     pub manifest: ScriptManifest,
 }
 
-/// Something in the scripts directory that could not be listed, surfaced instead of hidden.
+// Something in the scripts directory that could not be listed, surfaced instead of hidden.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ScriptProblem {
     pub name: String,
     pub message: String,
 }
 
-/// Everything the scripts directory currently offers.
+// Everything the scripts directory currently offers.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct ScriptListing {
     pub scripts: Vec<DiscoveredScript>,
@@ -51,7 +51,7 @@ pub enum ListingError {
     Io(#[from] io::Error),
 }
 
-/// List every script under `root`, creating it when absent.
+// List every script under `root`, creating it when absent.
 pub fn list_scripts(root: &Path) -> Result<ScriptListing, ListingError> {
     if !root.exists() {
         fs::create_dir_all(root)?;
@@ -100,10 +100,18 @@ pub fn list_scripts(root: &Path) -> Result<ScriptListing, ListingError> {
             }
         }
     }
+    for script in &listing.scripts {
+        if !script.manifest.declaration_problems().is_empty() {
+            listing.problems.push(ScriptProblem {
+                name: script.name.to_string(),
+                message: script.manifest.declaration_problems().join("; "),
+            });
+        }
+    }
     Ok(listing)
 }
 
-/// Resolve one script by name at execution time.
+// Resolve one script by name at execution time.
 pub fn resolve_script(root: &Path, name: &ScriptName) -> Result<DiscoveredScript, ListingError> {
     let path = root.join(name.as_str());
     let metadata =
@@ -143,7 +151,13 @@ fn read_bare_script(
     path: &Path,
     name: &ScriptName,
 ) -> Result<DiscoveredScript, ListingError> {
-    let preamble = read_utf8_prefix(path, SHEBANG_PREFIX_BYTES)?;
+    let mut preamble = read_utf8_prefix(path, MAX_LEGACY_METADATA_BYTES as u64)?;
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("go"))
+    {
+        preamble = go_script_header(&preamble);
+    }
     let adapter = detect_bare_script_adapter(&preamble);
     let compatibility_name = match adapter {
         ScriptAdapter::Nzbget => Some(super::model::NzbgetCompatibilityName::new(
@@ -158,17 +172,18 @@ fn read_bare_script(
         None,
         name.as_str().to_string(),
         vec![],
-        vec![],
+        bare_script_options(&preamble),
     )?;
     Ok(DiscoveredScript {
         name: name.clone(),
         root: root.to_path_buf(),
-        manifest,
+        manifest: apply_bare_script_declarations(manifest, &preamble),
     })
 }
 
-/// A regular file counts as a script when it carries a known script extension or
-/// the executable bit, which is what both oracles list.
+// A regular file counts as a script when it carries a known script extension or
+// the executable bit, which is what both oracles list. A Go source file is
+// weaver's own addition to the extensions.
 fn is_bare_script_candidate(path: &Path, metadata: &fs::Metadata) -> bool {
     let known_extension = path
         .extension()
@@ -176,7 +191,7 @@ fn is_bare_script_candidate(path: &Path, metadata: &fs::Metadata) -> bool {
         .is_some_and(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "sh" | "bash" | "py" | "pl" | "rb" | "ps1" | "bat" | "cmd" | "exe"
+                "sh" | "bash" | "py" | "pl" | "rb" | "ps1" | "bat" | "cmd" | "exe" | "go"
             )
         });
     #[cfg(unix)]
@@ -206,6 +221,15 @@ fn read_utf8_limited(path: &Path, limit: u64) -> Result<String, ListingError> {
 
 fn read_utf8_prefix(path: &Path, limit: u64) -> Result<String, ListingError> {
     let mut bytes = Vec::with_capacity(limit as usize);
-    File::open(path)?.take(limit).read_to_end(&mut bytes)?;
+    File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit as usize {
+        bytes.truncate(limit as usize);
+        // Do not interpret a declaration cut off by the metadata byte bound.
+        let complete = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |i| i + 1);
+        bytes.truncate(complete);
+    }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }

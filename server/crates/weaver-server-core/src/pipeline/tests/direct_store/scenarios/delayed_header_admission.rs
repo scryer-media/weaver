@@ -434,8 +434,8 @@ async fn delayed_header_admission_spills_to_a_peer_job_but_obeys_global_hard_pre
     );
 }
 
-/// Every article of the job's queue, in the order a handout scans them, put
-/// back exactly as it was. `edit` rewrites the list before it is requeued.
+// Every article of the job's queue, in the order a handout scans them, put
+// back exactly as it was. `edit` rewrites the list before it is requeued.
 fn requeue_in_scan_order(
     pipeline: &mut Pipeline,
     edit: impl FnOnce(&mut Vec<DownloadWork>),
@@ -537,7 +537,7 @@ async fn a_header_probe_is_handed_out_alone_when_the_set_budget_is_spent() {
     assert_eq!(handed_out(&mut pipeline, 3), vec![segment(65, 0)]);
 }
 
-/// The scheduler counters the per-file early-out is judged by.
+// The scheduler counters the per-file early-out is judged by.
 fn scan_counters(pipeline: &Pipeline) -> (u64, u64, u64) {
     use crate::operations::metrics::SchedulerBlockClause;
     let metrics = &pipeline.metrics;
@@ -553,8 +553,8 @@ fn scan_counters(pipeline: &Pipeline) -> (u64, u64, u64) {
     )
 }
 
-/// Leave only the queued articles of volumes 66 to 68, plus the header
-/// article of volume 65 when `with_header` is set.
+// Leave only the queued articles of volumes 66 to 68, plus the header
+// article of volume 65 when `with_header` is set.
 fn keep_three_volumes(pipeline: &mut Pipeline, with_header: bool) -> Vec<DownloadWork> {
     requeue_in_scan_order(pipeline, |order| {
         order.retain(|work| {
@@ -625,8 +625,8 @@ async fn a_probe_exempt_header_gets_past_the_per_file_early_out() {
     assert_eq!(scan_counters(&pipeline).2, budget_blocks);
 }
 
-/// The articles behind the delayed header, in arrival order. Every one of them
-/// is staged in the set's holds until the header arrives.
+// The articles behind the delayed header, in arrival order. Every one of them
+// is staged in the set's holds until the header arrives.
 fn held_arrivals() -> impl Iterator<Item = (u32, u32)> {
     (66..84).flat_map(|file| [(file, 0), (file, 1)])
 }
@@ -757,10 +757,10 @@ async fn holds_disk_reserve_demotion_reconstructs_held_volumes_without_refetchin
     .await;
 }
 
-/// A set demoted for room — whichever of its holds limits it ran out of —
-/// keeps every held byte: the held volumes are rebuilt from the holds, none
-/// of their articles is fetched again, and the holds are released once the
-/// sweep has read them.
+// A set demoted for room — whichever of its holds limits it ran out of —
+// keeps every held byte: the held volumes are rebuilt from the holds, none
+// of their articles is fetched again, and the holds are released once the
+// sweep has read them.
 async fn room_demotion_reconstructs_held_volumes_without_refetching_them(
     reason: crate::pipeline::direct_store::router::DemotionReason,
 ) {
@@ -874,10 +874,10 @@ async fn routing_time_disk_reserve_demotion_keeps_every_held_article_but_the_han
     .await;
 }
 
-/// Uncontrolled arrivals behind the delayed header, as in the pre-admission
-/// sequence: the article whose paging runs the set out of room demotes it
-/// while routing and is handed to the decode seam. `reason` is the demotion
-/// the set must show.
+// Uncontrolled arrivals behind the delayed header, as in the pre-admission
+// sequence: the article whose paging runs the set out of room demotes it
+// while routing and is handed to the decode seam. `reason` is the demotion
+// the set must show.
 async fn routing_time_room_demotion_keeps_every_held_article_but_the_handoff(
     mut pipeline: Pipeline,
     volumes: &[(String, Vec<u8>)],

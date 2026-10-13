@@ -4,17 +4,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crossbeam_queue::ArrayQueue;
 use tokio::sync::Semaphore;
 
-/// Size tiers for buffer allocation.
-///
-/// Usenet articles are almost always under 1MB. Typical decoded sizes are
-/// ~380KB (750KB yEnc segments) or ~760KB (~1.4MB segments).
+// Size tiers for buffer allocation.
+//
+// Usenet articles are almost always under 1MB. Typical decoded sizes are
+// ~380KB (750KB yEnc segments) or ~760KB (~1.4MB segments).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferTier {
-    /// 512 KB — most segments.
+    // 512 KB — most segments.
     Small,
-    /// 1 MB — large segments.
+    // 1 MB — large segments.
     Medium,
-    /// 4 MB — PAR2 recovery blocks, unusual articles.
+    // 4 MB — PAR2 recovery blocks, unusual articles.
     Large,
 }
 
@@ -27,7 +27,7 @@ impl BufferTier {
         }
     }
 
-    /// Pick the smallest tier that fits `needed` bytes.
+    // Pick the smallest tier that fits `needed` bytes.
     pub fn for_size(needed: usize) -> Self {
         if needed <= Self::Small.size_bytes() {
             Self::Small
@@ -39,7 +39,7 @@ impl BufferTier {
     }
 }
 
-/// Configuration for a [`BufferPool`].
+// Configuration for a [`BufferPool`].
 #[derive(Debug, Clone)]
 pub struct BufferPoolConfig {
     pub small_count: usize,
@@ -58,23 +58,23 @@ impl Default for BufferPoolConfig {
 }
 
 impl BufferPoolConfig {
-    /// On uncapped hosts, keep idle/runtime provisioning within the existing
-    /// 4–8 GiB tier instead of scaling buffers with very large available RAM.
+    // On uncapped hosts, keep idle/runtime provisioning within the existing
+    // 4–8 GiB tier instead of scaling buffers with very large available RAM.
     const UNCAPPED_HOST_MEMORY_CAP_BYTES: u64 = (8 * 1024 * 1024 * 1024) - 1;
 
-    /// Total memory this pool will allocate.
+    // Total memory this pool will allocate.
     pub fn total_bytes(&self) -> usize {
         self.small_count * BufferTier::Small.size_bytes()
             + self.medium_count * BufferTier::Medium.size_bytes()
             + self.large_count * BufferTier::Large.size_bytes()
     }
 
-    /// Scale buffer pool configuration based on available system memory.
-    ///
-    /// Uses the effective available memory (respecting cgroup limits) to pick
-    /// appropriate buffer counts. The pool targets roughly 5% of available RAM,
-    /// clamped between a minimum floor (for 512MB systems) and the default
-    /// ceiling (for 8GB+ systems).
+    // Scale buffer pool configuration based on available system memory.
+    //
+    // Uses the effective available memory (respecting cgroup limits) to pick
+    // appropriate buffer counts. The pool targets roughly 5% of available RAM,
+    // clamped between a minimum floor (for 512MB systems) and the default
+    // ceiling (for 8GB+ systems).
     pub fn for_available_memory(available_bytes: u64) -> Self {
         let available_mb = (available_bytes / (1024 * 1024)) as usize;
 
@@ -108,9 +108,9 @@ impl BufferPoolConfig {
         }
     }
 
-    /// Runtime sizing policy:
-    /// - respect explicit cgroup limits
-    /// - otherwise cap uncapped hosts to the existing 4–8 GiB tier
+    // Runtime sizing policy:
+    // - respect explicit cgroup limits
+    // - otherwise cap uncapped hosts to the existing 4–8 GiB tier
     pub fn for_runtime_memory(available_bytes: u64, cgroup_limit: Option<u64>) -> Self {
         Self::for_available_memory(Self::runtime_sizing_memory_bytes(
             available_bytes,
@@ -122,8 +122,8 @@ impl BufferPoolConfig {
         cgroup_limit.unwrap_or_else(|| available_bytes.min(Self::UNCAPPED_HOST_MEMORY_CAP_BYTES))
     }
 
-    /// Recommended write buffer max_pending for this memory tier.
-    /// Fewer pending segments per file on constrained systems.
+    // Recommended write buffer max_pending for this memory tier.
+    // Fewer pending segments per file on constrained systems.
     pub fn write_buffer_max_pending(&self) -> usize {
         if self.small_count <= 64 {
             4
@@ -135,7 +135,7 @@ impl BufferPoolConfig {
     }
 }
 
-/// Metrics for monitoring buffer pool utilization.
+// Metrics for monitoring buffer pool utilization.
 #[derive(Debug)]
 pub struct BufferPoolMetrics {
     pub small_in_use: usize,
@@ -147,12 +147,12 @@ pub struct BufferPoolMetrics {
     pub wait_count: usize,
 }
 
-/// A tiered, slab-backed buffer pool with backpressure.
-///
-/// Buffers are pre-allocated at startup and reused via lock-free queues.
-/// When all buffers of a tier are in use, [`acquire`](BufferPool::acquire)
-/// awaits until one is returned — this is the primary backpressure mechanism
-/// in the pipeline.
+// A tiered, slab-backed buffer pool with backpressure.
+//
+// Buffers are pre-allocated at startup and reused via lock-free queues.
+// When all buffers of a tier are in use, [`acquire`](BufferPool::acquire)
+// awaits until one is returned — this is the primary backpressure mechanism
+// in the pipeline.
 pub struct BufferPool {
     small: TierPool,
     medium: TierPool,
@@ -175,9 +175,9 @@ struct BufferSlot {
 }
 
 impl BufferPool {
-    /// Create a new buffer pool with the given configuration.
-    ///
-    /// All buffers are allocated upfront.
+    // Create a new buffer pool with the given configuration.
+    //
+    // All buffers are allocated upfront.
     pub fn new(config: BufferPoolConfig) -> Arc<Self> {
         Arc::new(Self {
             small: TierPool::new(BufferTier::Small, config.small_count),
@@ -187,11 +187,11 @@ impl BufferPool {
         })
     }
 
-    /// Acquire a buffer from the specified tier.
-    ///
-    /// If no buffers are available, this will wait until one is returned.
-    /// This is the backpressure mechanism: downstream stages must release
-    /// buffers before upstream stages can proceed.
+    // Acquire a buffer from the specified tier.
+    //
+    // If no buffers are available, this will wait until one is returned.
+    // This is the backpressure mechanism: downstream stages must release
+    // buffers before upstream stages can proceed.
     pub async fn acquire(self: &Arc<Self>, tier: BufferTier) -> BufferHandle {
         let tier_pool = self.tier_pool(tier);
 
@@ -232,8 +232,8 @@ impl BufferPool {
         }
     }
 
-    /// Try to acquire a buffer without waiting. Returns `None` if all
-    /// buffers of the requested tier are in use.
+    // Try to acquire a buffer without waiting. Returns `None` if all
+    // buffers of the requested tier are in use.
     pub fn try_acquire(self: &Arc<Self>, tier: BufferTier) -> Option<BufferHandle> {
         let tier_pool = self.tier_pool(tier);
         let permit = tier_pool.semaphore.clone().try_acquire_owned().ok()?;
@@ -251,7 +251,7 @@ impl BufferPool {
         })
     }
 
-    /// Current pool metrics.
+    // Current pool metrics.
     pub fn metrics(&self) -> BufferPoolMetrics {
         BufferPoolMetrics {
             small_in_use: self.small.in_use.load(Ordering::Relaxed),
@@ -264,17 +264,17 @@ impl BufferPool {
         }
     }
 
-    /// Whether a tier is close to running out: a quarter or less of its
-    /// slots are free. Readers that can trade a copy for a slot — the direct
-    /// store copying a hold out of the decoder buffer it arrived in — do so
-    /// when this is true, so that slots pinned by long-lived holds come back
-    /// before decoding falls through to fresh allocations.
+    // Whether a tier is close to running out: a quarter or less of its
+    // slots are free. Readers that can trade a copy for a slot — the direct
+    // store copying a hold out of the decoder buffer it arrived in — do so
+    // when this is true, so that slots pinned by long-lived holds come back
+    // before decoding falls through to fresh allocations.
     pub fn is_scarce(&self, tier: BufferTier) -> bool {
         let tp = self.tier_pool(tier);
         self.available(tier).saturating_mul(4) <= tp.total
     }
 
-    /// Number of available (not in use) buffers for a tier.
+    // Number of available (not in use) buffers for a tier.
     pub fn available(&self, tier: BufferTier) -> usize {
         let tp = self.tier_pool(tier);
         tp.total - tp.in_use.load(Ordering::Relaxed)
@@ -320,9 +320,9 @@ impl TierPool {
     }
 }
 
-/// Handle to a pooled buffer. Clone is cheap (Arc).
-///
-/// When the last handle is dropped, the buffer is returned to the pool.
+// Handle to a pooled buffer. Clone is cheap (Arc).
+//
+// When the last handle is dropped, the buffer is returned to the pool.
 #[derive(Clone)]
 pub struct BufferHandle {
     inner: Arc<BufferInner>,
@@ -337,58 +337,58 @@ struct BufferInner {
 }
 
 impl BufferHandle {
-    /// The capacity of this buffer (determined by its tier).
+    // The capacity of this buffer (determined by its tier).
     pub fn capacity(&self) -> usize {
         self.inner.slot.data.len()
     }
 
-    /// The amount of valid data written to this buffer.
+    // The amount of valid data written to this buffer.
     pub fn len(&self) -> usize {
         self.inner.len.load(Ordering::Acquire)
     }
 
-    /// Whether the buffer contains no valid data.
+    // Whether the buffer contains no valid data.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Set the valid data length after writing.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `len` exceeds the buffer capacity.
+    // Set the valid data length after writing.
+    //
+    // # Panics
+    //
+    // Panics if `len` exceeds the buffer capacity.
     pub fn set_len(&self, len: usize) {
         assert!(len <= self.capacity(), "len exceeds buffer capacity");
         self.inner.len.store(len, Ordering::Release);
     }
 
-    /// Immutable view of the valid data.
+    // Immutable view of the valid data.
     pub fn as_slice(&self) -> &[u8] {
         &self.inner.slot.data[..self.len()]
     }
 
-    /// Mutable view of the entire buffer capacity (for writing decoded data).
-    ///
-    /// Returns `None` if there are multiple handles to this buffer (i.e.,
-    /// it's been cloned). Only the sole owner can write.
+    // Mutable view of the entire buffer capacity (for writing decoded data).
+    //
+    // Returns `None` if there are multiple handles to this buffer (i.e.,
+    // it's been cloned). Only the sole owner can write.
     pub fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
         let inner = Arc::get_mut(&mut self.inner)?;
         Some(&mut inner.slot.data)
     }
 
-    /// The tier this buffer belongs to.
+    // The tier this buffer belongs to.
     pub fn tier(&self) -> BufferTier {
         self.inner.tier
     }
 }
 
-/// Lets a decoded slot be handed out as a refcounted byte view without a copy:
-/// the view owns a clone of this handle, so the slot returns to the pool when
-/// the last view of it drops rather than when the decoder is finished.
-///
-/// The valid length is fixed before the handle leaves the decoder — the only
-/// writer is the sole owner, which `as_mut_slice` enforces — so every call here
-/// answers the same bytes.
+// Lets a decoded slot be handed out as a refcounted byte view without a copy:
+// the view owns a clone of this handle, so the slot returns to the pool when
+// the last view of it drops rather than when the decoder is finished.
+//
+// The valid length is fixed before the handle leaves the decoder — the only
+// writer is the sole owner, which `as_mut_slice` enforces — so every call here
+// answers the same bytes.
 impl AsRef<[u8]> for BufferHandle {
     fn as_ref(&self) -> &[u8] {
         self.as_slice()

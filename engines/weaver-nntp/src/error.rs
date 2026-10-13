@@ -4,8 +4,8 @@ use thiserror::Error;
 
 use crate::types::StatusCode;
 
-/// Render [`NntpError::AcquireTimeout`], whose zero case is not a duration at
-/// all but the statement that we declined to wait.
+// Render [`NntpError::AcquireTimeout`], whose zero case is not a duration at
+// all but the statement that we declined to wait.
 fn acquire_timeout_message(seconds: u64) -> String {
     if seconds == 0 {
         "no connection available; did not wait".to_string()
@@ -14,161 +14,163 @@ fn acquire_timeout_message(seconds: u64) -> String {
     }
 }
 
-/// Errors that can occur during NNTP operations.
+// Errors that can occur during NNTP operations.
 #[derive(Debug, Error)]
 pub enum NntpError {
+    #[error("route: {0}")]
+    Route(std::sync::Arc<weaver_tunnel::pipe::DialError>),
     // --- Transport errors ---
-    /// An I/O error occurred on the underlying transport.
+    // An I/O error occurred on the underlying transport.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// A TLS error occurred during handshake or encrypted communication.
+    // A TLS error occurred during handshake or encrypted communication.
     #[error("TLS error: {0}")]
     Tls(#[from] tokio_rustls::rustls::Error),
 
-    /// The operation timed out.
+    // The operation timed out.
     #[error("connection timed out")]
     Timeout,
 
-    /// The server closed the connection unexpectedly.
+    // The server closed the connection unexpectedly.
     #[error("connection closed by server")]
     ConnectionClosed,
 
     // --- Protocol errors ---
-    /// The server returned an unexpected response code.
+    // The server returned an unexpected response code.
     #[error("unexpected response: {code} {message}")]
     UnexpectedResponse { code: StatusCode, message: String },
 
-    /// The server sent a response that could not be parsed.
+    // The server sent a response that could not be parsed.
     #[error("malformed response: {0}")]
     MalformedResponse(String),
 
-    /// The server disconnected while a multi-line article body was still in flight.
+    // The server disconnected while a multi-line article body was still in flight.
     #[error("server disconnected mid-body")]
     ServerDisconnectedMidBody,
 
-    /// The server stalled before completing a multi-line article body.
+    // The server stalled before completing a multi-line article body.
     #[error("truncated multi-line body")]
     TruncatedMultilineBody,
 
-    /// The server started a multiline terminator but never completed it.
+    // The server started a multiline terminator but never completed it.
     #[error("malformed multiline terminator")]
     MalformedMultilineTerminator,
 
-    /// The server is recovering and its one probe connection is already out,
-    /// or the probe is not demanded work. Local admission, not a refusal by
-    /// the server and not a shortage of permits: a server can be wide open on
-    /// sockets and still answer this.
+    // The server is recovering and its one probe connection is already out,
+    // or the probe is not demanded work. Local admission, not a refusal by
+    // the server and not a shortage of permits: a server can be wide open on
+    // sockets and still answer this.
     #[error("server is recovering; the recovery probe is already out")]
     ServerRecovering,
 
-    /// The server asked for authentication again (480) part-way through a
-    /// pipelined batch. The session expired mid-stream; the credentials were
-    /// never rejected, so this is the connection's problem and not the
-    /// server's, and the batch's outstanding articles are simply unanswered.
+    // The server asked for authentication again (480) part-way through a
+    // pipelined batch. The session expired mid-stream; the credentials were
+    // never rejected, so this is the connection's problem and not the
+    // server's, and the batch's outstanding articles are simply unanswered.
     #[error("session expired mid-pipeline (480)")]
     SessionExpired,
 
     // --- Authentication errors ---
-    /// The server requires authentication (480).
+    // The server requires authentication (480).
     #[error("authentication required (480)")]
     AuthenticationRequired,
 
-    /// Authentication failed — bad credentials (481).
+    // Authentication failed — bad credentials (481).
     #[error("authentication failed (481)")]
     AuthenticationFailed,
 
-    /// Authentication credentials were rejected (482).
+    // Authentication credentials were rejected (482).
     #[error("authentication rejected (482)")]
     AuthenticationRejected,
 
     // --- Article/group errors ---
-    /// The requested article does not exist on this server (430).
+    // The requested article does not exist on this server (430).
     #[error("no such article: {message_id}")]
     NoSuchArticle { message_id: String },
 
-    /// Article not found (430) without a specific message-id context.
+    // Article not found (430) without a specific message-id context.
     #[error("article not found on server (430)")]
     ArticleNotFound,
 
-    /// No such newsgroup (411).
+    // No such newsgroup (411).
     #[error("no such newsgroup (411)")]
     NoSuchGroup,
 
-    /// No newsgroup selected (412).
+    // No newsgroup selected (412).
     #[error("no newsgroup selected (412)")]
     NoGroupSelected,
 
-    /// No article with that number in the current group (423).
+    // No article with that number in the current group (423).
     #[error("no article with that number (423)")]
     NoArticleWithNumber,
 
     // --- Server errors ---
-    /// Service temporarily unavailable (400).
+    // Service temporarily unavailable (400).
     #[error("service temporarily unavailable (400)")]
     ServiceUnavailable,
 
-    /// Command not recognized by the server (500).
+    // Command not recognized by the server (500).
     #[error("command not recognized (500)")]
     CommandNotRecognized,
 
-    /// Too many connections to this server (502).
-    /// Transient — back off and retry, do NOT disable the server.
+    // Too many connections to this server (502).
+    // Transient — back off and retry, do NOT disable the server.
     #[error("too many connections (502)")]
     TooManyConnections,
 
-    /// Access denied — server refuses this client (502).
-    /// Permanent — credentials or IP are rejected.
+    // Access denied — server refuses this client (502).
+    // Permanent — credentials or IP are rejected.
     #[error("access denied (502)")]
     AccessDenied,
 
-    /// A fresh connect was skipped because this server recently answered one
-    /// with "too many connections". Nothing was sent, so the server is not
-    /// implicated: the caller waits and retries after the deadline.
+    // A fresh connect was skipped because this server recently answered one
+    // with "too many connections". Nothing was sent, so the server is not
+    // implicated: the caller waits and retries after the deadline.
     #[error("server is over its connection limit until {until_epoch_ms} (epoch ms)")]
     ServerOverLimit { until_epoch_ms: u64 },
 
-    /// The server requires TLS before proceeding (483).
+    // The server requires TLS before proceeding (483).
     #[error("TLS required (483)")]
     TlsRequired,
 
     // --- Pool errors (defined here for completeness; used later) ---
-    /// No connections are available in the pool.
+    // No connections are available in the pool.
     #[error("no connections available")]
     PoolExhausted,
 
-    /// The connection pool has been shut down.
+    // The connection pool has been shut down.
     #[error("pool is shut down")]
     PoolShutdown,
 
-    /// An article fetch exceeded the soft timeout, triggering failover to the next server.
-    ///
-    /// This is a *live connection* condition: the command was sent (or the
-    /// socket was already ours) and the reply never arrived in time, so the
-    /// server is implicated.
+    // An article fetch exceeded the soft timeout, triggering failover to the next server.
+    //
+    // This is a *live connection* condition: the command was sent (or the
+    // socket was already ours) and the reply never arrived in time, so the
+    // server is implicated.
     #[error("article fetch soft timeout ({0}s)")]
     SoftTimeout(u64),
 
-    /// No pooled connection became available before the caller's deadline.
-    ///
-    /// Nothing was ever sent to the server: the request never got past our own
-    /// connection semaphore. This is a local capacity condition (every lane is
-    /// leased, or the adaptive limit is saturated), never a server fault, so it
-    /// must not cool the server down or advance its failure counters — see
-    /// `cooldown_reason` and `record_transient_server_failure` in `client.rs`.
-    ///
-    /// A zero means the acquire never waited: either the caller's deadline was
-    /// already spent, or every connection was held by a busy download lane and
-    /// queueing behind it would only have burned the caller's whole budget.
+    // No pooled connection became available before the caller's deadline.
+    //
+    // Nothing was ever sent to the server: the request never got past our own
+    // connection semaphore. This is a local capacity condition (every lane is
+    // leased, or the adaptive limit is saturated), never a server fault, so it
+    // must not cool the server down or advance its failure counters — see
+    // `cooldown_reason` and `record_transient_server_failure` in `client.rs`.
+    //
+    // A zero means the acquire never waited: either the caller's deadline was
+    // already spent, or every connection was held by a busy download lane and
+    // queueing behind it would only have burned the caller's whole budget.
     #[error("{}", acquire_timeout_message(*.0))]
     AcquireTimeout(u64),
 
-    /// A per-server BODY quota rejected admission before the command was sent.
-    /// This is scheduler policy, never a server health failure.
+    // A per-server BODY quota rejected admission before the command was sent.
+    // This is scheduler policy, never a server health failure.
     #[error("server download quota blocked: {0:?}")]
     QuotaBlocked(Box<crate::transfer::QuotaRejection>),
 
-    /// A preceding pipeline item was quota-rejected, so this BODY was never sent.
+    // A preceding pipeline item was quota-rejected, so this BODY was never sent.
     #[error(
         "BODY ({requested_body_bytes} estimated bytes) was not requested after quota rejection: {preceding_rejection:?}"
     )]
@@ -178,7 +180,7 @@ pub enum NntpError {
     },
 }
 
-/// Convenience type alias.
+// Convenience type alias.
 pub type Result<T> = std::result::Result<T, NntpError>;
 
 impl NntpError {
@@ -196,16 +198,16 @@ impl NntpError {
         }
     }
 
-    /// Whether this error is the server's "I do not have that article"
-    /// answer (430/423, or the message-id-carrying form the lanes rewrite it
-    /// into).
-    ///
-    /// A not-found answer is a *complete* server response: the status line was
-    /// read in full and no multiline body follows, so the connection is still
-    /// in a known-good state and the next pipelined BODY response is exactly
-    /// where the reader expects it. Callers use this to keep a lane and its
-    /// pipelining proof alive across an article that simply is not on this
-    /// server.
+    // Whether this error is the server's "I do not have that article"
+    // answer (430/423, or the message-id-carrying form the lanes rewrite it
+    // into).
+    //
+    // A not-found answer is a *complete* server response: the status line was
+    // read in full and no multiline body follows, so the connection is still
+    // in a known-good state and the next pipelined BODY response is exactly
+    // where the reader expects it. Callers use this to keep a lane and its
+    // pipelining proof alive across an article that simply is not on this
+    // server.
     pub fn is_article_not_found(&self) -> bool {
         matches!(
             self,
@@ -215,7 +217,7 @@ impl NntpError {
         )
     }
 
-    /// Create an `UnexpectedResponse` from a status code and message.
+    // Create an `UnexpectedResponse` from a status code and message.
     pub fn unexpected(code: StatusCode, message: impl Into<String>) -> Self {
         NntpError::UnexpectedResponse {
             code,
@@ -223,7 +225,7 @@ impl NntpError {
         }
     }
 
-    /// Map common NNTP status codes to specific error variants.
+    // Map common NNTP status codes to specific error variants.
     pub fn from_status(code: StatusCode, message: &str) -> Self {
         match code.raw() {
             400 => NntpError::ServiceUnavailable,
@@ -241,10 +243,10 @@ impl NntpError {
         }
     }
 
-    /// Check if a 481/482 response is actually a "too many connections" error.
-    ///
-    /// Some servers (Eweka, etc.) return 481 or 482 with messages like
-    /// "too many connections for your user" instead of the standard 502.
+    // Check if a 481/482 response is actually a "too many connections" error.
+    //
+    // Some servers (Eweka, etc.) return 481 or 482 with messages like
+    // "too many connections for your user" instead of the standard 502.
     fn classify_auth_error(message: &str, default: NntpError) -> Self {
         if Self::is_too_many_connections_message(message) {
             NntpError::TooManyConnections
@@ -253,16 +255,16 @@ impl NntpError {
         }
     }
 
-    /// Distinguish "too many connections" (transient) from "access denied"
-    /// (permanent) based on the 502 response message text.
-    ///
-    /// Real-world 502 messages from news providers:
-    /// - "502 too many connections" (Newshosting, Eweka, etc.)
-    /// - "502 Too Many Connections - Teknews"
-    /// - "502 max connection limit reached"
-    /// - "502 connection limit exceeded"
-    /// - "502 Access Denied"
-    /// - "502 You have no permission to talk"
+    // Distinguish "too many connections" (transient) from "access denied"
+    // (permanent) based on the 502 response message text.
+    //
+    // Real-world 502 messages from news providers:
+    // - "502 too many connections" (Newshosting, Eweka, etc.)
+    // - "502 Too Many Connections - Teknews"
+    // - "502 max connection limit reached"
+    // - "502 connection limit exceeded"
+    // - "502 Access Denied"
+    // - "502 You have no permission to talk"
     fn classify_502(message: &str) -> Self {
         if Self::is_too_many_connections_message(message) {
             NntpError::TooManyConnections
@@ -271,10 +273,10 @@ impl NntpError {
         }
     }
 
-    /// Check if a response message indicates a connection-limit error.
-    ///
-    /// Used by both `classify_502` and `classify_auth_error` since servers
-    /// return these messages on 481, 482, and 502 interchangeably.
+    // Check if a response message indicates a connection-limit error.
+    //
+    // Used by both `classify_502` and `classify_auth_error` since servers
+    // return these messages on 481, 482, and 502 interchangeably.
     fn is_too_many_connections_message(message: &str) -> bool {
         let lower = message.to_ascii_lowercase();
         lower.contains("too many")

@@ -4,44 +4,44 @@ use crate::jobs::model::{HealthDeferral, HealthDeferralKind};
 const HEALTH_PROBE_REARM_MIN_BYTES: u64 = 128 * 1024 * 1024;
 const HEALTH_PROBE_REARM_PAYLOAD_DIVISOR: u64 = 200;
 
-/// How far ahead of the delivered payload the losses must run before damage
-/// confined to a single file is allowed to look like a dead release.
-///
-/// One withheld volume in an otherwise healthy posting is a hole PAR2 covers,
-/// not a release nobody uploaded, and sampling the rest of it answers a
-/// question no one asked. A release that really is gone looks different: almost
-/// nothing lands while the failures pile up.
+// How far ahead of the delivered payload the losses must run before damage
+// confined to a single file is allowed to look like a dead release.
+//
+// One withheld volume in an otherwise healthy posting is a hole PAR2 covers,
+// not a release nobody uploaded, and sampling the rest of it answers a
+// question no one asked. A release that really is gone looks different: almost
+// nothing lands while the failures pile up.
 const HEALTH_PROBE_DEAD_RELEASE_LANDED_DIVISOR: u64 = 4;
 
-/// Whether early PAR2 promotion runs on the terminal-segment edge.
-///
-/// On by default. The switch exists so the behaviour can be taken out in one
-/// place if promoting before the completion checkpoint ever proves to conflict
-/// with the direct-store PAR2 wiring, without unpicking the call sites.
+// Whether early PAR2 promotion runs on the terminal-segment edge.
+//
+// On by default. The switch exists so the behaviour can be taken out in one
+// place if promoting before the completion checkpoint ever proves to conflict
+// with the direct-store PAR2 wiring, without unpicking the call sites.
 const EARLY_RECOVERY_PROMOTION: bool = true;
 
-/// Running tally over one probe round's confirmation batches.
-///
-/// A batch can come back without an answer — a transport failure, or no
-/// connection freed up inside the client's acquire deadline while the download
-/// lanes hold every permit. That costs the round coverage, not its verdict: the
-/// batches that did answer are still evidence about the release, and a sample
-/// that is smaller than intended is what `total` already stands for. Only a
-/// round that answered for nothing at all has no verdict to give.
+// Running tally over one probe round's confirmation batches.
+//
+// A batch can come back without an answer — a transport failure, or no
+// connection freed up inside the client's acquire deadline while the download
+// lanes hold every permit. That costs the round coverage, not its verdict: the
+// batches that did answer are still evidence about the release, and a sample
+// that is smaller than intended is what `total` already stands for. Only a
+// round that answered for nothing at all has no verdict to give.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ProbeTally {
-    /// Segments a batch answered for authoritatively.
+    // Segments a batch answered for authoritatively.
     pub(super) checked: usize,
-    /// Of those, the ones no usable server holds.
+    // Of those, the ones no usable server holds.
     pub(super) missed: usize,
-    /// Segments left unanswered by a batch that could not settle.
+    // Segments left unanswered by a batch that could not settle.
     pub(super) unverified: usize,
-    /// How many batches could not settle.
+    // How many batches could not settle.
     pub(super) unverified_batches: usize,
 }
 
 impl ProbeTally {
-    /// Fold in a batch that answered.
+    // Fold in a batch that answered.
     pub(super) fn record_answered(&mut self, exists: &[bool]) {
         for found in exists {
             self.checked = self.checked.saturating_add(1);
@@ -51,14 +51,14 @@ impl ProbeTally {
         }
     }
 
-    /// Fold in a batch that could not settle, so the round goes on with the
-    /// segments it could not reach counted against its coverage.
+    // Fold in a batch that could not settle, so the round goes on with the
+    // segments it could not reach counted against its coverage.
     pub(super) fn record_unsettled(&mut self, batch_len: usize) {
         self.unverified_batches = self.unverified_batches.saturating_add(1);
         self.unverified = self.unverified.saturating_add(batch_len);
     }
 
-    /// The update the round reports with what it has so far.
+    // The update the round reports with what it has so far.
     pub(super) fn update(&self, job_id: JobId, probe_round: u32, done: bool) -> ProbeUpdate {
         ProbeUpdate {
             job_id,
@@ -74,29 +74,29 @@ impl ProbeTally {
     }
 }
 
-/// One recovery set and what it could still repair.
+// One recovery set and what it could still repair.
 #[derive(Debug, Clone, Copy)]
 struct SetRecoveryCapacity {
     set_id: par2_rs::RecoverySetId,
     slice_size: u64,
-    /// The set's obtainable blocks, in bytes of its own slices.
+    // The set's obtainable blocks, in bytes of its own slices.
     capacity_bytes: u64,
 }
 
-/// What a job could still get hold of to repair itself with.
+// What a job could still get hold of to repair itself with.
 #[derive(Debug, Clone, Copy, Default)]
 struct ObtainableRecovery {
-    /// Whether any recovery is reachable at all.
+    // Whether any recovery is reachable at all.
     obtainable: bool,
-    /// The most damage the reachable recovery could cover, when that is
-    /// knowable, and `None` while it is not.
-    ///
-    /// It is knowable once a set has been parsed: its blocks and its slice size
-    /// are facts. Before that there is only a filename's claim, and the
-    /// critical-health line is already derived from exactly that claim — capping
-    /// on it a second time would refuse every deferral this gate exists to make,
-    /// because a job is below critical only once its damage has already passed
-    /// what its filenames advertise.
+    // The most damage the reachable recovery could cover, when that is
+    // knowable, and `None` while it is not.
+    //
+    // It is knowable once a set has been parsed: its blocks and its slice size
+    // are facts. Before that there is only a filename's claim, and the
+    // critical-health line is already derived from exactly that claim — capping
+    // on it a second time would refuse every deferral this gate exists to make,
+    // because a job is below critical only once its damage has already passed
+    // what its filenames advertise.
     ceiling: Option<u64>,
 }
 
@@ -120,13 +120,13 @@ impl Pipeline {
         }
     }
 
-    /// The failed-byte figure the health policy decides on.
-    ///
-    /// The ledger is derived from per-segment terminal states and is what the
-    /// job reports; a completed probe round contributes a *projection* over its
-    /// sample, which is a health signal and nothing else. Taking the larger of
-    /// the two keeps the early abort on a dead release while leaving the
-    /// reported ledger a sum of facts.
+    // The failed-byte figure the health policy decides on.
+    //
+    // The ledger is derived from per-segment terminal states and is what the
+    // job reports; a completed probe round contributes a *projection* over its
+    // sample, which is a health signal and nothing else. Taking the larger of
+    // the two keeps the early abort on a dead release while leaving the
+    // reported ledger a sum of facts.
     pub(crate) fn health_decision_failed_bytes(state: &crate::jobs::model::JobState) -> u64 {
         state.failed_bytes.max(state.probe_projected_failed_bytes)
     }
@@ -159,26 +159,26 @@ impl Pipeline {
             .max(immediate_rearm)
     }
 
-    /// How many health-counted files this job has already lost at least one
-    /// segment of.
-    ///
-    /// Maintained on the same booking edge as `failed_bytes`, so the two agree
-    /// by construction, and on the same rule: a missing recovery volume is not
-    /// damage to the release.
+    // How many health-counted files this job has already lost at least one
+    // segment of.
+    //
+    // Maintained on the same booking edge as `failed_bytes`, so the two agree
+    // by construction, and on the same rule: a missing recovery volume is not
+    // damage to the release.
     pub(crate) fn health_failing_file_count(&self, job_id: JobId) -> usize {
         self.jobs
             .get(&job_id)
             .map_or(0, |state| state.health_failing_files.len())
     }
 
-    /// Recovery blocks it would take to cover `failed_bytes` of lost payload,
-    /// for the recovery set this job is served by.
-    ///
-    /// Deliberately generous: the lost bytes rounded up to whole slices, plus
-    /// one slice for each damaged file, because a hole never starts on a slice
-    /// boundary. Both callers want to be wrong in this direction — the probe
-    /// policy only stands down when the recovery covers the *over*-estimate,
-    /// and early promotion asks for at least as much as the repair will.
+    // Recovery blocks it would take to cover `failed_bytes` of lost payload,
+    // for the recovery set this job is served by.
+    //
+    // Deliberately generous: the lost bytes rounded up to whole slices, plus
+    // one slice for each damaged file, because a hole never starts on a slice
+    // boundary. Both callers want to be wrong in this direction — the probe
+    // policy only stands down when the recovery covers the *over*-estimate,
+    // and early promotion asks for at least as much as the repair will.
     fn par2_shortfall_blocks(
         &self,
         job_id: JobId,
@@ -199,8 +199,8 @@ impl Pipeline {
         Some(blocks.min(u64::from(u32::MAX)) as u32)
     }
 
-    /// Every recovery set this job could repair from — the parsed sets and
-    /// the served one — each with the bytes its obtainable blocks recover.
+    // Every recovery set this job could repair from — the parsed sets and
+    // the served one — each with the bytes its obtainable blocks recover.
     fn par2_set_recovery_capacities(&self, job_id: JobId) -> Vec<SetRecoveryCapacity> {
         let mut set_ids = self.par2_servable_set_ids(job_id);
         if let Some(served) = self.par2_served_set_id(job_id)
@@ -226,12 +226,12 @@ impl Pipeline {
             .collect()
     }
 
-    /// Whether the recovery sets can cover what each of them is asked for.
-    ///
-    /// Spare slices in one set cannot repair another set's files, so each
-    /// set's shortfall is counted on its own. What the live discovery
-    /// candidates hold is not yet known to belong to any set, so it may still
-    /// make up any of those shortfalls: `ceiling` less the sets' own capacity.
+    // Whether the recovery sets can cover what each of them is asked for.
+    //
+    // Spare slices in one set cannot repair another set's files, so each
+    // set's shortfall is counted on its own. What the live discovery
+    // candidates hold is not yet known to belong to any set, so it may still
+    // make up any of those shortfalls: `ceiling` less the sets' own capacity.
     fn par2_sets_cover_needs(
         sets: &[SetRecoveryCapacity],
         needed_by_set: &std::collections::HashMap<par2_rs::RecoverySetId, u64>,
@@ -254,16 +254,16 @@ impl Pipeline {
         shortfall <= ceiling.saturating_sub(known_capacity)
     }
 
-    /// Books each lost file's charge against a set that describes it.
-    ///
-    /// `charges` holds, for every lost file some parsed set describes, the
-    /// charge each describing set would take for it. A file only one set
-    /// describes is that set's to repair and is booked there first. A file
-    /// several sets describe can be repaired from any of them, so it goes to
-    /// whichever still has the most capacity left once the files booked
-    /// before it are counted. That is a greedy assignment, not an exact one:
-    /// it never charges a shared file to a set that has nothing left while
-    /// another describing set does, but it does not search every split.
+    // Books each lost file's charge against a set that describes it.
+    //
+    // `charges` holds, for every lost file some parsed set describes, the
+    // charge each describing set would take for it. A file only one set
+    // describes is that set's to repair and is booked there first. A file
+    // several sets describe can be repaired from any of them, so it goes to
+    // whichever still has the most capacity left once the files booked
+    // before it are counted. That is a greedy assignment, not an exact one:
+    // it never charges a shared file to a set that has nothing left while
+    // another describing set does, but it does not search every split.
     fn book_needs_by_set(
         sets: &[SetRecoveryCapacity],
         charges: &[Vec<(par2_rs::RecoverySetId, u64)>],
@@ -296,24 +296,24 @@ impl Pipeline {
         needed_by_set
     }
 
-    /// Whether this job's declared recovery is still *obtainable*, and how many
-    /// bytes of it there could be.
-    ///
-    /// Two sources, both of them things the pipeline has observed rather than
-    /// read off a filename:
-    ///
-    /// * every parsed recovery set — blocks its volumes can supply, at the
-    ///   set's own slice size, counting only volumes with an article delivered
-    ///   or still able to arrive. Not the served set alone: completion repairs
-    ///   each set's files from that set, and a secondary set that has parsed
-    ///   is no longer a discovery candidate either, so leaving it out would
-    ///   drop its recovery from both sources;
-    /// * discovery candidates that are still live: no verdict yet, and at least
-    ///   one article that could still arrive. Nothing is known about their
-    ///   contents, so they contribute their declared article bytes.
-    ///
-    /// Neither is the NZB's static PAR2 byte count, which is what a posting
-    /// whose every recovery volume is already dead still reports in full.
+    // Whether this job's declared recovery is still *obtainable*, and how many
+    // bytes of it there could be.
+    //
+    // Two sources, both of them things the pipeline has observed rather than
+    // read off a filename:
+    //
+    // * every parsed recovery set — blocks its volumes can supply, at the
+    //   set's own slice size, counting only volumes with an article delivered
+    //   or still able to arrive. Not the served set alone: completion repairs
+    //   each set's files from that set, and a secondary set that has parsed
+    //   is no longer a discovery candidate either, so leaving it out would
+    //   drop its recovery from both sources;
+    // * discovery candidates that are still live: no verdict yet, and at least
+    //   one article that could still arrive. Nothing is known about their
+    //   contents, so they contribute their declared article bytes.
+    //
+    // Neither is the NZB's static PAR2 byte count, which is what a posting
+    // whose every recovery volume is already dead still reports in full.
     fn obtainable_recovery(&self, job_id: JobId) -> ObtainableRecovery {
         let sets = self.par2_set_recovery_capacities(job_id);
         let served = (!sets.is_empty()).then(|| {
@@ -341,10 +341,10 @@ impl Pipeline {
         }
     }
 
-    /// Whether a discovery candidate could still produce metadata.
-    ///
-    /// A candidate that has reached a verdict has nothing left to give, and one
-    /// whose every article has reached a terminal state can never reach one.
+    // Whether a discovery candidate could still produce metadata.
+    //
+    // A candidate that has reached a verdict has nothing left to give, and one
+    // whose every article has reached a terminal state can never reach one.
     fn par2_discovery_candidate_is_live(&self, job_id: JobId, file_index: u32) -> bool {
         if self
             .par2_discovery_state_for_candidate(job_id, file_index)
@@ -371,13 +371,13 @@ impl Pipeline {
         })
     }
 
-    /// Whether a loaded recovery set already answers the question a probe would
-    /// ask.
-    ///
-    /// `par2_bytes > 0` was never enough: it says a job declared recovery
-    /// files, not that any of them describe this damage or that there are
-    /// enough of them. This asks the parsed set instead — the shortfall in
-    /// blocks against what the posting's recovery volumes can actually supply.
+    // Whether a loaded recovery set already answers the question a probe would
+    // ask.
+    //
+    // `par2_bytes > 0` was never enough: it says a job declared recovery
+    // files, not that any of them describe this damage or that there are
+    // enough of them. This asks the parsed set instead — the shortfall in
+    // blocks against what the posting's recovery volumes can actually supply.
     fn par2_recovery_covers_health_damage(&self, job_id: JobId, failed_bytes: u64) -> bool {
         let Some(set_id) = self.par2_served_set_id(job_id) else {
             return false;
@@ -388,22 +388,22 @@ impl Pipeline {
         self.total_recovery_block_capacity(job_id, set_id) >= blocks_needed
     }
 
-    /// Put the recovery this job already knows it needs on the wire now.
-    ///
-    /// Damage is known the moment a segment reaches a terminal state, but the
-    /// blocks that repair it used to stay parked in `recovery_queue` until the
-    /// completion checkpoint ran — which is to say until the payload had
-    /// finished. The two downloads are then strictly sequential for no reason:
-    /// promoted recovery is ordinary completion-critical work and rides the
-    /// same lanes, so it can just as well arrive while the rest of the payload
-    /// is still coming.
-    ///
-    /// Idempotent by construction: `promote_recovery_targeted` subtracts what
-    /// is already merged or already on its way before selecting anything, and
-    /// skips files it has promoted before. Damage discovered later — a CRC
-    /// failure, a verification verdict — still reaches the checkpoint-time
-    /// promotion exactly as before; this only front-runs the part that was
-    /// knowable at booking time.
+    // Put the recovery this job already knows it needs on the wire now.
+    //
+    // Damage is known the moment a segment reaches a terminal state, but the
+    // blocks that repair it used to stay parked in `recovery_queue` until the
+    // completion checkpoint ran — which is to say until the payload had
+    // finished. The two downloads are then strictly sequential for no reason:
+    // promoted recovery is ordinary completion-critical work and rides the
+    // same lanes, so it can just as well arrive while the rest of the payload
+    // is still coming.
+    //
+    // Idempotent by construction: `promote_recovery_targeted` subtracts what
+    // is already merged or already on its way before selecting anything, and
+    // skips files it has promoted before. Damage discovered later — a CRC
+    // failure, a verification verdict — still reaches the checkpoint-time
+    // promotion exactly as before; this only front-runs the part that was
+    // knowable at booking time.
     pub(in crate::pipeline) fn promote_recovery_for_known_damage(&mut self, job_id: JobId) {
         if !EARLY_RECOVERY_PROMOTION {
             return;
@@ -501,20 +501,20 @@ impl Pipeline {
         (offset..total_segs).step_by(stride).collect()
     }
 
-    /// Whether the damage has the shape a probe exists to catch.
-    ///
-    /// The probe's job is to abandon a release nobody posted before a gigabyte
-    /// proves it. Two shapes qualify:
-    ///
-    /// * losses spanning more than one file — a posting that is coming apart in
-    ///   several places is unlikely to be coming apart in only those places;
-    /// * losses that dwarf what has landed — the job is trying and getting
-    ///   nothing back, whether or not it has reached a second file yet.
-    ///
-    /// One file failing while the rest of the posting arrives cleanly is
-    /// neither. That is a hole, and the recovery set — or, without one, the
-    /// completion checkpoint — decides what to do about it. Sampling the files
-    /// that are already arriving cannot add anything.
+    // Whether the damage has the shape a probe exists to catch.
+    //
+    // The probe's job is to abandon a release nobody posted before a gigabyte
+    // proves it. Two shapes qualify:
+    //
+    // * losses spanning more than one file — a posting that is coming apart in
+    //   several places is unlikely to be coming apart in only those places;
+    // * losses that dwarf what has landed — the job is trying and getting
+    //   nothing back, whether or not it has reached a second file yet.
+    //
+    // One file failing while the rest of the posting arrives cleanly is
+    // neither. That is a hole, and the recovery set — or, without one, the
+    // completion checkpoint — decides what to do about it. Sampling the files
+    // that are already arriving cannot add anything.
     fn health_damage_looks_like_a_dead_release(
         state: &crate::jobs::model::JobState,
         failing_files: usize,
@@ -529,11 +529,11 @@ impl Pipeline {
             < failed_bytes
     }
 
-    /// Known damaged files each require what they lost, and at least one
-    /// slice, from their own set. The loss is counted in declared bytes, the
-    /// same measure the job's failed bytes are compared to the ceiling in. A
-    /// probe projection has no set attribution, so only booked failures can
-    /// prove that one set is already beyond repair.
+    // Known damaged files each require what they lost, and at least one
+    // slice, from their own set. The loss is counted in declared bytes, the
+    // same measure the job's failed bytes are compared to the ceiling in. A
+    // probe projection has no set attribution, so only booked failures can
+    // prove that one set is already beyond repair.
     fn known_health_losses_fit_recovery_sets(&self, job_id: JobId, ceiling: Option<u64>) -> bool {
         let Some(ceiling) = ceiling else {
             return true;
@@ -594,12 +594,12 @@ impl Pipeline {
         Self::par2_sets_cover_needs(&sets, &needed_by_set, ceiling)
     }
 
-    /// Check job health and abort if below critical threshold.
-    ///
-    /// Health = (total_bytes - failed_bytes) / total_bytes × 1000.
-    /// Critical health is derived from available PAR2 recovery data:
-    ///   critical = (total - 2 × par2_bytes) / (total - par2_bytes) × 1000
-    /// If no PAR2 data, defaults to 850 (85%).
+    // Check job health and abort if below critical threshold.
+    //
+    // Health = (total_bytes - failed_bytes) / total_bytes × 1000.
+    // Critical health is derived from available PAR2 recovery data:
+    //   critical = (total - 2 × par2_bytes) / (total - par2_bytes) × 1000
+    // If no PAR2 data, defaults to 850 (85%).
     pub(super) fn check_health(&mut self, job_id: JobId) {
         if self.jobs.get(&job_id).is_none_or(|state| {
             matches!(state.status, JobStatus::Failed { .. } | JobStatus::Complete)
@@ -744,6 +744,11 @@ impl Pipeline {
                 "aborting job: health below critical threshold"
             );
             let error = self.health_abort_error(job_id, health, critical);
+            self.raise_queue_script_event(
+                job_id,
+                crate::post_processing::model::QueueEvent::NzbDeleted,
+                Some("HEALTH"),
+            );
             self.fail_job(job_id, error);
             return;
         }
@@ -798,20 +803,25 @@ impl Pipeline {
             "aborting job: health below critical threshold"
         );
         let error = self.health_abort_error(job_id, health, critical);
+        self.raise_queue_script_event(
+            job_id,
+            crate::post_processing::model::QueueEvent::NzbDeleted,
+            Some("HEALTH"),
+        );
         self.fail_job(job_id, error);
     }
 
-    /// Holds a health abort while the first-article sample can still rule the
-    /// post dead, so that the failure carries that diagnosis rather than a
-    /// byte count. Returns whether the abort was held.
-    ///
-    /// The hold is bounded: the sample is one article per payload file, those
-    /// articles lead the queue, and each one settles by delivery or by every
-    /// server answering for it, on which [`Self::note_first_article_settled`]
-    /// reads the sample again and re-runs the health arithmetic when it can
-    /// no longer reach its share. Health is not consulted a second time on a
-    /// path the sample cannot change: once the share is out of reach, or the
-    /// sample is complete, the health error stands as before.
+    // Holds a health abort while the first-article sample can still rule the
+    // post dead, so that the failure carries that diagnosis rather than a
+    // byte count. Returns whether the abort was held.
+    //
+    // The hold is bounded: the sample is one article per payload file, those
+    // articles lead the queue, and each one settles by delivery or by every
+    // server answering for it, on which [`Self::note_first_article_settled`]
+    // reads the sample again and re-runs the health arithmetic when it can
+    // no longer reach its share. Health is not consulted a second time on a
+    // path the sample cannot change: once the share is out of reach, or the
+    // sample is complete, the health error stands as before.
     fn defer_health_abort_to_first_article_sample(
         &mut self,
         job_id: JobId,
@@ -840,11 +850,11 @@ impl Pipeline {
         true
     }
 
-    /// Whether the first-article sample is short of its verdict only because
-    /// articles are still outstanding: large enough to be read, not yet at
-    /// the failure share, and able to reach it if every outstanding article
-    /// comes back missing. A sample that has already ruled is read by
-    /// [`Self::evaluate_first_article_gate`] and never reaches here.
+    // Whether the first-article sample is short of its verdict only because
+    // articles are still outstanding: large enough to be read, not yet at
+    // the failure share, and able to reach it if every outstanding article
+    // comes back missing. A sample that has already ruled is read by
+    // [`Self::evaluate_first_article_gate`] and never reaches here.
     fn first_article_sample_can_still_decide(&self, job_id: JobId) -> bool {
         let Some(state) = self.jobs.get(&job_id) else {
             return false;
@@ -873,14 +883,14 @@ impl Pipeline {
         outstanding > 0 && missing * 100 < share && (missing + outstanding) * 100 >= share
     }
 
-    /// The terminal error for a job the health arithmetic is failing.
-    ///
-    /// The health figure says how many bytes are gone; the first-article
-    /// sample, when it has already seen enough, says why — the post itself is
-    /// gone. A sample still waiting on some of its articles can be certain
-    /// before it is complete, and then its diagnosis is the one the job fails
-    /// with, worded exactly as the complete sample would word it. The health
-    /// figure is logged beside it. Short of that, the health error stands.
+    // The terminal error for a job the health arithmetic is failing.
+    //
+    // The health figure says how many bytes are gone; the first-article
+    // sample, when it has already seen enough, says why — the post itself is
+    // gone. A sample still waiting on some of its articles can be certain
+    // before it is complete, and then its diagnosis is the one the job fails
+    // with, worded exactly as the complete sample would word it. The health
+    // figure is logged beside it. Short of that, the health error stands.
     fn health_abort_error(&self, job_id: JobId, health: u32, critical: u32) -> String {
         let health_error = format!(
             "health {:.1}% below critical {:.1}%",
@@ -902,11 +912,11 @@ impl Pipeline {
         }
     }
 
-    /// Handle a probe update (partial or final).
-    ///
-    /// Final updates either confirm a new payload-health estimate or discard
-    /// the round if probe confirmation was inconclusive. If probe activation
-    /// parked work for a given job, it is restored before resuming.
+    // Handle a probe update (partial or final).
+    //
+    // Final updates either confirm a new payload-health estimate or discard
+    // the round if probe confirmation was inconclusive. If probe activation
+    // parked work for a given job, it is restored before resuming.
     pub(super) fn handle_probe_update(&mut self, update: ProbeUpdate) {
         let ProbeUpdate {
             job_id,
@@ -969,6 +979,11 @@ impl Pipeline {
                 total
             );
             warn!(job_id = job_id.0, "{error}");
+            self.raise_queue_script_event(
+                job_id,
+                crate::post_processing::model::QueueEvent::NzbDeleted,
+                Some("HEALTH"),
+            );
             self.fail_job(job_id, error);
             return;
         }
@@ -1022,26 +1037,26 @@ impl Pipeline {
         }
     }
 
-    /// Retire an in-flight health probe once the job has nothing left to
-    /// download but the probe itself.
-    ///
-    /// A probe is an *early* estimate: it samples the release while segments
-    /// are still arriving so an entirely missing release can be abandoned
-    /// before a gigabyte proves it. Once the queue has drained and every
-    /// segment has reached a terminal state the job holds the real answer the
-    /// probe was approximating, and the round has nothing left to say.
-    ///
-    /// It no longer holds anything up — a probe is not pending pipeline work
-    /// and no longer moves the status — so this is now about the round itself:
-    /// dropping it re-arms the hysteresis against the settled ledger instead of
-    /// leaving a moot round to fold a sampled projection into a job whose real
-    /// terminal states are already in.
-    ///
-    /// The round is abandoned rather than awaited: `handle_probe_update` drops
-    /// a result whose round the job is no longer waiting on.
-    ///
-    /// Held segments (the decode breaker's, not the probe's) still count as
-    /// work, so a job parking any is left alone.
+    // Retire an in-flight health probe once the job has nothing left to
+    // download but the probe itself.
+    //
+    // A probe is an *early* estimate: it samples the release while segments
+    // are still arriving so an entirely missing release can be abandoned
+    // before a gigabyte proves it. Once the queue has drained and every
+    // segment has reached a terminal state the job holds the real answer the
+    // probe was approximating, and the round has nothing left to say.
+    //
+    // It no longer holds anything up — a probe is not pending pipeline work
+    // and no longer moves the status — so this is now about the round itself:
+    // dropping it re-arms the hysteresis against the settled ledger instead of
+    // leaving a moot round to fold a sampled projection into a job whose real
+    // terminal states are already in.
+    //
+    // The round is abandoned rather than awaited: `handle_probe_update` drops
+    // a result whose round the job is no longer waiting on.
+    //
+    // Held segments (the decode breaker's, not the probe's) still count as
+    // work, so a job parking any is left alone.
     pub(crate) fn retire_health_probe_if_download_pipeline_drained(
         &mut self,
         job_id: JobId,
@@ -1084,8 +1099,8 @@ impl Pipeline {
         true
     }
 
-    /// Reject untrusted delivery content or an incomplete security check
-    /// without exposing the working tree to terminal scripts or publication.
+    // Reject untrusted delivery content or an incomplete security check
+    // without exposing the working tree to terminal scripts or publication.
     pub(super) fn fail_delivery_security_check(&mut self, job_id: JobId, error: String) {
         if let Some(budget) = self.extraction_budgets.get(&job_id) {
             budget.reject_content_policy(error.clone());
@@ -1095,10 +1110,10 @@ impl Pipeline {
         self.finish_failed_job(job_id, error, released_repair, released_extract);
     }
 
-    /// Record one deferral of a job's health failure.
-    ///
-    /// Returns whether it opened a new spell of deferring — the one event in a
-    /// spell the caller announces — rather than extending the one running.
+    // Record one deferral of a job's health failure.
+    //
+    // Returns whether it opened a new spell of deferring — the one event in a
+    // spell the caller announces — rather than extending the one running.
     fn note_health_deferral(&mut self, job_id: JobId, kind: HealthDeferralKind) -> bool {
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return false;
@@ -1118,7 +1133,7 @@ impl Pipeline {
         true
     }
 
-    /// Close any spell of health deferral this job is in, reporting its total.
+    // Close any spell of health deferral this job is in, reporting its total.
     pub(super) fn clear_health_deferral(&mut self, job_id: JobId) {
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
@@ -1142,21 +1157,21 @@ impl Pipeline {
         );
     }
 
-    /// The smallest number of files a first-article verdict is worth taking.
-    ///
-    /// One article per file is a sample, and a sample of a handful of files
-    /// says very little: a two-file post whose first file is missing is an
-    /// ordinary damaged post, not a dead one.
+    // The smallest number of files a first-article verdict is worth taking.
+    //
+    // One article per file is a sample, and a sample of a handful of files
+    // says very little: a two-file post whose first file is missing is an
+    // ordinary damaged post, not a dead one.
     const FIRST_ARTICLE_GATE_MIN_FILES: usize = 10;
 
-    /// How much of the sample has to be missing before the post is called dead,
-    /// in hundredths. Short of this the ordinary health path rules, because a
-    /// post with real recovery data behind it can survive a great deal.
+    // How much of the sample has to be missing before the post is called dead,
+    // in hundredths. Short of this the ordinary health path rules, because a
+    // post with real recovery data behind it can survive a great deal.
     const FIRST_ARTICLE_GATE_MISSING_PCT: usize = 80;
 
-    /// One article of a file has reached its verdict — delivered, or answered
-    /// for by every server. When it is that file's first article, the sample
-    /// is read again: it may now be able to answer.
+    // One article of a file has reached its verdict — delivered, or answered
+    // for by every server. When it is that file's first article, the sample
+    // is read again: it may now be able to answer.
     pub(in crate::pipeline) fn note_first_article_settled(&mut self, segment_id: SegmentId) {
         let job_id = segment_id.file_id.job_id;
         if !self
@@ -1180,46 +1195,51 @@ impl Pipeline {
         }
     }
 
-    /// Reads the first-article sample as soon as it can answer.
-    ///
-    /// A post whose every file answers "no such article" on the very first
-    /// article of each of them is not a post that is going to complete, and
-    /// nothing later in the pipeline can learn that any sooner: the recovery
-    /// arithmetic needs a recovery set that this post cannot supply either.
-    /// Failing here costs one article per file and no lane of its own.
-    ///
-    /// The sample counts files, not bytes. When the files it rules missing are
-    /// small beside the recovery the job can still obtain, the post is damaged
-    /// rather than dead, and the ordinary health path rules instead.
+    // Reads the first-article sample as soon as it can answer.
+    //
+    // A post whose every file answers "no such article" on the very first
+    // article of each of them is not a post that is going to complete, and
+    // nothing later in the pipeline can learn that any sooner: the recovery
+    // arithmetic needs a recovery set that this post cannot supply either.
+    // Failing here costs one article per file and no lane of its own.
+    //
+    // The sample counts files, not bytes. When the files it rules missing are
+    // small beside the recovery the job can still obtain, the post is damaged
+    // rather than dead, and the ordinary health path rules instead.
     fn evaluate_first_article_gate(&mut self, job_id: JobId) {
         if let Some((missing, total)) = self.first_article_verdict(job_id) {
             if self.first_article_losses_recoverable(job_id) {
                 return;
             }
+            self.raise_queue_script_event(
+                job_id,
+                crate::post_processing::model::QueueEvent::NzbDeleted,
+                Some("HEALTH"),
+            );
             self.fail_job(job_id, Self::first_article_verdict_error(missing, total));
         }
     }
 
-    /// Whether the recovery this job can still obtain covers every file whose
-    /// sampled first article is ruled missing, taking each of those files as
-    /// wholly lost.
-    ///
-    /// The cover is the obtainable capacity of every parsed set when one is
-    /// known, and otherwise the recovery the posting declares, which is also
-    /// what the critical-health line is drawn from.
-    ///
-    /// Once a set is parsed the comparison is in slice units, because the two
-    /// sides otherwise disagree: the capacity is decoded slices, while a
-    /// file's declared size is yEnc-encoded, about 3% larger — enough to fail
-    /// a post whose losses the set covers exactly. Each lost file costs the
-    /// whole slices of the length the set that describes it gives, at that
-    /// set's slice size, which is what the repair will spend (a file several
-    /// sets describe is charged to one of them, as [`Self::book_needs_by_set`]
-    /// chooses); a file no parsed
-    /// set describes costs its declared size in the served set's slices. That
-    /// charge is generous rather than exact — no set can repair such a file —
-    /// and it is the same charge the byte comparison has always made for a
-    /// file another set protects.
+    // Whether the recovery this job can still obtain covers every file whose
+    // sampled first article is ruled missing, taking each of those files as
+    // wholly lost.
+    //
+    // The cover is the obtainable capacity of every parsed set when one is
+    // known, and otherwise the recovery the posting declares, which is also
+    // what the critical-health line is drawn from.
+    //
+    // Once a set is parsed the comparison is in slice units, because the two
+    // sides otherwise disagree: the capacity is decoded slices, while a
+    // file's declared size is yEnc-encoded, about 3% larger — enough to fail
+    // a post whose losses the set covers exactly. Each lost file costs the
+    // whole slices of the length the set that describes it gives, at that
+    // set's slice size, which is what the repair will spend (a file several
+    // sets describe is charged to one of them, as [`Self::book_needs_by_set`]
+    // chooses); a file no parsed
+    // set describes costs its declared size in the served set's slices. That
+    // charge is generous rather than exact — no set can repair such a file —
+    // and it is the same charge the byte comparison has always made for a
+    // file another set protects.
     fn first_article_losses_recoverable(&self, job_id: JobId) -> bool {
         let Some(state) = self.jobs.get(&job_id) else {
             return false;
@@ -1303,15 +1323,15 @@ impl Pipeline {
         }
     }
 
-    /// The sample's verdict, once it is certain: `Some((missing, total))` when
-    /// the articles already ruled missing reach the failure share of the whole
-    /// sample, `None` otherwise.
-    ///
-    /// Only a ruling of missing counts toward the share, and an article still
-    /// outstanding can only add to it or leave it where it is, so a sample
-    /// that reaches the share with articles outstanding has the verdict the
-    /// complete sample would have. A sample short of the share says nothing
-    /// yet, complete or not.
+    // The sample's verdict, once it is certain: `Some((missing, total))` when
+    // the articles already ruled missing reach the failure share of the whole
+    // sample, `None` otherwise.
+    //
+    // Only a ruling of missing counts toward the share, and an article still
+    // outstanding can only add to it or leave it where it is, so a sample
+    // that reaches the share with articles outstanding has the verdict the
+    // complete sample would have. A sample short of the share says nothing
+    // yet, complete or not.
     fn first_article_verdict(&self, job_id: JobId) -> Option<(usize, usize)> {
         let state = self.jobs.get(&job_id)?;
         let total = state.download_queue.first_articles().count();
@@ -1347,7 +1367,7 @@ impl Pipeline {
         )
     }
 
-    /// Mark a job as failed and purge its queued segments.
+    // Mark a job as failed and purge its queued segments.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
         tracing::error!(job_id = job_id.0, reason = %error, "job failed");
         self.clear_health_deferral(job_id);
@@ -1386,6 +1406,7 @@ impl Pipeline {
         if extraction_rejected && let Some(budget) = self.extraction_budgets.get(&job_id) {
             budget.cancel_with_error(&error);
         }
+        let error = JobExtractionBudget::job_failure_reason(error);
         let should_defer = !extraction_rejected
             && scripts_may_run
             && self.jobs.contains_key(&job_id)
@@ -1559,21 +1580,21 @@ impl Pipeline {
         self.publish_snapshot();
     }
 
-    /// Spawn a dedicated STAT probe task to quickly estimate job health.
-    ///
-    /// Instead of pushing probes into the download queue (where they compete
-    /// with 150k+ regular segments), this issues batched STAT checks through
-    /// the high-level NNTP client so probes inherit the normal server ordering,
-    /// failover, and soft-timeout semantics used by real downloads.
-    ///
-    /// e.g. 150k segs × 8% = ~12k probes / 50 per batch = ~240 batched checks.
-    /// If every single probe returns 430 across the usable server set, the job
-    /// is failed immediately.
-    ///
-    /// The job's status is deliberately left alone. A probe is a handful of
-    /// STAT round trips running alongside a download that is still going; the
-    /// job is downloading, and saying so kept it out of dispatch decisions,
-    /// completion scheduling and the capacity budget that all read the status.
+    // Spawn a dedicated STAT probe task to quickly estimate job health.
+    //
+    // Instead of pushing probes into the download queue (where they compete
+    // with 150k+ regular segments), this issues batched STAT checks through
+    // the high-level NNTP client so probes inherit the normal server ordering,
+    // failover, and soft-timeout semantics used by real downloads.
+    //
+    // e.g. 150k segs × 8% = ~12k probes / 50 per batch = ~240 batched checks.
+    // If every single probe returns 430 across the usable server set, the job
+    // is failed immediately.
+    //
+    // The job's status is deliberately left alone. A probe is a handful of
+    // STAT round trips running alongside a download that is still going; the
+    // job is downloading, and saying so kept it out of dispatch decisions,
+    // completion scheduling and the capacity budget that all read the status.
     pub(super) fn activate_health_probes(&mut self, job_id: JobId) -> bool {
         // The failing-file count this round was armed on: another file failing
         // is what re-arms the next one, and a second dead article in a file

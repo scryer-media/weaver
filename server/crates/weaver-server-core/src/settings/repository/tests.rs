@@ -41,7 +41,7 @@ fn server_crud() {
             limit_bytes: 50_000_000,
             period: crate::servers::ServerDownloadQuotaPeriod::Weekly,
             reset_time_minutes_local: 7 * 60,
-            weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Wed,
+            weekly_reset_weekday: crate::bandwidth::QuotaWeekday::Wed,
             monthly_reset_day: 15,
         },
         tls_ca_cert: None,
@@ -111,7 +111,7 @@ fn config_roundtrip() {
                 limit_bytes: 80_000_000,
                 period: crate::servers::ServerDownloadQuotaPeriod::Monthly,
                 reset_time_minutes_local: 90,
-                weekly_reset_weekday: crate::bandwidth::IspBandwidthCapWeekday::Fri,
+                weekly_reset_weekday: crate::bandwidth::QuotaWeekday::Fri,
                 monthly_reset_day: 31,
             },
             tls_ca_cert: None,
@@ -124,7 +124,6 @@ fn config_roundtrip() {
         }],
         retry: None,
         max_download_speed: Some(1_000_000),
-        isp_bandwidth_cap: None,
         propagation_delay_secs: None,
         cleanup_after_extract: Some(false),
         watch_folder: crate::watch_folder::WatchFolderConfig {
@@ -239,10 +238,10 @@ fn loading_the_config_removes_settings_no_release_reads() {
     );
 }
 
-/// An install that never touched direct unpack loads no table at all, which is
-/// "every default" — and must not be confused with a table that explicitly says
-/// `false`, since the resolved gate is off either way but the config surface is
-/// not.
+// An install that never touched direct unpack loads no table at all, which is
+// "every default" — and must not be confused with a table that explicitly says
+// `false`, since the resolved gate is off either way but the config surface is
+// not.
 #[test]
 fn an_unconfigured_direct_unpack_loads_as_absent() {
     let db = Database::open_in_memory().unwrap();
@@ -253,8 +252,8 @@ fn an_unconfigured_direct_unpack_loads_as_absent() {
     assert!(loaded.direct_unpack.is_none());
 }
 
-/// A table that explicitly disables direct unpack round-trips as `Some(false)`,
-/// not as an absent table.
+// A table that explicitly disables direct unpack round-trips as `Some(false)`,
+// not as an absent table.
 #[test]
 fn an_explicitly_disabled_direct_unpack_round_trips() {
     let db = Database::open_in_memory().unwrap();
@@ -272,8 +271,8 @@ fn an_explicitly_disabled_direct_unpack_round_trips() {
     );
 }
 
-/// An install that never touched delivery naming loads no table at all, so the
-/// accessors answer with the shipped defaults: rename on, srrdb off.
+// An install that never touched delivery naming loads no table at all, so the
+// accessors answer with the shipped defaults: rename on, srrdb off.
 #[test]
 fn an_unconfigured_delivery_naming_table_loads_as_absent_defaults() {
     let db = Database::open_in_memory().unwrap();
@@ -286,9 +285,9 @@ fn an_unconfigured_delivery_naming_table_loads_as_absent_defaults() {
     assert!(!loaded.enable_srrdb_lookup());
 }
 
-/// An install that never touched direct-store loads no table at all, which is
-/// what "every default" looks like — and it must not be confused with a table
-/// that explicitly says `false`.
+// An install that never touched direct-store loads no table at all, which is
+// what "every default" looks like — and it must not be confused with a table
+// that explicitly says `false`.
 #[test]
 fn an_unconfigured_direct_store_loads_as_absent() {
     let db = Database::open_in_memory().unwrap();

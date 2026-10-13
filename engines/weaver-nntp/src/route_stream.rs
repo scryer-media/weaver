@@ -1,4 +1,4 @@
-//! Socket-compatible access to a direct TCP connection or an in-process route.
+// Socket-compatible access to a direct TCP connection or an in-process route.
 use std::{
     io::{self, Read, Write},
     pin::Pin,
@@ -14,8 +14,8 @@ pub enum RouteStream {
         stream: DirectStream,
         peeked: Option<Option<u8>>,
     },
-    /// Installed only during a synchronous idle TLS inspection. Limits the
-    /// ciphertext consumed by backends that drive several reads per poll.
+    // Installed only during a synchronous idle TLS inspection. Limits the
+    // ciphertext consumed by backends that drive several reads per poll.
     Inspecting {
         inner: Option<Box<RouteStream>>,
         remaining: usize,
@@ -31,6 +31,17 @@ impl From<DirectStream> for RouteStream {
         Self::Tunnel {
             stream,
             peeked: None,
+        }
+    }
+}
+impl From<weaver_tunnel::pipe::DialedStream> for RouteStream {
+    fn from(stream: weaver_tunnel::pipe::DialedStream) -> Self {
+        match stream {
+            weaver_tunnel::pipe::DialedStream::Socket(socket) => Self::Tcp(socket),
+            weaver_tunnel::pipe::DialedStream::Tunnel(stream) => Self::Tunnel {
+                stream: DirectStream::from_stream(stream),
+                peeked: None,
+            },
         }
     }
 }
@@ -160,7 +171,8 @@ impl AsyncWrite for RouteStream {
 pub(crate) enum BlockingSocket {
     Tcp(std::net::TcpStream),
     Tunnel {
-        stream: DirectStream,
+        // Dropped by hand inside the runtime; see the `Drop` impl.
+        stream: std::mem::ManuallyDrop<DirectStream>,
         runtime: tokio::runtime::Handle,
         read_timeout: std::cell::Cell<Option<Duration>>,
         write_timeout: std::cell::Cell<Option<Duration>>,
@@ -172,13 +184,13 @@ impl From<std::net::TcpStream> for BlockingSocket {
     }
 }
 impl BlockingSocket {
-    pub(crate) fn tunnel(
-        stream: DirectStream,
+    pub(crate) fn tunnel_boxed(
+        stream: Box<dyn weaver_tunnel::TunnelStream>,
         runtime: tokio::runtime::Handle,
         timeout: Duration,
     ) -> Self {
         Self::Tunnel {
-            stream,
+            stream: std::mem::ManuallyDrop::new(DirectStream::from_stream(stream)),
             runtime,
             read_timeout: std::cell::Cell::new(Some(timeout)),
             write_timeout: std::cell::Cell::new(Some(timeout)),
@@ -213,6 +225,22 @@ impl BlockingSocket {
             Self::Tcp(tcp) => tcp.set_nonblocking(enabled),
             Self::Tunnel { .. } if !enabled => Ok(()),
             _ => Err(io::Error::other("tunnel adapter requires blocking calls")),
+        }
+    }
+}
+impl Drop for BlockingSocket {
+    fn drop(&mut self) {
+        if let Self::Tunnel {
+            stream, runtime, ..
+        } = self
+        {
+            // The blocking socket lives on a lane thread with no reactor, but
+            // dropping the tunnel stream closes its SSH channel from a Tokio
+            // task, which panics outside a runtime context.
+            let _guard = runtime.enter();
+            // SAFETY: the stream is dropped exactly once, here, and nothing
+            // reads it after this point.
+            unsafe { std::mem::ManuallyDrop::drop(stream) };
         }
     }
 }

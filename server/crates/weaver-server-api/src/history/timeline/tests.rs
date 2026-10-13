@@ -28,6 +28,12 @@ fn history(created_at: i64, completed_at: i64) -> JobHistoryRow {
 
 fn job(status: JobStatus) -> JobInfo {
     let (download_state, post_state, run_state, error) = match &status {
+        JobStatus::AwaitingQueueScripts => (
+            weaver_server_core::DownloadState::Complete,
+            weaver_server_core::PostState::AwaitingQueueScripts,
+            weaver_server_core::RunState::Active,
+            None,
+        ),
         JobStatus::Queued => (
             weaver_server_core::DownloadState::Queued,
             weaver_server_core::PostState::Idle,

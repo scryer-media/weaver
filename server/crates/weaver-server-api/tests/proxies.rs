@@ -69,6 +69,27 @@ async fn profile_crud_redacts_secrets_and_preserves_omitted_credentials() {
 }
 
 #[tokio::test]
+async fn an_ssh_profile_is_refused_a_password() {
+    let h = harness().await;
+    let result = h
+        .execute(
+            r#"mutation { saveProxyProfile(input: {
+        name: "seedbox", kind: SSH, enabled: true, host: "127.0.0.1", port: 22,
+        username: "operator", password: "fixture-password"
+    }) { id } }"#,
+        )
+        .await;
+    assert_has_errors(&result);
+    assert!(
+        result.errors[0]
+            .message
+            .contains("SSH requires an Ed25519 private key and takes no password")
+    );
+    assert!(h.db.list_proxy_profiles().unwrap().is_empty());
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+#[tokio::test]
 async fn http3_profiles_round_trip_and_feed_routes_keep_credentials_private() {
     let h = harness().await;
     let result = h

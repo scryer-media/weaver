@@ -2,6 +2,47 @@ use super::*;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use weaver_nntp::{NntpClient, NntpConnection, ServerConfig, ServerId, client::NntpClientConfig};
 
+struct BridgeDialer(Arc<weaver_tunnel::bridge::Bridge>);
+#[async_trait::async_trait]
+impl weaver_tunnel::pipe::Dialer for BridgeDialer {
+    async fn dial(
+        &self,
+        target: &weaver_tunnel::pipe::Target,
+    ) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
+        let (stream, outcome) = self
+            .0
+            .dial(&target.host, target.port)
+            .await
+            .map_err(weaver_tunnel::pipe::DialError::Egress)?;
+        Ok(weaver_tunnel::pipe::Dialed {
+            stream: weaver_tunnel::pipe::DialedStream::Tunnel(Box::new(stream)),
+            outcome,
+            path: Default::default(),
+            peer: None,
+            source: None,
+            setup: None,
+        })
+    }
+    fn budget(&self) -> Duration {
+        self.0.connect_timeout
+    }
+    fn describe(&self) -> String {
+        "fixture bridge".into()
+    }
+}
+fn bridge_dialer(
+    bridge: Arc<weaver_tunnel::bridge::Bridge>,
+) -> Arc<weaver_nntp::route_dialer::RouteDialer> {
+    Arc::new(weaver_nntp::route_dialer::RouteDialer {
+        inner: Arc::new(BridgeDialer(bridge)),
+        egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::with_scope(
+            weaver_nntp::transfer::TransferScope::Egress,
+        )),
+        runtime: tokio::runtime::Handle::current(),
+        server: 0,
+    })
+}
+
 #[derive(Clone, Copy)]
 enum Mode {
     Healthy,
@@ -82,8 +123,8 @@ impl TunnelProvider for NntpFixture {
         "NNTP review fixture".into()
     }
 }
-/// Route and NNTP timeouts that a test does not exercise, set out of reach of a
-/// slow runner so only the behavior under test can decide the outcome.
+// Route and NNTP timeouts that a test does not exercise, set out of reach of a
+// slow runner so only the behavior under test can decide the outcome.
 const NOT_UNDER_TEST: Duration = Duration::from_secs(3600);
 
 fn route(modes: &[Mode], timeout: Duration) -> Arc<ConsumerRoute> {
@@ -108,6 +149,7 @@ fn route(modes: &[Mode], timeout: Duration) -> Arc<ConsumerRoute> {
             RoutingPolicy {
                 proxy_ids: (1..=modes.len() as u32).collect(),
                 allow_direct: false,
+                ..Default::default()
             },
             timeout,
         )
@@ -118,7 +160,7 @@ fn config(route: &Arc<ConsumerRoute>) -> ServerConfig {
         host: "nntp-review.invalid".into(),
         port: 119,
         tls: false,
-        proxy: Some(route.bridge().unwrap()),
+        dialer: Some(bridge_dialer(route.bridge().unwrap())),
         connect_timeout: NOT_UNDER_TEST,
         command_timeout: NOT_UNDER_TEST,
         ..Default::default()

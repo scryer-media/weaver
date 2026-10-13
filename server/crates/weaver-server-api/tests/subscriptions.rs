@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_graphql::Request;
+use async_graphql::futures_util::FutureExt;
 use common::TestHarness;
 use tokio_stream::StreamExt;
 use weaver_server_api::auth::CallerScope;
@@ -66,6 +67,41 @@ async fn queue_snapshots_include_new_job() {
     assert!(
         !items.is_empty(),
         "queueSnapshots should include the submitted job"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_queue_snapshots_client_gets_nothing_until_a_job_is_added() {
+    let h = TestHarness::new().await;
+
+    let request =
+        Request::new("subscription { queueSnapshots { items { id } } }").data(CallerScope::Read);
+    let mut stream = h.schema.execute_stream(request);
+
+    let initial = stream.next().await.expect("stream should stay open");
+    assert!(initial.errors.is_empty());
+    let data = initial.data.into_json().unwrap();
+    assert!(
+        data["queueSnapshots"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Poll the stream to register its next heartbeat, drive that exact
+    // deadline, and check that it leaves no snapshot queued.
+    assert!(stream.next().now_or_never().is_none());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(stream.next().now_or_never().is_none());
+
+    let job_id = h.submit_test_nzb("idle-then-added").await;
+    let response = stream.next().await.expect("stream should stay open");
+    assert!(response.errors.is_empty());
+    let data = response.data.into_json().unwrap();
+    let items = data["queueSnapshots"]["items"].as_array().unwrap();
+    assert!(
+        items.iter().any(|item| item["id"].as_u64() == Some(job_id)),
+        "the snapshot after an add should carry the new job"
     );
 }
 

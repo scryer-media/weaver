@@ -51,6 +51,72 @@ fn expired_token_fails() {
     ));
 }
 
+fn run_claims(exp: u64) -> ScriptRunClaims {
+    ScriptRunClaims {
+        run_id: "run-1".into(),
+        instance_id: "instance-1".into(),
+        job_id: Some(42),
+        exp,
+    }
+}
+
+#[test]
+fn a_script_run_token_says_which_run_it_is_for() {
+    let secret = [5u8; 32];
+    let claims = run_claims(u64::MAX);
+    let token = create_script_run_jwt(&claims, &secret);
+    assert!(is_signed_token_shape(&token));
+    assert_eq!(verify_script_run_jwt(&token, &secret).unwrap(), claims);
+
+    let jobless = ScriptRunClaims {
+        job_id: None,
+        ..claims
+    };
+    let token = create_script_run_jwt(&jobless, &secret);
+    assert_eq!(verify_script_run_jwt(&token, &secret).unwrap(), jobless);
+
+    assert!(matches!(
+        verify_script_run_jwt(&token, &[6u8; 32]),
+        Err(JwtError::InvalidSignature)
+    ));
+    assert!(matches!(
+        verify_script_run_jwt(&create_script_run_jwt(&run_claims(0), &secret), &secret),
+        Err(JwtError::Expired)
+    ));
+}
+
+#[test]
+fn a_login_token_and_a_script_run_token_are_never_taken_for_each_other() {
+    let secret = [8u8; 32];
+    let login = create_jwt("admin", &secret, 3600);
+    let run = create_script_run_jwt(&run_claims(u64::MAX), &secret);
+    assert!(matches!(
+        verify_script_run_jwt(&login, &secret),
+        Err(JwtError::InvalidSignature)
+    ));
+    assert!(matches!(
+        verify_jwt(&run, &secret),
+        Err(JwtError::InvalidSignature)
+    ));
+}
+
+#[test]
+fn only_a_token_this_server_could_have_signed_has_its_shape() {
+    for other in [
+        "",
+        "wvr_0123456789abcdef0123456789abcdef",
+        "a.b.c",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..signature",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature.more",
+    ] {
+        assert!(!is_signed_token_shape(other), "{other}");
+    }
+    assert!(is_signed_token_shape(&create_jwt("admin", &[9u8; 32], 60)));
+}
+
 #[test]
 fn malformed_token_fails() {
     let secret = [4u8; 32];

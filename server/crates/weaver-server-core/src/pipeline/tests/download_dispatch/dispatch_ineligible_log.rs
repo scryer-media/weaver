@@ -1,9 +1,9 @@
 use super::*;
 
-/// A job dispatch will not serve is re-visited by every dispatch pass, and
-/// passes come in bursts. Reporting it once per pass wrote hundreds of
-/// identical lines a second — synchronously, on the pipeline actor thread —
-/// for as long as it lasted. One line a job a window is the budget.
+// A job dispatch will not serve is re-visited by every dispatch pass, and
+// passes come in bursts. Reporting it once per pass wrote hundreds of
+// identical lines a second — synchronously, on the pipeline actor thread —
+// for as long as it lasted. One line a job a window is the budget.
 #[tokio::test]
 async fn an_ineligible_job_reports_at_most_once_a_window() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -41,10 +41,10 @@ async fn an_ineligible_job_reports_at_most_once_a_window() {
     );
 }
 
-/// A job whose download is over has nothing for dispatch to hand out, whether
-/// it is extracting, verifying or moving its output. Reporting each one as a
-/// dispatch stall — with a dump of its recent debug lines — filled the log with
-/// thousands of alarms about jobs that were working normally.
+// A job whose download is over has nothing for dispatch to hand out, whether
+// it is extracting, verifying or moving its output. Reporting each one as a
+// dispatch stall — with a dump of its recent debug lines — filled the log with
+// thousands of alarms about jobs that were working normally.
 #[tokio::test]
 async fn a_job_past_its_download_is_not_a_stall() {
     for (offset, status) in [
@@ -87,9 +87,9 @@ async fn a_job_past_its_download_is_not_a_stall() {
     }
 }
 
-/// Recovery parked behind a phase that dispatches nothing is waiting for that
-/// phase to end, not stalled; reporting it as a stall sent operators looking
-/// for a fault in every job that moved its output with recovery still queued.
+// Recovery parked behind a phase that dispatches nothing is waiting for that
+// phase to end, not stalled; reporting it as a stall sent operators looking
+// for a fault in every job that moved its output with recovery still queued.
 #[tokio::test]
 async fn parked_recovery_behind_a_moving_job_is_not_a_stall() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -121,9 +121,9 @@ async fn parked_recovery_behind_a_moving_job_is_not_a_stall() {
     );
 }
 
-/// The probe rides the download lanes, so a job that is holding every lane
-/// starves the batch that is trying to decide whether its release exists at
-/// all. Withholding one handout from that job is what frees a lane for it.
+// The probe rides the download lanes, so a job that is holding every lane
+// starves the batch that is trying to decide whether its release exists at
+// all. Withholding one handout from that job is what frees a lane for it.
 #[tokio::test]
 async fn a_job_starving_its_own_probe_stands_down_for_one_handout() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -157,9 +157,9 @@ async fn a_job_starving_its_own_probe_stands_down_for_one_handout() {
     );
 }
 
-/// A settlement that is deferred for the same reason on every pass is worth
-/// one line, not one line a pass. The reason is fingerprinted in job state, so
-/// a changed reason speaks up again and a removed job starts over.
+// A settlement that is deferred for the same reason on every pass is worth
+// one line, not one line a pass. The reason is fingerprinted in job state, so
+// a changed reason speaks up again and a removed job starts over.
 #[tokio::test]
 async fn a_deferred_settlement_announces_itself_once_per_reason() {
     let temp_dir = tempfile::tempdir().unwrap();

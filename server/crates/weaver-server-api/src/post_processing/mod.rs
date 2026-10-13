@@ -1,3 +1,4 @@
+pub mod script_run;
 pub mod types;
 
 pub use crate::schema::post_processing_mutation as mutation;

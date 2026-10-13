@@ -1,8 +1,8 @@
 use super::*;
 use std::collections::HashMap;
 
-/// Two fill servers, the second in a lower priority group, plus an optional
-/// backfill server in the highest group there is.
+// Two fill servers, the second in a lower priority group, plus an optional
+// backfill server in the highest group there is.
 fn grouped_client(groups: &[(u32, bool)]) -> weaver_nntp::client::NntpClient {
     let servers = groups
         .iter()
@@ -28,13 +28,13 @@ fn grouped_client(groups: &[(u32, bool)]) -> weaver_nntp::client::NntpClient {
     })
 }
 
-/// An idle cached lane is a reason to prefer a server over its peers, not a
-/// reason to outrank the group above it. Priority in this pipeline is a
-/// preference order: the lower group takes ordinary work only once the
-/// higher one is out of seats. A job retrying hard on a low-priority server
-/// keeps an idle lane there almost continuously, and ordering on idleness
-/// alone then handed that server every other job's articles — which reads
-/// downstream as a primary that never failed.
+// An idle cached lane is a reason to prefer a server over its peers, not a
+// reason to outrank the group above it. Priority in this pipeline is a
+// preference order: the lower group takes ordinary work only once the
+// higher one is out of seats. A job retrying hard on a low-priority server
+// keeps an idle lane there almost continuously, and ordering on idleness
+// alone then handed that server every other job's articles — which reads
+// downstream as a primary that never failed.
 #[test]
 fn an_idle_lane_does_not_promote_a_server_over_the_group_above_it() {
     let client = grouped_client(&[(0, false), (1, false)]);
@@ -55,8 +55,8 @@ fn an_idle_lane_does_not_promote_a_server_over_the_group_above_it() {
     );
 }
 
-/// Inside one group the preference is the point: a server that already holds
-/// a connection saves a dial, so it goes first among its equals.
+// Inside one group the preference is the point: a server that already holds
+// a connection saves a dial, so it goes first among its equals.
 #[test]
 fn an_idle_lane_wins_inside_its_own_group() {
     let client = grouped_client(&[(0, false), (0, false)]);
@@ -69,9 +69,9 @@ fn an_idle_lane_wins_inside_its_own_group() {
     assert_eq!(servers, vec![1, 0]);
 }
 
-/// Backfill is a reservation, not a preference: it is ordered after every
-/// fill server even when its group number is the highest and it is the one
-/// holding an idle lane.
+// Backfill is a reservation, not a preference: it is ordered after every
+// fill server even when its group number is the highest and it is the one
+// holding an idle lane.
 #[test]
 fn a_backfill_server_stays_last_however_it_is_grouped() {
     let client = grouped_client(&[(1, false), (0, true)]);

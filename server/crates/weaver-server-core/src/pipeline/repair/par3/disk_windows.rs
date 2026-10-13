@@ -1,5 +1,5 @@
-//! Mutable Windows files use identity and change-time fences between reads.
-//! No retained sharing lock may prevent the next decoded article from writing.
+// Mutable Windows files use identity and change-time fences between reads.
+// No retained sharing lock may prevent the next decoded article from writing.
 
 use super::*;
 use std::fs::File;
@@ -147,11 +147,7 @@ mod tests {
         assert_eq!(access.snapshot(source).unwrap(), snapshot);
         // The fence sees a same-length rewrite through its timestamps, which
         // NTFS advances only at the system clock's granularity.
-        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
-        while std::fs::metadata(&path).unwrap().modified().unwrap() == written {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            std::fs::write(&path, b"other").unwrap();
-        }
+        crate::pipeline::repair::par3::rewrite_until_modified(&path, b"other");
         assert!(matches!(
             EngineError::from(access.snapshot(source).unwrap_err()),
             EngineError::SourceChanged(id) if id == source

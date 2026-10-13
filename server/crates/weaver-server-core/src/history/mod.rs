@@ -1,4 +1,5 @@
 pub mod attributes;
+pub mod delete_queue;
 pub mod model;
 pub mod persistence;
 pub mod queries;

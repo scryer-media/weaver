@@ -35,6 +35,29 @@ pub fn is_weaver_owned_working_dir(dir: &Path) -> bool {
         .is_some_and(|root| owned_working_directory(root, dir).is_ok())
 }
 
+pub(crate) fn check_script_directory_owner(path: &Path, job_id: JobId) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("directory has no parent"))?;
+    let dir = open_working_directory(parent, path)?;
+    match read_working_marker(&dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(stored)
+            if marker_job_id(&stored) == Some(job_id)
+                && !matches!(
+                    match_marker(&dir, path, &stored, job_id)?,
+                    MarkerMatch::Mismatch
+                ) =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(std::io::Error::other(
+            "script directory has a foreign ownership marker",
+        )),
+    }
+}
+
 fn open_working_directory(root: &Path, path: &Path) -> std::io::Result<Dir> {
     let relative = path.strip_prefix(root).map_err(std::io::Error::other)?;
     let mut components = relative.components();
@@ -51,13 +74,13 @@ fn open_working_directory(root: &Path, path: &Path) -> std::io::Result<Dir> {
 const MARKER_V1_PREFIX: &str = "weaver-job-v1:";
 const MARKER_V2_PREFIX: &str = "weaver-job-v2:";
 
-/// The marker's identity hash.
-///
-/// v2 binds the directory's path, inode and owning job. v1 also bound the
-/// device number, which is not stable on every filesystem: pooled and layered
-/// filesystems renumber it across reboots or dataset recreation, and every
-/// marker written before the renumbering then stopped matching its own
-/// directory. `dev` is only passed when recomputing a v1 marker.
+// The marker's identity hash.
+//
+// v2 binds the directory's path, inode and owning job. v1 also bound the
+// device number, which is not stable on every filesystem: pooled and layered
+// filesystems renumber it across reboots or dataset recreation, and every
+// marker written before the renumbering then stopped matching its own
+// directory. `dev` is only passed when recomputing a v1 marker.
 fn marker_hash(path: &Path, dev: Option<u64>, ino: u64, job_id: JobId) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(path.as_os_str().as_encoded_bytes());
@@ -78,8 +101,8 @@ fn working_marker_value(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Resul
     ))
 }
 
-/// The v1 markers this directory could legitimately carry for `job_id`: the
-/// hash with the device number as it reads now, and with none at all.
+// The v1 markers this directory could legitimately carry for `job_id`: the
+// hash with the device number as it reads now, and with none at all.
 fn legacy_marker_values(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Result<[String; 2]> {
     let metadata = dir.dir_metadata()?;
     let line = |dev| {
@@ -92,7 +115,7 @@ fn legacy_marker_values(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Resul
     Ok([line(Some(metadata.dev())), line(None)])
 }
 
-/// The job a marker names, from either marker version.
+// The job a marker names, from either marker version.
 fn marker_job_id(stored: &str) -> Option<JobId> {
     stored
         .strip_prefix(MARKER_V2_PREFIX)
@@ -102,15 +125,15 @@ fn marker_job_id(stored: &str) -> Option<JobId> {
         .map(JobId)
 }
 
-/// How a stored marker compares with what this directory should carry for
-/// the job it names.
+// How a stored marker compares with what this directory should carry for
+// the job it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MarkerMatch {
-    /// A v2 marker for this directory and job.
+    // A v2 marker for this directory and job.
     Current,
-    /// A v1 marker for this directory and job, to be rewritten as v2.
+    // A v1 marker for this directory and job, to be rewritten as v2.
     Legacy,
-    /// The marker names this job but its hash does not match the directory.
+    // The marker names this job but its hash does not match the directory.
     Mismatch,
 }
 
@@ -142,17 +165,17 @@ fn write_working_marker(dir: &Dir, value: &str) -> std::io::Result<()> {
         .write_all(value.as_bytes())
 }
 
-/// Where the v2 form of a marker is written before it replaces the v1 one.
-/// Never read as a marker.
+// Where the v2 form of a marker is written before it replaces the v1 one.
+// Never read as a marker.
 const WORKING_DIR_MARKER_UPGRADE: &str = ".weaver-job-dir.upgrade";
 
-/// Replaces a verified v1 marker with its v2 form, so the directory stops
-/// depending on a device number that may change.
-///
-/// The v2 value is written and synced under another name and then renamed
-/// over the marker, so a crash or a failed write leaves the v1 marker in
-/// place rather than a directory with no marker at all. A temporary left by
-/// an earlier attempt is removed first.
+// Replaces a verified v1 marker with its v2 form, so the directory stops
+// depending on a device number that may change.
+//
+// The v2 value is written and synced under another name and then renamed
+// over the marker, so a crash or a failed write leaves the v1 marker in
+// place rather than a directory with no marker at all. A temporary left by
+// an earlier attempt is removed first.
 fn upgrade_legacy_marker(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Result<()> {
     let current = working_marker_value(dir, path, job_id)?;
     match dir.remove_file(WORKING_DIR_MARKER_UPGRADE) {
@@ -246,14 +269,14 @@ pub fn remove_weaver_owned_working_dir(root: &Path, path: &Path) -> std::io::Res
     owned_working_directory(root, path)?.remove_open_dir_all()
 }
 
-/// What a history cleanup did with one job's working directory.
+// What a history cleanup did with one job's working directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryWorkingDir {
-    /// The directory is the job's (or is already gone) and may be removed.
+    // The directory is the job's (or is already gone) and may be removed.
     Owned,
-    /// The marker names this job but no longer matches the directory, so the
-    /// directory is left on disk. The history record can still go: nothing
-    /// about the mismatch makes the directory anyone else's.
+    // The marker names this job but no longer matches the directory, so the
+    // directory is left on disk. The history record can still go: nothing
+    // about the mismatch makes the directory anyone else's.
     LeftInPlace,
 }
 
@@ -287,8 +310,8 @@ fn judge_history_marker(
     }
 }
 
-/// Delete only the directory still owned by the job selected for cleanup.
-/// Validation and removal use the same opened directory capability.
+// Delete only the directory still owned by the job selected for cleanup.
+// Validation and removal use the same opened directory capability.
 pub fn remove_job_working_dir(
     root: &Path,
     path: &Path,
@@ -363,6 +386,39 @@ pub fn is_weaver_owned_output_dir(dir: &Path) -> bool {
     std::fs::read(&marker).is_ok_and(|stored| stored == expected)
 }
 
+pub(crate) fn is_relocated_output_dir(dir: &Path, previous: &Path) -> bool {
+    if !matches!(std::fs::symlink_metadata(previous), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return false;
+    }
+    let Some(parent) = previous
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+    else {
+        return false;
+    };
+    let Some(name) = previous.file_name() else {
+        return false;
+    };
+    let previous = parent.join(name);
+    let Ok(metadata) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let marker = dir.join(OUTPUT_DIR_MARKER);
+    let Ok(metadata) = std::fs::symlink_metadata(&marker) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let digest = blake3::hash(previous.as_os_str().as_encoded_bytes());
+    let expected = format!("weaver-output-v1:{}\n", digest.to_hex());
+    std::fs::read(&marker).is_ok_and(|stored| stored == expected.as_bytes())
+}
+
 fn output_marker_value(dir: &Path) -> std::io::Result<Vec<u8>> {
     let canonical = std::fs::canonicalize(dir)?;
     let digest = blake3::hash(canonical.as_os_str().as_encoded_bytes());
@@ -418,8 +474,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    /// Writes a v1 marker for `path` computed with `dev`, the way a binary that
-    /// still hashed the device number would have.
+    // Writes a v1 marker for `path` computed with `dev`, the way a binary that
+    // still hashed the device number would have.
     fn write_v1_marker(path: &Path, dev: Option<u64>, job_id: JobId) {
         let ino = std::fs::metadata(path).unwrap().ino();
         std::fs::write(

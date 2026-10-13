@@ -117,7 +117,23 @@ impl WatchFolderScanner {
         &self,
         settings: WatchFolderConfig,
     ) -> Result<WatchFolderScanReport, WatchFolderScannerError> {
-        let _guard = self.scan_lock.lock().await;
+        self.scan_once_cancellable(
+            settings,
+            crate::bandwidth::schedule::ScheduleCancellation::new(),
+        )
+        .await
+    }
+
+    pub(super) async fn scan_once_cancellable(
+        &self,
+        settings: WatchFolderConfig,
+        cancellation: crate::bandwidth::schedule::ScheduleCancellation,
+    ) -> Result<WatchFolderScanReport, WatchFolderScannerError> {
+        let _guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(WatchFolderScanReport::default()),
+            guard = self.scan_lock.lock() => guard,
+        };
         let path = settings
             .normalized_path()
             .ok_or(WatchFolderScannerError::MissingPath)?;
@@ -163,7 +179,11 @@ impl WatchFolderScanner {
             });
         }
 
-        let (stable, unstable) = await_stable_candidates(pending, settings.stability_secs).await;
+        let (stable, unstable) = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(report),
+            result = await_stable_candidates(pending, settings.stability_secs) => result,
+        };
         for pending in unstable {
             self.record_transient_or_escalate(
                 &pending.candidate.path,
@@ -173,6 +193,10 @@ impl WatchFolderScanner {
             .await;
         }
         for pending in stable {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            // Once a claim starts, finish its owned intake transaction before stopping.
             self.process_candidate(pending, &mut report).await;
         }
 

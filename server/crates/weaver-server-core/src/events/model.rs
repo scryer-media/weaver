@@ -10,15 +10,15 @@ pub enum ServerAttemptOutcome {
     PermanentFailure,
 }
 
-/// Pipeline events emitted by the scheduler and consumed by the state journal,
-/// API subscriptions, and internal scheduler logic.
-///
-/// These events form the heartbeat of the byte pipeline. Each event represents
-/// a state transition that downstream consumers can react to.
+// Pipeline events emitted by the scheduler and consumed by the state journal,
+// API subscriptions, and internal scheduler logic.
+//
+// These events form the heartbeat of the byte pipeline. Each event represents
+// a state transition that downstream consumers can react to.
 #[derive(Debug, Clone)]
 pub enum PipelineEvent {
     // ---- Job lifecycle ----
-    /// A new job was created from an NZB submission.
+    // A new job was created from an NZB submission.
     JobCreated {
         job_id: JobId,
         name: String,
@@ -26,41 +26,52 @@ pub enum PipelineEvent {
         total_bytes: u64,
     },
 
-    /// Job was paused by the user.
-    JobPaused { job_id: JobId },
+    // Job was paused by the user.
+    JobPaused {
+        job_id: JobId,
+    },
 
-    /// Job was resumed by the user.
-    JobResumed { job_id: JobId },
+    // Job was resumed by the user.
+    JobResumed {
+        job_id: JobId,
+    },
 
-    /// Job was cancelled by the user.
-    JobCancelled { job_id: JobId },
+    // Job was cancelled by the user.
+    JobCancelled {
+        job_id: JobId,
+    },
 
-    /// All downloads paused globally.
+    // All downloads paused globally.
     GlobalPaused,
 
-    /// All downloads resumed globally.
+    // All downloads resumed globally.
     GlobalResumed,
 
-    /// All files downloaded, verified, and extracted.
-    JobCompleted { job_id: JobId },
+    // All files downloaded, verified, and extracted.
+    JobCompleted {
+        job_id: JobId,
+    },
 
-    /// Job failed permanently.
-    JobFailed { job_id: JobId, error: String },
+    // Job failed permanently.
+    JobFailed {
+        job_id: JobId,
+        error: String,
+    },
 
     // ---- Download stage ----
-    /// A segment was queued for download.
+    // A segment was queued for download.
     SegmentQueued {
         segment_id: SegmentId,
         byte_estimate: u32,
     },
 
-    /// Raw article data received from NNTP.
+    // Raw article data received from NNTP.
     ArticleDownloaded {
         segment_id: SegmentId,
         raw_size: u32,
     },
 
-    /// A single server attempt made while fetching an article.
+    // A single server attempt made while fetching an article.
     ServerAttempt {
         segment_id: SegmentId,
         server_id: ServerId,
@@ -72,36 +83,42 @@ pub enum PipelineEvent {
         is_recovery: bool,
     },
 
-    /// A job started an active article download pass.
-    DownloadStarted { job_id: JobId },
+    // A job started an active article download pass.
+    DownloadStarted {
+        job_id: JobId,
+    },
 
-    /// A job finished an active article download pass.
+    // A job finished an active article download pass.
     DownloadFinished {
         job_id: JobId,
         finalization_pending: bool,
     },
 
-    /// A job fully drained the post-download decode/write pipeline.
-    DownloadPipelineDrained { job_id: JobId },
+    // A job fully drained the post-download decode/write pipeline.
+    DownloadPipelineDrained {
+        job_id: JobId,
+    },
 
-    /// Article not found on any configured server.
-    ArticleNotFound { segment_id: SegmentId },
+    // Article not found on any configured server.
+    ArticleNotFound {
+        segment_id: SegmentId,
+    },
 
-    /// A failed segment was scheduled for retry with backoff.
+    // A failed segment was scheduled for retry with backoff.
     SegmentRetryScheduled {
         segment_id: SegmentId,
         attempt: u32,
         delay_secs: f64,
     },
 
-    /// A segment permanently failed after exhausting all retries.
+    // A segment permanently failed after exhausting all retries.
     SegmentFailedPermanent {
         segment_id: SegmentId,
         error: String,
     },
 
     // ---- Decode stage ----
-    /// yEnc decode completed. Data is in a pooled buffer.
+    // yEnc decode completed. Data is in a pooled buffer.
     SegmentDecoded {
         segment_id: SegmentId,
         decoded_size: u32,
@@ -109,24 +126,26 @@ pub enum PipelineEvent {
         crc_valid: bool,
     },
 
-    /// yEnc decode failed for a segment.
+    // yEnc decode failed for a segment.
     SegmentDecodeFailed {
         segment_id: SegmentId,
         error: String,
     },
 
     // ---- Assembly stage ----
-    /// Decoded segment data committed to disk.
-    SegmentCommitted { segment_id: SegmentId },
+    // Decoded segment data committed to disk.
+    SegmentCommitted {
+        segment_id: SegmentId,
+    },
 
-    /// All segments for a file have been received and committed.
+    // All segments for a file have been received and committed.
     FileComplete {
         file_id: NzbFileId,
         filename: String,
         total_bytes: u64,
     },
 
-    /// Some segments for a file could not be retrieved.
+    // Some segments for a file could not be retrieved.
     FileMissing {
         file_id: NzbFileId,
         filename: String,
@@ -134,29 +153,41 @@ pub enum PipelineEvent {
     },
 
     // ---- Verification stage ----
-    /// File verification started.
-    VerificationStarted { file_id: NzbFileId },
+    // File verification started.
+    VerificationStarted {
+        file_id: NzbFileId,
+    },
 
-    /// File verification completed.
+    // File verification completed.
     VerificationComplete {
         file_id: NzbFileId,
         status: FileVerifyStatus,
     },
 
-    /// PAR2 metadata was parsed, enabling verification.
-    Par2MetadataLoaded { job_id: JobId },
+    // PAR2 metadata was parsed, enabling verification.
+    Par2MetadataLoaded {
+        job_id: JobId,
+    },
 
-    /// Job-level PAR2 verification started.
-    JobVerificationStarted { job_id: JobId },
+    // Job-level PAR2 verification started.
+    JobVerificationStarted {
+        job_id: JobId,
+    },
 
-    /// Job-level PAR2 verification completed.
-    JobVerificationComplete { job_id: JobId, passed: bool },
+    // Job-level PAR2 verification completed.
+    JobVerificationComplete {
+        job_id: JobId,
+        passed: bool,
+    },
 
-    /// A settled native PAR3 assessment verified the described protected data
-    /// or established that it remains incomplete.
-    Par3VerificationComplete { job_id: JobId, passed: bool },
+    // A settled native PAR3 assessment verified the described protected data
+    // or established that it remains incomplete.
+    Par3VerificationComplete {
+        job_id: JobId,
+        passed: bool,
+    },
 
-    /// Updated repair confidence after verification.
+    // Updated repair confidence after verification.
     RepairConfidenceUpdated {
         job_id: JobId,
         damaged_slices: u32,
@@ -165,31 +196,44 @@ pub enum PipelineEvent {
     },
 
     // ---- Repair stage ----
-    /// Recovery repair started.
-    RepairStarted { job_id: JobId },
+    // Recovery repair started.
+    RepairStarted {
+        job_id: JobId,
+    },
 
-    /// Recovery repair completed.
-    RepairComplete { job_id: JobId, slices_repaired: u32 },
+    // Recovery repair completed.
+    RepairComplete {
+        job_id: JobId,
+        slices_repaired: u32,
+    },
 
-    /// Embedded protection was replaced after verified repair; the original
-    /// carrier could not be restored byte for byte.
-    EmbeddedProtectionReplaced { job_id: JobId, blocks_repaired: u64 },
+    // Embedded protection was replaced after verified repair; the original
+    // carrier could not be restored byte for byte.
+    EmbeddedProtectionReplaced {
+        job_id: JobId,
+        blocks_repaired: u64,
+    },
 
-    /// Recovery repair failed.
-    RepairFailed { job_id: JobId, error: String },
+    // Recovery repair failed.
+    RepairFailed {
+        job_id: JobId,
+        error: String,
+    },
 
     // ---- Extraction stage ----
-    /// Archive extraction is ready to begin.
-    ExtractionReady { job_id: JobId },
+    // Archive extraction is ready to begin.
+    ExtractionReady {
+        job_id: JobId,
+    },
 
-    /// A specific archive member started extraction work.
+    // A specific archive member started extraction work.
     ExtractionMemberStarted {
         job_id: JobId,
         set_name: String,
         member: String,
     },
 
-    /// A specific archive member is blocked waiting for another RAR volume.
+    // A specific archive member is blocked waiting for another RAR volume.
     ExtractionMemberWaitingStarted {
         job_id: JobId,
         set_name: String,
@@ -197,7 +241,7 @@ pub enum PipelineEvent {
         volume_index: usize,
     },
 
-    /// A specific archive member resumed after a blocking volume wait.
+    // A specific archive member resumed after a blocking volume wait.
     ExtractionMemberWaitingFinished {
         job_id: JobId,
         set_name: String,
@@ -205,21 +249,21 @@ pub enum PipelineEvent {
         volume_index: usize,
     },
 
-    /// A specific archive member started append/concat finalization.
+    // A specific archive member started append/concat finalization.
     ExtractionMemberAppendStarted {
         job_id: JobId,
         set_name: String,
         member: String,
     },
 
-    /// A specific archive member finished append/concat finalization.
+    // A specific archive member finished append/concat finalization.
     ExtractionMemberAppendFinished {
         job_id: JobId,
         set_name: String,
         member: String,
     },
 
-    /// Progress on extracting a single archive member.
+    // Progress on extracting a single archive member.
     ExtractionProgress {
         job_id: JobId,
         member: String,
@@ -227,14 +271,14 @@ pub enum PipelineEvent {
         total_bytes: u64,
     },
 
-    /// A specific archive member finished extraction successfully.
+    // A specific archive member finished extraction successfully.
     ExtractionMemberFinished {
         job_id: JobId,
         set_name: String,
         member: String,
     },
 
-    /// A specific archive member failed extraction or CRC validation.
+    // A specific archive member failed extraction or CRC validation.
     ExtractionMemberFailed {
         job_id: JobId,
         set_name: String,
@@ -242,36 +286,50 @@ pub enum PipelineEvent {
         error: String,
     },
 
-    /// All archive members extracted.
-    ExtractionComplete { job_id: JobId },
+    // All archive members extracted.
+    ExtractionComplete {
+        job_id: JobId,
+    },
 
-    /// Extraction failed.
-    ExtractionFailed { job_id: JobId, error: String },
+    // Extraction failed.
+    ExtractionFailed {
+        job_id: JobId,
+        error: String,
+    },
 
     // ---- File classification (discovered during download) ----
-    /// A file's role was identified or updated.
-    FileClassified { file_id: NzbFileId, role: FileRole },
+    // A file's role was identified or updated.
+    FileClassified {
+        file_id: NzbFileId,
+        role: FileRole,
+    },
 
-    /// Final move from intermediate to complete has started.
-    MoveToCompleteStarted { job_id: JobId },
+    // Final move from intermediate to complete has started.
+    MoveToCompleteStarted {
+        job_id: JobId,
+    },
 
-    /// Final move from intermediate to complete finished successfully.
-    MoveToCompleteFinished { job_id: JobId },
+    // Final move from intermediate to complete finished successfully.
+    MoveToCompleteFinished {
+        job_id: JobId,
+    },
 
-    /// Runtime-only phase progress or download wait metadata changed for a job.
-    PhaseProgressUpdated { job_id: JobId },
+    // Runtime-only phase progress or download wait metadata changed for a job.
+    PhaseProgressUpdated {
+        job_id: JobId,
+    },
 }
 
-/// Result of verifying a file against PAR2 checksums.
+// Result of verifying a file against PAR2 checksums.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileVerifyStatus {
-    /// All slices verified successfully.
+    // All slices verified successfully.
     Intact,
-    /// Some slices failed verification.
+    // Some slices failed verification.
     Damaged { bad_slices: u32, total_slices: u32 },
-    /// File is completely missing.
+    // File is completely missing.
     Missing,
-    /// No PAR2 metadata available for this file.
+    // No PAR2 metadata available for this file.
     Unverifiable,
 }
 

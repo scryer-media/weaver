@@ -1,6 +1,20 @@
+import { closedPath, directLeg, routeInput, type NetworkRoute } from "./networking.ts";
 export type ProxyKind = "HTTP_CONNECT" | "HTTP3_CONNECT" | "SOCKS5" | "SSH" | "WIRE_GUARD";
 export const proxyLabels: Record<ProxyKind, string> = { HTTP_CONNECT: "HTTP CONNECT", HTTP3_CONNECT: "HTTP/3 CONNECT", SOCKS5: "SOCKS5", SSH: "SSH", WIRE_GUARD: "WireGuard" };
-export type RoutingPolicy = { proxyIds: number[]; allowDirect: boolean };
+export type RoutingPolicy = { proxyIds: number[]; allowDirect: boolean; legs?: NetworkRoute["legs"]; failover?: NetworkRoute["failover"] };
+export function policyAsRoute(policy: RoutingPolicy): NetworkRoute {
+  return {failover:policy.failover??"REDISTRIBUTE",legs:policy.legs??[{...directLeg(),path:policy.proxyIds.length===0&&policy.allowDirect?directLeg().path:{kind:"LADDER",directFallback:policy.allowDirect,rungs:policy.proxyIds.map(id=>({kind:"PROXY",proxyId:id,poolId:null,chainIds:[]}))}}]};
+}
+/** The kill switch: no proxy to go through, and no going direct, so nothing leaves. */
+export const blockedRouting: RoutingPolicy = { proxyIds: [], allowDirect: false };
+/**
+ * A consumer's route as its input names it. A route's ladder needs a rung, so
+ * only the older `routing` field can say that nothing may leave.
+ */
+export function routeFields(policy: RoutingPolicy) {
+  const route=policyAsRoute(policy);
+  return route.legs.length===1&&closedPath(route.legs[0]!.path)?{routing:blockedRouting}:{route:routeInput(route)};
+}
 export type RoutingStatus = { state: string; selectedProxyId: number | null; failures: { proxyId: number; message: string }[] };
 export const directRouting: RoutingPolicy = { proxyIds: [], allowDirect: true };
 /** The daemon accepts at most this many proxy routes in one policy. */
@@ -22,3 +36,49 @@ export type ProxyProfile = {
   mtu: number; keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null;
   hasUsername: boolean; hasPassword: boolean; hasPrivateKey: boolean; hasPassphrase: boolean; hasPresharedKey: boolean;
 };
+type ChainProfile = Pick<ProxyProfile, "id" | "kind"> & Partial<Pick<ProxyProfile, "dnsServers">>;
+/** What a chain's ladder rules out besides the chain's own hops. */
+export type ChainLimits = {
+  /** The proxies the ladder's other rungs already use, pool members included. */
+  taken?: ReadonlySet<number>;
+  /** A feed's route resolves names through its proxies, so each needs DNS servers. */
+  needsDns?: boolean;
+};
+/**
+ * Whether `profile` can sit on the hops in `beneath`, as the daemon rules it.
+ * A ladder uses a proxy once. WireGuard and HTTP/3 need UDP, which only the
+ * egress or a WireGuard hop beneath them carries, and only WireGuard can ride
+ * a WireGuard hop.
+ */
+function chainHopAllows<T extends ChainProfile>(profiles: T[], beneath: number[], profile: T, limits: ChainLimits): boolean {
+  if (beneath.includes(profile.id) || limits.taken?.has(profile.id)) return false;
+  if (limits.needsDns && !profile.dnsServers?.length) return false;
+  if (beneath.length === 0 || (profile.kind !== "WIRE_GUARD" && profile.kind !== "HTTP3_CONNECT")) return true;
+  const carrier = profiles.find((candidate) => candidate.id === beneath.at(-1))?.kind;
+  return profile.kind === "WIRE_GUARD" && carrier === "WIRE_GUARD";
+}
+/**
+ * The proxies a chain's hop can use: those the hops beneath it allow and no
+ * other hop holds. The hop's own choice always stays listed.
+ */
+export function chainHopProfiles<T extends ChainProfile>(profiles: T[], chainIds: number[], hop: number, limits: ChainLimits = {}): T[] {
+  const beneath = chainIds.slice(0, hop);
+  return profiles.filter((profile) =>
+    profile.id === chainIds[hop]
+    || (!chainIds.includes(profile.id) && chainHopAllows(profiles, beneath, profile, limits)));
+}
+/**
+ * The chain with `id` at `hop`, or with that hop taken out when `id` is null.
+ * The hops above it stay only while each can still sit on what is now beneath
+ * it, so the chain is cut at the first that cannot.
+ */
+export function withChainHop<T extends ChainProfile>(profiles: T[], chainIds: number[], hop: number, id: number | null, limits: ChainLimits = {}): number[] {
+  const ids = chainIds.slice(0, hop);
+  if (id !== null) ids.push(id);
+  for (const above of chainIds.slice(hop + 1)) {
+    const profile = profiles.find((candidate) => candidate.id === above);
+    if (!profile || !chainHopAllows(profiles, ids, profile, limits)) break;
+    ids.push(above);
+  }
+  return ids;
+}

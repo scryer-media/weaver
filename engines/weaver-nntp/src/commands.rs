@@ -2,16 +2,16 @@ use bytes::{Bytes, BytesMut};
 
 use crate::types::ArticleId;
 
-/// Write an article identifier as its wire argument.
-///
-/// RFC 3977 requires a message-id argument to be the *bracketed* form. An
-/// unbracketed argument is a legal article *number* reference instead, so a
-/// server that has a group selected answers 430 for every article rather than
-/// rejecting the command — a silent, total download failure. Callers construct
-/// `ArticleId::MessageId` from many places (some of which strip the brackets
-/// during NZB parsing), so the encoder is the one place that can guarantee the
-/// frame is right. Bracketing here is idempotent: an already-bracketed id is
-/// written verbatim.
+// Write an article identifier as its wire argument.
+//
+// RFC 3977 requires a message-id argument to be the *bracketed* form. An
+// unbracketed argument is a legal article *number* reference instead, so a
+// server that has a group selected answers 430 for every article rather than
+// rejecting the command — a silent, total download failure. Callers construct
+// `ArticleId::MessageId` from many places (some of which strip the brackets
+// during NZB parsing), so the encoder is the one place that can guarantee the
+// frame is right. Bracketing here is idempotent: an already-bracketed id is
+// written verbatim.
 fn encode_article_id(buf: &mut BytesMut, id: &ArticleId) {
     match id {
         ArticleId::MessageId(message_id) => {
@@ -29,36 +29,36 @@ fn encode_article_id(buf: &mut BytesMut, id: &ArticleId) {
     }
 }
 
-/// An NNTP command to be sent to the server.
+// An NNTP command to be sent to the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Retrieve a complete article (headers + body).
+    // Retrieve a complete article (headers + body).
     Article(ArticleId),
-    /// Retrieve only the article body.
+    // Retrieve only the article body.
     Body(ArticleId),
-    /// Retrieve only the article headers.
+    // Retrieve only the article headers.
     Head(ArticleId),
-    /// Check if an article exists (returns status only, no data).
+    // Check if an article exists (returns status only, no data).
     Stat(ArticleId),
-    /// Select a newsgroup.
+    // Select a newsgroup.
     Group(String),
-    /// Request the server's capability list.
+    // Request the server's capability list.
     Capabilities,
-    /// Send username for authentication (RFC 4643).
+    // Send username for authentication (RFC 4643).
     AuthInfoUser(String),
-    /// Send password for authentication (RFC 4643).
+    // Send password for authentication (RFC 4643).
     AuthInfoPass(String),
-    /// Request STARTTLS upgrade.
+    // Request STARTTLS upgrade.
     StartTls,
-    /// Quit the session.
+    // Quit the session.
     Quit,
-    /// Request the server's current date and time (RFC 3977 DATE).
-    /// Lightweight command suitable for health probes.
+    // Request the server's current date and time (RFC 3977 DATE).
+    // Lightweight command suitable for health probes.
     Date,
 }
 
 impl Command {
-    /// Encode the command into its wire format (including trailing CRLF).
+    // Encode the command into its wire format (including trailing CRLF).
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(128);
         match self {
@@ -107,7 +107,7 @@ impl Command {
         buf.freeze()
     }
 
-    /// Whether this command expects a multi-line response from the server.
+    // Whether this command expects a multi-line response from the server.
     pub fn expects_multiline(&self) -> bool {
         matches!(
             self,

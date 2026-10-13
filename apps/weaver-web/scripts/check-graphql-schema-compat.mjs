@@ -5,11 +5,21 @@ import {
   buildSchema,
   findBreakingChanges,
   findDangerousChanges,
+  parse,
+  print,
+  specifiedDirectives,
 } from "graphql";
 
 export function findSchemaCompatibilityChanges(oldSdl, newSdl) {
-  const oldSchema = buildSchema(oldSdl);
-  const newSchema = buildSchema(newSdl);
+  // Rust's exporter emits a specified directive only once the schema uses it.
+  // Compare an omitted declaration with that same declaration, rather than
+  // GraphQL.js's potentially newer spec default. Explicit changes still count.
+  const declarations = (sdl) => parse(sdl).definitions.filter(d => d.kind === "DirectiveDefinition");
+  const oldDirectives = declarations(oldSdl), newDirectives = declarations(newSdl);
+  const specified = new Set(specifiedDirectives.map(d => d.name));
+  const missing = (own, other) => other.filter(d => specified.has(d.name.value) && !own.some(o => o.name.value === d.name.value)).map(print).join("\n");
+  const oldSchema = buildSchema(`${oldSdl}\n${missing(oldDirectives,newDirectives)}`);
+  const newSchema = buildSchema(`${newSdl}\n${missing(newDirectives,oldDirectives)}`);
   return {
     breaking: findBreakingChanges(oldSchema, newSchema),
     // Existing callers can omit newly added optional input fields.

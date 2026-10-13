@@ -39,8 +39,8 @@ function sourceFiles(dir: string): string[] {
   });
 }
 
-/** Keys the classic dictionaries define, which Next screens reuse for shared wording. */
-function classicKeys(): Set<string> {
+/** Keys the base dictionaries define, which screens reuse for shared wording. */
+function baseKeys(): Set<string> {
   const keys = new Set<string>();
   for (const file of ["lib/i18n/locales/en.ts", "lib/i18n/duplicate-locales.ts"]) {
     for (const match of readFileSync(join(SRC, file), "utf8").matchAll(/^\s*"([\w.-]+)":/gm)) {
@@ -68,7 +68,7 @@ test("translations keep every placeholder and are never empty", () => {
 });
 
 test("every key the Next screens name exists", () => {
-  const known = new Set([...Object.keys(nextEn), ...classicKeys()]);
+  const known = new Set([...Object.keys(nextEn), ...baseKeys()]);
   const missing: string[] = [];
   for (const file of sourceFiles(join(SRC, "next"))) {
     if (file.includes(`${join("next", "i18n")}`)) {

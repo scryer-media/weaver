@@ -13,9 +13,9 @@ use weaver_server_core::settings::SharedConfig;
 use weaver_server_core::watch_folder::{WatchFolderConfig, WatchFolderMode, WatchFolderService};
 use weaver_server_core::{Database, SchedulerHandle};
 
-/// Refuse a schedule rule this machine could never apply, judged against the
-/// live probe as the hardware-profile choice is.
-fn validate_schedule_input(
+// Refuse a schedule rule this machine could never apply, judged against the
+// live probe as the hardware-profile choice is.
+async fn validate_schedule_input(
     ctx: &Context<'_>,
     input: &crate::settings::types::ScheduleInput,
 ) -> Result<()> {
@@ -25,7 +25,15 @@ fn validate_schedule_input(
         .read()
         .map_err(|_| async_graphql::Error::new("system profile unavailable"))?
         .clone();
-    input.validate(&probe).map_err(async_graphql::Error::new)
+    input.validate(&probe).map_err(async_graphql::Error::new)?;
+    Ok(())
+}
+
+async fn schedule_response(
+    _ctx: &Context<'_>,
+    entries: Vec<weaver_server_core::bandwidth::ScheduleEntry>,
+) -> Result<Vec<crate::settings::types::Schedule>> {
+    Ok(entries.into_iter().map(Into::into).collect())
 }
 
 static SETTINGS_MUTATION_GUARD: LazyLock<tokio::sync::Mutex<()>> =
@@ -36,6 +44,30 @@ pub(crate) struct SettingsMutation;
 
 #[Object]
 impl SettingsMutation {
+    #[graphql(guard = "AdminGuard")]
+    async fn update_archive_password_settings(
+        &self,
+        ctx: &Context<'_>,
+        passwords: Option<Vec<String>>,
+        password_file: MaybeUndefined<String>,
+    ) -> Result<crate::settings::types::ArchivePasswordSettings> {
+        let db = ctx.data::<Database>()?.clone();
+        let password_file = match password_file {
+            MaybeUndefined::Undefined => None,
+            MaybeUndefined::Null => Some(None),
+            MaybeUndefined::Value(file) => Some(Some(file)),
+        };
+        let (has_passwords, password_file) = tokio::task::spawn_blocking(move || {
+            db.save_archive_password_settings(passwords, password_file)?;
+            db.archive_password_settings()
+        })
+        .await??;
+        Ok(crate::settings::types::ArchivePasswordSettings {
+            has_passwords,
+            password_file,
+        })
+    }
+
     /// Choose how hard Weaver leans on this machine.
     ///
     /// A profile the machine cannot honour is refused by name rather than
@@ -119,7 +151,6 @@ impl SettingsMutation {
         let max_retries = input.max_retries;
         let propagation_delay_secs = input.propagation_delay_secs;
         let enable_srrdb_lookup = input.enable_srrdb_lookup;
-        let isp_bandwidth_cap = input.isp_bandwidth_cap.clone();
         let duplicate_policy_update = input.duplicate_policy.clone();
         let watch_folder_update = input
             .watch_folder
@@ -144,7 +175,6 @@ impl SettingsMutation {
             cleanup_after_extract,
             max_download_speed,
             max_retries,
-            isp_bandwidth_cap.clone(),
             watch_folder_update.clone(),
             duplicate_policy_update.clone(),
             enable_srrdb_lookup,
@@ -175,48 +205,7 @@ impl SettingsMutation {
                         if let Some(v) = persist_input.4 {
                             db.set_setting("retry.max_retries", &v.to_string())?;
                         }
-                        if let Some(ref cap) = persist_input.5 {
-                            db.set_setting("bandwidth_cap.enabled", &cap.enabled.to_string())?;
-                            db.set_setting(
-                                "bandwidth_cap.period",
-                                match cap.period {
-                                    crate::settings::types::IspBandwidthCapPeriodGql::Daily => {
-                                        "daily"
-                                    }
-                                    crate::settings::types::IspBandwidthCapPeriodGql::Weekly => {
-                                        "weekly"
-                                    }
-                                    crate::settings::types::IspBandwidthCapPeriodGql::Monthly => {
-                                        "monthly"
-                                    }
-                                },
-                            )?;
-                            db.set_setting(
-                                "bandwidth_cap.limit_bytes",
-                                &cap.limit_bytes.to_string(),
-                            )?;
-                            db.set_setting(
-                                "bandwidth_cap.reset_time_minutes_local",
-                                &cap.reset_time_minutes_local.to_string(),
-                            )?;
-                            db.set_setting(
-                                "bandwidth_cap.weekly_reset_weekday",
-                                match cap.weekly_reset_weekday {
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Mon => "mon",
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Tue => "tue",
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Wed => "wed",
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Thu => "thu",
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Fri => "fri",
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Sat => "sat",
-                                    crate::settings::types::IspBandwidthCapWeekdayGql::Sun => "sun",
-                                },
-                            )?;
-                            db.set_setting(
-                                "bandwidth_cap.monthly_reset_day",
-                                &cap.monthly_reset_day.to_string(),
-                            )?;
-                        }
-                        if let Some(ref watch) = persist_input.6 {
+                        if let Some(ref watch) = persist_input.5 {
                             if let Some(mode) = watch.mode {
                                 db.set_setting("watch_folder.mode", mode.as_str())?;
                             }
@@ -246,7 +235,7 @@ impl SettingsMutation {
                                 db.set_setting("watch_folder.scanning_paused", &value.to_string())?;
                             }
                         }
-                        if let Some(ref duplicate_policy) = persist_input.7 {
+                        if let Some(ref duplicate_policy) = persist_input.6 {
                             if let Some(value) = duplicate_policy.strict_active_or_success {
                                 db.set_setting(
                                     "duplicate_policy.strict_active_or_success",
@@ -285,10 +274,10 @@ impl SettingsMutation {
                                 )?;
                             }
                         }
-                        if let Some(seconds) = persist_input.9 {
+                        if let Some(seconds) = persist_input.8 {
                             db.set_setting("propagation_delay_secs", &seconds.to_string())?;
                         }
-                        if let Some(enabled) = persist_input.8 {
+                        if let Some(enabled) = persist_input.7 {
                             db.set_setting(
                                 "delivery_naming.enable_srrdb_lookup",
                                 &enabled.to_string(),
@@ -339,9 +328,6 @@ impl SettingsMutation {
                             });
                     retry.max_retries = Some(retries);
                 }
-                if let Some(cap) = isp_bandwidth_cap {
-                    cfg.isp_bandwidth_cap = Some(cap.into());
-                }
                 if let Some(enabled) = enable_srrdb_lookup {
                     cfg.delivery_naming
                         .get_or_insert_with(Default::default)
@@ -370,7 +356,6 @@ impl SettingsMutation {
                     propagation_delay_secs: cfg.propagation_delay_secs(),
                     max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
                     enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
-                    isp_bandwidth_cap: cfg.isp_bandwidth_cap.as_ref().map(Into::into),
                     watch_folder: (&cfg.watch_folder).into(),
                     duplicate_policy: cfg.duplicate_policy.into(),
                 };
@@ -385,9 +370,6 @@ impl SettingsMutation {
         // Apply speed limit immediately.
         if let Some(speed) = max_download_speed {
             let _ = handle.set_speed_limit(speed).await;
-        }
-        if let Some(cap) = input.isp_bandwidth_cap {
-            let _ = handle.set_bandwidth_cap_policy(Some(cap.into())).await;
         }
 
         // Apply directory changes immediately so new jobs use them without restart.
@@ -459,8 +441,9 @@ impl SettingsMutation {
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
-        validate_schedule_input(ctx, &input)?;
-        let entry = input.into_entry();
+        validate_schedule_input(ctx, &input).await?;
+        let entry = input.into_entry().map_err(async_graphql::Error::new)?;
+        let mut schedules_guard = schedules_state.write().await;
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
             move || db.list_schedules()
@@ -468,12 +451,14 @@ impl SettingsMutation {
         .await??;
         entries.push(entry);
         let entries_for_save = entries.clone();
-        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
-        *schedules_state.write().await = entries.clone();
-        Ok(entries
-            .into_iter()
-            .map(crate::settings::types::Schedule::from)
-            .collect())
+        let entries = tokio::task::spawn_blocking(move || {
+            db.save_schedules(&entries_for_save)?;
+            db.list_schedules()
+        })
+        .await??;
+        *schedules_guard = entries.clone();
+        drop(schedules_guard);
+        schedule_response(ctx, entries).await
     }
     #[graphql(guard = "AdminGuard")]
     async fn update_schedule(
@@ -486,27 +471,27 @@ impl SettingsMutation {
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
-        validate_schedule_input(ctx, &input)?;
+        validate_schedule_input(ctx, &input).await?;
+        let mut schedules_guard = schedules_state.write().await;
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
             move || db.list_schedules()
         })
         .await??;
         if let Some(existing) = entries.iter_mut().find(|e| e.id == id) {
-            let updated = input.into_entry();
-            existing.enabled = updated.enabled;
-            existing.label = updated.label;
-            existing.days = updated.days;
-            existing.time = updated.time;
-            existing.action = updated.action;
+            let mut updated = input.into_entry().map_err(async_graphql::Error::new)?;
+            updated.id = existing.id.clone();
+            *existing = updated;
         }
         let entries_for_save = entries.clone();
-        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
-        *schedules_state.write().await = entries.clone();
-        Ok(entries
-            .into_iter()
-            .map(crate::settings::types::Schedule::from)
-            .collect())
+        let entries = tokio::task::spawn_blocking(move || {
+            db.save_schedules(&entries_for_save)?;
+            db.list_schedules()
+        })
+        .await??;
+        *schedules_guard = entries.clone();
+        drop(schedules_guard);
+        schedule_response(ctx, entries).await
     }
     #[graphql(guard = "AdminGuard")]
     async fn delete_schedule(
@@ -518,6 +503,7 @@ impl SettingsMutation {
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
+        let mut schedules_guard = schedules_state.write().await;
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
             move || db.list_schedules()
@@ -525,12 +511,14 @@ impl SettingsMutation {
         .await??;
         entries.retain(|e| e.id != id);
         let entries_for_save = entries.clone();
-        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
-        *schedules_state.write().await = entries.clone();
-        Ok(entries
-            .into_iter()
-            .map(crate::settings::types::Schedule::from)
-            .collect())
+        let entries = tokio::task::spawn_blocking(move || {
+            db.save_schedules(&entries_for_save)?;
+            db.list_schedules()
+        })
+        .await??;
+        *schedules_guard = entries.clone();
+        drop(schedules_guard);
+        schedule_response(ctx, entries).await
     }
     #[graphql(guard = "AdminGuard")]
     async fn toggle_schedule(
@@ -543,6 +531,7 @@ impl SettingsMutation {
         let schedules_state = ctx
             .data::<weaver_server_core::bandwidth::schedule::SharedSchedules>()?
             .clone();
+        let mut schedules_guard = schedules_state.write().await;
         let mut entries = tokio::task::spawn_blocking({
             let db = db.clone();
             move || db.list_schedules()
@@ -552,12 +541,14 @@ impl SettingsMutation {
             existing.enabled = enabled;
         }
         let entries_for_save = entries.clone();
-        tokio::task::spawn_blocking(move || db.save_schedules(&entries_for_save)).await??;
-        *schedules_state.write().await = entries.clone();
-        Ok(entries
-            .into_iter()
-            .map(crate::settings::types::Schedule::from)
-            .collect())
+        let entries = tokio::task::spawn_blocking(move || {
+            db.save_schedules(&entries_for_save)?;
+            db.list_schedules()
+        })
+        .await??;
+        *schedules_guard = entries.clone();
+        drop(schedules_guard);
+        schedule_response(ctx, entries).await
     }
 }
 
@@ -685,7 +676,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),

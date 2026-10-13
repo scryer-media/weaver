@@ -70,7 +70,7 @@ fn file_verification(
     }
 }
 
-/// A four-file pre-repair verdict with one of each status.
+// A four-file pre-repair verdict with one of each status.
 fn mixed_pre_repair_verification() -> par2_rs::VerificationResult {
     let files = vec![
         file_verification(
@@ -113,16 +113,16 @@ fn mixed_pre_repair_verification() -> par2_rs::VerificationResult {
     }
 }
 
-/// Six intact parts at the wrong names is not a failed repair.
-///
-/// This is the shape the placement-normalization fixture produces: every
-/// article arrived, nothing is damaged, and the parts simply need to be
-/// moved to the names the recovery set describes. The post-repair guard
-/// used to reject it — `needs_repair()` is true for a `Renamed` file — and
-/// report it as "0 damaged slices", the zero being the tell that there was
-/// nothing to repair at all. The rename entries the plan carries are
-/// derived from those very statuses, so the guard was refusing the repair
-/// for the one thing the next step fixes.
+// Six intact parts at the wrong names is not a failed repair.
+//
+// This is the shape the placement-normalization fixture produces: every
+// article arrived, nothing is damaged, and the parts simply need to be
+// moved to the names the recovery set describes. The post-repair guard
+// used to reject it — `needs_repair()` is true for a `Renamed` file — and
+// report it as "0 damaged slices", the zero being the tell that there was
+// nothing to repair at all. The rename entries the plan carries are
+// derived from those very statuses, so the guard was refusing the repair
+// for the one thing the next step fixes.
 fn multi_rename_post_repair_verification() -> par2_rs::VerificationResult {
     let files = (1..=6u8)
         .map(|part| {
@@ -208,18 +208,18 @@ fn post_repair_damage_still_fails_and_counts_what_remains() {
     );
 }
 
-/// The write set is every file the repair could have acted on, which is
-/// every file that was not already complete at its canonical name.
-///
-/// `Renamed` belongs in it. The rule used to read "Damaged and Missing",
-/// on the reasoning that misplaced content already exists intact somewhere
-/// else and is moved by placement rather than rewritten. A repair over a set
-/// whose only fault was misplacement disproved it: the repairer copied every
-/// one of those files onto its canonical name — the run reconstructed no
-/// slice and still reported bytes copied — and left the displaced originals
-/// as `<name>.N`. Carrying the pre-repair `Renamed` entries through that
-/// reported six placed files as still misplaced, and the placement step then
-/// tried to rename them onto names the repair had just filled.
+// The write set is every file the repair could have acted on, which is
+// every file that was not already complete at its canonical name.
+//
+// `Renamed` belongs in it. The rule used to read "Damaged and Missing",
+// on the reasoning that misplaced content already exists intact somewhere
+// else and is moved by placement rather than rewritten. A repair over a set
+// whose only fault was misplacement disproved it: the repairer copied every
+// one of those files onto its canonical name — the run reconstructed no
+// slice and still reported bytes copied — and left the displaced originals
+// as `<name>.N`. Carrying the pre-repair `Renamed` entries through that
+// reported six placed files as still misplaced, and the placement step then
+// tried to rename them onto names the repair had just filled.
 #[test]
 fn par2_repair_write_set_is_everything_not_already_complete() {
     let write_set = par2_repair_write_set(&mixed_pre_repair_verification());
@@ -271,8 +271,8 @@ fn placement_plan_from_verification_places_by_verdict() {
     );
 }
 
-/// A recovery set carrying nothing but the two numbers the merge reads:
-/// the recovery-block count and the file order.
+// A recovery set carrying nothing but the two numbers the merge reads:
+// the recovery-block count and the file order.
 fn merge_test_par2_set(recovery_blocks: u32) -> par2_rs::Par2FileSet {
     let recovery_slices = (0..recovery_blocks)
         .map(|exponent| {
@@ -297,10 +297,10 @@ fn merge_test_par2_set(recovery_blocks: u32) -> par2_rs::Par2FileSet {
     }
 }
 
-/// The shape the merge actually sees. `verify_all` and
-/// `verify_selected_file_ids` only ever report `Complete`, `Damaged` or
-/// `Missing` — `Renamed` comes from the repairer's own scanner, never from
-/// the pass that produces the pre-repair result this merges onto.
+// The shape the merge actually sees. `verify_all` and
+// `verify_selected_file_ids` only ever report `Complete`, `Damaged` or
+// `Missing` — `Renamed` comes from the repairer's own scanner, never from
+// the pass that produces the pre-repair result this merges onto.
 fn production_pre_repair_verification() -> par2_rs::VerificationResult {
     let mut verification = mixed_pre_repair_verification();
     verification
@@ -672,9 +672,9 @@ fn parked_promoted_recovery_is_not_pending_until_reapplied() {
     assert!(!state.has_pending_work());
 }
 
-/// The checkpoint line names a set's suspect volumes. A set with hundreds of
-/// them printed hundreds of indexes on every pass; the operator reads the
-/// shape, not the list, so the line carries a count and the runs behind it.
+// The checkpoint line names a set's suspect volumes. A set with hundreds of
+// them printed hundreds of indexes on every pass; the operator reads the
+// shape, not the list, so the line carries a count and the runs behind it.
 #[test]
 fn a_suspect_volume_list_is_summarized_as_runs() {
     assert_eq!(summarize_volume_index_ranges(&[]), "");

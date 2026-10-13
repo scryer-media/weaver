@@ -1,22 +1,22 @@
-//! Where a chase stages its output, and who makes that directory.
-//!
-//! Arming runs on the pipeline task, so it must not touch the staging tree at
-//! all: the worker creates it on its own thread before it decodes anything.
+// Where a chase stages its output, and who makes that directory.
+//
+// Arming runs on the pipeline task, so it must not touch the staging tree at
+// all: the worker creates it on its own thread before it decodes anything.
 
 use super::*;
 use crate::pipeline::direct_unpack::wiring::{AbortLatch, DemotionReason};
 
-/// Wait for a condition a blocking worker will make true. No deadline: the
-/// test runner bounds a condition that never arrives.
+// Wait for a condition a blocking worker will make true. No deadline: the
+// test runner bounds a condition that never arrives.
 async fn yield_until(mut condition: impl FnMut() -> bool) {
     while !condition() {
         tokio::task::yield_now().await;
     }
 }
 
-/// A worker that cannot make its staging directory ends in a demotion that
-/// names the directory, and arming — which runs on the pipeline task — never
-/// found out, because it never looked.
+// A worker that cannot make its staging directory ends in a demotion that
+// names the directory, and arming — which runs on the pipeline task — never
+// found out, because it never looked.
 #[tokio::test]
 async fn a_worker_that_cannot_make_its_staging_is_demoted_for_it() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -77,10 +77,10 @@ async fn a_worker_that_cannot_make_its_staging_is_demoted_for_it() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// Generation numbers restart with the process, so a directory at a new
-/// generation's path can only be an earlier process's leftovers. It is
-/// cleared rather than adopted: the chase's budget starts from zero because
-/// the directory it writes into starts empty.
+// Generation numbers restart with the process, so a directory at a new
+// generation's path can only be an earlier process's leftovers. It is
+// cleared rather than adopted: the chase's budget starts from zero because
+// the directory it writes into starts empty.
 #[test]
 fn a_stale_tree_at_a_generation_path_is_cleared_not_adopted() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -120,14 +120,14 @@ fn a_stale_tree_at_a_generation_path_is_cleared_not_adopted() {
     }
 }
 
-/// Hold every staging deletion until the test releases it.
+// Hold every staging deletion until the test releases it.
 fn hold_staging_cleanups(pipeline: &mut Pipeline) -> std::sync::Arc<tokio::sync::Semaphore> {
     let hold = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     pipeline.direct_unpack.staging_cleanup_hold = Some(std::sync::Arc::clone(&hold));
     hold
 }
 
-/// End a running chase the way a pause does, and reap its worker.
+// End a running chase the way a pause does, and reap its worker.
 async fn abort_retryably_and_reap(pipeline: &mut Pipeline, job_id: JobId, set_name: &str) {
     pipeline.direct_unpack_abort_set(
         job_id,
@@ -146,10 +146,10 @@ async fn abort_retryably_and_reap(pipeline: &mut Pipeline, job_id: JobId, set_na
     assert!(!pipeline.direct_unpack.is_draining(job_id, set_name));
 }
 
-/// A set that re-arms after a retryable abort stages into a new directory,
-/// and it does so while the previous arm's tree is still waiting to be
-/// deleted: the two never share a path, so neither waits for the other. The
-/// outcome names the directory its own worker wrote.
+// A set that re-arms after a retryable abort stages into a new directory,
+// and it does so while the previous arm's tree is still waiting to be
+// deleted: the two never share a path, so neither waits for the other. The
+// outcome names the directory its own worker wrote.
 #[tokio::test]
 async fn a_re_armed_set_stages_into_a_new_generation() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -219,9 +219,9 @@ async fn a_re_armed_set_stages_into_a_new_generation() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// Reaping an aborted chase hands its tree to a deletion the pipeline task
-/// does not wait for. The reap returns with the tree still there, and the
-/// tree is gone once that deletion is observed to finish.
+// Reaping an aborted chase hands its tree to a deletion the pipeline task
+// does not wait for. The reap returns with the tree still there, and the
+// tree is gone once that deletion is observed to finish.
 #[tokio::test]
 async fn reaping_an_aborted_chase_does_not_wait_for_its_staging_to_go() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -253,8 +253,8 @@ async fn reaping_an_aborted_chase_does_not_wait_for_its_staging_to_go() {
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// Forgetting a job — a reprocess, a nested rebuild — drops its finished
-/// chases, and their trees go with them rather than waiting for the sweep.
+// Forgetting a job — a reprocess, a nested rebuild — drops its finished
+// chases, and their trees go with them rather than waiting for the sweep.
 #[tokio::test]
 async fn forgetting_a_job_retires_its_finished_chases_staging() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -286,9 +286,9 @@ async fn forgetting_a_job_retires_its_finished_chases_staging() {
     assert!(!staging.exists());
 }
 
-/// An install that fails leaves the chase's tree behind — both installs only
-/// remove it once every member is in place — so consumption retires it before
-/// falling back to conventional extraction.
+// An install that fails leaves the chase's tree behind — both installs only
+// remove it once every member is in place — so consumption retires it before
+// falling back to conventional extraction.
 #[tokio::test]
 async fn a_failed_install_retires_the_chases_staging() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -325,10 +325,10 @@ async fn a_failed_install_retires_the_chases_staging() {
     yield_until(|| !staging.exists()).await;
 }
 
-/// A later part's completion does not open part one for its signature
-/// header while part one has fewer than 32 committed bytes: the pipeline
-/// task already knows the answer would be "not yet". Bytes already sitting in
-/// the file do not count until they are committed.
+// A later part's completion does not open part one for its signature
+// header while part one has fewer than 32 committed bytes: the pipeline
+// task already knows the answer would be "not yet". Bytes already sitting in
+// the file do not count until they are committed.
 #[tokio::test]
 async fn arming_does_not_open_part_one_before_its_header_is_committed() {
     let temp_dir = tempfile::tempdir().unwrap();

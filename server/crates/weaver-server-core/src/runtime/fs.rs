@@ -26,8 +26,8 @@ pub(crate) struct DirectoryFingerprint {
     file_index: u64,
 }
 
-/// An atomic regular-file move with no copy or hard-link fallback. Callers
-/// journaling both names can replay an interruption without partial outputs.
+// An atomic regular-file move with no copy or hard-link fallback. Callers
+// journaling both names can replay an interruption without partial outputs.
 pub(crate) fn rename_file_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
     if !std::fs::symlink_metadata(src)?.file_type().is_file() {
         return Err(io::Error::new(
@@ -248,7 +248,46 @@ pub(crate) fn destination_parent_matches(
     directory_fingerprint_from_path(parent).map(|actual| &actual == expected)
 }
 
-pub(crate) fn normalize_extracted_tree(path: &Path) -> io::Result<()> {
+pub(crate) fn normalize_extracted_paths(root: &Path, members: &[String]) -> io::Result<()> {
+    for member in members {
+        let relative = Path::new(member);
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid extracted member path",
+            ));
+        }
+        let mut path = root.to_path_buf();
+        for component in relative.components() {
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid extracted member parent",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error),
+            }
+            normalize_extracted_path(&path, false)?;
+            path.push(component);
+        }
+        normalize_extracted_path(&path, false)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn normalize_extracted_tree(path: &Path) -> io::Result<()> {
+    normalize_extracted_path(path, true)
+}
+
+fn normalize_extracted_path(path: &Path, recursive: bool) -> io::Result<()> {
     if let Err(error) = std::fs::symlink_metadata(path) {
         if error.kind() == io::ErrorKind::NotFound {
             return Ok(());
@@ -258,18 +297,18 @@ pub(crate) fn normalize_extracted_tree(path: &Path) -> io::Result<()> {
 
     #[cfg(unix)]
     {
-        normalize_extracted_tree_unix(path)
+        normalize_extracted_tree_unix(path, recursive)
     }
 
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = (path, recursive);
         Ok(())
     }
 }
 
 #[cfg(unix)]
-fn normalize_extracted_tree_unix(path: &Path) -> io::Result<()> {
+fn normalize_extracted_tree_unix(path: &Path, recursive: bool) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
@@ -279,6 +318,7 @@ fn normalize_extracted_tree_unix(path: &Path) -> io::Result<()> {
         uid: libc::uid_t,
         gid: libc::gid_t,
         umask: u32,
+        recursive: bool,
     ) -> io::Result<()> {
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
@@ -317,7 +357,7 @@ fn normalize_extracted_tree_unix(path: &Path) -> io::Result<()> {
             return Err(error);
         }
 
-        if metadata.is_dir() {
+        if recursive && metadata.is_dir() {
             let entries = match std::fs::read_dir(path) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -329,7 +369,7 @@ fn normalize_extracted_tree_unix(path: &Path) -> io::Result<()> {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error),
                 };
-                normalize_one(&entry.path(), uid, gid, umask)?;
+                normalize_one(&entry.path(), uid, gid, umask, true)?;
             }
         }
 
@@ -341,6 +381,7 @@ fn normalize_extracted_tree_unix(path: &Path) -> io::Result<()> {
         unsafe { libc::geteuid() },
         unsafe { libc::getegid() },
         current_umask(),
+        recursive,
     )
 }
 
@@ -562,6 +603,38 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_extracted_members_leaves_live_sources_unchanged() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("out");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let member = nested.join("movie.mkv");
+        let source = nested.join("live.partial");
+        std::fs::write(&member, b"media").unwrap();
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::set_permissions(&member, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(&source).unwrap();
+
+        normalize_extracted_paths(&root, &["nested/movie.mkv".to_owned()]).unwrap();
+
+        let after = std::fs::metadata(&source).unwrap();
+        assert_eq!(before.mode(), after.mode());
+        assert_eq!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec())
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"source");
+        assert_eq!(
+            std::fs::metadata(&member).unwrap().mode() & 0o777,
+            0o666 & !current_umask()
+        );
     }
 
     #[cfg(unix)]

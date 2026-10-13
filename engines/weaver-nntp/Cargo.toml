@@ -8,6 +8,7 @@ license-file.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait = "0.1"
 weaver-tunnel = { path = "../weaver-tunnel" }
 weaver-yenc = { path = "../weaver-yenc", default-features = false }
 tokio = { workspace = true }

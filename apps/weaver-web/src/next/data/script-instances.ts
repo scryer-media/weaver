@@ -1,0 +1,569 @@
+import type { Translate } from "@/lib/context/translate-context";
+import type { SecretRef } from "./secrets";
+
+/**
+ * Script instances: a script wired to one trigger, with what was saved for it.
+ *
+ * The instance is what runs. A script's header only offers a preset, which
+ * fills a form and is never read back into a saved instance. Everything here is
+ * the arithmetic the Scripts screen is drawn from, kept apart from React so it
+ * can be tested on its own.
+ */
+
+export type ScriptKind = "POST_PROCESSING" | "QUEUE" | "SCAN" | "SCHEDULER" | "FEED";
+
+/** The triggers, in the order every list and picker draws them. */
+export const SCRIPT_KINDS: readonly ScriptKind[] = ["POST_PROCESSING", "QUEUE", "SCAN", "SCHEDULER", "FEED"];
+
+export const SCRIPT_KIND_LABELS: Record<ScriptKind, string> = {
+  POST_PROCESSING: "next.postProcessing.kindPostProcessing",
+  QUEUE: "next.postProcessing.kindQueue",
+  SCAN: "next.postProcessing.kindScan",
+  SCHEDULER: "next.schedules.schedule",
+  FEED: "next.postProcessing.kindFeed",
+};
+
+/** The queue events an instance can run on, in the order the daemon lists them. */
+export const QUEUE_EVENTS = [
+  "FILE_DOWNLOADED",
+  "URL_COMPLETED",
+  "NZB_MARKED",
+  "NZB_ADDED",
+  "NZB_NAMED",
+  "NZB_DOWNLOADED",
+  "NZB_DELETED",
+] as const;
+
+export type QueueEvent = (typeof QUEUE_EVENTS)[number];
+
+export type ScriptOptionType = "STRING" | "INTEGER" | "NUMBER" | "BOOLEAN" | "SECRET";
+
+/** What a script's header says about one input, for drawing its field. */
+export interface ScriptOption {
+  name: string;
+  section?: string | null;
+  optionType: ScriptOptionType;
+  displayName?: string | null;
+  description: string[];
+  select: string[];
+  required: boolean;
+  defaultValue?: string | null;
+}
+
+/**
+ * One saved input: a value, the named secret it links, or a secret of the
+ * job's own. Neither kind of secret is ever read back.
+ */
+export interface ScriptInstanceValue {
+  name: string;
+  /** Empty when the input is a secret of either kind. */
+  value: string;
+  secret: SecretRef | null;
+  /** The value is the job's own secret: stored encrypted, and never read back. */
+  sealed: boolean;
+}
+
+/** One input a header declares, at its default. A secret input has no value: it links a secret. */
+export interface ScriptPresetValue {
+  name: string;
+  value: string;
+  secret: boolean;
+}
+
+export interface ScriptPresetTrigger {
+  trigger: ScriptKind;
+  queueEvent: QueueEvent | null;
+}
+
+/** What a script's header offers as a starting point. */
+export interface ScriptPreset {
+  triggers: ScriptPresetTrigger[];
+  taskTimes: string[];
+  inputs: ScriptPresetValue[];
+}
+
+export interface DiscoveredScript {
+  name: string;
+  displayName: string;
+  adapter: "SABNZBD" | "NZBGET";
+  kinds: ScriptKind[];
+  queueEvents: string[];
+  taskTimes: string[];
+  version?: string | null;
+  options: ScriptOption[];
+  preset: ScriptPreset;
+}
+
+export interface ScriptInstance {
+  id: string;
+  name: string;
+  script: string;
+  trigger: ScriptKind;
+  queueEvent: QueueEvent | null;
+  inputs: ScriptInstanceValue[];
+  /** Empty runs for every category. */
+  categories: string[];
+  enabled: boolean;
+  blocking: boolean;
+  /** Null runs under the default timeout of its trigger. */
+  timeoutSeconds: number | null;
+  /** When a schedule job runs; empty for every other trigger. */
+  schedule: JobSchedule;
+  runOrder: number;
+  /** Why the script cannot run as things stand; null when it can. */
+  scriptProblem: string | null;
+  /** The script's header no longer declares the inputs this instance holds. */
+  headerDrift: boolean;
+}
+
+/** The longest an instance may be given: seven days. */
+export const MAX_TIMEOUT_SECONDS = 7 * 24 * 60 * 60;
+
+/** Only a download has a category, so only these triggers can be narrowed to one. */
+export function categoryScoped(trigger: ScriptKind): boolean {
+  return trigger === "POST_PROCESSING" || trigger === "QUEUE";
+}
+
+/** A trigger in words; a queue trigger keeps the event it runs on. */
+export function triggerTitle(t: Translate, trigger: ScriptKind, queueEvent: string | null): string {
+  const kind = t(SCRIPT_KIND_LABELS[trigger]);
+  return trigger === "QUEUE" && queueEvent ? `${kind} · ${queueEvent}` : kind;
+}
+
+/* ------------------------------------------------------------------ groups */
+
+export interface InstanceGroup {
+  /** Stable across renders: the trigger, and the event for a queue group. */
+  id: string;
+  trigger: ScriptKind;
+  queueEvent: QueueEvent | null;
+  instances: ScriptInstance[];
+}
+
+function groupId(trigger: ScriptKind, queueEvent: string | null): string {
+  return trigger === "QUEUE" ? `QUEUE:${queueEvent ?? ""}` : trigger;
+}
+
+function byRunOrder(left: ScriptInstance, right: ScriptInstance): number {
+  return left.runOrder - right.runOrder;
+}
+
+/**
+ * Instances by what starts them: one group per trigger, and one per event for
+ * the queue, each in the order its instances run. A group with nothing in it
+ * is left out.
+ */
+export function groupInstances(instances: readonly ScriptInstance[]): InstanceGroup[] {
+  const groups: InstanceGroup[] = [];
+  const add = (trigger: ScriptKind, queueEvent: QueueEvent | null) => {
+    const id = groupId(trigger, queueEvent);
+    const members = instances
+      .filter((instance) => groupId(instance.trigger, instance.queueEvent) === id)
+      .sort(byRunOrder);
+    if (members.length > 0) {
+      groups.push({ id, trigger, queueEvent, instances: members });
+    }
+  };
+  for (const trigger of SCRIPT_KINDS) {
+    if (trigger === "QUEUE") {
+      for (const event of QUEUE_EVENTS) {
+        add(trigger, event);
+      }
+      // A queue instance whose event this screen does not know still has a row.
+      const known = new Set<string>(QUEUE_EVENTS);
+      const others = [...new Set(
+        instances
+          .filter((instance) => instance.trigger === "QUEUE" && !known.has(instance.queueEvent ?? ""))
+          .map((instance) => instance.queueEvent),
+      )];
+      for (const event of others) {
+        add(trigger, event);
+      }
+    } else {
+      add(trigger, null);
+    }
+  }
+  return groups;
+}
+
+/**
+ * The order to ask for when an instance trades places with its neighbour.
+ *
+ * The daemon orders one trigger's instances together, while the table shows
+ * the queue's by event, so the neighbour is the next row of the same group and
+ * the ids sent are every instance of the trigger. Null when there is no
+ * neighbour that way.
+ */
+export function reorderedIds(
+  instances: readonly ScriptInstance[],
+  id: string,
+  direction: -1 | 1,
+): { trigger: ScriptKind; ids: string[] } | null {
+  const moving = instances.find((instance) => instance.id === id);
+  if (!moving) {
+    return null;
+  }
+  const group = groupInstances(instances).find((entry) =>
+    entry.instances.some((instance) => instance.id === id),
+  );
+  const row = group?.instances.findIndex((instance) => instance.id === id) ?? -1;
+  const neighbour = group?.instances[row + direction];
+  if (!neighbour) {
+    return null;
+  }
+  const ids = instances
+    .filter((instance) => instance.trigger === moving.trigger)
+    .sort(byRunOrder)
+    .map((instance) => instance.id);
+  const from = ids.indexOf(moving.id);
+  const to = ids.indexOf(neighbour.id);
+  ids[from] = neighbour.id;
+  ids[to] = moving.id;
+  return { trigger: moving.trigger, ids };
+}
+
+function sameTrigger(left: ScriptPresetTrigger, instance: ScriptInstance): boolean {
+  return left.trigger === instance.trigger
+    && (left.trigger !== "QUEUE" || left.queueEvent === instance.queueEvent);
+}
+
+/** The triggers a script's header declares that no instance of it runs on yet. */
+export function unwiredTriggers(
+  script: DiscoveredScript,
+  instances: readonly ScriptInstance[],
+): ScriptPresetTrigger[] {
+  const own = instances.filter((instance) => instance.script === script.name);
+  return script.preset.triggers.filter((trigger) => !own.some((instance) => sameTrigger(trigger, instance)));
+}
+
+/* -------------------------------------------------------------------- form */
+
+/**
+ * One input as the editor holds it: a value, a slot that links a named secret,
+ * or a secret of the job's own.
+ */
+export interface InstanceInputForm {
+  name: string;
+  /** What is typed. Unused while the input links a secret. */
+  value: string;
+  /** The input links a named secret. */
+  secret: boolean;
+  /** The secret a secret input links; null until one is chosen. */
+  secretId: string | null;
+  /** The value is the job's own secret: stored encrypted, and never read back. */
+  own: boolean;
+  /** An own secret is already saved; left blank, it is kept as it is. */
+  held: boolean;
+}
+
+export interface InstanceForm {
+  /** Blank takes the script's name. */
+  name: string;
+  script: string;
+  trigger: ScriptKind;
+  /** Only read while the trigger is the queue. */
+  queueEvent: QueueEvent;
+  inputs: InstanceInputForm[];
+  categories: string[];
+  enabled: boolean;
+  blocking: boolean;
+  /** Zero runs under the trigger's default timeout. */
+  timeoutSeconds: number;
+  /** When it runs; only read while the trigger is the schedule. */
+  schedule: JobScheduleForm;
+}
+
+function sameName(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
+}
+
+function presetInputs(script: DiscoveredScript | undefined): InstanceInputForm[] {
+  return (script?.preset.inputs ?? []).map((input) => ({
+    name: input.name,
+    // A secret is never pre-filled from the header.
+    value: input.secret ? "" : input.value,
+    secret: input.secret,
+    secretId: null,
+    own: false,
+    held: false,
+  }));
+}
+
+/**
+ * A new instance of `script`, filled from its header: the first trigger it
+ * declares and every declared input at its default.
+ */
+export function newInstanceForm(script: DiscoveredScript | undefined): InstanceForm {
+  const declared = script?.preset.triggers[0];
+  return {
+    name: "",
+    script: script?.name ?? "",
+    trigger: declared?.trigger ?? "POST_PROCESSING",
+    queueEvent: declared?.queueEvent ?? firstQueueEvent(script),
+    inputs: presetInputs(script),
+    categories: [],
+    enabled: true,
+    blocking: true,
+    timeoutSeconds: 0,
+    schedule: scheduleFromHeader(script),
+  };
+}
+
+/** The queue event a form starts on: the first the header declares, else the first there is. */
+export function firstQueueEvent(script: DiscoveredScript | undefined): QueueEvent {
+  return script?.preset.triggers.find((trigger) => trigger.trigger === "QUEUE")?.queueEvent ?? "NZB_ADDED";
+}
+
+/**
+ * A saved instance as the editor shows it.
+ *
+ * A secret the header declares and the instance was never linked to has no
+ * saved input at all, so it is added here: otherwise there would be nowhere to
+ * choose one.
+ */
+export function formFromInstance(instance: ScriptInstance, script: DiscoveredScript | undefined): InstanceForm {
+  const inputs: InstanceInputForm[] = instance.inputs.map((input) => ({
+    name: input.name,
+    value: input.secret || input.sealed ? "" : input.value,
+    secret: input.secret !== null,
+    secretId: input.secret?.id ?? null,
+    own: input.sealed === true,
+    held: input.sealed === true,
+  }));
+  for (const declared of presetInputs(script)) {
+    if (declared.secret && !inputs.some((input) => sameName(input.name, declared.name))) {
+      inputs.push(declared);
+    }
+  }
+  return {
+    name: instance.name,
+    script: instance.script,
+    trigger: instance.trigger,
+    queueEvent: instance.queueEvent ?? firstQueueEvent(script),
+    inputs,
+    categories: instance.categories,
+    enabled: instance.enabled,
+    blocking: instance.blocking,
+    timeoutSeconds: instance.timeoutSeconds ?? 0,
+    schedule: {
+      times: instance.schedule.times.join(", "),
+      days: instance.schedule.days,
+      startup: instance.schedule.runAtStartup,
+    },
+  };
+}
+
+/**
+ * The form after another script is picked. A new instance starts again from
+ * that script's header; a saved one keeps what is saved in it.
+ */
+export function withScript(form: InstanceForm, script: DiscoveredScript | undefined, creating: boolean): InstanceForm {
+  if (!creating) {
+    return { ...form, script: script?.name ?? form.script };
+  }
+  const fresh = newInstanceForm(script);
+  return { ...fresh, name: form.name, enabled: form.enabled, blocking: form.blocking, timeoutSeconds: form.timeoutSeconds };
+}
+
+/**
+ * An input as the daemon is sent it: a plain value, the id of the secret it
+ * links, or a secret of the job's own. An own secret sent with no value keeps
+ * the one the job already holds.
+ */
+export type ScriptInstanceValueInput =
+  | { name: string; value: string }
+  | { name: string; secretId: string }
+  | { name: string; value?: string; secret: true };
+
+export interface ScriptInstanceInput {
+  name: string;
+  script: string;
+  trigger: ScriptKind;
+  queueEvent: QueueEvent | null;
+  inputs: ScriptInstanceValueInput[];
+  categories: string[];
+  enabled: boolean;
+  blocking: boolean;
+  timeoutSeconds: number | null;
+  schedule: JobSchedule;
+}
+
+/**
+ * The input as it is sent. A secret input sends the secret it links; one with
+ * no secret chosen is left out, as there is nothing to give the script. An own
+ * secret sends what was typed, or nothing but its name to keep the saved one.
+ */
+function sentInput(input: InstanceInputForm): ScriptInstanceValueInput[] {
+  const name = input.name.trim();
+  if (input.own) {
+    if (input.value !== "") {
+      return [{ name, value: input.value, secret: true }];
+    }
+    return input.held ? [{ name, secret: true }] : [];
+  }
+  if (!input.secret) {
+    return [{ name, value: input.value }];
+  }
+  return input.secretId === null ? [] : [{ name, secretId: input.secretId }];
+}
+
+/**
+ * What the daemon is sent for a form. Run times that cannot be read are left
+ * out; {@link jobSchedule} says what is wrong with them before saving.
+ */
+export function inputFromForm(form: InstanceForm): ScriptInstanceInput {
+  const schedule = form.trigger === "SCHEDULER" ? jobSchedule(form.schedule) : NO_SCHEDULE;
+  return {
+    name: form.name.trim(),
+    script: form.script,
+    trigger: form.trigger,
+    queueEvent: form.trigger === "QUEUE" ? form.queueEvent : null,
+    inputs: form.inputs.flatMap(sentInput),
+    categories: categoryScoped(form.trigger) ? form.categories : [],
+    enabled: form.enabled,
+    blocking: form.blocking,
+    timeoutSeconds: form.timeoutSeconds > 0 ? Math.min(MAX_TIMEOUT_SECONDS, Math.round(form.timeoutSeconds)) : null,
+    schedule: "problem" in schedule ? NO_SCHEDULE : schedule,
+  };
+}
+
+/** A saved instance sent back as it is, apart from `patch`. Its secrets, linked or its own, are kept. */
+export function inputFromInstance(
+  instance: ScriptInstance,
+  patch: Partial<Pick<ScriptInstanceInput, "enabled" | "blocking">> = {},
+): ScriptInstanceInput {
+  return {
+    name: instance.name,
+    script: instance.script,
+    trigger: instance.trigger,
+    queueEvent: instance.trigger === "QUEUE" ? instance.queueEvent : null,
+    inputs: instance.inputs.map((input) =>
+      input.sealed
+        ? { name: input.name, secret: true }
+        : input.secret
+          ? { name: input.name, secretId: input.secret.id }
+          : { name: input.name, value: input.value },
+    ),
+    categories: instance.categories,
+    enabled: instance.enabled,
+    blocking: instance.blocking,
+    timeoutSeconds: instance.timeoutSeconds,
+    schedule: instance.schedule,
+    ...patch,
+  };
+}
+
+/**
+ * The input after its secret box is ticked or cleared. Either way it starts
+ * empty: a typed value never becomes a secret, and a secret's link never
+ * becomes a value.
+ */
+export function withSecret(input: InstanceInputForm, secret: boolean): InstanceInputForm {
+  return { ...input, secret, value: "", secretId: null, own: false, held: false };
+}
+
+/**
+ * The secret input linked to `secretId`, or unlinked when it is null. An
+ * unlinked secret input stays a secret slot and is left out of what is sent.
+ */
+export function withLinkedSecret(input: InstanceInputForm, secretId: string | null): InstanceInputForm {
+  return { ...input, secret: true, value: "", secretId, own: false, held: false };
+}
+
+/** Letters, digits, `_` and `-`, starting with a letter; dots join such parts. */
+const INPUT_NAME = /^[A-Za-z][A-Za-z0-9_-]*(\.[A-Za-z][A-Za-z0-9_-]*)*$/;
+
+/** Why `name` cannot be added to `inputs`, as a translation key; null when it can. */
+export function inputNameProblem(name: string, inputs: readonly InstanceInputForm[]): string | null {
+  const trimmed = name.trim();
+  if (!INPUT_NAME.test(trimmed) || trimmed.length > 128) {
+    return "next.postProcessing.inputNameInvalid";
+  }
+  return inputs.some((input) => sameName(input.name, trimmed)) ? "next.postProcessing.inputNameTaken" : null;
+}
+
+/** What the header declares about an input, whatever case the instance holds its name in. */
+export function declaredOption(script: DiscoveredScript | undefined, name: string): ScriptOption | undefined {
+  return script?.options.find((option) => sameName(option.name, name));
+}
+
+/** A boolean input as the daemon writes one: `yes` or `no`. */
+export function booleanInputValue(on: boolean): string {
+  return on ? "yes" : "no";
+}
+
+export function booleanInputOn(value: string): boolean {
+  return ["yes", "true", "1", "on"].includes(value.trim().toLowerCase());
+}
+
+/** A timeout exactly as it was set: `45s`, `1m 30s`, `2h`, `7d`. */
+export function formatTimeout(seconds: number): string {
+  const total = Math.max(0, Math.round(seconds));
+  const parts = [
+    [Math.floor(total / 86400), "d"],
+    [Math.floor(total / 3600) % 24, "h"],
+    [Math.floor(total / 60) % 60, "m"],
+    [total % 60, "s"],
+  ] as const;
+  const shown = parts.filter(([amount]) => amount > 0).map(([amount, unit]) => `${amount}${unit}`);
+  return shown.length > 0 ? shown.join(" ") : "0s";
+}
+
+/** One time a Schedule job runs at: `HH:MM`, `*:MM` for every hour, or `*` for startup. */
+const SCRIPT_TIME = /^(?:\*|(?:\*|[01]?\d|2[0-3]):[0-5]?\d)$/;
+/** A run at startup, as a script's list of times spells it. */
+const AT_STARTUP = "*";
+
+/** When a Schedule job runs, as it is saved. */
+export interface JobSchedule {
+  /** `mon` to `sun`; empty runs on every day. */
+  days: string[];
+  /** Each `HH:MM`, or `*:MM` for that minute of every hour. */
+  times: string[];
+  runAtStartup: boolean;
+}
+
+/** What a job of any other trigger is saved with. */
+export const NO_SCHEDULE: JobSchedule = { days: [], times: [], runAtStartup: false };
+
+/** When a Schedule job runs, as its editor holds it. */
+export interface JobScheduleForm {
+  /** The times as typed, separated by commas. */
+  times: string;
+  /** Empty runs on every day. */
+  days: string[];
+  startup: boolean;
+}
+
+/** Where a new job's schedule starts: the times its script's header asks for. */
+export function scheduleFromHeader(script: DiscoveredScript | undefined): JobScheduleForm {
+  const times = script?.preset.taskTimes ?? [];
+  return {
+    times: times.filter((time) => time !== AT_STARTUP).join(", "),
+    days: [],
+    startup: times.includes(AT_STARTUP),
+  };
+}
+
+/**
+ * The schedule for what was entered, or why it makes none. A job with no time
+ * and no run at startup would never run, so that is a problem.
+ */
+export function jobSchedule(
+  form: JobScheduleForm,
+): JobSchedule | { problem: "none" } | { problem: "invalid"; time: string } {
+  const typed = form.times
+    .split(/[,;]/)
+    .map((time) => time.trim())
+    .filter((time) => time !== "");
+  const invalid = typed.find((time) => !SCRIPT_TIME.test(time));
+  if (invalid !== undefined) {
+    return { problem: "invalid", time: invalid };
+  }
+  const clock = typed.filter((time) => time !== AT_STARTUP);
+  const runAtStartup = form.startup || clock.length < typed.length;
+  if (clock.length === 0 && !runAtStartup) {
+    return { problem: "none" };
+  }
+  return { days: form.days, times: clock, runAtStartup };
+}

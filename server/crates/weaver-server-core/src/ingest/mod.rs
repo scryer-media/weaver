@@ -12,7 +12,7 @@ pub use import::{
 pub use metadata::{
     ORIGINAL_TITLE_METADATA_KEY, append_original_title_metadata, original_release_title,
 };
-pub use naming::{derive_release_name, strip_nzb_source_suffix};
+pub use naming::{completed_folder_name, derive_release_name, strip_nzb_source_suffix};
 pub use persisted_nzb::{
     PersistedNzbError, PreparedPersistedNzb, compress_nzb_bytes, decode_persisted_nzb_bytes,
     hash_persisted_nzb_bytes, load_persisted_nzb_storage_bytes, parse_and_hash_persisted_nzb_bytes,

@@ -1,20 +1,20 @@
-//! A holding page while a database upgrade runs.
-//!
-//! Migrations finish before the real server binds, so a long upgrade used to
-//! look like a Weaver that would not start: the browser got "connection
-//! refused" and nothing said why. This watches for an upgrade and, only once
-//! one is actually running, answers on Weaver's own address with the turning W
-//! and how far the upgrade has got. The page polls, and reloads into Weaver
-//! when something other than this page answers.
-//!
-//! If Weaver stops answering instead -- an upgrade that failed ends the
-//! process -- the page turns into Weaver's error page, which waits for Weaver
-//! to answer again and offers a retry. It is carried inside the upgrade page
-//! because by then there is no server left to fetch it from.
-//!
-//! Nothing here is authenticated because nothing here is private: the page
-//! shows a count of migrations. Every non-page request is refused with 503, so
-//! an integration retries rather than mistaking the holding page for Weaver.
+// A holding page while a database upgrade runs.
+//
+// Migrations finish before the real server binds, so a long upgrade used to
+// look like a Weaver that would not start: the browser got "connection
+// refused" and nothing said why. This watches for an upgrade and, only once
+// one is actually running, answers on Weaver's own address with the turning W
+// and how far the upgrade has got. The page polls, and reloads into Weaver
+// when something other than this page answers.
+//
+// If Weaver stops answering instead -- an upgrade that failed ends the
+// process -- the page turns into Weaver's error page, which waits for Weaver
+// to answer again and offers a retry. It is carried inside the upgrade page
+// because by then there is no server left to fetch it from.
+//
+// Nothing here is authenticated because nothing here is private: the page
+// shows a count of migrations. Every non-page request is refused with 503, so
+// an integration retries rather than mistaking the holding page for Weaver.
 
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
@@ -38,29 +38,29 @@ use weaver_server_core::security::{
     resolve_bind_address,
 };
 
-/// Where the page's own requests go, under the base URL. Namespaced so it
-/// cannot collide with a route of the real server.
+// Where the page's own requests go, under the base URL. Namespaced so it
+// cannot collide with a route of the real server.
 const SPLASH_PATH: &str = "/__weaver/upgrade";
-/// How long a stopping page may take to close its connections before it is
-/// cut off: the real server is waiting for the port.
+// How long a stopping page may take to close its connections before it is
+// cut off: the real server is waiting for the port.
 const STOP_GRACE: Duration = Duration::from_secs(2);
-/// A stored address that cannot be read quickly is not worth delaying the
-/// page for; it falls back the same way an unreadable one does.
+// A stored address that cannot be read quickly is not worth delaying the
+// page for; it falls back the same way an unreadable one does.
 const PEEK_TIMEOUT: Duration = Duration::from_secs(2);
-/// The colour mark and wordmark for a dark ground. Compiled in rather than
-/// served, because the error page shows it after the server has gone.
+// The colour mark and wordmark for a dark ground. Compiled in rather than
+// served, because the error page shows it after the server has gone.
 const LOCKUP_SVG: &str = include_str!("../../../../../docs/img/weaver-lockup-on-dark.svg");
 
-/// The watcher, and the page once it is up. Stop it before the real server
-/// binds.
+// The watcher, and the page once it is up. Stop it before the real server
+// binds.
 pub(crate) struct UpgradeSplash {
     stop: oneshot::Sender<()>,
     task: JoinHandle<()>,
 }
 
 impl UpgradeSplash {
-    /// Watch this process's schema upgrade and serve the page on `port` while
-    /// one runs.
+    // Watch this process's schema upgrade and serve the page on `port` while
+    // one runs.
     pub(crate) fn watch(config_path: PathBuf, port: u16, base_url: &str) -> Self {
         let (stop, mut stopped) = oneshot::channel();
         let base_url = normalize_base_url(base_url);
@@ -98,7 +98,7 @@ impl UpgradeSplash {
         Self { stop, task }
     }
 
-    /// Take the page down and release the port.
+    // Take the page down and release the port.
     pub(crate) async fn stop(self) {
         let Self { stop, mut task } = self;
         let _ = stop.send(());
@@ -109,7 +109,7 @@ impl UpgradeSplash {
     }
 }
 
-/// The address the real server will try, with the same loopback fallback.
+// The address the real server will try, with the same loopback fallback.
 async fn bind(config_path: &std::path::Path, port: u16) -> Option<tokio::net::TcpListener> {
     let env_value = std::env::var(ENV_HTTP_BIND_ADDRESS).ok();
     let stored = if env_value

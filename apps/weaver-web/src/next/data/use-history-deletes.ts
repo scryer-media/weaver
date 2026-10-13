@@ -20,7 +20,7 @@ const POLL_MS = 1000;
 const NO_LOCKS: ReadonlyMap<number, DeleteLock> = new Map();
 
 /**
- * History deletes the way the classic History screen runs them.
+ * History deletes, run as one locked, polled operation per request.
  *
  * Accepting a delete locks the rows it covers straight away; while any
  * operation is active its progress is polled every second; and when the last

@@ -14,18 +14,18 @@ use crate::types::Response;
 use crate::uu::{self, UuDecoder, UuOutcome};
 
 const MAX_CONTROL_LINE: usize = 16 * 1024;
-/// Trailing bytes tolerated between the yEnc trailer and the NNTP terminator.
+// Trailing bytes tolerated between the yEnc trailer and the NNTP terminator.
 const MAX_TRAILER_JUNK: u64 = 64 * 1024;
 const MAX_ARTICLE_RESERVE: usize = 16 * 1024 * 1024;
 const OUTPUT_BATCH_TARGET: usize = 512 * 1024;
-/// Wire bytes handed to the kernel once a sized batch is full. The truthful
-/// continuation is the trailer, which produces nothing, so the probe only has
-/// to be long enough to reach `=y`; a header that lied fills the probe with
-/// data instead and the batch grows from there.
+// Wire bytes handed to the kernel once a sized batch is full. The truthful
+// continuation is the trailer, which produces nothing, so the probe only has
+// to be long enough to reach `=y`; a header that lied fills the probe with
+// data instead and the batch grows from there.
 const TAIL_PROBE_INPUT: usize = 256;
-/// How many bytes of leading junk may precede `=ybegin` before the article is
-/// declared header-less. Bounded so a 222 response whose body never contains a
-/// yEnc header cannot make the header scan run for the whole article.
+// How many bytes of leading junk may precede `=ybegin` before the article is
+// declared header-less. Bounded so a 222 response whose body never contains a
+// yEnc header cannot make the header scan run for the whole article.
 const MAX_HEADER_SCAN_BYTES: usize = 64 * 1024;
 
 #[cfg(unix)]
@@ -104,23 +104,23 @@ impl From<FusedYencError> for NntpError {
 
 pub type Result<T> = std::result::Result<T, FusedYencError>;
 
-/// What an article's body decoded to, and therefore what evidence it carries.
-///
-/// The two encodings are not interchangeable products. A yEnc article states
-/// where its bytes belong in the file and what they check to; a uuencode article
-/// states neither. Keeping them apart in the type means no downstream stage can
-/// read a placement or a checksum off a uuencode article by accident.
+// What an article's body decoded to, and therefore what evidence it carries.
+//
+// The two encodings are not interchangeable products. A yEnc article states
+// where its bytes belong in the file and what they check to; a uuencode article
+// states neither. Keeping them apart in the type means no downstream stage can
+// read a placement or a checksum off a uuencode article by accident.
 #[derive(Debug)]
 pub enum FusedArticleBody {
-    /// yEnc: offsets, per-part CRC, and the block-aligned CRC segments the
-    /// dual-CRC grid is fed from.
+    // yEnc: offsets, per-part CRC, and the block-aligned CRC segments the
+    // dual-CRC grid is fed from.
     Yenc(Box<DecodeResult>),
-    /// uuencode: decoded bytes, and a name only if this part carried a header.
+    // uuencode: decoded bytes, and a name only if this part carried a header.
     Uu(UuOutcome),
 }
 
 impl FusedArticleBody {
-    /// The yEnc decode result, or `None` for a uuencode article.
+    // The yEnc decode result, or `None` for a uuencode article.
     pub fn yenc(&self) -> Option<&DecodeResult> {
         match self {
             Self::Yenc(result) => Some(result),
@@ -128,7 +128,7 @@ impl FusedArticleBody {
         }
     }
 
-    /// The uuencode outcome, or `None` for a yEnc article.
+    // The uuencode outcome, or `None` for a yEnc article.
     pub fn uu(&self) -> Option<&UuOutcome> {
         match self {
             Self::Uu(outcome) => Some(outcome),
@@ -146,12 +146,12 @@ pub struct FusedYencArticle {
 }
 
 impl FusedYencArticle {
-    /// The yEnc decode result, for callers that already know this article is
-    /// yEnc — the decoder's own tests, which post yEnc bodies by construction.
-    ///
-    /// Panics on a uuencode article. Production paths match on
-    /// [`Self::body`] instead, so that the two encodings' differing evidence
-    /// has to be handled rather than assumed.
+    // The yEnc decode result, for callers that already know this article is
+    // yEnc — the decoder's own tests, which post yEnc bodies by construction.
+    //
+    // Panics on a uuencode article. Production paths match on
+    // [`Self::body`] instead, so that the two encodings' differing evidence
+    // has to be handled rather than assumed.
     #[cfg(test)]
     pub(crate) fn yenc_result(&self) -> &DecodeResult {
         self.body
@@ -196,12 +196,12 @@ pub struct FusedYencArticleStats {
     pub yenc_control_hits: u64,
     pub nntp_terminator_hits: u64,
     pub nntp_terminator_bytes: u64,
-    /// Bytes drained between the yEnc trailer and the NNTP terminator.
+    // Bytes drained between the yEnc trailer and the NNTP terminator.
     pub nntp_trailer_junk_bytes: u64,
     pub leftover_bytes_after_terminator: u64,
     pub buffer_compactions: u64,
-    /// Times the output batch grew past its reservation: a header that lied,
-    /// or an unreserved article growing amortised. Zero for a truthful header.
+    // Times the output batch grew past its reservation: a header that lied,
+    // or an unreserved article growing amortised. Zero for a truthful header.
     pub output_grow_events: u64,
     pub transport_read: TransportReadStats,
     pub read_poll_cpu: Duration,
@@ -213,7 +213,7 @@ pub struct FusedYencArticleStats {
     pub nntp_terminator_cpu: Duration,
     pub article_finish_cpu: Duration,
     pub output_callback_cpu: Duration,
-    /// Deliberate shared server-rate wait, excluded from RTT/timeout metrics.
+    // Deliberate shared server-rate wait, excluded from RTT/timeout metrics.
     pub throttle_wait: Duration,
 }
 
@@ -224,37 +224,37 @@ enum FusedArticleState {
     Body,
     YEndLine,
     NntpTerminator,
-    /// A uuencode article claimed the header scan; the rest of the body is fed
-    /// line-by-line to the uuencode decoder instead of the yEnc kernels.
+    // A uuencode article claimed the header scan; the rest of the body is fed
+    // line-by-line to the uuencode decoder instead of the yEnc kernels.
     UuBody,
     Done,
 }
 
-/// In-memory prototype for a fused NNTP BODY + yEnc article decoder.
-///
-/// The decoder consumes bytes directly from a caller-owned `BytesMut` and leaves
-/// any bytes after the NNTP multiline terminator untouched for the next
-/// response.
+// In-memory prototype for a fused NNTP BODY + yEnc article decoder.
+//
+// The decoder consumes bytes directly from a caller-owned `BytesMut` and leaves
+// any bytes after the NNTP multiline terminator untouched for the next
+// response.
 #[derive(Debug)]
 pub struct FusedYencArticleDecoder {
     state: FusedArticleState,
     response: Option<Response>,
     line_buf: Vec<u8>,
     metadata: Option<YencMetadata>,
-    /// Bytes of non-`=ybegin` lines skipped while scanning for the yEnc header.
+    // Bytes of non-`=ybegin` lines skipped while scanning for the yEnc header.
     junk_before_ybegin_bytes: usize,
-    /// Present once the header scan handed the article to uuencode.
+    // Present once the header scan handed the article to uuencode.
     uu: Option<UuDecoder>,
     yend_line: Option<Vec<u8>>,
     decode_state: DecodeState,
     output: Vec<u8>,
     output_chunks: Vec<Box<[u8]>>,
     output_reserved: bool,
-    /// The batch was sized from a declared length, so a full batch means the
-    /// trailer is next and the kernel must not grow it to find that out.
+    // The batch was sized from a declared length, so a full batch means the
+    // trailer is next and the kernel must not grow it to find that out.
     output_sized: bool,
-    /// Where a full sized batch's next input decodes; empty for a truthful
-    /// header, the lie's first bytes otherwise.
+    // Where a full sized batch's next input decodes; empty for a truthful
+    // header, the lie's first bytes otherwise.
     tail_scratch: Vec<u8>,
     profile_cpu: bool,
     checkpoint_plan: CheckpointPlan,
@@ -358,12 +358,12 @@ impl FusedYencArticleDecoder {
         self.state == FusedArticleState::Done
     }
 
-    /// Set the immutable geometry that checkpoints the decode CRC pass, so the
-    /// article's [`weaver_yenc::DecodeResult::segments`] can compose into every
-    /// grid present when this article began decoding without a second pass.
-    ///
-    /// Set before the article's yEnc header is consumed. `None` (the default)
-    /// emits one coarse segment for the article.
+    // Set the immutable geometry that checkpoints the decode CRC pass, so the
+    // article's [`weaver_yenc::DecodeResult::segments`] can compose into every
+    // grid present when this article began decoding without a second pass.
+    //
+    // Set before the article's yEnc header is consumed. `None` (the default)
+    // emits one coarse segment for the article.
     pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
         self.checkpoint_plan = checkpoint_plan;
     }
@@ -372,9 +372,9 @@ impl FusedYencArticleDecoder {
         self.profile_cpu = enabled;
     }
 
-    /// Raw NNTP BODY payload consumed so far, excluding the multiline
-    /// terminator. Available even when the next decode call returns an error,
-    /// which lets transfer accounting retain partial failed bodies.
+    // Raw NNTP BODY payload consumed so far, excluding the multiline
+    // terminator. Available even when the next decode call returns an error,
+    // which lets transfer accounting retain partial failed bodies.
     pub(crate) fn body_payload_bytes_consumed(&self) -> u64 {
         self.stats
             .encoded_bytes_consumed
@@ -514,9 +514,9 @@ impl FusedYencArticleDecoder {
         Ok(true)
     }
 
-    /// Enter the body with the CRC pass anchored at this article's place in the
-    /// file, so its checkpoints land on PAR2 block boundaries rather than on
-    /// wire-chunk boundaries.
+    // Enter the body with the CRC pass anchored at this article's place in the
+    // file, so its checkpoints land on PAR2 block boundaries rather than on
+    // wire-chunk boundaries.
     fn begin_body(&mut self) {
         if let Some(metadata) = self.metadata.as_ref() {
             let plan = std::mem::take(&mut self.checkpoint_plan);
@@ -638,11 +638,11 @@ impl FusedYencArticleDecoder {
         }
     }
 
-    /// Feed the rest of the article to the uuencode decoder, a line at a time.
-    ///
-    /// Returns `true` once the NNTP multiline terminator has been consumed.
-    /// Lines after the uuencode `end` are still drained here rather than
-    /// rejected: trailers are routine, and the decoder ignores them.
+    // Feed the rest of the article to the uuencode decoder, a line at a time.
+    //
+    // Returns `true` once the NNTP multiline terminator has been consumed.
+    // Lines after the uuencode `end` are still drained here rather than
+    // rejected: trailers are routine, and the decoder ignores them.
     fn process_uu_body(&mut self, src: &mut BytesMut) -> Result<bool> {
         loop {
             if !self.consume_line_into_buffer(src)? {
@@ -716,13 +716,13 @@ impl FusedYencArticleDecoder {
         })
     }
 
-    /// Close out an article the uuencode decoder claimed.
-    ///
-    /// An article that engaged the sniffer but decoded nothing is not a
-    /// uuencode article after all — treating it as one would hand the pipeline
-    /// an empty segment for a file that never existed. It fails as a missing
-    /// header instead, which is exactly what the article would have done before
-    /// uuencode support existed.
+    // Close out an article the uuencode decoder claimed.
+    //
+    // An article that engaged the sniffer but decoded nothing is not a
+    // uuencode article after all — treating it as one would hand the pipeline
+    // an empty segment for a file that never existed. It fails as a missing
+    // header instead, which is exactly what the article would have done before
+    // uuencode support existed.
     fn finish_uu_article(&mut self) -> Result<FusedYencArticle> {
         let cpu_started = self.phase_cpu_started();
         let response = self.response.take().ok_or_else(|| {
@@ -837,19 +837,19 @@ impl FusedYencArticleDecoder {
         }
     }
 
-    /// How much wire input the next decode call may take.
-    ///
-    /// The kernel needs one byte of spare capacity per input byte, so handing
-    /// it more input than the batch has room for makes it grow the batch.
-    /// With a header-sized reservation that growth is pure waste: the batch
-    /// was already sized for the whole part, and the doubling lands exactly on
-    /// the last chunk, whose decoded bytes fit the room that is left. So the
-    /// input is trimmed to the spare capacity first. Once a
-    /// sized batch is full the only truthful continuation is the trailer, so
-    /// the input is trimmed to a short probe that decodes through scratch (see
-    /// [`Self::decode_body_tail`]) rather than doubling a finished batch to
-    /// consume two bytes of line ending. An unreserved batch (no declared
-    /// size) has nothing exact to defend and keeps growing amortised as before.
+    // How much wire input the next decode call may take.
+    //
+    // The kernel needs one byte of spare capacity per input byte, so handing
+    // it more input than the batch has room for makes it grow the batch.
+    // With a header-sized reservation that growth is pure waste: the batch
+    // was already sized for the whole part, and the doubling lands exactly on
+    // the last chunk, whose decoded bytes fit the room that is left. So the
+    // input is trimmed to the spare capacity first. Once a
+    // sized batch is full the only truthful continuation is the trailer, so
+    // the input is trimmed to a short probe that decodes through scratch (see
+    // [`Self::decode_body_tail`]) rather than doubling a finished batch to
+    // consume two bytes of line ending. An unreserved batch (no declared
+    // size) has nothing exact to defend and keeps growing amortised as before.
     fn next_body_input_len(&self, available: usize) -> usize {
         let batch_room = OUTPUT_BATCH_TARGET.saturating_sub(self.output.len());
         let spare = self.output.capacity() - self.output.len();
@@ -863,20 +863,20 @@ impl FusedYencArticleDecoder {
         available.min(room)
     }
 
-    /// A batch sized from the header with no room left: the declared bytes are
-    /// all decoded, and whatever comes next is either the trailer or a lie.
+    // A batch sized from the header with no room left: the declared bytes are
+    // all decoded, and whatever comes next is either the trailer or a lie.
     fn sized_batch_is_full(&self) -> bool {
         self.output_sized && self.output.capacity() == self.output.len()
     }
 
-    /// Decode past a full sized batch without growing it.
-    ///
-    /// The kernel reserves one output byte per input byte before it looks at
-    /// the input, so feeding it the trailer through the batch doubles the
-    /// batch (and a later shrink reallocates it back) to write nothing. The
-    /// probe decodes into a small scratch instead; bytes that do come out are
-    /// a header that understated the part, and they are appended so the batch
-    /// grows amortised exactly as an unreserved one would.
+    // Decode past a full sized batch without growing it.
+    //
+    // The kernel reserves one output byte per input byte before it looks at
+    // the input, so feeding it the trailer through the batch doubles the
+    // batch (and a later shrink reallocates it back) to write nothing. The
+    // probe decodes into a small scratch instead; bytes that do come out are
+    // a header that understated the part, and they are appended so the batch
+    // grows amortised exactly as an unreserved one would.
     fn decode_body_tail(&mut self, input: &[u8]) -> Result<RapidyencDecodeProgress> {
         self.tail_scratch.clear();
         let progress =
@@ -1134,9 +1134,9 @@ mod tests {
         assert_eq!(expected_meta.defects, actual_meta.defects);
     }
 
-    /// Body of the split-point acceptance guard: the fused decoder must agree
-    /// with the streaming path, and must leave the pipelined bytes after the
-    /// NNTP terminator untouched, for *every* chunk boundary in the transcript.
+    // Body of the split-point acceptance guard: the fused decoder must agree
+    // with the streaming path, and must leave the pipelined bytes after the
+    // NNTP terminator untouched, for *every* chunk boundary in the transcript.
     fn assert_fused_matches_at_every_split_point(article: &[u8], leftover: &[u8]) {
         let transcript = transcript(article, leftover);
         // Block sizes small enough that this corpus's articles straddle many
@@ -1180,13 +1180,13 @@ mod tests {
         );
     }
 
-    /// Payload used by the broken-poster corpus: escape-heavy, dot-stuffable,
-    /// and long enough to straddle several encoded lines.
+    // Payload used by the broken-poster corpus: escape-heavy, dot-stuffable,
+    // and long enough to straddle several encoded lines.
     const BROKEN_POSTER_BODY: &[u8] = b"\x04broken poster body = with escapes\r\n\0\x04";
 
-    /// Build a single-part article with caller-supplied `=ybegin`/`=yend` lines
-    /// wrapped around a genuinely valid encoded body, so header damage is the
-    /// only variable under test. `yend` receives the true decoded size and CRC.
+    // Build a single-part article with caller-supplied `=ybegin`/`=yend` lines
+    // wrapped around a genuinely valid encoded body, so header damage is the
+    // only variable under test. `yend` receives the true decoded size and CRC.
     fn broken_poster_article(
         prologue: &[u8],
         ybegin: &[u8],
@@ -1219,7 +1219,7 @@ mod tests {
         dot_stuff_lines(&article)
     }
 
-    /// The well-formed `=yend` for [`broken_poster_article`].
+    // The well-formed `=yend` for [`broken_poster_article`].
     fn healthy_yend(size: u64, crc: u32) -> Vec<u8> {
         format!("=yend size={size} crc32={crc:08x}\r\n").into_bytes()
     }
@@ -1412,8 +1412,8 @@ mod tests {
     // pipelined response's bytes in `src` no matter where the chunk boundary
     // lands.
 
-    /// `=ybegin` is scanned for, not required on the first body line --
-    /// including junk that contains `=` and partial `=yb` prefixes.
+    // `=ybegin` is scanned for, not required on the first body line --
+    // including junk that contains `=` and partial `=yb` prefixes.
     #[test]
     fn fused_tolerates_leading_junk_at_every_split_point() {
         let prologue = b"Subject: leftover = header\r\n\
@@ -1438,8 +1438,8 @@ mod tests {
         assert_eq!(decoded.yenc_result().crc_status, CrcVerification::Verified);
     }
 
-    /// `line=`/`size=`/`name=` are all optional -- reference decoders do
-    /// not even parse `line=`. Every combination the references tolerate.
+    // `line=`/`size=`/`name=` are all optional -- reference decoders do
+    // not even parse `line=`. Every combination the references tolerate.
     #[test]
     fn fused_tolerates_every_missing_ybegin_field_combination_at_every_split_point() {
         for line_field in [None, Some("line=16")] {
@@ -1461,8 +1461,8 @@ mod tests {
         }
     }
 
-    /// A `=ybegin` whose numeric fields are unparseable degrades
-    /// exactly like one that omitted them.
+    // A `=ybegin` whose numeric fields are unparseable degrades
+    // exactly like one that omitted them.
     #[test]
     fn fused_tolerates_unparseable_ybegin_numbers_at_every_split_point() {
         let article = broken_poster_article(
@@ -1473,8 +1473,8 @@ mod tests {
         assert_fused_matches_at_every_split_point(&article, b"223 next\r\n");
     }
 
-    /// `=ypart end=` past the `=ybegin size=` file size. The part length
-    /// (end - begin + 1) is still checked against the decoded byte count.
+    // `=ypart end=` past the `=ybegin size=` file size. The part length
+    // (end - begin + 1) is still checked against the decoded byte count.
     #[test]
     fn fused_tolerates_ypart_end_past_declared_size_at_every_split_point() {
         let size = BROKEN_POSTER_BODY.len() as u64;
@@ -1494,7 +1494,7 @@ mod tests {
         assert_eq!(decoded.to_data(), BROKEN_POSTER_BODY);
     }
 
-    /// The healthy direction (`end` well inside `size`) stays defect-free.
+    // The healthy direction (`end` well inside `size`) stays defect-free.
     #[test]
     fn fused_multipart_end_below_declared_size_is_clean_at_every_split_point() {
         let size = BROKEN_POSTER_BODY.len() as u64;
@@ -1515,8 +1515,8 @@ mod tests {
         assert_eq!(decoded.yenc_result().crc_status, CrcVerification::Verified);
     }
 
-    /// A mangled `crc32=` is treated as absent, leaving the article decoded
-    /// but explicitly *unverified* -- never silently "valid".
+    // A mangled `crc32=` is treated as absent, leaving the article decoded
+    // but explicitly *unverified* -- never silently "valid".
     #[test]
     fn fused_tolerates_garbage_crc_at_every_split_point() {
         for garbage in ["nothex", "", "DEADBEEFDEADBEEF0", "1234ZZZZ", "0x1234"] {
@@ -1544,8 +1544,8 @@ mod tests {
         }
     }
 
-    /// An over-long but parseable CRC keeps its low 32 bits for posters that
-    /// emit wide hashes, and still verifies.
+    // An over-long but parseable CRC keeps its low 32 bits for posters that
+    // emit wide hashes, and still verifies.
     #[test]
     fn fused_truncates_over_long_crc_and_still_verifies() {
         let article = broken_poster_article(
@@ -1562,8 +1562,8 @@ mod tests {
         assert!(!decoded.yenc_result().defects.invalid_crc32);
     }
 
-    /// One byte-wise parser serves every entry point, so tab separators
-    /// and mixed-case field names behave identically in the fused path.
+    // One byte-wise parser serves every entry point, so tab separators
+    // and mixed-case field names behave identically in the fused path.
     #[test]
     fn fused_tolerates_tab_and_case_field_variants_at_every_split_point() {
         for ybegin in [
@@ -1576,8 +1576,8 @@ mod tests {
         }
     }
 
-    /// A 222 body that never contains `=ybegin` must fail cleanly at the NNTP
-    /// terminator instead of waiting forever for a header that is not coming.
+    // A 222 body that never contains `=ybegin` must fail cleanly at the NNTP
+    // terminator instead of waiting forever for a header that is not coming.
     #[test]
     fn fused_reports_missing_header_when_body_has_no_ybegin() {
         let mut bytes = b"222 <test@local> body follows\r\n".to_vec();
@@ -1597,8 +1597,8 @@ mod tests {
 
     // ── B7: the fused path shares the kernel's stop rule ─────────────────
 
-    /// Drive the fused decoder to completion and fail if it does not reject the
-    /// transcript, at every split point.
+    // Drive the fused decoder to completion and fail if it does not reject the
+    // transcript, at every split point.
     fn assert_fused_rejects_at_every_split_point(article: &[u8], expected_reason: &str) {
         let transcript = transcript(article, b"223 next\r\n");
 
@@ -1628,8 +1628,8 @@ mod tests {
         }
     }
 
-    /// A `\r\n=y…` line that is not `=yend`: the kernel stops there, so the
-    /// article cannot decode past it in any entry point.
+    // A `\r\n=y…` line that is not `=yend`: the kernel stops there, so the
+    // article cannot decode past it in any entry point.
     #[test]
     fn fused_rejects_stray_control_line_in_body_at_every_split_point() {
         for stray in [
@@ -1658,8 +1658,8 @@ mod tests {
         }
     }
 
-    /// A dot-stuffed trailer (`\r\n.=yend `): the kernel strips the one leading
-    /// `.` at line start, so this really is the trailer.
+    // A dot-stuffed trailer (`\r\n.=yend `): the kernel strips the one leading
+    // `.` at line start, so this really is the trailer.
     #[test]
     fn fused_finds_dot_prefixed_trailer_at_every_split_point() {
         let base = broken_poster_article(
@@ -1687,8 +1687,8 @@ mod tests {
 
     // ── E19: pre-reservation for oversized articles ──────────────────────
 
-    /// An article whose declared size exceeds the 16 MiB cap used to get *no*
-    /// pre-reservation at all. It must reserve a batch and grow from there.
+    // An article whose declared size exceeds the 16 MiB cap used to get *no*
+    // pre-reservation at all. It must reserve a batch and grow from there.
     #[test]
     fn fused_reserves_output_for_articles_larger_than_the_cap() {
         for size in [OUTPUT_BATCH_TARGET as u64, MAX_ARTICLE_RESERVE as u64 * 2] {
@@ -1714,9 +1714,9 @@ mod tests {
 
     // ── E20: a sized batch is allocated once ─────────────────────────────
 
-    /// A truthful header's batch is sized once and never touched again: not
-    /// mid-article, and not on the finishing call that consumes the trailer,
-    /// where the kernel's own reserve used to double it for nothing.
+    // A truthful header's batch is sized once and never touched again: not
+    // mid-article, and not on the finishing call that consumes the trailer,
+    // where the kernel's own reserve used to double it for nothing.
     #[test]
     fn fused_never_grows_a_sized_batch_for_a_truthful_header() {
         for size in [37usize, 4096, 100 * 1024 + 7, OUTPUT_BATCH_TARGET + 999] {
@@ -1757,9 +1757,9 @@ mod tests {
         }
     }
 
-    /// A header that understates its part fills the sized batch early. The
-    /// tail probe must carry the extra bytes into the batch (growing it, and
-    /// saying so) rather than losing them, so the size check sees the truth.
+    // A header that understates its part fills the sized batch early. The
+    // tail probe must carry the extra bytes into the batch (growing it, and
+    // saying so) rather than losing them, so the size check sees the truth.
     #[test]
     fn fused_grows_past_a_sized_batch_only_when_the_header_lied() {
         let original: Vec<u8> = (0..5000usize).map(|idx| (idx % 251) as u8).collect();
@@ -1787,9 +1787,9 @@ mod tests {
 
     // ── E12: decoded batches are delivered as they are produced ──────────
 
-    /// The decoder's batches are its streaming contract: draining them as they
-    /// appear must reproduce the buffered article exactly, in order, wherever
-    /// the chunk boundary lands.
+    // The decoder's batches are its streaming contract: draining them as they
+    // appear must reproduce the buffered article exactly, in order, wherever
+    // the chunk boundary lands.
     #[test]
     fn fused_batches_drain_in_order_at_every_split_point() {
         let original = b"\x04batched body with = escapes \0\r\n";
@@ -1825,8 +1825,8 @@ mod tests {
         }
     }
 
-    /// The same, for an article large enough to cross the batch target: the
-    /// batches really do arrive before the article is finished.
+    // The same, for an article large enough to cross the batch target: the
+    // batches really do arrive before the article is finished.
     #[test]
     fn fused_delivers_multiple_batches_before_the_article_finishes() {
         let mut original = Vec::with_capacity(2 * OUTPUT_BATCH_TARGET + 123);
@@ -1976,7 +1976,7 @@ mod tests {
 
     // ---- uuencode sniffing and routing ----
 
-    /// Encode `data` as a uuencode body, optionally with a `begin` header.
+    // Encode `data` as a uuencode body, optionally with a `begin` header.
     fn uu_body(data: &[u8], name: Option<&str>) -> Vec<u8> {
         let mut body = Vec::new();
         if let Some(name) = name {

@@ -1,0 +1,24 @@
+[package]
+name = "tunnel-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "SSH and WireGuard endpoints for the Weaver advanced-networking e2e flows"
+
+# A workspace of its own. The Weaver image builds from the repository root
+# with `e2e` excluded from the build context, so this crate must never be a
+# member of the product workspace. It depends on nothing from Weaver: the
+# doubles come straight from proxy-tunnels at the revision Weaver pins.
+[workspace]
+
+[dependencies]
+# Keep this rev identical to engines/weaver-tunnel/Cargo.toml.
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", rev = "c467e8952f29940c4f07d9f57adbff981d990a88", features = ["test-support"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+base64 = "0.22"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time", "test-util"] }

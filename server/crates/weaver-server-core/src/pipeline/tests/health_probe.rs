@@ -560,13 +560,13 @@ async fn missed_probe_rearms_on_next_failed_byte() {
     assert!(matches!(state.status, JobStatus::Downloading));
 }
 
-/// A probe still in flight must not postpone PAR2 recovery promotion.
-///
-/// A volume the poster never uploaded leaves the job with nothing more to
-/// download and a probe running against a soft timeout. The completion
-/// checkpoint is what promotes the recovery blocks that repair the hole, and
-/// counting the probe as pending pipeline work held that promotion — and every
-/// second of repair and extraction behind it — until the probe gave up.
+// A probe still in flight must not postpone PAR2 recovery promotion.
+//
+// A volume the poster never uploaded leaves the job with nothing more to
+// download and a probe running against a soft timeout. The completion
+// checkpoint is what promotes the recovery blocks that repair the hole, and
+// counting the probe as pending pipeline work held that promotion — and every
+// second of repair and extraction behind it — until the probe gave up.
 #[tokio::test]
 async fn health_probe_in_flight_does_not_delay_recovery_promotion() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -720,13 +720,13 @@ async fn health_probe_in_flight_does_not_delay_recovery_promotion() {
     );
 }
 
-/// Retiring the probe must not leave an unrecoverable job parked.
-///
-/// Before the probe was retired at drain time, a job with no recovery data and
-/// articles it could never fetch reached its failure through the probe's own
-/// verdict. With the probe retired instead, the completion checkpoint has to
-/// carry that verdict on its own: the pass is over, files are still short, and
-/// nothing can repair them.
+// Retiring the probe must not leave an unrecoverable job parked.
+//
+// Before the probe was retired at drain time, a job with no recovery data and
+// articles it could never fetch reached its failure through the probe's own
+// verdict. With the probe retired instead, the completion checkpoint has to
+// carry that verdict on its own: the pass is over, files are still short, and
+// nothing can repair them.
 #[tokio::test]
 async fn a_retired_probe_still_lets_an_unrecoverable_job_fail() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -783,17 +783,17 @@ async fn a_retired_probe_still_lets_an_unrecoverable_job_fail() {
     );
 }
 
-/// The decode that settles last must retire the probe, not just the download
-/// result that preceded it.
-///
-/// Live ordering, which the drain-time tests above never reproduce: the last
-/// article's download result is processed while its decode is still queued.
-/// The drain sequence therefore runs with an unsettled decode on the books —
-/// pending download work by definition — and correctly refuses to retire the
-/// probe. If nothing re-runs it when that decode lands, the job sits in
-/// `Checking` behind a probe with nothing left to say until the probe's own
-/// soft timeout fires, holding the completion checkpoint and PAR2 recovery
-/// promotion for the whole of it.
+// The decode that settles last must retire the probe, not just the download
+// result that preceded it.
+//
+// Live ordering, which the drain-time tests above never reproduce: the last
+// article's download result is processed while its decode is still queued.
+// The drain sequence therefore runs with an unsettled decode on the books —
+// pending download work by definition — and correctly refuses to retire the
+// probe. If nothing re-runs it when that decode lands, the job sits in
+// `Checking` behind a probe with nothing left to say until the probe's own
+// soft timeout fires, holding the completion checkpoint and PAR2 recovery
+// promotion for the whole of it.
 #[tokio::test]
 async fn the_last_decode_to_settle_retires_the_probe() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -863,11 +863,11 @@ const PROBE_POLICY_PAYLOAD: &str = "silver.horizon.part01.rar";
 const PROBE_POLICY_INDEX: &str = "silver.horizon.par2";
 const PROBE_POLICY_VOLUME: &str = "silver.horizon.vol00+08.par2";
 
-/// A posting with a recovery set: one payload file in eight 64-byte articles,
-/// the set's index, and one recovery volume.
-///
-/// Returns the spec alongside the payload bytes and the index bytes, because
-/// both are needed to install a matching PAR2 runtime.
+// A posting with a recovery set: one payload file in eight 64-byte articles,
+// the set's index, and one recovery volume.
+//
+// Returns the spec alongside the payload bytes and the index bytes, because
+// both are needed to install a matching PAR2 runtime.
 fn probe_policy_par2_job(name: &str) -> (JobSpec, Vec<u8>, Vec<u8>) {
     let payload: Vec<u8> = (0..512u32).map(|value| (value % 251) as u8).collect();
     let index_bytes = build_test_par2_index(PROBE_POLICY_PAYLOAD, &payload, 64);
@@ -930,14 +930,14 @@ fn probe_policy_payload_segment(job_id: JobId, segment_number: u32) -> SegmentId
     }
 }
 
-/// One withheld volume against a recovery set that covers it must not probe.
-///
-/// The probe exists to recognise a release nobody uploaded early enough to
-/// abandon it. A single file lost out of a posting whose PAR2 set already
-/// carries more blocks than the hole needs is not that: the answer is known,
-/// the repair is already scheduled, and the sample would spend round trips
-/// re-deriving a verdict the recovery set has settled. Take the coverage away
-/// and the same damage is worth asking about again.
+// One withheld volume against a recovery set that covers it must not probe.
+//
+// The probe exists to recognise a release nobody uploaded early enough to
+// abandon it. A single file lost out of a posting whose PAR2 set already
+// carries more blocks than the hole needs is not that: the answer is known,
+// the repair is already scheduled, and the sample would spend round trips
+// re-deriving a verdict the recovery set has settled. Take the coverage away
+// and the same damage is worth asking about again.
 #[tokio::test]
 async fn par2_capacity_covering_the_damage_suppresses_the_probe() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1001,13 +1001,13 @@ async fn par2_capacity_covering_the_damage_suppresses_the_probe() {
     );
 }
 
-/// One file failing while the rest of the job lands is not a dead release.
-///
-/// This is the withheld-volume shape without a recovery set to settle it, and
-/// it is the case the 2% threshold on its own got wrong: a job that has
-/// delivered most of its bytes and lost one file is healthy enough that a
-/// sample tells nobody anything. A release that really is gone looks the other
-/// way round — the failures run far ahead of what has landed.
+// One file failing while the rest of the job lands is not a dead release.
+//
+// This is the withheld-volume shape without a recovery set to settle it, and
+// it is the case the 2% threshold on its own got wrong: a job that has
+// delivered most of its bytes and lost one file is healthy enough that a
+// sample tells nobody anything. A release that really is gone looks the other
+// way round — the failures run far ahead of what has landed.
 #[tokio::test]
 async fn a_single_file_failing_while_the_job_lands_does_not_probe() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1046,8 +1046,8 @@ async fn a_single_file_failing_while_the_job_lands_does_not_probe() {
     );
 }
 
-/// Damage spread across files with no recovery data probes, and a round that
-/// comes back entirely missing abandons the job.
+// Damage spread across files with no recovery data probes, and a round that
+// comes back entirely missing abandons the job.
 #[tokio::test]
 async fn damage_across_files_without_recovery_probes_and_all_missing_aborts() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1090,15 +1090,15 @@ async fn damage_across_files_without_recovery_probes_and_all_missing_aborts() {
     assert!(error.contains("all 10 samples missing"), "{error}");
 }
 
-/// The first booked failure promotes recovery, without a checkpoint.
-///
-/// Recovery blocks used to sit parked in the job's recovery queue until the
-/// completion checkpoint ran, which is after the whole payload has settled — so
-/// the articles a repair cannot start without were fetched strictly after every
-/// byte they were meant to overlap with. Damage is known the moment a segment
-/// is booked terminal, and so is the capacity of a loaded recovery set, so the
-/// promotion happens there instead and the blocks ride the same lanes as the
-/// payload.
+// The first booked failure promotes recovery, without a checkpoint.
+//
+// Recovery blocks used to sit parked in the job's recovery queue until the
+// completion checkpoint ran, which is after the whole payload has settled — so
+// the articles a repair cannot start without were fetched strictly after every
+// byte they were meant to overlap with. Damage is known the moment a segment
+// is booked terminal, and so is the capacity of a loaded recovery set, so the
+// promotion happens there instead and the blocks ride the same lanes as the
+// payload.
 #[tokio::test]
 async fn booked_damage_promotes_recovery_before_any_checkpoint() {
     let temp_dir = tempfile::tempdir().unwrap();

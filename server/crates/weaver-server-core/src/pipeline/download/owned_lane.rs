@@ -8,24 +8,24 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 
-/// How long a lane-side probe waits for a worker to pick its request up.
-///
-/// An idle worker picks up immediately. This only bounds the case where the
-/// worker took a lease between the idle marker being read and the request
-/// arriving: rather than sit behind a whole lease, the probe gives up on that
-/// worker and tries the next one, or the async client. It bounds the pickup
-/// alone, never the answer: once a lane has taken the batch its STAT and HEAD
-/// round trips take as long as the wire takes, and a far provider must not be
-/// mistaken for a busy one.
+// How long a lane-side probe waits for a worker to pick its request up.
+//
+// An idle worker picks up immediately. This only bounds the case where the
+// worker took a lease between the idle marker being read and the request
+// arriving: rather than sit behind a whole lease, the probe gives up on that
+// worker and tries the next one, or the async client. It bounds the pickup
+// alone, never the answer: once a lane has taken the batch its STAT and HEAD
+// round trips take as long as the wire takes, and a far provider must not be
+// mistaken for a busy one.
 const LANE_PROBE_PICKUP_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// How long a probe waits for a *busy* lane to take it up.
-///
-/// A busy worker looks at its commands once per ring response, and at the
-/// dry point it sits on the actor's refill answer for up to the idle hold, so
-/// the pickup is bounded by one article's transfer plus that hold. The wait
-/// pays off: the alternative is a cold dial for a permit the busy lanes are
-/// holding, which never completes while they are.
+// How long a probe waits for a *busy* lane to take it up.
+//
+// A busy worker looks at its commands once per ring response, and at the
+// dry point it sits on the actor's refill answer for up to the idle hold, so
+// the pickup is bounded by one article's transfer plus that hold. The wait
+// pays off: the alternative is a cold dial for a permit the busy lanes are
+// holding, which never completes while they are.
 const LANE_PROBE_BUSY_PICKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) struct OwnedDownloadLanePool {
@@ -34,60 +34,60 @@ pub(crate) struct OwnedDownloadLanePool {
     reset_calls: AtomicUsize,
 }
 
-/// Everything the pool and its workers agree on: who is idle, what connection
-/// each idle worker is holding, and the runs no worker was free to take.
-///
-/// One lock rather than a marker per worker, because the two decisions that
-/// matter are joint ones. A submit has to pick a worker *and* mark it taken in
-/// the same breath, or two submits choose the same lane; a worker has to look
-/// for queued work *and* publish itself idle in the same breath, or a run is
-/// pushed into the gap between the two and waits for a wake-up that has
-/// already happened. It is taken at lease boundaries only — never per article.
+// Everything the pool and its workers agree on: who is idle, what connection
+// each idle worker is holding, and the runs no worker was free to take.
+//
+// One lock rather than a marker per worker, because the two decisions that
+// matter are joint ones. A submit has to pick a worker *and* mark it taken in
+// the same breath, or two submits choose the same lane; a worker has to look
+// for queued work *and* publish itself idle in the same breath, or a run is
+// pushed into the gap between the two and waits for a wake-up that has
+// already happened. It is taken at lease boundaries only — never per article.
 struct OwnedLanePoolShared {
     workers: Vec<OwnedLaneWorkerSlot>,
-    /// Jobs whose probe batch asked every lane and got no pickup.
-    ///
-    /// Read by the dispatch eligibility walk, which withholds the job's next
-    /// handout while it is in here, so the next lane to come free finds no
-    /// work waiting for it and takes the probe instead. No lane is reserved
-    /// and no count changes: the job simply stops being offered the one
-    /// handout its own probe is waiting behind.
+    // Jobs whose probe batch asked every lane and got no pickup.
+    //
+    // Read by the dispatch eligibility walk, which withholds the job's next
+    // handout while it is in here, so the next lane to come free finds no
+    // work waiting for it and takes the probe instead. No lane is reserved
+    // and no count changes: the job simply stops being offered the one
+    // handout its own probe is waiting behind.
     probe_starved_jobs: std::collections::HashSet<u64>,
-    /// Runs that arrived while every worker was busy. Whichever worker
-    /// finishes first drains this before it publishes itself idle, so a lease
-    /// never sits behind one busy worker's private channel.
+    // Runs that arrived while every worker was busy. Whichever worker
+    // finishes first drains this before it publishes itself idle, so a lease
+    // never sits behind one busy worker's private channel.
     queued_runs: VecDeque<Box<OwnedLaneRun>>,
 }
 
 struct OwnedLaneWorkerSlot {
     sender: std_mpsc::Sender<OwnedLanePoolCommand>,
-    /// `Some` while the worker sits between runs and no run has been routed to
-    /// it yet. Taking it is the claim: two concurrent submits cannot choose
-    /// the same worker, and a worker that is already spoken for is not offered
-    /// a second lease.
+    // `Some` while the worker sits between runs and no run has been routed to
+    // it yet. Taking it is the claim: two concurrent submits cannot choose
+    // the same worker, and a worker that is already spoken for is not offered
+    // a second lease.
     idle: Option<IdleOwnedLaneWorker>,
-    /// The server a running worker's connection belongs to, published once
-    /// its lease has a connection and cleared when it is back at the lease
-    /// boundary. It is how a probe reaches a server none of the idle lanes
-    /// is holding: the worker answers on its own socket once its ring has
-    /// drained, which costs the probe one drain and the lease nothing.
+    // The server a running worker's connection belongs to, published once
+    // its lease has a connection and cleared when it is back at the lease
+    // boundary. It is how a probe reaches a server none of the idle lanes
+    // is holding: the worker answers on its own socket once its ring has
+    // drained, which costs the probe one drain and the lease nothing.
     busy_server: Option<usize>,
 }
 
 #[derive(Clone, Default)]
 struct IdleOwnedLaneWorker {
-    /// The connection this worker kept across its park, when it kept one.
+    // The connection this worker kept across its park, when it kept one.
     lane: Option<IdleOwnedLane>,
 }
 
-/// What an idle worker's cached connection can serve, published so a submit
-/// can route to it without touching the worker.
+// What an idle worker's cached connection can serve, published so a submit
+// can route to it without touching the worker.
 #[derive(Clone)]
 struct IdleOwnedLane {
-    /// The client the connection belongs to. Weak, so a published marker never
-    /// keeps a retired client alive: the worker itself holds the strong
-    /// reference for exactly as long as the connection is cached, and a marker
-    /// whose client is gone simply matches nothing.
+    // The client the connection belongs to. Weak, so a published marker never
+    // keeps a retired client alive: the worker itself holds the strong
+    // reference for exactly as long as the connection is cached, and a marker
+    // whose client is gone simply matches nothing.
     nntp: std::sync::Weak<weaver_nntp::NntpClient>,
     server: weaver_nntp::pool::ServerId,
 }
@@ -100,16 +100,16 @@ impl IdleOwnedLane {
         }
     }
 
-    /// Whether this connection could take `run` without redialling.
-    ///
-    /// Deliberately cheap and deliberately advisory: it asks only what can be
-    /// answered from the published marker — same client and a server the
-    /// lease does not exclude. The newsgroups the connection was opened for do
-    /// not matter: the worker re-points its socket at the lease's groups when
-    /// they differ. Quota and health are the worker's own
-    /// `CachedOwnedLane::matches` check, which runs against live state a
-    /// moment later; guessing wrong here costs a park and a dial on a worker
-    /// that had nothing better to do, never a wrong fetch.
+    // Whether this connection could take `run` without redialling.
+    //
+    // Deliberately cheap and deliberately advisory: it asks only what can be
+    // answered from the published marker — same client and a server the
+    // lease does not exclude. The newsgroups the connection was opened for do
+    // not matter: the worker re-points its socket at the lease's groups when
+    // they differ. Quota and health are the worker's own
+    // `CachedOwnedLane::matches` check, which runs against live state a
+    // moment later; guessing wrong here costs a park and a dial on a worker
+    // that had nothing better to do, never a wrong fetch.
     fn serves(&self, run: &OwnedLaneRun) -> bool {
         self.nntp
             .upgrade()
@@ -121,49 +121,49 @@ impl IdleOwnedLane {
     }
 }
 
-/// Cloneable view of the owned-lane pool that the health probe uses to ask an
-/// idle lane a STAT batch on the connection it is already holding.
-///
-/// Owned lanes hold their server's connection permits for as long as they are
-/// cached, which is the point: a lane that keeps its socket starts its next
-/// lease with no dial at all. The cost used to fall on the probe, which had to
-/// prise a permit loose and open its own connection — four and a half round
-/// trips of TCP, TLS, greeting and authentication before its first STAT. Now
-/// it borrows the lane's connection for the length of one batch instead.
+// Cloneable view of the owned-lane pool that the health probe uses to ask an
+// idle lane a STAT batch on the connection it is already holding.
+//
+// Owned lanes hold their server's connection permits for as long as they are
+// cached, which is the point: a lane that keeps its socket starts its next
+// lease with no dial at all. The cost used to fall on the probe, which had to
+// prise a permit loose and open its own connection — four and a half round
+// trips of TCP, TLS, greeting and authentication before its first STAT. Now
+// it borrows the lane's connection for the length of one batch instead.
 #[derive(Clone)]
 pub(crate) struct OwnedLaneProbeHandle {
     shared: Arc<std::sync::Mutex<OwnedLanePoolShared>>,
-    /// The job whose release this probe is sampling. A starved batch asks
-    /// dispatch to hold *this* job back, because it is the job holding every
-    /// lane the batch could have used.
+    // The job whose release this probe is sampling. A starved batch asks
+    // dispatch to hold *this* job back, because it is the job holding every
+    // lane the batch could have used.
     job_id: u64,
 }
 
 impl OwnedLaneProbeHandle {
-    /// Existence for a batch of message-ids, answered on idle owned lanes.
-    ///
-    /// Returns `None` when no owned lane could answer at all, which is the
-    /// caller's signal to fall back to the async client. Otherwise the result
-    /// has the same shape as the client's own probe, and `servers_settled`
-    /// names the servers whose lanes answered conclusively, so the caller can
-    /// tell which servers a miss has already been put to.
-    ///
-    /// # Every lane at once
-    ///
-    /// The servers are asked **concurrently**, and the reason is what this
-    /// probe is usually waiting for. A missing article is only missing once
-    /// every configured server has said so, and each answer is one pipelined
-    /// STAT batch — one round trip — plus, for a lane that took a lease
-    /// between its idle marker being read and the request arriving, up to
-    /// [`LANE_PROBE_PICKUP_TIMEOUT`] of waiting for a pickup that never comes.
-    /// Asked one after another those add up: the verdict costs the *sum* over
-    /// servers where the wire only requires the *maximum*, and the recovery
-    /// that verdict releases waits out the difference.
-    ///
-    /// The cost of asking at once is that each server is asked about the whole
-    /// batch rather than only what the servers before it could not find. That
-    /// is bytes in a single write, not round trips, and it buys back an answer
-    /// that no longer scales with the number of providers configured.
+    // Existence for a batch of message-ids, answered on idle owned lanes.
+    //
+    // Returns `None` when no owned lane could answer at all, which is the
+    // caller's signal to fall back to the async client. Otherwise the result
+    // has the same shape as the client's own probe, and `servers_settled`
+    // names the servers whose lanes answered conclusively, so the caller can
+    // tell which servers a miss has already been put to.
+    //
+    // # Every lane at once
+    //
+    // The servers are asked **concurrently**, and the reason is what this
+    // probe is usually waiting for. A missing article is only missing once
+    // every configured server has said so, and each answer is one pipelined
+    // STAT batch — one round trip — plus, for a lane that took a lease
+    // between its idle marker being read and the request arriving, up to
+    // [`LANE_PROBE_PICKUP_TIMEOUT`] of waiting for a pickup that never comes.
+    // Asked one after another those add up: the verdict costs the *sum* over
+    // servers where the wire only requires the *maximum*, and the recovery
+    // that verdict releases waits out the difference.
+    //
+    // The cost of asking at once is that each server is asked about the whole
+    // batch rather than only what the servers before it could not find. That
+    // is bytes in a single write, not round trips, and it buys back an answer
+    // that no longer scales with the number of providers configured.
     async fn probe(&self, message_ids: &[String]) -> Option<LaneProbeOutcome> {
         if message_ids.is_empty() {
             return Some(LaneProbeOutcome {
@@ -225,10 +225,10 @@ impl OwnedLaneProbeHandle {
             .await
     }
 
-    /// Put one batch to every candidate lane at once and fold their answers.
-    ///
-    /// `None` when not one of them answered, which is what separates "no lane
-    /// would take it" from "the lanes took it and it was inconclusive".
+    // Put one batch to every candidate lane at once and fold their answers.
+    //
+    // `None` when not one of them answered, which is what separates "no lane
+    // would take it" from "the lanes took it and it was inconclusive".
     async fn ask_lanes(
         &self,
         candidates: &[(usize, std_mpsc::Sender<OwnedLanePoolCommand>, Duration)],
@@ -281,7 +281,7 @@ impl OwnedLaneProbeHandle {
         })
     }
 
-    /// Ask dispatch to withhold this job's next handout until the guard drops.
+    // Ask dispatch to withhold this job's next handout until the guard drops.
     pub(in crate::pipeline) fn hold_dispatch_for_starved_probe(&self) -> StarvedProbeYield {
         lock_pool(&self.shared)
             .probe_starved_jobs
@@ -296,15 +296,15 @@ impl OwnedLaneProbeHandle {
         }
     }
 
-    /// Puts one batch to one lane and waits for its verdict.
-    ///
-    /// `None` covers every way a lane can decline to answer — a worker that
-    /// has gone away, one that did not pick the request up inside
-    /// `pickup` because it took a lease or is still reading a ring, and one
-    /// that dropped the request — none of which is a verdict about the
-    /// articles. The timeout bounds the pickup alone: once a lane has taken
-    /// the batch, its STAT and HEAD round trips take as long as the wire
-    /// takes, and a busy lane's drain comes before them.
+    // Puts one batch to one lane and waits for its verdict.
+    //
+    // `None` covers every way a lane can decline to answer — a worker that
+    // has gone away, one that did not pick the request up inside
+    // `pickup` because it took a lease or is still reading a ring, and one
+    // that dropped the request — none of which is a verdict about the
+    // articles. The timeout bounds the pickup alone: once a lane has taken
+    // the batch, its STAT and HEAD round trips take as long as the wire
+    // takes, and a busy lane's drain comes before them.
     async fn ask_lane(
         sender: std_mpsc::Sender<OwnedLanePoolCommand>,
         message_ids: Arc<[String]>,
@@ -325,8 +325,8 @@ impl OwnedLaneProbeHandle {
         reply_rx.await.ok().flatten()
     }
 
-    /// Every worker that is mid-lease on a connection it has published the
-    /// server of. One that is still dialling has nothing to answer on yet.
+    // Every worker that is mid-lease on a connection it has published the
+    // server of. One that is still dialling has nothing to answer on yet.
     fn busy_workers(&self) -> Vec<(usize, std_mpsc::Sender<OwnedLanePoolCommand>)> {
         let shared = lock_pool(&self.shared);
         shared
@@ -337,8 +337,8 @@ impl OwnedLaneProbeHandle {
             .collect()
     }
 
-    /// Every worker that is currently idle, with the server index of the
-    /// connection it kept — `None` when it sits idle without one.
+    // Every worker that is currently idle, with the server index of the
+    // connection it kept — `None` when it sits idle without one.
     fn idle_workers(&self) -> Vec<(Option<usize>, std_mpsc::Sender<OwnedLanePoolCommand>)> {
         let shared = lock_pool(&self.shared);
         shared
@@ -354,18 +354,18 @@ impl OwnedLaneProbeHandle {
             .collect()
     }
 
-    /// Existence for a batch, preferring idle owned lanes and falling back to
-    /// the async client for whatever they could not settle.
-    ///
-    /// The fallback is deliberately narrow: it runs only when no lane answered
-    /// at all, when a lane could not settle its batch, or when some usable
-    /// server has no idle lane and could still hold an article the settled
-    /// servers do not — and then it asks only those servers. The ones whose
-    /// lanes have answered are left out, because their connection permits are
-    /// exactly what those idle lanes are holding: queueing behind them would
-    /// wait out the client's whole acquire deadline for a verdict already in
-    /// hand. A miss that every usable server has been asked about is final,
-    /// and costs no connection.
+    // Existence for a batch, preferring idle owned lanes and falling back to
+    // the async client for whatever they could not settle.
+    //
+    // The fallback is deliberately narrow: it runs only when no lane answered
+    // at all, when a lane could not settle its batch, or when some usable
+    // server has no idle lane and could still hold an article the settled
+    // servers do not — and then it asks only those servers. The ones whose
+    // lanes have answered are left out, because their connection permits are
+    // exactly what those idle lanes are holding: queueing behind them would
+    // wait out the client's whole acquire deadline for a verdict already in
+    // hand. A miss that every usable server has been asked about is final,
+    // and costs no connection.
     pub(crate) async fn confirm_exists_for_probe(
         &self,
         nntp: &weaver_nntp::NntpClient,
@@ -418,11 +418,11 @@ impl OwnedLaneProbeHandle {
     }
 }
 
-/// The withheld handout, for as long as a starved probe batch needs it.
-///
-/// A guard rather than a pair of calls so the hold cannot outlive the batch:
-/// every way out of the retry — an answer, a second timeout, a dropped future
-/// — releases it.
+// The withheld handout, for as long as a starved probe batch needs it.
+//
+// A guard rather than a pair of calls so the hold cannot outlive the batch:
+// every way out of the retry — an answer, a second timeout, a dropped future
+// — releases it.
 pub(in crate::pipeline) struct StarvedProbeYield {
     shared: Arc<std::sync::Mutex<OwnedLanePoolShared>>,
     job_id: u64,
@@ -436,12 +436,12 @@ impl Drop for StarvedProbeYield {
     }
 }
 
-/// What the idle owned lanes could say about one probe batch.
+// What the idle owned lanes could say about one probe batch.
 struct LaneProbeOutcome {
     result: weaver_nntp::client::ProbeBatchResult,
-    /// Server indexes whose lanes answered conclusively, so the caller knows
-    /// which providers a miss has actually been put to and need not be asked
-    /// again.
+    // Server indexes whose lanes answered conclusively, so the caller knows
+    // which providers a miss has actually been put to and need not be asked
+    // again.
     servers_settled: Vec<usize>,
 }
 
@@ -457,33 +457,33 @@ enum OwnedLanePoolCommand {
     Run(Box<OwnedLaneRun>),
     Reset,
     RecallSocket(u64),
-    /// Open a connection now, before there is work for it.
-    ///
-    /// A job whose first wave is held to a barrier — the PAR2 index bootstrap
-    /// is the standing case — leases one batch and leaves every other worker
-    /// with nothing to dial for. The handshakes are then paid one after the
-    /// other as the barrier lifts, and the first payload BODY of each lane
-    /// waits out a TCP, TLS, greeting and authentication exchange that had
-    /// nothing to wait for. Warming turns those into a connection the lane is
-    /// already holding when its first lease arrives.
-    ///
-    /// A warm lane is an idle lane: it is not counted as an active download
-    /// connection anywhere, and if no lease ever comes it parks with the rest.
+    // Open a connection now, before there is work for it.
+    //
+    // A job whose first wave is held to a barrier — the PAR2 index bootstrap
+    // is the standing case — leases one batch and leaves every other worker
+    // with nothing to dial for. The handshakes are then paid one after the
+    // other as the barrier lifts, and the first payload BODY of each lane
+    // waits out a TCP, TLS, greeting and authentication exchange that had
+    // nothing to wait for. Warming turns those into a connection the lane is
+    // already holding when its first lease arrives.
+    //
+    // A warm lane is an idle lane: it is not counted as an active download
+    // connection anywhere, and if no lease ever comes it parks with the rest.
     Warm(Box<OwnedLaneWarm>),
-    /// Answer an existence probe on this worker's cached connection. The reply
-    /// is `None` when the worker has no cached lane to answer with.
+    // Answer an existence probe on this worker's cached connection. The reply
+    // is `None` when the worker has no cached lane to answer with.
     Probe {
         message_ids: Arc<[String]>,
-        /// Signalled the moment the worker takes the request up. A caller
-        /// that has stopped listening by then has moved on, and the request
-        /// is dropped rather than answered into the void.
+        // Signalled the moment the worker takes the request up. A caller
+        // that has stopped listening by then has moved on, and the request
+        // is dropped rather than answered into the void.
         picked_up: oneshot::Sender<()>,
         reply: oneshot::Sender<Option<weaver_nntp::client::ProbeBatchResult>>,
     },
 }
 
-/// A probe a worker has taken up mid-lease: the ids to look for, and the
-/// channel its verdict is owed on once the lane's ring has drained.
+// A probe a worker has taken up mid-lease: the ids to look for, and the
+// channel its verdict is owed on once the lane's ring has drained.
 type PendingProbe = (
     Arc<[String]>,
     oneshot::Sender<Option<weaver_nntp::client::ProbeBatchResult>>,
@@ -494,8 +494,8 @@ struct CachedOwnedLane {
     lane: weaver_nntp::blocking::BlockingBodyLane,
 }
 
-/// What a warm dial needs: the connection a lease for this job would have
-/// asked for.
+// What a warm dial needs: the connection a lease for this job would have
+// asked for.
 pub(crate) struct OwnedLaneWarm {
     nntp: Arc<weaver_nntp::NntpClient>,
     exclude_servers: Arc<[usize]>,
@@ -511,17 +511,17 @@ fn lock_pool(
 }
 
 impl OwnedLanePoolShared {
-    /// Route one run to the worker that can start it soonest, and claim that
-    /// worker so a concurrent submit cannot pick it too.
-    ///
-    /// The order is the cost of starting, not fairness. A worker whose cached
-    /// connection already serves this lease starts on the first round trip; a
-    /// worker with no connection pays one dial; a worker holding a connection
-    /// this lease cannot use pays a park and then that dial. Rotating instead
-    /// of routing is what made a promoted recovery lease land on an arbitrary
-    /// worker while the connection it wanted sat idle on another — and, since
-    /// those idle connections hold every server permit, made the dial it fell
-    /// back to fail for capacity.
+    // Route one run to the worker that can start it soonest, and claim that
+    // worker so a concurrent submit cannot pick it too.
+    //
+    // The order is the cost of starting, not fairness. A worker whose cached
+    // connection already serves this lease starts on the first round trip; a
+    // worker with no connection pays one dial; a worker holding a connection
+    // this lease cannot use pays a park and then that dial. Rotating instead
+    // of routing is what made a promoted recovery lease land on an arbitrary
+    // worker while the connection it wanted sat idle on another — and, since
+    // those idle connections hold every server permit, made the dial it fell
+    // back to fail for capacity.
     fn claim_worker_for(&mut self, run: &OwnedLaneRun) -> Option<usize> {
         let matching = self.workers.iter().position(|worker| {
             worker
@@ -541,12 +541,12 @@ impl OwnedLanePoolShared {
         Some(index)
     }
 
-    /// Take a run this worker should start now, or publish it idle.
-    ///
-    /// The two are one decision: a worker that looked for queued work, found
-    /// none and then published itself idle would leave a window in which a
-    /// submit sees no idle worker, queues its run, and waits for a worker that
-    /// is already asleep.
+    // Take a run this worker should start now, or publish it idle.
+    //
+    // The two are one decision: a worker that looked for queued work, found
+    // none and then published itself idle would leave a window in which a
+    // submit sees no idle worker, queues its run, and waits for a worker that
+    // is already asleep.
     fn take_queued_run_or_publish_idle(
         &mut self,
         index: usize,
@@ -566,15 +566,15 @@ impl OwnedLanePoolShared {
         None
     }
 
-    /// Publish the server a running worker's connection belongs to.
+    // Publish the server a running worker's connection belongs to.
     fn note_busy_server(&mut self, index: usize, server: Option<usize>) {
         if let Some(worker) = self.workers.get_mut(index) {
             worker.busy_server = server;
         }
     }
 
-    /// Update what an already-idle worker is holding. A worker that has been
-    /// claimed since is left alone: its next run is already on the way.
+    // Update what an already-idle worker is holding. A worker that has been
+    // claimed since is left alone: its next run is already on the way.
     fn note_idle_lane(&mut self, index: usize, lane: Option<IdleOwnedLane>) {
         if let Some(worker) = self.workers.get_mut(index)
             && let Some(idle) = worker.idle.as_mut()
@@ -589,8 +589,8 @@ impl OwnedLanePoolShared {
         }
     }
 
-    /// Idle workers with no connection, in pool order — the ones a warm can
-    /// give a head start without disturbing anything.
+    // Idle workers with no connection, in pool order — the ones a warm can
+    // give a head start without disturbing anything.
     fn idle_workers_without_a_lane(
         &self,
         limit: usize,
@@ -641,14 +641,14 @@ impl OwnedDownloadLanePool {
         }
     }
 
-    /// Whether this job's probe is waiting for a lane none of them would give
-    /// it. Read by the dispatch eligibility walk.
+    // Whether this job's probe is waiting for a lane none of them would give
+    // it. Read by the dispatch eligibility walk.
     pub(crate) fn probe_is_starved_by(&self, job_id: u64) -> bool {
         lock_pool(&self.shared).probe_starved_jobs.contains(&job_id)
     }
 
-    /// The servers of the connections idle workers are keeping, one entry
-    /// per idle worker; `None` for a worker idle without a connection.
+    // The servers of the connections idle workers are keeping, one entry
+    // per idle worker; `None` for a worker idle without a connection.
     pub(crate) fn idle_lane_servers(&self) -> Vec<Option<usize>> {
         let shared = lock_pool(&self.shared);
         shared
@@ -670,8 +670,8 @@ impl OwnedDownloadLanePool {
         self.reset_calls.load(Ordering::Relaxed)
     }
 
-    /// Fence queued runs before workers can take another retired-client lease.
-    /// The actor returns these unstarted leases without charging article retries.
+    // Fence queued runs before workers can take another retired-client lease.
+    // The actor returns these unstarted leases without charging article retries.
     pub(crate) fn reset(&self) -> Vec<DownloadBatchLease> {
         #[cfg(test)]
         self.reset_calls.fetch_add(1, Ordering::Relaxed);
@@ -731,11 +731,11 @@ impl OwnedDownloadLanePool {
             })
     }
 
-    /// Ask up to `limit` connectionless idle workers to dial now.
-    ///
-    /// Returns how many were asked. Each dials on its own worker thread, so
-    /// the handshakes overlap each other and nothing already leased waits on
-    /// them; a worker whose dial is refused simply stays without a connection.
+    // Ask up to `limit` connectionless idle workers to dial now.
+    //
+    // Returns how many were asked. Each dials on its own worker thread, so
+    // the handshakes overlap each other and nothing already leased waits on
+    // them; a worker whose dial is refused simply stays without a connection.
     pub(crate) fn warm(
         &self,
         nntp: &Arc<weaver_nntp::NntpClient>,
@@ -859,8 +859,8 @@ fn run_owned_lane_worker(
     park_cached_lane(&mut cached_lane);
 }
 
-/// Answer one command on an idle worker. A run is handed back to the caller
-/// to start; everything else is settled here and leaves the worker idle.
+// Answer one command on an idle worker. A run is handed back to the caller
+// to start; everything else is settled here and leaves the worker idle.
 fn answer_idle_command(
     index: usize,
     shared: &Arc<std::sync::Mutex<OwnedLanePoolShared>>,
@@ -925,17 +925,17 @@ fn answer_idle_command(
     None
 }
 
-/// How a run reaches back to the worker it is running on: the slot to
-/// publish its connection's server on, and the command channel it polls
-/// between ring responses so a probe can reach a busy lane.
+// How a run reaches back to the worker it is running on: the slot to
+// publish its connection's server on, and the command channel it polls
+// between ring responses so a probe can reach a busy lane.
 struct WorkerLink<'a> {
     index: usize,
     shared: &'a Arc<std::sync::Mutex<OwnedLanePoolShared>>,
     commands: &'a std_mpsc::Receiver<OwnedLanePoolCommand>,
 }
 
-/// Open the connection a lease for this job would have asked for, so the lease
-/// itself does not have to.
+// Open the connection a lease for this job would have asked for, so the lease
+// itself does not have to.
 fn warm_cached_lane(cached_lane: &mut Option<CachedOwnedLane>, warm: OwnedLaneWarm) {
     if cached_lane.is_some() {
         return;
@@ -963,13 +963,13 @@ fn warm_cached_lane(cached_lane: &mut Option<CachedOwnedLane>, warm: OwnedLaneWa
 }
 
 impl CachedOwnedLane {
-    /// Whether this connection can carry `lease` without redialling.
-    ///
-    /// The lease's newsgroups are not a condition: a socket opened for one
-    /// job's groups serves the next job's after [`Self::adopt_groups`], which
-    /// on most servers sends nothing at all. Dropping the connection at every
-    /// job boundary instead is what turned a provider's momentary refusal of
-    /// new sockets into a stall of every lane.
+    // Whether this connection can carry `lease` without redialling.
+    //
+    // The lease's newsgroups are not a condition: a socket opened for one
+    // job's groups serves the next job's after [`Self::adopt_groups`], which
+    // on most servers sends nothing at all. Dropping the connection at every
+    // job boundary instead is what turned a provider's momentary refusal of
+    // new sockets into a stall of every lane.
     fn matches(&self, nntp: &Arc<weaver_nntp::NntpClient>, lease: &DownloadBatchLease) -> bool {
         let server = self.lane.server_id();
         if !Arc::ptr_eq(&self.nntp, nntp) || lease.dial_exclude_servers.contains(&server.0) {
@@ -983,6 +983,11 @@ impl CachedOwnedLane {
                 .expect("owned download lease must contain work")
                 .byte_estimate,
         );
+        // An egress out of quota keeps refusing on this socket; a fresh dial
+        // goes out through whichever egress the route still has.
+        if self.lane.egress_quota_rejection(estimate).is_some() {
+            return false;
+        }
         let cached_rejection = nntp.server_quota_rejection(server, estimate);
         if cached_rejection.is_none() {
             return true;
@@ -1000,12 +1005,12 @@ impl CachedOwnedLane {
         cached_lane_matches_selection(server, true, &selection)
     }
 
-    /// Re-point the cached socket at `groups`. The lane itself knows which
-    /// group the socket has selected, so this is asked for every lease: on
-    /// most servers it is one capability lookup, and on one that requires a
-    /// selected group a socket that already sits on a candidate sends
-    /// nothing. `Err` means the socket could not be re-pointed and is no
-    /// longer worth keeping.
+    // Re-point the cached socket at `groups`. The lane itself knows which
+    // group the socket has selected, so this is asked for every lease: on
+    // most servers it is one capability lookup, and on one that requires a
+    // selected group a socket that already sits on a candidate sends
+    // nothing. `Err` means the socket could not be re-pointed and is no
+    // longer worth keeping.
     fn adopt_groups(&mut self, groups: &[String]) -> weaver_nntp::Result<()> {
         self.lane.adopt_groups(groups)
     }
@@ -1031,13 +1036,13 @@ fn park_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) {
     }
 }
 
-/// How often an idle worker checks that the server still holds its cached
-/// connection open.
+// How often an idle worker checks that the server still holds its cached
+// connection open.
 const CACHED_LANE_LIVENESS_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Drop a cached connection the server has already closed. There is nothing
-/// to QUIT; what matters is that its permit goes back to the pool now rather
-/// than when the next lease finds the socket dead.
+// Drop a cached connection the server has already closed. There is nothing
+// to QUIT; what matters is that its permit goes back to the pool now rather
+// than when the next lease finds the socket dead.
 fn discard_closed_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) -> bool {
     if !cached_lane
         .as_mut()
@@ -1053,21 +1058,21 @@ fn discard_closed_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) -> bool
     true
 }
 
-/// Everything a downloaded article needs from the lease its work came from.
-///
-/// A lease boundary is no longer a pipeline boundary: the first BODY of the
-/// next lease goes on the wire while the tail of the current one is still
-/// being read, so two leases are in flight at once and a response cannot ask
-/// "what is the current lease" when it lands. The context rides with the work
-/// instead.
+// Everything a downloaded article needs from the lease its work came from.
+//
+// A lease boundary is no longer a pipeline boundary: the first BODY of the
+// next lease goes on the wire while the tail of the current one is still
+// being read, so two leases are in flight at once and a response cannot ask
+// "what is the current lease" when it lands. The context rides with the work
+// instead.
 struct LaneLeaseContext {
     lane_id: u64,
     job_id: JobId,
     runtime_generation: u64,
     completion_critical: bool,
-    /// The job's retention exclusions, carried from the lease. Job-derived and
-    /// the same for every article on the lane; each result unions it with the
-    /// article's own failure ledger.
+    // The job's retention exclusions, carried from the lease. Job-derived and
+    // the same for every article on the lane; each result unions it with the
+    // article's own failure ledger.
     retention_excludes: Vec<usize>,
     pressure_clear: bool,
     mode: DownloadLaneMode,
@@ -1102,19 +1107,23 @@ impl LaneLeaseContext {
     }
 }
 
-/// Why a lane stopped issuing.
+// Why a lane stopped issuing.
 #[derive(Clone, Copy)]
 enum LaneStop {
-    /// The transport is unusable. Everything still on the ring is unanswerable
-    /// and the connection is discarded.
+    // The transport is unusable. Everything still on the ring is unanswerable
+    // and the connection is discarded.
     ConnectionLost,
-    /// A quota or unrequested outcome. The socket is exactly where the next
-    /// BODY would expect it, so the ring still drains, but nothing more may be
-    /// issued on it.
+    // A quota or unrequested outcome. The socket is exactly where the next
+    // BODY would expect it, so the ring still drains, but nothing more may be
+    // issued on it.
     PolicyBlocked,
+    // The egress this connection leaves through is out of quota. The ring
+    // drains as for any policy outcome, but the socket is let go: the route
+    // dials its next connection through an egress that can still download.
+    EgressQuota,
     RecoveryYield,
     Quarantined,
-    /// The result or refill channel is gone; the orchestrator is shutting down.
+    // The result or refill channel is gone; the orchestrator is shutting down.
     Error,
 }
 
@@ -1127,21 +1136,33 @@ fn lane_stop_park(stop: Option<LaneStop>) -> Option<(LaneParkReason, bool)> {
             LaneParkReason::ServerQuota,
             keep_cached_lane_after_park(LaneParkReason::ServerQuota),
         ),
+        LaneStop::EgressQuota => (LaneParkReason::ServerQuota, false),
     })
 }
 
-/// How many times a worker re-asks for a connection when the shared server
-/// health state was busy. Each attempt already spins on the lock inside the
-/// client; this only covers the case where the whole spin lost.
+// Whether a result is a BODY its connection's egress refused for quota.
+fn egress_quota_refused(data: &Result<DownloadPayload, DownloadError>) -> bool {
+    matches!(
+        data,
+        Err(DownloadError::Fetch(failure))
+            if failure.quota_rejection.as_ref().is_some_and(|rejection| {
+                rejection.scope == weaver_nntp::transfer::TransferScope::Egress
+            })
+    )
+}
+
+// How many times a worker re-asks for a connection when the shared server
+// health state was busy. Each attempt already spins on the lock inside the
+// client; this only covers the case where the whole spin lost.
 const OWNED_LANE_SELECTION_CONTENTION_RETRIES: usize = 3;
 
-/// Acquire a connection, treating "the health state was busy" as "ask again"
-/// rather than as an answer.
-///
-/// The distinction is the whole point of the contended variant: a collapsed
-/// selection reads as "no server can serve this" and pushes the lease off the
-/// owned lanes onto a path that then queues behind the very permits those
-/// lanes are holding.
+// Acquire a connection, treating "the health state was busy" as "ask again"
+// rather than as an answer.
+//
+// The distinction is the whole point of the contended variant: a collapsed
+// selection reads as "no server can serve this" and pushes the lease off the
+// owned lanes onto a path that then queues behind the very permits those
+// lanes are holding.
 fn acquire_owned_lane_through_contention(
     nntp: &weaver_nntp::NntpClient,
     groups: &[String],
@@ -1169,29 +1190,29 @@ fn acquire_owned_lane_through_contention(
     }
 }
 
-/// How little unfinished work a lane may still hold before its next lease has
-/// to be in hand.
-///
-/// A refill costs at least one orchestrator turn to answer, and a lane at
-/// depth `d` retires about `d` articles per round trip. One pipe of runway
-/// pays for the answer and a second pays for the ask, plus the article being
-/// read: 3 articles at depth 1, 5 at depth 2, 9 at depth 4. An ordinary lease
-/// is exactly one pipe deep, so it trips this the moment it is adopted and the
-/// ask goes out while the lease's own first article is still on the wire —
-/// which is the zero-gap handoff sequential mode needs. A runway-sized hot
-/// lease trips it two round trips before it runs dry.
+// How little unfinished work a lane may still hold before its next lease has
+// to be in hand.
+//
+// A refill costs at least one orchestrator turn to answer, and a lane at
+// depth `d` retires about `d` articles per round trip. One pipe of runway
+// pays for the answer and a second pays for the ask, plus the article being
+// read: 3 articles at depth 1, 5 at depth 2, 9 at depth 4. An ordinary lease
+// is exactly one pipe deep, so it trips this the moment it is adopted and the
+// ask goes out while the lease's own first article is still on the wire —
+// which is the zero-gap handoff sequential mode needs. A runway-sized hot
+// lease trips it two round trips before it runs dry.
 fn refill_deadline(depth: usize) -> usize {
     2 * depth.max(1) + 1
 }
 
-/// Hand one finished article to the orchestrator on its own, without waiting
-/// for an acknowledgement.
-///
-/// Delivery per article rather than per lease is what lets decode start on the
-/// first article of a lease instead of its last, and what makes a direct-store
-/// volume settle when its final article lands. The bounded event channel is
-/// the backpressure; the acknowledgement is kept for the lane's final event,
-/// where it orders the results ahead of the park message on the other channel.
+// Hand one finished article to the orchestrator on its own, without waiting
+// for an acknowledgement.
+//
+// Delivery per article rather than per lease is what lets decode start on the
+// first article of a lease instead of its last, and what makes a direct-store
+// volume settle when its final article lands. The bounded event channel is
+// the backpressure; the acknowledgement is kept for the lane's final event,
+// where it orders the results ahead of the park message on the other channel.
 fn stream_owned_result(
     event_tx: &mpsc::Sender<OwnedDownloadLaneEvent>,
     lane: &weaver_nntp::blocking::BlockingBodyLane,
@@ -1211,14 +1232,14 @@ fn stream_owned_result(
     )
 }
 
-/// The newsgroups a connection for this lease has to be pointed at.
-///
-/// A batch is cut around its first work's compatibility and every work that
-/// joins it is admitted against that, so the first work's groups are the
-/// lease's groups. They are not decoration: a server that answers a
-/// message-id fetch only after a GROUP prologue gets none from an empty list,
-/// and a freshly dialled connection has no candidate for its initial group
-/// probe.
+// The newsgroups a connection for this lease has to be pointed at.
+//
+// A batch is cut around its first work's compatibility and every work that
+// joins it is admitted against that, so the first work's groups are the
+// lease's groups. They are not decoration: a server that answers a
+// message-id fetch only after a GROUP prologue gets none from an empty list,
+// and a freshly dialled connection has no candidate for its initial group
+// probe.
 fn lease_groups(lease: &DownloadBatchLease) -> &[String] {
     match lease.works.first() {
         Some(work) => work.groups.as_ref(),
@@ -1226,10 +1247,10 @@ fn lease_groups(lease: &DownloadBatchLease) -> &[String] {
     }
 }
 
-/// Run one lease to its park on this worker's connection.
-///
-/// Returns the commands that reached the worker mid-lease and belong to the
-/// lease boundary instead: the worker answers them before it goes idle.
+// Run one lease to its park on this worker's connection.
+//
+// Returns the commands that reached the worker mid-lease and belong to the
+// lease boundary instead: the worker answers them before it goes idle.
 #[allow(clippy::too_many_lines)]
 fn run_owned_blocking_download_lane(
     cached_lane: &mut Option<CachedOwnedLane>,
@@ -1500,6 +1521,9 @@ fn run_owned_blocking_download_lane(
                 },
                 &work_context.retention_excludes,
             );
+            if matches!(stop, Some(LaneStop::PolicyBlocked)) && egress_quota_refused(&result.data) {
+                stop = Some(LaneStop::EgressQuota);
+            }
             if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
                 stop = Some(LaneStop::Error);
             }
@@ -1655,11 +1679,14 @@ fn run_owned_blocking_download_lane(
                     DownloadFailureKind::ServerQuota | DownloadFailureKind::Unrequested
                 )
         );
+        let egress_blocked = egress_quota_refused(&result.data);
         if stream_owned_result(&event_tx, lane, &mut stats_mark, result).is_err() {
             stop = Some(LaneStop::Error);
         }
         if !keeps_connection || meta.connection_discarded || lane.ring_is_closed() {
             stop.get_or_insert(LaneStop::ConnectionLost);
+        } else if egress_blocked {
+            stop.get_or_insert(LaneStop::EgressQuota);
         } else if policy_blocked {
             stop.get_or_insert(LaneStop::PolicyBlocked);
         }
@@ -1753,11 +1780,11 @@ fn run_owned_blocking_download_lane(
     deferred
 }
 
-/// Consume a prefetched refill response on a park/error path so its leased
-/// works are returned to the queue instead of being dropped. The orchestrator
-/// answers every refill request (or drops the sender on shutdown), so this
-/// cannot hang — provided the lane has already returned the articles it was
-/// holding, since a saturated lane's answer waits on exactly that.
+// Consume a prefetched refill response on a park/error path so its leased
+// works are returned to the queue instead of being dropped. The orchestrator
+// answers every refill request (or drops the sender on shutdown), so this
+// cannot hang — provided the lane has already returned the articles it was
+// holding, since a saturated lane's answer waits on exactly that.
 fn drain_pending_refill(
     pending_refill: Option<oneshot::Receiver<DownloadLaneRefillResponse>>,
     event_tx: &mpsc::Sender<OwnedDownloadLaneEvent>,
@@ -1783,15 +1810,15 @@ fn drain_pending_refill(
     None
 }
 
-/// Whether a park keeps the socket for the worker's next lease.
-///
-/// Everything but a transport fault does. A yield is the case worth stating:
-/// it hands the *scheduling* of this connection back so completion-critical
-/// work can have it, and dropping the socket to do that threw away the one
-/// thing the critical lease wanted — an authenticated connection it could
-/// issue on immediately. The routing in `claim_worker_for` is what makes the
-/// difference visible: the yielded worker is idle holding exactly the
-/// connection the next critical lease is looking for.
+// Whether a park keeps the socket for the worker's next lease.
+//
+// Everything but a transport fault does. A yield is the case worth stating:
+// it hands the *scheduling* of this connection back so completion-critical
+// work can have it, and dropping the socket to do that threw away the one
+// thing the critical lease wanted — an authenticated connection it could
+// issue on immediately. The routing in `claim_worker_for` is what makes the
+// difference visible: the yielded worker is idle holding exactly the
+// connection the next critical lease is looking for.
 fn keep_cached_lane_after_park(reason: LaneParkReason) -> bool {
     matches!(
         reason,
@@ -1818,13 +1845,13 @@ fn stats_delta(
     }
 }
 
-/// Hand results and returned works to the orchestrator.
-///
-/// `acknowledge` turns the send into a rendezvous. A streamed article does not
-/// need one — the bounded event channel already paces the lane, and waiting
-/// per article would put a thread hop on the hot path — but the lane's last
-/// event does: it has to be seen before the park message that follows it on a
-/// different channel.
+// Hand results and returned works to the orchestrator.
+//
+// `acknowledge` turns the send into a rendezvous. A streamed article does not
+// need one — the bounded event channel already paces the lane, and waiting
+// per article would put a thread hop on the hot path — but the lane's last
+// event does: it has to be seen before the park message that follows it on a
+// different channel.
 fn send_owned_batch(
     event_tx: &mpsc::Sender<OwnedDownloadLaneEvent>,
     lane_id: u64,
@@ -1857,19 +1884,19 @@ fn send_owned_batch(
     Ok(())
 }
 
-/// The exclusions a result reports for one article: the article's own
-/// failure ledger, plus the job's retention exclusions the lease carried.
-///
-/// The ledger has to come from the work itself. A lane's batch is cut for one
-/// server but not for one exclusion set, so two articles on the same lane can
-/// have failed on different servers; reporting the lease's set instead loses
-/// every server this article has already been refused by, and an article
-/// missing everywhere then retries forever because its exclusion set never
-/// grows and exhaustion never trips.
-///
-/// The rotation hint (`avoid_server`) deliberately stays out: it only shapes
-/// selection, and counting it here would let a transient timeout help declare
-/// an article missing.
+// The exclusions a result reports for one article: the article's own
+// failure ledger, plus the job's retention exclusions the lease carried.
+//
+// The ledger has to come from the work itself. A lane's batch is cut for one
+// server but not for one exclusion set, so two articles on the same lane can
+// have failed on different servers; reporting the lease's set instead loses
+// every server this article has already been refused by, and an article
+// missing everywhere then retries forever because its exclusion set never
+// grows and exhaustion never trips.
+//
+// The rotation hint (`avoid_server`) deliberately stays out: it only shapes
+// selection, and counting it here would let a transient timeout help declare
+// an article missing.
 fn result_exclude_servers(work: &DownloadWork, retention_excludes: &[usize]) -> Vec<usize> {
     Pipeline::union_exclude_servers(&work.exclude_servers, retention_excludes)
 }
@@ -2014,11 +2041,11 @@ fn test_lease(
     }
 }
 
-/// An idle marker standing for a cached connection on `server`.
-///
-/// The client is a dangling `Weak`, which is what an idle marker looks like
-/// once its client has been retired: it can serve nothing, so routing skips it
-/// while the probe still recognises it as a connection on that server.
+// An idle marker standing for a cached connection on `server`.
+//
+// The client is a dangling `Weak`, which is what an idle marker looks like
+// once its client has been retired: it can serve nothing, so routing skips it
+// while the probe still recognises it as a connection on that server.
 #[cfg(test)]
 fn test_idle_lane(server: usize) -> IdleOwnedLane {
     IdleOwnedLane {
@@ -2031,14 +2058,14 @@ fn test_idle_lane(server: usize) -> IdleOwnedLane {
 mod tests {
     use super::*;
 
-    /// Every configured server's lane holds the same batch at the same time.
-    ///
-    /// A missing article is only missing once every server has said so, so a
-    /// probe asked one lane at a time costs the sum of the answers where the
-    /// wire only requires the longest of them — and the recovery that verdict
-    /// releases waits out the difference. Each fake lane here refuses to answer
-    /// conclusively until the other is holding the batch too, which only a
-    /// probe that asked them together can satisfy.
+    // Every configured server's lane holds the same batch at the same time.
+    //
+    // A missing article is only missing once every server has said so, so a
+    // probe asked one lane at a time costs the sum of the answers where the
+    // wire only requires the longest of them — and the recovery that verdict
+    // releases waits out the difference. Each fake lane here refuses to answer
+    // conclusively until the other is holding the batch too, which only a
+    // probe that asked them together can satisfy.
     #[tokio::test]
     async fn every_idle_lane_holds_the_batch_at_once() {
         const LANES: usize = 2;
@@ -2108,9 +2135,9 @@ mod tests {
         assert_eq!(outcome.result.exists, vec![false]);
     }
 
-    /// Two leases are on the ring at a lease boundary, so a response has to
-    /// carry its own lease's identity, not whichever lease the lane happens to
-    /// be filling from when it lands.
+    // Two leases are on the ring at a lease boundary, so a response has to
+    // carry its own lease's identity, not whichever lease the lane happens to
+    // be filling from when it lands.
     #[test]
     fn a_result_is_attributed_to_the_lease_its_work_came_from() {
         let old = Arc::new(LaneLeaseContext::from_lease(
@@ -2170,12 +2197,12 @@ mod tests {
         assert_eq!(new.depth(), 4);
     }
 
-    /// A lane's batch is cut for one job, not for one exclusion set, so the
-    /// result has to report the article's own failure ledger. Reporting the
-    /// lease's set instead loses every server this article has already been
-    /// refused by, and an article missing on all of them then retries forever
-    /// because its exclusion set never grows past the server that just
-    /// answered.
+    // A lane's batch is cut for one job, not for one exclusion set, so the
+    // result has to report the article's own failure ledger. Reporting the
+    // lease's set instead loses every server this article has already been
+    // refused by, and an article missing on all of them then retries forever
+    // because its exclusion set never grows past the server that just
+    // answered.
     #[test]
     fn a_result_reports_the_article_s_own_failure_ledger() {
         let context = Arc::new(LaneLeaseContext::from_lease(
@@ -2223,10 +2250,10 @@ mod tests {
         );
     }
 
-    /// Per-article delivery is the point: decode starts on a lease's first
-    /// article instead of its last. Only the lane's closing event waits for an
-    /// acknowledgement, because that is what orders the results ahead of the
-    /// park message on the other channel.
+    // Per-article delivery is the point: decode starts on a lease's first
+    // article instead of its last. Only the lane's closing event waits for an
+    // acknowledgement, because that is what orders the results ahead of the
+    // park message on the other channel.
     #[tokio::test]
     async fn results_stream_one_article_at_a_time_and_only_the_last_waits() {
         let (event_tx, mut event_rx) = mpsc::channel(8);
@@ -2339,11 +2366,11 @@ mod tests {
         assert!(lane_stop_park(None).is_none());
     }
 
-    /// The refill must be asked for while the ring still has runway.
-    ///
-    /// An ordinary lease is exactly one pipe deep, so the deadline has to be
-    /// wider than the lease itself or the ask would land after the pipe is
-    /// already dry — the round-trip gap this path exists to remove.
+    // The refill must be asked for while the ring still has runway.
+    //
+    // An ordinary lease is exactly one pipe deep, so the deadline has to be
+    // wider than the lease itself or the ask would land after the pipe is
+    // already dry — the round-trip gap this path exists to remove.
     #[test]
     fn refill_deadline_leaves_runway_at_every_rung() {
         assert_eq!(refill_deadline(1), 3);
@@ -2361,13 +2388,13 @@ mod tests {
         }
     }
 
-    /// A 430 must not tear down the owned lane.
-    ///
-    /// The article-not-found answer is a complete, bodyless server response:
-    /// the socket is exactly where the next BODY expects it. Marking it dirty
-    /// used to QUIT the TLS session, drop the rest of the leased batch as
-    /// Unrequested, and block the server's pipelining proof — all because one
-    /// article lives on another provider.
+    // A 430 must not tear down the owned lane.
+    //
+    // The article-not-found answer is a complete, bodyless server response:
+    // the socket is exactly where the next BODY expects it. Marking it dirty
+    // used to QUIT the TLS session, drop the rest of the leased batch as
+    // Unrequested, and block the server's pipelining proof — all because one
+    // article lives on another provider.
     #[test]
     fn owned_article_not_found_keeps_the_lane_and_the_batch_clean() {
         let result = result_from_trace(
@@ -2377,6 +2404,7 @@ mod tests {
             JobId(42),
             weaver_nntp::client::DecodedBodyTrace {
                 attempts: vec![weaver_nntp::client::FetchAttemptTrace {
+                    route_feedback: None,
                     connection_health: None,
                     server_idx: 0,
                     remote_ip: None,
@@ -2442,8 +2470,8 @@ mod tests {
         assert!(lane_stop_park(None).is_none());
     }
 
-    /// Transport faults must stay dirty. Only the "fully consumed response"
-    /// outcomes are allowed to keep the connection.
+    // Transport faults must stay dirty. Only the "fully consumed response"
+    // outcomes are allowed to keep the connection.
     #[test]
     fn owned_transport_and_decode_failures_still_discard_the_connection() {
         for data in [
@@ -2637,14 +2665,14 @@ mod routing_tests {
         Some(IdleOwnedLaneWorker { lane })
     }
 
-    /// Routing, not rotation.
-    ///
-    /// After a wave parks, every worker sits idle holding a connection — and
-    /// with it every server permit. Handing the next lease to whichever worker
-    /// the counter lands on makes a warm connection useless: the chosen worker
-    /// parks a connection it cannot use and then tries to dial one the idle
-    /// lanes are holding the permits for. The order here is the cost of
-    /// starting: no dial, one dial, a park and a dial.
+    // Routing, not rotation.
+    //
+    // After a wave parks, every worker sits idle holding a connection — and
+    // with it every server permit. Handing the next lease to whichever worker
+    // the counter lands on makes a warm connection useless: the chosen worker
+    // parks a connection it cannot use and then tries to dial one the idle
+    // lanes are holding the permits for. The order here is the cost of
+    // starting: no dial, one dial, a park and a dial.
     #[test]
     fn a_lease_goes_to_the_worker_that_can_start_it_soonest() {
         let nntp = test_client();
@@ -2682,8 +2710,8 @@ mod routing_tests {
         );
     }
 
-    /// A claim is what stops two submits choosing the same idle worker: the
-    /// marker is taken at selection time, not when the worker starts running.
+    // A claim is what stops two submits choosing the same idle worker: the
+    // marker is taken at selection time, not when the worker starts running.
     #[test]
     fn claiming_a_worker_takes_it_out_of_the_running() {
         let nntp = test_client();
@@ -2694,8 +2722,8 @@ mod routing_tests {
         assert_eq!(shared.claim_worker_for(&run), None);
     }
 
-    /// An excluded server is not a connection this lease may use, however warm
-    /// it is.
+    // An excluded server is not a connection this lease may use, however warm
+    // it is.
     #[test]
     fn an_excluded_server_is_not_a_match() {
         let nntp = test_client();
@@ -2706,9 +2734,9 @@ mod routing_tests {
         assert!(idle_lane(&nntp, 0).serves(&run));
     }
 
-    /// The newsgroups a connection was opened for are no reason to redial:
-    /// the worker re-points the socket at the next lease's groups, so a job
-    /// boundary keeps every warm connection in play.
+    // The newsgroups a connection was opened for are no reason to redial:
+    // the worker re-points the socket at the next lease's groups, so a job
+    // boundary keeps every warm connection in play.
     #[test]
     fn a_connection_opened_for_other_newsgroups_still_serves() {
         let nntp = test_client();
@@ -2723,10 +2751,10 @@ mod routing_tests {
         );
     }
 
-    /// Whatever connection a lease lands on is pointed at that lease's own
-    /// newsgroups. An empty list is not the same thing: a server that answers
-    /// a message-id fetch only after a GROUP prologue is sent none, and a
-    /// fresh dial has no candidate for its initial group probe.
+    // Whatever connection a lease lands on is pointed at that lease's own
+    // newsgroups. An empty list is not the same thing: a server that answers
+    // a message-id fetch only after a GROUP prologue is sent none, and a
+    // fresh dial has no candidate for its initial group probe.
     #[test]
     fn a_lease_carries_the_newsgroups_its_work_was_posted_to() {
         let lease = test_lease(JobId(7), 1, Vec::new(), vec![tail_work(1, 0)]);
@@ -2744,8 +2772,8 @@ mod routing_tests {
         );
     }
 
-    /// A connection belonging to a client that has been retired matches
-    /// nothing: the marker is weak precisely so it cannot keep one alive.
+    // A connection belonging to a client that has been retired matches
+    // nothing: the marker is weak precisely so it cannot keep one alive.
     #[test]
     fn a_connection_from_another_client_is_not_a_match() {
         let nntp = test_client();
@@ -2756,9 +2784,9 @@ mod routing_tests {
         assert!(!test_idle_lane(0).serves(&run));
     }
 
-    /// With every worker mid-lease the run waits for the pool, not for one
-    /// worker's private channel: whichever finishes first takes it, and it
-    /// does so before publishing itself idle so the run cannot be missed.
+    // With every worker mid-lease the run waits for the pool, not for one
+    // worker's private channel: whichever finishes first takes it, and it
+    // does so before publishing itself idle so the run cannot be missed.
     #[test]
     fn a_run_with_no_idle_worker_waits_for_whichever_finishes_first() {
         let nntp = test_client();
@@ -2822,8 +2850,8 @@ mod routing_tests {
         assert!(pool.reset().is_empty(), "leases are returned only once");
     }
 
-    /// Only workers with nothing to lose are warmed: a worker already holding
-    /// a connection has nothing to gain, and a busy one is not there to ask.
+    // Only workers with nothing to lose are warmed: a worker already holding
+    // a connection has nothing to gain, and a busy one is not there to ask.
     #[test]
     fn warming_targets_idle_workers_without_a_connection() {
         let nntp = test_client();
@@ -2843,8 +2871,8 @@ mod routing_tests {
         assert!(shared.idle_workers_without_a_lane(0).is_empty());
     }
 
-    /// A warm lane is an idle lane: it is published exactly like one a park
-    /// kept, so the next lease for that job is routed straight to it.
+    // A warm lane is an idle lane: it is published exactly like one a park
+    // kept, so the next lease for that job is routed straight to it.
     #[test]
     fn a_warm_connection_is_published_as_an_idle_lane() {
         let nntp = test_client();
@@ -2869,8 +2897,8 @@ mod routing_tests {
         );
     }
 
-    /// A worker that has already been claimed must not be republished as idle
-    /// by a command it answers on the way to its next run.
+    // A worker that has already been claimed must not be republished as idle
+    // by a command it answers on the way to its next run.
     #[test]
     fn a_claimed_worker_is_not_republished_as_idle() {
         let nntp = test_client();
@@ -2891,8 +2919,8 @@ mod routing_tests {
 mod probe_tests {
     use super::*;
 
-    /// Waits for every worker's first idle publish before taking control of
-    /// its idle state. A probe reply is a barrier without changing that state.
+    // Waits for every worker's first idle publish before taking control of
+    // its idle state. A probe reply is a barrier without changing that state.
     async fn quiesce(pool: &OwnedDownloadLanePool) {
         let senders: Vec<_> = lock_pool(&pool.shared)
             .workers
@@ -2932,8 +2960,8 @@ mod probe_tests {
         lock_pool(&pool.shared).workers[index].idle = Some(IdleOwnedLaneWorker { lane });
     }
 
-    /// A worker with no cached lane answers the probe with `None` rather than
-    /// with a batch of missing verdicts, so the caller knows to ask elsewhere.
+    // A worker with no cached lane answers the probe with `None` rather than
+    // with a batch of missing verdicts, so the caller knows to ask elsewhere.
     #[tokio::test]
     async fn a_worker_without_a_cached_lane_declines_the_probe() {
         let pool = OwnedDownloadLanePool::new(1);
@@ -2951,9 +2979,9 @@ mod probe_tests {
         );
     }
 
-    /// A worker that is busy but has not published its server yet is still
-    /// dialling: there is no connection to answer on, so it is never asked
-    /// and the probe reports that no lane could answer.
+    // A worker that is busy but has not published its server yet is still
+    // dialling: there is no connection to answer on, so it is never asked
+    // and the probe reports that no lane could answer.
     #[tokio::test]
     async fn a_busy_worker_without_a_connection_is_not_asked() {
         let pool = OwnedDownloadLanePool::new(2);
@@ -2969,8 +2997,8 @@ mod probe_tests {
         );
     }
 
-    /// A pool of hand-built slots whose command channels the test holds, so
-    /// it can see exactly which workers a probe reaches.
+    // A pool of hand-built slots whose command channels the test holds, so
+    // it can see exactly which workers a probe reaches.
     fn handle_over(
         slots: Vec<(Option<IdleOwnedLaneWorker>, Option<usize>)>,
     ) -> (
@@ -2998,7 +3026,7 @@ mod probe_tests {
         (OwnedLaneProbeHandle { shared, job_id: 0 }, receivers)
     }
 
-    /// Answer the next probe on `receiver` with `exists`, off the runtime.
+    // Answer the next probe on `receiver` with `exists`, off the runtime.
     fn answer_probe(
         receiver: std_mpsc::Receiver<OwnedLanePoolCommand>,
         exists: Vec<bool>,
@@ -3022,14 +3050,14 @@ mod probe_tests {
         })
     }
 
-    /// One lane per server, idle before busy.
-    ///
-    /// Under a saturated pool every worker is mid-lease, and a server only
-    /// busy lanes are holding used to be unreachable: the probe went to the
-    /// async client, which had no permit to dial with and timed out. A busy
-    /// lane answers instead, once its ring drains. An idle lane on the same
-    /// server answers on the spot and is asked in its place, and a lane that
-    /// is still dialling has nothing to answer on.
+    // One lane per server, idle before busy.
+    //
+    // Under a saturated pool every worker is mid-lease, and a server only
+    // busy lanes are holding used to be unreachable: the probe went to the
+    // async client, which had no permit to dial with and timed out. A busy
+    // lane answers instead, once its ring drains. An idle lane on the same
+    // server answers on the spot and is asked in its place, and a lane that
+    // is still dialling has nothing to answer on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_server_only_busy_lanes_hold_is_asked_through_one_of_them() {
         let (handle, mut receivers) = handle_over(vec![
@@ -3080,7 +3108,7 @@ mod probe_tests {
         );
     }
 
-    /// An empty batch never touches a lane and is trivially settled.
+    // An empty batch never touches a lane and is trivially settled.
     #[tokio::test]
     async fn an_empty_batch_needs_no_lane() {
         let pool = OwnedDownloadLanePool::new(1);

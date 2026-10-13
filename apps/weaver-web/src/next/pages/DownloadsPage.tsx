@@ -417,15 +417,15 @@ export function DownloadsPage() {
   const rowCancelJob =
     confirmRowCancel === null ? null : (jobs.find((job) => job.id === confirmRowCancel) ?? null);
 
-  // A cap or a provider quota stops every download that would otherwise be
-  // fetching, whatever its own status says; so does pausing everything.
-  const blocked = downloadBlock.kind === "ISP_CAP" || downloadBlock.kind === "SERVER_QUOTA";
+  // An egress or a provider quota stops every download that would otherwise
+  // be fetching, whatever its own status says; so does pausing everything.
+  const blocked = downloadBlock.kind === "EGRESS_QUOTA" || downloadBlock.kind === "SERVER_QUOTA";
   const blockEta =
     downloadBlock.kind === "SERVER_QUOTA"
       ? t("jobs.serverQuotaEta")
-      : t("jobs.bandwidthCapEta", { resetAt: formatDayClock(downloadBlock.windowEndsAtEpochMs) });
+      : t("jobs.egressQuotaEta", { resetAt: formatDayClock(downloadBlock.windowEndsAtEpochMs) });
   const blockLabel =
-    downloadBlock.kind === "SERVER_QUOTA" ? t("jobs.serverQuotaBadge") : t("jobs.bandwidthCapShort");
+    downloadBlock.kind === "SERVER_QUOTA" ? t("jobs.serverQuotaBadge") : t("jobs.egressQuotaBadge");
 
   /** What stands in for time left: a hold, or an estimate; null when there is neither. */
   const waitValue = useCallback(

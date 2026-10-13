@@ -1,34 +1,34 @@
-//! What the 7z decoder's read pattern actually looks like, measured rather
-//! than assumed.
-//!
-//! # What is being measured, and why it is not a correctness proof
-//!
-//! [`GatedSplitReader`] is correct under any access pattern: the parts are on
-//! disk, so anything below a watermark is servable and only the frontier
-//! blocks. Nothing here is load-bearing for that.
-//!
-//! What these tests measure is *overlap* — how early direct unpack can get
-//! going. A chain that walks its packed streams in ascending order can be
-//! chased from the first committed bytes; one that revisits packed bytes has to
-//! wait for more of the archive to land before it can move, shrinking the
-//! overlap toward "extract after download" even though the result is identical.
-//!
-//! # The measured shape
-//!
-//! Every chain the writer can encode reads the same way: at most one probe into
-//! the archive's **tail**, then exactly one ascending sweep of the payload.
-//!
-//! The tail probe is the end header. For a single-member store or compress
-//! chain that header is plain and sits behind the packed region, so it never
-//! appears in these numbers at all. Give the archive several members or a
-//! password and 7z encodes or encrypts the header, which makes it a packed
-//! stream of its own living *inside* the packed region — hence a read near the
-//! end before the sweep starts. Either way the decoder never returns to payload
-//! it has already passed, which is what direct unpack needs, and which is why
-//! the tail is worth prefetching ahead of the streams in front of it.
-//!
-//! Fixtures are built in-process by the 7z writer (a test-only feature) across
-//! every chain it can encode, rather than checked in one file per chain.
+// What the 7z decoder's read pattern actually looks like, measured rather
+// than assumed.
+//
+// # What is being measured, and why it is not a correctness proof
+//
+// [`GatedSplitReader`] is correct under any access pattern: the parts are on
+// disk, so anything below a watermark is servable and only the frontier
+// blocks. Nothing here is load-bearing for that.
+//
+// What these tests measure is *overlap* — how early direct unpack can get
+// going. A chain that walks its packed streams in ascending order can be
+// chased from the first committed bytes; one that revisits packed bytes has to
+// wait for more of the archive to land before it can move, shrinking the
+// overlap toward "extract after download" even though the result is identical.
+//
+// # The measured shape
+//
+// Every chain the writer can encode reads the same way: at most one probe into
+// the archive's **tail**, then exactly one ascending sweep of the payload.
+//
+// The tail probe is the end header. For a single-member store or compress
+// chain that header is plain and sits behind the packed region, so it never
+// appears in these numbers at all. Give the archive several members or a
+// password and 7z encodes or encrypts the header, which makes it a packed
+// stream of its own living *inside* the packed region — hence a read near the
+// end before the sweep starts. Either way the decoder never returns to payload
+// it has already passed, which is what direct unpack needs, and which is why
+// the tail is worth prefetching ahead of the streams in front of it.
+//
+// Fixtures are built in-process by the 7z writer (a test-only feature) across
+// every chain it can encode, rather than checked in one file per chain.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -44,8 +44,8 @@ use super::coverage::SetCoverage;
 use super::reader::GatedSplitReader;
 use super::start_header::StartHeader;
 
-/// Payload per member. Big enough that every chain performs many reads, small
-/// enough that the whole matrix stays a unit test.
+// Payload per member. Big enough that every chain performs many reads, small
+// enough that the whole matrix stays a unit test.
 const MEMBER_LEN: usize = 3 * 1024 * 1024;
 
 const TEST_PASSWORD: &str = "SilverHorizonPass1";
@@ -54,10 +54,10 @@ const TEST_PASSWORD: &str = "SilverHorizonPass1";
 // Recording reader
 // ---------------------------------------------------------------------------
 
-/// Every read the decoder issued, as `(absolute offset, length)`.
+// Every read the decoder issued, as `(absolute offset, length)`.
 type ReadLog = Arc<Mutex<Vec<(u64, usize)>>>;
 
-/// Wraps a reader and logs the absolute offset and length of every read.
+// Wraps a reader and logs the absolute offset and length of every read.
 struct RecordingReader<R> {
     inner: R,
     position: u64,
@@ -101,8 +101,8 @@ impl<R: Seek> Seek for RecordingReader<R> {
 // Fixture construction
 // ---------------------------------------------------------------------------
 
-/// Deterministic pseudo-random bytes: compressible chains still have to move
-/// real volume, so the read counts mean something.
+// Deterministic pseudo-random bytes: compressible chains still have to move
+// real volume, so the read counts mean something.
 fn payload(len: usize, seed: u64) -> Vec<u8> {
     let mut state = seed | 1;
     (0..len)
@@ -115,17 +115,17 @@ fn payload(len: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-/// One cell of the codec matrix.
+// One cell of the codec matrix.
 struct Chain {
     name: &'static str,
-    /// Coder chain in library order, which is the reverse of the data's path:
-    /// the last entry receives the raw bytes and the first writes to the file.
-    /// So a filter chain reads `[compressor, filter]`, and encryption sits
-    /// first because it is applied last, to already-compressed bytes.
+    // Coder chain in library order, which is the reverse of the data's path:
+    // the last entry receives the raw bytes and the first writes to the file.
+    // So a filter chain reads `[compressor, filter]`, and encryption sits
+    // first because it is applied last, to already-compressed bytes.
     methods: Vec<EncoderConfiguration>,
     password: Option<&'static str>,
     encrypt_header: bool,
-    /// More than one member packed into a single block.
+    // More than one member packed into a single block.
     solid: bool,
     members: usize,
 }
@@ -173,7 +173,7 @@ impl Chain {
     }
 }
 
-/// The members a chain's fixture should contain, by name.
+// The members a chain's fixture should contain, by name.
 fn members_for(chain: &Chain) -> BTreeMap<String, Vec<u8>> {
     (0..chain.members)
         .map(|index| {
@@ -185,7 +185,7 @@ fn members_for(chain: &Chain) -> BTreeMap<String, Vec<u8>> {
         .collect()
 }
 
-/// Encode a fixture archive for `chain` entirely in memory.
+// Encode a fixture archive for `chain` entirely in memory.
 fn build_archive(chain: &Chain, members: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let buffer = io::Cursor::new(Vec::new());
     let mut writer = ArchiveWriter::new(buffer).expect("create 7z writer");
@@ -237,7 +237,7 @@ fn build_archive(chain: &Chain, members: &BTreeMap<String, Vec<u8>>) -> Vec<u8> 
 // Extraction harness
 // ---------------------------------------------------------------------------
 
-/// Extract every member through `reader`, returning the member bytes.
+// Extract every member through `reader`, returning the member bytes.
 fn extract_members<R: Read + Seek>(reader: R, password: Password) -> BTreeMap<String, Vec<u8>> {
     let dest = tempfile::tempdir().expect("tempdir");
     let extracted = Arc::new(Mutex::new(BTreeMap::new()));
@@ -267,7 +267,7 @@ fn extract_members<R: Read + Seek>(reader: R, password: Password) -> BTreeMap<St
         .expect("member sink")
 }
 
-/// One uninterrupted ascending sweep over the packed region.
+// One uninterrupted ascending sweep over the packed region.
 #[derive(Debug, Clone, Copy)]
 struct Run {
     first: u64,
@@ -275,20 +275,20 @@ struct Run {
     reads: usize,
 }
 
-/// What the read log says about a chain's access pattern.
+// What the read log says about a chain's access pattern.
 #[derive(Debug)]
 struct PatternStats {
     total_reads: usize,
     payload_reads: usize,
-    /// Ascending sweeps: one means the decoder walked the packed region front
-    /// to back exactly once, which is the best case for overlap.
+    // Ascending sweeps: one means the decoder walked the packed region front
+    // to back exactly once, which is the best case for overlap.
     runs: Vec<Run>,
-    /// Largest backward jump between consecutive packed reads.
+    // Largest backward jump between consecutive packed reads.
     max_backward: u64,
 }
 
 impl PatternStats {
-    /// The payload sweep: the run that carries the bulk of the reads.
+    // The payload sweep: the run that carries the bulk of the reads.
     fn sweep(&self) -> Run {
         *self
             .runs
@@ -297,10 +297,10 @@ impl PatternStats {
             .expect("at least one run")
     }
 
-    /// Runs that happen before the payload sweep. Every chain measured so far
-    /// spends these on the archive's tail, reading the end header — which for
-    /// an encoded or encrypted header is itself a packed stream, and so falls
-    /// inside the packed region rather than behind it.
+    // Runs that happen before the payload sweep. Every chain measured so far
+    // spends these on the archive's tail, reading the end header — which for
+    // an encoded or encrypted header is itself a packed stream, and so falls
+    // inside the packed region rather than behind it.
     fn tail_probes(&self) -> &[Run] {
         let sweep_at = self
             .runs
@@ -313,12 +313,12 @@ impl PatternStats {
     }
 }
 
-/// Measure the packed-region read pattern.
-///
-/// Only reads that land in the packed region are considered: the signature
-/// header at the front and the end header at the back are read out of order by
-/// design (the decoder has to see the end header before it can decode
-/// anything), and they say nothing about how the payload is consumed.
+// Measure the packed-region read pattern.
+//
+// Only reads that land in the packed region are considered: the signature
+// header at the front and the end header at the back are read out of order by
+// design (the decoder has to see the end header before it can decode
+// anything), and they say nothing about how the payload is consumed.
 fn measure(archive: &[u8], reads: &[(u64, usize)]) -> PatternStats {
     let header = StartHeader::parse(archive).expect("fixture has a valid signature header");
     let packed = header.packed_range().expect("no overflow");
@@ -364,7 +364,7 @@ fn measure(archive: &[u8], reads: &[(u64, usize)]) -> PatternStats {
     }
 }
 
-/// Every chain the workspace's sevenz-rust2 configuration can encode.
+// Every chain the workspace's sevenz-rust2 configuration can encode.
 fn matrix() -> Vec<Chain> {
     vec![
         Chain::simple("copy", EncoderMethod::COPY),
@@ -483,14 +483,14 @@ fn packed_reads_are_ascending_across_the_codec_matrix() {
     );
 }
 
-/// The branch filters are not behind any cargo feature — they come from
-/// lzma-rust2 and are compiled in unconditionally. Asserted by round-tripping
-/// each one rather than by reading the dependency's feature list, so a
-/// dependency bump that quietly drops one is caught here.
-///
-/// BCJ2 is deliberately absent: sevenz-rust2 decodes it but cannot encode it,
-/// so there is no way to build the fixture in-process, and hand-forging one
-/// would be asserting against our own bytes rather than a real archive.
+// The branch filters are not behind any cargo feature — they come from
+// lzma-rust2 and are compiled in unconditionally. Asserted by round-tripping
+// each one rather than by reading the dependency's feature list, so a
+// dependency bump that quietly drops one is caught here.
+//
+// BCJ2 is deliberately absent: sevenz-rust2 decodes it but cannot encode it,
+// so there is no way to build the fixture in-process, and hand-forging one
+// would be asserting against our own bytes rather than a real archive.
 #[test]
 fn every_branch_filter_round_trips() {
     let filters = [
@@ -659,21 +659,21 @@ fn extraction_keeps_up_with_a_drip_fed_download() {
     );
 }
 
-/// BCJ2, measured on an archive the official 7-Zip console binary wrote.
-///
-/// This is the one chain the writer used above cannot produce — sevenz-rust2
-/// decodes BCJ2 but cannot encode it — so the fixture is checked in rather than
-/// built in-process, and it is oracle-produced for the same reason every other
-/// e2e 7z fixture is.
-///
-/// BCJ2 is the interesting case because it is the only *multi-input* coder in
-/// the format: it splits its data across four pack streams that the decoder
-/// reads through concurrent cursors. Whether those cursors interleave — and so
-/// whether a chase can follow one — is not something to assume in either
-/// direction, which is why it is measured here.
-///
-/// The reader is correct regardless: the parts are on disk and any access
-/// pattern is servable. Only the overlap is at stake.
+// BCJ2, measured on an archive the official 7-Zip console binary wrote.
+//
+// This is the one chain the writer used above cannot produce — sevenz-rust2
+// decodes BCJ2 but cannot encode it — so the fixture is checked in rather than
+// built in-process, and it is oracle-produced for the same reason every other
+// e2e 7z fixture is.
+//
+// BCJ2 is the interesting case because it is the only *multi-input* coder in
+// the format: it splits its data across four pack streams that the decoder
+// reads through concurrent cursors. Whether those cursors interleave — and so
+// whether a chase can follow one — is not something to assume in either
+// direction, which is why it is measured here.
+//
+// The reader is correct regardless: the parts are on disk and any access
+// pattern is servable. Only the overlap is at stake.
 #[test]
 fn bcj2_read_pattern_is_measured_not_assumed() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

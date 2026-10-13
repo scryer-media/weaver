@@ -1,24 +1,24 @@
-//! CRC32 attribution + throughput probe.
-//!
-//! Evidence-gathering only: nothing here changes a production path. It answers
-//! one question — on a given CPU, *which* CRC32 code path actually executes for
-//! weaver's yEnc decode, and how fast is it relative to the alternatives.
-//!
-//!   cargo run --release --example crc_probe
-//!
-//! Optional env:
-//!   CRC_PROBE_GHZ    nominal core clock used for the cycles/byte column
-//!                    (default 2.1, the Atom C3538 / Denverton base clock)
-//!   CRC_PROBE_SECS   wall-clock budget per lane, seconds (default 1.5)
-//!
-//! Lanes:
-//!   a. weaver `Crc32` — the production wrapper, driven exactly like
-//!      `decode_body_with_line_length` drives it (one `update()` over the whole
-//!      decoded run, then `finalize()`; see src/decode.rs:666-671).
-//!   b. `crc_fast::Digest` called directly (same streaming shape).
-//!   c. a self-contained slice-by-16 table CRC32 (ISO-HDLC poly), no deps.
-//!   d. rapidyenc's own `RapidYenc::crc32`, via the shim (only when
-//!      `WEAVER_RAPIDYENC_SRC` was set at build time -> cfg(rapidyenc_linked)).
+// CRC32 attribution + throughput probe.
+//
+// Evidence-gathering only: nothing here changes a production path. It answers
+// one question — on a given CPU, *which* CRC32 code path actually executes for
+// weaver's yEnc decode, and how fast is it relative to the alternatives.
+//
+//   cargo run --release --example crc_probe
+//
+// Optional env:
+//   CRC_PROBE_GHZ    nominal core clock used for the cycles/byte column
+//                    (default 2.1, the Atom C3538 / Denverton base clock)
+//   CRC_PROBE_SECS   wall-clock budget per lane, seconds (default 1.5)
+//
+// Lanes:
+//   a. weaver `Crc32` — the production wrapper, driven exactly like
+//      `decode_body_with_line_length` drives it (one `update()` over the whole
+//      decoded run, then `finalize()`; see src/decode.rs:666-671).
+//   b. `crc_fast::Digest` called directly (same streaming shape).
+//   c. a self-contained slice-by-16 table CRC32 (ISO-HDLC poly), no deps.
+//   d. rapidyenc's own `RapidYenc::crc32`, via the shim (only when
+//      `WEAVER_RAPIDYENC_SRC` was set at build time -> cfg(rapidyenc_linked)).
 
 use std::time::{Duration, Instant};
 
@@ -284,13 +284,13 @@ fn crc_fast_attribution() {
     println!();
 }
 
-/// Replicates weaver-yenc's own wrapper gate. Source:
-/// `engines/weaver-yenc/src/crc.rs:108-124` `x86_vpclmul::available()`:
-///
-///     avx2 && pclmulqdq && sse4.1 && vpclmulqdq && !avx512vl
-///
-/// and `src/crc.rs:29` `VPCLMUL_MIN_UPDATE = 256` — updates below that byte
-/// count never take the folded path (`src/crc.rs:47`).
+// Replicates weaver-yenc's own wrapper gate. Source:
+// `engines/weaver-yenc/src/crc.rs:108-124` `x86_vpclmul::available()`:
+//
+//     avx2 && pclmulqdq && sse4.1 && vpclmulqdq && !avx512vl
+//
+// and `src/crc.rs:29` `VPCLMUL_MIN_UPDATE = 256` — updates below that byte
+// count never take the folded path (`src/crc.rs:47`).
 #[cfg(target_arch = "x86_64")]
 fn weaver_attribution() {
     println!("[2b] weaver-yenc Crc32 wrapper attribution (src/crc.rs)");

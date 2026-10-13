@@ -2,36 +2,40 @@ use std::time::Duration;
 
 use crate::servers::ServerConfig;
 
+// How long a server connection may take to dial, for the pool's routes and
+// for the connectivity probe alike.
+pub(crate) const SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 pub struct ServerConnectivityResult {
     pub success: bool,
     pub message: String,
     pub latency_ms: Option<u64>,
-    /// Command-to-status-line round trip on the established session, which is
-    /// what BODY pipelining actually has to hide. Taken from the CAPABILITIES
-    /// exchange setup already sends; no extra command is issued for it. `latency_ms` above is the
-    /// whole connect — TCP, TLS and authentication — and is far larger.
+    // Command-to-status-line round trip on the established session, which is
+    // what BODY pipelining actually has to hide. Taken from the CAPABILITIES
+    // exchange setup already sends; no extra command is issued for it. `latency_ms` above is the
+    // whole connect — TCP, TLS and authentication — and is far larger.
     pub first_byte_latency_ms: Option<u64>,
-    /// "good", "moderate" or "slow" for `first_byte_latency_ms`. Descriptive
-    /// only: nothing the operator has to act on follows from it.
+    // "good", "moderate" or "slow" for `first_byte_latency_ms`. Descriptive
+    // only: nothing the operator has to act on follows from it.
     pub first_byte_latency_band: Option<String>,
     pub supports_pipelining: bool,
     pub adoptable_tls_name_mismatch_certificate_der: Option<Vec<u8>>,
-    /// IANA name of the TLS suite negotiated with weaver's CPU-preferred
-    /// cipher family offered first; `None` for plaintext or failed probes.
+    // IANA name of the TLS suite negotiated with weaver's CPU-preferred
+    // cipher family offered first; `None` for plaintext or failed probes.
     pub tls_cipher_suite: Option<String>,
-    /// Whether the negotiated suite is the family weaver offered first, i.e.
-    /// the server follows client order. `None` for plaintext or failed probes.
+    // Whether the negotiated suite is the family weaver offered first, i.e.
+    // the server follows client order. `None` for plaintext or failed probes.
     pub tls_honors_client_cipher_order: Option<bool>,
 }
 
 pub async fn probe_server_connection(config: &ServerConfig) -> ServerConnectivityResult {
-    probe_server_connection_with_proxy(config, None).await
+    probe_server_connection_with_route(config, None).await
 }
 
-pub async fn probe_server_connection_with_proxy(
+pub async fn probe_server_connection_with_route(
     config: &ServerConfig,
-    proxy: Option<std::sync::Arc<weaver_tunnel::bridge::Bridge>>,
+    dialer: Option<std::sync::Arc<weaver_nntp::route_dialer::RouteDialer>>,
 ) -> ServerConnectivityResult {
     // Every check happens on the one real connection. Its handshake verifies
     // the certificate against the hostname, so a mismatch fails there, before
@@ -40,7 +44,25 @@ pub async fn probe_server_connection_with_proxy(
     // on a distant server each extra handshake or command is a full round
     // trip, and a seeded server's probe must finish inside a fixed deadline.
     let nntp_config = weaver_nntp::ServerConfig {
-        proxy: proxy.clone(),
+        dialer: Some(dialer.unwrap_or_else(|| {
+            std::sync::Arc::new(weaver_nntp::route_dialer::RouteDialer {
+                inner: std::sync::Arc::new(weaver_nntp::route_dialer::AddressPlanned::new(
+                    "server connectivity probe".into(),
+                    std::sync::Arc::new(weaver_tunnel::pipe::Egress {
+                        id: 0,
+                        binding: weaver_tunnel::egress::SocketEgress::System,
+                        timeout: SERVER_CONNECT_TIMEOUT,
+                    }),
+                )),
+                egress_controls: std::sync::Arc::new(
+                    weaver_nntp::transfer::ServerTransferRegistry::with_scope(
+                        weaver_nntp::transfer::TransferScope::Egress,
+                    ),
+                ),
+                runtime: tokio::runtime::Handle::current(),
+                server: config.id,
+            })
+        })),
         host: config.host.clone(),
         port: config.port,
         tls: config.tls,
@@ -49,6 +71,7 @@ pub async fn probe_server_connection_with_proxy(
         tls_ca_cert: config.tls_ca_cert.clone(),
         tls_name_mismatch_certificate_der: config.tls_name_mismatch_certificate_der.clone(),
         pipelining: weaver_nntp::PipeliningCapability::Probe,
+        connect_timeout: SERVER_CONNECT_TIMEOUT,
         ..Default::default()
     };
     let start = std::time::Instant::now();
@@ -84,7 +107,7 @@ pub async fn probe_server_connection_with_proxy(
                     &config.host,
                     config.port,
                     config.tls_ca_cert.as_deref(),
-                    proxy.as_ref(),
+                    nntp_config.dialer.as_ref(),
                 )
                 .await
                 .ok()
@@ -112,8 +135,8 @@ pub async fn probe_server_connection_with_proxy(
     }
 }
 
-/// Descriptive label for a first-byte latency, on the same thresholds the
-/// download depth explorer uses.
+// Descriptive label for a first-byte latency, on the same thresholds the
+// download depth explorer uses.
 fn latency_band_label(latency: Duration) -> &'static str {
     crate::pipeline::download::transport::LatencyBand::from_latency(latency).label()
 }

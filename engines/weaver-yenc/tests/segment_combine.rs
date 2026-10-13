@@ -1,17 +1,17 @@
-//! Pins the CRC32 combine this crate exposes bit-identical to
-//! `par2_rs::checksum::Crc32CombineOp` — the combine weaver's fused pipeline
-//! already uses to compose part CRCs into a completed-file CRC without
-//! re-reading the file.
-//!
-//! The pipeline requires one combine, not three. `weaver_yenc::crc32_combine` forwards to
-//! `crc-fast`'s `checksum_combine` (already in this crate's dependency set,
-//! same Mark Adler GF(2) zeros-operator construction) rather than pulling the
-//! PAR2 library down into the yEnc codec. This differential is what makes that
-//! substitution safe: the segments produced here are consumed by the evidence
-//! collector, which folds them with `Crc32CombineOp`, so the two must agree on
-//! every input, not merely be "both correct by construction".
-//!
-//! par2-rs is a dev-dependency only; nothing in the shipped crate links it.
+// Pins the CRC32 combine this crate exposes bit-identical to
+// `par2_rs::checksum::Crc32CombineOp` — the combine weaver's fused pipeline
+// already uses to compose part CRCs into a completed-file CRC without
+// re-reading the file.
+//
+// The pipeline requires one combine, not three. `weaver_yenc::crc32_combine` forwards to
+// `crc-fast`'s `checksum_combine` (already in this crate's dependency set,
+// same Mark Adler GF(2) zeros-operator construction) rather than pulling the
+// PAR2 library down into the yEnc codec. This differential is what makes that
+// substitution safe: the segments produced here are consumed by the evidence
+// collector, which folds them with `Crc32CombineOp`, so the two must agree on
+// every input, not merely be "both correct by construction".
+//
+// par2-rs is a dev-dependency only; nothing in the shipped crate links it.
 
 use std::num::NonZeroU64;
 
@@ -19,7 +19,7 @@ use par2_rs::checksum::{Crc32CombineOp, crc32 as par2_crc32};
 use weaver_yenc::segment::{SegmentedCrc32, combine_contiguous};
 use weaver_yenc::{CheckpointPlan, Segment, crc32_combine};
 
-/// Deterministic xorshift64* stream.
+// Deterministic xorshift64* stream.
 struct Rng(u64);
 
 impl Rng {
@@ -70,17 +70,17 @@ fn combine_matches_par2_rs_combine_op() {
     assert!(checked >= 2_400, "combine pairs checked {checked}");
 }
 
-/// The one input on which the two combines disagree, pinned so the difference
-/// is a recorded fact rather than a latent surprise for the downstream collector.
-///
-/// `Crc32CombineOp::new(0)` short-circuits to `crc1`, discarding `crc2`;
-/// `crc32_combine(a, b, 0)` returns `a ^ b`. The CRC32 of an empty range is 0,
-/// so on every *well-formed* zero-length input the two agree and both are the
-/// identity. They can only differ on a zero-length record carrying a non-zero
-/// CRC, which is malformed. `SegmentedCrc32` never emits a zero-length segment
-/// (`checkpoint` is a no-op with nothing fed), so the collector cannot reach
-/// this from decoder output — but a hand-built record could, and the xor
-/// semantics would then expose the bug that par2-rs's short-circuit hides.
+// The one input on which the two combines disagree, pinned so the difference
+// is a recorded fact rather than a latent surprise for the downstream collector.
+//
+// `Crc32CombineOp::new(0)` short-circuits to `crc1`, discarding `crc2`;
+// `crc32_combine(a, b, 0)` returns `a ^ b`. The CRC32 of an empty range is 0,
+// so on every *well-formed* zero-length input the two agree and both are the
+// identity. They can only differ on a zero-length record carrying a non-zero
+// CRC, which is malformed. `SegmentedCrc32` never emits a zero-length segment
+// (`checkpoint` is a no-op with nothing fed), so the collector cannot reach
+// this from decoder output — but a hand-built record could, and the xor
+// semantics would then expose the bug that par2-rs's short-circuit hides.
 #[test]
 fn zero_length_combine_agrees_on_well_formed_input_only() {
     let empty_crc = par2_crc32(&[]);
@@ -99,9 +99,9 @@ fn zero_length_combine_agrees_on_well_formed_input_only() {
     }
 }
 
-/// The whole CRC derivation, end to end, with par2-rs as the oracle on both
-/// sides: segment CRCs against `par2_rs::checksum::crc32`, and the block/article
-/// folds against `Crc32CombineOp`.
+// The whole CRC derivation, end to end, with par2-rs as the oracle on both
+// sides: segment CRCs against `par2_rs::checksum::crc32`, and the block/article
+// folds against `Crc32CombineOp`.
 #[test]
 fn derived_block_crcs_match_par2_rs_over_an_article_tiling() {
     let mut rng = Rng(0x000b_10c5);

@@ -1,5 +1,154 @@
-use super::manifest::{ManifestError, detect_bare_script_adapter, parse_nzbget_manifest};
-use super::model::{ScriptAdapter, ScriptOptionType, ScriptSelectValue};
+use super::manifest::{
+    ManifestError, bare_script_options, detect_bare_script_adapter, go_script_header,
+    option_name_suggests_secret, parse_nzbget_manifest,
+};
+use super::model::{OptionValue, ScriptAdapter, ScriptOptionType, ScriptSelectValue};
+
+#[test]
+fn a_bare_nzbget_header_declares_its_options_and_hints_credentials_secret() {
+    let script = "#!/usr/bin/env python3\n\
+        ##############################################################################\n\
+        ### NZBGET POST-PROCESSING SCRIPT                                          ###\n\
+        \n\
+        # Sends a notice.\n\
+        \n\
+        ##############################################################################\n\
+        ### OPTIONS                                                                ###\n\
+        \n\
+        # Server to send to.\n\
+        #\n\
+        # A host name.\n\
+        #Server=localhost\n\
+        \n\
+        # Account password.\n\
+        #Password=changeme\n\
+        #ApiKey=\n\
+        #UserToken=abc\n\
+        #ClientSecret=x\n\
+        #Passphrase=y\n\
+        #Mode=fast\n\
+        #Mode=again\n\
+        \n\
+        ### NZBGET POST-PROCESSING SCRIPT                                          ###\n\
+        ##############################################################################\n\
+        #Ignored=after the header\n\
+        import sys\n";
+    let options = bare_script_options(script);
+    let shape = options
+        .iter()
+        .map(|option| {
+            (
+                option.name().as_str(),
+                option.option_type(),
+                option.default().cloned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shape,
+        [
+            (
+                "Server",
+                ScriptOptionType::String,
+                Some(OptionValue::String("localhost".into()))
+            ),
+            // A credential keeps no default from the header.
+            ("Password", ScriptOptionType::Secret, None),
+            ("ApiKey", ScriptOptionType::Secret, None),
+            ("UserToken", ScriptOptionType::Secret, None),
+            ("ClientSecret", ScriptOptionType::Secret, None),
+            ("Passphrase", ScriptOptionType::Secret, None),
+            (
+                "Mode",
+                ScriptOptionType::String,
+                Some(OptionValue::String("fast".into()))
+            ),
+        ]
+    );
+    assert_eq!(
+        options[0].description(),
+        ["Server to send to.", "A host name."]
+    );
+    assert_eq!(options[1].description(), ["Account password."]);
+
+    // A script that is not an NZBGet one declares nothing.
+    assert!(bare_script_options("#!/bin/sh\n### OPTIONS ###\n#Token=x\n").is_empty());
+    for name in ["apikey", "KEY", "token", "Password", "pass", "SECRET"] {
+        assert!(option_name_suggests_secret(name), "{name}");
+    }
+    for name in ["Server", "Host", "Category"] {
+        assert!(!option_name_suggests_secret(name), "{name}");
+    }
+}
+
+#[test]
+fn a_credential_hint_matches_whole_words_of_the_option_name_only() {
+    for name in [
+        "ApiKey",
+        "API_KEY",
+        "APIKey",
+        "api-key",
+        "AuthToken",
+        "SmtpPassword",
+        "SMTP_PASSWD",
+        "DbPass",
+        "pass",
+        "Secret",
+        "WebhookSecret",
+        "Pass.Phrase",
+        "Key2",
+    ] {
+        assert!(option_name_suggests_secret(name), "{name}");
+    }
+    // A hint inside a longer word, or `pass` leading a name, is not a
+    // credential. `Tokenizer` is one word, so it is not one either.
+    for name in [
+        "IgnoreKeywords",
+        "Passive",
+        "Bypass",
+        "PassThrough",
+        "Keyboard",
+        "Tokenizer",
+        "Monkey",
+        "",
+    ] {
+        assert!(!option_name_suggests_secret(name), "{name}");
+    }
+
+    let script = "#!/bin/sh\n\
+        ### NZBGET POST-PROCESSING SCRIPT ###\n\
+        ### OPTIONS ###\n\
+        #IgnoreKeywords=sample\n\
+        #PassThrough=yes\n\
+        #WebhookSecret=x\n\
+        ### NZBGET POST-PROCESSING SCRIPT ###\n";
+    let shape = bare_script_options(script)
+        .iter()
+        .map(|option| {
+            (
+                option.name().as_str().to_string(),
+                option.option_type(),
+                option.default().cloned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shape,
+        [
+            (
+                "IgnoreKeywords".to_string(),
+                ScriptOptionType::String,
+                Some(OptionValue::String("sample".into()))
+            ),
+            (
+                "PassThrough".to_string(),
+                ScriptOptionType::String,
+                Some(OptionValue::String("yes".into()))
+            ),
+            ("WebhookSecret".to_string(), ScriptOptionType::Secret, None),
+        ]
+    );
+}
 
 const NZBGET_V2_MANIFEST: &str = include_str!("fixtures/nzbget-v2-post-processing-manifest.json");
 
@@ -124,10 +273,7 @@ fn manifest_validation_rejects_malformed_shapes_kinds_and_entrypoints() {
         parse_nzbget_manifest("[]"),
         Err(ManifestError::InvalidShape)
     ));
-    assert!(matches!(
-        parse_nzbget_manifest(&NZBGET_V2_MANIFEST.replace("POST-PROCESSING", "QUEUE")),
-        Err(ManifestError::UnsupportedKind)
-    ));
+    assert!(parse_nzbget_manifest(&NZBGET_V2_MANIFEST.replace("POST-PROCESSING", "QUEUE")).is_ok());
     assert!(matches!(
         parse_nzbget_manifest(&NZBGET_V2_MANIFEST.replace("\"author\":", "\"author_missing\":")),
         Err(ManifestError::InvalidShape)
@@ -215,4 +361,191 @@ fn bare_script_detection_stops_when_executable_content_begins() {
         detect_bare_script_adapter("#!/bin/sh"),
         ScriptAdapter::Sabnzbd
     );
+}
+
+#[test]
+fn a_go_script_declares_the_legacy_header_in_its_leading_line_comments() {
+    let script = "\u{feff}//go:build ignore\r\n\
+        \r\n\
+        // ### NZBGET QUEUE/SCHEDULER SCRIPT ###\r\n\
+        //### QUEUE EVENTS: NZB_ADDED\r\n\
+        // ### TASK TIME: 03:15\r\n\
+        //\r\n\
+        // Prose that is not part of the header.\r\n\
+        // ### OPTIONS ###\r\n\
+        // # Where to report.\r\n\
+        // #Server=localhost\r\n\
+        //#ApiToken=\r\n\
+        // ### NZBGET QUEUE/SCHEDULER SCRIPT ###\r\n\
+        \r\n\
+        package main\r\n\
+        \r\n\
+        // #Ignored=after the code began\r\n";
+    let header = go_script_header(script);
+    assert_eq!(
+        header,
+        "\n\n### NZBGET QUEUE/SCHEDULER SCRIPT ###\n### QUEUE EVENTS: NZB_ADDED\n\
+         ### TASK TIME: 03:15\n\n\n### OPTIONS ###\n# Where to report.\n#Server=localhost\n\
+         #ApiToken=\n### NZBGET QUEUE/SCHEDULER SCRIPT ###\n\n"
+    );
+    assert_eq!(detect_bare_script_adapter(&header), ScriptAdapter::Nzbget);
+    let options = bare_script_options(&header);
+    let shape = options
+        .iter()
+        .map(|option| (option.name().as_str(), option.option_type()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shape,
+        [
+            ("Server", ScriptOptionType::String),
+            ("ApiToken", ScriptOptionType::Secret),
+        ]
+    );
+    assert_eq!(options[0].description(), ["Where to report."]);
+
+    // Without the header it is a SABnzbd script like any other, and a header
+    // below the first line of code is not one.
+    for plain in [
+        "// Reports a finished download.\npackage main\n",
+        "package main\n\n// ### NZBGET QUEUE SCRIPT ###\n",
+        "/*\n### NZBGET QUEUE SCRIPT ###\n*/\npackage main\n",
+    ] {
+        assert_eq!(
+            detect_bare_script_adapter(&go_script_header(plain)),
+            ScriptAdapter::Sabnzbd,
+            "{plain}"
+        );
+    }
+}
+
+#[test]
+fn manifest_retains_kinds_queue_subscriptions_and_task_times() {
+    use super::model::{QueueEvent, ScriptKind, ScriptTaskTime};
+    let mut value: serde_json::Value = serde_json::from_str(NZBGET_V2_MANIFEST).unwrap();
+    value["kind"] = serde_json::json!("POST-PROCESSING/QUEUE/SCAN/SCHEDULER/FEED/FUTURE");
+    value["queueEvents"] = serde_json::json!("NZB_ADDED,NZB_DOWNLOADED");
+    value["taskTime"] = serde_json::json!("*;*:00,*:30;23:59;24:00");
+    let manifest = parse_nzbget_manifest(&value.to_string()).unwrap();
+    assert_eq!(
+        manifest.kinds().iter().copied().collect::<Vec<_>>(),
+        ScriptKind::ALL
+    );
+    assert_eq!(
+        manifest.queue_events().iter().copied().collect::<Vec<_>>(),
+        [QueueEvent::NzbAdded, QueueEvent::NzbDownloaded]
+    );
+    assert_eq!(
+        manifest.task_times(),
+        [
+            ScriptTaskTime::Startup,
+            ScriptTaskTime::Hourly { minute: 0 },
+            ScriptTaskTime::Hourly { minute: 30 },
+            ScriptTaskTime::Daily {
+                hour: 23,
+                minute: 59
+            }
+        ]
+    );
+    assert_eq!(manifest.declaration_problems().len(), 2);
+
+    value["kind"] = serde_json::json!("prefixQUEUEsuffix");
+    value["queueEvents"] = serde_json::json!("");
+    let manifest = parse_nzbget_manifest(&value.to_string()).unwrap();
+    assert_eq!(
+        manifest.kinds().iter().copied().collect::<Vec<_>>(),
+        [ScriptKind::Queue]
+    );
+    assert_eq!(manifest.queue_events().len(), QueueEvent::ALL.len());
+    assert!(manifest.task_times().is_empty());
+    value["queueEvents"] = serde_json::json!("NZB_NAMED");
+    assert_eq!(
+        parse_nzbget_manifest(&value.to_string())
+            .unwrap()
+            .queue_events()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        [QueueEvent::NzbNamed]
+    );
+    value["queueEvents"] = serde_json::json!("FUTURE_EVENT");
+    assert!(
+        parse_nzbget_manifest(&value.to_string())
+            .unwrap()
+            .queue_events()
+            .is_empty()
+    );
+    value["kind"] = serde_json::json!("FUTURE");
+    let manifest = parse_nzbget_manifest(&value.to_string()).unwrap();
+    assert!(manifest.kinds().is_empty());
+    assert_eq!(manifest.declaration_problems().len(), 1);
+}
+
+#[test]
+fn legacy_kinds_and_metadata_survive_long_option_headers() {
+    use super::manifest::{MAX_LEGACY_METADATA_BYTES, apply_bare_script_declarations};
+    use super::model::{QueueEvent, ScriptKind, ScriptTaskTime};
+    let base = parse_nzbget_manifest(NZBGET_V2_MANIFEST).unwrap();
+    for kind in ScriptKind::ALL {
+        let source = format!("#!/bin/sh\n### NZBGET {} SCRIPT ###\n", kind.as_str());
+        assert_eq!(detect_bare_script_adapter(&source), ScriptAdapter::Nzbget);
+        let manifest = apply_bare_script_declarations(base.clone(), &source);
+        assert_eq!(manifest.kinds().iter().copied().collect::<Vec<_>>(), [kind]);
+    }
+    let source = format!(
+        "### TASK TIME: * ###\n### NZBGET QUEUE/SCHEDULER SCRIPT ###\n{}\n### QUEUE EVENTS: NZB_DOWNLOADED ###\n### TASK TIME: *:30 ###\n",
+        "# option\n".repeat(1500)
+    );
+    let manifest = apply_bare_script_declarations(base.clone(), &source);
+    assert_eq!(
+        manifest.queue_events().iter().copied().collect::<Vec<_>>(),
+        [QueueEvent::NzbDownloaded]
+    );
+    assert_eq!(
+        manifest.task_times(),
+        [ScriptTaskTime::Hourly { minute: 30 }]
+    );
+    let bounded = format!(
+        "### NZBGET SCHEDULER SCRIPT ###\n{}\n### TASK TIME: * ###\n",
+        "#".repeat(MAX_LEGACY_METADATA_BYTES)
+    );
+    assert!(
+        apply_bare_script_declarations(base, &bounded)
+            .task_times()
+            .is_empty()
+    );
+}
+
+#[test]
+fn script_task_times_reject_out_of_range_and_malformed_values() {
+    use super::model::ScriptTaskTime;
+    for value in [
+        "24:00", "12:60", "-1:00", "1:*", "**", "1:2:3", ":01", "1:", "+1:00",
+    ] {
+        assert!(value.parse::<ScriptTaskTime>().is_err(), "accepted {value}");
+    }
+}
+
+#[test]
+fn stored_results_default_to_terminal_event_and_event_labels_round_trip() {
+    use super::model::{QueueEvent, ScriptEventLabel, ScriptResult};
+    let result: ScriptResult = serde_json::from_value(serde_json::json!({
+        "script": "notify.sh", "adapter": "nzbget", "status": "succeeded",
+        "exitCode": 93, "durationMs": 1, "finishedAtEpochMs": 1
+    }))
+    .unwrap();
+    assert_eq!(result.event, ScriptEventLabel::PostProcessing);
+    for event in [
+        ScriptEventLabel::PostProcessing,
+        ScriptEventLabel::Queue(QueueEvent::NzbDownloaded),
+        ScriptEventLabel::Scan,
+        ScriptEventLabel::Scheduler(0),
+        ScriptEventLabel::Feed(7),
+    ] {
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value.as_str(), Some(event.to_string().as_str()));
+        assert_eq!(
+            serde_json::from_value::<ScriptEventLabel>(value).unwrap(),
+            event
+        );
+    }
 }

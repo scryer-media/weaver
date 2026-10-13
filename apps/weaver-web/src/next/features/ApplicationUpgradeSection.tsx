@@ -1,12 +1,9 @@
-import { useApplicationUpgrade, RunProgress } from "@/features/updates/application-upgrade-card";
+import { useApplicationUpgrade, RunProgress } from "@/next/features/updates/use-application-upgrade";
 import { useTranslate } from "@/lib/context/translate-context";
 import { SectionHeader } from "../components/chrome";
 import { PrimaryButton } from "../components/controls";
 
-/**
- * The in-application upgrade on the Next UI's System Info page: the same state
- * and install action as the classic card, drawn in the Next page's rows.
- */
+/** The in-application upgrade on the System Info page, drawn in the page's rows. */
 export function ApplicationUpgradeSection() {
   const t = useTranslate();
   const { status, installable, run, install, starting, startError } = useApplicationUpgrade();

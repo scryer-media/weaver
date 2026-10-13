@@ -1,77 +1,77 @@
-//! Segment-CRC checkpointing: one CRC pass over decoded article bytes that
-//! also yields PAR2 block CRC32s.
-//!
-//! The decode path already computes a CRC32 over every decoded byte to verify
-//! the yEnc `pcrc32`. That pass covers exactly the bytes PAR2 blocks are made
-//! of, just cut at article boundaries instead of block boundaries. Checkpointing
-//! the pass at block boundaries makes one pass serve both integrity families:
-//!
-//! - the article `pcrc32` is the in-order combine-fold of the article's own
-//!   segments, and
-//! - a block CRC32 is the combine-fold of the segments tiling that block, which
-//!   may span several articles.
-//!
-//! Segment assembly across articles happens in the evidence collector above the
-//! decoder; this module provides the checkpointing pass ([`SegmentedCrc32`]),
-//! the record type ([`Segment`]) and the composition primitives
-//! ([`combine_contiguous`], [`crate::crc::crc32_combine`]).
-//!
-//! # Intended call pattern
-//!
-//! The caller declares boundaries in *absolute output offsets* — the file
-//! offset the article's decoded bytes land at, plus the PAR2 block size — and
-//! then feeds decoded bytes in whatever chunks the driver produces. Checkpoint
-//! placement is a function of file offsets alone, so it is invariant to chunk
-//! and window boundaries:
-//!
-//! ```rust
-//! use std::num::NonZeroU64;
-//! use weaver_yenc::segment::{CheckpointPlan, SegmentedCrc32, combine_contiguous};
-//!
-//! // Article starts 3 MiB into the file; PAR2 block size is 1 MiB.
-//! let mut pass = SegmentedCrc32::new(
-//!     3 << 20,
-//!     CheckpointPlan::Single(NonZeroU64::new(1 << 20).expect("non-zero")),
-//! );
-//! pass.update(&[b'a'; 700 * 1024]); // fed in arbitrary chunks by the driver
-//! pass.update(&[b'b'; 700 * 1024]);
-//! let segments = pass.finish();
-//!
-//! // Article pcrc32 == the in-order fold of the article's segments.
-//! let article = combine_contiguous(&segments).expect("contiguous");
-//! assert_eq!(article.file_offset, 3 << 20);
-//! assert_eq!(article.len, 1_400 * 1024);
-//! ```
-//!
-//! Before PAR2 geometry is known, construct with `CheckpointPlan::None`: the
-//! pass emits one segment for the whole article. Such segments still compose
-//! whenever they happen to tile a block; blocks they do not tile fall back to
-//! settle-time read-back. An article is never delayed or re-decoded to obtain
-//! checkpoints.
+// Segment-CRC checkpointing: one CRC pass over decoded article bytes that
+// also yields PAR2 block CRC32s.
+//
+// The decode path already computes a CRC32 over every decoded byte to verify
+// the yEnc `pcrc32`. That pass covers exactly the bytes PAR2 blocks are made
+// of, just cut at article boundaries instead of block boundaries. Checkpointing
+// the pass at block boundaries makes one pass serve both integrity families:
+//
+// - the article `pcrc32` is the in-order combine-fold of the article's own
+//   segments, and
+// - a block CRC32 is the combine-fold of the segments tiling that block, which
+//   may span several articles.
+//
+// Segment assembly across articles happens in the evidence collector above the
+// decoder; this module provides the checkpointing pass ([`SegmentedCrc32`]),
+// the record type ([`Segment`]) and the composition primitives
+// ([`combine_contiguous`], [`crate::crc::crc32_combine`]).
+//
+// # Intended call pattern
+//
+// The caller declares boundaries in *absolute output offsets* — the file
+// offset the article's decoded bytes land at, plus the PAR2 block size — and
+// then feeds decoded bytes in whatever chunks the driver produces. Checkpoint
+// placement is a function of file offsets alone, so it is invariant to chunk
+// and window boundaries:
+//
+// ```rust
+// use std::num::NonZeroU64;
+// use weaver_yenc::segment::{CheckpointPlan, SegmentedCrc32, combine_contiguous};
+//
+// // Article starts 3 MiB into the file; PAR2 block size is 1 MiB.
+// let mut pass = SegmentedCrc32::new(
+//     3 << 20,
+//     CheckpointPlan::Single(NonZeroU64::new(1 << 20).expect("non-zero")),
+// );
+// pass.update(&[b'a'; 700 * 1024]); // fed in arbitrary chunks by the driver
+// pass.update(&[b'b'; 700 * 1024]);
+// let segments = pass.finish();
+//
+// // Article pcrc32 == the in-order fold of the article's segments.
+// let article = combine_contiguous(&segments).expect("contiguous");
+// assert_eq!(article.file_offset, 3 << 20);
+// assert_eq!(article.len, 1_400 * 1024);
+// ```
+//
+// Before PAR2 geometry is known, construct with `CheckpointPlan::None`: the
+// pass emits one segment for the whole article. Such segments still compose
+// whenever they happen to tile a block; blocks they do not tile fall back to
+// settle-time read-back. An article is never delayed or re-decoded to obtain
+// checkpoints.
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::crc::{Crc32, Crc32Combine, crc32_combine};
 
-/// Maximum number of distinct PAR2 slice grids admitted to one checkpoint
-/// plan. Keeping this small bounds both boundary selection and the work a
-/// decoded segment can offer to downstream collectors.
+// Maximum number of distinct PAR2 slice grids admitted to one checkpoint
+// plan. Keeping this small bounds both boundary selection and the work a
+// decoded segment can offer to downstream collectors.
 pub const MAX_CHECKPOINT_GRIDS: usize = 32;
 
-/// Hard cap for checkpoint segment storage for one article. The count below is
-/// deliberately derived from the representation so a future `Segment` layout
-/// change cannot silently raise the allocation bound.
+// Hard cap for checkpoint segment storage for one article. The count below is
+// deliberately derived from the representation so a future `Segment` layout
+// change cannot silently raise the allocation bound.
 pub const MAX_CHECKPOINT_SEGMENT_BYTES: usize = 64 * 1024;
 pub const MAX_CHECKPOINT_SEGMENTS: usize =
     MAX_CHECKPOINT_SEGMENT_BYTES / std::mem::size_of::<Segment>();
 
-/// Maximum downstream grid offers represented by one decoded article.
+// Maximum downstream grid offers represented by one decoded article.
 pub const MAX_CHECKPOINT_OFFER_WORK: usize = 65_536;
 
-/// An immutable snapshot of every PAR2 slice geometry known when an article
-/// began decoding. It describes cuts only; file/set ownership remains a
-/// durable-commit decision.
+// An immutable snapshot of every PAR2 slice geometry known when an article
+// began decoding. It describes cuts only; file/set ownership remains a
+// durable-commit decision.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum CheckpointPlan {
     #[default]
@@ -80,20 +80,20 @@ pub enum CheckpointPlan {
     Multi(Arc<[NonZeroU64]>),
 }
 
-/// Why a plan was safely degraded to [`CheckpointPlan::None`].
+// Why a plan was safely degraded to [`CheckpointPlan::None`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckpointPlanDegradation {
     TooManyGrids,
     InvalidSliceSize,
 }
 
-/// Why a checkpointing pass safely discarded fine-grained segments for one
-/// article. The decoded bytes and article CRC remain valid; downstream PAR2
-/// evidence must simply read back any block the coarse segment cannot tile.
-///
-/// This deliberately records only a small, stable classification. It crosses
-/// the yEnc/server boundary so the server can profile defensive fallbacks once
-/// per completed article without adding instrumentation to the cut loop.
+// Why a checkpointing pass safely discarded fine-grained segments for one
+// article. The decoded bytes and article CRC remain valid; downstream PAR2
+// evidence must simply read back any block the coarse segment cannot tile.
+//
+// This deliberately records only a small, stable classification. It crosses
+// the yEnc/server boundary so the server can profile defensive fallbacks once
+// per completed article without adding instrumentation to the cut loop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckpointCollapseReason {
     SegmentCount,
@@ -105,7 +105,7 @@ pub enum CheckpointCollapseReason {
     OffsetOverflow,
 }
 
-/// Result of normalizing untrusted parsed slice sizes into a safe plan.
+// Result of normalizing untrusted parsed slice sizes into a safe plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointPlanBuild {
     pub plan: CheckpointPlan,
@@ -113,9 +113,9 @@ pub struct CheckpointPlanBuild {
 }
 
 impl CheckpointPlan {
-    /// Normalize, sort, and deduplicate slice sizes without ever growing a
-    /// temporary list beyond the admitted-grid cap. An oversized distinct set
-    /// degrades as a whole rather than keeping an order-dependent prefix.
+    // Normalize, sort, and deduplicate slice sizes without ever growing a
+    // temporary list beyond the admitted-grid cap. An oversized distinct set
+    // degrades as a whole rather than keeping an order-dependent prefix.
     pub fn from_sizes<I>(sizes: I) -> CheckpointPlanBuild
     where
         I: IntoIterator<Item = NonZeroU64>,
@@ -151,9 +151,9 @@ impl CheckpointPlan {
         }
     }
 
-    /// Normalize raw PAR2 slice sizes. A zero value is malformed metadata, so
-    /// it disables checkpointing for the whole snapshot instead of being
-    /// silently filtered out and changing the plan's meaning.
+    // Normalize raw PAR2 slice sizes. A zero value is malformed metadata, so
+    // it disables checkpointing for the whole snapshot instead of being
+    // silently filtered out and changing the plan's meaning.
     pub fn from_slice_sizes<I>(slice_sizes: I) -> CheckpointPlanBuild
     where
         I: IntoIterator<Item = u64>,
@@ -202,75 +202,75 @@ impl CheckpointPlan {
     }
 }
 
-/// A contiguous run of decoded output bytes and its standalone CRC32.
-///
-/// `crc32` is a complete CRC32 over `[file_offset, file_offset + len)` with the
-/// standard init and final xor — not a running prefix value — so segments
-/// compose in any order-preserving tiling via [`combine_contiguous`].
+// A contiguous run of decoded output bytes and its standalone CRC32.
+//
+// `crc32` is a complete CRC32 over `[file_offset, file_offset + len)` with the
+// standard init and final xor — not a running prefix value — so segments
+// compose in any order-preserving tiling via [`combine_contiguous`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Segment {
-    /// Absolute offset of the first byte within the reconstructed file.
+    // Absolute offset of the first byte within the reconstructed file.
     pub file_offset: u64,
-    /// Number of bytes covered.
+    // Number of bytes covered.
     pub len: u64,
-    /// CRC32 (ISO-HDLC) over exactly those bytes.
+    // CRC32 (ISO-HDLC) over exactly those bytes.
     pub crc32: u32,
 }
 
 impl Segment {
-    /// Absolute offset one past the last byte covered.
+    // Absolute offset one past the last byte covered.
     #[inline]
     pub fn end_offset(&self) -> u64 {
         self.file_offset + self.len
     }
 }
 
-/// A CRC32 pass over decoded output bytes that checkpoints at caller-declared
-/// block boundaries.
-///
-/// Feeding is chunk-agnostic: `update` may be called with any split of the
-/// article's decoded bytes and produces the same segments, because boundaries
-/// are derived from absolute file offsets rather than from call boundaries.
+// A CRC32 pass over decoded output bytes that checkpoints at caller-declared
+// block boundaries.
+//
+// Feeding is chunk-agnostic: `update` may be called with any split of the
+// article's decoded bytes and produces the same segments, because boundaries
+// are derived from absolute file offsets rather than from call boundaries.
 #[derive(Debug, Clone)]
 pub struct SegmentedCrc32 {
     crc: Crc32,
-    /// File offset of the first byte fed to this pass.
+    // File offset of the first byte fed to this pass.
     base_offset: u64,
-    /// File offset of the first byte of the segment currently open.
+    // File offset of the first byte of the segment currently open.
     open_offset: u64,
-    /// File offset one past the last byte fed.
+    // File offset one past the last byte fed.
     cursor: u64,
-    /// Bytes remaining until the next fixed-stride checkpoint.
+    // Bytes remaining until the next fixed-stride checkpoint.
     until_boundary: Option<u64>,
     checkpoint_plan: CheckpointPlan,
-    /// Next boundary for each admitted grid. The plan cap makes this fixed.
+    // Next boundary for each admitted grid. The plan cap makes this fixed.
     next_boundaries: [u64; MAX_CHECKPOINT_GRIDS],
     next_boundary_count: usize,
     segments: Vec<Segment>,
-    /// In-order combine-fold of every closed segment, i.e. the CRC32 over
-    /// `[base_offset, open_offset)`. Maintained at each cut so the whole-pass
-    /// CRC is available in O(1) without re-folding the segment list.
+    // In-order combine-fold of every closed segment, i.e. the CRC32 over
+    // `[base_offset, open_offset)`. Maintained at each cut so the whole-pass
+    // CRC is available in O(1) without re-folding the segment list.
     closed_crc: u32,
-    /// Bytes covered by closed segments. Kept independently of absolute file
-    /// offsets so an address overflow can fail closed without corrupting the
-    /// article CRC calculation.
+    // Bytes covered by closed segments. Kept independently of absolute file
+    // offsets so an address overflow can fail closed without corrupting the
+    // article CRC calculation.
     closed_len: u64,
-    /// Total decoded bytes in this article.
+    // Total decoded bytes in this article.
     total_len: u64,
-    /// Fine-grained evidence was discarded after a defensive limit or offset
-    /// arithmetic failure. The final result is one coarse article segment.
+    // Fine-grained evidence was discarded after a defensive limit or offset
+    // arithmetic failure. The final result is one coarse article segment.
     collapsed: bool,
     collapse_reason: Option<CheckpointCollapseReason>,
-    /// The combine operator for the last cut's segment length. Segments on a
-    /// checkpoint stride all have the stride's length, so the operator is
-    /// built once per stride rather than once per cut.
+    // The combine operator for the last cut's segment length. Segments on a
+    // checkpoint stride all have the stride's length, so the operator is
+    // built once per stride rather than once per cut.
     combine_memo: Option<(u64, Crc32Combine)>,
 }
 
 impl SegmentedCrc32 {
-    /// Start a pass whose first byte lands at `file_offset` in the
-    /// reconstructed file, checkpointing according to an immutable geometry
-    /// snapshot.
+    // Start a pass whose first byte lands at `file_offset` in the
+    // reconstructed file, checkpointing according to an immutable geometry
+    // snapshot.
     pub fn new(file_offset: u64, mut checkpoint_plan: CheckpointPlan) -> Self {
         let oversized_multi = matches!(
             &checkpoint_plan,
@@ -334,8 +334,8 @@ impl SegmentedCrc32 {
         }
     }
 
-    /// The combine operator for a closed segment of `len` bytes, reusing the
-    /// last one when the length repeats.
+    // The combine operator for a closed segment of `len` bytes, reusing the
+    // last one when the length repeats.
     #[inline]
     fn combine_for(&mut self, len: u64) -> Crc32Combine {
         match self.combine_memo {
@@ -348,48 +348,48 @@ impl SegmentedCrc32 {
         }
     }
 
-    /// File offset of the first byte this pass covers.
+    // File offset of the first byte this pass covers.
     #[inline]
     pub fn base_offset(&self) -> u64 {
         self.base_offset
     }
 
-    /// File offset one past the last byte fed so far.
+    // File offset one past the last byte fed so far.
     #[inline]
     pub fn cursor(&self) -> u64 {
         self.cursor
     }
 
-    /// Bytes fed so far.
+    // Bytes fed so far.
     #[inline]
     pub fn len(&self) -> u64 {
         self.total_len
     }
 
-    /// Whether no bytes have been fed yet.
+    // Whether no bytes have been fed yet.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.total_len == 0
     }
 
-    /// Immutable geometry this article used for checkpointing.
+    // Immutable geometry this article used for checkpointing.
     #[inline]
     pub fn checkpoint_plan(&self) -> &CheckpointPlan {
         &self.checkpoint_plan
     }
 
-    /// Why this article was reduced to one coarse segment, if it was.
+    // Why this article was reduced to one coarse segment, if it was.
     #[inline]
     pub fn collapse_reason(&self) -> Option<CheckpointCollapseReason> {
         self.collapse_reason
     }
 
-    /// CRC32 over every byte fed so far — the article `pcrc32` as of the
-    /// cursor, identical to what an unsegmented [`Crc32`] over the same bytes
-    /// would report.
-    ///
-    /// Closed segments are folded in as they are cut, so this is one combine
-    /// over the open segment rather than a re-fold of the whole list.
+    // CRC32 over every byte fed so far — the article `pcrc32` as of the
+    // cursor, identical to what an unsegmented [`Crc32`] over the same bytes
+    // would report.
+    //
+    // Closed segments are folded in as they are cut, so this is one combine
+    // over the open segment rather than a re-fold of the whole list.
     #[inline]
     pub fn current_crc(&self) -> u32 {
         crc32_combine(
@@ -399,15 +399,15 @@ impl SegmentedCrc32 {
         )
     }
 
-    /// Segments closed so far. The segment currently open is not included;
-    /// call [`Self::finish`] to close it.
+    // Segments closed so far. The segment currently open is not included;
+    // call [`Self::finish`] to close it.
     #[inline]
     pub fn segments(&self) -> &[Segment] {
         &self.segments
     }
 
-    /// Feed decoded output bytes, closing a segment at every checkpoint-plan
-    /// boundary crossed.
+    // Feed decoded output bytes, closing a segment at every checkpoint-plan
+    // boundary crossed.
     pub fn update(&mut self, mut data: &[u8]) {
         if self.collapsed || self.checkpoint_plan.is_none() {
             self.consume(data);
@@ -421,37 +421,37 @@ impl SegmentedCrc32 {
         }
     }
 
-    /// Close the segment currently open at the current cursor.
-    ///
-    /// Automatic block-boundary checkpoints call this; callers with boundaries
-    /// that are not a fixed stride can drive it directly. A no-op when no bytes
-    /// have been fed since the previous checkpoint — zero-length segments are
-    /// never emitted.
+    // Close the segment currently open at the current cursor.
+    //
+    // Automatic block-boundary checkpoints call this; callers with boundaries
+    // that are not a fixed stride can drive it directly. A no-op when no bytes
+    // have been fed since the previous checkpoint — zero-length segments are
+    // never emitted.
     pub fn checkpoint(&mut self) {
         if !self.collapsed && self.total_len > self.closed_len {
             self.cut();
         }
     }
 
-    /// Close the open segment and return every segment in file order.
+    // Close the open segment and return every segment in file order.
     pub fn finish(mut self) -> Vec<Segment> {
         self.checkpoint();
         self.finish_segments()
     }
 
-    /// Close the open segment and return both the CRC32 over everything fed
-    /// (the article `pcrc32`) and the segments in file order.
-    ///
-    /// This is the decoder-facing finish: the CRC is the value an unsegmented
-    /// pass would have produced, so checkpointing cannot move an article's
-    /// verdict, and the segments are the block-aligned evidence.
+    // Close the open segment and return both the CRC32 over everything fed
+    // (the article `pcrc32`) and the segments in file order.
+    //
+    // This is the decoder-facing finish: the CRC is the value an unsegmented
+    // pass would have produced, so checkpointing cannot move an article's
+    // verdict, and the segments are the block-aligned evidence.
     pub fn finish_article(self) -> (u32, Vec<Segment>) {
         let (crc, segments, _) = self.finish_article_with_reason();
         (crc, segments)
     }
 
-    /// Like [`Self::finish_article`], retaining the defensive-collapse
-    /// classification for once-per-article observability.
+    // Like [`Self::finish_article`], retaining the defensive-collapse
+    // classification for once-per-article observability.
     pub fn finish_article_with_reason(
         self,
     ) -> (u32, Vec<Segment>, Option<CheckpointCollapseReason>) {
@@ -459,8 +459,8 @@ impl SegmentedCrc32 {
         (crc, segments, reason)
     }
 
-    /// Like [`Self::finish_article_with_reason`], returning the immutable
-    /// plan by move for the transport result.
+    // Like [`Self::finish_article_with_reason`], returning the immutable
+    // plan by move for the transport result.
     pub fn finish_article_with_reason_and_plan(
         mut self,
     ) -> (
@@ -648,15 +648,15 @@ impl SegmentedCrc32 {
 }
 
 impl Default for SegmentedCrc32 {
-    /// A pass over an article whose file offset is not yet known and with no
-    /// block grid: one segment based at offset 0, i.e. exactly an unsegmented
-    /// [`Crc32`] plus a byte counter.
+    // A pass over an article whose file offset is not yet known and with no
+    // block grid: one segment based at offset 0, i.e. exactly an unsegmented
+    // [`Crc32`] plus a byte counter.
     fn default() -> Self {
         Self::new(0, CheckpointPlan::None)
     }
 }
 
-/// Bytes from `offset` to the next multiple of `block_size` strictly after it.
+// Bytes from `offset` to the next multiple of `block_size` strictly after it.
 #[inline]
 fn bytes_to_next_boundary(offset: u64, block_size: NonZeroU64) -> u64 {
     let size = block_size.get();
@@ -667,13 +667,13 @@ fn next_boundary_after(offset: u64, block_size: NonZeroU64) -> Option<u64> {
     offset.checked_add(bytes_to_next_boundary(offset, block_size))
 }
 
-/// Fold segments that tile a contiguous file range into the single segment
-/// covering that range.
-///
-/// Returns `None` if `segments` is empty or does not form a gapless,
-/// non-overlapping, ascending tiling — a caller assembling a block from
-/// several articles' segments uses that to detect an unclaimed block rather
-/// than publishing a CRC derived from a broken tiling.
+// Fold segments that tile a contiguous file range into the single segment
+// covering that range.
+//
+// Returns `None` if `segments` is empty or does not form a gapless,
+// non-overlapping, ascending tiling — a caller assembling a block from
+// several articles' segments uses that to detect an unclaimed block rather
+// than publishing a CRC derived from a broken tiling.
 pub fn combine_contiguous(segments: &[Segment]) -> Option<Segment> {
     let (first, rest) = segments.split_first()?;
     let mut folded = *first;
@@ -700,8 +700,8 @@ pub fn combine_contiguous(segments: &[Segment]) -> Option<Segment> {
 mod tests {
     use super::*;
 
-    /// Deterministic xorshift64* stream: every test input and every random
-    /// matrix below is a pure function of its seed.
+    // Deterministic xorshift64* stream: every test input and every random
+    // matrix below is a pure function of its seed.
     struct Rng(u64);
 
     impl Rng {
@@ -736,8 +736,8 @@ mod tests {
         block_size.map_or(CheckpointPlan::None, CheckpointPlan::Single)
     }
 
-    /// Run one article's bytes through the checkpointing pass with a chunking
-    /// schedule, returning the emitted segments.
+    // Run one article's bytes through the checkpointing pass with a chunking
+    // schedule, returning the emitted segments.
     fn run_pass(
         data: &[u8],
         file_offset: u64,
@@ -829,11 +829,11 @@ mod tests {
         assert_eq!(pass.finish_article(), (direct(&[]), Vec::new()));
     }
 
-    /// The incrementally folded whole-pass CRC — what the decoder reports as the
-    /// article `pcrc32` — must equal the CRC of everything fed at every prefix,
-    /// whatever the block grid. This is what makes checkpointing invisible to
-    /// the article verdict: a segmented pass and an unsegmented one agree byte
-    /// for byte, at every point, not just at the end.
+    // The incrementally folded whole-pass CRC — what the decoder reports as the
+    // article `pcrc32` — must equal the CRC of everything fed at every prefix,
+    // whatever the block grid. This is what makes checkpointing invisible to
+    // the article verdict: a segmented pass and an unsegmented one agree byte
+    // for byte, at every point, not just at the end.
     #[test]
     fn running_and_final_article_crc_equal_an_unsegmented_pass() {
         let data = random_bytes(0x9ec0, 20_000);
@@ -945,14 +945,14 @@ mod tests {
         assert_eq!(crc32_combine(direct(&[]), crc, data.len() as u64), crc);
     }
 
-    /// Gate 1 + gate 2, exhaustively over a seeded random matrix: random file
-    /// bytes x random block sizes x random article tilings (articles that
-    /// straddle 0..3 boundaries, first/last block, short final block) x random
-    /// chunk schedules.
-    ///
-    /// Every article's derived pcrc32 must equal its direct whole-article CRC,
-    /// and every block's CRC derived from the segments tiling it must equal the
-    /// direct CRC over that block's bytes.
+    // Gate 1 + gate 2, exhaustively over a seeded random matrix: random file
+    // bytes x random block sizes x random article tilings (articles that
+    // straddle 0..3 boundaries, first/last block, short final block) x random
+    // chunk schedules.
+    //
+    // Every article's derived pcrc32 must equal its direct whole-article CRC,
+    // and every block's CRC derived from the segments tiling it must equal the
+    // direct CRC over that block's bytes.
     #[test]
     fn derived_block_and_article_crcs_match_direct_over_random_matrix() {
         let mut cases = 0usize;
@@ -1084,9 +1084,9 @@ mod tests {
         }
     }
 
-    /// Checkpoint placement is a function of file offsets only: the same
-    /// article fed with wildly different chunk schedules must produce
-    /// byte-identical segment records.
+    // Checkpoint placement is a function of file offsets only: the same
+    // article fed with wildly different chunk schedules must produce
+    // byte-identical segment records.
     #[test]
     fn segments_are_invariant_to_chunking() {
         for seed in 0..24u64 {
@@ -1117,8 +1117,8 @@ mod tests {
         }
     }
 
-    /// Every split point of a small article, at every offset within a small
-    /// block grid — the dense counterpart to the random sweep above.
+    // Every split point of a small article, at every offset within a small
+    // block grid — the dense counterpart to the random sweep above.
     #[test]
     fn every_split_point_and_offset_agrees_with_direct() {
         let data = random_bytes(0xc0ffee, 300);
@@ -1145,10 +1145,10 @@ mod tests {
         }
     }
 
-    /// A checkpoint must be able to cut a segment while the x86 folded-streak
-    /// path is carrying state, and while it is not. Sizes straddle the
-    /// `VPCLMUL_MIN_UPDATE` threshold in both directions so the cut lands on a
-    /// pending folded streak, on a digest-path streak, and on the hand-off.
+    // A checkpoint must be able to cut a segment while the x86 folded-streak
+    // path is carrying state, and while it is not. Sizes straddle the
+    // `VPCLMUL_MIN_UPDATE` threshold in both directions so the cut lands on a
+    // pending folded streak, on a digest-path streak, and on the hand-off.
     #[test]
     fn checkpoint_cuts_across_folded_streak_states() {
         let data = random_bytes(0x51ea4, 64 * 1024);
@@ -1365,8 +1365,8 @@ mod tests {
         assert_eq!(segments[0].crc32, direct(b"ab"));
     }
 
-    /// The checkpoint primitive on the raw CRC state: a cut must restart from
-    /// the CRC init state, not carry the closed segment's value forward.
+    // The checkpoint primitive on the raw CRC state: a cut must restart from
+    // the CRC init state, not carry the closed segment's value forward.
     #[test]
     fn crc_checkpoint_restarts_from_init_state() {
         let data = random_bytes(0x1234_5678, 40_000);

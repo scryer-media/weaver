@@ -1,4 +1,4 @@
-//! `par2_completion` tests, part of a mechanical split of the original file.
+// `par2_completion` tests, part of a mechanical split of the original file.
 
 use super::*;
 
@@ -24,8 +24,8 @@ fn bounded_repair_reconstructs_a_missing_payload() {
     );
 }
 
-/// Admission, authenticated metadata ingestion, the normal repair worker, and
-/// final output reconciliation must all tolerate a payload with no disk inode.
+// Admission, authenticated metadata ingestion, the normal repair worker, and
+// final output reconciliation must all tolerate a payload with no disk inode.
 #[tokio::test]
 async fn admitted_job_reconstructs_an_entirely_missing_payload() {
     use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
@@ -292,6 +292,7 @@ async fn restore_job_reloads_par2_metadata_from_disk_after_restart() {
         tokio::fs::write(working_dir.join(par2_filename), &par2_bytes)
             .await
             .unwrap();
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
@@ -419,6 +420,7 @@ async fn restored_unknown_par2_is_inspected_on_completion_not_startup() {
         tokio::fs::write(working_dir.join(payload_filename), payload)
             .await
             .unwrap();
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
@@ -529,7 +531,7 @@ async fn par2_metadata_sanitizes_unsafe_canonical_target_before_rename() {
     let topology = pipeline
         .jobs
         .get(&job_id)
-        .and_then(|state| state.assembly.archive_topology_for("Fixture.Payload"))
+        .and_then(|state| state.assembly.archive_topology_for("fixture.payload"))
         .cloned()
         .expect("sanitized PAR2 rebinding should rebuild RAR topology");
     assert!(
@@ -542,78 +544,115 @@ async fn par2_metadata_sanitizes_unsafe_canonical_target_before_rename() {
 
 #[tokio::test]
 async fn par2_metadata_records_canonical_name_without_phantom_current_path() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(30113);
-    let canonical_filename = "show.part001.rar";
-    let source_filename = "incoming.part001.rar";
-    let rar_bytes = build_multifile_multivolume_rar_set()[0].1.clone();
-    let spec = JobSpec {
-        name: "PAR2 Canonical Before File Completion".to_string(),
-        password: None,
-        total_bytes: rar_bytes.len() as u64,
-        category: None,
-        metadata: vec![],
-        files: vec![FileSpec {
-            filename: source_filename.to_string(),
-            role: FileRole::from_filename(source_filename),
-            groups: vec!["alt.binaries.test".to_string()],
-            posted_at_epoch: None,
-            segments: vec![segment_spec! {
-                number: 0,
-                bytes: rar_bytes.len() as u32,
-                message_id: "rar-before-complete@example.com".to_string(),
+    use crate::pipeline::direct_unpack::settings::{DirectUnpackGate, DirectUnpackSettings};
+    use crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime;
+    for chase in [false, true] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
+            gate: if chase {
+                DirectUnpackGate::Enabled
+            } else {
+                DirectUnpackGate::Disabled
+            },
+        });
+        let job_id = JobId(30113);
+        let canonical_filename = "show.part001.rar";
+        let source_filename = "incoming.part001.rar";
+        let rar_bytes = build_multifile_multivolume_rar_set()[0].1.clone();
+        let spec = JobSpec {
+            name: "PAR2 Canonical Before File Completion".to_string(),
+            password: None,
+            total_bytes: rar_bytes.len() as u64,
+            category: None,
+            metadata: vec![],
+            files: vec![FileSpec {
+                filename: source_filename.to_string(),
+                role: FileRole::from_filename(source_filename),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: rar_bytes.len() as u32,
+                    message_id: "rar-before-complete@example.com".to_string(),
+                }],
             }],
-        }],
-    };
-    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-    install_test_par2_runtime(
-        &mut pipeline,
-        job_id,
-        placement_par2_file_set(&[(canonical_filename.to_string(), rar_bytes.clone())]),
-        &[],
-    );
-
-    pipeline.retry_par2_authoritative_identity(job_id).await;
-
-    let identity = pipeline
-        .file_identity(
+        };
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+        install_test_par2_runtime(
+            &mut pipeline,
             job_id,
-            NzbFileId {
-                job_id,
-                file_index: 0,
-            },
-        )
-        .cloned()
-        .expect("PAR2 should still bind identity by RAR volume number");
-    assert_eq!(identity.current_filename, source_filename);
-    assert_eq!(
-        identity.canonical_filename.as_deref(),
-        Some(canonical_filename)
-    );
-    assert_eq!(identity.classification_source, FileIdentitySource::Par2);
-    assert!(!working_dir.join(canonical_filename).exists());
+            placement_par2_file_set(&[(canonical_filename.to_string(), rar_bytes.clone())]),
+            &[],
+        );
 
-    write_and_complete_file(&mut pipeline, job_id, 0, source_filename, &rar_bytes).await;
-    pipeline.retry_par2_authoritative_identity(job_id).await;
+        pipeline.retry_par2_authoritative_identity(job_id).await;
 
-    let identity = pipeline
-        .file_identity(
+        let file_id = NzbFileId {
             job_id,
-            NzbFileId {
+            file_index: 0,
+        };
+        assert!(
+            pipeline
+                .file_identity(job_id, file_id)
+                .is_none_or(|identity| identity.canonical_filename.is_none()),
+            "the same volume number alone must not establish canonical identity"
+        );
+        // Model decoded bytes captured before their file-completion commit.
+        // Content can establish a canonical name without inventing its disk path.
+        pipeline.file_prefix_16k.insert(
+            file_id,
+            rar_bytes[..rar_bytes.len().min(crate::pipeline::PAR2_HASH_16K_BYTES)].to_vec(),
+        );
+        pipeline.retry_par2_authoritative_identity(job_id).await;
+
+        let identity = pipeline
+            .file_identity(
                 job_id,
-                file_index: 0,
-            },
-        )
-        .cloned()
-        .expect("data file identity should remain persisted");
-    assert_eq!(identity.current_filename, canonical_filename);
-    assert_eq!(
-        identity.canonical_filename.as_deref(),
-        Some(canonical_filename)
-    );
-    assert!(!working_dir.join(source_filename).exists());
-    assert!(working_dir.join(canonical_filename).exists());
+                NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+            )
+            .cloned()
+            .expect("PAR2 should bind identity from the decoded content prefix");
+        assert_eq!(identity.current_filename, source_filename);
+        assert_eq!(
+            identity.canonical_filename.as_deref(),
+            Some(canonical_filename)
+        );
+        assert_eq!(identity.classification_source, FileIdentitySource::Par2);
+        assert!(!working_dir.join(canonical_filename).exists());
+
+        write_and_complete_file(&mut pipeline, job_id, 0, source_filename, &rar_bytes).await;
+        pipeline.retry_par2_authoritative_identity(job_id).await;
+
+        let identity = pipeline
+            .file_identity(
+                job_id,
+                NzbFileId {
+                    job_id,
+                    file_index: 0,
+                },
+            )
+            .cloned()
+            .expect("data file identity should remain persisted");
+        assert_eq!(
+            identity.current_filename,
+            if chase {
+                source_filename
+            } else {
+                canonical_filename
+            }
+        );
+        assert_eq!(
+            identity.canonical_filename.as_deref(),
+            Some(canonical_filename)
+        );
+        assert_eq!(working_dir.join(source_filename).exists(), chase);
+        assert_eq!(working_dir.join(canonical_filename).exists(), !chase);
+        assert!(working_dir.join(&identity.current_filename).is_file());
+    }
 }
 
 #[tokio::test]
@@ -1844,6 +1883,7 @@ async fn restore_job_reparses_par2_without_promoted_recovery_state() {
             .db
             .upsert_par2_file(job_id, 1, recovery_filename, 1, true)
             .unwrap();
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 
@@ -2312,7 +2352,7 @@ async fn direct_payload_par2_repair_verifies_complete_corrupt_payload() {
     assert_eq!(completed_payload, original_payload);
 }
 
-/// The post-repair pass reads the file the repair rewrote and nothing else.
+// The post-repair pass reads the file the repair rewrote and nothing else.
 #[tokio::test]
 async fn post_repair_verification_reads_only_the_files_the_repair_rewrote() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2369,15 +2409,15 @@ async fn post_repair_verification_reads_only_the_files_the_repair_rewrote() {
     );
 }
 
-/// The trade this seam accepts, pinned honestly rather than left implicit.
-///
-/// A file the repair did not touch is vouched by the pre-repair pass, which
-/// read its bytes. If something outside this job rewrites that file in the
-/// minutes between the two passes, the post-repair pass will not notice — it
-/// is not asked to. This is the documented residual, not a bug: it is the same
-/// window, and the same trust class, as an in-stream claim relied on across the
-/// same interval. The test exists so the day someone changes it, they change it
-/// deliberately.
+// The trade this seam accepts, pinned honestly rather than left implicit.
+//
+// A file the repair did not touch is vouched by the pre-repair pass, which
+// read its bytes. If something outside this job rewrites that file in the
+// minutes between the two passes, the post-repair pass will not notice — it
+// is not asked to. This is the documented residual, not a bug: it is the same
+// window, and the same trust class, as an in-stream claim relied on across the
+// same interval. The test exists so the day someone changes it, they change it
+// deliberately.
 #[tokio::test]
 async fn post_repair_verification_accepts_a_file_corrupted_after_the_pre_repair_read() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2469,15 +2509,15 @@ async fn post_repair_verification_accepts_a_file_corrupted_after_the_pre_repair_
     assert!(plan.swaps.is_empty() && plan.renames.is_empty());
 }
 
-/// A file the pre-repair verdict called `Renamed` is read back at its canonical
-/// name, not carried.
-///
-/// The repairer treats a misplaced file as work: it is not complete at the path
-/// its description names, so the repair copies the bytes onto that path and
-/// moves whatever held the name aside. Carrying the pre-repair entry through
-/// that would report a file as still misplaced after the repair had already
-/// placed it, and hand the placement step a rename onto a name the repair had
-/// just filled.
+// A file the pre-repair verdict called `Renamed` is read back at its canonical
+// name, not carried.
+//
+// The repairer treats a misplaced file as work: it is not complete at the path
+// its description names, so the repair copies the bytes onto that path and
+// moves whatever held the name aside. Carrying the pre-repair entry through
+// that would report a file as still misplaced after the repair had already
+// placed it, and hand the placement step a rename onto a name the repair had
+// just filled.
 #[tokio::test]
 async fn post_repair_verification_reads_back_a_renamed_file_at_its_canonical_name() {
     let temp_dir = tempfile::tempdir().unwrap();

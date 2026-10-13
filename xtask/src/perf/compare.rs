@@ -1,4 +1,4 @@
-//! Matched PAR2 command-line measurements; pipeline/download acceptance is separate.
+// Matched PAR2 command-line measurements; pipeline/download acceptance is separate.
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
@@ -160,8 +160,8 @@ fn parse_usage(text: &str, macos: bool) -> Result<Usage> {
     })
 }
 
-/// Two-sided 95% Student-t interval on paired log elapsed-time ratios.
-/// Only the prescribed 10- and 30-pair checkpoints are evaluated.
+// Two-sided 95% Student-t interval on paired log elapsed-time ratios.
+// Only the prescribed 10- and 30-pair checkpoints are evaluated.
 fn interval(ratios: &[f64]) -> Result<(f64, f64, f64)> {
     let critical = match ratios.len() {
         10 => 2.262_157_163,

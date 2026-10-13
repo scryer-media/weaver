@@ -40,7 +40,7 @@ impl ScannedExtractionFile {
     }
 }
 
-/// Simple archive type for non-RAR, non-7z extraction.
+// Simple archive type for non-RAR, non-7z extraction.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SimpleArchiveKind {
     Zip,
@@ -60,6 +60,7 @@ pub(crate) enum SimpleArchiveKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NestedExtractionDecision {
     Started,
+    Deferred,
     NoNestedArchives,
     PreserveOutputsAtDepthLimit,
 }

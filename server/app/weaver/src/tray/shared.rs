@@ -1,10 +1,10 @@
-//! The parts of the Weaver desktop wrapper that are the same on every platform.
-//!
-//! Both wrappers supervise the same `weaver` server process, poll the same
-//! readiness surface, and answer the same question about which links belong
-//! inside the app window. Keeping those rules here is what keeps the
-//! platform modules down to window and menu plumbing, and it is the only way
-//! the two platforms can be relied on to behave identically.
+// The parts of the Weaver desktop wrapper that are the same on every platform.
+//
+// Both wrappers supervise the same `weaver` server process, poll the same
+// readiness surface, and answer the same question about which links belong
+// inside the app window. Keeping those rules here is what keeps the
+// platform modules down to window and menu plumbing, and it is the only way
+// the two platforms can be relied on to behave identically.
 #![allow(
     dead_code,
     reason = "the Windows and macOS wrappers each use a subset of this module, and neither is compiled on other platforms"
@@ -18,30 +18,30 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// The port `weaver serve` is started on, and the port the wrapper expects the
-/// UI to answer on. Users who want a different port run the server themselves;
-/// the wrapper owns this one.
+// The port `weaver serve` is started on, and the port the wrapper expects the
+// UI to answer on. Users who want a different port run the server themselves;
+// the wrapper owns this one.
 pub(crate) const DEFAULT_PORT: u16 = 9090;
 
-/// How long a start or restart waits for the server to answer before the
-/// wrapper reports the failure to the user.
+// How long a start or restart waits for the server to answer before the
+// wrapper reports the failure to the user.
 pub(crate) const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a Unix stop waits after `SIGTERM` before escalating to `SIGKILL`.
-/// The server's own graceful teardown is what needs the time here; a process
-/// that ignores the signal must not be able to strand the wrapper.
+// How long a Unix stop waits after `SIGTERM` before escalating to `SIGKILL`.
+// The server's own graceful teardown is what needs the time here; a process
+// that ignores the signal must not be able to strand the wrapper.
 #[cfg(unix)]
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The names the wrapper and the server are installed under. Both binaries
-/// ship in the same directory, which is what lets the wrapper find the server
-/// without a configured path.
+// The names the wrapper and the server are installed under. Both binaries
+// ship in the same directory, which is what lets the wrapper find the server
+// without a configured path.
 #[cfg(windows)]
 const SERVER_EXECUTABLE: &str = "weaver.exe";
 
-/// Size past which the captured stderr log is rotated on the next server
-/// start. What lands there is sparse — a setup code, a runtime's last words —
-/// so this is a bound against a server that spews, not a budget.
+// Size past which the captured stderr log is rotated on the next server
+// start. What lands there is sparse — a setup code, a runtime's last words —
+// so this is a bound against a server that spews, not a budget.
 const STDERR_LOG_ROTATE_BYTES: u64 = 1 << 20;
 
 #[cfg(windows)]
@@ -51,20 +51,20 @@ const SERVER_EXECUTABLE: &str = "weaver";
 #[cfg(not(windows))]
 const WRAPPER_EXECUTABLE: &str = "weaver-tray";
 
-/// The origin the app window is allowed to stay inside.
+// The origin the app window is allowed to stay inside.
 pub(crate) fn app_origin(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
-/// The document the app window opens.
+// The document the app window opens.
 pub(crate) fn app_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/")
 }
 
-/// Where the desktop wrapper keeps the server's configuration, database and
-/// logs. This is deliberately not the portable layout the tarball uses: a
-/// wrapper install writes to per-user application data, and a portable install
-/// writes beside itself, and the two must never collide.
+// Where the desktop wrapper keeps the server's configuration, database and
+// logs. This is deliberately not the portable layout the tarball uses: a
+// wrapper install writes to per-user application data, and a portable install
+// writes beside itself, and the two must never collide.
 #[cfg(windows)]
 pub(crate) fn desktop_profile_dir() -> Result<PathBuf, String> {
     let local_app_data = std::env::var_os("LOCALAPPDATA")
@@ -81,19 +81,19 @@ pub(crate) fn desktop_profile_dir() -> Result<PathBuf, String> {
     ))
 }
 
-/// The vendor/product suffix both platforms append to their per-user data
-/// root, split out so the layout can be asserted without an environment.
+// The vendor/product suffix both platforms append to their per-user data
+// root, split out so the layout can be asserted without an environment.
 pub(crate) fn desktop_profile_dir_from(application_data: &Path) -> PathBuf {
     application_data.join("ScryerMedia").join("Weaver")
 }
 
-/// Holds the version of the wrapper that last ran against this profile.
+// Holds the version of the wrapper that last ran against this profile.
 const LAST_RUN_VERSION_FILE: &str = "desktop-version";
 
-/// Record `version` as the wrapper that ran against this profile, and report
-/// whether a different one ran before it. A new profile has no earlier run to
-/// differ from. The answer is yes once per upgrade: a marker that cannot be
-/// written answers no, so the caller's work is never repeated on every start.
+// Record `version` as the wrapper that ran against this profile, and report
+// whether a different one ran before it. A new profile has no earlier run to
+// differ from. The answer is yes once per upgrade: a marker that cannot be
+// written answers no, so the caller's work is never repeated on every start.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn note_version_change(profile_dir: &Path, version: &str) -> bool {
     let marker = profile_dir.join(LAST_RUN_VERSION_FILE);
@@ -107,14 +107,14 @@ pub(crate) fn note_version_change(profile_dir: &Path, version: &str) -> bool {
     std::fs::write(&marker, version).is_ok() && upgraded
 }
 
-/// Whether a navigation the app window is about to perform belongs in the
-/// user's browser instead.
-///
-/// Only absolute `http`/`https` navigations are redirected. Everything else —
-/// `about:blank` while a webview initializes, `data:` and `blob:` documents
-/// the app itself creates, and schemes the platform webview already refuses —
-/// is left to the webview, because handing those to the shell would either do
-/// nothing or hand the user's shell a document the app generated.
+// Whether a navigation the app window is about to perform belongs in the
+// user's browser instead.
+//
+// Only absolute `http`/`https` navigations are redirected. Everything else —
+// `about:blank` while a webview initializes, `data:` and `blob:` documents
+// the app itself creates, and schemes the platform webview already refuses —
+// is left to the webview, because handing those to the shell would either do
+// nothing or hand the user's shell a document the app generated.
 pub(crate) fn opens_in_external_browser(app_origin: &str, url: &str) -> bool {
     match http_origin(url) {
         Some(origin) => !origin.eq_ignore_ascii_case(app_origin),
@@ -122,13 +122,13 @@ pub(crate) fn opens_in_external_browser(app_origin: &str, url: &str) -> bool {
     }
 }
 
-/// The `scheme://authority` prefix of an absolute `http`/`https` URL.
-///
-/// This is deliberately a prefix slice rather than a parsed origin: the
-/// comparison above is against a string this process built, so anything that
-/// is not byte-for-byte (case-insensitively) the same origin — a different
-/// port, a host alias, userinfo smuggled into the authority — is correctly
-/// treated as somewhere else.
+// The `scheme://authority` prefix of an absolute `http`/`https` URL.
+//
+// This is deliberately a prefix slice rather than a parsed origin: the
+// comparison above is against a string this process built, so anything that
+// is not byte-for-byte (case-insensitively) the same origin — a different
+// port, a host alias, userinfo smuggled into the authority — is correctly
+// treated as somewhere else.
 fn http_origin(url: &str) -> Option<&str> {
     let (scheme, rest) = url.split_once("://")?;
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
@@ -138,7 +138,7 @@ fn http_origin(url: &str) -> Option<&str> {
     Some(&url[..scheme.len() + "://".len() + authority_len])
 }
 
-/// Poll until the server answers, or the timeout expires.
+// Poll until the server answers, or the timeout expires.
 pub(crate) fn wait_for_server(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -150,31 +150,31 @@ pub(crate) fn wait_for_server(port: u16, timeout: Duration) -> bool {
     false
 }
 
-/// Whether the server is serving the UI yet.
-///
-/// A connected socket is not enough: the listener binds before the SPA is
-/// mounted, so the wrapper would open a window on an error page. Asking for
-/// the document itself is the only readiness signal that means what the user
-/// is about to see is there.
-///
-/// A `200` is not enough either. The wrapper owns a fixed port, and anything
-/// else on the machine can be listening on it; accepting whatever answers
-/// would skip starting the bundled server and load a stranger's page into the
-/// window. The document has to be one of Weaver's.
+// Whether the server is serving the UI yet.
+//
+// A connected socket is not enough: the listener binds before the SPA is
+// mounted, so the wrapper would open a window on an error page. Asking for
+// the document itself is the only readiness signal that means what the user
+// is about to see is there.
+//
+// A `200` is not enough either. The wrapper owns a fixed port, and anything
+// else on the machine can be listening on it; accepting whatever answers
+// would skip starting the bundled server and load a stranger's page into the
+// window. The document has to be one of Weaver's.
 pub(crate) fn server_ready(port: u16) -> bool {
     probe_port(port) == PortProbe::Weaver
 }
 
-/// What one probe of the wrapper's port found.
+// What one probe of the wrapper's port found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PortProbe {
-    /// Nothing answered: the port is free, or a server is still starting. The
-    /// server binds its listener before it serves, so a connection accepted in
-    /// that window simply gets no response and lands here too.
+    // Nothing answered: the port is free, or a server is still starting. The
+    // server binds its listener before it serves, so a connection accepted in
+    // that window simply gets no response and lands here too.
     NotAnswering,
-    /// Something answered, and it was not Weaver's entry page.
+    // Something answered, and it was not Weaver's entry page.
     Foreign,
-    /// Weaver's entry page came back.
+    // Weaver's entry page came back.
     Weaver,
 }
 
@@ -189,19 +189,19 @@ pub(crate) fn probe_port(port: u16) -> PortProbe {
     }
 }
 
-/// How long one readiness probe waits on the socket. Short: the probe runs on
-/// a timer while the splash screen is up, and a server that takes longer than
-/// this to hand over its entry page is not ready.
+// How long one readiness probe waits on the socket. Short: the probe runs on
+// a timer while the splash screen is up, and a server that takes longer than
+// this to hand over its entry page is not ready.
 const READY_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Whether a response to `GET /` is Weaver's entry page rather than some other
-/// program's.
-///
-/// Every document the server answers `/` with — the SPA shell, the login page,
-/// the setup wizard, and the pages that tell an unadmitted browser why it is
-/// not getting in — is titled with the product name, and the server's own
-/// tests pin those titles. The title is the one thing all of them share that a
-/// listener which merely happens to be on the port would not produce.
+// Whether a response to `GET /` is Weaver's entry page rather than some other
+// program's.
+//
+// Every document the server answers `/` with — the SPA shell, the login page,
+// the setup wizard, and the pages that tell an unadmitted browser why it is
+// not getting in — is titled with the product name, and the server's own
+// tests pin those titles. The title is the one thing all of them share that a
+// listener which merely happens to be on the port would not produce.
 pub(crate) fn is_weaver_document(response: &HttpResponse) -> bool {
     if response.status != 200 {
         return false;
@@ -212,7 +212,7 @@ pub(crate) fn is_weaver_document(response: &HttpResponse) -> bool {
     html_title(body).is_some_and(|title| title.contains("Weaver"))
 }
 
-/// The text of the first `<title>` element, if the document has one.
+// The text of the first `<title>` element, if the document has one.
 fn html_title(html: &str) -> Option<&str> {
     let lower = html.to_ascii_lowercase();
     let start = lower.find("<title>")? + "<title>".len();
@@ -224,50 +224,50 @@ fn html_title(html: &str) -> Option<&str> {
 // The queue snapshot the menu-bar popover shows
 // ---------------------------------------------------------------------------
 
-/// The name of the browser session cookie the server hands a trusted loopback
-/// peer (`http::auth::SESSION_COOKIE_NAME`). The wrapper is a browser as far as
-/// the server is concerned, so it earns its access the same way.
+// The name of the browser session cookie the server hands a trusted loopback
+// peer (`http::auth::SESSION_COOKIE_NAME`). The wrapper is a browser as far as
+// the server is concerned, so it earns its access the same way.
 const SESSION_COOKIE: &str = "weaver_session";
 
-/// How many queue items the popover shows. The popover is a glance, not the
-/// queue page.
+// How many queue items the popover shows. The popover is a glance, not the
+// queue page.
 pub(crate) const POPOVER_ROWS: usize = 5;
 
-/// The width of the popover, in points.
+// The width of the popover, in points.
 pub(crate) const POPOVER_WIDTH: f64 = 300.0;
 
-/// How long a popover fetch waits on the server before it gives up. Short: a
-/// hover that has already ended must not leave a socket open behind it.
+// How long a popover fetch waits on the server before it gives up. Short: a
+// hover that has already ended must not leave a socket open behind it.
 const QUEUE_FETCH_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// A response body larger than this is a server the wrapper does not
-/// understand, not a queue snapshot.
+// A response body larger than this is a server the wrapper does not
+// understand, not a queue snapshot.
 const QUEUE_RESPONSE_LIMIT: usize = 1 << 20;
 
-/// The query the popover asks. Written as one line so the request body needs no
-/// escaping beyond the quoting below.
+// The query the popover asks. Written as one line so the request body needs no
+// escaping beyond the quoting below.
 const QUEUE_QUERY: &str = "{ queueSnapshot { items { id displayTitle name state progressPercent phaseProgress { phase rateBps } } globalState { isPaused } } }";
 
-/// One queue item, reduced to what a menu-bar row can show.
+// One queue item, reduced to what a menu-bar row can show.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct QueueRow {
     pub(crate) name: String,
-    /// The item state, in the casing a person reads rather than the casing the
-    /// schema uses.
+    // The item state, in the casing a person reads rather than the casing the
+    // schema uses.
     pub(crate) state: String,
     pub(crate) progress_percent: f64,
 }
 
-/// Everything the popover draws.
-///
-/// `status` is absent exactly when there is no queue to describe — the server
-/// did not answer, or it refused the wrapper — because in those states a status
-/// line would be inventing one.
+// Everything the popover draws.
+//
+// `status` is absent exactly when there is no queue to describe — the server
+// did not answer, or it refused the wrapper — because in those states a status
+// line would be inventing one.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PopoverContent {
     pub(crate) status: Option<String>,
     pub(crate) rows: Vec<QueueRow>,
-    /// Shown instead of rows when there are none.
+    // Shown instead of rows when there are none.
     pub(crate) message: Option<String>,
 }
 
@@ -280,25 +280,25 @@ impl PopoverContent {
         }
     }
 
-    /// The server is not answering on the port at all.
+    // The server is not answering on the port at all.
     pub(crate) fn offline() -> Self {
         Self::message_only("Weaver isn't running")
     }
 
-    /// Something is answering the port, but it did not give up a queue: this
-    /// peer is not one the install hands a session to — a fresh install that
-    /// trusts nobody yet, or a login-protected one — or the answer was not a
-    /// snapshot at all. Either way the window is where the user finds out.
+    // Something is answering the port, but it did not give up a queue: this
+    // peer is not one the install hands a session to — a fresh install that
+    // trusts nobody yet, or a login-protected one — or the answer was not a
+    // snapshot at all. Either way the window is where the user finds out.
     fn unavailable() -> Self {
         Self::message_only("Queue unavailable — open Weaver")
     }
 }
 
-/// Ask the running server for the queue, reusing a session cookie across calls.
-///
-/// The cookie is refreshed at most once per call: a second 401 means the server
-/// is never going to hand this peer a session, and retrying it on every hover
-/// would be a login attempt loop the user cannot see.
+// Ask the running server for the queue, reusing a session cookie across calls.
+//
+// The cookie is refreshed at most once per call: a second 401 means the server
+// is never going to hand this peer a session, and retrying it on every hover
+// would be a login attempt loop the user cannot see.
 pub(crate) fn fetch_popover_content(port: u16, cookie: &mut Option<String>) -> PopoverContent {
     if cookie.is_none() {
         *cookie = fetch_session_cookie(port);
@@ -325,7 +325,7 @@ pub(crate) fn fetch_popover_content(port: u16, cookie: &mut Option<String>) -> P
         .unwrap_or_else(PopoverContent::unavailable)
 }
 
-/// Fetch the document the way a browser does, for the session cookie it sets.
+// Fetch the document the way a browser does, for the session cookie it sets.
 fn fetch_session_cookie(port: u16) -> Option<String> {
     let request = format!(
         "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
@@ -353,10 +353,10 @@ fn post_graphql(port: u16, cookie: Option<&str>) -> Option<HttpResponse> {
     http_exchange(port, request.as_bytes(), QUEUE_FETCH_TIMEOUT)
 }
 
-/// One request and one response on a connection the server closes.
-///
-/// `Connection: close` is what makes reading to EOF a complete response, so
-/// this needs no keep-alive framing of its own.
+// One request and one response on a connection the server closes.
+//
+// `Connection: close` is what makes reading to EOF a complete response, so
+// this needs no keep-alive framing of its own.
 fn http_exchange(port: u16, request: &[u8], timeout: Duration) -> Option<HttpResponse> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&address, timeout).ok()?;
@@ -379,20 +379,20 @@ fn http_exchange(port: u16, request: &[u8], timeout: Duration) -> Option<HttpRes
     parse_http_response(&raw)
 }
 
-/// A response split into the three parts the wrapper reads.
+// A response split into the three parts the wrapper reads.
 #[derive(Debug, PartialEq)]
 pub(crate) struct HttpResponse {
     pub(crate) status: u16,
-    /// Field names as received; every lookup here is case-insensitive.
+    // Field names as received; every lookup here is case-insensitive.
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
 }
 
-/// Split a raw response, decoding a chunked body if that is how it arrived.
-///
-/// Only the two framings axum produces are handled — a declared length and
-/// chunked — because a response with neither is one this wrapper did not ask
-/// for.
+// Split a raw response, decoding a chunked body if that is how it arrived.
+//
+// Only the two framings axum produces are handled — a declared length and
+// chunked — because a response with neither is one this wrapper did not ask
+// for.
 pub(crate) fn parse_http_response(raw: &[u8]) -> Option<HttpResponse> {
     let split = raw.windows(4).position(|window| window == b"\r\n\r\n")?;
     let head = std::str::from_utf8(&raw[..split]).ok()?;
@@ -423,7 +423,7 @@ pub(crate) fn parse_http_response(raw: &[u8]) -> Option<HttpResponse> {
     })
 }
 
-/// The first value for a header name, matched case-insensitively.
+// The first value for a header name, matched case-insensitively.
 fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -431,7 +431,7 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
         .map(|(_, value)| value.as_str())
 }
 
-/// The value of one named cookie across every `Set-Cookie` header.
+// The value of one named cookie across every `Set-Cookie` header.
 pub(crate) fn set_cookie_value(headers: &[(String, String)], name: &str) -> Option<String> {
     headers
         .iter()
@@ -443,7 +443,7 @@ pub(crate) fn set_cookie_value(headers: &[(String, String)], name: &str) -> Opti
         })
 }
 
-/// Reassemble a `Transfer-Encoding: chunked` body.
+// Reassemble a `Transfer-Encoding: chunked` body.
 pub(crate) fn decode_chunked(body: &[u8]) -> Option<Vec<u8>> {
     let mut decoded = Vec::new();
     let mut rest = body;
@@ -463,8 +463,8 @@ pub(crate) fn decode_chunked(body: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// A string as a JSON literal. The query is a program constant, so this only
-/// has to be correct, not fast.
+// A string as a JSON literal. The query is a program constant, so this only
+// has to be correct, not fast.
 fn json_string_literal(value: &str) -> String {
     let mut literal = String::with_capacity(value.len() + 2);
     literal.push('"');
@@ -485,11 +485,11 @@ fn json_string_literal(value: &str) -> String {
     literal
 }
 
-/// Map a `queueSnapshot` response onto what the popover draws.
-///
-/// Returns `None` only when the payload is not a queue snapshot at all. Unknown
-/// item states and missing optional fields are carried through: a state this
-/// build has never heard of must still show up as a row.
+// Map a `queueSnapshot` response onto what the popover draws.
+//
+// Returns `None` only when the payload is not a queue snapshot at all. Unknown
+// item states and missing optional fields are carried through: a state this
+// build has never heard of must still show up as a row.
 pub(crate) fn popover_content_from_graphql(body: &str) -> Option<PopoverContent> {
     #[derive(serde::Deserialize)]
     struct Envelope {
@@ -569,15 +569,15 @@ pub(crate) fn popover_content_from_graphql(body: &str) -> Option<PopoverContent>
     })
 }
 
-/// The states that mean bytes are moving. `FINALIZING_DOWNLOAD` counts: the
-/// last articles of a job are still arriving while it is set.
+// The states that mean bytes are moving. `FINALIZING_DOWNLOAD` counts: the
+// last articles of a job are still arriving while it is set.
 fn is_downloading_state(state: &str) -> bool {
     ["DOWNLOADING", "FETCHING_REPAIR_DATA", "FINALIZING_DOWNLOAD"]
         .iter()
         .any(|known| state.eq_ignore_ascii_case(known))
 }
 
-/// The one line above the rows.
+// The one line above the rows.
 fn queue_status_line<'a>(
     is_paused: bool,
     states: impl Iterator<Item = &'a str>,
@@ -600,8 +600,8 @@ fn queue_status_line<'a>(
     }
 }
 
-/// `displayTitle` is what the queue page shows; `name` is the fallback for a
-/// job whose release has not been parsed yet.
+// `displayTitle` is what the queue page shows; `name` is the fallback for a
+// job whose release has not been parsed yet.
 fn row_name(display_title: &str, name: &str) -> String {
     for candidate in [display_title, name] {
         let candidate = candidate.trim();
@@ -612,8 +612,8 @@ fn row_name(display_title: &str, name: &str) -> String {
     "Untitled".to_string()
 }
 
-/// `FETCHING_REPAIR_DATA` is not a label. Unknown states go through the same
-/// transformation rather than being dropped.
+// `FETCHING_REPAIR_DATA` is not a label. Unknown states go through the same
+// transformation rather than being dropped.
 fn humanize_state(state: &str) -> String {
     let words = state.trim().replace('_', " ").to_ascii_lowercase();
     let mut characters = words.chars();
@@ -631,8 +631,8 @@ fn clamp_percent(percent: f64) -> f64 {
     }
 }
 
-/// The byte scale the web UI uses (`SpeedDisplay.tsx`), so a speed read in the
-/// menu bar and the same speed read in the window agree.
+// The byte scale the web UI uses (`SpeedDisplay.tsx`), so a speed read in the
+// menu bar and the same speed read in the window agree.
 pub(crate) fn format_bytes(bytes: f64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     if !bytes.is_finite() || bytes <= 0.0 {
@@ -655,32 +655,32 @@ pub(crate) fn format_speed(bytes_per_sec: f64) -> String {
     format!("{}/s", format_bytes(bytes_per_sec))
 }
 
-/// The secondary line under a row's progress bar.
+// The secondary line under a row's progress bar.
 pub(crate) fn row_detail(row: &QueueRow) -> String {
     format!("{} · {}%", row.state, row.progress_percent.round())
 }
 
 use crate::bundle_relaunch::is_bundle_relaunch_exit;
 
-/// What a start or readiness wait reports while a bundle relaunch is pending.
+// What a start or readiness wait reports while a bundle relaunch is pending.
 const RELAUNCH_PENDING_MESSAGE: &str = "Weaver was updated and is reopening to finish.";
 
-/// What one poll of the supervised server found.
+// What one poll of the supervised server found.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SupervisedServer {
-    /// Still running, or never owned by this wrapper.
+    // Still running, or never owned by this wrapper.
     Running,
-    /// The server applied an application-bundle upgrade and asked the wrapper
-    /// to relaunch the app from the replaced bundle.
+    // The server applied an application-bundle upgrade and asked the wrapper
+    // to relaunch the app from the replaced bundle.
     RelaunchRequested,
-    /// The server exited for some other reason.
+    // The server exited for some other reason.
     Exited(ExitStatus),
 }
 
-/// The `.app` bundle the running wrapper was launched from, if it was.
-///
-/// Derived from this process's own path rather than anything the server said,
-/// so a relaunch can only ever target the bundle the user actually started.
+// The `.app` bundle the running wrapper was launched from, if it was.
+//
+// Derived from this process's own path rather than anything the server said,
+// so a relaunch can only ever target the bundle the user actually started.
 #[cfg(target_os = "macos")]
 pub(crate) fn running_app_bundle() -> Option<PathBuf> {
     let wrapper = std::env::current_exe().ok()?;
@@ -688,14 +688,14 @@ pub(crate) fn running_app_bundle() -> Option<PathBuf> {
     application_updater::installation::macos_app_bundle_path(&resolved).map(Path::to_path_buf)
 }
 
-/// Start the updated bundle once this wrapper has exited.
-///
-/// The wrapper holds the single-instance lock until its process ends, and a
-/// second instance that finds the lock taken hands off to the first and exits.
-/// Opening the bundle directly would race this wrapper's own shutdown and, when
-/// it lost, leave nothing running. So a detached shell waits for this process
-/// to go, then opens the bundle. The bundle path travels as an argument, never
-/// as script text.
+// Start the updated bundle once this wrapper has exited.
+//
+// The wrapper holds the single-instance lock until its process ends, and a
+// second instance that finds the lock taken hands off to the first and exits.
+// Opening the bundle directly would race this wrapper's own shutdown and, when
+// it lost, leave nothing running. So a detached shell waits for this process
+// to go, then opens the bundle. The bundle path travels as an argument, never
+// as script text.
 #[cfg(target_os = "macos")]
 pub(crate) fn relaunch_app_bundle(bundle: &Path) -> Result<(), String> {
     const WAIT_THEN_OPEN: &str = "while /bin/kill -0 \"$1\" 2>/dev/null; do /bin/sleep 0.2; done; exec /usr/bin/open -n \"$2\"";
@@ -713,31 +713,31 @@ pub(crate) fn relaunch_app_bundle(bundle: &Path) -> Result<(), String> {
         .map_err(|error| format!("failed to relaunch {}: {error}", bundle.display()))
 }
 
-/// The `weaver` server process the wrapper owns.
-///
-/// The wrapper is the parent of the server it started, so this is also what
-/// guarantees the server goes away when the user quits the wrapper. It
-/// deliberately tolerates a server it did not start: a user who already has
-/// `weaver serve` running on the port gets the same window, and the wrapper
-/// simply has no child to supervise.
+// The `weaver` server process the wrapper owns.
+//
+// The wrapper is the parent of the server it started, so this is also what
+// guarantees the server goes away when the user quits the wrapper. It
+// deliberately tolerates a server it did not start: a user who already has
+// `weaver serve` running on the port gets the same window, and the wrapper
+// simply has no child to supervise.
 pub(crate) struct ServerSupervisor {
     profile_dir: PathBuf,
     port: u16,
     server: Option<Child>,
     setup_code: Arc<Mutex<Option<String>>>,
-    /// How long the log was when the owned server was started, so a failed
-    /// start is reported with its own error rather than an earlier run's.
+    // How long the log was when the owned server was started, so a failed
+    // start is reported with its own error rather than an earlier run's.
     log_offset: u64,
-    /// The owned server exited asking for a bundle relaunch, and whichever
-    /// path reaped it was not the supervision poll. Held until the poll
-    /// reports it, so a start or readiness wait that happens to reap the exit
-    /// first cannot turn the relaunch into an ordinary server restart.
+    // The owned server exited asking for a bundle relaunch, and whichever
+    // path reaped it was not the supervision poll. Held until the poll
+    // reports it, so a start or readiness wait that happens to reap the exit
+    // first cannot turn the relaunch into an ordinary server restart.
     relaunch_pending: bool,
 }
 
-/// Reads the server's stderr to its end. Setup codes are kept for the UI;
-/// everything else is copied to the capture file and to the wrapper's own
-/// stderr, which has somewhere to go when the wrapper runs from a console.
+// Reads the server's stderr to its end. Setup codes are kept for the UI;
+// everything else is copied to the capture file and to the wrapper's own
+// stderr, which has somewhere to go when the wrapper runs from a console.
 fn forward_server_stderr(
     stderr: impl Read,
     setup_code: Arc<Mutex<Option<String>>>,
@@ -760,8 +760,8 @@ fn forward_server_stderr(
     }
 }
 
-/// The exit status with the raw code in hex beside it: on Windows a crash
-/// exits with an NTSTATUS, which the decimal rendering hides.
+// The exit status with the raw code in hex beside it: on Windows a crash
+// exits with an NTSTATUS, which the decimal rendering hides.
 fn describe_exit(status: ExitStatus) -> String {
     match status.code() {
         Some(code) => format!("{status} (0x{:08X})", code as u32),
@@ -801,20 +801,20 @@ impl ServerSupervisor {
         self.logs_dir().join("weaver.log")
     }
 
-    /// Where the owned server's stderr lands. The server logs to `weaver.log`
-    /// itself; what reaches stderr is the runtime's own last words — a panic's
-    /// default report, "memory allocation of N bytes failed", "thread 'x' has
-    /// overflowed its stack" — none of which go through the logger, and none
-    /// of which survive being forwarded to a windowless wrapper's stderr. The
-    /// exit status the wrapper observes is recorded here too, so a server that
-    /// died without a word at least leaves its exit code.
+    // Where the owned server's stderr lands. The server logs to `weaver.log`
+    // itself; what reaches stderr is the runtime's own last words — a panic's
+    // default report, "memory allocation of N bytes failed", "thread 'x' has
+    // overflowed its stack" — none of which go through the logger, and none
+    // of which survive being forwarded to a windowless wrapper's stderr. The
+    // exit status the wrapper observes is recorded here too, so a server that
+    // died without a word at least leaves its exit code.
     fn stderr_log_file(&self) -> PathBuf {
         weaver_server_core::runtime::log_buffer::stderr_capture_path(&self.log_file())
     }
 
-    /// Opens the stderr capture for appending, rotating it first once it has
-    /// outgrown its bound. Failing to open it only loses the capture: the
-    /// wrapper still starts the server.
+    // Opens the stderr capture for appending, rotating it first once it has
+    // outgrown its bound. Failing to open it only loses the capture: the
+    // wrapper still starts the server.
     fn open_stderr_log(&self) -> Option<std::fs::File> {
         let path = self.stderr_log_file();
         if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > STDERR_LOG_ROTATE_BYTES) {
@@ -827,7 +827,7 @@ impl ServerSupervisor {
             .ok()
     }
 
-    /// Records how the owned server exited, next to whatever it said last.
+    // Records how the owned server exited, next to whatever it said last.
     fn record_server_exit(&mut self, status: ExitStatus) {
         if is_bundle_relaunch_exit(status) {
             self.relaunch_pending = true;
@@ -851,9 +851,9 @@ impl ServerSupervisor {
         self.setup_code.lock().ok()?.take()
     }
 
-    /// Create the profile the server is about to be pointed at. The server
-    /// creates its own subdirectories, but it is started with an explicit log
-    /// file path, and it cannot create the directory that path lives in.
+    // Create the profile the server is about to be pointed at. The server
+    // creates its own subdirectories, but it is started with an explicit log
+    // file path, and it cannot create the directory that path lives in.
     pub(crate) fn ensure_profile_dirs(&self) -> Result<(), String> {
         std::fs::create_dir_all(self.logs_dir()).map_err(|error| {
             format!(
@@ -863,12 +863,12 @@ impl ServerSupervisor {
         })
     }
 
-    /// Start the server unless something is already serving the port.
-    ///
-    /// Returning early on a live port is what makes this idempotent for every
-    /// caller — menu item, window open, and login start all funnel through
-    /// here — but it is also why a caller that has just torn the server down
-    /// must wait for the old process to disappear first.
+    // Start the server unless something is already serving the port.
+    //
+    // Returning early on a live port is what makes this idempotent for every
+    // caller — menu item, window open, and login start all funnel through
+    // here — but it is also why a caller that has just torn the server down
+    // must wait for the old process to disappear first.
     pub(crate) fn start(&mut self) -> Result<(), String> {
         match probe_port(self.port) {
             PortProbe::Weaver => return Ok(()),
@@ -930,8 +930,8 @@ impl ServerSupervisor {
         Ok(())
     }
 
-    /// Stop the server this wrapper started. A server it did not start is left
-    /// alone: it belongs to whoever ran it.
+    // Stop the server this wrapper started. A server it did not start is left
+    // alone: it belongs to whoever ran it.
     pub(crate) fn stop(&mut self) -> Result<(), String> {
         let Some(mut child) = self.server.take() else {
             return Ok(());
@@ -956,16 +956,16 @@ impl ServerSupervisor {
         Ok(())
     }
 
-    /// Stop and start again, from a user action.
+    // Stop and start again, from a user action.
     pub(crate) fn restart(&mut self) -> Result<(), String> {
         self.stop()?;
         self.start()?;
         self.wait_until_ready()
     }
 
-    /// Wait for the server to answer. An owned server that exits first is
-    /// reported with the error it logged: a server that cannot start says why
-    /// in its log, and waiting out the timeout would only hide it.
+    // Wait for the server to answer. An owned server that exits first is
+    // reported with the error it logged: a server that cannot start says why
+    // in its log, and waiting out the timeout would only hide it.
     pub(crate) fn wait_until_ready(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + SERVER_READY_TIMEOUT;
         loop {
@@ -988,13 +988,13 @@ impl ServerSupervisor {
         }
     }
 
-    /// What the supervised server is doing right now.
-    ///
-    /// This is the whole of the server→wrapper channel for a bundle upgrade.
-    /// It is deliberately not a socket, a port or a file: the only thing read
-    /// here is the exit status of a child *this process started*, which cannot
-    /// be produced by anything else on the machine, needs no authentication of
-    /// its own, and adds no listening surface.
+    // What the supervised server is doing right now.
+    //
+    // This is the whole of the server→wrapper channel for a bundle upgrade.
+    // It is deliberately not a socket, a port or a file: the only thing read
+    // here is the exit status of a child *this process started*, which cannot
+    // be produced by anything else on the machine, needs no authentication of
+    // its own, and adds no listening surface.
     pub(crate) fn poll_supervised_server(&mut self) -> Result<SupervisedServer, String> {
         if std::mem::take(&mut self.relaunch_pending) {
             return Ok(SupervisedServer::RelaunchRequested);
@@ -1009,7 +1009,7 @@ impl ServerSupervisor {
         }
     }
 
-    /// How the owned server exited, once it has.
+    // How the owned server exited, once it has.
     fn exited_server(&mut self) -> Result<Option<ExitStatus>, String> {
         let Some(child) = self.server.as_mut() else {
             return Ok(None);
@@ -1034,10 +1034,10 @@ impl ServerSupervisor {
         )
     }
 
-    /// Wait for the running server to disappear, bounded so a process that
-    /// never exits cannot strand the wrapper. The owned child is the reliable
-    /// signal; when the wrapper does not own one, the port answering is the
-    /// only evidence left. Falls back to the kill path on timeout.
+    // Wait for the running server to disappear, bounded so a process that
+    // never exits cannot strand the wrapper. The owned child is the reliable
+    // signal; when the wrapper does not own one, the port answering is the
+    // only evidence left. Falls back to the kill path on timeout.
     pub(crate) fn wait_for_exit(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -1062,9 +1062,9 @@ impl ServerSupervisor {
         let _ = self.stop();
     }
 
-    /// The server ships beside the wrapper, so its path is derived rather than
-    /// searched: picking up a `weaver` from `PATH` would silently run a
-    /// different install than the one the user launched.
+    // The server ships beside the wrapper, so its path is derived rather than
+    // searched: picking up a `weaver` from `PATH` would silently run a
+    // different install than the one the user launched.
     fn server_executable(&self) -> Result<PathBuf, String> {
         let wrapper = std::env::current_exe()
             .map_err(|error| format!("failed to resolve {WRAPPER_EXECUTABLE} path: {error}"))?;
@@ -1079,11 +1079,11 @@ impl ServerSupervisor {
     }
 }
 
-/// How much of the end of the log a failed start reads. The error that
-/// stopped the server is the last thing it wrote.
+// How much of the end of the log a failed start reads. The error that
+// stopped the server is the last thing it wrote.
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
-/// The last error the server logged at or after `offset` in `log_file`.
+// The last error the server logged at or after `offset` in `log_file`.
 fn last_logged_error(log_file: &Path, offset: u64) -> Option<String> {
     let mut file = std::fs::File::open(log_file).ok()?;
     let len = file.metadata().ok()?.len();
@@ -1101,8 +1101,8 @@ fn last_logged_error(log_file: &Path, offset: u64) -> Option<String> {
         .find_map(logged_error_message)
 }
 
-/// The message of a log line written at ERROR, without its timestamp, level
-/// and target.
+// The message of a log line written at ERROR, without its timestamp, level
+// and target.
 fn logged_error_message(line: &str) -> Option<String> {
     let (timestamp, rest) = line.split_once(" ERROR ")?;
     // The level follows the timestamp; a line whose message mentions ERROR
@@ -1118,15 +1118,15 @@ fn logged_error_message(line: &str) -> Option<String> {
     Some(message.trim().to_string())
 }
 
-/// Folders an uninstall keeps while they hold anything: the download and
-/// script folders default to living in the profile, and what is in them is
-/// the user's.
+// Folders an uninstall keeps while they hold anything: the download and
+// script folders default to living in the profile, and what is in them is
+// the user's.
 const KEPT_PROFILE_FOLDERS: [&str; 3] = ["complete", "intermediate", "scripts"];
 
-/// Remove the desktop profile — the database, logs, WebView2 data and every
-/// other file Weaver keeps there — except download and script folders that
-/// hold anything. The profile and its vendor folder go too once empty.
-/// Returns what could not be removed.
+// Remove the desktop profile — the database, logs, WebView2 data and every
+// other file Weaver keeps there — except download and script folders that
+// hold anything. The profile and its vendor folder go too once empty.
+// Returns what could not be removed.
 pub(crate) fn remove_desktop_profile(profile_dir: &Path) -> Vec<String> {
     let entries = match std::fs::read_dir(profile_dir) {
         Ok(entries) => entries,
@@ -1159,8 +1159,8 @@ pub(crate) fn remove_desktop_profile(profile_dir: &Path) -> Vec<String> {
     problems
 }
 
-/// Remove a file, or a folder and everything below it. A link is removed
-/// itself, never what it points at.
+// Remove a file, or a folder and everything below it. A link is removed
+// itself, never what it points at.
 fn remove_path(path: &Path) -> std::io::Result<()> {
     if std::fs::symlink_metadata(path)?.file_type().is_dir() {
         std::fs::remove_dir_all(path)
@@ -1170,12 +1170,12 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Build the command that starts the supervised server.
-///
-/// Separate from `start` so a test can read the environment back: the
-/// supervision marker is what tells the server it may hand a bundle upgrade to
-/// the wrapper, so losing it would silently make in-app upgrades ineligible
-/// rather than fail loudly.
+// Build the command that starts the supervised server.
+//
+// Separate from `start` so a test can read the environment back: the
+// supervision marker is what tells the server it may hand a bundle upgrade to
+// the wrapper, so losing it would silently make in-app upgrades ineligible
+// rather than fail loudly.
 fn build_server_command(
     server_executable: &Path,
     profile_dir: &Path,
@@ -1197,9 +1197,9 @@ fn build_server_command(
     command
 }
 
-/// Keep the server out of the user's face. On Windows a console subsystem
-/// child would flash a window on every start; on macOS the child inherits the
-/// wrapper's already-windowless session and needs nothing.
+// Keep the server out of the user's face. On Windows a console subsystem
+// child would flash a window on every start; on macOS the child inherits the
+// wrapper's already-windowless session and needs nothing.
 #[cfg(windows)]
 fn configure_server_command(command: &mut Command) {
     use std::os::windows::process::CommandExt;
@@ -1211,11 +1211,11 @@ fn configure_server_command(command: &mut Command) {
 #[cfg(not(windows))]
 fn configure_server_command(_command: &mut Command) {}
 
-/// Ask the server to shut down cleanly, and report whether it did.
-///
-/// The server writes a database on every job; killing it outright is safe but
-/// throws away the flush it would otherwise do, so the signal comes first and
-/// the caller only escalates when this returns false.
+// Ask the server to shut down cleanly, and report whether it did.
+//
+// The server writes a database on every job; killing it outright is safe but
+// throws away the flush it would otherwise do, so the signal comes first and
+// the caller only escalates when this returns false.
 #[cfg(unix)]
 fn request_graceful_stop(child: &mut Child) -> Result<bool, String> {
     // SAFETY: `child` is a live process this wrapper started, so its PID is
@@ -1234,11 +1234,11 @@ fn request_graceful_stop(child: &mut Child) -> Result<bool, String> {
     Ok(false)
 }
 
-/// A single-page HTTP server used only by `--webview-smoke`.
-///
-/// The smoke test has to prove the webview stack renders a real network
-/// document, and it has to do that on a machine where no Weaver server is
-/// installed or running — so it serves its own.
+// A single-page HTTP server used only by `--webview-smoke`.
+//
+// The smoke test has to prove the webview stack renders a real network
+// document, and it has to do that on a machine where no Weaver server is
+// installed or running — so it serves its own.
 pub(crate) fn start_smoke_server() -> Result<u16, String> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .map_err(|error| format!("failed to bind the smoke test HTTP server: {error}"))?;
@@ -1267,8 +1267,8 @@ pub(crate) fn start_smoke_server() -> Result<u16, String> {
 
 const SMOKE_BODY: &str = "<!doctype html><title>Weaver webview smoke</title><p>ok</p>";
 
-/// Written verbatim, including the length, so the smoke server needs no HTTP
-/// implementation at all.
+// Written verbatim, including the length, so the smoke server needs no HTTP
+// implementation at all.
 const SMOKE_RESPONSE: &str = concat!(
     "HTTP/1.1 200 OK\r\n",
     "Content-Type: text/html; charset=utf-8\r\n",
@@ -1278,12 +1278,12 @@ const SMOKE_RESPONSE: &str = concat!(
     "<!doctype html><title>Weaver webview smoke</title><p>ok</p>",
 );
 
-/// How long the smoke test waits for the webview to report a result before it
-/// declares the wiring broken. Generous, because a cold WebView2 or WebKit
-/// process launch on a loaded CI machine is slow.
+// How long the smoke test waits for the webview to report a result before it
+// declares the wiring broken. Generous, because a cold WebView2 or WebKit
+// process launch on a loaded CI machine is slow.
 pub(crate) const SMOKE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// The line CI greps for. Printed to stdout only on success.
+// The line CI greps for. Printed to stdout only on success.
 pub(crate) const SMOKE_SUCCESS_LINE: &str = "webview-smoke: ok";
 
 #[cfg(test)]
@@ -1876,9 +1876,9 @@ mod tests {
 
     // -- the server's relaunch request ---------------------------------------
 
-    /// The request is a specific exit code and nothing else. An ordinary
-    /// failure, a panic, a clean exit and a signal must all stay ordinary
-    /// exits, or a crashing server would relaunch the app in a loop.
+    // The request is a specific exit code and nothing else. An ordinary
+    // failure, a panic, a clean exit and a signal must all stay ordinary
+    // exits, or a crashing server would relaunch the app in a loop.
     #[cfg(unix)]
     #[test]
     fn only_the_relaunch_exit_code_asks_the_wrapper_to_relaunch() {
@@ -1900,10 +1900,10 @@ mod tests {
         ));
     }
 
-    /// Opening the window after the upgraded server exited, but before the
-    /// supervision poll ran, reaps the relaunch exit in `start`. The relaunch
-    /// must survive that: `start` refuses to launch a server under the stale
-    /// wrapper, and the next poll still reports the relaunch, once.
+    // Opening the window after the upgraded server exited, but before the
+    // supervision poll ran, reaps the relaunch exit in `start`. The relaunch
+    // must survive that: `start` refuses to launch a server under the stale
+    // wrapper, and the next poll still reports the relaunch, once.
     #[cfg(unix)]
     #[test]
     fn a_relaunch_exit_reaped_by_start_still_reaches_the_poll() {

@@ -1,84 +1,86 @@
-//! Per-server health tracking with automatic degradation and disabling.
-//!
-//! Servers transition through four states based on connection outcomes:
-//!
-//! - **Healthy** — all good, use normally
-//! - **Degraded** — experiencing transient failures, still usable but deprioritised
-//! - **CoolingDown** — short-lived quarantine after transport/capacity problems
-//! - **Disabled** — temporarily taken out of rotation (auth failure or too many consecutive errors)
+// Per-server health tracking with automatic degradation and disabling.
+//
+// Servers transition through four states based on connection outcomes:
+//
+// - **Healthy** — all good, use normally
+// - **Degraded** — experiencing transient failures, still usable but deprioritised
+// - **CoolingDown** — short-lived quarantine after transport/capacity problems
+// - **Disabled** — temporarily taken out of rotation (auth failure or too many consecutive errors)
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The current operational state of a server.
+// The current operational state of a server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerState {
-    /// Server is operating normally.
+    // Server is operating normally.
     Healthy,
-    /// Server is experiencing transient failures but is still usable.
-    Degraded { consecutive_failures: u32 },
-    /// Server hit a short-lived transport/capacity issue and should be skipped
-    /// briefly without affecting the longer-lived health state machine.
+    // Server is experiencing transient failures but is still usable.
+    Degraded {
+        consecutive_failures: u32,
+    },
+    // Server hit a short-lived transport/capacity issue and should be skipped
+    // briefly without affecting the longer-lived health state machine.
     CoolingDown {
         until: Instant,
         reason: CooldownReason,
         resume_degraded: Option<u32>,
     },
-    /// Server is temporarily disabled and should not be used.
+    // Server is temporarily disabled and should not be used.
     Disabled {
         until: Instant,
         reason: DisableReason,
     },
 }
 
-/// Why a server entered a short-lived cooldown.
+// Why a server entered a short-lived cooldown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CooldownReason {
-    /// Transport-level problems such as timeouts, disconnects, or 400 errors.
+    // Transport-level problems such as timeouts, disconnects, or 400 errors.
     Transport,
-    /// Capacity-related problems such as too many connections or pool exhaustion.
+    // Capacity-related problems such as too many connections or pool exhaustion.
     Capacity,
 }
 
-/// Why a server was disabled.
+// Why a server was disabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisableReason {
-    /// Authentication failed — credentials are wrong or expired.
+    // Authentication failed — credentials are wrong or expired.
     AuthFailure,
-    /// Too many consecutive failures exceeded the disable threshold.
+    // Too many consecutive failures exceeded the disable threshold.
     ConsecutiveFailures,
-    /// The windowed transport-failure ratio exceeded the configured threshold.
-    ///
-    /// The consecutive-failure machine cannot catch a server that fails a
-    /// steady fraction of attempts: any success resets the run, so a primary
-    /// stalling 10% of BODY fetches stays "Healthy" forever while a clean
-    /// backup idles. The ratio window catches failures spread across attempts.
+    // The windowed transport-failure ratio exceeded the configured threshold.
+    //
+    // The consecutive-failure machine cannot catch a server that fails a
+    // steady fraction of attempts: any success resets the run, so a primary
+    // stalling 10% of BODY fetches stays "Healthy" forever while a clean
+    // backup idles. The ratio window catches failures spread across attempts.
     FailureRatio,
 }
 
-/// Configuration thresholds for health state transitions.
+// Configuration thresholds for health state transitions.
 #[derive(Debug, Clone)]
 pub struct HealthConfig {
-    /// Consecutive failures before entering the Degraded state.
+    // Consecutive failures before entering the Degraded state.
     pub degraded_threshold: u32,
-    /// Consecutive failures before entering the Disabled state.
+    // Consecutive failures before entering the Disabled state.
     pub disable_threshold: u32,
-    /// Initial backoff duration when disabled due to consecutive failures.
+    // Initial backoff duration when disabled due to consecutive failures.
     pub base_backoff: Duration,
-    /// Maximum backoff duration.
+    // Maximum backoff duration.
     pub max_backoff: Duration,
-    /// How long to disable a server after an authentication failure.
+    // How long to disable a server after an authentication failure.
     pub auth_disable_duration: Duration,
-    /// How long to cool down a server after a transport-level failure.
+    // How long to cool down a server after a transport-level failure.
     pub transient_cooldown: Duration,
-    /// How long to cool down a server after a capacity-related failure.
+    // How long to cool down a server after a capacity-related failure.
     pub capacity_cooldown: Duration,
-    /// Length of the rolling window for failure-ratio accounting.
+    // Length of the rolling window for failure-ratio accounting.
     pub failure_ratio_window: Duration,
-    /// Minimum attempts inside one window before the ratio can trip; keeps
-    /// isolated blips on quiet servers from disabling anything.
+    // Minimum attempts inside one window before the ratio can trip; keeps
+    // isolated blips on quiet servers from disabling anything.
     pub failure_ratio_min_attempts: u32,
-    /// Percentage of failed attempts within a window that disables the server.
+    // Percentage of failed attempts within a window that disables the server.
     pub failure_ratio_threshold_pct: u32,
 }
 
@@ -102,43 +104,43 @@ impl Default for HealthConfig {
     }
 }
 
-/// Per-server health state tracker.
+// Per-server health state tracker.
 #[derive(Debug)]
 pub struct ServerHealth {
     state: ServerState,
-    /// Total successful operations since creation.
+    // Total successful operations since creation.
     pub success_count: u64,
-    /// Total failed operations since creation.
+    // Total failed operations since creation.
     pub failure_count: u64,
-    /// Current run of consecutive failures (reset on success).
+    // Current run of consecutive failures (reset on success).
     pub consecutive_failures: u32,
-    /// Lifetime disable transitions, independent of the current episode backoff.
+    // Lifetime disable transitions, independent of the current episode backoff.
     disable_count: u32,
     recovery_attempts: u32,
     recovery_pending: bool,
     recovery_event: Option<(u64, u64)>,
     pub(crate) recovery: std::sync::Arc<crate::recovery::RecoveryGate>,
     config: HealthConfig,
-    /// Exponentially weighted moving average of latency in microseconds.
+    // Exponentially weighted moving average of latency in microseconds.
     latency_ewma_us: f64,
-    /// Number of latency samples recorded.
+    // Number of latency samples recorded.
     latency_samples: u32,
-    /// Recent premature connection deaths (connections that died before
-    /// `MIN_CONNECTION_LIFETIME`). Stored as timestamps for time-windowed counting.
+    // Recent premature connection deaths (connections that died before
+    // `MIN_CONNECTION_LIFETIME`). Stored as timestamps for time-windowed counting.
     premature_deaths: Vec<Instant>,
-    /// Start of the current failure-ratio window; `None` until the first attempt.
+    // Start of the current failure-ratio window; `None` until the first attempt.
     ratio_window_started: Option<Instant>,
-    /// Attempts recorded in the current failure-ratio window.
+    // Attempts recorded in the current failure-ratio window.
     ratio_attempts: u32,
-    /// Failed attempts recorded in the current failure-ratio window.
+    // Failed attempts recorded in the current failure-ratio window.
     ratio_failures: u32,
 }
 
 impl ServerHealth {
-    /// Create a new `ServerHealth` starting in the `Healthy` state.
-    /// Connections younger than this when they die are counted as premature deaths.
+    // Create a new `ServerHealth` starting in the `Healthy` state.
+    // Connections younger than this when they die are counted as premature deaths.
     pub const MIN_CONNECTION_LIFETIME: Duration = Duration::from_secs(60);
-    /// Window for counting recent premature deaths.
+    // Window for counting recent premature deaths.
     const PREMATURE_DEATH_WINDOW: Duration = Duration::from_secs(120);
 
     pub fn new(config: HealthConfig) -> Self {
@@ -162,7 +164,7 @@ impl ServerHealth {
         }
     }
 
-    /// Record a successful operation — resets consecutive failures and returns to Healthy.
+    // Record a successful operation — resets consecutive failures and returns to Healthy.
     pub fn record_success(&mut self) {
         self.success_count += 1;
         if self.recovery_pending {
@@ -187,14 +189,14 @@ impl ServerHealth {
         self.recovery_attempts = 0;
     }
 
-    /// Record one attempt into the failure-ratio window; returns `true` when
-    /// the window tripped and moved the server to [`ServerState::Disabled`].
-    ///
-    /// Unlike `consecutive_failures` (reset by any success), the window counts
-    /// cumulatively, so a server failing a steady fraction of a busy workload
-    /// trips even though successes vastly outnumber failures. Quiet servers
-    /// never reach `failure_ratio_min_attempts` within one window and fall
-    /// back to the consecutive machine.
+    // Record one attempt into the failure-ratio window; returns `true` when
+    // the window tripped and moved the server to [`ServerState::Disabled`].
+    //
+    // Unlike `consecutive_failures` (reset by any success), the window counts
+    // cumulatively, so a server failing a steady fraction of a busy workload
+    // trips even though successes vastly outnumber failures. Quiet servers
+    // never reach `failure_ratio_min_attempts` within one window and fall
+    // back to the consecutive machine.
     fn note_ratio_attempt(&mut self, failed: bool, allow_trip: bool) -> bool {
         let now = Instant::now();
         match self.ratio_window_started {
@@ -227,21 +229,21 @@ impl ServerHealth {
         true
     }
 
-    /// Record a failed operation.
-    ///
-    /// If `is_auth` is true the server is immediately disabled regardless of the
-    /// consecutive failure count. Otherwise the state transitions through
-    /// Degraded and eventually Disabled based on configured thresholds.
+    // Record a failed operation.
+    //
+    // If `is_auth` is true the server is immediately disabled regardless of the
+    // consecutive failure count. Otherwise the state transitions through
+    // Degraded and eventually Disabled based on configured thresholds.
     pub fn record_failure(&mut self, is_auth: bool) {
         self.record_failure_gated(is_auth, true);
     }
 
-    /// [`Self::record_failure`] with an explicit failure-ratio trip gate.
-    ///
-    /// [`HealthTracker`] passes `allow_ratio_trip: false` when no other fill
-    /// server could absorb the shifted load — disabling the only usable
-    /// server would turn a 10%-flaky-but-90%-working connection into a full
-    /// outage. The window still counts attempts either way.
+    // [`Self::record_failure`] with an explicit failure-ratio trip gate.
+    //
+    // [`HealthTracker`] passes `allow_ratio_trip: false` when no other fill
+    // server could absorb the shifted load — disabling the only usable
+    // server would turn a 10%-flaky-but-90%-working connection into a full
+    // outage. The window still counts attempts either way.
     pub fn record_failure_gated(&mut self, is_auth: bool, allow_ratio_trip: bool) {
         self.failure_count += 1;
         self.consecutive_failures += 1;
@@ -280,17 +282,17 @@ impl ServerHealth {
         }
     }
 
-    /// Record a short-lived transport or capacity failure.
-    ///
-    /// Capacity failures only trigger a brief cooldown. Transport failures also
-    /// advance the longer-lived degraded/disabled thresholds so a flaky primary
-    /// eventually yields to backup servers instead of re-entering immediately forever.
+    // Record a short-lived transport or capacity failure.
+    //
+    // Capacity failures only trigger a brief cooldown. Transport failures also
+    // advance the longer-lived degraded/disabled thresholds so a flaky primary
+    // eventually yields to backup servers instead of re-entering immediately forever.
     pub fn record_cooldown(&mut self, reason: CooldownReason) {
         self.record_cooldown_gated(reason, true);
     }
 
-    /// [`Self::record_cooldown`] with an explicit failure-ratio trip gate
-    /// (see [`Self::record_failure_gated`]).
+    // [`Self::record_cooldown`] with an explicit failure-ratio trip gate
+    // (see [`Self::record_failure_gated`]).
     pub fn record_cooldown_gated(&mut self, reason: CooldownReason, allow_ratio_trip: bool) {
         self.failure_count += 1;
 
@@ -354,7 +356,7 @@ impl ServerHealth {
         };
     }
 
-    /// Whether this server can currently accept work.
+    // Whether this server can currently accept work.
     pub fn is_available(&self) -> bool {
         !matches!(
             self.state,
@@ -362,22 +364,22 @@ impl ServerHealth {
         )
     }
 
-    /// The current state of this server.
+    // The current state of this server.
     pub fn state(&self) -> &ServerState {
         &self.state
     }
 
-    /// How many times this server has been disabled since process start. Drives
-    /// the exponential re-enable backoff and is exported as a monitoring
-    /// counter — a server that keeps flapping shows a climbing value even when
-    /// each individual outage is short enough to miss a scrape.
+    // How many times this server has been disabled since process start. Drives
+    // the exponential re-enable backoff and is exported as a monitoring
+    // counter — a server that keeps flapping shows a climbing value even when
+    // each individual outage is short enough to miss a scrape.
     pub fn disable_count(&self) -> u32 {
         self.disable_count
     }
 
-    /// If the server is disabled and the backoff period has elapsed, transition
-    /// back to Degraded. A separate gate admits one fresh demanded connection;
-    /// cached stragglers cannot decide the recovery outcome.
+    // If the server is disabled and the backoff period has elapsed, transition
+    // back to Degraded. A separate gate admits one fresh demanded connection;
+    // cached stragglers cannot decide the recovery outcome.
     pub fn check_reenable(&mut self) {
         match self.state {
             ServerState::Disabled { until, .. } if Instant::now() >= until => {
@@ -403,10 +405,10 @@ impl ServerHealth {
         }
     }
 
-    /// Record a latency sample, updating the EWMA with α=0.2.
-    ///
-    /// The first sample seeds the EWMA directly; subsequent samples are
-    /// blended using `new = α * sample + (1 - α) * old`.
+    // Record a latency sample, updating the EWMA with α=0.2.
+    //
+    // The first sample seeds the EWMA directly; subsequent samples are
+    // blended using `new = α * sample + (1 - α) * old`.
     pub fn record_latency(&mut self, duration: Duration) {
         let sample_us = duration.as_secs_f64() * 1_000_000.0;
         if self.latency_samples == 0 {
@@ -418,8 +420,8 @@ impl ServerHealth {
         self.latency_samples += 1;
     }
 
-    /// Returns the EWMA latency in milliseconds, or 50.0 if no samples have
-    /// been recorded yet (cold start default).
+    // Returns the EWMA latency in milliseconds, or 50.0 if no samples have
+    // been recorded yet (cold start default).
     pub fn latency_ms(&self) -> f64 {
         if self.latency_samples == 0 {
             50.0
@@ -428,9 +430,9 @@ impl ServerHealth {
         }
     }
 
-    /// Record a premature connection death — a connection that died before
-    /// reaching `MIN_CONNECTION_LIFETIME`. Indicates infrastructure problems
-    /// (firewalls, proxies, ISP throttling) rather than article-level issues.
+    // Record a premature connection death — a connection that died before
+    // reaching `MIN_CONNECTION_LIFETIME`. Indicates infrastructure problems
+    // (firewalls, proxies, ISP throttling) rather than article-level issues.
     pub fn record_premature_death(&mut self) {
         let now = Instant::now();
         self.premature_deaths.push(now);
@@ -439,7 +441,7 @@ impl ServerHealth {
         self.premature_deaths.retain(|&t| t > cutoff);
     }
 
-    /// Count of premature connection deaths within the recent time window.
+    // Count of premature connection deaths within the recent time window.
     pub fn recent_premature_deaths(&self) -> usize {
         let cutoff = Instant::now() - Self::PREMATURE_DEATH_WINDOW;
         self.premature_deaths
@@ -448,7 +450,7 @@ impl ServerHealth {
             .count()
     }
 
-    /// Compute the exponential backoff duration capped at `max_backoff`.
+    // Compute the exponential backoff duration capped at `max_backoff`.
     fn compute_backoff(&self) -> Duration {
         let multiplier = 2u32.saturating_pow(self.recovery_attempts);
         let backoff = self.config.base_backoff.saturating_mul(multiplier);
@@ -510,14 +512,14 @@ impl ServerHealth {
     }
 }
 
-/// Manages health state for multiple servers.
+// Manages health state for multiple servers.
 #[derive(Debug)]
 pub struct HealthTracker {
     servers: Vec<ServerHealth>,
-    /// Backfill flag per server, parallel to `servers`. Failure-ratio trips
-    /// only fire when another FILL server can absorb the shifted load;
-    /// backfill servers never count (health never unlocks backfill, so
-    /// disabling the last fill server in their favor would stall fill work).
+    // Backfill flag per server, parallel to `servers`. Failure-ratio trips
+    // only fire when another FILL server can absorb the shifted load;
+    // backfill servers never count (health never unlocks backfill, so
+    // disabling the last fill server in their favor would stall fill work).
     backfill: Vec<bool>,
 }
 
@@ -547,8 +549,8 @@ impl HealthTracker {
         }
     }
 
-    /// One line per failed recovery probe: a server that never leaves
-    /// quarantine is otherwise invisible between throttled fetch-failure logs.
+    // One line per failed recovery probe: a server that never leaves
+    // quarantine is otherwise invisible between throttled fetch-failure logs.
     fn warn_probe_failed(server_idx: usize, health: &ServerHealth) {
         tracing::warn!(
             server = server_idx,
@@ -582,13 +584,13 @@ impl HealthTracker {
         self.record_cooldown(idx, reason);
         self.servers[idx].recovery_event = None;
     }
-    /// Create a tracker for `server_count` servers, all starting Healthy and
-    /// all treated as fill servers.
+    // Create a tracker for `server_count` servers, all starting Healthy and
+    // all treated as fill servers.
     pub fn new(server_count: usize, config: HealthConfig) -> Self {
         Self::new_with_backfill(server_count, config, vec![false; server_count])
     }
 
-    /// Create a tracker with explicit per-server backfill flags.
+    // Create a tracker with explicit per-server backfill flags.
     pub fn new_with_backfill(
         server_count: usize,
         config: HealthConfig,
@@ -601,10 +603,10 @@ impl HealthTracker {
         Self { servers, backfill }
     }
 
-    /// Whether a failure-ratio trip on `server_idx` has somewhere to shift
-    /// load: another fill server that is currently usable. A server sitting in
-    /// an unexpired disable/cooldown does not count — conservative, since the
-    /// next window re-evaluates after it re-enables.
+    // Whether a failure-ratio trip on `server_idx` has somewhere to shift
+    // load: another fill server that is currently usable. A server sitting in
+    // an unexpired disable/cooldown does not count — conservative, since the
+    // next window re-evaluates after it re-enables.
     fn ratio_trip_allowed(&self, server_idx: usize) -> bool {
         self.servers.iter().enumerate().any(|(idx, server)| {
             idx != server_idx
@@ -616,38 +618,38 @@ impl HealthTracker {
         })
     }
 
-    /// Record a successful operation for the given server.
+    // Record a successful operation for the given server.
     pub fn record_success(&mut self, server_idx: usize) {
         self.servers[server_idx].record_success();
     }
 
-    /// Record a failed operation for the given server.
+    // Record a failed operation for the given server.
     pub fn record_failure(&mut self, server_idx: usize, is_auth: bool) {
         let allow_ratio_trip = self.ratio_trip_allowed(server_idx);
         self.servers[server_idx].record_failure_gated(is_auth, allow_ratio_trip);
     }
 
-    /// Record a short-lived cooldown-worthy failure for the given server.
+    // Record a short-lived cooldown-worthy failure for the given server.
     pub fn record_cooldown(&mut self, server_idx: usize, reason: CooldownReason) {
         let allow_ratio_trip = self.ratio_trip_allowed(server_idx);
         self.servers[server_idx].record_cooldown_gated(reason, allow_ratio_trip);
     }
 
-    /// Whether the given server is available for work.
+    // Whether the given server is available for work.
     pub fn is_available(&mut self, server_idx: usize) -> bool {
         self.servers[server_idx].check_reenable();
         self.servers[server_idx].is_available()
     }
 
-    /// Check all disabled servers and re-enable any whose backoff has expired.
+    // Check all disabled servers and re-enable any whose backoff has expired.
     pub fn check_reenable_all(&mut self) {
         for server in &mut self.servers {
             server.check_reenable();
         }
     }
 
-    /// Return server indices ordered by health: Healthy first, Degraded second,
-    /// Disabled servers are excluded entirely.
+    // Return server indices ordered by health: Healthy first, Degraded second,
+    // Disabled servers are excluded entirely.
     pub fn ordered_servers(&mut self) -> Vec<usize> {
         self.check_reenable_all();
 
@@ -666,27 +668,27 @@ impl HealthTracker {
         healthy
     }
 
-    /// Record a premature connection death for the given server.
+    // Record a premature connection death for the given server.
     pub fn record_premature_death(&mut self, server_idx: usize) {
         self.servers[server_idx].record_premature_death();
     }
 
-    /// Recent premature deaths for the given server.
+    // Recent premature deaths for the given server.
     pub fn recent_premature_deaths(&self, server_idx: usize) -> usize {
         self.servers[server_idx].recent_premature_deaths()
     }
 
-    /// Record a latency sample for the given server.
+    // Record a latency sample for the given server.
     pub fn record_latency(&mut self, server_idx: usize, duration: Duration) {
         self.servers[server_idx].record_latency(duration);
     }
 
-    /// Returns the EWMA latency in milliseconds for the given server.
+    // Returns the EWMA latency in milliseconds for the given server.
     pub fn latency_ms(&self, server_idx: usize) -> f64 {
         self.servers[server_idx].latency_ms()
     }
 
-    /// Get a reference to the health state for a specific server.
+    // Get a reference to the health state for a specific server.
     pub fn server(&self, server_idx: usize) -> &ServerHealth {
         &self.servers[server_idx]
     }
@@ -700,8 +702,8 @@ mod recovery_tests;
 mod tests {
     use super::*;
 
-    /// Longer than any test runs: a quarantine or cooldown never lapses on
-    /// its own, so a test that needs one over says so with [`lapse`].
+    // Longer than any test runs: a quarantine or cooldown never lapses on
+    // its own, so a test that needs one over says so with [`lapse`].
     const NEVER_LAPSES: Duration = Duration::from_secs(3600);
 
     fn test_config() -> HealthConfig {
@@ -721,8 +723,8 @@ mod tests {
         }
     }
 
-    /// End the server's current quarantine or cooldown now, instead of
-    /// waiting for it to run out.
+    // End the server's current quarantine or cooldown now, instead of
+    // waiting for it to run out.
     fn lapse(health: &mut ServerHealth) {
         match &mut health.state {
             ServerState::Disabled { until, .. } | ServerState::CoolingDown { until, .. } => {
@@ -867,8 +869,8 @@ mod tests {
         ));
     }
 
-    /// Drive one server in a tracker through a 50% failure pattern that
-    /// crosses the ratio threshold (min 4 samples).
+    // Drive one server in a tracker through a 50% failure pattern that
+    // crosses the ratio threshold (min 4 samples).
     fn drive_ratio_pattern(tracker: &mut HealthTracker, server_idx: usize) {
         for _ in 0..4 {
             tracker.record_success(server_idx);

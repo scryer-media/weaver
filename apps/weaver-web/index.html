@@ -4,53 +4,8 @@
     <meta charset="UTF-8" />
     <base href="/" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <script>
-      (() => {
-        const root = document.documentElement;
-        // The Next UI is a single dark palette on its own background, so it
-        // settles both questions at once and skips the theme class entirely.
-        // Next is the default: only a browser that chose classic skips it.
-        // Mirrors `readUiVariant`, which takes the first store holding a choice.
-        const variant = [() => window.localStorage, () => window.sessionStorage]
-          .map((store) => {
-            try {
-              return store().getItem("weaver.ui-variant");
-            } catch {
-              return null;
-            }
-          })
-          .find((value) => value === "classic" || value === "next");
-        if (variant !== "classic") {
-          root.dataset.ui = "next";
-          root.dataset.initialTheme = "dark";
-          root.style.colorScheme = "dark";
-          return;
-        }
-        try {
-          const storedTheme = window.localStorage.getItem("theme");
-          const theme = storedTheme === "system"
-            ? window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"
-            : storedTheme === "light" ? "light" : "dark";
-          root.classList.toggle("dark", theme === "dark");
-          root.dataset.initialTheme = theme;
-          root.style.colorScheme = theme;
-        } catch {
-          root.classList.add("dark");
-          root.dataset.initialTheme = "dark";
-          root.style.colorScheme = "dark";
-        }
-      })();
-    </script>
     <style>
-      html, body { background-color: #050914; color-scheme: dark; }
-      html[data-initial-theme="light"], html[data-initial-theme="light"] body {
-        background-color: #f8f9fc;
-        color-scheme: light;
-      }
-      html[data-ui="next"], html[data-ui="next"] body {
-        background-color: #1a1b1e;
-        color-scheme: dark;
-      }
+      html, body { background-color: #1a1b1e; color-scheme: dark; }
     </style>
     <meta name="theme-color" content="#d9d9d9" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#081224" media="(prefers-color-scheme: dark)" />

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "./helpers";
@@ -28,7 +28,16 @@ async function confirmRemoval(page: Page, label: string) {
   await expect(confirm).toBeHidden();
 }
 
-test("general SRRDB lookup and bandwidth ceiling and cap persist through the settings top bar", async ({ cleanPage: page }) => {
+/** Open the System egress's editor from the egress table. */
+async function openSystemEgress(page: Page): Promise<Locator> {
+  await page.goto("/settings/networking/egress");
+  await tableRow(page, "Egress interfaces", "System").click();
+  const editor = page.getByRole("dialog", { name: "System", exact: true });
+  await expect(editor).toBeVisible();
+  return editor;
+}
+
+test("general SRRDB lookup, bandwidth ceiling and an egress download quota persist", async ({ cleanPage: page }) => {
   await page.goto("/settings/general");
   const srrdbLookup = page.getByRole("switch", { name: "SRRDB release lookup", exact: true });
   await expect(srrdbLookup).toBeVisible();
@@ -36,8 +45,11 @@ test("general SRRDB lookup and bandwidth ceiling and cap persist through the set
     await expect(srrdbLookup).toBeChecked();
     await page.goto("/settings/bandwidth");
     await expect(page.getByRole("spinbutton", { name: "Download ceiling", exact: true })).toHaveValue("8");
-    await expect(page.getByRole("switch", { name: "Enforce a data cap", exact: true })).toBeChecked();
-    await expect(page.getByRole("spinbutton", { name: "Reset day of month", exact: true })).toHaveValue("17");
+    const editor = await openSystemEgress(page);
+    await expect(editor.getByRole("switch", { name: "Enforce a download quota", exact: true })).toBeChecked();
+    await expect(editor.getByRole("spinbutton", { name: "Reset day of month", exact: true })).toHaveValue("17");
+    await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(editor).toBeHidden();
     return;
   }
 
@@ -52,23 +64,80 @@ test("general SRRDB lookup and bandwidth ceiling and cap persist through the set
   const ceiling = page.getByRole("spinbutton", { name: "Download ceiling", exact: true });
   await ceiling.fill("8");
   await ceiling.press("Tab");
-  await page.getByRole("switch", { name: "Enforce a data cap", exact: true }).click();
+  await saveSettings(page);
+  await page.reload();
+  await expect(ceiling).toHaveValue("8");
+
+  // The data cap is a download quota on an egress.
+  let editor = await openSystemEgress(page);
+  await editor.getByRole("switch", { name: "Enforce a download quota", exact: true }).click();
+  await editor.getByRole("button", { name: "Quota window", exact: true }).click();
   await page
-    .getByRole("radiogroup", { name: "Cap window", exact: true })
-    .getByRole("radio", { name: "Monthly", exact: true })
+    .getByRole("menu", { name: "Quota window", exact: true })
+    .getByRole("menuitemradio", { name: "Monthly", exact: true })
     .click();
-  await page.getByRole("textbox", { name: "Allowance", exact: true }).fill("500");
-  const monthlyDay = page.getByRole("spinbutton", { name: "Reset day of month", exact: true });
+  await editor.getByRole("textbox", { name: "Allowance", exact: true }).fill("500");
+  const monthlyDay = editor.getByRole("spinbutton", { name: "Reset day of month", exact: true });
   // The day of month clamps to the calendar instead of refusing the draft.
   await monthlyDay.fill("32");
   await monthlyDay.press("Tab");
   await expect(monthlyDay).toHaveValue("31");
   await monthlyDay.fill("17");
   await monthlyDay.press("Tab");
+  await editor.getByRole("button", { name: "Save egress", exact: true }).click();
+  await expect(editor).toBeHidden();
+  await page.reload();
+  editor = await openSystemEgress(page);
+  await expect(editor.getByRole("switch", { name: "Enforce a download quota", exact: true })).toBeChecked();
+  await expect(editor.getByRole("spinbutton", { name: "Reset day of month", exact: true })).toHaveValue("17");
+  await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(editor).toBeHidden();
+});
+
+test("archive passwords and the password file save, clear and persist without echoing the list", async ({ cleanPage: page }) => {
+  await page.goto("/settings/general");
+  const section = page.getByRole("region", { name: "Archive passwords", exact: true });
+  const list = section.getByRole("textbox", { name: "Passwords (one per line)", exact: true });
+  const file = section.getByRole("textbox", { name: "Password file", exact: true });
+  const clear = section.getByRole("button", { name: "Clear", exact: true });
+  const passwordFile = "/data/e2e-archive-passwords.txt";
+  if (afterRestart) {
+    // The daemon reports only that a list is stored; the list never comes back.
+    await expect(clear).toBeVisible();
+    await expect(list).toHaveValue("");
+    await expect(file).toHaveValue(passwordFile);
+    return;
+  }
+
+  await expect(clear).toHaveCount(0);
+  writeFileSync("/weaver-data/e2e-archive-passwords.txt", "fixture-password\n", { mode: 0o644 });
+  await list.fill("first-secret\nsecond-secret");
+  await file.click();
+  const picker = page.getByRole("dialog", { name: "Password file", exact: true });
+  await expect(picker).toBeVisible();
+  await picker.getByRole("button", { name: "e2e-archive-passwords.txt", exact: true }).click();
+  await picker.getByRole("button", { name: "Use this file", exact: true }).click();
+  await expect(picker).toBeHidden();
+  await expect(file).toHaveValue(passwordFile);
   await saveSettings(page);
   await page.reload();
-  await expect(ceiling).toHaveValue("8");
-  await expect(monthlyDay).toHaveValue("17");
+  await expect(clear).toBeVisible();
+  await expect(list).toHaveValue("");
+  await expect(file).toHaveValue(passwordFile);
+
+  // Clearing removes the stored list on save and keeps the file.
+  await clear.click();
+  await expect(section.getByRole("button", { name: "Keep", exact: true })).toBeVisible();
+  await saveSettings(page);
+  await page.reload();
+  await expect(clear).toHaveCount(0);
+  await expect(file).toHaveValue(passwordFile);
+
+  // Leave a list stored for the restart stage.
+  await list.fill("third-secret");
+  await saveSettings(page);
+  await page.reload();
+  await expect(clear).toBeVisible();
 });
 
 test("provider edits keep the stored password masked and a disabled provider can be added and removed", async ({ cleanPage: page }) => {
@@ -102,7 +171,7 @@ test("provider edits keep the stored password masked and a disabled provider can
   await page.reload();
   await expect(serverRow.getByText("5", { exact: true })).toBeVisible();
 
-  await page.getByRole("banner").getByRole("button", { name: "Add provider", exact: true }).click();
+  await page.getByRole("main").getByRole("button", { name: "Add provider", exact: true }).click();
   const addForm = page.getByRole("dialog", { name: "Add provider", exact: true });
   await addForm.getByRole("textbox", { name: "Host", exact: true }).fill("e2e-ui.invalid");
   await addForm.getByRole("switch", { name: "TLS", exact: true }).click();
@@ -146,7 +215,7 @@ test("category create, edit, persistence, and delete are browser-owned", async (
   }
 
   const addCategory = async (name: string, aliases: string) => {
-    await page.getByRole("banner").getByRole("button", { name: "Add category", exact: true }).click();
+    await page.getByRole("main").getByRole("button", { name: "Add category", exact: true }).click();
     const form = page.getByRole("dialog", { name: "Add category", exact: true });
     await form.getByRole("textbox", { name: "Name", exact: true }).fill(name);
     await form.getByRole("textbox", { name: "Also known as", exact: true }).fill(aliases);
@@ -172,36 +241,37 @@ test("category create, edit, persistence, and delete are browser-owned", async (
 
 test("schedule rules support create, toggle, edit, and delete", async ({ cleanPage: page }) => {
   await page.goto("/settings/schedules");
+  // The list heads only the groups that hold a rule, so the list itself is what loads.
+  await expect(page.getByRole("region", { name: "Schedules", exact: true })).toBeVisible();
   const removeSchedule = async (label: string) => {
-    await tableRow(page, "Schedules", label).click();
+    await tableRow(page, "Downloads", label).click();
     await page
       .getByRole("dialog", { name: label, exact: true })
       .getByRole("button", { name: "Remove schedule", exact: true })
       .click();
     await confirmRemoval(page, "Remove schedule");
-    await expect(tableRow(page, "Schedules", label)).toHaveCount(0);
+    await expect(tableRow(page, "Downloads", label)).toHaveCount(0);
   };
   if (afterRestart) {
-    const persistedRule = tableRow(page, "Schedules", persistedSchedule);
+    const persistedRule = tableRow(page, "Downloads", persistedSchedule);
     await expect(persistedRule.getByRole("switch", { name: "04:30 schedule enabled", exact: true })).not.toBeChecked();
     await removeSchedule(persistedSchedule);
     return;
   }
 
   const addSchedule = async (time: string, label: string) => {
-    await page.getByRole("banner").getByRole("button", { name: "Add schedule", exact: true }).click();
+    await page.getByRole("main").getByRole("button", { name: "Add schedule", exact: true }).click();
     const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
     await form.getByLabel("Time", { exact: true }).fill(time);
     await form.getByRole("textbox", { name: "Label", exact: true }).fill(label);
+    await form.getByRole("switch", { name: "Enabled", exact: true }).click();
     await form.getByRole("button", { name: "Save", exact: true }).click();
     await expect(form).toBeHidden();
-    return tableRow(page, "Schedules", label);
+    return tableRow(page, "Downloads", label);
   };
 
   let rule = await addSchedule("03:15", "e2e-off-peak");
-  const enabled = rule.getByRole("switch", { name: "03:15 schedule enabled", exact: true });
-  await expect(enabled).toBeChecked();
-  await enabled.click();
+  let enabled = rule.getByRole("switch", { name: "03:15 schedule enabled", exact: true });
   await expect(enabled).not.toBeChecked();
   await page.reload();
   await expect(enabled).not.toBeChecked();
@@ -209,16 +279,73 @@ test("schedule rules support create, toggle, edit, and delete", async ({ cleanPa
   await rule.click();
   const form = page.getByRole("dialog", { name: "e2e-off-peak", exact: true });
   await form.getByRole("textbox", { name: "Label", exact: true }).fill("e2e-off-peak-edited");
+  // Exercise the editor toggle without publishing an enabled hold to this
+  // shared instance, where either pause or resume affects other scenarios.
+  const draftEnabled = form.getByRole("switch", { name: "Enabled", exact: true });
+  await draftEnabled.click();
+  await expect(draftEnabled).toBeChecked();
+  await draftEnabled.click();
+  await expect(draftEnabled).not.toBeChecked();
   await form.getByRole("button", { name: "Save", exact: true }).click();
   await expect(form).toBeHidden();
-  rule = tableRow(page, "Schedules", "e2e-off-peak-edited");
+  rule = tableRow(page, "Downloads", "e2e-off-peak-edited");
   await expect(rule).toBeVisible();
+  enabled = rule.getByRole("switch", { name: "03:15 schedule enabled", exact: true });
+  await expect(enabled).not.toBeChecked();
   await removeSchedule("e2e-off-peak-edited");
 
   rule = await addSchedule("04:30", persistedSchedule);
   const persistedEnabled = rule.getByRole("switch", { name: "04:30 schedule enabled", exact: true });
-  await persistedEnabled.click();
   await expect(persistedEnabled).not.toBeChecked();
+});
+
+test("new schedule actions stay disabled and appear on their own tracks", async ({ cleanPage: page }) => {
+  test.skip(afterRestart, "temporary rules are removed before restart");
+  await page.goto("/settings/schedules");
+  const cases = [
+    ["Pause all intake", "Downloads"],
+    ["Pause post-processing", "Post-processing"],
+    ["Resume post-processing", "Post-processing"],
+    ["Set server availability", "Servers"],
+    ["Set quota metering", "Quota metering"],
+    ["Pause RSS", "RSS"],
+    ["Resume RSS", "RSS"],
+    ["Prune history", "One-shot actions"],
+  ];
+  for (const [action, track] of cases) {
+    const label = `e2e-disabled-${action}`;
+    await page.getByRole("main").getByRole("button", { name: "Add schedule", exact: true }).click();
+    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
+    await form.getByRole("textbox", { name: "Label", exact: true }).fill(label);
+    await form.getByRole("switch", { name: "Enabled", exact: true }).click();
+    await form.getByRole("button", { name: "Action", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: action, exact: true }).click();
+    if (action === "Set server availability") {
+      await form.getByRole("button", { name: "Server", exact: true }).click();
+      await page.getByRole("menuitemradio", { name: "nntp", exact: true }).click();
+    }
+    if (action === "Prune history") await form.getByRole("switch", { name: "Completed", exact: true }).check();
+    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(form).toBeHidden();
+    let row = tableRow(page, track, label);
+    await expect(row).toBeVisible();
+    await expect(row.getByRole("switch")).not.toBeChecked();
+    await row.click();
+    const edit = page.getByRole("dialog", { name: label, exact: true });
+    await edit.getByRole("textbox", { name: "Label", exact: true }).fill(`${label}-edited`);
+    // Toggle only the draft, and save disabled so no hold reaches the shared instance.
+    await edit.getByRole("switch", { name: "Enabled", exact: true }).click();
+    await edit.getByRole("switch", { name: "Enabled", exact: true }).click();
+    await edit.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(edit).toBeHidden();
+    await page.reload();
+    row = tableRow(page, track, `${label}-edited`);
+    await expect(row.getByRole("switch")).not.toBeChecked();
+    await row.click();
+    await page.getByRole("dialog", { name: `${label}-edited`, exact: true }).getByRole("button", { name: "Remove schedule", exact: true }).click();
+    await confirmRemoval(page, "Remove schedule");
+    await expect(row).toHaveCount(0);
+  }
 });
 
 const profileNames: Record<string, string> = {

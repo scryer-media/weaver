@@ -1,20 +1,20 @@
-//! What each carrier's scan found.
-//!
-//! The scanner authenticates every packet before it hands one over, so a
-//! damaged packet is never delivered: it is skipped, and the bytes it occupied
-//! simply produce nothing. That is the only damage signal available here, so
-//! this module reconstructs it from the coordinates of the packets that *did*
-//! authenticate — a run of carrier bytes that were readable and yielded no
-//! authenticated packet is damage, and a run that was never published is a
-//! hole. Both are plain integers on the carrier's own record, folded into the
-//! process counters once, at the work unit's handback.
+// What each carrier's scan found.
+//
+// The scanner authenticates every packet before it hands one over, so a
+// damaged packet is never delivered: it is skipped, and the bytes it occupied
+// simply produce nothing. That is the only damage signal available here, so
+// this module reconstructs it from the coordinates of the packets that *did*
+// authenticate — a run of carrier bytes that were readable and yielded no
+// authenticated packet is damage, and a run that was never published is a
+// hole. Both are plain integers on the carrier's own record, folded into the
+// process counters once, at the work unit's handback.
 
 use par3_rs::ingest::{IngestedPacket, PayloadKind};
 use par3_rs::source::SourceId;
 
-/// The packet families a carrier summary counts separately. A set needs an
-/// authenticated Start, matrix and Root before any of its files can be
-/// planned, so those three are named rather than lumped together.
+// The packet families a carrier summary counts separately. A set needs an
+// authenticated Start, matrix and Root before any of its files can be
+// planned, so those three are named rather than lumped together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::pipeline) enum Par3PacketKind {
     Start,
@@ -30,8 +30,8 @@ pub(in crate::pipeline) enum Par3PacketKind {
 impl Par3PacketKind {
     pub const COUNT: usize = 8;
 
-    /// The families a set cannot be planned without, in the order a reader
-    /// should hear about them.
+    // The families a set cannot be planned without, in the order a reader
+    // should hear about them.
     pub const VITAL: [Self; 3] = [Self::Start, Self::Root, Self::Matrix];
 
     pub const fn index(self) -> usize {
@@ -60,12 +60,12 @@ impl Par3PacketKind {
         }
     }
 
-    /// Which family an authenticated packet belongs to.
-    ///
-    /// The family comes from the declared type rather than from the parsed
-    /// body: a packet whose body needs the set's Start packet before it can be
-    /// parsed is retained verbatim, and it is still a packet of its own
-    /// family.
+    // Which family an authenticated packet belongs to.
+    //
+    // The family comes from the declared type rather than from the parsed
+    // body: a packet whose body needs the set's Start packet before it can be
+    // parsed is retained verbatim, and it is still a packet of its own
+    // family.
     pub fn of(packet: &IngestedPacket) -> Self {
         use par3_rs::packet::PacketType;
         if let Some(metadata) = packet.metadata() {
@@ -91,24 +91,24 @@ impl Par3PacketKind {
     }
 }
 
-/// One carrier's scan record. Every field is a plain integer advanced by the
-/// scan loop; nothing here touches an atomic or allocates.
+// One carrier's scan record. Every field is a plain integer advanced by the
+// scan loop; nothing here touches an atomic or allocates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::pipeline) struct CarrierScan {
-    /// Carrier bytes the scanner has walked past, authenticated or not.
+    // Carrier bytes the scanner has walked past, authenticated or not.
     pub bytes_scanned: u64,
-    /// Authenticated packets, by family.
+    // Authenticated packets, by family.
     pub authenticated: [u64; Par3PacketKind::COUNT],
-    /// Authenticated packets a set refused to admit.
+    // Authenticated packets a set refused to admit.
     pub rejected: u64,
-    /// Start of the first readable run that produced no authenticated packet.
+    // Start of the first readable run that produced no authenticated packet.
     pub first_damage_offset: Option<u64>,
-    /// Total readable bytes that produced no authenticated packet.
+    // Total readable bytes that produced no authenticated packet.
     pub damaged_bytes: u64,
-    /// Times the scanner had to step over a range that had not arrived.
+    // Times the scanner had to step over a range that had not arrived.
     pub unavailable_ranges: u64,
-    /// Where the next authenticated packet is expected to begin. Everything
-    /// between here and the packet that actually arrives is damage.
+    // Where the next authenticated packet is expected to begin. Everything
+    // between here and the packet that actually arrives is damage.
     next_offset: u64,
 }
 
@@ -127,15 +127,15 @@ impl Default for CarrierScan {
 }
 
 impl CarrierScan {
-    /// Start the damage cursor at the offset the scan begins from.
-    ///
-    /// The cursor starts at zero, which is only right for a carrier read from
-    /// its first byte. A PAR3 payload embedded behind an archive's own prefix
-    /// is scanned from the offset where its packets begin, and without this
-    /// the first packet would credit that whole prefix as damage — a healthy
-    /// carrier reported as damaged from byte zero. Only a scan that has
-    /// produced nothing yet can be moved; once anything is credited the cursor
-    /// belongs to the scan.
+    // Start the damage cursor at the offset the scan begins from.
+    //
+    // The cursor starts at zero, which is only right for a carrier read from
+    // its first byte. A PAR3 payload embedded behind an archive's own prefix
+    // is scanned from the offset where its packets begin, and without this
+    // the first packet would credit that whole prefix as damage — a healthy
+    // carrier reported as damaged from byte zero. Only a scan that has
+    // produced nothing yet can be moved; once anything is credited the cursor
+    // belongs to the scan.
     pub fn start_at(&mut self, offset: u64) {
         if self.bytes_scanned == 0 && self.damaged_bytes == 0 && self.first_damage_offset.is_none()
         {
@@ -143,36 +143,36 @@ impl CarrierScan {
         }
     }
 
-    /// Credit one authenticated packet, together with whatever readable span
-    /// preceded it and produced nothing.
+    // Credit one authenticated packet, together with whatever readable span
+    // preceded it and produced nothing.
     pub fn note_packet(&mut self, kind: Par3PacketKind, offset: u64, length: u64) {
         self.note_gap(offset);
         self.authenticated[kind.index()] += 1;
         self.advance(offset.saturating_add(length));
     }
 
-    /// Credit one authenticated packet a set would not admit. The bytes are
-    /// accounted for either way: the packet was readable and well formed.
+    // Credit one authenticated packet a set would not admit. The bytes are
+    // accounted for either way: the packet was readable and well formed.
     pub fn note_rejected(&mut self, offset: u64, length: u64) {
         self.note_gap(offset);
         self.rejected += 1;
         self.advance(offset.saturating_add(length));
     }
 
-    /// Step over a range that has not arrived. Absent bytes are a hole, never
-    /// damage, so the damage cursor moves with the scanner.
+    // Step over a range that has not arrived. Absent bytes are a hole, never
+    // damage, so the damage cursor moves with the scanner.
     pub fn note_unavailable(&mut self, resume: u64) {
         self.unavailable_ranges += 1;
         self.advance(resume);
     }
 
-    /// Close the carrier at its published length, so a damaged tail counts.
+    // Close the carrier at its published length, so a damaged tail counts.
     pub fn note_end(&mut self, len: u64) {
         self.note_gap(len);
         self.advance(len);
     }
 
-    /// Whether this carrier reported anything a reader should hear about.
+    // Whether this carrier reported anything a reader should hear about.
     pub fn is_damaged(&self) -> bool {
         self.damaged_bytes != 0 || self.rejected != 0
     }
@@ -193,7 +193,7 @@ impl CarrierScan {
     }
 }
 
-/// One carrier's line in a damage summary.
+// One carrier's line in a damage summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::pipeline) struct CarrierDamage {
     pub source: SourceId,
@@ -235,9 +235,9 @@ mod tests {
         scan
     }
 
-    /// A carrier scanned from an offset owes nothing for the bytes before it.
-    /// The prefix an embedded PAR3 payload sits behind was never part of the
-    /// scan, so the first packet credits no damage.
+    // A carrier scanned from an offset owes nothing for the bytes before it.
+    // The prefix an embedded PAR3 payload sits behind was never part of the
+    // scan, so the first packet credits no damage.
     #[test]
     fn a_scan_started_at_an_offset_reports_no_damage_for_the_prefix() {
         const START: u64 = 4096;
@@ -252,8 +252,8 @@ mod tests {
         assert_eq!(scan.bytes_scanned, 100, "only the scanned span is counted");
     }
 
-    /// Damage after the scan start is still damage: moving the cursor sets
-    /// where the scan begins, it does not excuse a hole inside it.
+    // Damage after the scan start is still damage: moving the cursor sets
+    // where the scan begins, it does not excuse a hole inside it.
     #[test]
     fn a_scan_started_at_an_offset_still_reports_damage_inside_it() {
         const START: u64 = 4096;
@@ -266,7 +266,7 @@ mod tests {
         assert!(scan.is_damaged());
     }
 
-    /// A carrier whose packets abut leaves nothing unexplained.
+    // A carrier whose packets abut leaves nothing unexplained.
     #[test]
     fn a_whole_carrier_reports_no_damage() {
         let scan = scanned(&[(0, 100), (100, 50), (150, 50)], 200);
@@ -276,8 +276,8 @@ mod tests {
         assert!(!scan.is_damaged());
     }
 
-    /// A packet the scanner could not authenticate leaves its bytes behind,
-    /// and the summary names where the run started, not where it ended.
+    // A packet the scanner could not authenticate leaves its bytes behind,
+    // and the summary names where the run started, not where it ended.
     #[test]
     fn a_skipped_packet_becomes_a_damaged_run_at_its_own_offset() {
         let scan = scanned(&[(0, 100), (250, 50)], 300);
@@ -286,8 +286,8 @@ mod tests {
         assert!(scan.is_damaged());
     }
 
-    /// Bytes that never arrived are a hole. Stepping over one must not be
-    /// reported as damage, and must not shift the damage that follows it.
+    // Bytes that never arrived are a hole. Stepping over one must not be
+    // reported as damage, and must not shift the damage that follows it.
     #[test]
     fn an_unavailable_range_is_a_hole_and_not_damage() {
         let mut scan = CarrierScan::default();
@@ -301,8 +301,8 @@ mod tests {
         assert_eq!(scan.damaged_bytes, 100);
     }
 
-    /// A carrier that stops producing packets before its end is damaged to
-    /// its last byte, not silently accepted as finished.
+    // A carrier that stops producing packets before its end is damaged to
+    // its last byte, not silently accepted as finished.
     #[test]
     fn a_damaged_tail_is_counted_when_the_carrier_closes() {
         let scan = scanned(&[(0, 100)], 1_000);
@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(scan.damaged_bytes, 900);
     }
 
-    /// Every family has its own slot and its own stable label.
+    // Every family has its own slot and its own stable label.
     #[test]
     fn the_packet_families_are_distinct_and_named() {
         use std::collections::BTreeSet;

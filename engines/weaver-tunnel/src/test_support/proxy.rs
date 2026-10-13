@@ -1,4 +1,4 @@
-//! Strict local HTTP CONNECT/SOCKS5 fixture with an explicit destination map.
+// Strict local HTTP CONNECT/SOCKS5 fixture with an explicit destination map.
 use crate::transport::TransportKind;
 use std::{
     collections::HashMap,

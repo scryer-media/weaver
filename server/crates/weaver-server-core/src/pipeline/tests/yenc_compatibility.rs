@@ -297,7 +297,7 @@ async fn deliver_from(
     .await;
 }
 
-/// An article whose body looks cut short, with no checksum either way.
+// An article whose body looks cut short, with no checksum either way.
 async fn deliver_suspected(
     pipeline: &mut Pipeline,
     file_id: NzbFileId,
@@ -379,10 +379,10 @@ async fn deliver_declared(
     settle_direct_demotion_work(pipeline).await;
 }
 
-/// An NZB that omits one segment number still numbers the rest densely, so the
-/// prefix sums it implies sit below the true offsets of every later article.
-/// Those articles must still be accepted, and the hole they leave must surface
-/// as a file that needs verification rather than as a clean completion.
+// An NZB that omits one segment number still numbers the rest densely, so the
+// prefix sums it implies sit below the true offsets of every later article.
+// Those articles must still be accepted, and the hole they leave must surface
+// as a file that needs verification rather than as a clean completion.
 #[tokio::test]
 async fn sparse_segment_list_commits_every_listed_article_and_flags_the_hole() {
     let temp = tempfile::tempdir().unwrap();
@@ -434,8 +434,8 @@ async fn sparse_segment_list_commits_every_listed_article_and_flags_the_hole() {
     );
 }
 
-/// Posters exist that write a running whole-file checksum, or zeros, on every
-/// part but the last. That cannot be allowed to end the job.
+// Posters exist that write a running whole-file checksum, or zeros, on every
+// part but the last. That cannot be allowed to end the job.
 #[tokio::test]
 async fn conflicting_whole_file_crcs_drop_the_expectation_instead_of_failing() {
     let temp = tempfile::tempdir().unwrap();
@@ -454,9 +454,9 @@ async fn conflicting_whole_file_crcs_drop_the_expectation_instead_of_failing() {
     assert!(!is_terminal_status(&pipeline.jobs[&file_id.job_id].status));
 }
 
-/// Every part verified against its own checksum and the placements tile the
-/// file exactly, so the bytes are what was posted: the trailer's whole-file
-/// value is the thing that is wrong.
+// Every part verified against its own checksum and the placements tile the
+// file exactly, so the bytes are what was posted: the trailer's whole-file
+// value is the thing that is wrong.
 #[tokio::test]
 async fn wrong_whole_file_crc_yields_to_parts_that_all_verified() {
     let temp = tempfile::tempdir().unwrap();
@@ -490,8 +490,8 @@ async fn wrong_whole_file_crc_yields_to_parts_that_all_verified() {
     );
 }
 
-/// With a part that could not vouch for itself, nothing corroborates the
-/// poster's value — but that is still not grounds for ending the job.
+// With a part that could not vouch for itself, nothing corroborates the
+// poster's value — but that is still not grounds for ending the job.
 #[tokio::test(start_paused = true)]
 async fn wrong_whole_file_crc_without_proof_holds_the_file_for_verification() {
     let temp = tempfile::tempdir().unwrap();
@@ -814,7 +814,7 @@ async fn restart_refetches_retained_damage_and_overwrites_it() {
         .unwrap();
     assert!(recovered.complete_files.is_empty());
     assert!(recovered.file_progress.is_empty());
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let (mut restored, _, _) = new_direct_pipeline(&temp).await;
     restored
         .restore_job(RestoreJobRequest {
@@ -991,7 +991,7 @@ async fn restart_partial(mut pipeline: Pipeline, temp: &TempDir, file_id: NzbFil
         .remove(&job_id)
         .unwrap();
     assert!(recovered.complete_files.is_empty());
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let (mut restored, _, _) = new_direct_pipeline(temp).await;
     restored
         .restore_job(RestoreJobRequest {
@@ -1248,7 +1248,7 @@ async fn real_wire_crc32_only_retry_clears_damage_through_every_adapter() {
     }
 }
 
-/// Build a yEnc article out of bytes that need no escaping.
+// Build a yEnc article out of bytes that need no escaping.
 fn plain_article(headers: &[&str], body: &[u8], trailer: Option<&str>) -> Vec<u8> {
     let mut article = Vec::new();
     for header in headers {
@@ -1269,8 +1269,8 @@ fn decoded(article: &[u8]) -> weaver_yenc::DecodeResult {
     weaver_yenc::decode(article, &mut output).unwrap()
 }
 
-/// A part whose declared span accounts for every byte that arrived is complete
-/// even without a trailer: there is nothing left for a missing `=yend` to hide.
+// A part whose declared span accounts for every byte that arrived is complete
+// even without a trailer: there is nothing left for a missing `=yend` to hide.
 #[test]
 fn a_confirmed_length_survives_a_missing_trailer() {
     let body = vec![0u8; 16];
@@ -1287,8 +1287,8 @@ fn a_confirmed_length_survives_a_missing_trailer() {
     )));
 }
 
-/// A body that stops short of its declared span, with no trailer and no
-/// checksum, is exactly the response another server should be asked for.
+// A body that stops short of its declared span, with no trailer and no
+// checksum, is exactly the response another server should be asked for.
 #[test]
 fn a_short_body_without_a_trailer_is_suspected() {
     let body = vec![0u8; 8];
@@ -1305,8 +1305,8 @@ fn a_short_body_without_a_trailer_is_suspected() {
     assert!(crate::pipeline::yenc_truncation_suspected(&result));
 }
 
-/// A single-part article that neither ends with a trailer nor accounts for its
-/// declared size is suspect for the same reason.
+// A single-part article that neither ends with a trailer nor accounts for its
+// declared size is suspect for the same reason.
 #[test]
 fn a_single_part_body_short_of_its_declared_size_is_suspected() {
     let body = vec![0u8; 8];
@@ -1316,7 +1316,7 @@ fn a_single_part_body_short_of_its_declared_size_is_suspected() {
     )));
 }
 
-/// A trailer that disagrees with the bytes delivered is evidence on its own.
+// A trailer that disagrees with the bytes delivered is evidence on its own.
 #[test]
 fn a_trailer_size_that_disagrees_is_suspected() {
     let body = vec![0u8; 16];
@@ -1333,7 +1333,7 @@ fn a_trailer_size_that_disagrees_is_suspected() {
     assert!(crate::pipeline::yenc_truncation_suspected(&result));
 }
 
-/// A checksum that verifies proves the bytes whatever the size fields claim.
+// A checksum that verifies proves the bytes whatever the size fields claim.
 #[test]
 fn a_verified_checksum_outranks_every_size_disagreement() {
     let body = vec![0u8; 16];
@@ -1351,8 +1351,8 @@ fn a_verified_checksum_outranks_every_size_disagreement() {
     assert!(!crate::pipeline::yenc_truncation_suspected(&result));
 }
 
-/// Bytes that look cut short are written, never counted, and re-requested.
-/// They are not a checksum failure, so the CRC-error metric stays still.
+// Bytes that look cut short are written, never counted, and re-requested.
+// They are not a checksum failure, so the CRC-error metric stays still.
 #[tokio::test(start_paused = true)]
 async fn suspected_truncation_is_retried_and_a_verified_copy_settles_it() {
     let temp = tempfile::tempdir().unwrap();
@@ -1399,8 +1399,8 @@ async fn suspected_truncation_is_retried_and_a_verified_copy_settles_it() {
     assert_eq!(pipeline.metrics.crc_errors.load(Ordering::Relaxed), 0);
 }
 
-/// A later copy that accounts for its own length settles a body that was only
-/// suspected of being cut short, even though it carries no checksum either.
+// A later copy that accounts for its own length settles a body that was only
+// suspected of being cut short, even though it carries no checksum either.
 #[tokio::test(start_paused = true)]
 async fn a_copy_with_a_confirmed_length_settles_suspected_truncation() {
     let temp = tempfile::tempdir().unwrap();
@@ -1425,8 +1425,8 @@ async fn a_copy_with_a_confirmed_length_settles_suspected_truncation() {
     assert!(!file.has_retained_damage());
 }
 
-/// An article whose `=ypart begin=` could not be read: intact bytes with no
-/// position of their own.
+// An article whose `=ypart begin=` could not be read: intact bytes with no
+// position of their own.
 async fn deliver_unanchored(
     pipeline: &mut Pipeline,
     file_id: NzbFileId,
@@ -1444,7 +1444,7 @@ async fn deliver_unanchored(
     .await;
 }
 
-/// The same article, with whatever its body turned out to be worth.
+// The same article, with whatever its body turned out to be worth.
 async fn deliver_unanchored_status(
     pipeline: &mut Pipeline,
     file_id: NzbFileId,
@@ -1494,7 +1494,7 @@ async fn deliver_unanchored_status(
     settle_direct_demotion_work(pipeline).await;
 }
 
-/// A part with no usable start is laid immediately after the part before it.
+// A part with no usable start is laid immediately after the part before it.
 #[tokio::test]
 async fn an_article_without_a_start_follows_the_one_before_it() {
     let temp = tempfile::tempdir().unwrap();
@@ -1511,9 +1511,9 @@ async fn an_article_without_a_start_follows_the_one_before_it() {
     assert!(pipeline.unanchored_requeues.is_empty());
 }
 
-/// Arriving before the part it must follow is an ordering condition, not
-/// damage: the decoded article is held, costs no fetch and no retry, and lands
-/// the moment its predecessor is placed.
+// Arriving before the part it must follow is an ordering condition, not
+// damage: the decoded article is held, costs no fetch and no retry, and lands
+// the moment its predecessor is placed.
 #[tokio::test]
 async fn an_article_without_a_start_waits_for_its_predecessor() {
     let temp = tempfile::tempdir().unwrap();
@@ -1551,8 +1551,8 @@ async fn an_article_without_a_start_waits_for_its_predecessor() {
     assert!(pipeline.jobs[&file_id.job_id].download_queue.is_empty());
 }
 
-/// A run of held articles releases in one pass once its head is placed, each
-/// laid after the one before it.
+// A run of held articles releases in one pass once its head is placed, each
+// laid after the one before it.
 #[tokio::test]
 async fn a_run_of_held_articles_releases_behind_its_head() {
     let temp = tempfile::tempdir().unwrap();
@@ -1571,8 +1571,8 @@ async fn a_run_of_held_articles_releases_behind_its_head() {
     assert!(file.is_complete());
 }
 
-/// Held articles have no offset once the part they follow is given up, so they
-/// are retired with it rather than held for a placement that cannot come.
+// Held articles have no offset once the part they follow is given up, so they
+// are retired with it rather than held for a placement that cannot come.
 #[tokio::test]
 async fn giving_up_a_predecessor_retires_the_articles_held_behind_it() {
     let temp = tempfile::tempdir().unwrap();
@@ -1599,8 +1599,8 @@ async fn giving_up_a_predecessor_retires_the_articles_held_behind_it() {
     assert!(pipeline.jobs[&file_id.job_id].download_queue.is_empty());
 }
 
-/// An article that cannot be held is asked for again without retry budget, and
-/// the bound on that counts only attempts since the file last placed a part.
+// An article that cannot be held is asked for again without retry budget, and
+// the bound on that counts only attempts since the file last placed a part.
 #[tokio::test]
 async fn an_article_that_cannot_be_held_is_requeued_until_the_file_stalls() {
     let temp = tempfile::tempdir().unwrap();
@@ -1623,9 +1623,9 @@ async fn an_article_that_cannot_be_held_is_requeued_until_the_file_stalls() {
     assert!(!pipeline.segment_terminal_states.contains_key(&segment));
 }
 
-/// A predecessor that lands as damage is sent for again rather than placed,
-/// so the article held behind it keeps waiting and lands behind the verified
-/// replacement.
+// A predecessor that lands as damage is sent for again rather than placed,
+// so the article held behind it keeps waiting and lands behind the verified
+// replacement.
 #[tokio::test]
 async fn a_held_article_waits_out_a_damaged_predecessor() {
     let temp = tempfile::tempdir().unwrap();
@@ -1645,8 +1645,8 @@ async fn a_held_article_waits_out_a_damaged_predecessor() {
     );
 }
 
-/// An article arriving after the part it follows was given up is retired at
-/// once: there is no offset to wait for.
+// An article arriving after the part it follows was given up is retired at
+// once: there is no offset to wait for.
 #[tokio::test]
 async fn an_article_behind_a_given_up_predecessor_is_not_held() {
     let temp = tempfile::tempdir().unwrap();
@@ -1668,8 +1668,8 @@ async fn an_article_behind_a_given_up_predecessor_is_not_held() {
     assert!(pipeline.jobs[&file_id.job_id].download_queue.is_empty());
 }
 
-/// A damaged article that still named its own range in its header. The bytes
-/// are kept for repair; the range it declared is where the next part starts.
+// A damaged article that still named its own range in its header. The bytes
+// are kept for repair; the range it declared is where the next part starts.
 async fn deliver_damaged_declaring(
     pipeline: &mut Pipeline,
     file_id: NzbFileId,
@@ -1718,10 +1718,10 @@ async fn deliver_damaged_declaring(
     settle_direct_demotion_work(pipeline).await;
 }
 
-/// Bytes kept for repair still say where the part behind them begins. Once no
-/// further copy of the damaged part is coming, the article held behind it is
-/// laid at the boundary that part declared for itself — not booked as failed
-/// for repair to rebuild from scratch.
+// Bytes kept for repair still say where the part behind them begins. Once no
+// further copy of the damaged part is coming, the article held behind it is
+// laid at the boundary that part declared for itself — not booked as failed
+// for repair to rebuild from scratch.
 #[tokio::test(start_paused = true)]
 async fn a_held_article_anchors_on_the_range_a_given_up_predecessor_declared() {
     let temp = tempfile::tempdir().unwrap();
@@ -1766,9 +1766,9 @@ async fn a_held_article_anchors_on_the_range_a_given_up_predecessor_declared() {
     assert!(!file.is_complete());
 }
 
-/// A clean copy of the damaged part is still what wins. While another server
-/// may serve it, the article behind it keeps waiting and lands on the
-/// replacement's placement rather than on bytes kept for repair.
+// A clean copy of the damaged part is still what wins. While another server
+// may serve it, the article behind it keeps waiting and lands on the
+// replacement's placement rather than on bytes kept for repair.
 #[tokio::test(start_paused = true)]
 async fn a_clean_replacement_outranks_the_range_damaged_bytes_declared() {
     let temp = tempfile::tempdir().unwrap();
@@ -1792,8 +1792,8 @@ async fn a_clean_replacement_outranks_the_range_damaged_bytes_declared() {
     assert!(file.is_complete());
 }
 
-/// The same boundary serves an article that only arrives after its
-/// predecessor was given up: it is placed, not retired.
+// The same boundary serves an article that only arrives after its
+// predecessor was given up: it is placed, not retired.
 #[tokio::test(start_paused = true)]
 async fn an_article_behind_settled_damage_is_placed_rather_than_retired() {
     let temp = tempfile::tempdir().unwrap();
@@ -1823,8 +1823,8 @@ async fn an_article_behind_settled_damage_is_placed_rather_than_retired() {
     assert!(file.requires_file_verification());
 }
 
-/// The whole run held behind settled damage releases, each part anchoring the
-/// next exactly as it does behind a placement.
+// The whole run held behind settled damage releases, each part anchoring the
+// next exactly as it does behind a placement.
 #[tokio::test(start_paused = true)]
 async fn a_run_held_behind_settled_damage_releases_in_order() {
     let temp = tempfile::tempdir().unwrap();
@@ -1857,9 +1857,9 @@ async fn a_run_held_behind_settled_damage_releases_in_order() {
     }
 }
 
-/// A damaged part that named no range of its own still measured its own bytes,
-/// as long as nothing suggests the body was cut short: its extent is the
-/// boundary the part behind it starts at.
+// A damaged part that named no range of its own still measured its own bytes,
+// as long as nothing suggests the body was cut short: its extent is the
+// boundary the part behind it starts at.
 #[tokio::test(start_paused = true)]
 async fn a_believable_length_anchors_even_without_a_declared_range() {
     let temp = tempfile::tempdir().unwrap();
@@ -1892,10 +1892,10 @@ async fn a_believable_length_anchors_even_without_a_declared_range() {
     }));
 }
 
-/// A body that looked cut short, from a part that named no range either, knows
-/// neither where it ends nor how much is missing. There is nothing to anchor
-/// on, so the run held behind it is retired for repair rather than laid at a
-/// guessed offset.
+// A body that looked cut short, from a part that named no range either, knows
+// neither where it ends nor how much is missing. There is nothing to anchor
+// on, so the run held behind it is retired for repair rather than laid at a
+// guessed offset.
 #[tokio::test(start_paused = true)]
 async fn a_body_cut_short_without_a_range_anchors_nothing() {
     let temp = tempfile::tempdir().unwrap();

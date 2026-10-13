@@ -7,34 +7,34 @@ use chrono::{
 };
 
 use crate::SchedulerError;
-use crate::bandwidth::{IspBandwidthCapConfig, IspBandwidthCapPeriod, IspBandwidthCapWeekday};
+use crate::bandwidth::QuotaWeekday;
 use crate::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use crate::pipeline::Pipeline;
+use crate::servers::{ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod};
 
-/// Origin of a global download pause, so the download-block presentation can
-/// distinguish a schedule-driven pause from a manual one across every refresh.
+// Origin of a global download pause, so the download-block presentation can
+// distinguish a schedule-driven pause from a manual one across every refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GlobalPause {
-    /// Not globally paused; the cap/quota may still block.
+    // Not globally paused; a download quota may still block.
     Running,
-    /// Operator pressed pause.
+    // Operator pressed pause.
     Manual,
-    /// A bandwidth schedule paused downloads.
+    // A bandwidth schedule paused downloads.
     Scheduled,
 }
 
 const BANDWIDTH_LEDGER_RETENTION_DAYS: i64 = 90;
-const BANDWIDTH_CAP_USAGE_FLUSH_BYTES: u64 = 64 * 1024 * 1024;
-const BANDWIDTH_CAP_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(10);
-const BANDWIDTH_DISPLAY_USAGE_FLUSH_BYTES: u64 = 1024 * 1024 * 1024;
-const BANDWIDTH_DISPLAY_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(60);
+const BANDWIDTH_USAGE_FLUSH_BYTES: u64 = 1024 * 1024 * 1024;
+const BANDWIDTH_USAGE_FLUSH_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
+// One quota period, in local time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BandwidthCapWindow {
+pub(crate) struct QuotaWindow {
     period: Range<DateTime<Local>>,
 }
 
-impl BandwidthCapWindow {
+impl QuotaWindow {
     fn new(start: DateTime<Local>, end: DateTime<Local>) -> Self {
         Self {
             period: Range { start, end },
@@ -48,133 +48,35 @@ impl BandwidthCapWindow {
     pub(crate) fn ends_at(&self) -> DateTime<Local> {
         self.period.end
     }
-
-    /// Instant containment on epoch seconds: the per-article path asks this
-    /// question several times per article and must not resolve a calendar
-    /// to answer it.
-    fn contains_unix_seconds(&self, now_secs: i64) -> bool {
-        self.period.start.timestamp() <= now_secs && now_secs < self.period.end.timestamp()
-    }
 }
 
+// The per-minute download ledger behind the bandwidth graph.
+//
+// It records every BODY byte once, tagged with whether quota metering was on
+// when it arrived, and flushes in batches. Download quotas themselves live on
+// each egress and server; nothing here refuses work.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BandwidthCapRuntime {
-    policy: Option<IspBandwidthCapConfig>,
-    window: Option<BandwidthCapWindow>,
-    used_bytes: u64,
-    reserved_bytes: u64,
-    /// Dispatch was refused because the next reservation no longer fits the
-    /// allowance. Conservative pre-reservation parks work before `used`
-    /// reaches the limit, so the blocked presentation must not wait for
-    /// `remaining_bytes() == 0`. Sticky until a reservation succeeds, the
-    /// window rolls over, or the policy changes.
-    parked_on_cap: bool,
+pub(crate) struct BandwidthLedgerRuntime {
+    metering_suspended: bool,
     last_pruned_bucket_epoch_minute: Option<i64>,
-    /// The `%Z` label for the block-state presentation, keyed by the epoch
-    /// hour it was resolved in. Timezone abbreviations only change on the
-    /// hour (DST transitions), and resolving one allocates and walks the tz
-    /// database, which the per-article refresh must not pay.
-    timezone_label: Option<(i64, String)>,
-    pending_usage_by_minute: BTreeMap<i64, u64>,
+    pending_usage_by_minute: BTreeMap<(i64, bool), u64>,
     pending_usage_bytes: u64,
     pending_usage_started_at: Option<Instant>,
 }
 
-impl BandwidthCapRuntime {
-    pub(crate) fn set_policy(&mut self, policy: Option<IspBandwidthCapConfig>) {
-        self.policy = policy;
-        self.window = None;
-        self.used_bytes = 0;
-        self.reserved_bytes = 0;
-        self.parked_on_cap = false;
+impl BandwidthLedgerRuntime {
+    pub(crate) fn set_metering_enabled(&mut self, enabled: bool) {
+        self.metering_suspended = !enabled;
     }
 
-    pub(crate) fn cap_enabled(&self) -> bool {
-        self.policy.as_ref().is_some_and(|policy| policy.enabled)
-    }
-
-    pub(crate) fn limit_bytes(&self) -> u64 {
-        self.policy.as_ref().map_or(0, |policy| policy.limit_bytes)
-    }
-
-    pub(crate) fn remaining_bytes(&self) -> u64 {
-        self.limit_bytes()
-            .saturating_sub(self.used_bytes.saturating_add(self.reserved_bytes))
-    }
-
-    /// Default policy used solely for computing a display window when no
-    /// real policy is configured.  Monthly from day 1 at midnight matches
-    /// the frontend form defaults.
-    fn default_display_policy() -> IspBandwidthCapConfig {
-        IspBandwidthCapConfig {
-            enabled: false,
-            period: IspBandwidthCapPeriod::Monthly,
-            limit_bytes: 0,
-            reset_time_minutes_local: 0,
-            weekly_reset_weekday: IspBandwidthCapWeekday::Mon,
-            monthly_reset_day: 1,
-        }
-    }
-
-    pub(crate) fn update_for_now(&mut self, db: &crate::Database) -> Result<(), crate::StateError> {
+    pub(crate) fn prune_if_due(&mut self, db: &crate::Database) -> Result<(), crate::StateError> {
         let now_secs = crate::e2e_clock::unix_seconds();
-        // The window is a calendar computation (local midnight, DST-resolved
-        // reset times); it is recomputed only when the clock has left the one
-        // in hand. Inside the window this is an integer compare, which is what
-        // the per-article refresh should cost.
-        let in_window = self
-            .window
-            .as_ref()
-            .is_some_and(|window| window.contains_unix_seconds(now_secs));
-        if !in_window {
-            // Always compute a window so the UI can show real usage even before
-            // the user configures a cap.  Fall back to a default monthly window.
-            let default_policy = Self::default_display_policy();
-            let policy = self.policy.as_ref().unwrap_or(&default_policy);
-            let now = crate::e2e_clock::local_now();
-            let next_window = compute_window(now, policy);
-            if self.window.as_ref() != Some(&next_window) {
-                self.flush_pending_usage(db)?;
-                let start_minute = next_window.starts_at().timestamp().div_euclid(60);
-                let end_minute = next_window.ends_at().timestamp().div_euclid(60);
-                self.used_bytes = db.sum_bandwidth_usage_minutes(start_minute, end_minute)?;
-                self.window = Some(next_window);
-                self.reserved_bytes = 0;
-                self.parked_on_cap = false;
-            }
-        }
-        self.refresh_timezone_label(now_secs);
-
         let prune_cutoff = now_secs.div_euclid(60) - BANDWIDTH_LEDGER_RETENTION_DAYS * 24 * 60;
         if self.last_pruned_bucket_epoch_minute != Some(prune_cutoff) {
             db.prune_bandwidth_usage_before(prune_cutoff)?;
             self.last_pruned_bucket_epoch_minute = Some(prune_cutoff);
         }
-
         Ok(())
-    }
-
-    pub(crate) fn can_reserve(&self, bytes: u64) -> bool {
-        if !self.cap_enabled() {
-            return true;
-        }
-        self.used_bytes
-            .saturating_add(self.reserved_bytes)
-            .saturating_add(bytes)
-            <= self.limit_bytes()
-    }
-
-    pub(crate) fn reserve(&mut self, bytes: u64) {
-        self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
-        self.parked_on_cap = false;
-    }
-
-    pub(crate) fn record_reservation_rejected(&mut self) {
-        self.parked_on_cap = true;
-    }
-
-    pub(crate) fn release(&mut self, bytes: u64) {
-        self.reserved_bytes = self.reserved_bytes.saturating_sub(bytes);
     }
 
     pub(crate) fn record_download_bytes(
@@ -182,19 +84,11 @@ impl BandwidthCapRuntime {
         db: &crate::Database,
         payload_bytes: u64,
     ) -> Result<(), crate::StateError> {
-        let now_secs = crate::e2e_clock::unix_seconds();
-        let bucket_epoch_minute = now_secs.div_euclid(60);
+        let bucket_epoch_minute = crate::e2e_clock::unix_seconds().div_euclid(60);
         self.record_pending_usage(bucket_epoch_minute, payload_bytes);
-        if let Some(window) = &self.window
-            && window.contains_unix_seconds(now_secs)
-        {
-            self.used_bytes = self.used_bytes.saturating_add(payload_bytes);
-        } else {
-            self.flush_pending_usage(db)?;
-            self.update_for_now(db)?;
-        }
         if self.should_flush_pending_usage() {
             self.flush_pending_usage(db)?;
+            self.prune_if_due(db)?;
         }
         Ok(())
     }
@@ -210,9 +104,9 @@ impl BandwidthCapRuntime {
         let entries = self
             .pending_usage_by_minute
             .iter()
-            .map(|(bucket, bytes)| (*bucket, *bytes))
+            .map(|((bucket, metered), bytes)| (*bucket, *metered, *bytes))
             .collect::<Vec<_>>();
-        db.add_bandwidth_usage_minutes(&entries)?;
+        db.add_metered_bandwidth_usage_minutes(&entries)?;
         self.pending_usage_by_minute.clear();
         self.pending_usage_bytes = 0;
         self.pending_usage_started_at = None;
@@ -225,96 +119,33 @@ impl BandwidthCapRuntime {
             self.pending_usage_started_at = Some(Instant::now());
         }
         self.pending_usage_by_minute
-            .entry(bucket_epoch_minute)
+            .entry((bucket_epoch_minute, !self.metering_suspended))
             .and_modify(|bytes| *bytes = bytes.saturating_add(payload_bytes))
             .or_insert(payload_bytes);
         self.pending_usage_bytes = self.pending_usage_bytes.saturating_add(payload_bytes);
     }
 
     fn should_flush_pending_usage(&self) -> bool {
-        let (bytes, interval) = if self.cap_enabled() {
-            (
-                BANDWIDTH_CAP_USAGE_FLUSH_BYTES,
-                BANDWIDTH_CAP_USAGE_FLUSH_INTERVAL,
-            )
-        } else {
-            (
-                BANDWIDTH_DISPLAY_USAGE_FLUSH_BYTES,
-                BANDWIDTH_DISPLAY_USAGE_FLUSH_INTERVAL,
-            )
-        };
-        self.pending_usage_bytes >= bytes
+        self.pending_usage_bytes >= BANDWIDTH_USAGE_FLUSH_BYTES
             || self
                 .pending_usage_started_at
-                .is_some_and(|started| started.elapsed() >= interval)
-    }
-
-    fn resolve_timezone_label() -> String {
-        let now = crate::e2e_clock::local_now();
-        let label = now.format("%Z").to_string();
-        if label.is_empty() {
-            now.offset().to_string()
-        } else {
-            label
-        }
-    }
-
-    fn refresh_timezone_label(&mut self, now_secs: i64) {
-        let hour = now_secs.div_euclid(3600);
-        if self
-            .timezone_label
-            .as_ref()
-            .is_none_or(|(at, _)| *at != hour)
-        {
-            self.timezone_label = Some((hour, Self::resolve_timezone_label()));
-        }
-    }
-
-    fn timezone_label(&self) -> String {
-        let hour = crate::e2e_clock::unix_seconds().div_euclid(3600);
-        match &self.timezone_label {
-            Some((at, label)) if *at == hour => label.clone(),
-            _ => Self::resolve_timezone_label(),
-        }
+                .is_some_and(|started| started.elapsed() >= BANDWIDTH_USAGE_FLUSH_INTERVAL)
     }
 
     pub(crate) fn to_download_block_state(&self, pause: GlobalPause) -> DownloadBlockState {
-        let timezone_name = self.timezone_label();
-
-        // A global pause outranks the cap. The origin of the pause is carried
-        // explicitly so every block-state refresh reports the same kind:
-        // deriving it from a single `global_paused` bool let a scheduled pause
-        // be silently reclassified as manual by any later refresh.
+        // The origin of the pause is carried explicitly so every block-state
+        // refresh reports the same kind: deriving it from a single
+        // `global_paused` bool let a scheduled pause be silently reclassified
+        // as manual by any later refresh. Quota blocks are laid over this by
+        // the shared state.
         let kind = match pause {
             GlobalPause::Manual => DownloadBlockKind::ManualPause,
             GlobalPause::Scheduled => DownloadBlockKind::Scheduled,
-            GlobalPause::Running => {
-                if self.cap_enabled() && (self.remaining_bytes() == 0 || self.parked_on_cap) {
-                    DownloadBlockKind::IspCap
-                } else {
-                    DownloadBlockKind::None
-                }
-            }
+            GlobalPause::Running => DownloadBlockKind::None,
         };
-
         DownloadBlockState {
             kind,
-            cap_enabled: self.cap_enabled(),
-            period: self.policy.as_ref().map(|policy| policy.period),
-            used_bytes: self.used_bytes,
-            limit_bytes: self.limit_bytes(),
-            remaining_bytes: self.remaining_bytes(),
-            reserved_bytes: self.reserved_bytes,
-            window_starts_at_epoch_ms: self
-                .window
-                .as_ref()
-                .map(|window| window.starts_at().timestamp_millis() as f64),
-            window_ends_at_epoch_ms: self
-                .window
-                .as_ref()
-                .map(|window| window.ends_at().timestamp_millis() as f64),
-            timezone_name,
-            scheduled_speed_limit: 0,
+            ..DownloadBlockState::default()
         }
     }
 }
@@ -372,19 +203,19 @@ fn resolve_local_datetime(mut naive: NaiveDateTime) -> DateTime<Local> {
     }
 }
 
-fn weekday_to_chrono(weekday: IspBandwidthCapWeekday) -> chrono::Weekday {
+fn weekday_to_chrono(weekday: QuotaWeekday) -> chrono::Weekday {
     match weekday {
-        IspBandwidthCapWeekday::Mon => chrono::Weekday::Mon,
-        IspBandwidthCapWeekday::Tue => chrono::Weekday::Tue,
-        IspBandwidthCapWeekday::Wed => chrono::Weekday::Wed,
-        IspBandwidthCapWeekday::Thu => chrono::Weekday::Thu,
-        IspBandwidthCapWeekday::Fri => chrono::Weekday::Fri,
-        IspBandwidthCapWeekday::Sat => chrono::Weekday::Sat,
-        IspBandwidthCapWeekday::Sun => chrono::Weekday::Sun,
+        QuotaWeekday::Mon => chrono::Weekday::Mon,
+        QuotaWeekday::Tue => chrono::Weekday::Tue,
+        QuotaWeekday::Wed => chrono::Weekday::Wed,
+        QuotaWeekday::Thu => chrono::Weekday::Thu,
+        QuotaWeekday::Fri => chrono::Weekday::Fri,
+        QuotaWeekday::Sat => chrono::Weekday::Sat,
+        QuotaWeekday::Sun => chrono::Weekday::Sun,
     }
 }
 
-fn compute_daily_window(now: DateTime<Local>, reset_minutes: u16) -> BandwidthCapWindow {
+fn compute_daily_window(now: DateTime<Local>, reset_minutes: u16) -> QuotaWindow {
     let today = now.date_naive();
     let today_anchor = local_datetime(today.year(), today.month(), today.day(), reset_minutes);
     let start = if now >= today_anchor {
@@ -392,7 +223,7 @@ fn compute_daily_window(now: DateTime<Local>, reset_minutes: u16) -> BandwidthCa
     } else {
         let previous = today
             .pred_opt()
-            .expect("previous day exists for daily bandwidth cap");
+            .expect("previous day exists for a daily quota window");
         local_datetime(
             previous.year(),
             previous.month(),
@@ -403,21 +234,21 @@ fn compute_daily_window(now: DateTime<Local>, reset_minutes: u16) -> BandwidthCa
     let next_day = start
         .date_naive()
         .succ_opt()
-        .expect("next day exists for daily bandwidth cap");
+        .expect("next day exists for a daily quota window");
     let end = local_datetime(
         next_day.year(),
         next_day.month(),
         next_day.day(),
         reset_minutes,
     );
-    BandwidthCapWindow::new(start, end)
+    QuotaWindow::new(start, end)
 }
 
 fn compute_weekly_window(
     now: DateTime<Local>,
-    reset_weekday: IspBandwidthCapWeekday,
+    reset_weekday: QuotaWeekday,
     reset_minutes: u16,
-) -> BandwidthCapWindow {
+) -> QuotaWindow {
     let now_date = now.date_naive();
     let target = weekday_to_chrono(reset_weekday).num_days_from_monday() as i64;
     let current = now.weekday().num_days_from_monday() as i64;
@@ -444,14 +275,10 @@ fn compute_weekly_window(
         end_date.day(),
         reset_minutes,
     );
-    BandwidthCapWindow::new(start, end)
+    QuotaWindow::new(start, end)
 }
 
-fn compute_monthly_window(
-    now: DateTime<Local>,
-    reset_day: u8,
-    reset_minutes: u16,
-) -> BandwidthCapWindow {
+fn compute_monthly_window(now: DateTime<Local>, reset_day: u8, reset_minutes: u16) -> QuotaWindow {
     let today = now.date_naive();
     let current_day = clamp_day(today.year(), today.month(), reset_day);
     let current_anchor = local_datetime(today.year(), today.month(), current_day, reset_minutes);
@@ -466,31 +293,33 @@ fn compute_monthly_window(
     let (end_year, end_month) = shift_month(start_year, start_month, 1);
     let end_day = clamp_day(end_year, end_month, reset_day);
     let end = local_datetime(end_year, end_month, end_day, reset_minutes);
-    BandwidthCapWindow::new(start, end)
+    QuotaWindow::new(start, end)
 }
 
+// The quota period containing `now`, or `None` for a one-time quota.
 pub(crate) fn compute_window(
     now: DateTime<Local>,
-    policy: &IspBandwidthCapConfig,
-) -> BandwidthCapWindow {
-    match policy.period {
-        IspBandwidthCapPeriod::Daily => compute_daily_window(now, policy.reset_time_minutes_local),
-        IspBandwidthCapPeriod::Weekly => compute_weekly_window(
+    quota: &ServerDownloadQuotaConfig,
+) -> Option<QuotaWindow> {
+    Some(match quota.period {
+        ServerDownloadQuotaPeriod::OneTime => return None,
+        ServerDownloadQuotaPeriod::Daily => {
+            compute_daily_window(now, quota.reset_time_minutes_local)
+        }
+        ServerDownloadQuotaPeriod::Weekly => compute_weekly_window(
             now,
-            policy.weekly_reset_weekday,
-            policy.reset_time_minutes_local,
+            quota.weekly_reset_weekday,
+            quota.reset_time_minutes_local,
         ),
-        IspBandwidthCapPeriod::Monthly => compute_monthly_window(
-            now,
-            policy.monthly_reset_day,
-            policy.reset_time_minutes_local,
-        ),
-    }
+        ServerDownloadQuotaPeriod::Monthly => {
+            compute_monthly_window(now, quota.monthly_reset_day, quota.reset_time_minutes_local)
+        }
+    })
 }
 
 impl Pipeline {
-    /// The current global-pause origin, so every download-block refresh reports
-    /// a consistent Scheduled vs ManualPause kind.
+    // The current global-pause origin, so every download-block refresh reports
+    // a consistent Scheduled vs ManualPause kind.
     pub(crate) fn global_pause(&self) -> GlobalPause {
         if !self.global_paused {
             GlobalPause::Running
@@ -501,74 +330,26 @@ impl Pipeline {
         }
     }
 
-    fn publish_download_block(&mut self) {
+    pub(crate) fn publish_download_block(&mut self) {
         let mut block = self
-            .bandwidth_cap
+            .bandwidth_ledger
             .to_download_block_state(self.global_pause());
         block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
         self.shared_state.set_download_block(block);
-    }
-
-    pub(crate) fn refresh_bandwidth_cap_window(&mut self) -> Result<(), SchedulerError> {
-        self.bandwidth_cap.update_for_now(&self.db)?;
-        self.publish_download_block();
-        Ok(())
-    }
-
-    pub(crate) fn apply_bandwidth_cap_policy(
-        &mut self,
-        policy: Option<IspBandwidthCapConfig>,
-    ) -> Result<(), SchedulerError> {
-        self.bandwidth_cap.set_policy(policy);
-        self.refresh_bandwidth_cap_window()?;
-        Ok(())
-    }
-
-    pub(crate) fn reserve_bandwidth_for_dispatch(
-        &mut self,
-        segment_id: crate::jobs::ids::SegmentId,
-        estimate_bytes: u64,
-    ) -> Result<bool, SchedulerError> {
-        // One publication per dispatch, after the reservation decision: the
-        // pre-decision state would be overwritten on the next line anyway.
-        self.bandwidth_cap.update_for_now(&self.db)?;
-        let reserved = if self.bandwidth_cap.can_reserve(estimate_bytes) {
-            self.bandwidth_cap.reserve(estimate_bytes);
-            self.bandwidth_reservations
-                .insert(segment_id, estimate_bytes);
-            true
-        } else {
-            self.bandwidth_cap.record_reservation_rejected();
-            false
-        };
-        self.publish_download_block();
-        Ok(reserved)
-    }
-
-    pub(crate) fn release_bandwidth_reservation(
-        &mut self,
-        segment_id: crate::jobs::ids::SegmentId,
-    ) -> Result<(), SchedulerError> {
-        if let Some(reserved) = self.bandwidth_reservations.remove(&segment_id) {
-            self.bandwidth_cap.release(reserved);
-            self.refresh_bandwidth_cap_window()?;
-        }
-        Ok(())
     }
 
     pub(crate) fn record_download_bandwidth_usage(
         &mut self,
         payload_bytes: u64,
     ) -> Result<(), SchedulerError> {
-        self.bandwidth_cap
+        self.bandwidth_ledger
             .record_download_bytes(&self.db, payload_bytes)?;
-        self.publish_download_block();
         Ok(())
     }
 
     pub(crate) fn flush_download_bandwidth_usage(&mut self) -> Result<(), SchedulerError> {
-        self.bandwidth_cap.flush_pending_usage(&self.db)?;
-        self.publish_download_block();
+        self.bandwidth_ledger.flush_pending_usage(&self.db)?;
+        self.bandwidth_ledger.prune_if_due(&self.db)?;
         Ok(())
     }
 }

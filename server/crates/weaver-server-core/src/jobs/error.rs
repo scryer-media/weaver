@@ -1,6 +1,6 @@
 use crate::jobs::ids::JobId;
 
-/// Errors that can occur within the scheduler.
+// Errors that can occur within the scheduler.
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
     #[error("job {0} not found")]

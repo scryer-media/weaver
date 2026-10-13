@@ -46,11 +46,11 @@ pub fn open_database(config_path: &Path) -> Result<Database, Box<dyn std::error:
     Ok(Database::open_target(target)?)
 }
 
-/// Read one stored setting without opening the database for use: no
-/// migrations, no pool, nothing created. For code that needs a value before
-/// [`open_database`] has finished, while a schema upgrade may be holding the
-/// database. Any failure — no database yet, a schema without the table, a
-/// locked file — reads as unset.
+// Read one stored setting without opening the database for use: no
+// migrations, no pool, nothing created. For code that needs a value before
+// [`open_database`] has finished, while a schema upgrade may be holding the
+// database. Any failure — no database yet, a schema without the table, a
+// locked file — reads as unset.
 pub async fn peek_setting(config_path: &Path, key: &str) -> Option<String> {
     use sqlx::Connection;
 

@@ -79,12 +79,12 @@ pub struct HttpBindAddressStatus {
     pub bind_fallback: Option<String>,
 }
 
-/// Compute what the next restart binds and whether that differs from now.
-///
-/// Parsed comparison, never strings: `0:0:0:0:0:0:0:1` and `::1` are the same
-/// address, and a stored spelling must not read as an eternal pending restart.
-/// A cleared setting (stored `None`) pends a return to the default, which is a
-/// restart-worthy difference when the process is currently bound wider.
+// Compute what the next restart binds and whether that differs from now.
+//
+// Parsed comparison, never strings: `0:0:0:0:0:0:0:1` and `::1` are the same
+// address, and a stored spelling must not read as an eternal pending restart.
+// A cleared setting (stored `None`) pends a return to the default, which is a
+// restart-worthy difference when the process is currently bound wider.
 pub(crate) fn pending_bind_state(
     running: std::net::IpAddr,
     stored: Option<&str>,
@@ -101,11 +101,11 @@ pub(crate) fn pending_bind_state(
     (pending, pending != running)
 }
 
-/// Whether the address the next restart binds leaves the admin interface
-/// reachable beyond this machine with no login configured.
-///
-/// Loopback is judged canonically, so an IPv4-mapped `::ffff:127.0.0.1` reads
-/// as this machine rather than as an exposed binding.
+// Whether the address the next restart binds leaves the admin interface
+// reachable beyond this machine with no login configured.
+//
+// Loopback is judged canonically, so an IPv4-mapped `::ffff:127.0.0.1` reads
+// as this machine rather than as an exposed binding.
 pub(crate) fn exposed_without_login(login_enabled: bool, pending: std::net::IpAddr) -> bool {
     !login_enabled && !weaver_server_core::security::ip_is_loopback(pending)
 }
@@ -135,10 +135,10 @@ pub struct AccessPolicyStatus {
     pub strict_security: bool,
 }
 
-/// Request evidence made available to the network-access resolver by the HTTP
-/// transport. It is deliberately optional: schema-only callers cannot invent
-/// a peer or forwarding chain, and the resolver reports that absence instead
-/// of presenting a guess as a network diagnostic.
+// Request evidence made available to the network-access resolver by the HTTP
+// transport. It is deliberately optional: schema-only callers cannot invent
+// a peer or forwarding chain, and the resolver reports that absence instead
+// of presenting a guess as a network diagnostic.
 #[derive(Clone)]
 pub struct NetworkRequestSecurityContext {
     pub peer: Option<SocketAddr>,
@@ -430,4 +430,7 @@ pub enum CallerIdentity {
     Local([u8; 32]),
     Jwt([u8; 32]),
     ApiKey([u8; 32]),
+    // A running script, named by its run. It is a caller only for as long as
+    // that run lasts.
+    ScriptRun(String),
 }

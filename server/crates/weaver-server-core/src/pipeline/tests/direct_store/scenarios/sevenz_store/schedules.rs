@@ -1,17 +1,17 @@
-//! Tail-metadata discovery under every bounded arrival/duplicate schedule.
+// Tail-metadata discovery under every bounded arrival/duplicate schedule.
 use super::super::archive_schedules::{
-    ExtractionProfile, Interruption, Route, Selection, combined_campaign, run_described_schedule,
-    selected_schedules, wrong_password_schedules,
+    ExtractionProfile, Interruption, RecoveryFormat, Route, Schedule, ScheduleOptions, Selection,
+    combined_campaign, run_schedule_with, selected_schedules, wrong_password_schedules,
 };
 use super::*;
 use crate::pipeline::direct_store::router::sevenz::SevenZipRefusal;
 
 mod extended;
 
-/// Bytes in which no slice recurs. A recovery set mends a lost slice from any
-/// copy of it elsewhere in the set, so a payload that repeats survives a loss
-/// the set carries no recovery data for.
-fn unrepeated_payload(seed: u64, len: usize) -> Vec<u8> {
+// Bytes in which no slice recurs. A recovery set mends a lost slice from any
+// copy of it elsewhere in the set, so a payload that repeats survives a loss
+// the set carries no recovery data for.
+pub(in super::super) fn unrepeated_payload(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed;
     (0..len)
         .map(|_| {
@@ -23,7 +23,7 @@ fn unrepeated_payload(seed: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Reads one 7z variable-length number at `*at`, advancing past it.
+// Reads one 7z variable-length number at `*at`, advancing past it.
 fn sevenz_number(bytes: &[u8], at: &mut usize) -> u64 {
     let first = bytes[*at];
     *at += 1;
@@ -39,11 +39,11 @@ fn sevenz_number(bytes: &[u8], at: &mut usize) -> u64 {
     value
 }
 
-/// The archive byte ranges a reader needs before it knows the container's
-/// layout: the start header, the end header it points at, and, when that end
-/// header only names a compressed header stored earlier, that stream too. An
-/// encrypted header refuses the set from the end header alone, so its stream
-/// is never needed.
+// The archive byte ranges a reader needs before it knows the container's
+// layout: the start header, the end header it points at, and, when that end
+// header only names a compressed header stored earlier, that stream too. An
+// encrypted header refuses the set from the end header alone, so its stream
+// is never needed.
 fn map_extents(archive: &[u8]) -> Vec<(usize, usize)> {
     const SIGNATURE_HEADER: usize = 32;
     const ENCODED_HEADER: u8 = 0x17;
@@ -71,8 +71,8 @@ fn map_extents(archive: &[u8]) -> Vec<(usize, usize)> {
     extents
 }
 
-/// The schedule slots holding any byte of [`map_extents`], as a loss mask.
-fn map_slots(archive: &[u8], count: usize, articles: usize) -> u8 {
+// The schedule slots holding any byte of [`map_extents`], as a loss mask.
+pub(in super::super) fn map_slots(archive: &[u8], count: usize, articles: usize) -> u8 {
     let chunk = archive.len().div_ceil(count);
     let extents = map_extents(archive);
     let mut slots = 0u8;
@@ -90,13 +90,13 @@ fn map_slots(archive: &[u8], count: usize, articles: usize) -> u8 {
     slots
 }
 
-/// `mask` loses an article of `MAP`.
+// `mask` loses an article of `MAP`.
 fn loses<const MAP: u8>(mask: u8) -> bool {
     mask & MAP != 0
 }
 
-/// [`loses`] for every four-slot map, indexed by the map's own mask.
-const LOSES: [fn(u8) -> bool; 16] = [
+// [`loses`] for every four-slot map, indexed by the map's own mask.
+pub(in super::super) const LOSES: [fn(u8) -> bool; 16] = [
     loses::<0>,
     loses::<1>,
     loses::<2>,
@@ -118,8 +118,11 @@ const LOSES: [fn(u8) -> bool; 16] = [
 #[derive(Clone, Copy, Debug)]
 enum Shape {
     Copy,
-    /// Four single-article volumes, so two of the volumes are middle volumes.
+    // Four single-article volumes, so two of the volumes are middle volumes.
     CopyFourVolumes,
+    // One four-article volume: the start header opens it, the end header
+    // closes it, and nothing else is posted besides the recovery set.
+    CopySingle,
     Multiple,
     EmptyEntry,
     Nested,
@@ -130,9 +133,12 @@ enum Shape {
     Solid,
     SolidEncrypted,
     SolidHeaders,
-    /// Volume names that say nothing. The recovery set carries the real
-    /// names, as an obfuscated post's does.
+    // Volume names that say nothing. The recovery set carries the real
+    // names, as an obfuscated post's does.
     CopyObfuscated,
+    // One whole container under a name that says nothing: its own signature
+    // header is the only identity it needs.
+    CopySingleObfuscated,
 }
 
 async fn campaign(shape: Shape, selection: Selection) {
@@ -148,9 +154,28 @@ async fn conventional_campaign(shape: Shape, selection: Selection) {
 }
 
 async fn profile_campaign(shape: Shape, selection: Selection, profile: ExtractionProfile) {
+    run_shape(
+        shape,
+        profile,
+        ScheduleOptions::MATRIX,
+        wrong_password_schedules(selection),
+        selected_schedules(selection),
+    )
+    .await;
+}
+
+// Runs `cases`, and `wrong_password` under a password the archive does not
+// open with, over `shape` and holds each to what `profile` allows.
+async fn run_shape(
+    shape: Shape,
+    profile: ExtractionProfile,
+    options: ScheduleOptions,
+    wrong_password: Vec<Schedule>,
+    cases: Vec<(usize, Schedule)>,
+) {
     // A described volume is bound by the fingerprint of its first 16 KiB,
     // which its offset-zero article has to cover whole.
-    let first = if matches!(shape, Shape::CopyObfuscated) {
+    let first = if matches!(shape, Shape::CopyObfuscated | Shape::CopySingleObfuscated) {
         unrepeated_payload(13, 70_001)
     } else {
         payload(13, 6001)
@@ -228,25 +253,33 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
             matches!(shape, Shape::EncryptedHeaders),
         )
     };
-    let count = if matches!(shape, Shape::CopyFourVolumes) {
-        4
-    } else {
-        2
+    let count = match shape {
+        Shape::CopyFourVolumes => 4,
+        Shape::CopySingle | Shape::CopySingleObfuscated => 1,
+        _ => 2,
     };
     let volumes = split_volumes(&archive, count);
-    let (volumes, described) = if matches!(shape, Shape::CopyObfuscated) {
-        let described = volumes.iter().map(|(name, _)| name.clone()).collect();
-        (obfuscate_volumes(&volumes), Some(described))
-    } else {
-        (volumes, None::<Vec<String>>)
-    };
+    let (volumes, described) =
+        if matches!(shape, Shape::CopyObfuscated | Shape::CopySingleObfuscated) {
+            let described = volumes.iter().map(|(name, _)| name.clone()).collect();
+            (obfuscate_volumes(&volumes), Some(described))
+        } else {
+            (volumes, None::<Vec<String>>)
+        };
     let mut spec = sevenz_job_spec(&volumes, 4 / count);
     spec.password = password.map(str::to_owned);
     let wanted = expected.keys().copied().collect::<Vec<_>>();
     let direct_compatible = matches!(
         shape,
-        Shape::Copy | Shape::CopyFourVolumes | Shape::Multiple | Shape::EmptyEntry | Shape::Nested
-    );
+        Shape::Copy
+            | Shape::CopyFourVolumes
+            | Shape::CopySingle
+            | Shape::CopySingleObfuscated
+            | Shape::Multiple
+            | Shape::EmptyEntry
+            | Shape::Nested
+    ) || (matches!(shape, Shape::CopyObfuscated)
+        && options.recovery != RecoveryFormat::Par3);
     // A 7z set's layout lives in articles of its own: the start header opens
     // the first volume and the end header closing the last volume holds the
     // map. Every schedule spans four article slots, so those are slots 0 and
@@ -257,6 +290,36 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
     assert_eq!(map & 0b1001, 0b1001, "{shape:?}: map slots {map:#06b}");
     let unmapped_loss = LOSES[usize::from(map)];
     let route = match shape {
+        // Its own front is the only thing that names the container, so
+        // while that article is lost nothing admits it. A PAR3 set names a
+        // file only once its bytes are on disk, so any damage it has to
+        // repair hands the container back to be named there.
+        Shape::CopySingleObfuscated => Route {
+            unmapped_loss,
+            unnamed_loss: if options.recovery == RecoveryFormat::Par3 {
+                |mask| mask != 0
+            } else {
+                |mask| mask & 0b0001 != 0
+            },
+            ..Route::DIRECT
+        },
+        // A PAR3 set says which file is which only once the bytes are on
+        // disk, so nothing names a part in time: the set extracts from the
+        // volumes once they carry their names.
+        Shape::CopyObfuscated if options.recovery == RecoveryFormat::Par3 => Route {
+            unmapped_loss,
+            ..Route::refused(|_| false)
+        },
+        // The parts carry nothing that says which part they are, so only the
+        // recovery set's descriptions name them: the set routes direct when
+        // they arrive before its body, and a part whose front is lost is
+        // never named. Slots 0 and 2 are the two parts' offset-zero articles.
+        Shape::CopyObfuscated => Route {
+            unmapped_loss,
+            unnamed_loss: |mask| mask & 0b0101 != 0,
+            named_by_early_index: true,
+            ..Route::DIRECT
+        },
         _ if direct_compatible => Route {
             unmapped_loss,
             ..Route::DIRECT
@@ -267,13 +330,6 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
             ..Route::refused(|reason| {
                 matches!(reason, DemotionReason::SevenZip(SevenZipRefusal::Coder))
             })
-        },
-        // The recovery set's descriptions admit RAR volumes only, so an
-        // obfuscated 7z set is never admitted and nothing in it routes
-        // direct: it extracts from the volumes once they carry their names.
-        Shape::CopyObfuscated => Route {
-            unmapped_loss,
-            ..Route::refused(|_| false)
         },
         // Ciphertext is not the member's bytes either, and a header that is
         // itself encrypted hides the layout.
@@ -298,7 +354,7 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
     };
     // A password the archive does not open with. An archive that needs none
     // must not notice it.
-    for (order, interruption) in wrong_password_schedules(selection) {
+    for (order, interruption) in wrong_password {
         if !profile.includes(interruption) {
             continue;
         }
@@ -307,7 +363,8 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
         eprintln!(
             "wrong password {shape:?} profile={profile:?} order={order:?} interruption={interruption:?}"
         );
-        let outcome = run_described_schedule(
+        let outcome = run_schedule_with(
+            options,
             profile,
             wrong,
             &volumes,
@@ -335,14 +392,16 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
             }
         }
     }
-    for (case, (order, interruption)) in selected_schedules(selection) {
+    for (case, (order, interruption)) in cases {
         if !profile.includes(interruption) {
             continue;
         }
         eprintln!(
-            "{shape:?} profile={profile:?} selection={selection:?} case={case} order={order:?} interruption={interruption:?}"
+            "{shape:?} profile={profile:?} recovery={:?} case={case} order={order:?} interruption={interruption:?}",
+            options.recovery
         );
-        let outcome = run_described_schedule(
+        let outcome = run_schedule_with(
+            options,
             profile,
             spec.clone(),
             &volumes,
@@ -386,6 +445,24 @@ async fn profile_campaign(shape: Shape, selection: Selection, profile: Extractio
             );
         }
     }
+}
+
+#[tokio::test]
+async fn obfuscated_copy_demotion_waits_for_pending_downloads() {
+    run_shape(
+        Shape::CopyObfuscated,
+        ExtractionProfile::DirectStore,
+        ScheduleOptions::MATRIX,
+        Vec::new(),
+        vec![(
+            4555,
+            (
+                vec![(0, 0), (0, 0), (1, 0), (1, 1), (0, 1)],
+                Interruption::Demote(1),
+            ),
+        )],
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
-//! CRC32 combine: the native zlib-style operator against `crc-fast`'s
-//! zeros-operator matrices, at the lengths the pipeline actually combines
-//! (checkpoint segments, article sizes, file-sized tails).
+// CRC32 combine: the native zlib-style operator against `crc-fast`'s
+// zeros-operator matrices, at the lengths the pipeline actually combines
+// (checkpoint segments, article sizes, file-sized tails).
 
 use std::hint::black_box;
 

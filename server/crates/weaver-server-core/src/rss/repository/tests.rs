@@ -2,6 +2,7 @@ use super::*;
 
 fn sample_feed(id: u32) -> RssFeedRow {
     RssFeedRow {
+        scripts: Vec::new(),
         id,
         name: format!("Feed {id}"),
         url: format!("https://example.com/{id}.xml"),

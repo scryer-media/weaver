@@ -1,4 +1,4 @@
-//! Durable duplicate-admission identity records.
+// Durable duplicate-admission identity records.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,8 +25,8 @@ pub struct DuplicateAdmissionRequest {
     pub evidence: FingerprintEvidence,
     pub mode: DuplicateMode,
     pub semantic: Option<SemanticDuplicate>,
-    /// Present for SCORE candidates so a parked candidate can be promoted
-    /// after restart without creating a queue/history placeholder first.
+    // Present for SCORE candidates so a parked candidate can be promoted
+    // after restart without creating a queue/history placeholder first.
     pub semantic_source: Option<SemanticCandidateSource>,
     pub origin: SubmissionOrigin,
     pub idempotency: Option<CallerScopedIdempotency>,
@@ -103,8 +103,8 @@ pub struct SemanticAdmission {
     pub normalized_key: String,
     pub score: i64,
     pub state: SemanticCandidateState,
-    /// Monotonic authority generation consumed atomically with active-job
-    /// persistence. A superseded pre-enqueue request cannot materialize.
+    // Monotonic authority generation consumed atomically with active-job
+    // persistence. A superseded pre-enqueue request cannot materialize.
     pub materialization_generation: i64,
     pub superseded_job_id: Option<JobId>,
 }
@@ -121,31 +121,31 @@ pub struct SemanticCandidateSnapshot {
     pub promotion_state: SemanticPromotionState,
 }
 
-/// Durable duplicate identity and evidence for one job. The bulk loader below
-/// returns these in one bounded query so queue/history renderers do not need
-/// per-job snapshot and fingerprint lookups.
+// Durable duplicate identity and evidence for one job. The bulk loader below
+// returns these in one bounded query so queue/history renderers do not need
+// per-job snapshot and fingerprint lookups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuplicateJobSummary {
     pub snapshot: DuplicateJobSnapshot,
-    /// Exact action persisted at admission time; consumers must not infer it
-    /// from the job's current lifecycle.
+    // Exact action persisted at admission time; consumers must not infer it
+    // from the job's current lifecycle.
     pub admission_action: DuplicateAction,
-    /// Fingerprint kind that produced the persisted admission action. This is
-    /// absent for backfilled jobs and semantic-only decisions.
+    // Fingerprint kind that produced the persisted admission action. This is
+    // absent for backfilled jobs and semantic-only decisions.
     pub admission_reason: Option<FingerprintKind>,
     pub fingerprints: Vec<JobFingerprint>,
     pub semantic: Option<SemanticCandidateSnapshot>,
 }
 
-/// Private source-bearing claim returned only to backend materialization code.
-/// It is deliberately not projected through GraphQL/history APIs.
+// Private source-bearing claim returned only to backend materialization code.
+// It is deliberately not projected through GraphQL/history APIs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticPromotionClaim {
     pub trigger_job_id: JobId,
     pub job_id: JobId,
     pub group_id: i64,
-    /// Monotonic lease generation. Complete/release are no-ops for an expired
-    /// or superseded owner.
+    // Monotonic lease generation. Complete/release are no-ops for an expired
+    // or superseded owner.
     pub generation: i64,
     pub source: SemanticCandidateSource,
 }
@@ -158,8 +158,8 @@ pub enum DuplicateAdmission {
         created_at: i64,
         semantic: Option<SemanticAdmission>,
     },
-    /// The candidate has a durable identity and source NZB, but intentionally
-    /// has no scheduler job, working directory, or visible history row.
+    // The candidate has a durable identity and source NZB, but intentionally
+    // has no scheduler job, working directory, or visible history row.
     Parked {
         job_id: JobId,
         decision: DuplicateDecision,
@@ -184,8 +184,8 @@ pub struct DuplicateBackfillState {
     pub completed_at: Option<i64>,
 }
 
-/// A bounded unit of historical NZB material to parse outside the database
-/// and scheduler threads. It is intentionally not a public/API type.
+// A bounded unit of historical NZB material to parse outside the database
+// and scheduler threads. It is intentionally not a public/API type.
 #[derive(Debug, Clone)]
 pub struct DuplicateBackfillSource {
     pub job_id: JobId,
@@ -195,7 +195,7 @@ pub struct DuplicateBackfillSource {
     pub created_at: i64,
 }
 
-/// Parser-validated evidence ready for one atomic backfill commit.
+// Parser-validated evidence ready for one atomic backfill commit.
 #[derive(Debug, Clone)]
 pub struct DuplicateBackfillEntry {
     pub job_id: JobId,
@@ -205,9 +205,9 @@ pub struct DuplicateBackfillEntry {
 }
 
 impl Database {
-    /// Atomically allocates a job id, records the evidence and claims its
-    /// identities. The short-lived reservation is recovered if the scheduler
-    /// never materializes the active job after a process crash.
+    // Atomically allocates a job id, records the evidence and claims its
+    // identities. The short-lived reservation is recovered if the scheduler
+    // never materializes the active job after a process crash.
     pub fn admit_duplicate_submission(
         &self,
         request: &DuplicateAdmissionRequest,
@@ -266,8 +266,8 @@ impl Database {
         })
     }
 
-    /// Removes a reservation that did not become a scheduler-owned job. This
-    /// is intentionally separate from visible-history deletion.
+    // Removes a reservation that did not become a scheduler-owned job. This
+    // is intentionally separate from visible-history deletion.
     pub fn release_duplicate_admission(&self, job_id: JobId) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
@@ -278,8 +278,8 @@ impl Database {
         })
     }
 
-    /// Explicitly forgets durable duplicate identity. Normal history deletion
-    /// must not call this: duplicate identity deliberately outlives retention.
+    // Explicitly forgets durable duplicate identity. Normal history deletion
+    // must not call this: duplicate identity deliberately outlives retention.
     pub fn forget_duplicate_identity(&self, job_id: JobId) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let now = epoch_seconds();
@@ -403,8 +403,8 @@ impl Database {
         })
     }
 
-    /// Loads at most 256 requested duplicate summaries with one bounded query
-    /// on both SQLite and PostgreSQL. Missing identities are omitted.
+    // Loads at most 256 requested duplicate summaries with one bounded query
+    // on both SQLite and PostgreSQL. Missing identities are omitted.
     pub fn duplicate_summaries(
         &self,
         job_ids: &[JobId],
@@ -500,8 +500,8 @@ impl Database {
         })
     }
 
-    /// Marks a successful candidate as good and permanently suppresses its
-    /// lower-or-equal parked alternatives. Higher-score upgrades remain valid.
+    // Marks a successful candidate as good and permanently suppresses its
+    // lower-or-equal parked alternatives. Higher-score upgrades remain valid.
     pub fn mark_semantic_candidate_good(&self, job_id: JobId) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let now = epoch_seconds();
@@ -562,8 +562,8 @@ impl Database {
         })
     }
 
-    /// Explicitly marks a candidate bad. This is the only operator override
-    /// that schedules semantic promotion regardless of the raw failure text.
+    // Explicitly marks a candidate bad. This is the only operator override
+    // that schedules semantic promotion regardless of the raw failure text.
     pub fn mark_semantic_candidate_bad(&self, job_id: JobId) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let now = epoch_seconds();
@@ -588,9 +588,9 @@ impl Database {
         })
     }
 
-    /// Reverts an operator mark-bad only when no scheduler cancellation was
-    /// issued. This prevents a post-processing race from leaving a phantom
-    /// pending promotion behind.
+    // Reverts an operator mark-bad only when no scheduler cancellation was
+    // issued. This prevents a post-processing race from leaving a phantom
+    // pending promotion behind.
     pub fn clear_semantic_bad_transition(&self, job_id: JobId) -> Result<(), StateError> {
         let datastore = self.datastore();
         let now = epoch_seconds();
@@ -617,9 +617,9 @@ impl Database {
         })
     }
 
-    /// Atomically chooses the best parked candidate for a promotable group and
-    /// marks it claimed before any scheduler work is created. The winner rule
-    /// is score descending, then oldest creation time, then lowest job ID.
+    // Atomically chooses the best parked candidate for a promotable group and
+    // marks it claimed before any scheduler work is created. The winner rule
+    // is score descending, then oldest creation time, then lowest job ID.
     pub fn claim_semantic_promotion(
         &self,
         trigger_job_id: JobId,
@@ -638,8 +638,8 @@ impl Database {
         })
     }
 
-    /// Reclaims only an expired promotion lease. The expected generation makes
-    /// concurrent runtime/API recovery attempts single-winner operations.
+    // Reclaims only an expired promotion lease. The expected generation makes
+    // concurrent runtime/API recovery attempts single-winner operations.
     fn reclaim_semantic_promotion_claim(
         &self,
         job_id: JobId,
@@ -739,9 +739,9 @@ impl Database {
         })
     }
 
-    /// Reconciles crash windows after startup: completed scheduler-owned claims
-    /// are finalized, while claimed-without-active-job and pending groups are
-    /// returned for idempotent materialization by the scheduler owner.
+    // Reconciles crash windows after startup: completed scheduler-owned claims
+    // are finalized, while claimed-without-active-job and pending groups are
+    // returned for idempotent materialization by the scheduler owner.
     pub fn reconcile_semantic_promotion_claims(
         &self,
         limit: usize,
@@ -829,8 +829,8 @@ impl Database {
         Ok(claims)
     }
 
-    /// Marks a successfully materialized claim active. A scheduler enqueue
-    /// failure must call [`Self::release_semantic_promotion_claim`] instead.
+    // Marks a successfully materialized claim active. A scheduler enqueue
+    // failure must call [`Self::release_semantic_promotion_claim`] instead.
     pub fn complete_semantic_promotion_claim(
         &self,
         job_id: JobId,
@@ -897,8 +897,8 @@ impl Database {
         completed
     }
 
-    /// Restores the incumbent and parks a higher-score replacement when the
-    /// scheduler's last-moment post-processing guard rejects supersession.
+    // Restores the incumbent and parks a higher-score replacement when the
+    // scheduler's last-moment post-processing guard rejects supersession.
     pub fn rollback_semantic_supersession(
         &self,
         replacement_job_id: JobId,
@@ -1050,9 +1050,9 @@ impl Database {
         })
     }
 
-    /// Reads a small ordered page of persisted NZBs. Parsing is deliberately
-    /// left to the async caller's blocking worker, never the scheduler or SQL
-    /// runtime thread. Active rows win only while not yet archived.
+    // Reads a small ordered page of persisted NZBs. Parsing is deliberately
+    // left to the async caller's blocking worker, never the scheduler or SQL
+    // runtime thread. Active rows win only while not yet archived.
     pub fn load_duplicate_backfill_sources(
         &self,
         cursor_job_id: Option<JobId>,
@@ -1115,9 +1115,9 @@ impl Database {
         })
     }
 
-    /// Commits all parser-validated evidence and the cursor together. A crash
-    /// before commit repeats an idempotent page; a crash after commit never
-    /// loses its checkpoint.
+    // Commits all parser-validated evidence and the cursor together. A crash
+    // before commit repeats an idempotent page; a crash after commit never
+    // loses its checkpoint.
     pub fn commit_duplicate_backfill_batch(
         &self,
         entries: &[DuplicateBackfillEntry],
@@ -1273,9 +1273,9 @@ async fn save_duplicate_backfill_state_tx(
 }
 
 impl Database {
-    /// Applies terminal policy from pipeline-provided typed provenance. This is
-    /// queued immediately after archival, so it supersedes the legacy
-    /// raw-error classifier without parsing an operator-visible error string.
+    // Applies terminal policy from pipeline-provided typed provenance. This is
+    // queued immediately after archival, so it supersedes the legacy
+    // raw-error classifier without parsing an operator-visible error string.
     pub fn apply_semantic_terminal_cause(
         &self,
         job_id: JobId,
@@ -1619,9 +1619,9 @@ struct ActiveSemanticCandidate {
 }
 
 impl ActiveSemanticCandidate {
-    /// A SCORE replacement may interrupt download work, but never a job that
-    /// has started post-processing. Missing active-job state is treated as
-    /// non-supersedable so recovery remains conservative after a crash.
+    // A SCORE replacement may interrupt download work, but never a job that
+    // has started post-processing. Missing active-job state is treated as
+    // non-supersedable so recovery remains conservative after a crash.
     fn can_be_superseded(&self) -> bool {
         matches!(
             self.lifecycle,
@@ -2099,8 +2099,8 @@ async fn forget_duplicate_identity_tx(tx: &mut SqlTx<'_>, job_id: JobId) -> Resu
     Ok(())
 }
 
-/// Records a permanent user-requested deletion before removing the durable
-/// identity, so duplicate backfill cannot recreate it from stale source data.
+// Records a permanent user-requested deletion before removing the durable
+// identity, so duplicate backfill cannot recreate it from stale source data.
 pub(crate) async fn forget_duplicate_identity_for_history_delete_tx(
     tx: &mut SqlTx<'_>,
     job_id: JobId,

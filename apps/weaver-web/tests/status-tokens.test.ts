@@ -30,3 +30,7 @@ test("synthetic download stages remain part of the active queue filter", () => {
   assert.equal(isActiveStatus("FETCHING_REPAIR_DATA"), true);
   assert.equal(isActiveStatus("FINALIZING_DOWNLOAD"), true);
 });
+
+test("a job waiting on queue scripts counts as active, as the queue summary does", () => {
+  assert.equal(isActiveStatus("AWAITING_QUEUE_SCRIPTS"), true);
+});

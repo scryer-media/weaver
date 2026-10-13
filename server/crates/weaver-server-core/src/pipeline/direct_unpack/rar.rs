@@ -1,4 +1,4 @@
-//! RAR member extraction shared by disk-backed and mixed direct-store chases.
+// RAR member extraction shared by disk-backed and mixed direct-store chases.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -111,12 +111,10 @@ pub(crate) fn extract(
                         "RAR members resolve to the same destination: {name}"
                     ));
                 }
-                if !info.is_directory
-                    && let Some(pattern) = policy.unacceptable_extension_match(&name)
-                {
-                    return Err(budget.reject_content_policy(format!(
-                        "unacceptable extension '{pattern}' matched RAR member '{name}' before extraction"
-                    )));
+                if !info.is_directory && policy.unacceptable_extension_match(&name).is_some() {
+                    return Err(budget.reject_content_policy(
+                        crate::post_processing::model::unwanted_extension_reason(&name),
+                    ));
                 }
                 if !should_extract(&name)? {
                     if archive.is_solid() {
@@ -192,8 +190,8 @@ pub(crate) fn extract(
     })
 }
 
-/// Install only the verified member manifest. Retained files from an earlier
-/// process must never become output merely because they share a staging tree.
+// Install only the verified member manifest. Retained files from an earlier
+// process must never become output merely because they share a staging tree.
 pub(crate) fn install(from: &Path, to: &Path, names: &[String]) -> Result<(), String> {
     let mut entries = Vec::with_capacity(names.len());
     let mut destinations = HashSet::new();

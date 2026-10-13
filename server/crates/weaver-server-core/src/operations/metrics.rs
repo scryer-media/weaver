@@ -54,27 +54,27 @@ impl DownloadPressureState {
     }
 }
 
-/// A clause of the article scheduler's "may this server fetch this article"
-/// answer, as the per-clause hot-job block counters name it.
+// A clause of the article scheduler's "may this server fetch this article"
+// answer, as the per-clause hot-job block counters name it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulerBlockClause {
-    /// The job is too young to fetch from at all.
+    // The job is too young to fetch from at all.
     Propagation,
-    /// The job's posts are older than the server's retention.
+    // The job's posts are older than the server's retention.
     Retention,
-    /// A direct-store set's disk budget is full.
+    // A direct-store set's disk budget is full.
     DirectStore,
-    /// A demotion sweep holds the article's file.
+    // A demotion sweep holds the article's file.
     SweepHeld,
-    /// The article excludes the server, or its rotation hint points away.
+    // The article excludes the server, or its rotation hint points away.
     ServerExclusion,
-    /// A backfill server waits for the fill servers to give the article up.
+    // A backfill server waits for the fill servers to give the article up.
     Backfill,
-    /// The PAR2 index bootstrap claims the queue for its index files.
+    // The PAR2 index bootstrap claims the queue for its index files.
     Par2Bootstrap,
-    /// The UU spool cursor has not reached the article.
+    // The UU spool cursor has not reached the article.
     UuCursor,
-    /// The restart checkpoint holds the job's undurable lead.
+    // The restart checkpoint holds the job's undurable lead.
     Checkpoint,
 }
 
@@ -106,7 +106,7 @@ impl SchedulerBlockClause {
         }
     }
 
-    /// The clause's slot in the per-clause counters.
+    // The clause's slot in the per-clause counters.
     pub fn index(self) -> usize {
         self as usize
     }
@@ -164,23 +164,23 @@ impl DownloadPressureReason {
     pub const ALL: [Self; 4] = [Self::None, Self::Decode, Self::Write, Self::DecodeAndWrite];
 }
 
-/// Short-window rate for one monotonically increasing counter.
-///
-/// Holds a ring buffer of `(timestamp, cumulative)` samples and smooths the
-/// window's raw rate with a 1 s half-life EMA, so the published value follows
-/// pipeline ticks without showing every short-lived burst. Not hot-path code:
-/// it is advanced once per 100 ms metrics tick under the tracker mutex, and
-/// once per active job phase on that same tick, so a job's displayed rate and
-/// the global gauge are one estimator over one window and can be compared.
+// Short-window rate for one monotonically increasing counter.
+//
+// Holds a ring buffer of `(timestamp, cumulative)` samples and smooths the
+// window's raw rate with a 1 s half-life EMA, so the published value follows
+// pipeline ticks without showing every short-lived burst. Not hot-path code:
+// it is advanced once per 100 ms metrics tick under the tracker mutex, and
+// once per active job phase on that same tick, so a job's displayed rate and
+// the global gauge are one estimator over one window and can be compared.
 #[derive(Debug)]
 pub(crate) struct RateSeries {
-    /// Ring buffer of (timestamp, cumulative value) samples.
+    // Ring buffer of (timestamp, cumulative value) samples.
     samples: Vec<(Instant, u64)>,
-    /// Next write position in the ring buffer.
+    // Next write position in the ring buffer.
     pos: usize,
-    /// Last computed EMA-smoothed rate (units/sec).
+    // Last computed EMA-smoothed rate (units/sec).
     rate: f64,
-    /// Timestamp of the last EMA update.
+    // Timestamp of the last EMA update.
     last_ema_at: Option<Instant>,
 }
 
@@ -194,13 +194,13 @@ impl RateSeries {
         }
     }
 
-    /// Whether any sample has been recorded since construction.
+    // Whether any sample has been recorded since construction.
     #[cfg(test)]
     pub(crate) fn has_samples(&self) -> bool {
         !self.samples.is_empty()
     }
 
-    /// Record a sample and recompute the smoothed rate.
+    // Record a sample and recompute the smoothed rate.
     pub(crate) fn update(&mut self, now: Instant, cumulative: u64) -> f64 {
         if self.samples.len() < SPEED_WINDOW_SAMPLES {
             self.samples.push((now, cumulative));
@@ -244,23 +244,23 @@ impl RateSeries {
     }
 }
 
-/// Short-window rates published alongside the metrics snapshot.
+// Short-window rates published alongside the metrics snapshot.
 #[derive(Debug, Clone, Copy, Default)]
 struct CurrentRates {
-    /// Downloaded bytes per second.
+    // Downloaded bytes per second.
     download_bytes: u64,
-    /// Articles (segments) downloaded per second.
+    // Articles (segments) downloaded per second.
     articles: f64,
-    /// Decoded MiB per second.
+    // Decoded MiB per second.
     decode_mib: f64,
 }
 
-/// Tracks the three published "current" rates over a sliding window.
-///
-/// All three were once lifetime averages since process start, which made them
-/// useless as live indicators — a box that downloaded fast for an hour and then
-/// stalled kept reporting a healthy rate. They are now short-window rates
-/// computed on the same 100 ms tick that already takes this mutex.
+// Tracks the three published "current" rates over a sliding window.
+//
+// All three were once lifetime averages since process start, which made them
+// useless as live indicators — a box that downloaded fast for an hour and then
+// stalled kept reporting a healthy rate. They are now short-window rates
+// computed on the same 100 ms tick that already takes this mutex.
 struct SpeedTracker {
     bytes_downloaded: RateSeries,
     segments_downloaded: RateSeries,
@@ -278,7 +278,7 @@ impl SpeedTracker {
         }
     }
 
-    /// Record a sample of each series and recompute the published rates.
+    // Record a sample of each series and recompute the published rates.
     fn update(
         &mut self,
         now: Instant,
@@ -302,7 +302,7 @@ impl SpeedTracker {
         rates
     }
 
-    /// The most recently computed rates, without advancing the window.
+    // The most recently computed rates, without advancing the window.
     fn last(&self) -> CurrentRates {
         self.last
     }
@@ -316,7 +316,7 @@ impl std::fmt::Debug for SpeedTracker {
     }
 }
 
-/// Live metrics for the pipeline, updated atomically by various stages.
+// Live metrics for the pipeline, updated atomically by various stages.
 #[derive(Debug)]
 pub struct PipelineMetrics {
     // Throughput
@@ -328,35 +328,35 @@ pub struct PipelineMetrics {
     pub download_queue_depth: AtomicUsize,
     pub active_downloads: AtomicUsize,
     pub active_decodes: AtomicUsize,
-    /// Raw article bodies waiting for decode scheduling.
+    // Raw article bodies waiting for decode scheduling.
     pub decode_pending: AtomicUsize,
     pub decode_pending_bytes: AtomicU64,
     pub decode_active_bytes: AtomicU64,
     pub commit_pending: AtomicUsize,
-    /// All decoded bytes awaiting placement on disk, including UU spool files.
+    // All decoded bytes awaiting placement on disk, including UU spool files.
     pub write_pending_bytes: AtomicU64,
-    /// Resident decoded bytes awaiting placement on disk.
+    // Resident decoded bytes awaiting placement on disk.
     pub write_buffered_bytes: AtomicU64,
     pub write_buffered_segments: AtomicUsize,
-    /// Disk-backed uuencode parts awaiting their missing prefix.
+    // Disk-backed uuencode parts awaiting their missing prefix.
     pub uu_spooled_bytes: AtomicU64,
     pub uu_spooled_segments: AtomicUsize,
     pub direct_write_evictions: AtomicU64,
-    /// Direct-store engagement, as lifetime counters. These four exist so an
-    /// external observer — the e2e harness, or someone staring at a production
-    /// box — can tell whether direct routing actually carried a job or quietly
-    /// fell back to the conventional path: the output bytes are identical
-    /// either way, so nothing downstream can answer that. Admitted says the
-    /// gate engaged; finalized-direct says a set completed without ever
-    /// writing a source volume; demoted says one left direct routing (the
-    /// per-reason breakdown stays in the logs and the `direct_store.demoted.*`
-    /// perf-probe keys); repaired-while-direct says damage was repaired
-    /// without leaving.
+    // Direct-store engagement, as lifetime counters. These four exist so an
+    // external observer — the e2e harness, or someone staring at a production
+    // box — can tell whether direct routing actually carried a job or quietly
+    // fell back to the conventional path: the output bytes are identical
+    // either way, so nothing downstream can answer that. Admitted says the
+    // gate engaged; finalized-direct says a set completed without ever
+    // writing a source volume; demoted says one left direct routing (the
+    // per-reason breakdown stays in the logs and the `direct_store.demoted.*`
+    // perf-probe keys); repaired-while-direct says damage was repaired
+    // without leaving.
     pub direct_sets_admitted: AtomicU64,
     pub direct_sets_demoted: AtomicU64,
     pub direct_sets_finalized_direct: AtomicU64,
     pub direct_sets_repaired_while_direct: AtomicU64,
-    /// Delivered files renamed out of an obfuscated in-archive member name.
+    // Delivered files renamed out of an obfuscated in-archive member name.
     pub deobfuscated_members_renamed: AtomicU64,
     pub decode_pressure_soft_limit_bytes: AtomicU64,
     pub decode_pressure_hard_limit_bytes: AtomicU64,
@@ -368,34 +368,34 @@ pub struct PipelineMetrics {
     pub download_pressure_stall_duration_ms: AtomicU64,
     pub download_pressure_current_stall_ms: AtomicU64,
     pub download_restart_durable_lead_blocked_total: AtomicU64,
-    /// Article-scheduler guard: the scheduler answered "nothing to hand out"
-    /// for a server while an eligible job still held an article that server
-    /// was allowed to fetch. The scheduler's own rule forbids that, so any
-    /// nonzero reading is a defect, not a tuning signal.
+    // Article-scheduler guard: the scheduler answered "nothing to hand out"
+    // for a server while an eligible job still held an article that server
+    // was allowed to fetch. The scheduler's own rule forbids that, so any
+    // nonzero reading is a defect, not a tuning signal.
     pub download_scheduler_idle_with_servable_total: AtomicU64,
-    /// Handouts the article scheduler made from the job it considers hot.
+    // Handouts the article scheduler made from the job it considers hot.
     pub download_scheduler_handouts_total_hot: AtomicU64,
-    /// Handouts the article scheduler made from a job behind the hot one,
-    /// because the hot job could not serve the asking server.
+    // Handouts the article scheduler made from a job behind the hot one,
+    // because the hot job could not serve the asking server.
     pub download_scheduler_handouts_total_spill: AtomicU64,
-    /// Handouts made for a probe rather than for payload throughput.
+    // Handouts made for a probe rather than for payload throughput.
     pub download_scheduler_handouts_total_probe: AtomicU64,
-    /// Queued articles a scheduler queue scan looked at and passed over.
+    // Queued articles a scheduler queue scan looked at and passed over.
     pub download_scheduler_scan_items_skipped_total: AtomicU64,
-    /// Scheduler queue scans that found no article the server may fetch.
+    // Scheduler queue scans that found no article the server may fetch.
     pub download_scheduler_scan_no_match_total: AtomicU64,
-    /// Times the hot job had nothing for the asking server, counted once
-    /// for each clause that refused it, indexed by
-    /// [`SchedulerBlockClause::index`].
+    // Times the hot job had nothing for the asking server, counted once
+    // for each clause that refused it, indexed by
+    // [`SchedulerBlockClause::index`].
     pub download_scheduler_hot_blocked_total: [AtomicU64; SchedulerBlockClause::COUNT],
-    /// Raw article bytes dispatched to lanes and not yet answered, summed
-    /// across every lane. Sampled on the metrics tick from the dispatch
-    /// reservations, never maintained on an article path.
+    // Raw article bytes dispatched to lanes and not yet answered, summed
+    // across every lane. Sampled on the metrics tick from the dispatch
+    // reservations, never maintained on an article path.
     pub download_lane_inflight_bytes: AtomicU64,
-    /// Jobs competing for articles right now: the hot job plus every job
-    /// behind it that still has something this pipeline could fetch.
+    // Jobs competing for articles right now: the hot job plus every job
+    // behind it that still has something this pipeline could fetch.
     pub download_jobs_eligible: AtomicUsize,
-    /// One while a hot job exists, zero while nothing is being downloaded.
+    // One while a hot job exists, zero while nothing is being downloaded.
     pub download_jobs_hot: AtomicUsize,
     pub download_lanes_active: AtomicUsize,
     pub download_lanes_sequential_active: AtomicUsize,
@@ -431,11 +431,11 @@ pub struct PipelineMetrics {
     pub segments_decoded: AtomicU64,
     pub segments_committed: AtomicU64,
     pub articles_not_found: AtomicU64,
-    /// Articles booked missing because a 430 taught the retry nothing: the
-    /// exclusion set came back the same size it went out. Every increment is
-    /// a retry loop that would otherwise have re-asked the same servers at
-    /// zero delay forever, so a non-zero value here points at whatever lost
-    /// the article's exclusions on the way back.
+    // Articles booked missing because a 430 taught the retry nothing: the
+    // exclusion set came back the same size it went out. Every increment is
+    // a retry loop that would otherwise have re-asked the same servers at
+    // zero delay forever, so a non-zero value here points at whatever lost
+    // the article's exclusions on the way back.
     pub articles_not_found_without_new_server: AtomicU64,
     pub decode_errors: AtomicU64,
 
@@ -466,20 +466,20 @@ pub struct PipelineMetrics {
     // Recovery
     pub recovery_queue_depth: AtomicUsize,
 
-    /// Per-server article attempt counters and latency. Deliberately *not*
-    /// folded into [`MetricsSnapshot`]: the 100 ms tick must stay a fixed-size
-    /// struct copy, so this is read on demand through
-    /// [`crate::SchedulerHandle::server_metrics_snapshot`].
+    // Per-server article attempt counters and latency. Deliberately *not*
+    // folded into [`MetricsSnapshot`]: the 100 ms tick must stay a fixed-size
+    // struct copy, so this is read on demand through
+    // [`crate::SchedulerHandle::server_metrics_snapshot`].
     pub server_metrics: ServerMetricsRegistry,
-    /// Job lifecycle counters and duration histograms, read on demand through
-    /// [`crate::SchedulerHandle::job_lifecycle_metrics_snapshot`].
+    // Job lifecycle counters and duration histograms, read on demand through
+    // [`crate::SchedulerHandle::job_lifecycle_metrics_snapshot`].
     pub job_lifecycle: JobLifecycleMetrics,
-    /// Pipeline stage duration histograms, read on demand through
-    /// [`crate::SchedulerHandle::pipeline_histograms_snapshot`].
+    // Pipeline stage duration histograms, read on demand through
+    // [`crate::SchedulerHandle::pipeline_histograms_snapshot`].
     pub pipeline_histograms: PipelineHistograms,
-    /// PAR3 recovery counters, phases and stalls. Unlike the three registries
-    /// above these *are* folded into [`MetricsSnapshot`]: every field is a
-    /// relaxed atomic over fixed storage, so the tick stays a struct copy.
+    // PAR3 recovery counters, phases and stalls. Unlike the three registries
+    // above these *are* folded into [`MetricsSnapshot`]: every field is a
+    // relaxed atomic over fixed storage, so the tick stays a struct copy.
     pub par3: Par3Metrics,
 
     // Timing (not atomic — set once at creation)
@@ -589,9 +589,9 @@ impl PipelineMetrics {
         })
     }
 
-    /// Monotonic milliseconds since this metrics object was created. Every
-    /// PAR3 timestamp shares this origin so a snapshot can subtract two of
-    /// them without needing a clock of its own.
+    // Monotonic milliseconds since this metrics object was created. Every
+    // PAR3 timestamp shares this origin so a snapshot can subtract two of
+    // them without needing a clock of its own.
     pub fn now_ms(&self) -> u64 {
         self.start_time
             .elapsed()
@@ -862,26 +862,26 @@ impl PipelineMetrics {
         self.snapshot_with_speed(bytes_downloaded, rates)
     }
 
-    /// Return a fresh atomics-based metrics snapshot without advancing the
-    /// shared speed tracker. The rate gauges carry the values the last real
-    /// tick computed, so an off-cadence reader sees the same live window rather
-    /// than a zero it would have to interpret as "stopped".
+    // Return a fresh atomics-based metrics snapshot without advancing the
+    // shared speed tracker. The rate gauges carry the values the last real
+    // tick computed, so an off-cadence reader sees the same live window rather
+    // than a zero it would have to interpret as "stopped".
     pub fn raw_snapshot(&self) -> MetricsSnapshot {
         let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
         let rates = self.speed_tracker.lock().unwrap().last();
         self.snapshot_with_speed(bytes_downloaded, rates)
     }
 
-    /// Forget every rate sample, so a test can start the global window at a
-    /// known tick instead of at whatever moment the metrics were constructed.
+    // Forget every rate sample, so a test can start the global window at a
+    // known tick instead of at whatever moment the metrics were constructed.
     #[cfg(test)]
     pub(crate) fn reset_speed_tracker(&self) {
         *self.speed_tracker.lock().unwrap() = SpeedTracker::new();
     }
 }
 
-/// Point-in-time snapshot of metrics (non-atomic, for reporting).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Point-in-time snapshot of metrics (non-atomic, for reporting).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     pub bytes_downloaded: u64,
     pub bytes_decoded: u64,
@@ -922,7 +922,7 @@ pub struct MetricsSnapshot {
     pub download_scheduler_scan_items_skipped_total: u64,
     #[serde(default)]
     pub download_scheduler_scan_no_match_total: u64,
-    /// Indexed by [`SchedulerBlockClause::index`].
+    // Indexed by [`SchedulerBlockClause::index`].
     #[serde(default)]
     pub download_scheduler_hot_blocked_total: [u64; SchedulerBlockClause::COUNT],
     pub download_lane_inflight_bytes: u64,
@@ -981,7 +981,7 @@ pub struct MetricsSnapshot {
     pub recovery_queue_depth: usize,
     pub articles_per_sec: f64,
     pub decode_rate_mbps: f64,
-    /// PAR3 recovery counters and the two work slots' phase/stall state.
+    // PAR3 recovery counters and the two work slots' phase/stall state.
     #[serde(default)]
     pub par3: Par3MetricsSnapshot,
 }

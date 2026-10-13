@@ -211,3 +211,56 @@ export function stripConfigAssignment(raw: string, keys: readonly string[]): str
   const name = value.slice(0, separator).trim().toLowerCase();
   return keys.includes(name) ? value.slice(separator + 1).trim() : value;
 }
+
+/** A WireGuard key as `wg genkey` prints it: 32 bytes of base64. */
+export const WIREGUARD_KEY = /^[A-Za-z0-9+/]{43}=$/;
+
+/** What stops a configuration from being a tunnel, named by the key at fault. */
+export type WireguardConfigProblem =
+  | { kind: "missing"; key: string; section: "Interface" | "Peer" }
+  | { kind: "key"; key: string }
+  | { kind: "endpoint" }
+  | { kind: "number"; key: string };
+
+function validPort(port: string): boolean {
+  return /^\d{1,5}$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
+}
+
+/**
+ * Everything a whole configuration must have to become a tunnel, checked at
+ * once so one reading lists every fault. A fragment still parses, because a
+ * field of the form answers to a single pasted line; it is a file handed over
+ * whole that has to stand on its own.
+ */
+export function wireguardConfigProblems(config: WireguardConfigImport): WireguardConfigProblem[] {
+  const problems: WireguardConfigProblem[] = [];
+  const key = (name: string, section: "Interface" | "Peer", value: string, required: boolean) => {
+    if (value === "") {
+      if (required) problems.push({ kind: "missing", key: name, section });
+    } else if (!WIREGUARD_KEY.test(value)) {
+      problems.push({ kind: "key", key: name });
+    }
+  };
+  key("PrivateKey", "Interface", config.privateKey, true);
+  if (config.tunnelAddresses === "") {
+    problems.push({ kind: "missing", key: "Address", section: "Interface" });
+  }
+  if (config.tunnelMtu !== "" && !/^\d+$/.test(config.tunnelMtu)) {
+    problems.push({ kind: "number", key: "MTU" });
+  }
+  key("PublicKey", "Peer", config.peerPublicKey, true);
+  key("PresharedKey", "Peer", config.presharedKey, false);
+  if (config.endpoint === "") {
+    problems.push({ kind: "missing", key: "Endpoint", section: "Peer" });
+  } else {
+    const endpoint = /^(?:\[[^\]\s]+\]|[^:\s]+):(.+)$/.exec(config.endpoint);
+    if (!endpoint || !validPort(endpoint[1] ?? "")) {
+      problems.push({ kind: "endpoint" });
+    }
+  }
+  // `off` is how wg-quick writes a keepalive that is switched off.
+  if (!/^(\d+|off)$/i.test(config.tunnelKeepaliveSeconds || "0")) {
+    problems.push({ kind: "number", key: "PersistentKeepalive" });
+  }
+  return problems;
+}

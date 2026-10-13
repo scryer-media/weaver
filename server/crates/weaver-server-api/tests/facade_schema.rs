@@ -32,6 +32,18 @@ fn exported_schema_has_no_trailing_whitespace() {
     }
 }
 
+#[test]
+fn script_declarations_do_not_replace_the_queue_subscription_event_type() {
+    // The runtime deliberately disables introspection; inspect the public SDL.
+    let sdl = export_schema_sdl();
+    assert!(sdl.contains("type QueueEvent {\n\tcursor: String!"));
+    assert!(sdl.contains("enum ScriptQueueEvent {"));
+    assert!(!sdl.contains("enum QueueEvent {"));
+    assert!(sdl.contains("kinds: [ScriptKind!]!"));
+    assert!(sdl.contains("queueEvents: [ScriptQueueEvent!]!"));
+    assert!(sdl.contains("taskTimes: [String!]!"));
+}
+
 #[tokio::test]
 async fn public_facade_schema_exposes_core_surface() {
     let h = TestHarness::new().await;

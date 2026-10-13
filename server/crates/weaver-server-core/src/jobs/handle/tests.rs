@@ -22,6 +22,12 @@ fn runtime_lanes_for_status(
     Option<String>,
 ) {
     match status {
+        JobStatus::AwaitingQueueScripts => (
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::AwaitingQueueScripts,
+            crate::jobs::model::RunState::Active,
+            None,
+        ),
         JobStatus::Queued => (
             crate::jobs::model::DownloadState::Queued,
             crate::jobs::model::PostState::Idle,
@@ -209,7 +215,7 @@ fn raw_metrics_snapshot_reads_do_not_cool_shared_speed_tracker() {
     assert!(refreshed.current_download_speed < initial.current_download_speed);
 }
 
-/// Create a test scheduler handle with a minimal background loop.
+// Create a test scheduler handle with a minimal background loop.
 fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
     let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
     let (event_tx, _) = broadcast::channel(256);
@@ -292,6 +298,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         early_recovery_requested_blocks: 0,
                         last_health_probe_failed_bytes: 0,
                         next_health_probe_failed_bytes: 1,
+                        support_facts: Default::default(),
                         detected_archives: HashMap::new(),
                         file_identities: HashMap::new(),
                         held_segments: Vec::new(),
@@ -385,9 +392,6 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 | SchedulerCommand::SetSpeedLimit { reply, .. } => {
                     let _ = reply.send(());
                 }
-                SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
-                    let _ = reply.send(Ok(()));
-                }
                 SchedulerCommand::RebuildNntp { reply, .. } => {
                     let _ = reply.send(Ok(NntpRuntimeActivation {
                         generation: 1,
@@ -398,9 +402,6 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     let _ = reply.send(Ok(()));
                 }
                 SchedulerCommand::ApplyScheduleAction { reply, .. } => {
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::ClearScheduleAction { reply } => {
                     let _ = reply.send(());
                 }
                 SchedulerCommand::SetHardwareProfile { reply, .. }
@@ -454,6 +455,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                         early_recovery_requested_blocks: 0,
                         last_health_probe_failed_bytes: 0,
                         next_health_probe_failed_bytes: 1,
+                        support_facts: Default::default(),
                         detected_archives: HashMap::new(),
                         file_identities: HashMap::new(),
                         held_segments: Vec::new(),
@@ -472,7 +474,11 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                 SchedulerCommand::DeleteAllHistory { reply, .. } => {
                     let _ = reply.send(Ok(()));
                 }
-                SchedulerCommand::ReprocessJob { job_id, reply } => {
+                SchedulerCommand::ReprocessJob {
+                    job_id,
+                    password,
+                    reply,
+                } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
                             let (download_state, post_state, run_state, _) =
@@ -480,6 +486,9 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                             state.download_state = download_state;
                             state.post_state = post_state;
                             state.run_state = run_state;
+                            if let Some(password) = password {
+                                state.spec.password = Some(password);
+                            }
                             state.failure_error = None;
                             state.refresh_legacy_status();
                             Ok(())
@@ -492,7 +501,11 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::RedownloadJob { job_id, reply } => {
+                SchedulerCommand::RedownloadJob {
+                    job_id,
+                    password,
+                    reply,
+                } => {
                     let result = match jobs.get_mut(&job_id) {
                         Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
                             let (download_state, post_state, run_state, _) =
@@ -500,6 +513,9 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                             state.download_state = download_state;
                             state.post_state = post_state;
                             state.run_state = run_state;
+                            if let Some(password) = password {
+                                state.spec.password = Some(password);
+                            }
                             state.failure_error = None;
                             state.refresh_legacy_status();
                             Ok(())

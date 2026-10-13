@@ -5,49 +5,52 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::collections::BTreeMap;
 
-/// What [`Pipeline::clear_archive_set_if_unreferenced_and_idle`] did.
-///
-/// Retirement has three outcomes and only one of them touches any state, so the
-/// caller has to be told which one it got. The absence of a `rar_sets` key is
-/// not evidence of retirement: a set can be a bare name with no runtime entry at
-/// all, and reading "no key" as "retired" invents a teardown that never
-/// happened — and then re-arms the completion check that produced the name.
+// What [`Pipeline::clear_archive_set_if_unreferenced_and_idle`] did.
+//
+// Retirement has three outcomes and only one of them touches any state, so the
+// caller has to be told which one it got. The absence of a `rar_sets` key is
+// not evidence of retirement: a set can be a bare name with no runtime entry at
+// all, and reading "no key" as "retired" invents a teardown that never
+// happened — and then re-arms the completion check that produced the name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArchiveSetRetirement {
-    /// A worker or an in-flight member is still reading the set.
+    // A worker or an in-flight member is still reading the set.
     Busy,
-    /// Live file identities still classify into the set, so its names remain
-    /// this job's own answer for those bytes.
+    // Live file identities still classify into the set, so its names remain
+    // this job's own answer for those bytes.
     StillReferenced,
-    /// The set's topology is not a RAR one, so nothing this function can measure
-    /// says anything about whether it is in use. Refused rather than retired.
+    // The set's topology is not a RAR one, so nothing this function can measure
+    // says anything about whether it is in use. Refused rather than retired.
     NotRar,
-    /// The set was actually torn down through
-    /// [`Pipeline::clear_archive_set_for_source_retry`].
+    // The set was actually torn down through
+    // [`Pipeline::clear_archive_set_for_source_retry`].
     Retired,
 }
 
-/// What a RAR set with no on-disk volumes and live claimants turned out to be.
-///
-/// Reached only from extraction entry, where the set's names resolve to nothing
-/// readable yet live file identities still classify into it — so retirement is
-/// refused and there is nothing to open. The job is either already whole under
-/// another name or genuinely short of volumes, and the two must be told apart
-/// before anything reschedules.
+// What a RAR set with no on-disk volumes and live claimants turned out to be.
+//
+// Reached only from extraction entry, where the set's names resolve to nothing
+// readable yet live file identities still classify into it — so retirement is
+// refused and there is nothing to open. The job is either already whole under
+// another name or genuinely short of volumes, and the two must be told apart
+// before anything reschedules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UnmaterializedArchiveSet {
-    /// The claimants' bytes were consumed by the named set of the same job,
-    /// which has already extracted or finalized. This name is a second view of
-    /// content the job already holds.
+    // The claimants' bytes were consumed by the named set of the same job,
+    // which has already extracted or finalized. This name is a second view of
+    // content the job already holds.
     ConsumedBy(String),
-    /// No name link survives an identity rebind either way, but the job
-    /// demonstrably consumed archive content under another name — extracted in
-    /// this run, or volume facts persisted under another set — and never
-    /// parsed a RAR header under this set's name: it was named, never
-    /// materialized.
+    // Verified replacement volumes exist under one canonical name, but its
+    // extraction still owns the obligation to deliver the archive members.
+    ReplacedBy(String),
+    // No name link survives an identity rebind either way, but the job
+    // demonstrably consumed archive content under another name — extracted in
+    // this run, or volume facts persisted under another set — and never
+    // parsed a RAR header under this set's name: it was named, never
+    // materialized.
     NeverMaterialized,
-    /// Volumes are genuinely absent — nothing consumed them and nothing left
-    /// can deliver them.
+    // Volumes are genuinely absent — nothing consumed them and nothing left
+    // can deliver them.
     MissingVolumes,
 }
 
@@ -174,23 +177,28 @@ impl Pipeline {
             return ArchiveSetRetirement::NotRar;
         }
 
-        let busy = self
-            .rar_sets
-            .get(&set_key)
-            .is_some_and(|state| state.active_workers > 0 || !state.in_flight_members.is_empty());
+        let busy =
+            self.rar_sets.get(&set_key).is_some_and(|state| {
+                state.active_workers > 0 || !state.in_flight_members.is_empty()
+            }) || self
+                .rar_refresh_state
+                .get(&set_key)
+                .is_some_and(|refresh| refresh.in_flight.is_some());
         if busy {
             return ArchiveSetRetirement::Busy;
         }
 
         let still_referenced = self.jobs.get(&job_id).is_some_and(|state| {
             state.assembly.files().any(|file| {
-                matches!(
-                    self.classified_role_for_file(job_id, file),
-                    weaver_model::files::FileRole::RarVolume { .. }
-                ) && self
-                    .classified_archive_set_name_for_file(job_id, file)
-                    .as_deref()
-                    == Some(set_name)
+                !self.recovery_superseded_source(job_id, file.file_id())
+                    && matches!(
+                        self.classified_role_for_file(job_id, file),
+                        weaver_model::files::FileRole::RarVolume { .. }
+                    )
+                    && self
+                        .classified_archive_set_name_for_file(job_id, file)
+                        .as_deref()
+                        == Some(set_name)
             })
         });
         if still_referenced {
@@ -201,16 +209,16 @@ impl Pipeline {
         ArchiveSetRetirement::Retired
     }
 
-    /// Rules on a set whose names resolve to nothing on disk while live file
-    /// identities still claim them.
-    ///
-    /// Three facts are available and none of them is a map key. Whether every
-    /// claimant is complete says whether anything is still owed to this job.
-    /// Whether another already-extracted set of the job knows these files under
-    /// any of their names says where the bytes went. Whether this job ever
-    /// persisted volume facts under this name says whether the set was ever
-    /// more than a name — facts are written the moment a volume's headers parse
-    /// off real bytes, so a set with none never had a volume to read.
+    // Rules on a set whose names resolve to nothing on disk while live file
+    // identities still claim them.
+    //
+    // Three facts are available and none of them is a map key. Whether every
+    // claimant is complete says whether anything is still owed to this job.
+    // Whether another already-extracted set of the job knows these files under
+    // any of their names says where the bytes went. Whether this job ever
+    // persisted volume facts under this name says whether the set was ever
+    // more than a name — facts are written the moment a volume's headers parse
+    // off real bytes, so a set with none never had a volume to read.
     pub(crate) fn classify_unmaterialized_archive_set(
         &self,
         job_id: JobId,
@@ -219,6 +227,93 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return UnmaterializedArchiveSet::MissingVolumes;
         };
+
+        // A fully lost posted volume cannot supply a content identity. Its
+        // surviving sibling can still prove that this entire posted roster
+        // moved to one verified, extracted canonical set. Require the same
+        // volume count and no unmatched surviving bytes before retiring it.
+        if self.par2_verified.contains(&job_id)
+            && self.par2_verdict_delivered_unposted_payload(job_id)
+        {
+            let cohort: Vec<_> = state
+                .assembly
+                .files()
+                .filter_map(|file| {
+                    let identity = self.effective_file_identity(job_id, file.file_id())?;
+                    let role =
+                        weaver_model::files::FileRole::from_filename(&identity.source_filename);
+                    (matches!(role, weaver_model::files::FileRole::RarVolume { .. })
+                        && weaver_model::files::archive_base_name(&identity.source_filename, &role)
+                            .as_deref()
+                            == Some(set_name))
+                    .then_some((file, identity))
+                })
+                .collect();
+            let mut owners: HashSet<_> = cohort
+                .iter()
+                .filter_map(|(file, identity)| {
+                    (file.is_complete()
+                        && identity.classification_source
+                            == crate::jobs::record::FileIdentitySource::Par2)
+                        .then(|| self.classified_archive_set_name_for_file(job_id, file))
+                        .flatten()
+                        .filter(|name| name != set_name)
+                })
+                .collect();
+            // With total article loss there is no content identity to retain.
+            // The sole verified replacement roster may discharge the sole
+            // empty posted roster, but never choose among several archives.
+            if owners.is_empty()
+                && !cohort.is_empty()
+                && cohort.iter().all(|(file, _)| {
+                    self.recovery_superseded_source(job_id, file.file_id())
+                        || (file.received_bytes() == 0 && !file.has_retained_damage())
+                })
+                && !self.job_has_pending_download_pipeline_work(job_id)
+            {
+                let names = self.rar_set_names_for_job(job_id);
+                if names.len() == 2 && names.iter().any(|name| name == set_name) {
+                    owners.extend(names.into_iter().filter(|name| name != set_name));
+                }
+            }
+            if owners.len() == 1 {
+                let owner = owners.iter().next().unwrap();
+                let extracted = self
+                    .extracted_archives
+                    .get(&job_id)
+                    .is_some_and(|sets| sets.contains(owner))
+                    || self
+                        .rar_sets
+                        .get(&(job_id, owner.clone()))
+                        .and_then(|set| set.plan.as_ref())
+                        .is_some_and(|plan| {
+                            !plan.member_names.is_empty()
+                                && self.extracted_members.get(&job_id).is_some_and(|members| {
+                                    plan.member_names
+                                        .iter()
+                                        .all(|member| members.contains(member))
+                                })
+                        });
+                let volume_count = self
+                    .rar_sets
+                    .get(&(job_id, owner.clone()))
+                    .map(|set| set.volume_files.len());
+                let accounted = cohort.iter().all(|(file, _)| {
+                    self.classified_archive_set_name_for_file(job_id, file)
+                        .as_deref()
+                        == Some(owner)
+                        || self.recovery_superseded_source(job_id, file.file_id())
+                        || (file.received_bytes() == 0 && !file.has_retained_damage())
+                });
+                if volume_count == Some(cohort.len()) && accounted {
+                    return if extracted {
+                        UnmaterializedArchiveSet::ConsumedBy(owner.clone())
+                    } else {
+                        UnmaterializedArchiveSet::ReplacedBy(owner.clone())
+                    };
+                }
+            }
+        }
 
         // Every name this job has known these files by. A PAR2 rebind moves a
         // file between its posted name and its canonical one, and the set that
@@ -334,15 +429,15 @@ impl Pipeline {
         UnmaterializedArchiveSet::MissingVolumes
     }
 
-    /// Records a set as extracted so the completion check stops offering it.
-    ///
-    /// The candidate-name sources cannot be edited away here — a live file's
-    /// classification is the job's own record of what that file is, and
-    /// rewriting it to make a completion check quieter would lose the only
-    /// trace of the rebind. Marking the set extracted leaves those sources
-    /// intact and still moves the check forward: the name is offered again and
-    /// answered immediately, instead of being dispatched to an extraction that
-    /// has nothing to open.
+    // Records a set as extracted so the completion check stops offering it.
+    //
+    // The candidate-name sources cannot be edited away here — a live file's
+    // classification is the job's own record of what that file is, and
+    // rewriting it to make a completion check quieter would lose the only
+    // trace of the rebind. Marking the set extracted leaves those sources
+    // intact and still moves the check forward: the name is offered again and
+    // answered immediately, instead of being dispatched to an extraction that
+    // has nothing to open.
     pub(crate) fn absorb_archive_set_into_extracted(&mut self, job_id: JobId, set_name: &str) {
         self.extracted_archives
             .entry(job_id)
@@ -478,11 +573,11 @@ impl Pipeline {
         );
     }
 
-    /// Registered volumes of a set that no NZB file accounts for — written by
-    /// a standalone `.rev` restore — that are still on disk, with the facts
-    /// parsed from them. A restore that rewrote a downloaded volume in place
-    /// shares that volume's NZB filename and is deliberately not in this list:
-    /// it is a source the retry re-downloads like any other.
+    // Registered volumes of a set that no NZB file accounts for — written by
+    // a standalone `.rev` restore — that are still on disk, with the facts
+    // parsed from them. A restore that rewrote a downloaded volume in place
+    // shares that volume's NZB filename and is deliberately not in this list:
+    // it is a source the retry re-downloads like any other.
     fn restored_rar_volumes_to_preserve(
         &self,
         job_id: JobId,
@@ -1132,7 +1227,13 @@ impl Pipeline {
         }
 
         if has_incomplete_sets {
-            Some("no retryable work remains for incomplete RAR sets".to_string())
+            Some(
+                self.missing_first_rar_volume_report(job_id)
+                    .or_else(|| self.missing_rar_volumes_report(job_id))
+                    .unwrap_or_else(|| {
+                        "no retryable work remains for incomplete RAR sets".to_string()
+                    }),
+            )
         } else {
             None
         }
@@ -1194,10 +1295,12 @@ impl Pipeline {
         }
 
         for file in state.assembly.files() {
-            if matches!(
-                self.classified_role_for_file(job_id, file),
-                weaver_model::files::FileRole::RarVolume { .. }
-            ) && let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file)
+            if !self.recovery_superseded_source(job_id, file.file_id())
+                && matches!(
+                    self.classified_role_for_file(job_id, file),
+                    weaver_model::files::FileRole::RarVolume { .. }
+                )
+                && let Some(set_name) = self.classified_archive_set_name_for_file(job_id, file)
             {
                 set_names.insert(set_name);
             }
@@ -1327,6 +1430,7 @@ impl Pipeline {
             return;
         }
 
+        let settle_leftovers = self.settle_par2_input_identities_before_cleanup(job_id);
         let cleanup_files: HashSet<String> = {
             let state = self.jobs.get(&job_id).unwrap();
             let mut cleanup_files: HashSet<String> = state
@@ -1342,13 +1446,26 @@ impl Pipeline {
                             | weaver_model::files::FileRole::SevenZipSplit { .. }
                     )
                 })
-                .map(|f| self.current_filename_for_file(job_id, f))
+                .flat_map(|f| {
+                    let mut names = vec![self.current_filename_for_file(job_id, f)];
+                    if let Some(identity) = self.effective_file_identity(job_id, f.file_id())
+                        && identity.classification_source
+                            == crate::jobs::record::FileIdentitySource::Par2
+                        && let Some(canonical) = identity.canonical_filename
+                    {
+                        // Repair may materialize the canonical path while a
+                        // chase retains its original, verified input alias.
+                        names.push(canonical);
+                    }
+                    names
+                })
                 .collect();
             for topology in state.assembly.archive_topologies().values() {
                 cleanup_files.extend(topology.volume_map.keys().cloned());
             }
             cleanup_files.extend(self.par2_spent_input_names(job_id));
             cleanup_files.extend(self.finalized_direct_volume_filenames(job_id));
+            cleanup_files.extend(settle_leftovers);
             cleanup_files
         };
 
@@ -1361,6 +1478,7 @@ impl Pipeline {
         };
 
         match nested_decision {
+            NestedExtractionDecision::Deferred => return,
             NestedExtractionDecision::Started | NestedExtractionDecision::NoNestedArchives => {
                 let mut removed = 0u32;
                 for filename in &cleanup_files {
@@ -1411,6 +1529,10 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> Result<(), String> {
+        // A copy may have completed while its equivalent set was extracting;
+        // that live layout could not be rebound then. Reconsider it once the
+        // verification frontier is settled, before rebuilding missing sets.
+        self.group_nameless_rar_volumes(job_id).await;
         for set_name in self.rar_set_names_for_job(job_id) {
             if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
                 if crate::pipeline::archive::topology::is_incoherent_rar_waiting_state_error(&error)
@@ -1460,10 +1582,10 @@ impl Pipeline {
         })
     }
 
-    /// Whether the job carries any standalone RAR recovery volume (`.rev`),
-    /// the only input that makes a recovery-volume restore worth attempting.
-    /// Cheap on purpose: it runs from the completion checkpoint, which fires
-    /// far more often than a restore is possible.
+    // Whether the job carries any standalone RAR recovery volume (`.rev`),
+    // the only input that makes a recovery-volume restore worth attempting.
+    // Cheap on purpose: it runs from the completion checkpoint, which fires
+    // far more often than a restore is possible.
     pub(in crate::pipeline) fn job_has_rar_recovery_volume_files(&self, job_id: JobId) -> bool {
         self.jobs.get(&job_id).is_some_and(|state| {
             state.assembly.files().any(|file| {
@@ -1474,12 +1596,12 @@ impl Pipeline {
         })
     }
 
-    /// Restore missing RAR data volumes from sibling standalone `.rev` files.
-    ///
-    /// The recovery crate discovers and validates matching recovery volumes from
-    /// the already-known RAR set paths.  Weaver does not infer missing names or
-    /// trust a filename convention here: only a successful, verified recovery
-    /// report is registered back into the set topology.
+    // Restore missing RAR data volumes from sibling standalone `.rev` files.
+    //
+    // The recovery crate discovers and validates matching recovery volumes from
+    // the already-known RAR set paths.  Weaver does not infer missing names or
+    // trust a filename convention here: only a successful, verified recovery
+    // report is registered back into the set topology.
     pub(in crate::pipeline) async fn try_restore_rar_recovery_volumes(
         &mut self,
         job_id: JobId,

@@ -44,9 +44,20 @@ impl Pipeline {
     }
 
     pub(crate) fn persist_active_runtime(&self, job_id: JobId) {
+        self.persist_active_runtime_at(job_id, None);
+    }
+
+    // [`Self::persist_active_runtime`] that also records `output_dir` as the
+    // job's output location in the same ordered write.
+    pub(crate) fn persist_active_runtime_at(
+        &self,
+        job_id: JobId,
+        output_dir: Option<std::path::PathBuf>,
+    ) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
+        let output_dir = output_dir.map(|dir| dir.to_string_lossy().into_owned());
         let status = Self::persist_active_status_for(&state.status).to_string();
         let error = match &state.status {
             JobStatus::Failed { error } => Some(error.clone()),
@@ -94,8 +105,9 @@ impl Pipeline {
         if let Err(error) =
             self.db
                 .try_queue_job_write(job_id, "set_active_job_runtime", move |db| {
-                    db.set_active_job_runtime(
+                    db.set_active_job_runtime_at(
                         job_id,
+                        output_dir.as_deref(),
                         &status,
                         Some(&download_state),
                         Some(&post_state),
@@ -223,6 +235,7 @@ impl Pipeline {
 
     pub(crate) fn persist_active_status_for(status: &JobStatus) -> &'static str {
         match status {
+            JobStatus::AwaitingQueueScripts => "awaiting_queue_scripts",
             JobStatus::Queued => "queued",
             JobStatus::Downloading => "downloading",
             JobStatus::Checking => "checking",
@@ -565,6 +578,11 @@ impl Pipeline {
         if matches!(previous_run_state, crate::jobs::model::RunState::Paused) {
             return Ok(());
         }
+        if self.awaiting_queue_script_barrier(job_id) {
+            return Err(crate::SchedulerError::Conflict(
+                "the download is complete and waiting for queue scripts".into(),
+            ));
+        }
         // A pause stops new dispatch but never resumes on a schedule, so a
         // parked chase would hold a blocking thread for as long as the operator
         // leaves the job paused. Retryable: nothing about the archive was
@@ -727,6 +745,10 @@ impl Pipeline {
     }
 
     fn start_repair_phase(&mut self, job_id: JobId) -> bool {
+        if self.shared_state.is_post_processing_paused() {
+            self.deferred_post_processing.insert(job_id);
+            return false;
+        }
         let Some(status) = self.jobs.get(&job_id).map(|state| state.status.clone()) else {
             return false;
         };
@@ -771,6 +793,10 @@ impl Pipeline {
     }
 
     pub(crate) async fn maybe_start_extraction(&mut self, job_id: JobId) -> bool {
+        if self.shared_state.is_post_processing_paused() {
+            self.deferred_post_processing.insert(job_id);
+            return false;
+        }
         let Some(status) = self.jobs.get(&job_id).map(|state| state.status.clone()) else {
             return false;
         };
@@ -808,6 +834,9 @@ impl Pipeline {
     }
 
     pub(crate) fn promote_queued_repairs(&mut self) {
+        if self.shared_state.is_post_processing_paused() {
+            return;
+        }
         let Some(job_id) = self.next_queued_repair_job() else {
             return;
         };
@@ -817,6 +846,9 @@ impl Pipeline {
     }
 
     pub(crate) fn promote_queued_extractions(&mut self) {
+        if self.shared_state.is_post_processing_paused() {
+            return;
+        }
         let available = self
             .tuner
             .max_concurrent_extractions()
@@ -896,22 +928,22 @@ impl Pipeline {
         }
     }
 
-    /// Remove the volume images of container sets whose members were installed
-    /// straight from the wire.
-    ///
-    /// Such a set never writes its volumes, so there is normally nothing here.
-    /// A repair that rebuilt a volume is the exception: it lands the rebuilt
-    /// image at the volume's own name so the set can route it, and once the set
-    /// is finalized the image is spent. A job with only installed sets never
-    /// reaches the extraction cleanup that removes archive parts, so without
-    /// this the rebuilt volume would be released next to the members it
-    /// carried.
+    // Remove the volume images of container sets whose members were installed
+    // straight from the wire.
+    //
+    // Such a set never writes its volumes, so there is normally nothing here.
+    // A repair that rebuilt a volume is the exception: it lands the rebuilt
+    // image at the volume's own name so the set can route it, and once the set
+    // is finalized the image is spent. A job with only installed sets never
+    // reaches the extraction cleanup that removes archive parts, so without
+    // this the rebuilt volume would be released next to the members it
+    // carried.
     pub(super) async fn cleanup_installed_direct_set_volumes(&self, job_id: JobId) {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
         let cleanup_dir = state.working_dir.clone();
-        let volume_files: Vec<String> = state
+        let mut volume_files: std::collections::HashSet<String> = state
             .assembly
             .files()
             .filter(|f| {
@@ -923,6 +955,10 @@ impl Pipeline {
             })
             .map(|f| self.current_filename_for_file(job_id, f))
             .collect();
+        // Whatever an earlier incarnation of the job wrote at a finalized
+        // set's volume names is left over too, under any format and under
+        // names no role classifies.
+        volume_files.extend(self.finalized_direct_volume_filenames(job_id));
 
         let mut removed = 0u32;
         for filename in &volume_files {

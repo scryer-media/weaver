@@ -8,7 +8,7 @@ test("the link Scryer writes mints a control key", () => {
   assert.equal(taken.search, "");
 });
 
-test("the spellings the classic interface accepted still read", () => {
+test("the spellings Weaver accepted first still read", () => {
   assert.deepEqual(takeApiKeyLink("?apiKeyGenerate=true&apiKeyName=Sonarr&apiKeyScope=read").link, {
     name: "Sonarr",
     scope: "READ",

@@ -1,0 +1,92 @@
+[
+  {
+    "name": "nntp1",
+    "listen": "0.0.0.0:3119",
+    "upstream": "nntp:119",
+    "enabled": true
+  },
+  {
+    "name": "nntp2",
+    "listen": "0.0.0.0:4119",
+    "upstream": "nntp2:119",
+    "enabled": true
+  },
+  {
+    "name": "connect1",
+    "listen": "0.0.0.0:23101",
+    "upstream": "proxy-fixture:8101",
+    "enabled": true
+  },
+  {
+    "name": "connect2",
+    "listen": "0.0.0.0:23102",
+    "upstream": "proxy-fixture:8102",
+    "enabled": true
+  },
+  {
+    "name": "connect3",
+    "listen": "0.0.0.0:23103",
+    "upstream": "proxy-fixture:8103",
+    "enabled": true
+  },
+  {
+    "name": "connect4",
+    "listen": "0.0.0.0:23104",
+    "upstream": "proxy-fixture:8104",
+    "enabled": true
+  },
+  {
+    "name": "connect5",
+    "listen": "0.0.0.0:23105",
+    "upstream": "proxy-fixture:8105",
+    "enabled": true
+  },
+  {
+    "name": "connect6",
+    "listen": "0.0.0.0:23106",
+    "upstream": "proxy-fixture:8106",
+    "enabled": true
+  },
+  {
+    "name": "socks1",
+    "listen": "0.0.0.0:23201",
+    "upstream": "proxy-fixture:8201",
+    "enabled": true
+  },
+  {
+    "name": "socks2",
+    "listen": "0.0.0.0:23202",
+    "upstream": "proxy-fixture:8202",
+    "enabled": true
+  },
+  {
+    "name": "socks3",
+    "listen": "0.0.0.0:23203",
+    "upstream": "proxy-fixture:8203",
+    "enabled": true
+  },
+  {
+    "name": "socks4",
+    "listen": "0.0.0.0:23204",
+    "upstream": "proxy-fixture:8204",
+    "enabled": true
+  },
+  {
+    "name": "ssh1",
+    "listen": "0.0.0.0:23221",
+    "upstream": "tunnel-fixture:2221",
+    "enabled": true
+  },
+  {
+    "name": "ssh2",
+    "listen": "0.0.0.0:23222",
+    "upstream": "tunnel-fixture:2222",
+    "enabled": true
+  },
+  {
+    "name": "ssh3",
+    "listen": "0.0.0.0:23223",
+    "upstream": "tunnel-fixture:2223",
+    "enabled": true
+  }
+]

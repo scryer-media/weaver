@@ -1,6 +1,6 @@
-//! RAR4/RAR3 file encryption
-//! Header-encrypted (`-hp`) sets
-//! The dual-CRC grid, fed from the direct seam
+// RAR4/RAR3 file encryption
+// Header-encrypted (`-hp`) sets
+// The dual-CRC grid, fed from the direct seam
 
 use super::*;
 
@@ -832,18 +832,9 @@ async fn a_header_encrypted_set_with_no_password_demotes_by_name() {
 }
 
 #[tokio::test]
-async fn a_header_encrypted_set_does_not_try_a_placeholder_spec_password() {
-    // `spec.password` reaches the `-hp` ring by a different route from the rest
-    // of the harvest — the per-article re-offer in `refresh_direct_passwords` —
-    // and it has to be normalized the way
-    // `archive_password_candidates_for_job` normalizes, or the two routes
-    // disagree about what a password even *is*.
-    //
-    // Indexers use `password=yes` to mean "this post is passworded", and
-    // `normalize_archive_password_candidate` drops that whole family. Offering
-    // it here anyway would spend a PBKDF2 derivation proving nothing — and
-    // would report the refusal as `NoVerifiedCandidate`, "everything we tried
-    // was wrong", for a job that had nothing to try.
+async fn a_header_encrypted_set_tries_a_literal_explicit_password() {
+    // Explicit passwords remain literal even when the same value in harvested
+    // metadata would be a placeholder. The header ring must try and refute it.
     let payload: Vec<u8> = (0..1600u32).map(|index| (index % 163) as u8).collect();
     let volumes = header_encrypted_store_set(
         "Silver.Horizon.S04E14.mkv",
@@ -866,39 +857,39 @@ async fn a_header_encrypted_set_does_not_try_a_placeholder_spec_password() {
     assert!(
         outcome
             .shape
-            .contains("Demoted(HeaderEncryptedRefused(NoPassword))"),
-        "a placeholder is not a candidate, so this job had nothing to try, got {}",
+            .contains("Demoted(HeaderEncryptedRefused(NoVerifiedCandidate))"),
+        "the explicit password must be tried and refuted, got {}",
         outcome.shape
     );
     assert!(
-        !outcome.shape.contains("NoVerifiedCandidate"),
-        "and it must not be reported as a password that was tried and refuted, got {}",
+        !outcome.shape.contains("NoPassword"),
+        "an explicit password must not be discarded as missing, got {}",
         outcome.shape
     );
 }
 
-/// **The `Verified`-only decision, as a test.**
-///
-/// Both fixtures below carry an archive whose password the job *has* — the right
-/// one, in the spec, ready to use — and both must still refuse, because neither
-/// states a check that could prove it. That is the whole difference from `-p`,
-/// where the same `Unverifiable` verdict admits: a wrong key there corrupts data
-/// the whole-member CRC32 then catches, and a wrong key here corrupts the header
-/// parse that decides where bytes go.
-///
-/// If admission were relaxed to "admit on `Unverifiable`", both halves would
-/// pass their parse and complete — so this test fails loudly rather than
-/// quietly, and it fails for the exact change it is guarding.
-///
-/// # And the refusal is only defensible because the floor holds
-///
-/// Refusing an archive the job *can* open is a real cost, and the argument that
-/// it is the right trade is entirely about what happens next: the conventional
-/// path takes the set and opens it with the very same password. So each half
-/// runs that through — the refetch the demotion asked for, the volumes it
-/// materializes, the extraction, the member. Asserting only that a volume file
-/// appeared would leave the trade unproven in the one test whose whole subject
-/// is the trade.
+// **The `Verified`-only decision, as a test.**
+//
+// Both fixtures below carry an archive whose password the job *has* — the right
+// one, in the spec, ready to use — and both must still refuse, because neither
+// states a check that could prove it. That is the whole difference from `-p`,
+// where the same `Unverifiable` verdict admits: a wrong key there corrupts data
+// the whole-member CRC32 then catches, and a wrong key here corrupts the header
+// parse that decides where bytes go.
+//
+// If admission were relaxed to "admit on `Unverifiable`", both halves would
+// pass their parse and complete — so this test fails loudly rather than
+// quietly, and it fails for the exact change it is guarding.
+//
+// # And the refusal is only defensible because the floor holds
+//
+// Refusing an archive the job *can* open is a real cost, and the argument that
+// it is the right trade is entirely about what happens next: the conventional
+// path takes the set and opens it with the very same password. So each half
+// runs that through — the refetch the demotion asked for, the volumes it
+// materializes, the extraction, the member. Asserting only that a volume file
+// appeared would leave the trade unproven in the one test whose whole subject
+// is the trade.
 #[tokio::test]
 async fn a_header_encrypted_set_with_no_usable_check_refuses_rather_than_guessing() {
     let member_name = "Silver.Horizon.S04E05.mkv";
@@ -1750,16 +1741,16 @@ async fn a_header_encrypted_set_prefers_the_proved_candidate_over_the_spec_passw
     ));
 }
 
-/// A volume's articles arrive in whatever order twelve connections finish
-/// them, so several mid-file articles routinely land before the one carrying
-/// offset zero. The unparsable ceiling must judge the prefix the header walk
-/// can actually consume — not the sum of tail chunks the walk cannot reach.
-/// Before the fix this exact sequence demoted a store-method set
-/// `UnparsableVolume` with its headers never read: six tail articles staged
-/// ~4.2 MiB, segment zero arrived seventh, and the ceiling fired before the
-/// first parse ever ran. (Witnessed live as 23 of 44 demotions in one
-/// functional-direct run, mislabeling compressed sets and falsely demoting
-/// the store sets direct routing exists to carry.)
+// A volume's articles arrive in whatever order twelve connections finish
+// them, so several mid-file articles routinely land before the one carrying
+// offset zero. The unparsable ceiling must judge the prefix the header walk
+// can actually consume — not the sum of tail chunks the walk cannot reach.
+// Before the fix this exact sequence demoted a store-method set
+// `UnparsableVolume` with its headers never read: six tail articles staged
+// ~4.2 MiB, segment zero arrived seventh, and the ceiling fired before the
+// first parse ever ran. (Witnessed live as 23 of 44 demotions in one
+// functional-direct run, mislabeling compressed sets and falsely demoting
+// the store sets direct routing exists to carry.)
 #[tokio::test]
 async fn out_of_order_arrival_does_not_trip_the_header_prefix_ceiling() {
     // Payload comfortably past MAX_HEADER_PREFIX_BYTES so the tail articles

@@ -19,10 +19,21 @@ if (budgetMs > 0 && !process.env.E2E_WEAVER_PLAYWRIGHT_DEADLINE_MS) {
 }
 const deadlineMs = Number(process.env.E2E_WEAVER_PLAYWRIGHT_DEADLINE_MS) || 0;
 
+// Local iteration only: E2E_WEAVER_PLAYWRIGHT_TEST_TIMEOUT_MS caps every
+// test's timeout, including those a test raises itself, so a targeted re-run
+// fails fast. Unset (the gate and CI), every timeout is unchanged.
+const iterationTestTimeoutMs = Number(process.env.E2E_WEAVER_PLAYWRIGHT_TEST_TIMEOUT_MS) || 0;
+
+// Long-form scenarios (@extended) wait out ten-minute product timers. They
+// run only when the operator asks for them, like the archive matrix; the
+// npm scripts repeat this in --grep-invert, which replaces this setting.
+const extended = process.env.E2E_WEAVER_EXTENDED === "1";
+
 export default defineConfig({
   testDir: "./tests",
+  grepInvert: extended ? undefined : /@extended/,
   outputDir: `${runArtifactsDir}/test-results`,
-  timeout: 5 * 60 * 1000,
+  timeout: iterationTestTimeoutMs || 5 * 60 * 1000,
   globalTimeout: deadlineMs > 0 ? Math.max(1, deadlineMs - Date.now()) : 0,
   expect: { timeout: 20 * 1000 },
   fullyParallel: false,

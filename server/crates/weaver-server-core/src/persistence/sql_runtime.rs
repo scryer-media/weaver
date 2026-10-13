@@ -126,6 +126,14 @@ pub(crate) enum SqlTx<'db> {
     Postgres(Transaction<'db, Postgres>),
 }
 
+// One borrowed connection of either engine, for code that runs inside a
+// transaction it does not own: a migration step, or the reconciliation at
+// the end of a restore.
+pub(crate) enum SqlConn<'c> {
+    Sqlite(&'c mut sqlx::SqliteConnection),
+    Postgres(&'c mut sqlx::PgConnection),
+}
+
 pub(crate) fn max_rows_for_engine(engine: SqlEngine, binds_per_row: usize) -> usize {
     let bind_limit = match engine {
         SqlEngine::Sqlite => SQLITE_BATCH_BIND_LIMIT,
@@ -236,11 +244,11 @@ impl SqlRuntime {
         }
     }
 
-    /// Autocommit write that returns a row (e.g. `INSERT ... RETURNING`). Unlike
-    /// [`Self::fetch_optional`], this uses the WRITE retry policy (retry mode
-    /// `false`): a bare write's commit outcome is unknown on a dropped
-    /// connection, so only guaranteed-rolled-back failures are retried, never
-    /// connection errors — retrying those would duplicate the inserted row.
+    // Autocommit write that returns a row (e.g. `INSERT ... RETURNING`). Unlike
+    // [`Self::fetch_optional`], this uses the WRITE retry policy (retry mode
+    // `false`): a bare write's commit outcome is unknown on a dropped
+    // connection, so only guaranteed-rolled-back failures are retried, never
+    // connection errors — retrying those would duplicate the inserted row.
     pub(crate) async fn execute_returning(
         exec: SqlExec<'_, '_>,
         template: &str,
@@ -582,6 +590,54 @@ impl<'db> SqlTx<'db> {
     }
 }
 
+impl SqlConn<'_> {
+    pub(crate) async fn execute(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<u64> {
+        match self {
+            SqlConn::Sqlite(conn) => {
+                let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
+                bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args)
+                    .execute(&mut **conn)
+                    .await
+                    .map(|done| done.rows_affected())
+                    .map_err(db_err)
+            }
+            SqlConn::Postgres(conn) => {
+                let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
+                bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args)
+                    .execute(&mut **conn)
+                    .await
+                    .map(|done| done.rows_affected())
+                    .map_err(pg_db_err)
+            }
+        }
+    }
+
+    pub(crate) async fn fetch_all(
+        &mut self,
+        template: &str,
+        args: &[SqlArg],
+    ) -> SqlResult<Vec<SqlRow>> {
+        match self {
+            SqlConn::Sqlite(conn) => {
+                let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
+                bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map(|rows| rows.into_iter().map(SqlRow::Sqlite).collect())
+                    .map_err(db_err)
+            }
+            SqlConn::Postgres(conn) => {
+                let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
+                bind_postgres(sqlx::query(AssertSqlSafe(sql.as_str())), args)
+                    .fetch_all(&mut **conn)
+                    .await
+                    .map(|rows| rows.into_iter().map(SqlRow::Postgres).collect())
+                    .map_err(pg_db_err)
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 impl SqlRow {
     pub(crate) fn text(&self, column: &str) -> SqlResult<String> {
@@ -898,11 +954,11 @@ fn opt_bool_from_pg_row(row: &PgRow, column: &str) -> SqlResult<Option<bool>> {
     row.try_get(column).map_err(db_err)
 }
 
-/// SQLite extended result codes that mean "retry later, the DB is momentarily
-/// busy/locked": SQLITE_BUSY (5) and its BUSY_RECOVERY/BUSY_SNAPSHOT/BUSY_TIMEOUT
-/// variants (261/517/773), plus SQLITE_LOCKED (6) and LOCKED_SHAREDCACHE (262).
-/// These are the ONLY codes safe to spin on — a disk I/O error (e.g. code 522,
-/// SQLITE_IOERR_SHORT_READ) must surface immediately, not retry for 120s.
+// SQLite extended result codes that mean "retry later, the DB is momentarily
+// busy/locked": SQLITE_BUSY (5) and its BUSY_RECOVERY/BUSY_SNAPSHOT/BUSY_TIMEOUT
+// variants (261/517/773), plus SQLITE_LOCKED (6) and LOCKED_SHAREDCACHE (262).
+// These are the ONLY codes safe to spin on — a disk I/O error (e.g. code 522,
+// SQLITE_IOERR_SHORT_READ) must surface immediately, not retry for 120s.
 const SQLITE_BUSY_TRANSIENT_CODES: [u32; 6] = [5, 261, 517, 773, 6, 262];
 
 pub(crate) fn is_transient_sqlite_busy(error: &StateError) -> bool {
@@ -923,10 +979,10 @@ pub(crate) fn is_transient_sqlite_busy(error: &StateError) -> bool {
         || contains_sqlite_code(&normalized, "code: ", SQLITE_BUSY_TRANSIENT_CODES.as_slice())
 }
 
-/// Scan `haystack` for every occurrence of `marker`, parse the contiguous digit
-/// run that immediately follows it as a `u32`, and return true if any parsed
-/// value is in `codes`. The match is boundary-aware: the digit run ends at the
-/// first non-digit, so `"code: 5)"` yields 5 while `"code: 522"` yields 522.
+// Scan `haystack` for every occurrence of `marker`, parse the contiguous digit
+// run that immediately follows it as a `u32`, and return true if any parsed
+// value is in `codes`. The match is boundary-aware: the digit run ends at the
+// first non-digit, so `"code: 5)"` yields 5 while `"code: 522"` yields 522.
 fn contains_sqlite_code(haystack: &str, marker: &str, codes: &[u32]) -> bool {
     let mut rest = haystack;
     while let Some(pos) = rest.find(marker) {
@@ -943,9 +999,9 @@ fn contains_sqlite_code(haystack: &str, marker: &str, codes: &[u32]) -> bool {
     false
 }
 
-/// Postgres errors that are always safe to retry because the failed transaction
-/// is guaranteed to have rolled back: serialization failures (SQLSTATE 40001)
-/// and deadlocks (40P01). The code is preserved by [`pg_db_err`].
+// Postgres errors that are always safe to retry because the failed transaction
+// is guaranteed to have rolled back: serialization failures (SQLSTATE 40001)
+// and deadlocks (40P01). The code is preserved by [`pg_db_err`].
 pub(crate) fn is_postgres_rolled_back_transient(error: &StateError) -> bool {
     let StateError::Database(message) = error else {
         return false;
@@ -957,10 +1013,10 @@ pub(crate) fn is_postgres_rolled_back_transient(error: &StateError) -> bool {
         || normalized.contains("could not serialize access")
 }
 
-/// Postgres connection-level failures (SQLSTATE class 08 or a dropped socket).
-/// Retrying is safe for reads and for whole transactions (a lost connection
-/// aborts an open transaction) but NOT for a bare autocommit write, whose
-/// commit outcome is unknown.
+// Postgres connection-level failures (SQLSTATE class 08 or a dropped socket).
+// Retrying is safe for reads and for whole transactions (a lost connection
+// aborts an open transaction) but NOT for a bare autocommit write, whose
+// commit outcome is unknown.
 pub(crate) fn is_postgres_connection_error(error: &StateError) -> bool {
     let StateError::Database(message) = error else {
         return false;
@@ -977,6 +1033,30 @@ pub(crate) fn is_postgres_connection_error(error: &StateError) -> bool {
         || normalized.contains("terminating connection")
         || normalized.contains("server closed the connection")
         || normalized.contains("no connection to the server")
+}
+
+// A write refused by a unique constraint or index: SQLSTATE 23505 on
+// Postgres, `UNIQUE constraint failed` on SQLite.
+pub(crate) fn is_unique_violation(error: &StateError) -> bool {
+    let StateError::Database(message) = error else {
+        return false;
+    };
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("sqlstate=23505")
+        || normalized.contains("unique constraint failed")
+        || normalized.contains("duplicate key value violates unique constraint")
+}
+
+// A write refused by a foreign key: SQLSTATE 23503 on Postgres,
+// `FOREIGN KEY constraint failed` on SQLite.
+pub(crate) fn is_foreign_key_violation(error: &StateError) -> bool {
+    let StateError::Database(message) = error else {
+        return false;
+    };
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("sqlstate=23503")
+        || normalized.contains("foreign key constraint failed")
+        || normalized.contains("violates foreign key constraint")
 }
 
 async fn run_with_postgres_retries<T, Op, Fut>(
@@ -1014,21 +1094,21 @@ where
     }
 }
 
-/// Which phase of a Postgres transaction produced an error. The retry decision
-/// keys on this flag *structurally* — never on the error message — because a
-/// connection-class failure at COMMIT stringifies with the same `connection_error`
-/// marker as one before COMMIT, yet only the pre-commit case is safe to retry.
+// Which phase of a Postgres transaction produced an error. The retry decision
+// keys on this flag *structurally* — never on the error message — because a
+// connection-class failure at COMMIT stringifies with the same `connection_error`
+// marker as one before COMMIT, yet only the pre-commit case is safe to retry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPhase {
-    /// `pool.begin()` or a statement inside `op(&mut tx)` failed. Nothing was
-    /// committed, so the whole transaction can be re-`begin`'d and re-applied.
+    // `pool.begin()` or a statement inside `op(&mut tx)` failed. Nothing was
+    // committed, so the whole transaction can be re-`begin`'d and re-applied.
     BeforeCommit,
-    /// `tx.commit()` failed. If the failure is not guaranteed-rolled-back, the
-    /// commit outcome is UNKNOWN and the transaction must NOT be retried.
+    // `tx.commit()` failed. If the failure is not guaranteed-rolled-back, the
+    // commit outcome is UNKNOWN and the transaction must NOT be retried.
     Commit,
 }
 
-/// A transaction error tagged with the phase it originated in.
+// A transaction error tagged with the phase it originated in.
 struct PostgresTxError {
     phase: TxPhase,
     error: StateError,
@@ -1040,13 +1120,13 @@ impl PostgresTxError {
     }
 }
 
-/// Pure retry-eligibility decision for a phase-tagged Postgres transaction error.
-///
-/// * `BeforeCommit` — nothing durable was applied, so retry on either a
-///   guaranteed-rolled-back class-40 abort or any connection-level failure.
-/// * `Commit` — retry ONLY when the failure is guaranteed rolled back
-///   (serialization/deadlock raised at COMMIT). A connection-class error here
-///   means the commit's outcome is unknown, so it is not retried.
+// Pure retry-eligibility decision for a phase-tagged Postgres transaction error.
+//
+// * `BeforeCommit` — nothing durable was applied, so retry on either a
+//   guaranteed-rolled-back class-40 abort or any connection-level failure.
+// * `Commit` — retry ONLY when the failure is guaranteed rolled back
+//   (serialization/deadlock raised at COMMIT). A connection-class error here
+//   means the commit's outcome is unknown, so it is not retried.
 fn postgres_tx_retry_eligible(phase: TxPhase, error: &StateError) -> bool {
     match phase {
         TxPhase::BeforeCommit => {
@@ -1056,11 +1136,11 @@ fn postgres_tx_retry_eligible(phase: TxPhase, error: &StateError) -> bool {
     }
 }
 
-/// Run a Postgres transaction (`begin` + `op` + `commit`) with phase-aware
-/// transient retries bounded by [`POSTGRES_TRANSIENT_RETRY_DELAYS`]. The closure
-/// tags each failure with the phase it came from via [`PostgresTxError`]; the
-/// retry decision consults that flag through [`postgres_tx_retry_eligible`], so a
-/// connection error at COMMIT (outcome unknown) is surfaced rather than retried.
+// Run a Postgres transaction (`begin` + `op` + `commit`) with phase-aware
+// transient retries bounded by [`POSTGRES_TRANSIENT_RETRY_DELAYS`]. The closure
+// tags each failure with the phase it came from via [`PostgresTxError`]; the
+// retry decision consults that flag through [`postgres_tx_retry_eligible`], so a
+// connection error at COMMIT (outcome unknown) is surfaced rather than retried.
 async fn run_postgres_transaction_with_retries<T, Op, Fut>(
     op_name: &str,
     mut op: Op,
@@ -1102,8 +1182,8 @@ where
     }
 }
 
-/// Rewrite a commit-phase connection error so its message clearly conveys that
-/// the commit's outcome is unknown (the write may or may not have landed).
+// Rewrite a commit-phase connection error so its message clearly conveys that
+// the commit's outcome is unknown (the write may or may not have landed).
 fn commit_outcome_unknown(op_name: &str, error: StateError) -> StateError {
     StateError::Database(format!(
         "commit_outcome_unknown; transaction `{op_name}` lost its connection at COMMIT, so it may or may not have committed: {error}"
@@ -1187,9 +1267,9 @@ pub(crate) fn db_err(error: impl std::fmt::Display) -> StateError {
     StateError::Database(error.to_string())
 }
 
-/// Map a Postgres `sqlx::Error` to `StateError`, prefixing the SQLSTATE code as
-/// `sqlstate=<code>;` so the transient-retry classifiers can recognize
-/// serialization/deadlock/connection failures after the error is stringified.
+// Map a Postgres `sqlx::Error` to `StateError`, prefixing the SQLSTATE code as
+// `sqlstate=<code>;` so the transient-retry classifiers can recognize
+// serialization/deadlock/connection failures after the error is stringified.
 pub(crate) fn pg_db_err(error: sqlx::Error) -> StateError {
     if let Some(code) = error
         .as_database_error()
@@ -1291,6 +1371,46 @@ mod tests {
         )));
         assert!(!is_postgres_rolled_back_transient(&StateError::Database(
             "syntax error".to_string()
+        )));
+    }
+
+    #[test]
+    fn classifies_unique_and_foreign_key_violations_on_both_backends() {
+        let error = |message: &str| StateError::Database(message.to_string());
+        // SQLite.
+        let sqlite_unique = error(
+            "error returned from database: (code: 2067) UNIQUE constraint failed: secrets.name_key",
+        );
+        let sqlite_foreign =
+            error("error returned from database: (code: 787) FOREIGN KEY constraint failed");
+        assert!(is_unique_violation(&sqlite_unique));
+        assert!(!is_foreign_key_violation(&sqlite_unique));
+        assert!(is_foreign_key_violation(&sqlite_foreign));
+        assert!(!is_unique_violation(&sqlite_foreign));
+        // Postgres, as `pg_db_err` renders it.
+        let postgres_unique = error(
+            "sqlstate=23505; error returned from database: duplicate key value violates unique constraint \"secrets_name_key_key\"",
+        );
+        let postgres_foreign = error(
+            "sqlstate=23503; error returned from database: update or delete on table \"secrets\" violates foreign key constraint \"script_instance_inputs_secret_id_fkey\" on table \"script_instance_inputs\"",
+        );
+        assert!(is_unique_violation(&postgres_unique));
+        assert!(!is_foreign_key_violation(&postgres_unique));
+        assert!(is_foreign_key_violation(&postgres_foreign));
+        assert!(!is_unique_violation(&postgres_foreign));
+        // The bare driver messages, without the SQLSTATE prefix.
+        assert!(is_unique_violation(&error(
+            "duplicate key value violates unique constraint \"x\""
+        )));
+        assert!(is_foreign_key_violation(&error(
+            "insert or update on table \"x\" violates foreign key constraint \"y\""
+        )));
+        for unrelated in ["database is locked", "syntax error", "sqlstate=40001; x"] {
+            assert!(!is_unique_violation(&error(unrelated)), "{unrelated}");
+            assert!(!is_foreign_key_violation(&error(unrelated)), "{unrelated}");
+        }
+        assert!(!is_unique_violation(&StateError::Conflict(
+            "UNIQUE constraint failed".to_string()
         )));
     }
 

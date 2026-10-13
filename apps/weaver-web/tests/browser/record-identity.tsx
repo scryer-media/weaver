@@ -1,22 +1,19 @@
 import { act, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router";
-import { Client, Provider, type OperationResult } from "urql";
+import { Client, CombinedError, Provider, type OperationResult } from "urql";
 import { fromValue, make, mergeMap, pipe } from "wonka";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
-import { Servers } from "@/pages/Servers";
 import { ProvidersPanel } from "@/next/pages/settings/panels/ProvidersPanel";
+import { RssPanel } from "@/next/pages/settings/panels/RssPanel";
 import { SettingsShellProvider } from "@/next/pages/settings/framework";
-import { JobDetail } from "@/pages/JobDetail";
 import { JobDetailPage } from "@/next/pages/JobDetailPage";
-import { DirectoryBrowserDialog as LegacyFolders } from "@/components/DirectoryBrowserDialog";
-import { DirectoryBrowserDialog as NextFolders } from "@/next/features/DirectoryBrowserDialog";
-import "@/fonts.css";
-import "@/globals.css";
+import { DirectoryBrowserDialog } from "@/next/features/DirectoryBrowserDialog";
+import "@/next/fonts.css";
+import "@/next/theme.css";
 
 const params = new URLSearchParams(location.search);
-const variant = params.get("variant");
 const screen = params.get("screen") ?? "providers";
 const quota = { enabled: false, period: "MONTHLY", limitBytes: 1000, resetTimeMinutesLocal: 0,
   weeklyResetWeekday: "MON", monthlyResetDay: 1, usedBytes: 0, reservedBytes: 0,
@@ -26,6 +23,9 @@ const servers = [1, 2].map((id) => ({ id, host: `provider-${id}.example`, userna
   retentionDays: 0, maxDownloadSpeed: 0, downloadQuota: quota,
   routing: { proxyIds: [], allowDirect: true },
   tlsNameMismatchCertificateDerBase64: null, tlsNameMismatchCertificateFingerprint: null }));
+// A provider saved behind a kill switch and not given a route since, as its route reads back.
+servers.push({ ...servers[0], id: 3, host: "provider-3.example", username: "account-3", active: false, priority: 1,
+  routing: { failover: "REDISTRIBUTE", legs: [{ egressId: 0, weight: 100, path: { kind: "LADDER", directFallback: false, rungs: [] } }] } as never });
 function snapshot(id: number) {
   return { queueItem: null, historyItem: { id, name: `Job-${id}`, displayTitle: `Job-${id}`,
     originalTitle: `Job-${id}`, status: "COMPLETED", progressPercent: 100, totalBytes: 100,
@@ -35,6 +35,11 @@ function snapshot(id: number) {
     jobEvents: [], jobTimeline: null, serverAttribution: [] };
 }
 const listing = (path: string) => ({ currentPath: path, parentPath: "/", entries: [] });
+// One folder that holds a folder and two files; anything with an extension is a file, which is no folder to list.
+const fileListing = (path: string) => ({ currentPath: path, parentPath: "/",
+  entries: [{ name: "keys", path: `${path}/keys` }],
+  files: ["archive-passwords.txt", "notes.txt"].map((name) => ({ name, path: `${path}/${name}` })) });
+const isFile = (path: unknown) => /\.[a-z]+$/.test(String(path));
 const pending: { name: string; variables: Record<string, unknown>; deliver: () => void }[] = [];
 const mutations: { name: string; variables: Record<string, unknown> }[] = [];
 const delivered: string[] = [];
@@ -47,18 +52,25 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
     const variables = operation.variables;
     if (operation.kind === "mutation") mutations.push({ name, variables });
     const id = Number(variables.id ?? variables.jobId ?? 1);
+    if (name === "BrowseFiles" && isFile(variables.path)) {
+      return fromValue({ operation, error: new CombinedError({ graphQLErrors: [{ message: "Path is not a directory" }] }) } as OperationResult);
+    }
     const data = name === "Server" ? { server: servers.find((server) => server.id === id) }
       : name === "UpdateServer" ? { updateServer: { ...servers[id - 1], ...variables.input as object } }
-      : name === "AddServer" ? { addServer: { ...servers[0], ...variables.input as object, id: 3 } }
+      : name === "AddServer" ? { addServer: { ...servers[0], ...variables.input as object, id: 4 } }
+      : name === "AddRssFeed" ? { addRssFeed: { id: 1, rules: [], ...variables.input as object } }
       : name === "TestConnection" ? { testConnection: { success: false, message: "Result for provider 1", latencyMs: null,
           adoptableTlsNameMismatchCertificate: { derBase64: "old-certificate", sha256Fingerprint: "old-fingerprint", names: ["provider-1.example"] } } }
       : name === "BrowseDirectories" ? { browseDirectories: listing(String(variables.path)) }
+      : name === "BrowseFiles" ? { browseDirectories: fileListing(String(variables.path)) }
       : name === "CreateDirectory" ? { createDirectory: listing(`${variables.path}/${variables.name}`) }
       : name === "JobDetailUpdates" ? { jobDetailUpdates: snapshot(id) }
       : name === "Job" ? { jobDetailSnapshot: snapshot(id) }
       : name === "JobOutputFiles" ? { jobOutputFiles: { outputDir: `/job-${id}`, files: [], totalBytes: 0 } }
       : name === "DuplicateSnapshot" ? { duplicateSnapshot: null }
-      : { servers, proxies: [], categories: [], schedules: [], generalSettings: {} };
+      : name === "Networking" ? { egressInterfaces: [{ id: 0, name: "System", bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, addresses: [], enabled: true, maxDownloadSpeed: 0, health: "UP", reason: null }], proxyProfiles: [], proxyPools: [], servers: [], rssFeeds: [], discoverNetworkInterfaces: [], platformNetworking: { platform: "fixture", egressBindingKinds: ["SYSTEM"], sourceAddressHint: null, container: false, bridgeNetworkSuspected: false, maxWireguardInstances: 1, notes: [] } }
+      : name === "NetworkFlow" || name === "NetworkFlowUpdates" ? { networkFlow: { legs: [], sampledAt: 1767225600, consumers: [], proxies: [], proxyPools: [], egresses: [], pools: [] } }
+      : { servers, proxies: [], categories: [], schedules: [], generalSettings: {}, rssFeeds: [], rssSeenItems: [] };
     // Real urql hooks receive no new result until the test explicitly delivers it.
     if (held.has(name) || (id === 2 && ["Server", "Job", "JobDetailUpdates", "JobOutputFiles", "DuplicateSnapshot"].includes(name))) {
       return make<OperationResult>((observer) => {
@@ -98,14 +110,12 @@ function Fixture() {
     fixture.openFolder = setFolder;
     fixture.ready = true;
   }, [navigate]);
-  if (screen === "folders") {
+  if (screen === "folders" || screen === "files") {
     const choose = (path: string) => { fixture.chosen = path; setFolder(null); };
-    return variant === "next"
-      ? <NextFolders open={folder !== null} initialPath={folder} onClose={() => setFolder(null)} onChoose={choose} />
-      : <LegacyFolders open={folder !== null} path={folder} onPathChange={() => {}} onClose={() => setFolder(null)} onChoose={choose} />;
+    return <DirectoryBrowserDialog open={folder !== null} initialPath={folder} pick={screen === "files" ? "file" : undefined} onClose={() => setFolder(null)} onChoose={choose} />;
   }
-  if (screen === "jobs") return <Routes><Route path="/jobs/:id" element={variant === "next" ? <JobDetailPage /> : <JobDetail />} /></Routes>;
-  return variant === "next" ? <SettingsShellProvider search="" actionsRef={{ current: null }} setFlags={() => {}} controlsHost={document.getElementById("controls")}><ProvidersPanel /></SettingsShellProvider> : <Servers />;
+  if (screen === "jobs") return <Routes><Route path="/jobs/:id" element={<JobDetailPage />} /></Routes>;
+  return <SettingsShellProvider search="" actionsRef={{ current: null }} setFlags={() => {}} controlsHost={document.getElementById("controls")}>{screen === "feeds" ? <RssPanel /> : <ProvidersPanel />}</SettingsShellProvider>;
 }
 createRoot(document.getElementById("root")!).render(
   <Provider value={client}><TranslateContext.Provider value={{

@@ -1,8 +1,8 @@
-//! System capability detection using only std primitives.
-//!
-//! Runs once at startup to build a [`SystemProfile`] describing the host
-//! machine. All subprocess calls use [`std::process::Command`] (blocking)
-//! since this only executes once during initialization.
+// System capability detection using only std primitives.
+//
+// Runs once at startup to build a [`SystemProfile`] describing the host
+// machine. All subprocess calls use [`std::process::Command`] (blocking)
+// since this only executes once during initialization.
 
 use std::path::Path;
 #[cfg(any(target_os = "linux", all(test, unix)))]
@@ -14,32 +14,32 @@ use std::sync::OnceLock;
 use super::system_profile::*;
 use tracing::debug;
 
-/// Probe the running system and return a fully measured [`SystemProfile`].
-///
-/// Detection is best-effort: any individual probe that fails silently
-/// falls back to a safe default rather than aborting startup.
+// Probe the running system and return a fully measured [`SystemProfile`].
+//
+// Detection is best-effort: any individual probe that fails silently
+// falls back to a safe default rather than aborting startup.
 pub fn detect(output_dir: &Path) -> SystemProfile {
     let mut profile = detect_startup_profile(output_dir);
     profile.disk.random_read_iops = measure_random_read_iops(output_dir);
     profile
 }
 
-/// Classify the storage behind one directory without measuring it.
-///
-/// The startup profile only ever describes a single directory, so a caller that
-/// wants the class and filesystem of a *second* configured root (the
-/// intermediate or complete directory, say) has no way to ask for it. This is
-/// the same classification the startup profile uses, with no benchmark attached:
-/// it runs the platform's filesystem lookup and nothing else.
+// Classify the storage behind one directory without measuring it.
+//
+// The startup profile only ever describes a single directory, so a caller that
+// wants the class and filesystem of a *second* configured root (the
+// intermediate or complete directory, say) has no way to ask for it. This is
+// the same classification the startup profile uses, with no benchmark attached:
+// it runs the platform's filesystem lookup and nothing else.
 pub fn classify_storage(path: &Path) -> (StorageClass, FilesystemType) {
     detect_disk_info(path)
 }
 
-/// Collect the fast system facts needed to start the runtime.
-///
-/// Random-read IOPS is intentionally left at zero until
-/// [`measure_random_read_iops`] runs. Zero is conservative: the tuner admits
-/// only one extraction until the measured value is applied.
+// Collect the fast system facts needed to start the runtime.
+//
+// Random-read IOPS is intentionally left at zero until
+// [`measure_random_read_iops`] runs. Zero is conservative: the tuner admits
+// only one extraction until the measured value is applied.
 pub fn detect_startup_profile(output_dir: &Path) -> SystemProfile {
     let cpu = detect_cpu();
     let memory = detect_memory();
@@ -80,7 +80,7 @@ fn detect_cpu() -> CpuProfile {
     }
 }
 
-/// Try to read physical core count from the OS.
+// Try to read physical core count from the OS.
 fn detect_physical_cores() -> Option<usize> {
     #[cfg(target_os = "macos")]
     {
@@ -160,7 +160,7 @@ fn detect_simd() -> SimdSupport {
     }
 }
 
-/// Read cgroup v2 CPU quota if running in a container.
+// Read cgroup v2 CPU quota if running in a container.
 fn detect_cgroup_cpu_limit() -> Option<f64> {
     #[cfg(target_os = "linux")]
     {
@@ -228,14 +228,14 @@ fn memory_profile_from_facts(facts: &ProcessMemoryFacts) -> MemoryProfile {
     }
 }
 
-fn detect_memory() -> MemoryProfile {
+pub(crate) fn detect_memory() -> MemoryProfile {
     memory_profile_from_facts(process_memory_facts())
 }
 
-/// Total memory the process can actually use: physical total, clamped by any
-/// cgroup v2 limit (containers see the host's /proc/meminfo, not their own
-/// budget). Used for memory-scaled policy defaults (e.g. the RAR
-/// dictionary-size ceiling).
+// Total memory the process can actually use: physical total, clamped by any
+// cgroup v2 limit (containers see the host's /proc/meminfo, not their own
+// budget). Used for memory-scaled policy defaults (e.g. the RAR
+// dictionary-size ceiling).
 pub(crate) fn detect_total_memory_bytes() -> Option<u64> {
     let facts = process_memory_facts();
     let total = facts.memory_bytes.map(|(total, _)| total)?;
@@ -245,7 +245,7 @@ pub(crate) fn detect_total_memory_bytes() -> Option<u64> {
     })
 }
 
-/// Returns (total_bytes, available_bytes).
+// Returns (total_bytes, available_bytes).
 fn detect_memory_bytes() -> Option<(u64, u64)> {
     #[cfg(target_os = "macos")]
     {
@@ -297,7 +297,7 @@ fn detect_memory_bytes() -> Option<(u64, u64)> {
     }
 }
 
-/// Windows: `GlobalMemoryStatusEx` reports physical total and available.
+// Windows: `GlobalMemoryStatusEx` reports physical total and available.
 #[cfg(windows)]
 fn windows_memory_bytes() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -322,14 +322,14 @@ fn windows_memory_bytes() -> Option<(u64, u64)> {
     Some((status.ullTotalPhys, status.ullAvailPhys))
 }
 
-/// Parse a `/proc/meminfo` value like `"  16384000 kB"` into bytes.
+// Parse a `/proc/meminfo` value like `"  16384000 kB"` into bytes.
 #[cfg(target_os = "linux")]
 fn parse_meminfo_kb(s: &str) -> Option<u64> {
     let kb: u64 = s.split_whitespace().next()?.parse().ok()?;
     Some(kb * 1024)
 }
 
-/// Approximate available memory on macOS using `vm_stat`.
+// Approximate available memory on macOS using `vm_stat`.
 #[cfg(target_os = "macos")]
 fn macos_available_memory() -> Option<u64> {
     let output = Command::new("vm_stat").output().ok()?;
@@ -363,7 +363,7 @@ fn macos_available_memory() -> Option<u64> {
     Some((free + inactive + purgeable) * page_size)
 }
 
-/// Extract the page count from a vm_stat line like `"Pages free:    12345."`.
+// Extract the page count from a vm_stat line like `"Pages free:    12345."`.
 #[cfg(target_os = "macos")]
 fn extract_vm_stat_pages(line: &str, prefix: &str) -> Option<u64> {
     if !line.starts_with(prefix) {
@@ -373,9 +373,9 @@ fn extract_vm_stat_pages(line: &str, prefix: &str) -> Option<u64> {
     after_colon.trim().trim_end_matches('.').parse().ok()
 }
 
-/// Read the process's cgroup memory limit, including nested cgroup v2 and v1
-/// hierarchies. `/sys/fs/cgroup/memory.max` alone is only the namespace root;
-/// a systemd service can be constrained farther down that tree.
+// Read the process's cgroup memory limit, including nested cgroup v2 and v1
+// hierarchies. `/sys/fs/cgroup/memory.max` alone is only the namespace root;
+// a systemd service can be constrained farther down that tree.
 fn detect_cgroup_memory_limit() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -532,8 +532,8 @@ fn parse_cgroup_memory_limit(value: &str) -> Option<u64> {
 // Disk
 // ---------------------------------------------------------------------------
 
-/// Measure random 4 KB read IOPS, including the explicit test/benchmark
-/// override. This runs after HTTP startup in the long-lived server process.
+// Measure random 4 KB read IOPS, including the explicit test/benchmark
+// override. This runs after HTTP startup in the long-lived server process.
 pub fn measure_random_read_iops(output_dir: &Path) -> f64 {
     match startup_iops_override() {
         Some(pinned) => {
@@ -544,10 +544,10 @@ pub fn measure_random_read_iops(output_dir: &Path) -> f64 {
     }
 }
 
-/// `WEAVER_STARTUP_IOPS=<positive number>` skips the startup random-read
-/// probe and pins `random_read_iops` to that value, so benchmark and e2e
-/// runs are not skewed by the probe's I/O wait (and tuning stays
-/// deterministic across runs). Unset or invalid values run the probe.
+// `WEAVER_STARTUP_IOPS=<positive number>` skips the startup random-read
+// probe and pins `random_read_iops` to that value, so benchmark and e2e
+// runs are not skewed by the probe's I/O wait (and tuning stays
+// deterministic across runs). Unset or invalid values run the probe.
 fn startup_iops_override() -> Option<f64> {
     parse_startup_iops(std::env::var("WEAVER_STARTUP_IOPS").ok().as_deref())
 }
@@ -557,10 +557,10 @@ fn parse_startup_iops(raw: Option<&str>) -> Option<f64> {
     (value.is_finite() && value > 0.0).then_some(value)
 }
 
-/// Benchmark random 4 KB read IOPS on the given directory's filesystem.
-///
-/// Creates a temporary 4 MB file, issues 200 random `pread()` calls,
-/// and returns measured IOPS. Takes <1 ms on SSD, ~1 s on HDD.
+// Benchmark random 4 KB read IOPS on the given directory's filesystem.
+//
+// Creates a temporary 4 MB file, issues 200 random `pread()` calls,
+// and returns measured IOPS. Takes <1 ms on SSD, ~1 s on HDD.
 #[cfg(unix)]
 fn benchmark_random_read_iops(dir: &Path) -> Option<f64> {
     use std::io::Write;
@@ -666,8 +666,8 @@ fn benchmark_random_read_iops(dir: &Path) -> Option<f64> {
     }
 }
 
-/// Fallback for platforms without a positional-read benchmark: assume
-/// SSD-class IOPS. The tuner will adjust based on observed throughput.
+// Fallback for platforms without a positional-read benchmark: assume
+// SSD-class IOPS. The tuner will adjust based on observed throughput.
 #[cfg(not(any(unix, windows)))]
 fn benchmark_random_read_iops(_dir: &Path) -> Option<f64> {
     Some(50_000.0)
@@ -699,9 +699,9 @@ fn detect_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
     }
 }
 
-/// Windows: the volume behind the directory answers the filesystem name, the
-/// drive type says whether it is a network share, and the storage device
-/// behind the volume says whether it incurs a seek penalty (rotational).
+// Windows: the volume behind the directory answers the filesystem name, the
+// drive type says whether it is a network share, and the storage device
+// behind the volume says whether it incurs a seek penalty (rotational).
 #[cfg(windows)]
 fn windows_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -788,9 +788,9 @@ fn storage_class_from_seek_penalty(penalty: Option<bool>) -> StorageClass {
     }
 }
 
-/// Ask the storage device behind a volume root like `C:\` whether it incurs a
-/// seek penalty. `None` when the volume has no drive letter (a mounted folder)
-/// or the device does not answer the query.
+// Ask the storage device behind a volume root like `C:\` whether it incurs a
+// seek penalty. `None` when the volume has no drive letter (a mounted folder)
+// or the device does not answer the query.
 #[cfg(windows)]
 fn windows_seek_penalty(volume_root: &[u16]) -> Option<bool> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -877,7 +877,7 @@ fn windows_seek_penalty(volume_root: &[u16]) -> Option<bool> {
     Some(descriptor.IncursSeekPenalty)
 }
 
-/// macOS: use `diskutil info` to detect storage class and filesystem.
+// macOS: use `diskutil info` to detect storage class and filesystem.
 #[cfg(target_os = "macos")]
 fn macos_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
     // Resolve the path to handle symlinks, then find its mount point.
@@ -931,7 +931,7 @@ fn macos_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
     (storage_class, filesystem)
 }
 
-/// Find the mount point for a given path on macOS using `df`.
+// Find the mount point for a given path on macOS using `df`.
 #[cfg(target_os = "macos")]
 fn find_mount_point_macos(path: &Path) -> String {
     // `df <path>` outputs: "Filesystem ... Mounted on\n/dev/disk3s1 ... /System/Volumes/Data"
@@ -959,7 +959,7 @@ fn find_mount_point_macos(path: &Path) -> String {
     "/".to_string()
 }
 
-/// Linux: check rotational flag and /proc/mounts for filesystem type.
+// Linux: check rotational flag and /proc/mounts for filesystem type.
 #[cfg(target_os = "linux")]
 fn linux_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
     let target = std::fs::canonicalize(output_dir)
@@ -972,7 +972,7 @@ fn linux_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {
     (storage_class, filesystem)
 }
 
-/// Detect SSD vs HDD on Linux by reading the rotational flag.
+// Detect SSD vs HDD on Linux by reading the rotational flag.
 #[cfg(target_os = "linux")]
 fn linux_storage_class(path: &Path) -> StorageClass {
     // Find the device for the path using df.
@@ -1001,8 +1001,8 @@ fn linux_storage_class(path: &Path) -> StorageClass {
     }
 }
 
-/// Strip partition number suffix from a device name.
-/// `sda1` -> `sda`, `nvme0n1p1` -> `nvme0n1`, `vda2` -> `vda`.
+// Strip partition number suffix from a device name.
+// `sda1` -> `sda`, `nvme0n1p1` -> `nvme0n1`, `vda2` -> `vda`.
 #[cfg(target_os = "linux")]
 fn strip_partition_suffix(dev: &str) -> &str {
     // NVMe: nvme0n1p1 -> nvme0n1
@@ -1022,7 +1022,7 @@ fn strip_partition_suffix(dev: &str) -> &str {
     &dev[..end]
 }
 
-/// Detect filesystem type on Linux from /proc/mounts.
+// Detect filesystem type on Linux from /proc/mounts.
 #[cfg(target_os = "linux")]
 fn linux_filesystem_type(path: &Path) -> FilesystemType {
     let mounts = match std::fs::read_to_string("/proc/mounts") {
@@ -1053,7 +1053,7 @@ fn linux_filesystem_type(path: &Path) -> FilesystemType {
     parse_filesystem_type(best_fstype)
 }
 
-/// Map a filesystem name string to our enum.
+// Map a filesystem name string to our enum.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn parse_filesystem_type(s: &str) -> FilesystemType {
     let lower = s.to_lowercase();

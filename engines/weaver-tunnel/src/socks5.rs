@@ -1,24 +1,24 @@
-//! A minimal SOCKS5 front, hand-rolled over tokio.
-//!
-//! This is the adaptor that makes a tunnel look like an ordinary transport
-//! proxy: every existing egress site already knows how to hand reqwest a
-//! `socks5h://` URL, so a tunnel publishes one and nothing else in the codebase
-//! learns a new concept.
-//!
-//! Deliberate limits, because this front serves exactly one caller (our own
-//! process, over loopback) and every additional feature is attack surface:
-//!
-//! * **Loopback peers only.** The listener binds `127.0.0.1:0`, and the peer
-//!   address is re-checked on accept anyway.
-//! * **Authentication.** Production bridges require per-bridge credentials.
-//!   Loopback binding alone does not authenticate another local process.
-//! * **CONNECT only.** BIND and UDP ASSOCIATE are answered `0x07`
-//!   (command not supported).
-//! * **All three address types.** IPv4, IPv6 and — the one that matters —
-//!   domain names, which are passed to the provider unresolved so they resolve
-//!   on the far side of the tunnel.
-//! * **A handshake budget.** A peer that opens a socket and says nothing is
-//!   dropped after the configured timeout instead of holding a task forever.
+// A minimal SOCKS5 front, hand-rolled over tokio.
+//
+// This is the adaptor that makes a tunnel look like an ordinary transport
+// proxy: every existing egress site already knows how to hand reqwest a
+// `socks5h://` URL, so a tunnel publishes one and nothing else in the codebase
+// learns a new concept.
+//
+// Deliberate limits, because this front serves exactly one caller (our own
+// process, over loopback) and every additional feature is attack surface:
+//
+// * **Loopback peers only.** The listener binds `127.0.0.1:0`, and the peer
+//   address is re-checked on accept anyway.
+// * **Authentication.** Production bridges require per-bridge credentials.
+//   Loopback binding alone does not authenticate another local process.
+// * **CONNECT only.** BIND and UDP ASSOCIATE are answered `0x07`
+//   (command not supported).
+// * **All three address types.** IPv4, IPv6 and — the one that matters —
+//   domain names, which are passed to the provider unresolved so they resolve
+//   on the far side of the tunnel.
+// * **A handshake budget.** A peer that opens a socket and says nothing is
+//   dropped after the configured timeout instead of holding a task forever.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -56,7 +56,7 @@ fn credentials_match(expected: &[u8], supplied: &[u8]) -> bool {
         == 0
 }
 
-/// Everything one front needs to serve connections.
+// Everything one front needs to serve connections.
 pub struct Socks5Front {
     provider: Arc<dyn TunnelProvider>,
     observer: Arc<dyn TunnelObserver>,
@@ -67,9 +67,9 @@ pub struct Socks5Front {
     pub(crate) slots: Arc<tokio::sync::Semaphore>,
 }
 
-/// Why a single SOCKS5 conversation ended early. Never surfaced to an
-/// operator — the peer is our own reqwest client, which reports the failure
-/// in its own words — but traced, and mapped onto a SOCKS5 reply code.
+// Why a single SOCKS5 conversation ended early. Never surfaced to an
+// operator — the peer is our own reqwest client, which reports the failure
+// in its own words — but traced, and mapped onto a SOCKS5 reply code.
 #[derive(Debug)]
 enum Socks5Failure {
     Io(std::io::Error),
@@ -93,11 +93,11 @@ impl From<std::io::Error> for Socks5Failure {
     }
 }
 
-/// A peer is allowed only if it is on the loopback interface.
-///
-/// The listener already binds a loopback address, so this can only fire if the
-/// bind is ever changed; it is cheap insurance that a tunnel front never
-/// becomes an open proxy for the network.
+// A peer is allowed only if it is on the loopback interface.
+//
+// The listener already binds a loopback address, so this can only fire if the
+// bind is ever changed; it is cheap insurance that a tunnel front never
+// becomes an open proxy for the network.
 pub fn peer_is_permitted(peer: &SocketAddr) -> bool {
     peer.ip().is_loopback()
 }
@@ -139,7 +139,7 @@ impl Socks5Front {
         }
     }
 
-    /// Accept loop. Runs until `shutdown` is notified or the listener dies.
+    // Accept loop. Runs until `shutdown` is notified or the listener dies.
     pub async fn serve(self: Arc<Self>, listener: TcpListener, shutdown: Arc<tokio::sync::Notify>) {
         // Owning the tasks closes every carried stream when the front is revoked.
         let mut connections = tokio::task::JoinSet::new();
@@ -285,8 +285,8 @@ impl Socks5Front {
             .map_err(Socks5Failure::Io)
     }
 
-    /// Method negotiation followed by the CONNECT request. Returns the
-    /// destination the peer asked for, unresolved.
+    // Method negotiation followed by the CONNECT request. Returns the
+    // destination the peer asked for, unresolved.
     async fn negotiate(&self, stream: &mut TcpStream) -> Result<(String, u16), Socks5Failure> {
         let mut greeting = [0u8; 2];
         stream.read_exact(&mut greeting).await?;
@@ -385,9 +385,9 @@ impl Socks5Front {
     }
 }
 
-/// Map a dial failure onto the closest SOCKS5 reply code. reqwest reports every
-/// one of these as a connect error, which is what makes the proxy-hop
-/// classification in `transport_proxy` fire.
+// Map a dial failure onto the closest SOCKS5 reply code. reqwest reports every
+// one of these as a connect error, which is what makes the proxy-hop
+// classification in `transport_proxy` fire.
 fn reply_code_for(error: &TunnelError) -> u8 {
     match error {
         TunnelError::Dial { detail, .. } if detail.contains("ConnectFailed") => {
@@ -398,9 +398,9 @@ fn reply_code_for(error: &TunnelError) -> u8 {
     }
 }
 
-/// A SOCKS5 reply with a zeroed bound address. The client never uses BND.ADDR
-/// on a CONNECT, and there is no meaningful local address to report for a
-/// stream that lives inside an SSH channel.
+// A SOCKS5 reply with a zeroed bound address. The client never uses BND.ADDR
+// on a CONNECT, and there is no meaningful local address to report for a
+// stream that lives inside an SSH channel.
 async fn reply(stream: &mut TcpStream, code: u8) -> std::io::Result<()> {
     stream
         .write_all(&[SOCKS5_VERSION, code, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
@@ -412,8 +412,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// A provider that hands back one end of an in-memory duplex and records
-    /// what it was asked to dial. No SSH, no sockets.
+    // A provider that hands back one end of an in-memory duplex and records
+    // what it was asked to dial. No SSH, no sockets.
     struct FakeProvider {
         dialled: Mutex<Vec<(String, u16)>>,
         outcome: Mutex<Option<TunnelError>>,

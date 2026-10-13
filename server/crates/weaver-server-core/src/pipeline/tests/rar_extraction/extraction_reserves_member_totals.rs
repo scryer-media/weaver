@@ -1,4 +1,4 @@
-//! `rar_extraction` tests, part of a mechanical split of the original file.
+// `rar_extraction` tests, part of a mechanical split of the original file.
 
 use super::*;
 
@@ -90,10 +90,10 @@ async fn extraction_reserves_member_totals_at_open() {
     );
 }
 
-/// `weaver_pipeline_extract_member_duration_seconds` stays absent until a
-/// member has actually been extracted, then reports one observation per
-/// member. Extraction is rare next to an article, so the wall clock this needs
-/// is nowhere near a per-segment path.
+// `weaver_pipeline_extract_member_duration_seconds` stays absent until a
+// member has actually been extracted, then reports one observation per
+// member. Extraction is rare next to an article, so the wall clock this needs
+// is nowhere near a per-segment path.
 #[tokio::test]
 async fn extracting_members_records_one_wall_duration_each() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -960,17 +960,17 @@ async fn rar_refresh_follow_up_covers_holey_inflight_snapshot() {
     );
 }
 
-/// A coverage gap the plan CANNOT close must park, not respawn.
-///
-/// The follow-up machinery exists for absorbable facts: a holey snapshot's
-/// next rebuild attaches the present volumes and the gap closes. But a
-/// rebuild can also come back with a plan that has NOT absorbed every
-/// registered fact — a chain the opened headers cannot extend, a volume
-/// binding pointing at bytes no rebuild can attach — and an ungated
-/// follow-up then respawns an identical refresh from every completion, at
-/// actor speed, forever: identical inputs, identical plan, same gap. The
-/// completion fingerprint parks the second identical completion; a real
-/// fact change moves the fingerprint and re-arms the gap.
+// A coverage gap the plan CANNOT close must park, not respawn.
+//
+// The follow-up machinery exists for absorbable facts: a holey snapshot's
+// next rebuild attaches the present volumes and the gap closes. But a
+// rebuild can also come back with a plan that has NOT absorbed every
+// registered fact — a chain the opened headers cannot extend, a volume
+// binding pointing at bytes no rebuild can attach — and an ungated
+// follow-up then respawns an identical refresh from every completion, at
+// actor speed, forever: identical inputs, identical plan, same gap. The
+// completion fingerprint parks the second identical completion; a real
+// fact change moves the fingerprint and re-arms the gap.
 #[tokio::test]
 async fn a_refresh_gap_the_plan_cannot_close_parks_instead_of_respawning() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1319,6 +1319,93 @@ async fn rar_refresh_done_uses_actual_refreshed_frontier() {
         Some(BTreeSet::from([0, 1])),
         "refresh completion should keep the actual rebuilt frontier"
     );
+}
+
+#[tokio::test]
+async fn synchronous_rar_rebuild_rejects_pending_refresh() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(40139);
+    let files = build_multifile_multivolume_rar_set();
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        rar_job_spec("RAR Rebuild Refresh Ordering", &files),
+    )
+    .await;
+    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
+    write_and_complete_rar_volume(&mut pipeline, job_id, 0, &files[0].0, &files[0].1).await;
+    let key = (job_id, "show".to_string());
+    let first = pipeline.rar_sets.get(&key).unwrap();
+    let stale_plan = first.plan.clone().unwrap();
+    let stale_headers = pipeline.load_rar_snapshot(job_id, "show").unwrap();
+
+    for (index, (filename, bytes)) in files.iter().enumerate().skip(1) {
+        write_and_complete_rar_volume(&mut pipeline, job_id, index as u32, filename, bytes).await;
+    }
+    let generation = pipeline.rar_sets[&key].extraction_generation;
+    pipeline.rar_refresh_state.insert(
+        key.clone(),
+        RarRefreshState {
+            in_flight: Some(RarRefreshRequest {
+                target_completed_volume: 0,
+                reason: RefreshReason::CoverageExpansion,
+            }),
+            queued: None,
+            latest_completed_volume: 0,
+            refreshed_volumes: BTreeSet::from([0]),
+            structure_dirty: false,
+            last_error: None,
+            last_completion_fingerprint: None,
+        },
+    );
+
+    pipeline
+        .recompute_rar_set_state(job_id, "show")
+        .await
+        .unwrap();
+    let ready = |pipeline: &Pipeline| {
+        pipeline.rar_sets[&key]
+            .plan
+            .as_ref()
+            .unwrap()
+            .ready_members
+            .iter()
+            .map(|member| member.name.clone())
+            .collect::<Vec<_>>()
+    };
+    let expected = ready(&pipeline);
+    assert!(expected.iter().any(|name| name == "E01.mkv"));
+    assert!(
+        !stale_plan
+            .ready_members
+            .iter()
+            .any(|member| member.name == "E01.mkv")
+    );
+
+    pipeline
+        .handle_rar_refresh_done(RarRefreshDone {
+            job_id,
+            set_name: "show".to_string(),
+            request: RarRefreshRequest {
+                target_completed_volume: 0,
+                reason: RefreshReason::CoverageExpansion,
+            },
+            extraction_generation: generation,
+            result: Ok(ComputedRarSetState {
+                plan: stale_plan,
+                headers: stale_headers,
+                rebuild_source:
+                    crate::pipeline::archive::topology::RarTopologyRebuildSource::CachedHeaders,
+                integrated_volumes: BTreeSet::from([0]),
+            }),
+        })
+        .await;
+    assert_eq!(ready(&pipeline), expected);
+    if let Some(refresh) = pipeline.rar_refresh_state.get(&key) {
+        assert!(refresh.in_flight.is_none());
+        assert!(refresh.queued.is_none());
+    }
 }
 
 #[tokio::test]
@@ -2263,13 +2350,13 @@ async fn nested_rar_two_deep_extracts_final_media() {
     assert!(!dest.join("inner.rar").exists());
 }
 
-/// The delivery-naming pass, through the real completion path rather than the
-/// move function alone: the pipeline resolves the plan from config and the
-/// member reaches the complete directory already renamed.
-///
-/// `sample.mkv` is exactly the shape the pass exists for — a single lowercase
-/// word carrying none of the signals a human-written release name carries, on
-/// the one file large enough to be the payload.
+// The delivery-naming pass, through the real completion path rather than the
+// move function alone: the pipeline resolves the plan from config and the
+// member reaches the complete directory already renamed.
+//
+// `sample.mkv` is exactly the shape the pass exists for — a single lowercase
+// word carrying none of the signals a human-written release name carries, on
+// the one file large enough to be the payload.
 #[tokio::test]
 async fn an_obfuscated_extracted_member_reaches_the_complete_dir_under_the_job_name() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2329,7 +2416,20 @@ async fn nested_rar_three_deep_extracts_through_inner_7z() {
     let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
     write_and_complete_rar_volume(&mut pipeline, job_id, 0, fixture_name, &fixture_bytes).await;
 
+    let (reply, received) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(crate::pipeline::SchedulerCommand::PausePostProcessing { reply })
+        .await;
+    received.await.unwrap();
     pipeline.check_job_completion(job_id).await;
+    assert!(pipeline.deferred_post_processing.contains(&job_id));
+    assert_eq!(pipeline.jobs[&job_id].extraction_depth, 0);
+    let (reply, received) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(crate::pipeline::SchedulerCommand::ResumePostProcessing { reply })
+        .await;
+    received.await.unwrap();
+    assert!(pipeline.pending_completion_checks.contains(&job_id));
     drive_extractions_to_terminal(&mut pipeline, job_id, 6).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
@@ -2385,8 +2485,8 @@ async fn nested_single_stream_preserves_non_archive_sibling() {
     tokio::fs::write(staging_dir.join("sample.mkv"), media)
         .await
         .unwrap();
-    let mut xz =
-        lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(0)).unwrap();
+    let props = lzma_turbo::LzmaEncProps::xz_preset(0, false).unwrap();
+    let mut xz = lzma_turbo::XzWriter::new(Vec::new(), &props).unwrap();
     std::io::Write::write_all(&mut xz, notes).unwrap();
     tokio::fs::write(staging_dir.join("release.nfo.xz"), xz.finish().unwrap())
         .await
@@ -2397,6 +2497,28 @@ async fn nested_single_stream_preserves_non_archive_sibling() {
     pipeline.jobs.insert(job_id, state);
     pipeline.job_order.push(job_id);
 
+    let (reply, received) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(crate::pipeline::SchedulerCommand::PausePostProcessing { reply })
+        .await;
+    received.await.unwrap();
+    assert_eq!(
+        pipeline
+            .maybe_start_nested_extraction(job_id)
+            .await
+            .unwrap(),
+        crate::pipeline::completion::NestedExtractionDecision::Deferred
+    );
+    assert_eq!(pipeline.jobs[&job_id].extraction_depth, 0);
+    assert!(!pipeline.inflight_extractions.contains_key(&job_id));
+    assert!(staging_dir.join("release.nfo.xz").exists());
+    let (reply, received) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(crate::pipeline::SchedulerCommand::ResumePostProcessing { reply })
+        .await;
+    received.await.unwrap();
+
+    assert!(pipeline.pending_completion_checks.contains(&job_id));
     assert!(matches!(
         pipeline
             .maybe_start_nested_extraction(job_id)
@@ -2694,14 +2816,14 @@ async fn upstream_probe_registers_obfuscated_split_topology_rar_volumes_before_c
     assert!(dest.join("E02.mkv").exists());
 }
 
-/// A chase armed after the download is over finishes with nothing left to
-/// join it, so the reap has to bring the job back to completion.
-///
-/// The idle-restart pass offers each set to a RAR chase before the batch
-/// scheduler, and a set the chase takes is no longer the batch scheduler's.
-/// Every part is already complete, so no file completion is left to join that
-/// chase; the reap stored its outcome and nothing ever consumed it, leaving the
-/// job in extraction with its output sitting in staging.
+// A chase armed after the download is over finishes with nothing left to
+// join it, so the reap has to bring the job back to completion.
+//
+// The idle-restart pass offers each set to a RAR chase before the batch
+// scheduler, and a set the chase takes is no longer the batch scheduler's.
+// Every part is already complete, so no file completion is left to join that
+// chase; the reap stored its outcome and nothing ever consumed it, leaving the
+// job in extraction with its output sitting in staging.
 #[tokio::test]
 async fn a_rar_chase_armed_by_idle_restart_is_joined_once_it_finishes() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -2879,7 +3001,7 @@ async fn restore_job_rehydrates_detected_obfuscated_rar_identity() {
         .unwrap()
         .remove(&job_id)
         .unwrap();
-    drop(pipeline);
+    retire_pipeline_database(pipeline).await;
     let (mut restored, _intermediate_dir, complete_dir_restored) =
         new_direct_pipeline(&temp_dir).await;
     restored
@@ -2990,13 +3112,13 @@ async fn list_jobs_keeps_legacy_idle_post_state_for_waiting_rar_phase() {
     assert_eq!(info.post_state, crate::jobs::model::PostState::Idle);
 }
 
-/// Regression for the removed PAR2 expected-hash substitution: a completed
-/// RAR volume whose yEnc aggregate CRC matches must NOT have the recovery
-/// set's EXPECTED MD5 persisted as though it had been calculated. The yEnc
-/// header is the poster's own declaration; a same-length different byte
-/// sequence with internally consistent yEnc CRCs used to sail through here
-/// and later self-certify quick verification against the very hash it was
-/// copied from, overriding a `Damaged` IFSC verdict.
+// Regression for the removed PAR2 expected-hash substitution: a completed
+// RAR volume whose yEnc aggregate CRC matches must NOT have the recovery
+// set's EXPECTED MD5 persisted as though it had been calculated. The yEnc
+// header is the poster's own declaration; a same-length different byte
+// sequence with internally consistent yEnc CRCs used to sail through here
+// and later self-certify quick verification against the very hash it was
+// copied from, overriding a `Damaged` IFSC verdict.
 #[tokio::test]
 async fn completed_rar_with_par2_metadata_never_persists_the_expected_hash() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3056,9 +3178,9 @@ async fn completed_rar_with_par2_metadata_never_persists_the_expected_hash() {
     assert_ne!(any.get(&0).copied(), Some(expected_hash));
 }
 
-/// Twin of the test above for the no-whole-file-CRC arm the substitution also
-/// served: with only part CRCs verified, completion must still not mint the
-/// PAR2 expectation as a persisted digest.
+// Twin of the test above for the no-whole-file-CRC arm the substitution also
+// served: with only part CRCs verified, completion must still not mint the
+// PAR2 expectation as a persisted digest.
 #[tokio::test]
 async fn completed_rar_without_whole_file_crc_never_persists_the_expected_hash() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -3413,6 +3535,7 @@ async fn restore_job_reuses_persisted_rar_volume_facts_after_restart() {
             .add_extracted_member(job_id, "E01.mkv", &working_dir.join("E01.mkv"))
             .unwrap();
         pipeline.try_delete_volumes(job_id, "show");
+        retire_pipeline_database(pipeline).await;
         working_dir
     };
 

@@ -10,6 +10,9 @@ fn scope_permissions() {
     assert!(!CallerScope::Read.can_control());
     assert!(CallerScope::Control.can_control());
     assert!(CallerScope::Admin.can_control());
+    assert!(CallerScope::ScriptRun.can_read());
+    assert!(!CallerScope::ScriptRun.can_control());
+    assert!(!CallerScope::ScriptRun.is_admin());
 }
 
 #[test]

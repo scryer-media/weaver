@@ -377,7 +377,7 @@ fn file_role_classifies_trailing_sanitized_artifacts() {
             "Fixture.Payload.part01.rar_",
             &FileRole::from_filename("Fixture.Payload.part01.rar_")
         ),
-        Some("Fixture.Payload".to_string())
+        Some("fixture.payload".to_string())
     );
 }
 
@@ -405,15 +405,19 @@ fn archive_base_name_7z() {
     );
     assert_eq!(
         archive_base_name("Show.S01E01.7z.001", &FileRole::SevenZipSplit { number: 0 }),
-        Some("Show.S01E01.7z".into())
+        Some("show.s01e01.7z".into())
     );
     assert_eq!(
         archive_base_name("Show.S01E01.7z.003", &FileRole::SevenZipSplit { number: 2 }),
-        Some("Show.S01E01.7z".into())
+        Some("show.s01e01.7z".into())
     );
     assert_ne!(
         archive_base_name("Show.S01E01.7z.001", &FileRole::SevenZipSplit { number: 0 }),
         archive_base_name("Show.S01E02.7z.001", &FileRole::SevenZipSplit { number: 0 }),
+    );
+    assert_eq!(
+        archive_base_name("Show.S01E01.7z.001", &FileRole::SevenZipSplit { number: 0 }),
+        archive_base_name("show.s01e01.7Z.002", &FileRole::SevenZipSplit { number: 1 }),
     );
 }
 
@@ -433,6 +437,16 @@ fn archive_base_name_rar() {
     assert_eq!(
         archive_base_name("movie.r00", &FileRole::RarVolume { volume_number: 1 }),
         Some("movie".into())
+    );
+    assert_eq!(
+        archive_base_name(
+            "Movie.part01.rar",
+            &FileRole::RarVolume { volume_number: 0 }
+        ),
+        archive_base_name(
+            "movie.part02.RAR",
+            &FileRole::RarVolume { volume_number: 1 }
+        ),
     );
 }
 

@@ -14,16 +14,16 @@ pub(in crate::pipeline) fn lane_acquire_failure_for_work(
     }
 }
 
-/// Closes one decode task's wall-clock measurement, on whichever path the task
-/// leaves by.
-///
-/// This is the single, deliberate exception to "no clock reads on a
-/// per-segment path". `perf_probe::scope` already pays an unconditional
-/// `Instant::now()` when the task starts; this guard adds the matching read at
-/// the end and feeds the *same* `Duration` to both the profile bucket and the
-/// histogram, so profiling on or off the cost is one extra clock read per
-/// decode task — one per decoded article, roughly one per 750 KB of work, not
-/// one per byte. Everything else on this path stays `Relaxed`-atomic only.
+// Closes one decode task's wall-clock measurement, on whichever path the task
+// leaves by.
+//
+// This is the single, deliberate exception to "no clock reads on a
+// per-segment path". `perf_probe::scope` already pays an unconditional
+// `Instant::now()` when the task starts; this guard adds the matching read at
+// the end and feeds the *same* `Duration` to both the profile bucket and the
+// histogram, so profiling on or off the cost is one extra clock read per
+// decode task — one per decoded article, roughly one per 750 KB of work, not
+// one per byte. Everything else on this path stays `Relaxed`-atomic only.
 struct DecodeTaskTimer {
     scope: Option<crate::runtime::perf_probe::Scope>,
     metrics: Arc<crate::operations::metrics::PipelineMetrics>,
@@ -73,18 +73,18 @@ fn send_blocking_decode_failure(
 }
 
 impl Pipeline {
-    /// Decode an article that arrived as an undecoded buffer.
-    ///
-    /// This is the buffer-decode path, reached only from
-    /// [`DownloadPayload::Raw`]. Production never takes it: the download lanes
-    /// decode inline and hand back [`DownloadPayload::Decoded`], so `Raw` is
-    /// constructed only by tests.
-    ///
-    /// It is therefore yEnc-only. The uuencode sniffer lives in the fused
-    /// streaming decoder, which this path does not use, so a uuencode article
-    /// routed through here would fail its decode exactly as it did before
-    /// uuencode support existed. If `Raw` is ever made production-reachable
-    /// again, this path needs the same sniffer the fused decoder has.
+    // Decode an article that arrived as an undecoded buffer.
+    //
+    // This is the buffer-decode path, reached only from
+    // [`DownloadPayload::Raw`]. Production never takes it: the download lanes
+    // decode inline and hand back [`DownloadPayload::Decoded`], so `Raw` is
+    // constructed only by tests.
+    //
+    // It is therefore yEnc-only. The uuencode sniffer lives in the fused
+    // streaming decoder, which this path does not use, so a uuencode article
+    // routed through here would fail its decode exactly as it did before
+    // uuencode support existed. If `Raw` is ever made production-reachable
+    // again, this path needs the same sniffer the fused decoder has.
     pub(in crate::pipeline::download::worker) fn spawn_decode_task(
         &self,
         work: PendingDecodeWork,
@@ -354,15 +354,15 @@ impl Pipeline {
         self.pending_decode = remaining;
     }
 
-    /// Send a lease to the download engine.
-    ///
-    /// There is exactly one engine: the owned blocking lanes. Every server a
-    /// config can describe is lane-served — plaintext, implicit TLS, STARTTLS,
-    /// and a TLS server whose preferred backend cannot build trust for it,
-    /// which the rustls backend picks up — so no server needs a second
-    /// download path and none exists. The only lease that leaves here by
-    /// another route is one whose articles are already in the repeated-article
-    /// cache, which is answered from memory rather than fetched at all.
+    // Send a lease to the download engine.
+    //
+    // There is exactly one engine: the owned blocking lanes. Every server a
+    // config can describe is lane-served — plaintext, implicit TLS, STARTTLS,
+    // and a TLS server whose preferred backend cannot build trust for it,
+    // which the rustls backend picks up — so no server needs a second
+    // download path and none exists. The only lease that leaves here by
+    // another route is one whose articles are already in the repeated-article
+    // cache, which is answered from memory rather than fetched at all.
     pub(crate) fn spawn_download_batch(&mut self, initial_lease: DownloadBatchLease) {
         if initial_lease.works.is_empty() {
             return;

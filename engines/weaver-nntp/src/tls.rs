@@ -30,8 +30,8 @@ use tokio_rustls::rustls::{
 use crate::address_plan::AddressRoute;
 use crate::error::NntpError;
 
-/// Keeps normal WebPKI verification intact while allowing one explicitly
-/// adopted leaf certificate to bypass only a hostname mismatch.
+// Keeps normal WebPKI verification intact while allowing one explicitly
+// adopted leaf certificate to bypass only a hostname mismatch.
 #[derive(Debug)]
 enum NameMismatchCertificatePolicy {
     Adopted(Vec<u8>),
@@ -112,10 +112,10 @@ fn is_name_mismatch(error: &RustlsError) -> bool {
     )
 }
 
-/// Stream type behind the `S2nTls` variant. On Windows, where s2n-tls cannot
-/// compile, this aliases an uninhabited placeholder: the variant still
-/// typechecks (pin-project-lite cannot cfg-gate variants) but can never be
-/// constructed because backend selection rejects s2n there.
+// Stream type behind the `S2nTls` variant. On Windows, where s2n-tls cannot
+// compile, this aliases an uninhabited placeholder: the variant still
+// typechecks (pin-project-lite cannot cfg-gate variants) but can never be
+// constructed because backend selection rejects s2n there.
 #[cfg(not(windows))]
 type S2nTransportStream = S2nTlsStream<RouteStream>;
 #[cfg(windows)]
@@ -161,19 +161,19 @@ impl AsyncWrite for UnsupportedTlsStream {
 }
 
 pin_project_lite::pin_project! {
-    /// A transport that is either a plain TCP connection or a TLS-wrapped one.
-    ///
-    /// `ManualTls` is the production TLS path. `Tls` keeps the tokio-rustls
-    /// stream available for diagnostics that compare read batching behavior.
+    // A transport that is either a plain TCP connection or a TLS-wrapped one.
+    //
+    // `ManualTls` is the production TLS path. `Tls` keeps the tokio-rustls
+    // stream available for diagnostics that compare read batching behavior.
     #[project = NntpTransportProj]
     pub enum NntpTransport {
-        /// Unencrypted TCP.
+        // Unencrypted TCP.
         Plain { #[pin] inner: RouteStream, remote_addr: Option<SocketAddr> },
-        /// TLS-encrypted TCP through tokio-rustls.
+        // TLS-encrypted TCP through tokio-rustls.
         Tls { #[pin] inner: RustlsTlsStream<RouteStream>, remote_addr: Option<SocketAddr> },
-        /// TLS-encrypted TCP driven directly through rustls.
+        // TLS-encrypted TCP driven directly through rustls.
         ManualTls { inner: ManualTlsStream, remote_addr: Option<SocketAddr> },
-        /// TLS-encrypted TCP through s2n-tls (non-Windows only).
+        // TLS-encrypted TCP through s2n-tls (non-Windows only).
         S2nTls { #[pin] inner: S2nTransportStream, remote_addr: Option<SocketAddr> },
     }
 }
@@ -321,17 +321,17 @@ pub struct ManualTlsStream {
     read_buffer: Vec<u8>,
 }
 
-/// Sync rustls record engine shared by the async `ManualTls` transport and the
-/// blocking owned-lane transport: turns ciphertext slices into plaintext
-/// appended to a `BytesMut` and surfaces pending outbound TLS bytes for the
-/// caller's IO flavor to write.
+// Sync rustls record engine shared by the async `ManualTls` transport and the
+// blocking owned-lane transport: turns ciphertext slices into plaintext
+// appended to a `BytesMut` and surfaces pending outbound TLS bytes for the
+// caller's IO flavor to write.
 pub(crate) struct RustlsSession {
     tls: ClientConnection,
 }
 
 impl RustlsSession {
-    /// Idle NNTP has no application data. EOF, plaintext, and fatal TLS
-    /// errors all mean the cached transport must not serve another command.
+    // Idle NNTP has no application data. EOF, plaintext, and fatal TLS
+    // errors all mean the cached transport must not serve another command.
     pub(crate) fn idle_terminal(&mut self) -> bool {
         !matches!(self.tls.reader().read(&mut [0; 1]), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
     }
@@ -355,12 +355,12 @@ impl RustlsSession {
         self.tls.is_handshaking()
     }
 
-    /// Queue plaintext for encryption; drain the result with `next_outbound`.
+    // Queue plaintext for encryption; drain the result with `next_outbound`.
     pub(crate) fn buffer_plaintext(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.tls.writer().write_all(bytes)
     }
 
-    /// Next chunk of pending outbound TLS bytes, or `None` once drained.
+    // Next chunk of pending outbound TLS bytes, or `None` once drained.
     pub(crate) fn next_outbound(&mut self) -> io::Result<Option<Vec<u8>>> {
         if !self.tls.wants_write() {
             return Ok(None);
@@ -375,8 +375,8 @@ impl RustlsSession {
 }
 
 impl NntpTransport {
-    /// Inspect only idle transport state: no NNTP commands, waits, or more
-    /// than 64 KiB of ciphertext. Fragmented TLS state stays in the session.
+    // Inspect only idle transport state: no NNTP commands, waits, or more
+    // than 64 KiB of ciphertext. Fragmented TLS state stays in the session.
     pub(crate) fn idle_terminal(&mut self) -> bool {
         let poll = |stream: &mut (dyn AsyncRead + Unpin)| {
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -438,7 +438,7 @@ impl NntpTransport {
         }
     }
 
-    /// Returns `true` if this transport is TLS-encrypted.
+    // Returns `true` if this transport is TLS-encrypted.
     pub fn is_tls(&self) -> bool {
         matches!(
             self,
@@ -457,8 +457,8 @@ impl NntpTransport {
         }
     }
 
-    /// IANA name of the negotiated TLS cipher suite, when this transport is
-    /// TLS and the handshake has completed.
+    // IANA name of the negotiated TLS cipher suite, when this transport is
+    // TLS and the handshake has completed.
     pub fn negotiated_cipher_suite(&self) -> Option<String> {
         match self {
             NntpTransport::Plain { .. } => None,
@@ -928,28 +928,28 @@ impl AsyncWrite for NntpTransport {
     }
 }
 
-/// Build a `rustls` `ClientConfig` using Mozilla root certificates,
-/// optionally augmented with a custom CA certificate from a PEM file.
-/// Which AEAD family the TLS ClientHello offers first.
-///
-/// The fastest suite is a property of the local CPU, not of the upstream.
-/// With hardware AES (AES-NI/VAES, ARMv8 crypto extensions) AES-128-GCM beats
-/// AES-256-GCM by four rounds and both beat ChaCha20-Poly1305 several times
-/// over; without it ChaCha20 wins. Servers may still impose their own order,
-/// which the save-time probe records per server.
+// Build a `rustls` `ClientConfig` using Mozilla root certificates,
+// optionally augmented with a custom CA certificate from a PEM file.
+// Which AEAD family the TLS ClientHello offers first.
+//
+// The fastest suite is a property of the local CPU, not of the upstream.
+// With hardware AES (AES-NI/VAES, ARMv8 crypto extensions) AES-128-GCM beats
+// AES-256-GCM by four rounds and both beat ChaCha20-Poly1305 several times
+// over; without it ChaCha20 wins. Servers may still impose their own order,
+// which the save-time probe records per server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlsCipherPreference {
-    /// Resolve from the local CPU once per process.
+    // Resolve from the local CPU once per process.
     #[default]
     Auto,
-    /// AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305.
+    // AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305.
     AesFirst,
-    /// ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM.
+    // ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM.
     ChaChaFirst,
 }
 
 impl TlsCipherPreference {
-    /// The concrete order this preference produces on this machine.
+    // The concrete order this preference produces on this machine.
     pub fn resolve(self) -> Self {
         match self {
             Self::Auto => {
@@ -963,9 +963,9 @@ impl TlsCipherPreference {
         }
     }
 
-    /// Whether a negotiated suite is the family this preference offers
-    /// first. A server that answers with anything else did not follow the
-    /// client's order; one that answers with the first offer is taken to.
+    // Whether a negotiated suite is the family this preference offers
+    // first. A server that answers with anything else did not follow the
+    // client's order; one that answers with the first offer is taken to.
     pub fn leads_with(self, negotiated_suite: &str) -> bool {
         match self.resolve() {
             Self::ChaChaFirst => negotiated_suite.contains("CHACHA20"),
@@ -1007,7 +1007,7 @@ fn cipher_family(suite: CipherSuite) -> CipherFamily {
     }
 }
 
-/// IANA-style suite name shared by both TLS backends (`TLS_AES_128_GCM_SHA256`).
+// IANA-style suite name shared by both TLS backends (`TLS_AES_128_GCM_SHA256`).
 pub(crate) fn iana_cipher_suite_name(suite: CipherSuite) -> String {
     let name = format!("{suite:?}");
     match name.strip_prefix("TLS13_") {
@@ -1016,7 +1016,7 @@ pub(crate) fn iana_cipher_suite_name(suite: CipherSuite) -> String {
     }
 }
 
-/// Whether this CPU accelerates AES (detected once per process).
+// Whether this CPU accelerates AES (detected once per process).
 pub fn cpu_has_aes_acceleration() -> bool {
     static DETECTED: OnceLock<bool> = OnceLock::new();
     *DETECTED.get_or_init(detect_cpu_aes_acceleration)
@@ -1037,9 +1037,9 @@ fn detect_cpu_aes_acceleration() -> bool {
     }
 }
 
-/// Stable-sort the provider's suites so the ClientHello leads with the
-/// preferred family. TLS 1.3 suites stay ahead of TLS 1.2 suites; rustls only
-/// ever considers the suites of the negotiated protocol version.
+// Stable-sort the provider's suites so the ClientHello leads with the
+// preferred family. TLS 1.3 suites stay ahead of TLS 1.2 suites; rustls only
+// ever considers the suites of the negotiated protocol version.
 fn order_cipher_suites(suites: &mut [SupportedCipherSuite], preference: TlsCipherPreference) {
     suites.sort_by_key(|suite| {
         let version_rank = u8::from(suite.tls13().is_none());
@@ -1050,9 +1050,9 @@ fn order_cipher_suites(suites: &mut [SupportedCipherSuite], preference: TlsCiphe
     });
 }
 
-/// s2n security policies carry a fixed suite order (AES-128-GCM first), so a
-/// preference that resolves to anything else runs on rustls, which orders its
-/// ClientHello freely.
+// s2n security policies carry a fixed suite order (AES-128-GCM first), so a
+// preference that resolves to anything else runs on rustls, which orders its
+// ClientHello freely.
 pub(crate) fn tls_backend_for_preference(
     backend: NntpTlsBackend,
     preference: TlsCipherPreference,
@@ -1072,8 +1072,8 @@ pub fn build_tls_config(
     build_tls_config_with_name_mismatch_policy(ca_cert_path, None, cipher_preference)
 }
 
-/// Build a TLS config that may accept one explicitly adopted leaf certificate
-/// when, and only when, normal verification reached a hostname mismatch.
+// Build a TLS config that may accept one explicitly adopted leaf certificate
+// when, and only when, normal verification reached a hostname mismatch.
 pub fn build_tls_config_with_name_mismatch_certificate(
     ca_cert_path: Option<&Path>,
     adopted_name_mismatch_certificate_der: Option<&[u8]>,
@@ -1178,24 +1178,24 @@ impl NntpTlsBackend {
     }
 }
 
-/// Name of the TLS backend that carries article bodies, for `weaver_build_info`.
-///
-/// Reports the **owned blocking BODY lane's** choice, because that is the lane
-/// the bulk of the traffic goes through and the only one whose default differs
-/// by platform: unix defaults to s2n, Windows is always the rustls engine.
-/// `WEAVER_NNTP_TLS_BACKEND` overrides both lanes at once, so whenever an
-/// operator has made a choice this reports exactly that choice.
-///
-/// An unparseable override falls back to the rustls engine rather than
-/// failing: this exists to label a build, and a label must not be able to take
-/// the exporter down. The connection path still rejects the bad value loudly.
+// Name of the TLS backend that carries article bodies, for `weaver_build_info`.
+//
+// Reports the **owned blocking BODY lane's** choice, because that is the lane
+// the bulk of the traffic goes through and the only one whose default differs
+// by platform: unix defaults to s2n, Windows is always the rustls engine.
+// `WEAVER_NNTP_TLS_BACKEND` overrides both lanes at once, so whenever an
+// operator has made a choice this reports exactly that choice.
+//
+// An unparseable override falls back to the rustls engine rather than
+// failing: this exists to label a build, and a label must not be able to take
+// the exporter down. The connection path still rejects the bad value loudly.
 pub fn selected_tls_backend_name() -> &'static str {
     selected_blocking_tls_backend()
         .unwrap_or(NntpTlsBackend::ManualRustls)
         .as_str()
 }
 
-/// Parse an explicit `WEAVER_NNTP_TLS_BACKEND` value.
+// Parse an explicit `WEAVER_NNTP_TLS_BACKEND` value.
 fn parse_tls_backend(value: &str) -> Result<NntpTlsBackend, NntpError> {
     if value.eq_ignore_ascii_case("s2n") {
         #[cfg(not(windows))]
@@ -1230,9 +1230,9 @@ fn selected_tls_backend() -> Result<NntpTlsBackend, NntpError> {
     Ok(env_tls_backend()?.unwrap_or(NntpTlsBackend::ManualRustls))
 }
 
-/// Backend for the blocking owned BODY lane. Unlike the async default
-/// (manual rustls), unix defaults to s2n to preserve the tuned hot path;
-/// Windows always uses the rustls engine.
+// Backend for the blocking owned BODY lane. Unlike the async default
+// (manual rustls), unix defaults to s2n to preserve the tuned hot path;
+// Windows always uses the rustls engine.
 pub(crate) fn selected_blocking_tls_backend() -> Result<NntpTlsBackend, NntpError> {
     if let Some(backend) = env_tls_backend()? {
         return Ok(backend);
@@ -1321,14 +1321,14 @@ async fn connect_s2n_tls(
         .map_err(s2n_handshake_error)
 }
 
-/// Create a `ServerName` from a hostname string.
+// Create a `ServerName` from a hostname string.
 pub(crate) fn make_server_name(host: &str) -> Result<ServerName<'static>, NntpError> {
     ServerName::try_from(host.to_string())
         .map_err(|_| NntpError::MalformedResponse(format!("invalid hostname for TLS: {host}")))
 }
 
-/// Configure TCP keepalive on a socket to prevent connections from silently
-/// dying behind NATs/firewalls.
+// Configure TCP keepalive on a socket to prevent connections from silently
+// dying behind NATs/firewalls.
 fn set_keepalive(tcp: &TcpStream) {
     let sock_ref = SockRef::from(tcp);
     let ka = socket2::TcpKeepalive::new()
@@ -1337,9 +1337,9 @@ fn set_keepalive(tcp: &TcpStream) {
     let _ = sock_ref.set_tcp_keepalive(&ka);
 }
 
-/// Open the TCP socket for a direct connection: to the address `route`'s plan
-/// picks when there is one, otherwise to the first resolved address that
-/// answers.
+// Open the TCP socket for a direct connection: to the address `route`'s plan
+// picks when there is one, otherwise to the first resolved address that
+// answers.
 pub(crate) async fn dial_direct(
     host: &str,
     port: u16,
@@ -1374,7 +1374,7 @@ pub(crate) async fn dial_direct(
 async fn connect_first_answering(addrs: &[SocketAddr]) -> Result<TcpStream, NntpError> {
     let mut last_error = None;
     for addr in addrs {
-        match TcpStream::connect(addr).await {
+        match crate::egress::SocketEgress::System.connect(*addr).await {
             Ok(tcp) => return Ok(tcp),
             Err(error) => last_error = Some(error),
         }
@@ -1388,10 +1388,10 @@ async fn connect_first_answering(addrs: &[SocketAddr]) -> Result<TcpStream, Nntp
     })))
 }
 
-/// Inspect a certificate that failed only normal hostname validation.
-///
-/// This performs a TLS handshake only: it never reads the NNTP greeting or
-/// sends `MODE READER`, authentication, or any other NNTP command.
+// Inspect a certificate that failed only normal hostname validation.
+//
+// This performs a TLS handshake only: it never reads the NNTP greeting or
+// sends `MODE READER`, authentication, or any other NNTP command.
 pub async fn inspect_tls_name_mismatch_certificate(
     host: &str,
     port: u16,
@@ -1400,10 +1400,10 @@ pub async fn inspect_tls_name_mismatch_certificate(
     inspect_tls_name_mismatch_certificate_via(host, port, ca_cert_path, None).await
 }
 
-/// The hostnames a certificate is issued for, for showing to a person.
-///
-/// Returns the certificate's DNS subject alternative names, or its subject
-/// common name when it has none. Empty when the certificate cannot be parsed.
+// The hostnames a certificate is issued for, for showing to a person.
+//
+// Returns the certificate's DNS subject alternative names, or its subject
+// common name when it has none. Empty when the certificate cannot be parsed.
 pub fn certificate_names(der: &[u8]) -> Vec<String> {
     let der = CertificateDer::from(der);
     let Ok(cert) = webpki::EndEntityCert::try_from(&der) else {
@@ -1423,7 +1423,7 @@ pub fn certificate_names(der: &[u8]) -> Vec<String> {
     names
 }
 
-/// The first common name in a DER subject whose outer `SEQUENCE` is removed.
+// The first common name in a DER subject whose outer `SEQUENCE` is removed.
 fn subject_common_name(mut subject: &[u8]) -> Option<String> {
     const COMMON_NAME_OID: &[u8] = &[0x55, 0x04, 0x03];
     while !subject.is_empty() {
@@ -1454,7 +1454,7 @@ fn subject_common_name(mut subject: &[u8]) -> Option<String> {
     None
 }
 
-/// Split one DER element into its tag, contents and the bytes after it.
+// Split one DER element into its tag, contents and the bytes after it.
 fn der_element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     let (&tag, rest) = input.split_first()?;
     let (&first, mut rest) = rest.split_first()?;
@@ -1482,12 +1482,14 @@ pub async fn inspect_tls_name_mismatch_certificate_via(
     host: &str,
     port: u16,
     ca_cert_path: Option<&Path>,
-    proxy: Option<&Arc<weaver_tunnel::bridge::Bridge>>,
+    dialer: Option<&Arc<crate::route_dialer::RouteDialer>>,
 ) -> Result<Option<Vec<u8>>, NntpError> {
-    let timeout = proxy.map_or(std::time::Duration::from_secs(30), |p| p.connect_timeout);
+    let timeout = dialer.map_or(std::time::Duration::from_secs(30), |route| {
+        route.inner.budget()
+    });
     tokio::time::timeout(
         timeout,
-        inspect_certificate_inner(host, port, ca_cert_path, proxy),
+        inspect_certificate_inner(host, port, ca_cert_path, dialer),
     )
     .await
     .map_err(|_| NntpError::Timeout)?
@@ -1497,14 +1499,25 @@ async fn inspect_certificate_inner(
     host: &str,
     port: u16,
     ca_cert_path: Option<&Path>,
-    proxy: Option<&Arc<weaver_tunnel::bridge::Bridge>>,
+    dialer: Option<&Arc<crate::route_dialer::RouteDialer>>,
 ) -> Result<Option<Vec<u8>>, NntpError> {
     let captured_leaf_der = Arc::new(Mutex::new(None));
     let tls_config =
         build_tls_config_with_name_mismatch_capture(ca_cert_path, captured_leaf_der.clone())?;
     let server_name = make_server_name(host)?;
-    let tcp: RouteStream = if let Some(proxy) = proxy {
-        proxy.dial(host, port).await?.0.into()
+    let mut route_setup = None;
+    let mut route_outcome = None;
+    let tcp: RouteStream = if let Some(dialer) = dialer {
+        let dialed = dialer
+            .dial(&crate::ServerConfig {
+                host: host.into(),
+                port,
+                ..Default::default()
+            })
+            .await?;
+        route_setup = dialed.setup;
+        route_outcome = Some(dialed.outcome);
+        dialed.stream.into()
     } else {
         dial_direct(host, port, None, Duration::from_secs(30))
             .await?
@@ -1513,13 +1526,19 @@ async fn inspect_certificate_inner(
     };
 
     let _ = ManualTlsStream::connect(tcp, tls_config, server_name).await;
+    if let Some(setup) = route_setup {
+        setup.complete(true);
+    }
+    if let Some(outcome) = route_outcome {
+        outcome.closed();
+    }
     Ok(captured_leaf_der
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take())
 }
 
-/// Detect destination TLS errors without treating them as proxy establishment failures.
+// Detect destination TLS errors without treating them as proxy establishment failures.
 pub fn is_tls_error(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut source = Some(error);
     while let Some(error) = source {
@@ -1531,11 +1550,11 @@ pub fn is_tls_error(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// Connect to a host with implicit TLS (e.g. port 563).
-///
-/// Performs TCP connect followed by an immediate TLS handshake.
-/// If `ca_cert_path` is provided, the certificate is trusted in addition to
-/// the Mozilla root store.
+// Connect to a host with implicit TLS (e.g. port 563).
+//
+// Performs TCP connect followed by an immediate TLS handshake.
+// If `ca_cert_path` is provided, the certificate is trusted in addition to
+// the Mozilla root store.
 pub async fn connect_tls(
     host: &str,
     port: u16,
@@ -1553,8 +1572,8 @@ pub async fn connect_tls(
     .await
 }
 
-/// Run the implicit-TLS handshake on an already connected socket. `host` is
-/// the name the certificate is checked against.
+// Run the implicit-TLS handshake on an already connected socket. `host` is
+// the name the certificate is checked against.
 pub(crate) async fn connect_tls_over(
     tcp: TcpStream,
     remote_addr: Option<SocketAddr>,
@@ -1594,7 +1613,7 @@ pub(crate) async fn connect_tls_over(
     }
 }
 
-/// Connect to a host with plain TCP (e.g. port 119).
+// Connect to a host with plain TCP (e.g. port 119).
 pub async fn connect_plain(host: &str, port: u16) -> Result<NntpTransport, NntpError> {
     let (tcp, remote_addr) = dial_direct(host, port, None, Duration::from_secs(30)).await?;
     Ok(NntpTransport::Plain {
@@ -1603,10 +1622,10 @@ pub async fn connect_plain(host: &str, port: u16) -> Result<NntpTransport, NntpE
     })
 }
 
-/// Upgrade an existing plain TCP connection to TLS (STARTTLS).
-///
-/// The caller should already have sent the STARTTLS command and received
-/// a 382 response before calling this function.
+// Upgrade an existing plain TCP connection to TLS (STARTTLS).
+//
+// The caller should already have sent the STARTTLS command and received
+// a 382 response before calling this function.
 pub async fn upgrade_starttls(
     transport: NntpTransport,
     host: &str,

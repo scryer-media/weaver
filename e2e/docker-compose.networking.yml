@@ -1,0 +1,91 @@
+# Advanced-networking flows only. The harness layers this file over
+# docker-compose.yml, then adds a generated override that defines the
+# egress-a and egress-b networks, attaches Weaver and every destination to
+# both with fixed addresses, points Weaver's resolver at the proxy fixture,
+# and drops NET_RAW for the variant phase.
+services:
+  weaver:
+    environment:
+      # Docker's default capability set already includes NET_RAW; the
+      # entrypoint keeps it for Weaver only when this is true.
+      WEAVER_RETAIN_NET_RAW: "${E2E_WEAVER_RETAIN_NET_RAW:-true}"
+    # Weaver sizes its WireGuard instance budget from the memory it may use
+    # at boot (memory / 4 / 516 MiB, clamped to 1-8). A fixed limit makes the
+    # budget two on any runner with at least this much memory available.
+    mem_limit: 5g
+
+  proxy-fixture:
+    environment:
+      # CONNECT members connect1..6 on 8101-8106, SOCKS5 members socks1..4 on
+      # 8201-8204, beside the original four routes.
+      PROXY_FIXTURE_ROUTES: "all"
+
+  # SSH (ssh1..3, ssh-switch, ssh-refuse on 2221-2225) and WireGuard (wg1, wg2,
+  # wg-rss on UDP 51821-51823) endpoints, control on 8095.
+  tunnel-fixture:
+    image: ${E2E_TUNNEL_FIXTURE_IMAGE:-weaver-e2e-tunnel-fixture:local}
+    pull_policy: never
+    build:
+      context: ./tunnel-fixture
+      dockerfile: Dockerfile
+      args:
+        RUST_TOOLCHAIN: "${E2E_RUST_TOOLCHAIN:-1.97.1}"
+    environment:
+      TUNNEL_FIXTURE_NNTP: "nntp:119"
+      TUNNEL_FIXTURE_HTTP: "proxy-fixture:8089"
+    depends_on:
+      nntp:
+        condition: service_healthy
+      proxy-fixture:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8095"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  # tcpdump and link control in Weaver's own network namespace. Playwright
+  # reaches its control at weaver:8099.
+  capture:
+    image: ${E2E_CAPTURE_IMAGE:-weaver-e2e-capture:local}
+    pull_policy: never
+    build:
+      context: ./services/capture
+      dockerfile: Dockerfile
+    network_mode: "service:weaver"
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - ${E2E_WEAVER_PLAYWRIGHT_ARTIFACTS_DIR:-./artifacts/weaver}:/artifacts
+    depends_on:
+      weaver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/')"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  weaver-playwright:
+    environment:
+      E2E_NETWORK_LANE: "${E2E_NETWORK_LANE:-C}"
+      E2E_NET_A_SUBNET: "${E2E_NET_A_SUBNET:-}"
+      E2E_NET_B_SUBNET: "${E2E_NET_B_SUBNET:-}"
+      E2E_WEAVER_EGRESS_A_IP: "${E2E_WEAVER_EGRESS_A_IP:-}"
+      E2E_WEAVER_EGRESS_B_IP: "${E2E_WEAVER_EGRESS_B_IP:-}"
+      E2E_NETWORK_HOSTS: "${E2E_NETWORK_HOSTS:-}"
+      E2E_WEAVER_NET_RAW: "${E2E_WEAVER_NET_RAW:-retained}"
+      PROXY_FIXTURE_URL: "http://proxy-fixture:8090"
+      TUNNEL_FIXTURE_URL: "http://tunnel-fixture:8095"
+      CAPTURE_URL: "http://weaver:8099"
+      TOXIPROXY_URL: "http://toxiproxy:8474"
+    depends_on:
+      capture:
+        condition: service_healthy
+      tunnel-fixture:
+        condition: service_healthy
+      proxy-fixture:
+        condition: service_healthy
+      toxiproxy:
+        condition: service_healthy

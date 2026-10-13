@@ -79,8 +79,8 @@ impl SystemMutation {
     }
 }
 
-/// The upgrade's own error codes, kept out of `INTERNAL`: a refusal the operator
-/// can act on (an ineligible install, a stale notice) must not read as a bug.
+// The upgrade's own error codes, kept out of `INTERNAL`: a refusal the operator
+// can act on (an ineligible install, a stale notice) must not read as a bug.
 fn map_application_upgrade_error(
     error: weaver_server_core::application_upgrade::ApplicationUpgradeError,
 ) -> async_graphql::Error {

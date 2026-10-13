@@ -1,35 +1,68 @@
-//! Schedule evaluator — background task that applies time-based download rules.
-//!
-//! Every 60 seconds, evaluates all enabled schedule entries against the current
-//! local time and day-of-week. When the most recent applicable entry changes,
-//! sends the appropriate command to the scheduler.
-//!
-//! A rule stays in force until the next one fires, across midnight and across
-//! days the rules skip, so "pause at 23:00, resume at 06:00" pauses all night.
-//!
-//! Hardware-profile entries are a second, independent track: a profile rule
-//! never ends a pause or speed limit, and neither of those ends it.
+// Schedule evaluator — background task that applies time-based download rules.
+//
+// Every 60 seconds, evaluates all enabled schedule entries against the current
+// local time and day-of-week. When the most recent applicable entry changes,
+// sends the appropriate command to the scheduler.
+//
+// A rule stays in force until the next rule on its track fires, across midnight and across
+// days the rules skip, so "pause at 23:00, resume at 06:00" pauses all night.
+//
+// Downloads, watch-folder scanning, RSS, each speed limit, hardware profile,
+// quota metering and each server hold independently. Deleting the last rule
+// on a track does not undo its last applied state, except one egress's quota
+// metering, which goes back to the setting for every egress.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use chrono::{Datelike, NaiveTime};
+use chrono::{Datelike, Duration, NaiveDateTime, NaiveTime};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-use crate::bandwidth::{ScheduleAction, ScheduleEntry, Weekday};
-use crate::runtime::HardwareProfile;
+use crate::bandwidth::schedule_metrics::{
+    self, ActionOutcome, Evaluator, HoldReason, ReplayReason,
+};
+use crate::bandwidth::{QuotaTarget, ScheduleAction, ScheduleEntry, ScheduleTrack, Weekday};
 
 use crate::jobs::handle::SchedulerHandle;
 use crate::watch_folder::WatchFolderService;
 
-/// State shared between the evaluator and the API layer for reloading schedules.
+// State shared between the evaluator and the API layer for reloading schedules.
 pub type SharedSchedules = Arc<RwLock<Vec<ScheduleEntry>>>;
 
-/// Spawn the schedule evaluator background task.
-///
-/// The evaluator loads schedules from the shared state (populated by the API on
-/// startup and on config changes), evaluates them against the current time every
-/// 60 seconds, and sends commands to the scheduler when the active action changes.
+// Cooperative cancellation: owned database and intake transactions drain;
+// interruptible network reads and admission waits observe this signal.
+#[derive(Clone)]
+pub(crate) struct ScheduleCancellation(tokio::sync::watch::Sender<bool>);
+impl ScheduleCancellation {
+    pub(crate) fn new() -> Self {
+        Self(tokio::sync::watch::channel(false).0)
+    }
+    pub(crate) fn cancel(&self) {
+        self.0.send_replace(true);
+    }
+    pub(crate) fn is_cancelled(&self) -> bool {
+        *self.0.borrow()
+    }
+    pub(crate) async fn cancelled(&self) {
+        let mut receiver = self.0.subscribe();
+        let _ = receiver.wait_for(|cancelled| *cancelled).await;
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ScheduleServices {
+    pub watch_folder: Option<WatchFolderService>,
+    pub rss: Option<crate::rss::RssService>,
+    pub servers: Option<crate::servers::service::ServersService>,
+    pub db: Option<crate::Database>,
+}
+
+// Spawn the schedule evaluator background task.
+//
+// The evaluator loads schedules from the shared state (populated by the API on
+// startup and on config changes), evaluates them against the current time every
+// 60 seconds, and sends commands to the scheduler when the active action changes.
 pub fn spawn_evaluator(handle: SchedulerHandle, schedules: SharedSchedules) {
     spawn_evaluator_with_watch_folder(handle, schedules, None);
 }
@@ -39,110 +72,646 @@ pub fn spawn_evaluator_with_watch_folder(
     schedules: SharedSchedules,
     watch_folder: Option<WatchFolderService>,
 ) {
-    tokio::spawn(async move {
-        let mut last_action: Option<ScheduleAction> = None;
-        let mut last_profile: Option<HardwareProfile> = None;
+    let _initial_replay = spawn_evaluator_with_services(
+        handle,
+        schedules,
+        ScheduleServices {
+            watch_folder,
+            ..Default::default()
+        },
+    );
+}
+
+// Owns orderly shutdown of schedule work. Dropping it detaches the evaluator,
+// preserving the behavior of the convenience spawn functions.
+pub struct ScheduleEvaluatorTask {
+    stop: tokio::sync::oneshot::Sender<()>,
+    cancellation: crate::bandwidth::schedule::ScheduleCancellation,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ScheduleEvaluatorTask {
+    // Stop admitting actions and finish running work before its services stop.
+    pub async fn shutdown(self) {
+        self.cancellation.cancel();
+        let _ = self.stop.send(());
+        if let Err(error) = self.task.await {
+            warn!(%error, "schedule evaluator failed during shutdown");
+        }
+    }
+}
+
+pub fn spawn_evaluator_with_services(
+    handle: SchedulerHandle,
+    schedules: SharedSchedules,
+    services: ScheduleServices,
+) -> (
+    ScheduleEvaluatorTask,
+    tokio::sync::oneshot::Receiver<Result<(), String>>,
+) {
+    let (ready, replayed) = tokio::sync::oneshot::channel();
+    schedule_metrics::set_admission_hold(
+        &handle,
+        HoldReason::InitialReplay,
+        Some("waiting for the first schedule replay".into()),
+    );
+    let (stop, mut stopping) = tokio::sync::oneshot::channel();
+    let cancellation = crate::bandwidth::schedule::ScheduleCancellation::new();
+    let stopping_actions = cancellation.clone();
+    let task = tokio::spawn(async move {
+        let mut stop_open = true;
+        let mut ready = Some(ready);
+        let mut evaluator = HoldEvaluator::default();
+        let mut intake_state_loaded = services.db.is_none();
+        let mut intake_before_failure = None;
+        let mut one_shots = OneShotEvaluator::default();
+        let mut watermark_loaded = services.db.is_none();
+        let mut dispatcher = OneShotDispatcher::default();
         let mut interval = tokio::time::interval(crate::e2e_clock::schedule_poll_interval());
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            interval.tick().await;
-
-            let schedules = schedules.clone();
-            let handle = handle.clone();
-            let watch_folder = watch_folder.clone();
-            let prev_action = last_action.clone();
-            let prev_profile = last_profile;
-
-            let result = tokio::spawn(async move {
-                let entries = schedules.read().await;
-                let now = crate::e2e_clock::local_now();
-                let current_day = Weekday::from_chrono(now.weekday());
-                let current_time = now.time();
-
-                let desired_profile = find_active_profile(&entries, current_day, current_time);
-                if desired_profile != prev_profile {
-                    info!(
-                        profile = desired_profile.map(HardwareProfile::as_str),
-                        "schedule transition: hardware profile"
-                    );
-                    if let Err(e) = handle.set_scheduled_hardware_profile(desired_profile).await {
-                        warn!(error = %e, "failed to apply the scheduled hardware profile");
-                    }
+            tokio::select! {
+                biased;
+                result = &mut stopping, if stop_open => {
+                    if result.is_ok() { break; }
+                    stop_open = false;
+                    continue;
                 }
-
-                let active = find_active_entry(&entries, current_day, current_time);
-                let desired_action = active.map(|e| e.action.clone());
-
-                if desired_action == prev_action {
-                    return (desired_action, desired_profile); // no transition
+                _ = interval.tick() => {},
+                result = dispatcher.running.join_next(), if !dispatcher.running.is_empty() => {
+                    if let Some(Err(error)) = result { warn!(%error, "scheduled one-shot task failed"); }
+                    continue;
                 }
-
-                match &desired_action {
-                    Some(action) => {
-                        info!(
-                            action = ?action,
-                            "schedule transition: applying new action"
-                        );
-                        if let Err(e) = apply_schedule_action(
-                            handle.clone(),
-                            watch_folder.clone(),
-                            action.clone(),
-                        )
-                        .await
-                        {
-                            warn!(error = %e, "failed to apply schedule action");
-                        }
-                    }
-                    None => {
-                        if prev_action.is_some() {
-                            info!("schedule transition: clearing scheduled action");
-                            if let Err(e) = handle.clear_schedule_action().await {
-                                warn!(error = %e, "failed to clear schedule action");
+                _ = std::future::ready(()), if !dispatcher.pending.is_empty()
+                    && dispatcher.running.len() < MAX_RUNNING_ONE_SHOTS => {
+                    dispatcher.dispatch(|entry| {
+                        let handle = handle.clone();
+                        let services = services.clone();
+                        let cancellation = stopping_actions.clone();
+                        async move {
+                            let action = entry.action.clone();
+                            let result = apply_one_shot(handle, services, entry.action, cancellation).await;
+                            schedule_metrics::record_action(&entry.id, &action, None, match &result {
+                                Ok(()) => ActionOutcome::Applied,
+                                Err(ScheduleApplyError::Pending) => ActionOutcome::Skipped,
+                                Err(ScheduleApplyError::Failed(_)) => ActionOutcome::Failed,
+                            }, crate::e2e_clock::local_now().naive_utc(), None);
+                            if let Err(error) = result {
+                                warn!(%error, id = %entry.id, "scheduled one-shot failed");
                             }
                         }
+                    });
+                    continue;
+                }
+            }
+
+            let entries = schedules.read().await.clone();
+            if !intake_state_loaded {
+                let db = services.db.clone().expect("database checked above");
+                let pause_all_configured = entries
+                    .iter()
+                    .any(|entry| entry.enabled && matches!(entry.action, ScheduleAction::PauseAll));
+                match tokio::task::spawn_blocking(move || {
+                    if pause_all_configured {
+                        db.set_setting("schedule_pause_all_used", "true")?;
+                    }
+                    db.get_setting("schedule_pause_all_used")
+                })
+                .await
+                {
+                    Ok(Ok(value)) => {
+                        evaluator.pause_all_seen |= value.as_deref() == Some("true");
+                        intake_state_loaded = true;
+                    }
+                    result => {
+                        if intake_before_failure.is_none() {
+                            let watch_paused = match &services.watch_folder {
+                                Some(watch) => watch.scanning_paused().await,
+                                None => false,
+                            };
+                            let rss_paused = services
+                                .rss
+                                .as_ref()
+                                .is_some_and(|rss| rss.is_scheduled_paused());
+                            intake_before_failure = Some((watch_paused, rss_paused));
+                        }
+                        if let Some(watch) = &services.watch_folder {
+                            watch.pause_scanning_runtime().await;
+                        }
+                        if let Some(rss) = &services.rss {
+                            rss.set_scheduled_paused(true);
+                        }
+                        warn!(
+                            ?result,
+                            "cannot load schedule intake state; retrying next tick"
+                        );
+                        schedule_metrics::set_admission_hold(
+                            &handle,
+                            HoldReason::StateUnavailable,
+                            holds_admission(&entries)
+                                .then(|| format!("cannot load schedule state: {result:?}")),
+                        );
+                        if let Some(ready) = ready.take() {
+                            let _ = ready.send(Err(format!(
+                                "cannot load schedule intake state: {result:?}"
+                            )));
+                        }
+                        continue;
                     }
                 }
+            }
+            if !watermark_loaded {
+                watermark_loaded = true;
+                let db = services.db.clone().expect("database checked above");
+                match tokio::task::spawn_blocking(move || db.get_setting(ONE_SHOT_WATERMARK_KEY))
+                    .await
+                {
+                    Ok(Ok(value)) => {
+                        one_shots.restore(value.as_deref().and_then(OneShotWatermark::parse));
+                    }
+                    result => warn!(
+                        ?result,
+                        "cannot load when schedules last ran; one-shots missed while stopped are not caught up"
+                    ),
+                }
+            }
+            let clock = crate::e2e_clock::local_now();
+            schedule_metrics::record_evaluation();
+            let now = clock.naive_local();
+            let utc = clock.naive_utc();
+            let mut due = one_shots.due_at(&entries, now, utc);
+            // The watermark is written before anything it covers is started,
+            // so a restart can miss a one-shot but never start one twice. A
+            // tick whose watermark cannot be written starts none of its
+            // one-shots for the same reason.
+            if let Some(db) = services.db.clone() {
+                let mark = OneShotWatermark { utc, local: now }.to_string();
+                match tokio::task::spawn_blocking(move || {
+                    db.set_setting(ONE_SHOT_WATERMARK_KEY, &mark)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    result => {
+                        let skipped = due.iter().map(|entry| entry.id.clone()).collect::<Vec<_>>();
+                        warn!(
+                            ?result,
+                            ?skipped,
+                            "cannot record when schedules last ran; this minute's one-shots are skipped"
+                        );
+                        due.clear();
+                    }
+                }
+            }
 
-                (desired_action, desired_profile)
+            let handle = handle.clone();
+            let services = services.clone();
+            let mut tick = evaluator.clone();
+            let tick_handle = handle.clone();
+            let tick_services = services.clone();
+            let result = tokio::spawn(async move {
+                // Do not hold the settings lock while applying runtime commands.
+                let failures = tick
+                    .apply_effects_at(&entries, now, utc, |action, track| {
+                        apply_schedule_action(
+                            tick_handle.clone(),
+                            tick_services.clone(),
+                            action,
+                            Some(track),
+                        )
+                    })
+                    .await;
+                let released = tick.take_released_egress_quotas();
+                if !released.is_empty()
+                    && let Some(policy) = tick_handle.server_transfer_policy()
+                {
+                    for egress_id in released {
+                        policy.clear_one_egress_quota_metering(egress_id);
+                    }
+                }
+                (tick, failures)
             })
             .await;
 
             match result {
-                Ok((action, profile)) => {
-                    last_action = action;
-                    last_profile = profile;
+                Ok((tick, failures)) => {
+                    evaluator = tick;
+                    schedule_metrics::set_admission_hold(
+                        &handle,
+                        HoldReason::ActionFailed,
+                        evaluator.admission_hold.clone(),
+                    );
+                    if failures.is_empty()
+                        && let Some((watch_paused, rss_paused)) = intake_before_failure.take()
+                    {
+                        if !evaluator.applied.contains_key(&ScheduleTrack::WatchFolder)
+                            && let Some(watch) = &services.watch_folder
+                            && let Err(error) = watch.restore_scanning_runtime(watch_paused).await
+                        {
+                            watch.pause_scanning_runtime().await;
+                            intake_before_failure = Some((watch_paused, rss_paused));
+                            warn!(%error, "cannot restore watch intake after schedule recovery; retrying next tick");
+                        }
+                        if !evaluator.applied.contains_key(&ScheduleTrack::Rss)
+                            && let Some(rss) = &services.rss
+                        {
+                            rss.set_scheduled_paused(rss_paused);
+                        }
+                    }
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(if failures.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(failures.join("; "))
+                        });
+                    }
                 }
                 Err(panic) => {
+                    schedule_metrics::set_admission_hold(
+                        &handle,
+                        HoldReason::EvaluationFailed,
+                        holds_admission(&schedules.read().await)
+                            .then(|| format!("schedule evaluation failed: {panic}")),
+                    );
+                    evaluator.applied.remove(&ScheduleTrack::WatchFolder);
+                    evaluator.applied.remove(&ScheduleTrack::Rss);
+                    if intake_before_failure.is_none() {
+                        let watch_paused = match &services.watch_folder {
+                            Some(watch) => watch.scanning_paused().await,
+                            None => false,
+                        };
+                        let rss_paused = services
+                            .rss
+                            .as_ref()
+                            .is_some_and(|rss| rss.is_scheduled_paused());
+                        intake_before_failure = Some((watch_paused, rss_paused));
+                    }
+                    if let Some(watch_folder) = &services.watch_folder {
+                        watch_folder.pause_scanning_runtime().await;
+                    }
+                    if let Some(rss) = &services.rss {
+                        rss.set_scheduled_paused(true);
+                    }
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(Err(format!("initial schedule replay failed: {panic}")));
+                    }
                     tracing::error!(error = %panic, "CRITICAL: schedule evaluator tick panicked — loop continues");
                 }
             }
+            dispatcher.pending.extend(due);
+        }
+        while let Some(result) = dispatcher.running.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "scheduled one-shot task failed during shutdown");
+            }
         }
     });
+    (
+        ScheduleEvaluatorTask {
+            stop,
+            task,
+            cancellation,
+        },
+        replayed,
+    )
+}
+
+// Whether any enabled rule, left unapplied, would have to hold admission.
+fn holds_admission(entries: &[ScheduleEntry]) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.enabled && entry.action.holds_admission())
+}
+
+async fn apply_one_shot(
+    handle: SchedulerHandle,
+    services: ScheduleServices,
+    action: ScheduleAction,
+    cancellation: crate::bandwidth::schedule::ScheduleCancellation,
+) -> Result<(), ScheduleApplyError> {
+    if cancellation.is_cancelled() {
+        return Ok(());
+    }
+    // History acceptance is a short durable transaction. Drain its owned
+    // blocking task instead of abandoning a writer during service teardown.
+    apply_schedule_action(handle, services, action, None).await
+}
+
+const MAX_RUNNING_ONE_SHOTS: usize = 32;
+
+// Bound concurrent work without losing occurrences already accepted by the
+// evaluator. Pending actions do not block hold transitions or the next tick.
+#[derive(Default)]
+struct OneShotDispatcher {
+    pending: VecDeque<ScheduleEntry>,
+    running: tokio::task::JoinSet<()>,
+}
+
+impl OneShotDispatcher {
+    fn dispatch<F, Fut>(&mut self, mut apply: F)
+    where
+        F: FnMut(ScheduleEntry) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        while self.running.len() < MAX_RUNNING_ONE_SHOTS {
+            let Some(entry) = self.pending.pop_front() else {
+                break;
+            };
+            self.running.spawn(apply(entry));
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AppliedRule {
+    id: String,
+    occurrence: NaiveDateTime,
+    action: ScheduleAction,
+}
+
+// At most one successful occurrence per track. Failures remain pending, and
+// editing an action on the current occurrence reapplies that action.
+#[derive(Clone, Default)]
+struct HoldEvaluator {
+    applied: BTreeMap<ScheduleTrack, AppliedRule>,
+    last_tick: Option<NaiveDateTime>,
+    last_utc: Option<NaiveDateTime>,
+    repeated_until: Option<NaiveDateTime>,
+    pause_all_seen: bool,
+    // Set when a pause or server disable failed this tick. New downloads
+    // stay held until it applies, so the rule's intent is not overrun.
+    admission_hold: Option<String>,
+    // Egresses whose quota metering a rule set on its own. Kept across
+    // clock jumps, which forget `applied`.
+    egress_quotas_set: BTreeSet<u32>,
+    // Egresses no enabled rule sets metering for any more, to hand back to
+    // the setting for every egress.
+    egress_quotas_released: Vec<u32>,
+}
+
+impl HoldEvaluator {
+    #[cfg(test)]
+    async fn apply<F, Fut>(&mut self, entries: &[ScheduleEntry], now: NaiveDateTime, mut apply: F)
+    where
+        F: FnMut(ScheduleAction) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        self.apply_effects(entries, now, |action, _track| {
+            let pending = apply(action);
+            async move { pending.await.map_err(ScheduleApplyError::Failed) }
+        })
+        .await;
+    }
+
+    #[cfg(test)]
+    async fn apply_effects<F, Fut>(
+        &mut self,
+        entries: &[ScheduleEntry],
+        now: NaiveDateTime,
+        apply: F,
+    ) where
+        F: FnMut(ScheduleAction, ScheduleTrack) -> Fut,
+        Fut: std::future::Future<Output = Result<(), ScheduleApplyError>>,
+    {
+        self.apply_effects_at(entries, now, now, apply).await;
+    }
+
+    async fn apply_effects_at<F, Fut>(
+        &mut self,
+        entries: &[ScheduleEntry],
+        now: NaiveDateTime,
+        utc: NaiveDateTime,
+        mut apply: F,
+    ) -> Vec<String>
+    where
+        F: FnMut(ScheduleAction, ScheduleTrack) -> Fut,
+        Fut: std::future::Future<Output = Result<(), ScheduleApplyError>>,
+    {
+        let jumped = self.last_utc.is_some_and(|last| {
+            last - utc > Duration::minutes(5) || utc - last > Duration::minutes(90)
+        });
+        let replay = if self.last_utc.is_none() {
+            Some(ReplayReason::Startup)
+        } else {
+            jumped.then_some(ReplayReason::ClockJump)
+        };
+        if jumped {
+            schedule_metrics::record_clock_jump(Evaluator::Hold);
+            self.applied.clear();
+            self.repeated_until = None;
+        } else if self.last_tick.is_some_and(|last| now < last) {
+            self.repeated_until = self.last_tick;
+        }
+        if self.repeated_until.is_some_and(|until| now > until) {
+            self.repeated_until = None;
+        }
+        self.last_tick = Some(now);
+        self.last_utc = Some(utc);
+        let mut failures = Vec::new();
+        self.admission_hold = None;
+        // A legacy Resume only affects downloads. Once PauseAll has introduced
+        // intake holds, Resume must clear them even if that rule is later deleted.
+        self.pause_all_seen |= entries
+            .iter()
+            .any(|entry| entry.enabled && matches!(entry.action, ScheduleAction::PauseAll));
+        let tracks: BTreeSet<_> = entries
+            .iter()
+            .filter(|entry| entry.enabled)
+            .flat_map(|entry| entry.action.tracks())
+            .collect();
+        self.applied.retain(|track, _| tracks.contains(track));
+        // Unlike other tracks, one egress's metering does not outlive its
+        // last rule: that egress follows the rule for every egress again.
+        let released: Vec<u32> = self
+            .egress_quotas_set
+            .iter()
+            .copied()
+            .filter(|id| !tracks.contains(&ScheduleTrack::Quota(QuotaTarget::Egress(*id))))
+            .collect();
+        for id in released {
+            self.egress_quotas_set.remove(&id);
+            self.egress_quotas_released.push(id);
+        }
+        for track in tracks {
+            let Some((entry, days_back, time)) = most_recently_fired(
+                entries,
+                Weekday::from_chrono(now.weekday()),
+                now.time(),
+                |entry| {
+                    entry.action.tracks().contains(&track)
+                        && (self.pause_all_seen
+                            || !matches!(entry.action, ScheduleAction::Resume)
+                            || track == ScheduleTrack::Downloads)
+                },
+            ) else {
+                // Forget the occurrence, but preserve the runtime state. Re-enabling
+                // a rule later must apply it again even within the same occurrence.
+                self.applied.remove(&track);
+                continue;
+            };
+            let action = entry.action.for_track(track);
+            let desired = AppliedRule {
+                id: entry.id.clone(),
+                occurrence: (now.date() - Duration::days(days_back)).and_time(time),
+                action: action.clone(),
+            };
+            if self.applied.get(&track) == Some(&desired) {
+                continue;
+            }
+            if self.repeated_until.is_some()
+                && self.applied.get(&track).is_some_and(|applied| {
+                    desired.occurrence < applied.occurrence
+                        && entries.iter().any(|entry| {
+                            entry.enabled
+                                && entry.id == applied.id
+                                && entry.action.for_track(track) == applied.action
+                        })
+                })
+            {
+                continue;
+            }
+            info!(id = %entry.id, ?track, ?action, "schedule transition");
+            let applied = apply(action.clone(), track).await;
+            schedule_metrics::record_action(
+                &entry.id,
+                &action,
+                Some(track),
+                match &applied {
+                    Ok(()) => ActionOutcome::Applied,
+                    Err(ScheduleApplyError::Pending) => ActionOutcome::Skipped,
+                    Err(ScheduleApplyError::Failed(_)) => ActionOutcome::Failed,
+                },
+                utc,
+                replay,
+            );
+            match applied {
+                Ok(()) => {
+                    if let ScheduleTrack::Quota(QuotaTarget::Egress(id)) = track {
+                        self.egress_quotas_set.insert(id);
+                    }
+                    self.applied.insert(track, desired);
+                }
+                Err(ScheduleApplyError::Pending) => {}
+                Err(ScheduleApplyError::Failed(error)) => {
+                    if matches!(track, ScheduleTrack::Downloads | ScheduleTrack::Server(_))
+                        && action.holds_admission()
+                        && self.admission_hold.is_none()
+                    {
+                        let rule = if entry.label.is_empty() {
+                            &entry.id
+                        } else {
+                            &entry.label
+                        };
+                        self.admission_hold = Some(format!(
+                            "schedule rule \"{rule}\" could not be applied: {error}"
+                        ));
+                    }
+                    warn!(%error, id = %entry.id, "failed to apply schedule action; retrying next tick");
+                    failures.push(error);
+                }
+            }
+        }
+        failures
+    }
+
+    // The egresses to hand back to the quota metering for every egress,
+    // each once.
+    fn take_released_egress_quotas(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.egress_quotas_released)
+    }
+}
+
+#[derive(Debug)]
+enum ScheduleApplyError {
+    Pending,
+    Failed(String),
+}
+impl From<String> for ScheduleApplyError {
+    fn from(value: String) -> Self {
+        Self::Failed(value)
+    }
+}
+impl From<&str> for ScheduleApplyError {
+    fn from(value: &str) -> Self {
+        Self::Failed(value.into())
+    }
+}
+impl std::fmt::Display for ScheduleApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => formatter.write_str("schedule action pending"),
+            Self::Failed(error) => formatter.write_str(error),
+        }
+    }
 }
 
 async fn apply_schedule_action(
     handle: SchedulerHandle,
-    watch_folder: Option<WatchFolderService>,
+    services: ScheduleServices,
     action: ScheduleAction,
-) -> Result<(), String> {
-    match action {
-        ScheduleAction::PauseWatchFolderScanning => {
-            let Some(watch_folder) = watch_folder else {
-                return Err("watch folder service is not available".to_string());
-            };
-            watch_folder
-                .set_scanning_paused(true)
-                .await
-                .map_err(|error| error.to_string())
+    track: Option<ScheduleTrack>,
+) -> Result<(), ScheduleApplyError> {
+    if track == Some(ScheduleTrack::Downloads)
+        && matches!(action, ScheduleAction::Resume)
+        && let Some(db) = services.db.clone()
+        && tokio::task::spawn_blocking(move || db.get_setting("nzbget.scheduled_resume_at"))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|at| at > 0)
+    {
+        return Err(ScheduleApplyError::Pending);
+    }
+    if track == Some(ScheduleTrack::Rss) {
+        services
+            .rss
+            .ok_or("RSS service is not available")?
+            .set_scheduled_paused(matches!(
+                action,
+                ScheduleAction::PauseAll | ScheduleAction::PauseRss
+            ));
+        return Ok(());
+    }
+    if track == Some(ScheduleTrack::WatchFolder) {
+        let watch_folder = services
+            .watch_folder
+            .ok_or("watch folder service is not available")?;
+        let pausing = matches!(
+            action,
+            ScheduleAction::PauseAll | ScheduleAction::PauseWatchFolderScanning
+        );
+        let result = watch_folder.set_scanning_paused(pausing).await;
+        // A failed pause holds scanning stopped until the retry lands. A failed
+        // resume leaves scanning as it was, so removing the rule cannot strand
+        // an in-memory pause the stored setting does not record.
+        if result.is_err() && pausing {
+            watch_folder.pause_scanning_runtime().await;
         }
-        ScheduleAction::ResumeWatchFolderScanning => {
-            let Some(watch_folder) = watch_folder else {
-                return Err("watch folder service is not available".to_string());
-            };
-            watch_folder
-                .set_scanning_paused(false)
+        return result.map_err(|error| ScheduleApplyError::Failed(error.to_string()));
+    }
+    let result = match action {
+        ScheduleAction::SetServerActive { server_id, active } => {
+            services
+                .servers
+                .ok_or("servers service is not available")?
+                .set_active(server_id, active)
                 .await
-                .map_err(|error| error.to_string())
+        }
+        ScheduleAction::SpeedLimit { limits } => {
+            apply_speed_limits(&handle, services.servers.as_ref(), limits).await
+        }
+        ScheduleAction::PruneHistory {
+            failed,
+            completed,
+            cancelled,
+        } => {
+            services
+                .db
+                .ok_or("database is not available")?
+                .prune_history(failed, completed, cancelled)
+                .await
         }
         ScheduleAction::HardwareProfile { profile } => handle
             .set_scheduled_hardware_profile(Some(profile))
@@ -152,61 +721,65 @@ async fn apply_schedule_action(
             .apply_schedule_action(other)
             .await
             .map_err(|error| error.to_string()),
+    };
+    result.map_err(ScheduleApplyError::Failed)
+}
+
+// Set each limit a speed rule names. The global limit is the scheduler's;
+// an egress's or a provider's is that holder's own speed limit, saved and
+// put in force as an edit on the Networking or Servers screen would be.
+async fn apply_speed_limits(
+    handle: &SchedulerHandle,
+    servers: Option<&crate::servers::service::ServersService>,
+    limits: Vec<crate::bandwidth::SpeedLimitChange>,
+) -> Result<(), String> {
+    use crate::bandwidth::SpeedTarget;
+    for limit in limits {
+        match limit.target {
+            SpeedTarget::Global => handle
+                .apply_schedule_action(ScheduleAction::SpeedLimit {
+                    limits: vec![limit],
+                })
+                .await
+                .map_err(|error| error.to_string())?,
+            SpeedTarget::Egress(egress_id) => {
+                servers
+                    .ok_or("servers service is not available")?
+                    .set_egress_speed_limit(egress_id, limit.bytes_per_sec)
+                    .await?
+            }
+            SpeedTarget::Server(server_id) => {
+                servers
+                    .ok_or("servers service is not available")?
+                    .set_server_speed_limit(server_id, limit.bytes_per_sec)
+                    .await?
+            }
+        }
     }
+    Ok(())
 }
 
-/// The pause, resume, speed-limit or watch-folder rule in force, or `None`
-/// when no such rule is enabled. Hardware-profile rules are not candidates;
-/// see [`find_active_profile`].
-fn find_active_entry(
-    entries: &[ScheduleEntry],
-    current_day: Weekday,
-    current_time: NaiveTime,
-) -> Option<&ScheduleEntry> {
-    most_recently_fired(entries, current_day, current_time, |entry| {
-        !entry.action.is_hardware_profile()
-    })
-}
-
-/// The hardware profile the schedule has in force, or `None` when no enabled
-/// profile rule exists.
-fn find_active_profile(
-    entries: &[ScheduleEntry],
-    current_day: Weekday,
-    current_time: NaiveTime,
-) -> Option<HardwareProfile> {
-    most_recently_fired(entries, current_day, current_time, |entry| {
-        entry.action.is_hardware_profile()
-    })
-    .and_then(|entry| match entry.action {
-        ScheduleAction::HardwareProfile { profile } => Some(profile),
-        _ => None,
-    })
-}
-
-/// The enabled rule among `candidate`s that fired most recently.
-///
-/// A rule stays in force until the next one fires, however long that takes:
-/// today's rules up to now are considered first, then each earlier day's in
-/// turn, back to the rest of this weekday a week ago. A pause set at 23:00 is
-/// therefore still in force at 00:05, and a rule that runs on Fridays only is
-/// still in force on Sunday. Among rules at the same minute the last one
-/// wins.
+// The enabled rule among `candidate`s that fired most recently.
+//
+// A rule stays in force until the next one fires, however long that takes:
+// today's rules up to now are considered first, then each earlier day's in
+// turn, back to the rest of this weekday a week ago. A pause set at 23:00 is
+// therefore still in force at 00:05, and a rule that runs on Fridays only is
+// still in force on Sunday. Among rules at the same minute the last one
+// wins.
 fn most_recently_fired(
     entries: &[ScheduleEntry],
     current_day: Weekday,
     current_time: NaiveTime,
     candidate: impl Fn(&ScheduleEntry) -> bool,
-) -> Option<&ScheduleEntry> {
+) -> Option<(&ScheduleEntry, i64, NaiveTime)> {
     let rules: Vec<(&ScheduleEntry, NaiveTime)> = entries
         .iter()
         .filter(|entry| entry.enabled && candidate(entry))
-        .filter_map(|entry| match parse_time(&entry.time) {
-            Some(time) => Some((entry, time)),
-            None => {
-                debug!(time = %entry.time, id = %entry.id, "invalid schedule time, skipping");
-                None
-            }
+        .flat_map(|entry| {
+            entry_times(entry)
+                .into_iter()
+                .map(move |time| (entry, time))
         })
         .collect();
 
@@ -227,15 +800,197 @@ fn most_recently_fired(
                     _ => Some((*entry, *time)),
                 },
             );
-        if let Some((entry, _)) = fired {
-            return Some(entry);
+        if let Some((entry, time)) = fired {
+            return Some((entry, days_back, time));
         }
         day = day.previous();
     }
     None
 }
 
-fn parse_time(s: &str) -> Option<NaiveTime> {
+fn entry_times(entry: &ScheduleEntry) -> Vec<NaiveTime> {
+    if let Some(minute) = entry.every_hour_at_minute {
+        return (0..24)
+            .filter_map(|hour| NaiveTime::from_hms_opt(hour, u32::from(minute), 0))
+            .collect();
+    }
+    let mut times: Vec<_> = if entry.times.is_empty() {
+        parse_time(&entry.time).into_iter().collect()
+    } else {
+        entry
+            .times
+            .iter()
+            .filter_map(|time| parse_time(time))
+            .collect()
+    };
+    times.sort_unstable();
+    times.dedup();
+    times
+}
+
+// The settings key holding when the evaluator last ran, so a restart knows
+// which one-shots it missed.
+const ONE_SHOT_WATERMARK_KEY: &str = "schedule_one_shot_watermark";
+
+// When the evaluator last ran, as UTC and as the local wall time one-shots
+// are written in. The local time places occurrences; the UTC time catches a
+// clock that went back while weaver was stopped.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct OneShotWatermark {
+    utc: NaiveDateTime,
+    local: NaiveDateTime,
+}
+
+impl OneShotWatermark {
+    fn parse(value: &str) -> Option<Self> {
+        let (utc, local) = value.split_once(' ')?;
+        let at = |seconds: &str| {
+            chrono::DateTime::from_timestamp(seconds.parse().ok()?, 0).map(|at| at.naive_utc())
+        };
+        Some(Self {
+            utc: at(utc)?,
+            local: at(local)?,
+        })
+    }
+}
+
+impl std::fmt::Display for OneShotWatermark {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} {}",
+            self.utc.and_utc().timestamp(),
+            self.local.and_utc().timestamp()
+        )
+    }
+}
+
+#[derive(Default)]
+struct OneShotEvaluator {
+    last_tick: Option<NaiveDateTime>,
+    last_utc: Option<NaiveDateTime>,
+    fired: BTreeSet<(String, NaiveDateTime)>,
+    // When the evaluator last ran before this start, read once and used by
+    // the first tick only.
+    restored: Option<OneShotWatermark>,
+}
+
+impl OneShotEvaluator {
+    fn restore(&mut self, watermark: Option<OneShotWatermark>) {
+        self.restored = watermark;
+    }
+
+    #[cfg(test)]
+    fn due(&mut self, entries: &[ScheduleEntry], now: NaiveDateTime) -> Vec<ScheduleEntry> {
+        self.due_at(entries, now, now)
+    }
+
+    fn due_at(
+        &mut self,
+        entries: &[ScheduleEntry],
+        now: NaiveDateTime,
+        utc: NaiveDateTime,
+    ) -> Vec<ScheduleEntry> {
+        // Retain both sides of a repeated local hour, but bound memory by the
+        // current rules and two calendar days instead of process lifetime.
+        self.fired.retain(|(id, at)| {
+            *at >= now - Duration::days(1)
+                && *at <= now + Duration::days(1)
+                && entries.iter().any(|entry| entry.id == *id)
+        });
+        let last_utc = self.last_utc.replace(utc);
+        let Some(last) = self.last_tick.replace(now) else {
+            // The first tick after a start catches up what was missed while
+            // weaver was stopped, and only with a watermark: without one
+            // there is no telling what already ran. A clock that went back
+            // while stopped fires nothing, as it does while running.
+            return match self.restored.take() {
+                Some(mark) if mark.utc < utc && mark.local < now => {
+                    self.catch_up(entries, mark.local, now)
+                }
+                _ => Vec::new(),
+            };
+        };
+        if now < last
+            || last_utc.is_some_and(|last| utc < last || utc - last > Duration::minutes(90))
+        {
+            schedule_metrics::record_clock_jump(Evaluator::OneShot);
+            return Vec::new();
+        }
+        let mut due = Vec::new();
+        let mut date = last.date();
+        while date <= now.date() {
+            let day = Weekday::from_chrono(date.weekday());
+            for entry in entries.iter().filter(|entry| {
+                entry.enabled
+                    && entry.action.is_one_shot()
+                    && (entry.days.is_empty() || entry.days.contains(&day))
+            }) {
+                for time in entry_times(entry) {
+                    let at = date.and_time(time);
+                    if last < at && at <= now && self.fired.insert((entry.id.clone(), at)) {
+                        schedule_metrics::record_one_shot_fire(&entry.action);
+                        due.push(entry.clone());
+                    }
+                }
+            }
+            let Some(next) = date.succ_opt() else {
+                break;
+            };
+            date = next;
+        }
+        due
+    }
+}
+
+impl OneShotEvaluator {
+    // The latest occurrence of each one-shot after `since` and up to `now`,
+    // never more than one per rule however long weaver was stopped. Every
+    // rule repeats within a week, so the last eight days hold the latest
+    // occurrence of each.
+    fn catch_up(
+        &mut self,
+        entries: &[ScheduleEntry],
+        since: NaiveDateTime,
+        now: NaiveDateTime,
+    ) -> Vec<ScheduleEntry> {
+        let since = since.max(now - Duration::days(8));
+        let mut due = Vec::new();
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.enabled && entry.action.is_one_shot())
+        {
+            let times = entry_times(entry);
+            let mut latest = None;
+            let mut date = since.date();
+            while date <= now.date() {
+                let day = Weekday::from_chrono(date.weekday());
+                if entry.days.is_empty() || entry.days.contains(&day) {
+                    for time in &times {
+                        let at = date.and_time(*time);
+                        if since < at && at <= now {
+                            latest = latest.max(Some(at));
+                        }
+                    }
+                }
+                let Some(next) = date.succ_opt() else {
+                    break;
+                };
+                date = next;
+            }
+            if let Some(at) = latest
+                && self.fired.insert((entry.id.clone(), at))
+            {
+                schedule_metrics::record_catch_up_fire();
+                schedule_metrics::record_one_shot_fire(&entry.action);
+                due.push(entry.clone());
+            }
+        }
+        due
+    }
+}
+
+pub fn parse_time(s: &str) -> Option<NaiveTime> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 2 {
         return None;

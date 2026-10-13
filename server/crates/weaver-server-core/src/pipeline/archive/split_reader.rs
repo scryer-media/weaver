@@ -3,12 +3,12 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::range::Range;
 
-/// Presents multiple files as a single contiguous `Read + Seek` stream.
-///
-/// Used for split archives (e.g., `.7z.001`, `.7z.002`) where the archive
-/// parser expects a single seekable source.
+// Presents multiple files as a single contiguous `Read + Seek` stream.
+//
+// Used for split archives (e.g., `.7z.001`, `.7z.002`) where the archive
+// parser expects a single seekable source.
 pub struct SplitFileReader {
-    /// Ordered file parts and their byte spans in the virtual stream.
+    // Ordered file parts and their byte spans in the virtual stream.
     parts: Vec<Part>,
     total_size: u64,
     position: u64,
@@ -16,16 +16,34 @@ pub struct SplitFileReader {
 
 struct Part {
     file: File,
-    /// Half-open byte span owned by this part in the virtual stream.
+    // Half-open byte span owned by this part in the virtual stream.
     span: Range<u64>,
 }
 
 impl SplitFileReader {
-    /// Create a `SplitFileReader` from an ordered list of file paths.
-    ///
-    /// The files are concatenated in the order provided. All files are opened
-    /// immediately so that errors surface early.
+    // Create a `SplitFileReader` from an ordered list of file paths.
+    //
+    // The files are concatenated in the order provided. All files are opened
+    // immediately so that errors surface early.
     pub fn open(paths: &[impl AsRef<Path>]) -> io::Result<Self> {
+        Self::open_parts(paths, None)
+    }
+
+    // Concatenate validated logical prefixes while retaining the source files.
+    pub(crate) fn open_with_lengths(
+        paths: &[impl AsRef<Path>],
+        lengths: &[u64],
+    ) -> io::Result<Self> {
+        if paths.len() != lengths.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "part length count mismatch",
+            ));
+        }
+        Self::open_parts(paths, Some(lengths))
+    }
+
+    fn open_parts(paths: &[impl AsRef<Path>], lengths: Option<&[u64]>) -> io::Result<Self> {
         if paths.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -36,9 +54,16 @@ impl SplitFileReader {
         let mut parts = Vec::with_capacity(paths.len());
         let mut offset = 0u64;
 
-        for path in paths {
+        for (index, path) in paths.iter().enumerate() {
             let file = File::open(path.as_ref())?;
-            let size = file.metadata()?.len();
+            let physical_size = file.metadata()?.len();
+            let size = lengths.map_or(physical_size, |lengths| lengths[index]);
+            if lengths.is_some() && (size == 0 || size > physical_size) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid logical part length",
+                ));
+            }
             let end = offset.checked_add(size).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "split file size overflow")
             })?;
@@ -56,7 +81,7 @@ impl SplitFileReader {
         })
     }
 
-    /// Find the part index and local offset for the current position.
+    // Find the part index and local offset for the current position.
     fn find_part(&self) -> Option<(usize, u64)> {
         if self.position >= self.total_size {
             return None;

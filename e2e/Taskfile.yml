@@ -159,6 +159,13 @@ tasks:
     cmds:
       - "{{.E2E_BIN}} full {{.CLI_ARGS}}"
 
+  real-usenet:
+    desc: Download the private SAB test NZB through real WireGuard and Docker proxies (opt-in)
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} full real-usenet {{.CLI_ARGS}}"
+
   release-gate:
     desc: Run the Weaver product-behavior release gate
     dir: "{{.TASKFILE_DIR}}"

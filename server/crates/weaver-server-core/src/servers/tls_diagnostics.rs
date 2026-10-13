@@ -4,18 +4,18 @@ use crate::StateError;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
 
-/// What the save-time TLS probe learned about one server: the suite it
-/// negotiated when weaver offered its CPU-preferred family first, and
-/// whether reconnecting with the opposite family first changed that answer.
+// What the save-time TLS probe learned about one server: the suite it
+// negotiated when weaver offered its CPU-preferred family first, and
+// whether reconnecting with the opposite family first changed that answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerTlsDiagnostics {
     pub server_id: u32,
-    /// IANA name of the negotiated suite, e.g. `TLS_AES_128_GCM_SHA256`.
+    // IANA name of the negotiated suite, e.g. `TLS_AES_128_GCM_SHA256`.
     pub cipher_suite: String,
-    /// `Some(true)` when the server follows the client's cipher order, so
-    /// the CPU-derived preference decides which suite carries traffic;
-    /// `Some(false)` when the server imposes its own order; `None` when the
-    /// second probe handshake did not complete.
+    // `Some(true)` when the server follows the client's cipher order, so
+    // the CPU-derived preference decides which suite carries traffic;
+    // `Some(false)` when the server imposes its own order; `None` when the
+    // second probe handshake did not complete.
     pub honors_client_cipher_order: Option<bool>,
     pub probed_at: DateTime<Utc>,
 }

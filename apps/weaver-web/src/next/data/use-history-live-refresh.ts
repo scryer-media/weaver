@@ -13,7 +13,7 @@ interface QueueEvent {
 }
 
 /**
- * Keeps a history screen current the way the classic History screen does.
+ * Keeps a history screen current.
  *
  * History is paged on the server and never held in the client, so there is no
  * row to patch: a job reaching an outcome, or leaving, is a reason to read the

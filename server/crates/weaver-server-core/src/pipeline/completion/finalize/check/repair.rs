@@ -1,6 +1,6 @@
-//! Continuation of the `impl Pipeline` block from `finalize/check.rs`.
-//! Split out mechanically to keep the parent file readable; no behavior lives here
-//! that is not simply a method of the same type.
+// Continuation of the `impl Pipeline` block from `finalize/check.rs`.
+// Split out mechanically to keep the parent file readable; no behavior lives here
+// that is not simply a method of the same type.
 
 use super::*;
 
@@ -111,6 +111,23 @@ impl Pipeline {
                 .copied()
                 .or_else(|| by_source.get(&old_name).copied())
                 .or_else(|| by_canonical.get(&old_name).copied());
+            // A live direct set's source volume is never written under its
+            // name; the set holds its proven bytes elsewhere. Whatever sits at
+            // that name is a superseded write from an earlier incarnation of
+            // the job, which matches the description by its first 16 KiB
+            // only. Naming it as the volume would hand verification a file
+            // that is not the one the set accounts for. The job's cleanup
+            // removes it once the set has delivered.
+            if let Some((file_id, _)) = matched
+                && self.is_direct_source_file(file_id)
+            {
+                debug!(
+                    job_id = job_id.0,
+                    from = %old.display(),
+                    "refusing PAR2 rename of a file a direct set owns the bytes of"
+                );
+                continue;
+            }
             let Some(description) = self
                 .par2_set_for(job_id, *set_id)
                 .and_then(|set| set.file_description(&suggestion.file_id))
@@ -303,6 +320,13 @@ impl Pipeline {
                 continue;
             }
 
+            if old
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| self.chase_keeps_archive_alias(job_id, name, &correct_name))
+            {
+                continue;
+            }
             if new.exists() && !runtime_fs::paths_equivalent_for_placement(old, &new) {
                 warn!(
                     job_id = job_id.0,
@@ -469,9 +493,9 @@ impl Pipeline {
         outcome
     }
 
-    /// `verification` is the analysis result that led here, and is the
-    /// file-level half of the direct-unpack vouching evidence. `None` for a
-    /// preview run, which rewrites nothing and so parks nothing.
+    // `verification` is the analysis result that led here, and is the
+    // file-level half of the direct-unpack vouching evidence. `None` for a
+    // preview run, which rewrites nothing and so parks nothing.
     pub(super) async fn run_par2_repairer(
         &mut self,
         job_id: JobId,
@@ -869,11 +893,11 @@ impl Pipeline {
         }
     }
 
-    /// Hold a damaged-path verdict across the wait for targeted recovery.
-    ///
-    /// Called only where the gate has just decided to park: the analysis has
-    /// run, the damage is real, and the one thing standing between this job and
-    /// its repair is recovery still on the wire.
+    // Hold a damaged-path verdict across the wait for targeted recovery.
+    //
+    // Called only where the gate has just decided to park: the analysis has
+    // run, the damage is real, and the one thing standing between this job and
+    // its repair is recovery still on the wire.
     pub(in crate::pipeline) fn park_par2_repair_verdict(
         &mut self,
         job_id: JobId,
@@ -899,7 +923,7 @@ impl Pipeline {
         }
     }
 
-    /// Whether this set is holding a parked repair verdict.
+    // Whether this set is holding a parked repair verdict.
     pub(in crate::pipeline) fn has_pending_par2_repair(
         &self,
         job_id: JobId,
@@ -910,10 +934,10 @@ impl Pipeline {
             .is_some_and(|set_runtime| set_runtime.pending_repair.is_some())
     }
 
-    /// Drop a parked verdict. Every path that settles, fails, re-analyses or
-    /// re-shapes a set goes through here: a verdict outliving the state it
-    /// describes would put a stale `pre_repair` in front of the post-repair
-    /// read-back, which is the one thing this shortcut must never do.
+    // Drop a parked verdict. Every path that settles, fails, re-analyses or
+    // re-shapes a set goes through here: a verdict outliving the state it
+    // describes would put a stale `pre_repair` in front of the post-repair
+    // read-back, which is the one thing this shortcut must never do.
     pub(in crate::pipeline) fn clear_pending_par2_repair(
         &mut self,
         job_id: JobId,
@@ -928,9 +952,9 @@ impl Pipeline {
         }
     }
 
-    /// Every set of this job forgets its parked verdict. Used where the change
-    /// is job-shaped rather than set-shaped — a direct-store demotion rewrites
-    /// which files exist at all.
+    // Every set of this job forgets its parked verdict. Used where the change
+    // is job-shaped rather than set-shaped — a direct-store demotion rewrites
+    // which files exist at all.
     pub(in crate::pipeline) fn clear_pending_par2_repairs_for_job(&mut self, job_id: JobId) {
         if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
             for set_runtime in runtime.sets.values_mut() {
@@ -939,7 +963,7 @@ impl Pipeline {
         }
     }
 
-    /// Whether any set of this job is holding a parked repair verdict.
+    // Whether any set of this job is holding a parked repair verdict.
     pub(in crate::pipeline) fn job_has_pending_par2_repair(&self, job_id: JobId) -> bool {
         self.par2_runtime(job_id).is_some_and(|runtime| {
             runtime
@@ -949,21 +973,21 @@ impl Pipeline {
         })
     }
 
-    /// The parked verdict, if this entry may repair on it instead of analysing
-    /// again.
-    ///
-    /// Three things have to hold. The verdict must still describe the set about
-    /// to be repaired — same recovery set, same slice size, same described
-    /// files, so a metadata merge that changed the protected file set is
-    /// refused. The recovery it waited for must have *landed*: every promoted
-    /// PAR2 file complete and nothing promoted still moving, which is the same
-    /// drain the analysis arm below waits for. And the merged set must now hold
-    /// the blocks the verdict asked for, which is the one number a second
-    /// analysis could have told us and the repair reads off the set directly.
-    ///
-    /// Returned as a borrow; the caller clones the few kilobytes it needs before
-    /// `self` is borrowed mutably for the repair, which is nothing against the
-    /// whole-file read the verdict replaces.
+    // The parked verdict, if this entry may repair on it instead of analysing
+    // again.
+    //
+    // Three things have to hold. The verdict must still describe the set about
+    // to be repaired — same recovery set, same slice size, same described
+    // files, so a metadata merge that changed the protected file set is
+    // refused. The recovery it waited for must have *landed*: every promoted
+    // PAR2 file complete and nothing promoted still moving, which is the same
+    // drain the analysis arm below waits for. And the merged set must now hold
+    // the blocks the verdict asked for, which is the one number a second
+    // analysis could have told us and the repair reads off the set directly.
+    //
+    // Returned as a borrow; the caller clones the few kilobytes it needs before
+    // `self` is borrowed mutably for the repair, which is nothing against the
+    // whole-file read the verdict replaces.
     pub(super) fn ready_pending_par2_repair(
         &self,
         job_id: JobId,
@@ -991,20 +1015,20 @@ impl Pipeline {
         Some(pending)
     }
 
-    /// This set's damaged-path analysis, run off the pipeline task.
-    ///
-    /// `Ok(None)` means a ticket is outstanding and the caller must return: the
-    /// read is a whole-directory hash of every described file plus a rolling
-    /// scan of whatever else the directory holds, and awaiting it inline held
-    /// the actor for its entire duration — no other job's articles dispatched,
-    /// no decode result processed, no newly submitted NZB even parsed. The
-    /// ticket's completion re-enters the completion check, which reaches this
-    /// call again and finds the verdict parked.
-    ///
-    /// The one-time prologue — retiring the parked repair verdict, the status
-    /// transition, the verification-started events — runs at submission, not on
-    /// the resuming pass, so a job does not announce that it started verifying
-    /// twice for one read.
+    // This set's damaged-path analysis, run off the pipeline task.
+    //
+    // `Ok(None)` means a ticket is outstanding and the caller must return: the
+    // read is a whole-directory hash of every described file plus a rolling
+    // scan of whatever else the directory holds, and awaiting it inline held
+    // the actor for its entire duration — no other job's articles dispatched,
+    // no decode result processed, no newly submitted NZB even parsed. The
+    // ticket's completion re-enters the completion check, which reaches this
+    // call again and finds the verdict parked.
+    //
+    // The one-time prologue — retiring the parked repair verdict, the status
+    // transition, the verification-started events — runs at submission, not on
+    // the resuming pass, so a job does not announce that it started verifying
+    // twice for one read.
     pub(super) async fn analyze_par2_with_repairer(
         &mut self,
         job_id: JobId,
@@ -1092,12 +1116,12 @@ impl Pipeline {
         Ok(Some(outcome))
     }
 
-    /// The verdict a ticket left behind, if it belongs to the set this pass is
-    /// deciding.
-    ///
-    /// A result tagged for another set is put back rather than read as this
-    /// set's own: the gate serves one recovery set at a time, and a verdict
-    /// names files by path against the set that produced it.
+    // The verdict a ticket left behind, if it belongs to the set this pass is
+    // deciding.
+    //
+    // A result tagged for another set is put back rather than read as this
+    // set's own: the gate serves one recovery set at a time, and a verdict
+    // names files by path against the set that produced it.
     pub(super) fn take_parked_par2_analysis(
         &mut self,
         job_id: JobId,
@@ -1112,12 +1136,12 @@ impl Pipeline {
         None
     }
 
-    /// Snapshot everything this set's analysis needs and hand it to a blocking
-    /// worker.
-    ///
-    /// Returns once the ticket is running. `Err` is reserved for a failure that
-    /// happened *here*, on the actor, before any read started — the ticket does
-    /// not exist in that case and the caller owns the failure.
+    // Snapshot everything this set's analysis needs and hand it to a blocking
+    // worker.
+    //
+    // Returns once the ticket is running. `Err` is reserved for a failure that
+    // happened *here*, on the actor, before any read started — the ticket does
+    // not exist in that case and the caller owns the failure.
     pub(super) async fn submit_par2_analysis_ticket(
         &mut self,
         job_id: JobId,
@@ -1171,9 +1195,9 @@ impl Pipeline {
         Ok(())
     }
 
-    /// The actor-side half of starting an analysis: take the retained session,
-    /// collect the evidence the read may stand on, and turn it all into an
-    /// owned plan the worker can run without touching pipeline state.
+    // The actor-side half of starting an analysis: take the retained session,
+    // collect the evidence the read may stand on, and turn it all into an
+    // owned plan the worker can run without touching pipeline state.
     pub(super) async fn prepare_par2_analysis_work(
         &mut self,
         job_id: JobId,
@@ -1259,12 +1283,12 @@ impl Pipeline {
         })
     }
 
-    /// A finished analysis ticket, back on the pipeline task.
-    ///
-    /// Puts the retained session away, applies the bookkeeping the inline call
-    /// used to apply on return, parks the verdict for the completion check that
-    /// asked for it, and re-enters that check. A ticket the teardown, cancel or
-    /// rebind seams already forgot is discarded by the fence.
+    // A finished analysis ticket, back on the pipeline task.
+    //
+    // Puts the retained session away, applies the bookkeeping the inline call
+    // used to apply on return, parks the verdict for the completion check that
+    // asked for it, and re-enters that check. A ticket the teardown, cancel or
+    // rebind seams already forgot is discarded by the fence.
     pub(in crate::pipeline) async fn handle_par2_analysis_done(
         &mut self,
         done: Par2AnalysisWorkDone,
@@ -1307,9 +1331,9 @@ impl Pipeline {
         self.schedule_job_completion_check(done.job_id);
     }
 
-    /// Everything the inline analysis did with its raw result before returning
-    /// it: put the session back, record what the session may take on trust next
-    /// time, stash the carry, and refuse a terminal non-repair status.
+    // Everything the inline analysis did with its raw result before returning
+    // it: put the session back, record what the session may take on trust next
+    // time, stash the carry, and refuse a terminal non-repair status.
     pub(super) fn settle_par2_analysis_ticket(
         &mut self,
         job_id: JobId,
@@ -1372,13 +1396,13 @@ impl Pipeline {
         result
     }
 
-    /// Forgets a job's damaged-path analysis ticket and any parked verdict.
-    ///
-    /// The detached worker keeps running to its end; its done message then
-    /// finds no taker and is discarded by the fence, and the retained session
-    /// it was carrying is dropped with it. That is the point: a verdict names
-    /// files by path, and every caller of this is a seam where those paths, or
-    /// the recovery set behind them, stop meaning what the read assumed.
+    // Forgets a job's damaged-path analysis ticket and any parked verdict.
+    //
+    // The detached worker keeps running to its end; its done message then
+    // finds no taker and is discarded by the fence, and the retained session
+    // it was carrying is dropped with it. That is the point: a verdict names
+    // files by path, and every caller of this is a seam where those paths, or
+    // the recovery set behind them, stop meaning what the read assumed.
     pub(crate) fn forget_par2_analysis_work(&mut self, job_id: JobId) {
         if self.par2_analysis_in_flight.remove(&job_id).is_some() {
             self.metrics.verify_active.fetch_sub(1, Ordering::Relaxed);
@@ -1424,15 +1448,15 @@ impl Pipeline {
         Ok((verification, placement_plan))
     }
 
-    /// The post-repair authoritative pass, reading only the files the repair
-    /// rewrote and standing in for the rest with the pre-repair pass's own
-    /// entries.
-    ///
-    /// The pre-repair pass read every file in this set minutes ago, in this
-    /// same flow, and the repair only ever writes the files that pass could not
-    /// call complete ([`par2_repair_write_set`]). Re-reading and re-hashing the
-    /// files it left alone answers a question that was already answered by
-    /// reading the same bytes.
+    // The post-repair authoritative pass, reading only the files the repair
+    // rewrote and standing in for the rest with the pre-repair pass's own
+    // entries.
+    //
+    // The pre-repair pass read every file in this set minutes ago, in this
+    // same flow, and the repair only ever writes the files that pass could not
+    // call complete ([`par2_repair_write_set`]). Re-reading and re-hashing the
+    // files it left alone answers a question that was already answered by
+    // reading the same bytes.
     pub(in crate::pipeline) async fn verify_repaired_par2_files_with_placement(
         &mut self,
         job_id: JobId,
@@ -1488,9 +1512,9 @@ impl Pipeline {
         Ok((verification, placement_plan))
     }
 
-    /// Everything an authoritative pass does with its raw result before a
-    /// caller may read it: the direct-set damage adjustments, the volume-safety
-    /// recomputation and, when the caller is emitting them, the verdict events.
+    // Everything an authoritative pass does with its raw result before a
+    // caller may read it: the direct-set damage adjustments, the volume-safety
+    // recomputation and, when the caller is emitting them, the verdict events.
     pub(super) fn settle_par2_pass_result(
         &mut self,
         job_id: JobId,
@@ -1531,10 +1555,10 @@ impl Pipeline {
         }
     }
 
-    /// The authoritative PAR2 read, in whichever of its shapes
-    /// [`Par2PassScope`] asks for. Returns the raw result and the plan the pass
-    /// read through; settling it is the caller's, so the selective shape can
-    /// merge first and settle once over the combined set.
+    // The authoritative PAR2 read, in whichever of its shapes
+    // [`Par2PassScope`] asks for. Returns the raw result and the plan the pass
+    // read through; settling it is the caller's, so the selective shape can
+    // merge first and settle once over the combined set.
     pub(super) async fn run_par2_placement_pass(
         &mut self,
         job_id: JobId,
@@ -1735,12 +1759,12 @@ impl Pipeline {
         }
     }
 
-    /// What [`Pipeline::apply_direct_damage_adjustments`] moved, so each caller
-    /// can log it in its own voice.
-    ///
-    /// Counts rather than a bool: "how many blocks were forgiven" is the number
-    /// the operator needs to tell a job that was never damaged from one whose
-    /// damage was excused.
+    // What [`Pipeline::apply_direct_damage_adjustments`] moved, so each caller
+    // can log it in its own voice.
+    //
+    // Counts rather than a bool: "how many blocks were forgiven" is the number
+    // the operator needs to tell a job that was never damaged from one whose
+    // damage was excused.
     pub(crate) fn apply_direct_damage_adjustments(
         &self,
         job_id: JobId,
@@ -1787,9 +1811,9 @@ impl Pipeline {
             .unwrap_or_default()
     }
 
-    /// Discovery closes when no bounded collection bootstrap remains. Sibling
-    /// recovery volumes stay cold after one carrier has supplied usable
-    /// metadata, instead of being treated as completion-critical work.
+    // Discovery closes when no bounded collection bootstrap remains. Sibling
+    // recovery volumes stay cold after one carrier has supplied usable
+    // metadata, instead of being treated as completion-critical work.
     pub(in crate::pipeline) fn par2_metadata_discovery_closed(&self, job_id: JobId) -> bool {
         let candidates = self.par2_metadata_candidate_indices(job_id);
         if candidates.is_empty() {
@@ -1804,8 +1828,8 @@ impl Pipeline {
         self.next_par2_metadata_action(job_id).is_none()
     }
 
-    /// Whether every servable set has reached a final answer and no later
-    /// index can add one. A failed set is settled, but not verified.
+    // Whether every servable set has reached a final answer and no later
+    // index can add one. A failed set is settled, but not verified.
     pub(in crate::pipeline) fn par2_gate_settlement_complete(&self, job_id: JobId) -> bool {
         let set_ids = self.par2_servable_set_ids(job_id);
         !set_ids.is_empty()
@@ -1819,10 +1843,10 @@ impl Pipeline {
             })
     }
 
-    /// Recompute the job-level verification answer from immutable per-set
-    /// answers. This is intentionally the sole writer of `par2_verified`: a
-    /// newly parsed set can reopen the aggregate without invalidating a verdict
-    /// another set has already reached.
+    // Recompute the job-level verification answer from immutable per-set
+    // answers. This is intentionally the sole writer of `par2_verified`: a
+    // newly parsed set can reopen the aggregate without invalidating a verdict
+    // another set has already reached.
     pub(super) fn recompute_par2_verified(&mut self, job_id: JobId) -> bool {
         let set_ids = self.par2_servable_set_ids(job_id);
         let verified = !set_ids.is_empty()
@@ -1842,9 +1866,9 @@ impl Pipeline {
         verified
     }
 
-    /// Mark one set settled, reset only that set's re-entry latch, then update
-    /// the aggregate.  Direct outputs remain held until every servable set and
-    /// metadata discovery have reached a final answer.
+    // Mark one set settled, reset only that set's re-entry latch, then update
+    // the aggregate.  Direct outputs remain held until every servable set and
+    // metadata discovery have reached a final answer.
     pub(in crate::pipeline) async fn settle_par2_set(
         &mut self,
         job_id: JobId,
@@ -1900,7 +1924,7 @@ impl Pipeline {
         SetGateOutcome::Settled
     }
 
-    /// Records a set-local failure without aborting its siblings' passes.
+    // Records a set-local failure without aborting its siblings' passes.
     pub(super) fn mark_par2_set_failed(
         &mut self,
         job_id: JobId,
@@ -1957,8 +1981,8 @@ impl Pipeline {
         self.finish_or_rearm_after_par2_set_failure(job_id);
     }
 
-    /// Sibling PAR2 sets and explicitly eligible alternate work get their own
-    /// attempt. A PAR2-only job retains its immediate terminal failure behavior.
+    // Sibling PAR2 sets and explicitly eligible alternate work get their own
+    // attempt. A PAR2-only job retains its immediate terminal failure behavior.
     pub(super) fn finish_or_rearm_after_par2_set_failure(&mut self, job_id: JobId) {
         if let Some(message) = self.aggregate_par2_failure_message(job_id)
             && !self.par3_has_work_after_par2_failure(job_id)
@@ -1969,9 +1993,9 @@ impl Pipeline {
         }
     }
 
-    /// Make the earliest unsettled servable set the compatibility view used by
-    /// existing repair helpers.  The selection changes only at a set boundary;
-    /// a settled set is never selected again merely because another set arrives.
+    // Make the earliest unsettled servable set the compatibility view used by
+    // existing repair helpers.  The selection changes only at a set boundary;
+    // a settled set is never selected again merely because another set arrives.
     pub(super) fn activate_next_par2_gate_set(
         &mut self,
         job_id: JobId,
@@ -2004,10 +2028,10 @@ impl Pipeline {
         })
     }
 
-    /// A recovery set with no assembly binding and no bytes at any described
-    /// path has nothing this job can verify or repair.  The binding condition
-    /// is deliberately conservative: an empty but known assembly file still
-    /// takes the ordinary pass, because it may be waiting for recoverable data.
+    // A recovery set with no assembly binding and no bytes at any described
+    // path has nothing this job can verify or repair.  The binding condition
+    // is deliberately conservative: an empty but known assembly file still
+    // takes the ordinary pass, because it may be waiting for recoverable data.
     pub(in crate::pipeline) fn par2_set_is_absent_from_job(
         &self,
         job_id: JobId,
@@ -2121,10 +2145,10 @@ impl Pipeline {
         self.note_job_verification_result(job_id, passed, missing_blocks);
     }
 
-    /// Records the aggregate verdict and releases direct outputs exactly when
-    /// every servable set has verified. A per-set repair must not commit
-    /// neighbouring set B before B has had its own opportunity to verify or
-    /// repair.
+    // Records the aggregate verdict and releases direct outputs exactly when
+    // every servable set has verified. A per-set repair must not commit
+    // neighbouring set B before B has had its own opportunity to verify or
+    // repair.
     pub(in crate::pipeline) async fn mark_par2_verified(&mut self, job_id: JobId) {
         let was_verified = self.par2_verified.contains(&job_id);
         if !self.recompute_par2_verified(job_id) {
@@ -2213,13 +2237,13 @@ impl Pipeline {
             .send(PipelineEvent::JobVerificationStarted { job_id });
     }
 
-    /// Fold one job-level PAR2 verification verdict into the lifecycle metrics
-    /// and close the verify stage timer.
-    ///
-    /// Low-frequency: one call per verification pass, never per segment. The
-    /// four-way label is derived from what the pass actually produced — a pass
-    /// that needs repair and found nothing at all on disk is `missing`, one
-    /// that needs repair with blocks present is `damaged`.
+    // Fold one job-level PAR2 verification verdict into the lifecycle metrics
+    // and close the verify stage timer.
+    //
+    // Low-frequency: one call per verification pass, never per segment. The
+    // four-way label is derived from what the pass actually produced — a pass
+    // that needs repair and found nothing at all on disk is `missing`, one
+    // that needs repair with blocks present is `damaged`.
     pub(in super::super) fn note_job_verification_result(
         &mut self,
         job_id: JobId,
@@ -2244,18 +2268,18 @@ impl Pipeline {
         self.note_stage_finished(job_id, JobStageKind::Verify);
     }
 
-    /// Record that this job ended with no verification verdict to be had.
-    ///
-    /// A job with no recovery set can never produce `intact`, `damaged` or
-    /// `missing`: there is nothing to verify the payload against. Without
-    /// this, such jobs contribute nothing at all to
-    /// `weaver_verifications_total`, and the ratio of verified to unverified
-    /// downloads — the thing an operator actually wants from that series — is
-    /// unanswerable.
-    ///
-    /// Low-frequency: at most one call per job, at the terminal transition.
-    /// The guard set is the same per-job set a real verdict claims, so the two
-    /// can never both fire for one job.
+    // Record that this job ended with no verification verdict to be had.
+    //
+    // A job with no recovery set can never produce `intact`, `damaged` or
+    // `missing`: there is nothing to verify the payload against. Without
+    // this, such jobs contribute nothing at all to
+    // `weaver_verifications_total`, and the ratio of verified to unverified
+    // downloads — the thing an operator actually wants from that series — is
+    // unanswerable.
+    //
+    // Low-frequency: at most one call per job, at the terminal transition.
+    // The guard set is the same per-job set a real verdict claims, so the two
+    // can never both fire for one job.
     pub(in crate::pipeline) fn note_job_verification_unavailable(&mut self, job_id: JobId) {
         use crate::operations::instrumentation::VerificationOutcomeKind;
         if self.jobs_with_verification_outcome.insert(job_id) {
@@ -2265,8 +2289,8 @@ impl Pipeline {
         }
     }
 
-    /// Called at the two terminal transitions — the final move and job failure
-    /// — to attribute a job that never had a recovery set.
+    // Called at the two terminal transitions — the final move and job failure
+    // — to attribute a job that never had a recovery set.
     pub(in crate::pipeline) fn note_job_unverifiable_if_no_par2_set(&mut self, job_id: JobId) {
         self.note_par3_verification(job_id);
         if self.par2_set(job_id).is_none() {

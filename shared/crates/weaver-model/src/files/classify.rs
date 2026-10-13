@@ -2,59 +2,67 @@ use serde::{Deserialize, Serialize};
 
 use super::role_filename_view;
 
-/// What role a file plays in the context of a Usenet post.
-///
-/// Used by engines to understand archive layout and by the server to determine
-/// download priority and extraction readiness.
+// What role a file plays in the context of a Usenet post.
+//
+// Used by engines to understand archive layout and by the server to determine
+// download priority and extraction readiness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileRole {
-    /// RAR volume: part of an archive set.
-    RarVolume { volume_number: u32 },
-    /// PAR2 file: either index (`.par2`) or recovery (`.vol0+1.par2`).
+    // RAR volume: part of an archive set.
+    RarVolume {
+        volume_number: u32,
+    },
+    // PAR2 file: either index (`.par2`) or recovery (`.vol0+1.par2`).
     Par2 {
         is_index: bool,
         recovery_block_count: u32,
     },
-    /// Standalone PAR3 carrier. The name selects discovery priority only;
-    /// authenticated packets determine sets, matrices, and recovery capacity.
-    /// Embedded protection keeps its archive role.
-    Par3 { is_index: bool },
-    /// 7z archive (single file, not split).
+    // Standalone PAR3 carrier. The name selects discovery priority only;
+    // authenticated packets determine sets, matrices, and recovery capacity.
+    // Embedded protection keeps its archive role.
+    Par3 {
+        is_index: bool,
+    },
+    // 7z archive (single file, not split).
     SevenZipArchive,
-    /// 7z split file: `.7z.001`, `.7z.002`, etc. (0-indexed).
-    SevenZipSplit { number: u32 },
-    /// ZIP archive (`.zip`).
+    // 7z split file: `.7z.001`, `.7z.002`, etc. (0-indexed).
+    SevenZipSplit {
+        number: u32,
+    },
+    // ZIP archive (`.zip`).
     ZipArchive,
-    /// tar archive (`.tar`).
+    // tar archive (`.tar`).
     TarArchive,
-    /// Gzipped tar archive (`.tar.gz`, `.tgz`, `.tar.gzip`).
+    // Gzipped tar archive (`.tar.gz`, `.tgz`, `.tar.gzip`).
     TarGzArchive,
-    /// Bzip2-compressed tar archive (`.tar.bz2`, `.tbz`, `.tbz2`, `.tar.bzip2`).
+    // Bzip2-compressed tar archive (`.tar.bz2`, `.tbz`, `.tbz2`, `.tar.bzip2`).
     TarBz2Archive,
-    /// XZ-compressed tar archive (`.tar.xz`, `.txz`).
+    // XZ-compressed tar archive (`.tar.xz`, `.txz`).
     TarXzArchive,
-    /// Gzipped single file (`.gz`, but not `.tar.gz`).
+    // Gzipped single file (`.gz`, but not `.tar.gz`).
     GzArchive,
-    /// DEFLATE-compressed single file (`.deflate`).
+    // DEFLATE-compressed single file (`.deflate`).
     DeflateArchive,
-    /// Brotli-compressed single file (`.br`).
+    // Brotli-compressed single file (`.br`).
     BrotliArchive,
-    /// Zstandard-compressed single file (`.zst`, `.zstd`).
+    // Zstandard-compressed single file (`.zst`, `.zstd`).
     ZstdArchive,
-    /// Bzip2-compressed single file (`.bz2`).
+    // Bzip2-compressed single file (`.bz2`).
     Bzip2Archive,
-    /// XZ-compressed single file (`.xz`).
+    // XZ-compressed single file (`.xz`).
     XzArchive,
-    /// Plain split file (`.001`, `.002`, etc.). 0-indexed: `.001` = number 0.
-    SplitFile { number: u32 },
-    /// Standalone file (not part of an archive).
+    // Plain split file (`.001`, `.002`, etc.). 0-indexed: `.001` = number 0.
+    SplitFile {
+        number: u32,
+    },
+    // Standalone file (not part of an archive).
     Standalone,
-    /// Could not determine role from filename.
+    // Could not determine role from filename.
     Unknown,
 }
 
 impl FileRole {
-    /// Infer the file role from a filename using standard Usenet naming conventions.
+    // Infer the file role from a filename using standard Usenet naming conventions.
     pub fn from_filename(name: &str) -> Self {
         let lower = role_filename_view(name).to_ascii_lowercase();
         let lower = remove_duplicate_marker(&lower);
@@ -145,7 +153,7 @@ impl FileRole {
         FileRole::Unknown
     }
 
-    /// Download priority: lower number = download first.
+    // Download priority: lower number = download first.
     pub fn download_priority(&self) -> u32 {
         match self {
             FileRole::Par2 { is_index: true, .. } | FileRole::Par3 { is_index: true } => 0,
@@ -174,8 +182,8 @@ impl FileRole {
         }
     }
 
-    /// Whether this file role is a recovery/repair file that should be
-    /// routed to the recovery queue.
+    // Whether this file role is a recovery/repair file that should be
+    // routed to the recovery queue.
     pub fn is_recovery(&self) -> bool {
         matches!(
             self,
@@ -186,7 +194,7 @@ impl FileRole {
         )
     }
 
-    /// Whether missing segments for this file should reduce computed job health.
+    // Whether missing segments for this file should reduce computed job health.
     pub fn counts_toward_health(&self) -> bool {
         !matches!(self, FileRole::Par2 { .. } | FileRole::Par3 { .. })
     }

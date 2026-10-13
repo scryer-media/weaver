@@ -55,10 +55,10 @@ const RELEASE_LOCAL_PATH_TOKENS: &[&str] = &[
 ];
 const RELEASE_SIBLING_E2E_TOKENS: &[&str] = &[concat!("..", "/e2e/"), concat!("..\\", "e2e\\")];
 const GRAPHQL_API_COMPAT_STEP: &str = "graphql_api_compat";
-/// First weaver release that ships `api/graphql/schema.graphql`. Releases cut
-/// before this version have no committed schema to diff against, so the gate
-/// bootstraps its baseline instead of failing. Once a release at or after this
-/// version is tagged, a missing artifact is a hard release failure.
+// First weaver release that ships `api/graphql/schema.graphql`. Releases cut
+// before this version have no committed schema to diff against, so the gate
+// bootstraps its baseline instead of failing. Once a release at or after this
+// version is tagged, a missing artifact is a hard release failure.
 const GRAPHQL_API_BASELINE_VERSION: &str = "0.7.7";
 const GRAPHQL_SCHEMA_ARTIFACT: &str = "api/graphql/schema.graphql";
 const GRAPHQL_SCHEMA_EXPORT_DIR: &str = "target/xtask-release/graphql";
@@ -254,8 +254,8 @@ impl Drop for SignalForwarder {
 struct SignalForwarder;
 
 impl SignalForwarder {
-    /// Put the previous signal handlers back. Where none were installed
-    /// there is nothing to restore.
+    // Put the previous signal handlers back. Where none were installed
+    // there is nothing to restore.
     fn uninstall(self) {}
 }
 
@@ -913,10 +913,10 @@ fn porcelain_status_paths(status: &str) -> Vec<String> {
         .collect()
 }
 
-/// True when the only uncommitted path is this release's notes file.
-///
-/// Release notes are a required input written before the dry run, so a tree that
-/// carries nothing else is treated as ready instead of prompting the operator.
+// True when the only uncommitted path is this release's notes file.
+//
+// Release notes are a required input written before the dry run, so a tree that
+// carries nothing else is treated as ready instead of prompting the operator.
 fn dirty_paths_are_release_notes_only(status: &str, release_notes_relative: &str) -> bool {
     let paths = porcelain_status_paths(status);
     !paths.is_empty() && paths.iter().all(|path| path == release_notes_relative)
@@ -1135,8 +1135,8 @@ fn release_notes_path_relative(tag_name: &str) -> String {
     format!("{RELEASE_NOTES_DIR}/{tag_name}.md")
 }
 
-/// Where the authoring context is written, relative to the repo and spelled
-/// with `/` on every platform, the way the instructions print it.
+// Where the authoring context is written, relative to the repo and spelled
+// with `/` on every platform, the way the instructions print it.
 fn release_notes_context_path_relative(tag_name: &str) -> String {
     format!("tmp/xtask-release-notes/{tag_name}-context.md")
 }
@@ -1337,10 +1337,10 @@ fn release_notes_authoring_instructions(
     )
 }
 
-/// Refuses a release, dry or real, whose notes are missing or unusable.
-///
-/// The failure writes an authoring context (commit log, changed files, diffstat)
-/// under `tmp/` and says how to write the notes, so the next run can proceed.
+// Refuses a release, dry or real, whose notes are missing or unusable.
+//
+// The failure writes an authoring context (commit log, changed files, diffstat)
+// under `tmp/` and says how to write the notes, so the next run can proceed.
 fn require_release_notes(
     ctx: &TaskContext,
     latest_tag: Option<&str>,
@@ -1377,10 +1377,10 @@ fn require_release_notes(
     bail!("{problem}\n\n{instructions}")
 }
 
-/// Commits this release's notes on their own when they are uncommitted.
-///
-/// Only the notes path is committed, whatever else is staged, so the dry run and
-/// the real release both validate and cache a tree that already carries them.
+// Commits this release's notes on their own when they are uncommitted.
+//
+// Only the notes path is committed, whatever else is staged, so the dry run and
+// the real release both validate and cache a tree that already carries them.
 fn commit_release_notes_if_changed(
     ctx: &TaskContext,
     notes_path: &Path,
@@ -1576,13 +1576,13 @@ fn write_workspace_version(path: &Path, version: &Version) -> Result<()> {
     Ok(())
 }
 
-/// The toolchain `rust-toolchain.toml` pins.
-///
-/// The Linux clippy image is derived from it rather than named on its own,
-/// because rustup inside that container reads the same file from the mounted
-/// checkout: an image built on another compiler does not run clippy on an older
-/// toolchain, it downloads this one on every run. A hard-coded tag only drifts
-/// silently until someone notices the container is not the toolchain.
+// The toolchain `rust-toolchain.toml` pins.
+//
+// The Linux clippy image is derived from it rather than named on its own,
+// because rustup inside that container reads the same file from the mounted
+// checkout: an image built on another compiler does not run clippy on an older
+// toolchain, it downloads this one on every run. A hard-coded tag only drifts
+// silently until someone notices the container is not the toolchain.
 fn pinned_rust_channel(ctx: &TaskContext) -> Result<String> {
     let path = ctx.repo_root.join("rust-toolchain.toml");
     let document = fs::read_to_string(&path)
@@ -1595,11 +1595,11 @@ fn pinned_rust_channel(ctx: &TaskContext) -> Result<String> {
         .ok_or_else(|| anyhow!("{} has no toolchain.channel", path.display()))
 }
 
-/// C compiler flags a musl clippy build needs for its vendored C code.
-///
-/// aarch64 gcc defaults to `-moutline-atomics`, whose helpers link against a
-/// glibc-only symbol, so every atomics probe in a C configure script (jemalloc's
-/// among them) fails under musl and the build concludes it has no atomics.
+// C compiler flags a musl clippy build needs for its vendored C code.
+//
+// aarch64 gcc defaults to `-moutline-atomics`, whose helpers link against a
+// glibc-only symbol, so every atomics probe in a C configure script (jemalloc's
+// among them) fails under musl and the build concludes it has no atomics.
 fn musl_c_flags_env(target: &str) -> Vec<(String, String)> {
     if !target.starts_with("aarch64-") {
         return Vec::new();
@@ -2337,10 +2337,10 @@ fn run_weaver_release_hygiene_validation(ctx: &TaskContext, prefix: &'static str
     Ok(())
 }
 
-/// Export the current GraphQL SDL, diff it against the schema shipped by the
-/// previous release, and refresh the committed `api/graphql/schema.graphql`
-/// artifact. Breaking and dangerous changes fail a patch release outright and
-/// are only warned about when the release raises the minor or major version.
+// Export the current GraphQL SDL, diff it against the schema shipped by the
+// previous release, and refresh the committed `api/graphql/schema.graphql`
+// artifact. Breaking and dangerous changes fail a patch release outright and
+// are only warned about when the release raises the minor or major version.
 fn run_weaver_graphql_api_compat_validation(
     ctx: &TaskContext,
     prefix: &'static str,
@@ -2435,10 +2435,10 @@ fn read_previous_release_graphql_schema(
         .with_context(|| format!("failed to read {GRAPHQL_SCHEMA_ARTIFACT} from {latest_tag}"))
 }
 
-/// Bootstrapping is only allowed while every tagged release predates the
-/// baseline, i.e. no release has shipped the schema artifact yet. Once one
-/// has, a missing artifact means the previous release regressed and the gate
-/// fails instead of silently re-baselining.
+// Bootstrapping is only allowed while every tagged release predates the
+// baseline, i.e. no release has shipped the schema artifact yet. Once one
+// has, a missing artifact means the previous release regressed and the gate
+// fails instead of silently re-baselining.
 fn allow_missing_previous_graphql_schema(latest_tag: Option<&str>) -> bool {
     let Some(tag) = latest_tag else {
         return true;
@@ -2454,10 +2454,10 @@ fn graphql_api_baseline_version() -> Version {
         .expect("GraphQL API baseline version should be valid semver")
 }
 
-/// Breaking/dangerous GraphQL schema changes are permitted only when the
-/// release raises the minor or major version (e.g. 0.7.x → 0.8.0 — a major
-/// weaver release under 0.x versioning); patch releases keep the hard
-/// compatibility failure.
+// Breaking/dangerous GraphQL schema changes are permitted only when the
+// release raises the minor or major version (e.g. 0.7.x → 0.8.0 — a major
+// weaver release under 0.x versioning); patch releases keep the hard
+// compatibility failure.
 fn schema_breaks_allowed_for_bump(latest_tag: Option<&str>, next_version: &Version) -> bool {
     let Some(tag) = latest_tag else {
         return false;
@@ -2884,10 +2884,10 @@ fn forward_backend_sigaction() -> libc::sigaction {
     action
 }
 
-/// How the backend announces the code its first-run setup page asks for. It
-/// writes it to stderr only, never to tracing: a banner row in text logs, the
-/// message of one record in JSON logs. The code follows the marker as
-/// `K7P-M2X`.
+// How the backend announces the code its first-run setup page asks for. It
+// writes it to stderr only, never to tracing: a banner row in text logs, the
+// message of one record in JSON logs. The code follows the marker as
+// `K7P-M2X`.
 const SETUP_CODE_PREFIX: &str = "Weaver one-time setup code: ";
 
 fn parse_setup_code_line(line: &str) -> Option<&str> {
@@ -2907,8 +2907,8 @@ fn parse_setup_code_line(line: &str) -> Option<&str> {
     (shaped && whole).then_some(code)
 }
 
-/// The setup code a backend wrote to its log after `offset`. Skipping what
-/// came before keeps the bootstrap run's code, which died with it, out.
+// The setup code a backend wrote to its log after `offset`. Skipping what
+// came before keeps the bootstrap run's code, which died with it, out.
 fn read_setup_code(log_path: &Path, offset: u64) -> Result<Option<String>> {
     let mut log = fs::File::open(log_path)
         .with_context(|| format!("failed to open {}", log_path.display()))?;

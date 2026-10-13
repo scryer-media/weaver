@@ -1,4 +1,4 @@
-import { memo, useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useMutation, useQuery } from "urql";
 import { LOG_FILTER_QUERY, SET_LOG_FILTER_MUTATION } from "@/graphql/queries";
@@ -6,16 +6,11 @@ import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { EmptyState } from "../components/chrome";
 import { SecondaryButton, Select, TextField } from "../components/controls";
+import { LogRow } from "../components/LogRow";
 import { formatCount } from "../data/format";
 import { LOG_LEVEL_COLORS, WV } from "../data/palette";
 import { countLabel } from "../i18n/labels";
-import {
-  LOG_LEVELS,
-  useServiceLogs,
-  type LogKeyValue,
-  type LogLevelFilter,
-  type LogLine,
-} from "../data/use-service-logs";
+import { LOG_LEVELS, useServiceLogs, type LogLevelFilter } from "../data/use-service-logs";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, UptimeBlock } from "../shell/rail-blocks";
 
@@ -141,50 +136,6 @@ function LogFilterBar() {
     </div>
   );
 }
-
-/** Split the message so its `key=value` tail can be tinted separately. */
-function messageFragments(line: LogLine) {
-  const fragments: { text: string; kv: LogKeyValue | null }[] = [];
-  let cursor = 0;
-  for (const pair of line.kvPairs) {
-    if (pair.start > cursor) {
-      fragments.push({ text: line.message.slice(cursor, pair.start), kv: null });
-    }
-    fragments.push({ text: line.message.slice(pair.start, pair.end), kv: pair });
-    cursor = pair.end;
-  }
-  if (cursor < line.message.length) {
-    fragments.push({ text: line.message.slice(cursor), kv: null });
-  }
-  return fragments;
-}
-
-/**
- * One line of the log. A buffered line is never edited, so a row renders once
- * for as long as its line stays in view.
- */
-const LogRow = memo(function LogRow({ line }: { line: LogLine }) {
-  return (
-    <div className="flex flex-wrap gap-x-[14px] gap-y-0.5 border-b border-wv-log-line px-4 sm:px-6 py-1.5 font-wv-mono text-[11.5px] leading-[1.55] sm:flex-nowrap">
-      <span className="w-[34px] flex-none text-right text-wv-dim">{line.id + 1}</span>
-      <span className="flex-none text-wv-faint">{line.time}</span>
-      <span
-        className="w-[44px] flex-none font-semibold uppercase"
-        style={{ color: LOG_LEVEL_COLORS[line.level] }}
-      >
-        {line.level}
-      </span>
-      <span className="min-w-0 flex-1 truncate text-wv-slate sm:flex-none">{line.target}</span>
-      <span className="w-full min-w-0 break-words text-wv-secondary sm:w-auto sm:flex-1">
-        {messageFragments(line).map((fragment, index) => (
-          <span key={index} className={fragment.kv ? "text-wv-info" : undefined}>
-            {fragment.text}
-          </span>
-        ))}
-      </span>
-    </div>
-  );
-});
 
 export function LogsPage() {
   const t = useTranslate();

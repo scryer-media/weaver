@@ -3,54 +3,54 @@ use crate::jobs::model::{TerminalDiscard, TerminalDiscardKind};
 use crate::pipeline::TerminalReconciliation;
 use crate::pipeline::completion::finalize::check::par2_damage_ignorable;
 
-/// Below this share of its declared segments, a file has produced no delivery
-/// evidence at all: what is on disk for it is a rounding error, not a short
-/// delivery.
-///
-/// The distinction matters because the two are settled differently. A file the
-/// job substantially delivered but that ended a few articles short is ordinary
-/// Usenet damage and ships as it stands; a file that produced nothing and that
-/// no settlement fact vouches for is a hole being handed over as a delivery,
-/// and that is a failed job whatever the counters say.
+// Below this share of its declared segments, a file has produced no delivery
+// evidence at all: what is on disk for it is a rounding error, not a short
+// delivery.
+//
+// The distinction matters because the two are settled differently. A file the
+// job substantially delivered but that ended a few articles short is ordinary
+// Usenet damage and ships as it stands; a file that produced nothing and that
+// no settlement fact vouches for is a hole being handed over as a delivery,
+// and that is a failed job whatever the counters say.
 const DELIVERY_EVIDENCE_PERCENT: u32 = 10;
 
-/// Which settlement fact — if any — accounts for a payload file at the moment
-/// the job would be delivered.
-///
-/// The census asks this of every file that counts toward health, and the whole
-/// terminal record follows from the answers. Nothing here consults a filename
-/// to decide *whether* a file is claimed: recovery bindings resolve through
-/// PAR2 description identities or PAR3 source identities, and direct sets
-/// through the plan's own file index. Names
-/// appear only in what the operator is told afterwards.
+// Which settlement fact — if any — accounts for a payload file at the moment
+// the job would be delivered.
+//
+// The census asks this of every file that counts toward health, and the whole
+// terminal record follows from the answers. Nothing here consults a filename
+// to decide *whether* a file is claimed: recovery bindings resolve through
+// PAR2 description identities or PAR3 source identities, and direct sets
+// through the plan's own file index. Names
+// appear only in what the operator is told afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::pipeline) enum TerminalFileClaim {
-    /// A settled PAR2 recovery-set verdict verified or repaired this file.
+    // A settled PAR2 recovery-set verdict verified or repaired this file.
     Par2Verdict,
-    /// A current authenticated PAR3 assessment verified this bound source.
+    // A current authenticated PAR3 assessment verified this bound source.
     Par3Verdict,
-    /// A finalized direct set routed this file's bytes into its output; the
-    /// file itself was never written and never needed to be.
+    // A finalized direct set routed this file's bytes into its output; the
+    // file itself was never written and never needed to be.
     InStreamProof,
-    /// No parsed recovery set describes it. Whatever arrived is what ships,
-    /// short articles and all.
+    // No parsed recovery set describes it. Whatever arrived is what ships,
+    // short articles and all.
     Unprotected,
-    /// The settlement dropped it. Neither delivered nor missing: not part of
-    /// the delivery at all.
+    // The settlement dropped it. Neither delivered nor missing: not part of
+    // the delivery at all.
     Discarded(TerminalDiscardKind),
-    /// Nothing accounts for it. Either bytes that read complete without a
-    /// verdict behind them, or a file that produced nothing and that no
-    /// verdict, proof or discard ever spoke for.
+    // Nothing accounts for it. Either bytes that read complete without a
+    // verdict behind them, or a file that produced nothing and that no
+    // verdict, proof or discard ever spoke for.
     Unclaimed,
 }
 
 impl TerminalFileClaim {
-    /// Whether this claim says the job handed over content for the file.
-    ///
-    /// A repair leftover counts: a join or a rebuild consumed it into an output
-    /// the job delivered. An unfetchable-duplicate discard does not — that claim only
-    /// says the bytes could never arrive, which is a statement about the wire,
-    /// not about anything reaching the destination.
+    // Whether this claim says the job handed over content for the file.
+    //
+    // A repair leftover counts: a join or a rebuild consumed it into an output
+    // the job delivered. An unfetchable-duplicate discard does not — that claim only
+    // says the bytes could never arrive, which is a statement about the wire,
+    // not about anything reaching the destination.
     fn delivers_content(self) -> bool {
         matches!(
             self,
@@ -63,74 +63,74 @@ impl TerminalFileClaim {
     }
 }
 
-/// One file's row in the census.
+// One file's row in the census.
 struct ClaimedFile {
     file_id: NzbFileId,
     filename: String,
-    /// The NZB's declaration, which is what health is measured against.
+    // The NZB's declaration, which is what health is measured against.
     declared_bytes: u64,
     claim: TerminalFileClaim,
-    /// Declared bytes of this file's segments that reached a terminal state
-    /// without arriving.
+    // Declared bytes of this file's segments that reached a terminal state
+    // without arriving.
     terminal_failed_bytes: u64,
-    /// Nothing accounts for this file and it produced no delivery evidence, so
-    /// delivering the job would hand over a hole as though it were content.
+    // Nothing accounts for this file and it produced no delivery evidence, so
+    // delivering the job would hand over a hole as though it were content.
     blocks_delivery: bool,
-    /// Furniture by the settlement's own ignore list. Never blocks a delivery,
-    /// and never counts as one either.
+    // Furniture by the settlement's own ignore list. Never blocks a delivery,
+    // and never counts as one either.
     is_furniture: bool,
 }
 
 impl Pipeline {
-    /// Re-derive the terminal record from what claimed the job's files, rather
-    /// than from the wire counters the download layer left behind.
-    ///
-    /// # The two records disagree, and the counters are the wrong one
-    ///
-    /// `failed_bytes` and health are live download telemetry: they say what the
-    /// article layer could not fetch, and they are the truth while a job is
-    /// downloading. They are not the truth about a *delivered* job, because
-    /// everything that happens after the download — a PAR2 repair, an in-stream
-    /// verification, a discard — answers those misses without touching them.
-    /// Job 10206 delivered a clean repaired payload and archived health 91/1000
-    /// with 1.17 GB failed, which was the exact size of a dead duplicate the
-    /// settlement had already thrown away. Automation reads those fields to
-    /// decide whether a download failed, so the record misreported a good
-    /// delivery as a broken one.
-    ///
-    /// So at the last gate before the payload leaves, every file that counts
-    /// toward health is matched to the settlement fact that claims it, and the
-    /// record is rebuilt from the census:
-    ///
-    /// * claimed-delivered files contribute no failure — their wire misses were
-    ///   answered;
-    /// * discarded files leave both sides of the fraction, and say so in a
-    ///   typed detail;
-    /// * an unprotected file delivered short keeps its damage, so a job that
-    ///   really is imperfect still reports as imperfect;
-    /// * a file nothing claims is *not* forgiven — see below.
-    ///
-    /// # Both directions, because only one of them is safe to guess
-    ///
-    /// Forgiving a file no fact vouches for would turn every reconciliation
-    /// defect of ours into a green job. Job 10220 is what that looks like: its
-    /// PAR2 index was itself unfetchable, so no set described anything, the
-    /// absent-set arm settled the job as verified, the protected-file count was
-    /// zero because nothing was ever described — and a post that delivered
-    /// 10 KB of a 1.2 GB payload archived as a success. So when no settlement
-    /// fact delivered any content at all, a file that produced no delivery
-    /// evidence and that nothing claims blocks the delivery outright — and a
-    /// breaker discard stops counting as a discard, because with nothing else
-    /// delivered it is the payload, not a surplus copy. When the job did
-    /// deliver, the unclaimed and the undelivered keep their failure
-    /// contributions in an honest record and are named in warnings; a delivered
-    /// job with a hole beside it is a warning, not a failure.
-    ///
-    /// Pure fold over state the pipeline actor already holds: no I/O, no file
-    /// reads, nothing that can block the single task this runs on.
-    ///
-    /// Returns the operator-facing failure message when the census refuses the
-    /// delivery.
+    // Re-derive the terminal record from what claimed the job's files, rather
+    // than from the wire counters the download layer left behind.
+    //
+    // # The two records disagree, and the counters are the wrong one
+    //
+    // `failed_bytes` and health are live download telemetry: they say what the
+    // article layer could not fetch, and they are the truth while a job is
+    // downloading. They are not the truth about a *delivered* job, because
+    // everything that happens after the download — a PAR2 repair, an in-stream
+    // verification, a discard — answers those misses without touching them.
+    // Job 10206 delivered a clean repaired payload and archived health 91/1000
+    // with 1.17 GB failed, which was the exact size of a dead duplicate the
+    // settlement had already thrown away. Automation reads those fields to
+    // decide whether a download failed, so the record misreported a good
+    // delivery as a broken one.
+    //
+    // So at the last gate before the payload leaves, every file that counts
+    // toward health is matched to the settlement fact that claims it, and the
+    // record is rebuilt from the census:
+    //
+    // * claimed-delivered files contribute no failure — their wire misses were
+    //   answered;
+    // * discarded files leave both sides of the fraction, and say so in a
+    //   typed detail;
+    // * an unprotected file delivered short keeps its damage, so a job that
+    //   really is imperfect still reports as imperfect;
+    // * a file nothing claims is *not* forgiven — see below.
+    //
+    // # Both directions, because only one of them is safe to guess
+    //
+    // Forgiving a file no fact vouches for would turn every reconciliation
+    // defect of ours into a green job. Job 10220 is what that looks like: its
+    // PAR2 index was itself unfetchable, so no set described anything, the
+    // absent-set arm settled the job as verified, the protected-file count was
+    // zero because nothing was ever described — and a post that delivered
+    // 10 KB of a 1.2 GB payload archived as a success. So when no settlement
+    // fact delivered any content at all, a file that produced no delivery
+    // evidence and that nothing claims blocks the delivery outright — and a
+    // breaker discard stops counting as a discard, because with nothing else
+    // delivered it is the payload, not a surplus copy. When the job did
+    // deliver, the unclaimed and the undelivered keep their failure
+    // contributions in an honest record and are named in warnings; a delivered
+    // job with a hole beside it is a warning, not a failure.
+    //
+    // Pure fold over state the pipeline actor already holds: no I/O, no file
+    // reads, nothing that can block the single task this runs on.
+    //
+    // Returns the operator-facing failure message when the census refuses the
+    // delivery.
     pub(in crate::pipeline) fn reconcile_terminal_delivery(
         &mut self,
         job_id: JobId,
@@ -348,10 +348,10 @@ impl Pipeline {
         })
     }
 
-    /// The settlement fact that accounts for one payload file.
-    ///
-    /// Discards are asked first: a file that left the delivery has no delivery
-    /// question left to answer about it.
+    // The settlement fact that accounts for one payload file.
+    //
+    // Discards are asked first: a file that left the delivery has no delivery
+    // question left to answer about it.
     pub(in crate::pipeline) fn classify_terminal_file_claim(
         &self,
         job_id: JobId,
@@ -419,8 +419,8 @@ impl Pipeline {
         TerminalFileClaim::Unclaimed
     }
 
-    /// Whether a finalized direct set already routed this file's bytes into its
-    /// own output.
+    // Whether a finalized direct set already routed this file's bytes into its
+    // own output.
     fn direct_set_delivered_file(&self, file_id: NzbFileId) -> bool {
         self.direct_store
             .sets_for(file_id.job_id)
@@ -432,12 +432,12 @@ impl Pipeline {
             })
     }
 
-    /// The failed bytes and health the terminal record should carry, and the
-    /// discards that explain them.
-    ///
-    /// Falls back to the live ledger for a job that never reached the census —
-    /// a failed job, where the raw counters are the explanation and must be
-    /// preserved exactly as the download layer left them.
+    // The failed bytes and health the terminal record should carry, and the
+    // discards that explain them.
+    //
+    // Falls back to the live ledger for a job that never reached the census —
+    // a failed job, where the raw counters are the explanation and must be
+    // preserved exactly as the download layer left them.
     pub(in crate::pipeline) fn terminal_record_figures(
         &self,
         job_id: JobId,

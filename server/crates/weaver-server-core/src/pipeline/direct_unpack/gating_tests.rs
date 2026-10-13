@@ -1,10 +1,10 @@
-//! Gating behaviour of [`GatedSplitReader`]: what parks, what does not, and
-//! what wakes a parked reader.
-//!
-//! The part files here are written to disk in full up front while the coverage
-//! is advanced by hand. That gap is the point: the reader must believe the
-//! coverage and not the filesystem, so a test can hold it at an offset whose
-//! bytes are already sitting in the file and prove it waits anyway.
+// Gating behaviour of [`GatedSplitReader`]: what parks, what does not, and
+// what wakes a parked reader.
+//
+// The part files here are written to disk in full up front while the coverage
+// is advanced by hand. That gap is the point: the reader must believe the
+// coverage and not the filesystem, so a test can hold it at an offset whose
+// bytes are already sitting in the file and prove it waits anyway.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -17,13 +17,13 @@ use tempfile::TempDir;
 use super::coverage::SetCoverage;
 use super::reader::GatedSplitReader;
 
-/// Long enough that a reader which was going to spin would have spun many
-/// thousands of times before it elapses.
+// Long enough that a reader which was going to spin would have spun many
+// thousands of times before it elapses.
 const SETTLE: Duration = Duration::from_millis(250);
 
-/// Blocks until the reader has parked more than `previous` times. The park is
-/// counted under the coverage lock before the reader waits, so once this
-/// returns, anything the test does to the coverage reaches a parked reader.
+// Blocks until the reader has parked more than `previous` times. The park is
+// counted under the coverage lock before the reader waits, so once this
+// returns, anything the test does to the coverage reaches a parked reader.
 fn wait_for_park(coverage: &SetCoverage, previous: u64) {
     while coverage.park_count() <= previous {
         thread::yield_now();
@@ -37,8 +37,8 @@ struct SplitFixture {
     part_lens: Vec<u64>,
 }
 
-/// Deterministic pseudo-random bytes; incompressible enough that a codec has
-/// to actually move them.
+// Deterministic pseudo-random bytes; incompressible enough that a codec has
+// to actually move them.
 fn payload(len: usize, seed: u64) -> Vec<u8> {
     let mut state = seed | 1;
     (0..len)
@@ -51,7 +51,7 @@ fn payload(len: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-/// Split `bytes` at `boundaries` and write each piece as a part file.
+// Split `bytes` at `boundaries` and write each piece as a part file.
 fn split_fixture(bytes: Vec<u8>, boundaries: &[usize]) -> SplitFixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cuts = vec![0usize];
@@ -78,8 +78,8 @@ fn split_fixture(bytes: Vec<u8>, boundaries: &[usize]) -> SplitFixture {
     }
 }
 
-/// Coverage that already knows everything: every length declared, every part
-/// complete.
+// Coverage that already knows everything: every length declared, every part
+// complete.
 fn settled_coverage(fixture: &SplitFixture) -> Arc<SetCoverage> {
     let coverage = Arc::new(SetCoverage::new(fixture.paths.len()));
     coverage.set_total_len(fixture.bytes.len() as u64);
@@ -458,9 +458,9 @@ fn a_damage_cap_only_ever_lowers_the_frontier() {
     assert_eq!(coverage.readable_at(0, 0).expect("readable"), 20_000);
 }
 
-/// A capped part is not "finished" for the reader even when the download says
-/// it is: repair is still to come, and the bytes above the cap are exactly the
-/// ones it will rewrite.
+// A capped part is not "finished" for the reader even when the download says
+// it is: repair is still to come, and the bytes above the cap are exactly the
+// ones it will rewrite.
 #[test]
 fn a_capped_part_parks_rather_than_reporting_end_of_part() {
     let fixture = split_fixture(payload(60_000, 71), &[]);
@@ -532,9 +532,9 @@ fn releasing_after_repair_clears_the_cap_and_settles_the_length() {
     assert_eq!(coverage.readable_at(0, 0).expect("readable"), 50_000);
 }
 
-/// Review question (a): a reader parked *under a damage cap* is parked on a
-/// condition only repair can satisfy. If repair never comes, the abort path has
-/// to reach it — otherwise the blocking thread waits forever.
+// Review question (a): a reader parked *under a damage cap* is parked on a
+// condition only repair can satisfy. If repair never comes, the abort path has
+// to reach it — otherwise the blocking thread waits forever.
 #[test]
 fn abort_unblocks_a_reader_parked_under_a_damage_cap() {
     let fixture = split_fixture(payload(50_000, 79), &[]);
@@ -572,9 +572,9 @@ fn abort_unblocks_a_reader_parked_under_a_damage_cap() {
     );
 }
 
-/// Review question (b): repair writes the file the recovery set describes,
-/// which can be *shorter* than what was on disk. Releasing must not leave a
-/// watermark describing bytes the repaired file no longer has.
+// Review question (b): repair writes the file the recovery set describes,
+// which can be *shorter* than what was on disk. Releasing must not leave a
+// watermark describing bytes the repaired file no longer has.
 #[test]
 fn releasing_a_shrunk_part_clamps_the_watermark_to_the_repaired_length() {
     let coverage = SetCoverage::new(1);
@@ -595,8 +595,8 @@ fn releasing_a_shrunk_part_clamps_the_watermark_to_the_repaired_length() {
     assert!(coverage.abort_reason().is_none(), "nothing was over-read");
 }
 
-/// The same shrink, but the decoder had already read past where repair cut. The
-/// vouch this release rests on was about bytes that no longer exist.
+// The same shrink, but the decoder had already read past where repair cut. The
+// vouch this release rests on was about bytes that no longer exist.
 #[test]
 fn releasing_below_what_was_already_read_aborts_instead() {
     let coverage = SetCoverage::new(1);
@@ -617,8 +617,8 @@ fn releasing_below_what_was_already_read_aborts_instead() {
     assert!(coverage.readable_at(0, 0).is_err());
 }
 
-/// The whole point of repair-resume: a chase parked below damage picks up over
-/// the repaired bytes and finishes, rather than being thrown away.
+// The whole point of repair-resume: a chase parked below damage picks up over
+// the repaired bytes and finishes, rather than being thrown away.
 #[test]
 fn a_parked_chase_resumes_over_repaired_bytes_and_reads_the_whole_stream() {
     // The "damaged" part on disk, and what repair will write in its place.
@@ -666,12 +666,12 @@ fn a_parked_chase_resumes_over_repaired_bytes_and_reads_the_whole_stream() {
     );
 }
 
-/// Repair does not write into the damaged file. It moves that file aside,
-/// installs the repaired one under the same name, and the moved-aside copy is
-/// deleted as a leftover once the repair is accepted. A chase that had the
-/// damaged part open when it parked must open the path again on resume, or it
-/// keeps reading the file that was moved aside — zeros included — and fails
-/// the member checksum a moment after the repair that was meant to save it.
+// Repair does not write into the damaged file. It moves that file aside,
+// installs the repaired one under the same name, and the moved-aside copy is
+// deleted as a leftover once the repair is accepted. A chase that had the
+// damaged part open when it parked must open the path again on resume, or it
+// keeps reading the file that was moved aside — zeros included — and fails
+// the member checksum a moment after the repair that was meant to save it.
 #[test]
 fn a_parked_chase_reopens_a_part_the_repair_replaced() {
     let repaired = payload(160_000, 89);
@@ -733,8 +733,8 @@ fn a_parked_chase_reopens_a_part_the_repair_replaced() {
 // Gate-on-first-damage
 // ---------------------------------------------------------------------------
 
-/// A clean set pays nothing for gating: no verdict, no gate, and the frontier
-/// is exactly the download's own.
+// A clean set pays nothing for gating: no verdict, no gate, and the frontier
+// is exactly the download's own.
 #[test]
 fn an_ungated_set_serves_everything_the_download_committed() {
     let coverage = SetCoverage::new(1);
@@ -748,9 +748,9 @@ fn an_ungated_set_serves_everything_the_download_committed() {
     assert_eq!(coverage.readable_at(0, 0).expect("readable"), 80_000);
 }
 
-/// Damage anywhere gates the whole set — including the parts the chase has not
-/// reached, which is the point: their unverified bytes stop being served before
-/// the chase can race into them.
+// Damage anywhere gates the whole set — including the parts the chase has not
+// reached, which is the point: their unverified bytes stop being served before
+// the chase can race into them.
 #[test]
 fn damage_in_one_part_gates_every_other_part() {
     let coverage = SetCoverage::new(3);
@@ -781,10 +781,10 @@ fn damage_in_one_part_gates_every_other_part() {
     );
 }
 
-/// A prefix banked while the set was still clean pays out when it gates. A
-/// part that completes before the first damage lands gets no later refresh —
-/// its commits are over — so the prefix noted at its completion is the only
-/// evidence it will ever have, and it must keep the part serving fully.
+// A prefix banked while the set was still clean pays out when it gates. A
+// part that completes before the first damage lands gets no later refresh —
+// its commits are over — so the prefix noted at its completion is the only
+// evidence it will ever have, and it must keep the part serving fully.
 #[test]
 fn a_prefix_banked_before_gating_serves_fully_once_the_set_gates() {
     let coverage = SetCoverage::new(2);
@@ -810,7 +810,7 @@ fn a_prefix_banked_before_gating_serves_fully_once_the_set_gates() {
     assert_eq!(coverage.readable_at(0, 100_000).expect("readable"), 0);
 }
 
-/// A gated part serves exactly its vouched prefix, and grows with it.
+// A gated part serves exactly its vouched prefix, and grows with it.
 #[test]
 fn a_gated_part_serves_its_vouched_prefix_and_grows_with_it() {
     let coverage = SetCoverage::new(2);
@@ -836,8 +836,8 @@ fn a_gated_part_serves_its_vouched_prefix_and_grows_with_it() {
     assert_eq!(coverage.readable_at(0, 0).expect("readable"), 100_000);
 }
 
-/// A complete part whose blocks are all Intact serves fully even while gated —
-/// the tail probe has to keep working on an undamaged last part.
+// A complete part whose blocks are all Intact serves fully even while gated —
+// the tail probe has to keep working on an undamaged last part.
 #[test]
 fn a_fully_vouched_complete_part_serves_to_its_end_while_gated() {
     let coverage = SetCoverage::new(2);
@@ -857,8 +857,8 @@ fn a_fully_vouched_complete_part_serves_to_its_end_while_gated() {
     assert_eq!(coverage.readable_at(1, 100_000).expect("readable"), 0);
 }
 
-/// A gated part that is complete but only partly vouched must PARK at its
-/// vouched edge, not report end-of-part — the rest is what repair will rewrite.
+// A gated part that is complete but only partly vouched must PARK at its
+// vouched edge, not report end-of-part — the rest is what repair will rewrite.
 #[test]
 fn a_gated_complete_but_unvouched_part_parks_at_its_edge() {
     let fixture = split_fixture(payload(60_000, 91), &[]);
@@ -888,8 +888,8 @@ fn a_gated_complete_but_unvouched_part_parks_at_its_edge() {
     assert_eq!(read.as_slice(), &fixture.bytes[30_000..30_256]);
 }
 
-/// Release lifts gating with the caps: post-repair bytes are verified by the
-/// repair itself, so the vouched prefixes have nothing left to say.
+// Release lifts gating with the caps: post-repair bytes are verified by the
+// repair itself, so the vouched prefixes have nothing left to say.
 #[test]
 fn releasing_after_repair_lifts_gating_as_well_as_the_cap() {
     let coverage = SetCoverage::new(1);
@@ -906,8 +906,8 @@ fn releasing_after_repair_lifts_gating_as_well_as_the_cap() {
     assert_eq!(coverage.readable_at(0, 0).expect("readable"), 50_000);
 }
 
-/// A gated chase parked on evidence that never arrives must stay reachable by
-/// abort — otherwise the blocking thread waits for ever.
+// A gated chase parked on evidence that never arrives must stay reachable by
+// abort — otherwise the blocking thread waits for ever.
 #[test]
 fn abort_unblocks_a_reader_parked_under_the_gate() {
     let fixture = split_fixture(payload(50_000, 93), &[]);
@@ -940,15 +940,15 @@ fn abort_unblocks_a_reader_parked_under_the_gate() {
     );
 }
 
-/// A watermark past a declared length is a contradiction in the coverage, and it
-/// has to be survivable.
-///
-/// It used to be a `debug_assert!`. Under a debug build that panicked the
-/// pipeline task the moment a settle fabricated a short length for a part whose
-/// real completion commit was still in flight — one bad set took down the whole
-/// job pass and every scenario queued behind it. Under a release build it did
-/// something worse and quieter: kept serving, with a part boundary that every
-/// later part's offset had been mapped against.
+// A watermark past a declared length is a contradiction in the coverage, and it
+// has to be survivable.
+//
+// It used to be a `debug_assert!`. Under a debug build that panicked the
+// pipeline task the moment a settle fabricated a short length for a part whose
+// real completion commit was still in flight — one bad set took down the whole
+// job pass and every scenario queued behind it. Under a release build it did
+// something worse and quieter: kept serving, with a part boundary that every
+// later part's offset had been mapped against.
 #[test]
 fn a_watermark_past_a_declared_length_demotes_the_set_instead_of_panicking() {
     let coverage = SetCoverage::new(2);
@@ -969,9 +969,9 @@ fn a_watermark_past_a_declared_length_demotes_the_set_instead_of_panicking() {
     );
 }
 
-/// The guard must not fire on the ordinary case it sits next to: a watermark
-/// that reaches a declared length exactly is a part that finished, not a
-/// contradiction.
+// The guard must not fire on the ordinary case it sits next to: a watermark
+// that reaches a declared length exactly is a part that finished, not a
+// contradiction.
 #[test]
 fn a_watermark_that_lands_exactly_on_the_declared_length_is_fine() {
     let coverage = SetCoverage::new(1);

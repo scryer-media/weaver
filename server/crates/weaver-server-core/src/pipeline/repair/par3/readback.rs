@@ -1,4 +1,4 @@
-//! Verified installation images and bounded direct-store readback work.
+// Verified installation images and bounded direct-store readback work.
 
 use super::*;
 use crate::pipeline::direct_store::repair::{RepairedSpan, read_repaired_range};
@@ -89,9 +89,9 @@ pub(super) struct Target {
     pub volume: u32,
     pub output: usize,
     pub cipher: bool,
-    /// Edges are planned when this target comes up, not before the first
-    /// stripe: an earlier target's image has to be routed before this
-    /// volume's part has a place in its member.
+    // Edges are planned when this target comes up, not before the first
+    // stripe: an earlier target's image has to be routed before this
+    // volume's part has a place in its member.
     pub deferred: bool,
     pub edges: Vec<CipherEdge>,
 }
@@ -165,7 +165,7 @@ pub(super) struct Installation {
     pub settling_set: Option<usize>,
     pub pending_gap: Option<GapRead>,
     pub edge_reads: Vec<EdgeRead>,
-    /// Edge reads still admitted under the reservation.
+    // Edge reads still admitted under the reservation.
     pub edge_budget: usize,
     pub preflight_failed: bool,
     pub _edge_reservation: Option<assessment::ViewReservation>,
@@ -362,10 +362,11 @@ impl Pipeline {
         }
         let mut edge_reads = Vec::new();
         for index in 0..targets.len() {
-            if !targets[index].cipher || targets[index].deferred {
+            if !targets[index].cipher {
                 continue;
             }
-            match self.plan_par3_edges(job_id, &targets, index, MAX_EDGES - edge_reads.len()) {
+            match self.plan_par3_edges(job_id, &targets, index, MAX_EDGES - edge_reads.len(), true)
+            {
                 Ok(reads) => edge_reads.extend(reads),
                 Err(error) => {
                     self.fail_job(job_id, error.into());
@@ -397,28 +398,33 @@ impl Pipeline {
         }
     }
 
-    /// Plans the cipher neighbours one replacement image needs, bound to the
-    /// verified output or retained source that holds each.
+    // Plans the cipher neighbours one replacement image needs, bound to the
+    // verified output or retained source that holds each.
     fn plan_par3_edges(
         &self,
         job_id: JobId,
         targets: &[Target],
         index: usize,
         limit: usize,
+        before_installation: bool,
     ) -> Result<Vec<EdgeRead>, &'static str> {
         let target = &targets[index];
         let set = self
             .direct_store
             .set(job_id, target.set)
             .ok_or("missing PAR3 direct set")?;
-        let reads = set
-            .router
-            .cipher_replacement_edge_reads_bounded(target.volume, limit, &|volume| {
-                targets
-                    .iter()
-                    .any(|other| other.set == target.set && other.volume == volume)
-            })
-            .ok_or("PAR3 cipher edge plan is incomplete or exceeds the host budget")?;
+        let reads = if before_installation && target.deferred {
+            set.router
+                .cipher_unplaced_edge_reads_bounded(target.volume, limit)
+        } else {
+            set.router
+                .cipher_replacement_edge_reads_bounded(target.volume, limit, &|volume| {
+                    targets
+                        .iter()
+                        .any(|other| other.set == target.set && other.volume == volume)
+                })
+        }
+        .ok_or("PAR3 cipher edge plan is incomplete or exceeds the host budget")?;
         let mut edge_reads = Vec::with_capacity(reads.len());
         for (volume, offset, len) in reads {
             let file = set
@@ -696,10 +702,33 @@ impl Pipeline {
                     &installation.targets,
                     installation.current,
                     installation.edge_budget,
+                    false,
                 )?;
                 installation.edge_budget -= reads.len();
-                installation.edge_reads.extend(reads);
                 let current = installation.current;
+                let captured = std::mem::take(&mut installation.targets[current].edges);
+                for read in reads {
+                    if let Some((_, offset, bytes)) =
+                        captured.iter().find(|(volume, offset, bytes)| {
+                            *volume == read.volume
+                                && *offset <= read.offset
+                                && read.offset - offset + read.len <= bytes.len() as u64
+                        })
+                    {
+                        let start = (read.offset - offset) as usize;
+                        installation.targets[current].edges.push((
+                            read.volume,
+                            read.offset,
+                            bytes.slice(start..start + read.len as usize),
+                        ));
+                    } else if read.output.is_some() {
+                        installation.edge_reads.push(read);
+                    } else {
+                        return Err(
+                            "PAR3 deferred cipher edge was not captured before installation".into(),
+                        );
+                    }
+                }
                 installation.targets[current].deferred = false;
             }
             self.par3_runtime
@@ -872,6 +901,7 @@ mod tests {
             completion: work::RepairCompletion {
                 result: Ok(Default::default()),
                 embedded_replacement: false,
+                embedded_source: None,
                 outputs: Ok(vec![
                     VerifiedOutput::capture(path, STRIPE_BYTES + 17, options).unwrap(),
                 ]),

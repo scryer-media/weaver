@@ -1,25 +1,25 @@
-//! The last few debug lines of each job, kept whatever the log level is.
-//!
-//! A stall is usually reported at INFO, where the lines that explain it —
-//! the job's own DEBUG and TRACE events — were filtered out long before the
-//! report fired. The binary installs a tracing layer that feeds every such
-//! event carrying a `job_id` field into a small ring per job, and the code that
-//! reports a stall calls [`dump`] to write that ring out once, beside the
-//! report, as a short burst of "stall diagnostics" records.
-//!
-//! Capture sits on the download and decode hot paths, so it is kept cheap:
-//! rings are sharded by job so threads working different jobs do not share a
-//! lock, and a line is stamped with the raw wall-clock time, which is only
-//! rendered as text when a dump writes it out.
-//!
-//! Rings are bounded per job and in the number of jobs held, and dropped when
-//! the job's runtime is purged, so a process that never stalls pays only the
-//! capture itself.
-//!
-//! A replayed record never repeats the captured event's own line shape. It
-//! carries the event's level, target, message and fields as separate
-//! `replayed_*` values, so a reader scanning the log for an event's message
-//! can tell the event itself from a later replay of it.
+// The last few debug lines of each job, kept whatever the log level is.
+//
+// A stall is usually reported at INFO, where the lines that explain it —
+// the job's own DEBUG and TRACE events — were filtered out long before the
+// report fired. The binary installs a tracing layer that feeds every such
+// event carrying a `job_id` field into a small ring per job, and the code that
+// reports a stall calls [`dump`] to write that ring out once, beside the
+// report, as a short burst of "stall diagnostics" records.
+//
+// Capture sits on the download and decode hot paths, so it is kept cheap:
+// rings are sharded by job so threads working different jobs do not share a
+// lock, and a line is stamped with the raw wall-clock time, which is only
+// rendered as text when a dump writes it out.
+//
+// Rings are bounded per job and in the number of jobs held, and dropped when
+// the job's runtime is purged, so a process that never stalls pays only the
+// capture itself.
+//
+// A replayed record never repeats the captured event's own line shape. It
+// carries the event's level, target, message and fields as separate
+// `replayed_*` values, so a reader scanning the log for an event's message
+// can tell the event itself from a later replay of it.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -27,28 +27,28 @@ use std::time::SystemTime;
 
 use tracing::{Level, warn};
 
-/// Lines kept per job. Older lines fall off the front.
+// Lines kept per job. Older lines fall off the front.
 pub const LINES_PER_JOB: usize = 256;
 
-/// Jobs holding a ring at once. A purge normally removes a job's ring; this
-/// only bounds what a job that is never purged can leave behind.
+// Jobs holding a ring at once. A purge normally removes a job's ring; this
+// only bounds what a job that is never purged can leave behind.
 const MAX_JOBS: usize = 512;
 
-/// Lock shards. Each job lives in one shard, so threads working different jobs
-/// rarely meet on the same lock.
+// Lock shards. Each job lives in one shard, so threads working different jobs
+// rarely meet on the same lock.
 const SHARDS: usize = 64;
 
-/// What one captured event said, kept in parts rather than as a rendered line.
+// What one captured event said, kept in parts rather than as a rendered line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedEvent {
     pub level: Level,
     pub target: &'static str,
     pub message: String,
-    /// The event's other fields as ` name=value` pairs, `job_id` included.
+    // The event's other fields as ` name=value` pairs, `job_id` included.
     pub fields: String,
 }
 
-/// One captured event and when it was recorded.
+// One captured event and when it was recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebugLine {
     pub at: SystemTime,
@@ -56,7 +56,7 @@ pub struct DebugLine {
 }
 
 impl DebugLine {
-    /// The capture time as local RFC 3339 with microseconds.
+    // The capture time as local RFC 3339 with microseconds.
     pub fn timestamp(&self) -> String {
         chrono::DateTime::<chrono::Local>::from(self.at)
             .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
@@ -65,7 +65,7 @@ impl DebugLine {
 
 type Shard = HashMap<u64, VecDeque<DebugLine>>;
 
-/// Per-job rings of debug lines.
+// Per-job rings of debug lines.
 pub struct JobDebugRings {
     lines_per_job: usize,
     jobs_per_shard: usize,
@@ -87,7 +87,7 @@ impl JobDebugRings {
         }
     }
 
-    /// Appends one event to the job's ring, stamped with the current time.
+    // Appends one event to the job's ring, stamped with the current time.
     pub fn record(&self, job_id: u64, event: CapturedEvent) {
         let line = DebugLine {
             at: SystemTime::now(),
@@ -110,7 +110,7 @@ impl JobDebugRings {
         ring.push_back(line);
     }
 
-    /// Removes and returns the job's ring, oldest line first.
+    // Removes and returns the job's ring, oldest line first.
     pub fn take(&self, job_id: u64) -> Vec<DebugLine> {
         self.shard(job_id)
             .remove(&job_id)
@@ -142,20 +142,20 @@ impl JobDebugRings {
 
 static RINGS: OnceLock<JobDebugRings> = OnceLock::new();
 
-/// Turns capture on for this process. Until it is called, [`record`] and
-/// [`dump`] do nothing, so a process without the layer holds no rings.
+// Turns capture on for this process. Until it is called, [`record`] and
+// [`dump`] do nothing, so a process without the layer holds no rings.
 pub fn install() {
     let _ = RINGS.get_or_init(|| JobDebugRings::new(LINES_PER_JOB, MAX_JOBS));
 }
 
-/// Appends one captured event to the job's ring, stamped with the current time.
+// Appends one captured event to the job's ring, stamped with the current time.
 pub fn record(job_id: u64, event: CapturedEvent) {
     if let Some(rings) = RINGS.get() {
         rings.record(job_id, event);
     }
 }
 
-/// Removes and returns the job's ring, oldest line first, without writing it.
+// Removes and returns the job's ring, oldest line first, without writing it.
 pub fn take(job_id: u64) -> Vec<DebugLine> {
     RINGS
         .get()
@@ -163,21 +163,21 @@ pub fn take(job_id: u64) -> Vec<DebugLine> {
         .unwrap_or_default()
 }
 
-/// Drops the job's ring without writing it.
+// Drops the job's ring without writing it.
 pub fn forget(job_id: u64) {
     if let Some(rings) = RINGS.get() {
         rings.forget(job_id);
     }
 }
 
-/// Writes the job's ring out once, at WARN, and clears it: a header record
-/// giving the count, then one record per captured line, so a log viewer shows
-/// one row per line. Each record carries the captured event in parts, as
-/// `replayed_level`, `replayed_target`, `replayed_message` and
-/// `replayed_fields`, never as the event's own rendered line.
-///
-/// Callers are the throttled stall reports, so this runs at most as often as
-/// they do; an empty ring writes nothing.
+// Writes the job's ring out once, at WARN, and clears it: a header record
+// giving the count, then one record per captured line, so a log viewer shows
+// one row per line. Each record carries the captured event in parts, as
+// `replayed_level`, `replayed_target`, `replayed_message` and
+// `replayed_fields`, never as the event's own rendered line.
+//
+// Callers are the throttled stall reports, so this runs at most as often as
+// they do; an empty ring writes nothing.
 pub fn dump(job_id: u64, reason: &'static str) {
     let Some(rings) = RINGS.get() else {
         return;

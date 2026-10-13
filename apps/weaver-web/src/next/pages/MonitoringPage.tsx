@@ -4,7 +4,7 @@ import { useQuery } from "urql";
 import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import type { MetricsHistoryRange } from "@/lib/metrics";
-import { Bar, Eyebrow, KeyValueRow, MetricCell, SectionHeader, Square } from "../components/chrome";
+import { Bar, Eyebrow, MetricCell, SectionHeader, Square } from "../components/chrome";
 import { Segmented } from "../components/controls";
 import { Chart, type ChartSeries } from "../components/Chart";
 import { columnStyle } from "../components/columns";
@@ -27,6 +27,7 @@ import { WV, WV_FILL } from "../data/palette";
 import { aroundSlot, countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, UptimeBlock, providerLoadPercent } from "../shell/rail-blocks";
+import { metered, useEgressQuotas } from "../features/networking/egress-quota";
 
 type RangeId = "10m" | "1h" | "6h" | "24h" | "7d";
 
@@ -63,7 +64,7 @@ function axisLabels(timestamps: readonly number[]): string[] {
 
 export function MonitoringPage() {
   const t = useTranslate();
-  const { speed, peakSpeed, providers, queue, downloadBlock } = useNextData();
+  const { speed, peakSpeed, providers, queue } = useNextData();
   const [rangeId, setRangeId] = useState<RangeId>("1h");
   const range = RANGES.find((entry) => entry.value === rangeId)!.range;
 
@@ -298,7 +299,7 @@ export function MonitoringPage() {
           formatValue={(value) => formatCompactCount(value)}
         />
 
-        <DataCapSection block={downloadBlock} />
+        <EgressQuotaSection />
 
         <section className="flex flex-none flex-col">
           <SectionHeader
@@ -415,97 +416,61 @@ export function MonitoringPage() {
   );
 }
 
-const PERIOD_NOTE: Record<"DAILY" | "WEEKLY" | "MONTHLY", string> = {
-  DAILY: "next.monitoring.period.daily",
-  WEEKLY: "next.monitoring.period.weekly",
-  MONTHLY: "next.monitoring.period.monthly",
-};
-
 /**
- * How much of the data cap's current window is spent.
+ * How much of each egress's download quota the current window has spent.
  *
- * The same counters Settings → Bandwidth shows under Current window, here
- * because this is the screen someone watching a download's pace is already on.
+ * The same counters Settings → Bandwidth lists, here because this is the
+ * screen someone watching a download's pace is already on.
  */
-function DataCapSection({ block }: { block: ReturnType<typeof useNextData>["downloadBlock"] }) {
+function EgressQuotaSection() {
   const t = useTranslate();
-  const settingsLink = (
-    <Link to="/settings/bandwidth" className="text-wv-accent hover:text-wv-accent-hover">
-      {t("next.monitoring.bandwidthLink")}
-    </Link>
-  );
+  const { rows } = useEgressQuotas(t);
+  const meteredRows = rows.filter(metered);
 
-  if (!block.capEnabled) {
-    const [noCapBefore, noCapAfter] = aroundSlot(t, "next.monitoring.noCap", "link");
+  if (meteredRows.length === 0) {
+    const [before, after] = aroundSlot(t, "next.monitoring.noQuota", "link");
     return (
       <section className="flex flex-none flex-col">
-        <SectionHeader
-          label={t("next.monitoring.dataCap")}
-          note={t("next.monitoring.capNotEnforced")}
-          sticky={false}
-        />
+        <SectionHeader label={t("next.monitoring.downloadQuotas")} note={t("next.monitoring.quotaNotEnforced")} sticky={false} />
         <div className="px-4 py-5 text-[13px] text-wv-muted sm:px-6">
-          {noCapBefore}
-          {settingsLink}
-          {noCapAfter}
+          {before}
+          <Link to="/settings/networking/egress" className="text-wv-accent hover:text-wv-accent-hover">
+            {t("next.monitoring.egressLink")}
+          </Link>
+          {after}
         </div>
       </section>
     );
   }
-
-  // A provider quota block carries placeholder cap counters, so none are shown for it.
-  if (block.kind === "SERVER_QUOTA") {
-    return (
-      <section className="flex flex-none flex-col">
-        <SectionHeader
-          label={t("next.monitoring.dataCap")}
-          note={t("next.monitoring.capProviderQuota")}
-          sticky={false}
-        />
-        <div className="px-4 py-5 text-[13px] text-wv-muted sm:px-6">
-          {t("next.monitoring.capQuotaHeld")}
-        </div>
-      </section>
-    );
-  }
-
-  const percent = block.limitBytes > 0 ? (block.usedBytes / block.limitBytes) * 100 : 0;
-  const color = percent >= 90 ? WV.error : percent >= 70 ? WV.warn : WV.accent;
-  const note = [block.period ? t(PERIOD_NOTE[block.period]) : null, block.timezoneName || null]
-    .filter(Boolean)
-    .join(" · ");
 
   return (
     <section className="flex flex-none flex-col">
-      <SectionHeader label={t("next.monitoring.dataCap")} note={note || undefined} sticky={false} />
-      <div className="flex flex-col gap-2 border-b border-wv-hairline px-4 py-[14px] sm:px-6">
-        <Bar percent={percent} color={color} label={t("next.monitoring.capUsed")} />
-        <div className="flex items-baseline justify-between font-wv-mono text-[11.5px] text-wv-muted">
-          <span>
-            {t("next.monitoring.usedPercent", {
-              size: formatSize(block.usedBytes),
-              percent: Math.round(percent),
-            })}
-          </span>
-          <span>{t("next.monitoring.allowance", { size: formatSize(block.limitBytes) })}</span>
-        </div>
-      </div>
-      <KeyValueRow label={t("next.monitoring.remaining")} value={formatSize(block.remainingBytes)} />
-      <KeyValueRow label={t("next.monitoring.reserved")} value={formatSize(block.reservedBytes)} />
-      <KeyValueRow
-        label={t("next.monitoring.windowResets")}
-        value={formatDayClock(block.windowEndsAtEpochMs)}
-      />
-      <KeyValueRow
-        label={t("next.monitoring.heldByCap")}
-        value={
-          block.kind === "ISP_CAP" ? (
-            <span className="text-wv-warn">{t("next.common.yes")}</span>
-          ) : (
-            t("next.common.no")
-          )
-        }
-      />
+      <SectionHeader label={t("next.monitoring.downloadQuotas")} sticky={false} />
+      {meteredRows.map((egress) => {
+        const usage = egress.downloadQuotaUsage;
+        const limit = egress.downloadQuota?.limitBytes ?? 0;
+        const used = usage?.usedBytes ?? 0;
+        const percent = limit > 0 ? Math.min(100, (used / limit) * 100) : 0;
+        const color = usage?.blocked || percent >= 90 ? WV.error : percent >= 70 ? WV.warn : WV.accent;
+        return (
+          <div key={egress.id} className="flex flex-col gap-2 border-b border-wv-hairline px-4 py-[14px] sm:px-6">
+            <div className="flex items-baseline justify-between gap-3 text-[13px]">
+              <span className="truncate text-wv-fg">{egress.name}</span>
+              {usage?.blocked ? (
+                <span className="font-wv-mono text-[11.5px] text-wv-warn">{t("next.quota.blocked")}</span>
+              ) : null}
+            </div>
+            <Bar percent={percent} color={color} label={t("next.monitoring.quotaUsed", { name: egress.name })} />
+            <div className="flex flex-wrap items-baseline justify-between gap-x-4 font-wv-mono text-[11.5px] text-wv-muted">
+              <span>{t("next.monitoring.usedPercent", { size: formatSize(used), percent: Math.round(percent) })}</span>
+              <span>{t("next.monitoring.allowance", { size: formatSize(limit) })}</span>
+              <span>
+                {t("next.monitoring.resetsAt", { time: formatDayClock(usage?.windowEndsAtEpochMs ?? null) })}
+              </span>
+            </div>
+          </div>
+        );
+      })}
     </section>
   );
 }

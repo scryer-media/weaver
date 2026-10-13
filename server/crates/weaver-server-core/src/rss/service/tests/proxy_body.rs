@@ -25,7 +25,7 @@ async fn partial_response(stall: bool) -> (std::net::SocketAddr, tokio::task::Jo
 }
 
 #[tokio::test]
-async fn truncated_nzb_body_is_not_submitted_or_spliced_and_cools_the_route() {
+async fn truncated_nzb_body_is_not_submitted_or_spliced_and_does_not_blame_the_route() {
     let temp = TempDir::new().unwrap();
     let (addr, task) = partial_response(false).await;
     let fixture = Fixture::start(ProxyKind::Socks5, addr).await;
@@ -39,7 +39,18 @@ async fn truncated_nzb_body_is_not_submitted_or_spliced_and_cools_the_route() {
     let route = runtime
         .route(Consumer::Rss(1), Duration::from_secs(30))
         .unwrap();
-    assert!(route.begin(1).is_none());
+    assert!(route.begin(1).is_some());
+    let network = runtime
+        .network
+        .route(Consumer::Rss(1), 1, Duration::from_secs(30))
+        .unwrap();
+    assert!(
+        network
+            .weighted
+            .allocations()
+            .iter()
+            .all(|leg| leg.health == crate::proxies::LegHealthState::Up)
+    );
     assert!(submissions.lock().unwrap().is_empty());
     task.await.unwrap();
     runtime.stop_all().await;
@@ -63,6 +74,7 @@ async fn changing_feed_policy_closes_an_active_response_before_mutation_complete
             &RoutingPolicy {
                 proxy_ids: vec![],
                 allow_direct: false,
+                ..Default::default()
             },
         )
         .unwrap();

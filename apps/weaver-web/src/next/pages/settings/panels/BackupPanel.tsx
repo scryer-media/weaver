@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "urql";
+import { StoredBackups } from "./StoredBackups";
+import { createStoredBackup, useBackupAdminAction } from "./useBackupAdminAction";
 import { authHeaders } from "@/graphql/client";
 import { SETTINGS_QUERY } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
@@ -23,8 +25,7 @@ import {
  * Backup: take an encrypted snapshot of everything weaver knows, and put one
  * back.
  *
- * The only panel that talks to the REST API rather than GraphQL, because that
- * is where the archive endpoints live — a backup is a file, not a field.
+ * Archive downloads and uploads use REST; retained files and settings use GraphQL.
  * Restoring is staged: the daemon writes the archive aside and applies it on
  * its next start, so the button says so.
  */
@@ -103,6 +104,8 @@ export function BackupPanel() {
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [backupGeneration, setBackupGeneration] = useState(0);
+  const createAction = useBackupAdminAction();
 
   const [password, setPassword] = useState("");
   const [passwordConfirm, setPasswordConfirm] = useState("");
@@ -117,7 +120,7 @@ export function BackupPanel() {
   const [remaps, setRemaps] = useState<Record<string, string>>({});
   const [confirmRestore, setConfirmRestore] = useState(false);
 
-  usePanelStatus(error ?? note, error !== null);
+  usePanelStatus(error ?? createAction.error ?? note, error !== null || createAction.error !== null);
 
   useEffect(() => {
     setDataDir((current) => current || currentDataDir);
@@ -158,12 +161,22 @@ export function BackupPanel() {
       }
       const filename = await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.enc`);
       setNote(t("next.backup.savedFile", { name: filename }));
+      setBackupGeneration((value) => value + 1);
     } catch (failure) {
       setNote(null);
       setError(message(failure));
     } finally {
       setBusy(false);
     }
+  };
+
+  const create = () => {
+    setError(null); setNote(null);
+    void createAction.run(async () => {
+      await createStoredBackup(password, t);
+      setNote(t("next.backup.building"));
+      setBackupGeneration((value) => value + 1);
+    });
   };
 
   const inspect = async () => {
@@ -566,9 +579,12 @@ export function BackupPanel() {
         >
           {t("next.backup.download")}
         </SecondaryButton>
+        <SecondaryButton disabled={busy || createAction.busy || !password.trim() || mismatch} onClick={() => void create()}>{t("next.backup.createStored")}</SecondaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
+      <StoredBackups generation={backupGeneration} />
+      {createAction.reauthentication}
 
       <ConfirmDialog
         open={confirmRestore}

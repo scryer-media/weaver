@@ -1,0 +1,34 @@
+# Two-NIC lanes only (the `two-nic` command). Layered over docker-compose.yml
+# and docker-compose.networking.yml on the host that carries the destination
+# stack, it publishes every destination port on that host's addresses so a
+# Weaver on another machine reaches them through a physical interface.
+# E2E_TWO_NIC_STACK_HOST is the address Weaver dials; the proxy fixture
+# accepts CONNECT and SOCKS requests for it as its own address.
+services:
+  nntp:
+    ports:
+      - "${E2E_TWO_NIC_NNTP_PORT:-119}:119"
+
+  toxiproxy:
+    volumes:
+      - ./services/toxiproxy/networking.json:/config/toxiproxy.json:ro
+    ports:
+      - "23101-23106:23101-23106"
+      - "23201-23204:23201-23204"
+      - "23221-23223:23221-23223"
+
+  proxy-fixture:
+    environment:
+      PROXY_FIXTURE_IP: "${E2E_TWO_NIC_STACK_HOST:?E2E_TWO_NIC_STACK_HOST is required}"
+    ports:
+      - "8081-8083:8081-8083"
+      - "8089:8089"
+      - "8090:8090"
+      - "8101-8106:8101-8106"
+      - "8201-8204:8201-8204"
+
+  tunnel-fixture:
+    ports:
+      - "2221-2225:2221-2225"
+      - "51821-51823:51821-51823/udp"
+      - "8095:8095"

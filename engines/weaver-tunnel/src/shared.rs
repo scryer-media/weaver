@@ -1,4 +1,4 @@
-//! Weaver's persistence and outcome adapters for the shared tunnel engine.
+// Weaver's persistence and outcome adapters for the shared tunnel engine.
 use crate::{TunnelError, TunnelObserver, TunnelProvider, TunnelStream};
 use std::sync::Arc;
 
@@ -37,11 +37,28 @@ impl proxy_tunnels::TunnelObserver for Observer {
     }
 }
 
-/// Attach Weaver's outcome-aware provider interface to a shared provider.
+// Attach Weaver's outcome-aware provider interface to a shared provider.
 pub struct SharedProvider<T>(pub(crate) T);
 
+// The kind of session a shared provider holds.
+pub(crate) trait SessionKind {
+    const KIND: crate::metrics::TunnelKind;
+}
+
 #[async_trait::async_trait]
-impl<T: proxy_tunnels::TunnelProvider> TunnelProvider for SharedProvider<T> {
+impl<T: proxy_tunnels::TunnelProvider + SessionKind> TunnelProvider for SharedProvider<T> {
+    async fn prepare(&self) -> Result<(), TunnelError> {
+        self.0.prepare().await
+    }
+    async fn retire(&self) {
+        self.0.retire().await;
+    }
+    fn kind(&self) -> Option<crate::metrics::TunnelKind> {
+        Some(T::KIND)
+    }
+    fn source_address(&self) -> Option<std::net::SocketAddr> {
+        self.0.source_address()
+    }
     async fn shutdown(&self) {
         self.0.shutdown().await;
     }

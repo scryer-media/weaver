@@ -20,7 +20,7 @@ import {
   UPDATE_STATUS_SUBSCRIPTION,
   VERSION_QUERY,
 } from "@/graphql/queries";
-import { releaseNotification, type UpdateStatus } from "@/features/updates/update-notification";
+import { releaseNotification, type UpdateStatus } from "@/next/features/updates/update-notification";
 import { useReconnectPolling } from "@/lib/hooks/use-reconnect-polling";
 import { useTranslate } from "@/lib/context/translate-context";
 import {
@@ -140,12 +140,11 @@ export interface NextData {
 
 const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
   kind: "NONE",
-  capEnabled: false,
-  period: null,
+  egressId: null,
+  egressName: null,
   usedBytes: 0,
   limitBytes: 0,
   remainingBytes: 0,
-  reservedBytes: 0,
   windowStartsAtEpochMs: null,
   windowEndsAtEpochMs: null,
   timezoneName: "",
@@ -156,7 +155,8 @@ const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
 const EMPTY_PROVIDERS: ProviderHealth[] = [];
 const EMPTY_HOLDOFFS: ProviderHoldoff[] = [];
 
-const NextDataContext = createContext<NextData | null>(null);
+/** Exported so a fixture can hand a screen the data it reads without the live streams. */
+export const NextDataContext = createContext<NextData | null>(null);
 
 export function useNextData(): NextData {
   const value = useContext(NextDataContext);

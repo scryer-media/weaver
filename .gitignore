@@ -22,6 +22,8 @@
 **/*.env
 /.env
 *.pem
+/e2e/private/real-network/*
+!/e2e/private/real-network/.gitkeep
 
 # Database
 *.db

@@ -8,13 +8,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{Mutex, Semaphore};
 
-/// The idle list is guarded synchronously.
-///
-/// Nothing awaits while holding it, and a dropped [`PooledConnection`]
-/// must be able to put its socket back on the idle list *before* it releases
-/// the permit it was holding. Deferring the return to a spawned task released
-/// the permit first, so an acquire that fired in between found the list empty
-/// and dialled a fresh connection past a perfectly warm one.
+// The idle list is guarded synchronously.
+//
+// Nothing awaits while holding it, and a dropped [`PooledConnection`]
+// must be able to put its socket back on the idle list *before* it releases
+// the permit it was holding. Deferring the return to a spawned task released
+// the permit first, so an acquire that fired in between found the list empty
+// and dialled a fresh connection past a perfectly warm one.
 use std::sync::Mutex as SyncMutex;
 use std::sync::MutexGuard as SyncMutexGuard;
 use tokio::time::Instant as TokioInstant;
@@ -43,33 +43,33 @@ use crate::error::{NntpError, Result};
 use crate::health::{DisableReason, HealthConfig, HealthTracker, ServerState};
 use crate::transfer::{ServerTransferControl, StableServerId};
 
-/// Identifies a specific server in the configuration.
+// Identifies a specific server in the configuration.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct ServerId(pub usize);
 
-/// Whether BODY work can use any server without constructing a ranked order.
+// Whether BODY work can use any server without constructing a ranked order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyServerAvailability {
-    /// At least one server is usable, even if all of its permits are busy.
+    // At least one server is usable, even if all of its permits are busy.
     Eligible,
-    /// No server is usable now, but one has a timed health recovery.
+    // No server is usable now, but one has a timed health recovery.
     WaitingUntil(Duration),
-    /// No admissible server has a timed recovery.
+    // No admissible server has a timed recovery.
     Blocked,
 }
 
-/// Lock a synchronous pool mutex, reading through a poisoning panic.
-///
-/// A poisoned lock only means some thread panicked while holding it. The
-/// guarded values are plain collections of connections, so continuing is safe
-/// and strictly better than refusing to hand out or take back a socket.
+// Lock a synchronous pool mutex, reading through a poisoning panic.
+//
+// A poisoned lock only means some thread panicked while holding it. The
+// guarded values are plain collections of connections, so continuing is safe
+// and strictly better than refusing to hand out or take back a socket.
 fn lock_recovering<T>(mutex: &SyncMutex<T>) -> SyncMutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Connection pool for a single NNTP server.
+// Connection pool for a single NNTP server.
 #[allow(dead_code)]
 struct ServerPool {
     config: ServerConfig,
@@ -78,8 +78,11 @@ struct ServerPool {
     max_connections: usize,
 }
 
-/// Multi-server NNTP connection pool.
+// Multi-server NNTP connection pool.
 pub struct NntpPool {
+    route_probes_started: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    probe_waits: Vec<tokio::sync::watch::Sender<(u64, Option<tokio::time::Instant>)>>,
     pools: Vec<Arc<SyncMutex<ServerPool>>>,
     configs: Vec<ServerConfig>,
     stable_ids: Vec<StableServerId>,
@@ -90,32 +93,32 @@ pub struct NntpPool {
     max_idle_age: Duration,
     health: Arc<Mutex<HealthTracker>>,
     recovery_gates: Vec<Arc<crate::recovery::RecoveryGate>>,
-    /// Per-server timestamp of the last failed connection attempt.
+    // Per-server timestamp of the last failed connection attempt.
     last_connect_failure: Vec<Arc<Mutex<Option<Instant>>>>,
     reconnect_delay: Duration,
-    /// Priority group for each server (parallel to pools/configs).
+    // Priority group for each server (parallel to pools/configs).
     groups: Vec<u32>,
-    /// Backfill flag for each server (parallel to pools/configs).
+    // Backfill flag for each server (parallel to pools/configs).
     backfill: Vec<bool>,
-    /// Retention window in days for each server (parallel to pools/configs).
+    // Retention window in days for each server (parallel to pools/configs).
     retention_days: Vec<u32>,
-    /// Maximum connections per server (parallel to pools/configs).
+    // Maximum connections per server (parallel to pools/configs).
     max_connections: Vec<usize>,
-    /// Per-server deadline (unix epoch ms, `0` = none) before which fresh
-    /// connects are skipped because the provider refused the last one.
+    // Per-server deadline (unix epoch ms, `0` = none) before which fresh
+    // connects are skipped because the provider refused the last one.
     over_limit_until: Vec<AtomicU64>,
-    /// Per-server state of the episode behind `over_limit_until`: how many
-    /// connects in a row the provider has refused, and whether one caller is
-    /// out probing it. Only episode transitions take this lock; the steady
-    /// state reads the atomic deadline alone.
+    // Per-server state of the episode behind `over_limit_until`: how many
+    // connects in a row the provider has refused, and whether one caller is
+    // out probing it. Only episode transitions take this lock; the steady
+    // state reads the atomic deadline alone.
     over_limit_episodes: Vec<SyncMutex<OverLimitEpisode>>,
-    /// Per-server epoch-ms floor for the next blocking-connect warning, and the
-    /// failures suppressed since the last one was emitted. A server that cannot
-    /// be connected to fails on every dispatch pass, so an unthrottled warning
-    /// would be a log flood; a silent one is what made the condition invisible.
+    // Per-server epoch-ms floor for the next blocking-connect warning, and the
+    // failures suppressed since the last one was emitted. A server that cannot
+    // be connected to fails on every dispatch pass, so an unthrottled warning
+    // would be a log flood; a silent one is what made the condition invisible.
     blocking_connect_warn_after: Vec<AtomicU64>,
     blocking_connect_failures_since_warning: Vec<AtomicU64>,
-    /// Per-server choice of which resolved address new connections dial.
+    // Per-server choice of which resolved address new connections dial.
     address_plans: Vec<Arc<AddressPlan>>,
     // Cold connection admission only; established BODY lanes never touch it.
     auth_admission: Vec<AuthAdmission>,
@@ -187,8 +190,8 @@ pub struct BlockingConnectionPermit {
 
 #[cfg(test)]
 impl BlockingConnectionPermit {
-    /// A permit backed by its own semaphore, for lane tests that never
-    /// contend for a pool slot.
+    // A permit backed by its own semaphore, for lane tests that never
+    // contend for a pool slot.
     pub(crate) fn for_tests() -> Self {
         let semaphore = Arc::new(Semaphore::new(1));
         Self {
@@ -207,30 +210,33 @@ impl BlockingConnectionPermit {
     }
 }
 
-/// How long fresh connects to a server pause after the provider first answers
-/// a connect with "too many connections". Existing sessions keep running; only
-/// new sockets wait, which is what the provider is actually asking for.
-///
-/// When the pause ends, one connect goes out as a probe. A probe the provider
-/// accepts ends the episode; a refused one doubles the pause, up to
-/// [`OVER_LIMIT_HOLDOFF_MAX`], so a provider still holding a previous
-/// process's sessions is asked again in half a minute rather than ten, while
-/// one that keeps refusing is left alone for longer each time.
+// How long fresh connects to a server pause after the provider first answers
+// a connect with "too many connections". Existing sessions keep running; only
+// new sockets wait, which is what the provider is actually asking for.
+//
+// When the pause ends, one connect goes out as a probe. A probe the provider
+// accepts ends the episode; a refused one doubles the pause, up to
+// [`OVER_LIMIT_HOLDOFF_MAX`], so a provider still holding a previous
+// process's sessions is asked again in half a minute rather than ten, while
+// one that keeps refusing is left alone for longer each time.
 pub const OVER_LIMIT_HOLDOFF_INITIAL: Duration = Duration::from_secs(30);
 
-/// Ceiling the over-limit holdoff doubles toward while every probe is refused.
+// Ceiling the over-limit holdoff doubles toward while every probe is refused.
 pub const OVER_LIMIT_HOLDOFF_MAX: Duration = Duration::from_secs(10 * 60);
 
-/// How long a probe connect owns the right to ask the provider before another
-/// caller may take it over. Longer than any connect timeout, so a probe that
-/// is still dialling is never doubled up; short enough that a probe whose
-/// caller vanished does not hold the server closed for long.
-const OVER_LIMIT_PROBE_WINDOW: Duration = Duration::from_secs(30);
+// How long a probe connect owns the right to ask the provider before another
+// caller may take it over. Longer than any connect timeout, so a probe that
+// is still dialling is never doubled up; short enough that a probe whose
+// caller vanished does not hold the server closed for long.
+pub(crate) const OVER_LIMIT_PROBE_WINDOW: Duration = Duration::from_secs(30);
 
-/// The pause the `refusals`th consecutive refused connect of an episode earns.
+// The pause the `refusals`th consecutive refused connect of an episode earns,
+// doubling from the plan timing's initial holdoff (production:
+// [`OVER_LIMIT_HOLDOFF_INITIAL`]) up to [`OVER_LIMIT_HOLDOFF_MAX`].
 pub fn over_limit_holdoff(refusals: u32) -> Duration {
     let doublings = refusals.saturating_sub(1).min(16);
-    OVER_LIMIT_HOLDOFF_INITIAL
+    crate::plan_timing::timing()
+        .over_limit_holdoff_initial
         .saturating_mul(1u32 << doublings)
         .min(OVER_LIMIT_HOLDOFF_MAX)
 }
@@ -239,40 +245,40 @@ fn duration_to_epoch_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-/// What [`NntpPool::admit_fresh_connect`] let a caller do, handed back with
-/// the connect's outcome so the pool knows what that outcome proves.
+// What [`NntpPool::admit_fresh_connect`] let a caller do, handed back with
+// the connect's outcome so the pool knows what that outcome proves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreshConnectAdmission {
-    /// No over-limit episode was running when the connect was admitted. Its
-    /// success says nothing about a refusal that may have arrived since: a
-    /// socket the provider accepted before it started refusing is not proof
-    /// that it accepts again.
+    // No over-limit episode was running when the connect was admitted. Its
+    // success says nothing about a refusal that may have arrived since: a
+    // socket the provider accepted before it started refusing is not proof
+    // that it accepts again.
     Open,
-    /// The one connect allowed out after a holdoff to ask whether the
-    /// provider accepts new sockets again. Its outcome settles the episode —
-    /// unless the slot has changed hands since it was admitted, in which
-    /// case the later word stands. The token names this probe among those
-    /// the server has issued.
+    // The one connect allowed out after a holdoff to ask whether the
+    // provider accepts new sockets again. Its outcome settles the episode —
+    // unless the slot has changed hands since it was admitted, in which
+    // case the later word stands. The token names this probe among those
+    // the server has issued.
     Probe { token: u64 },
 }
 
-/// One server's over-limit episode. `over_limit_until` is the lock-free
-/// mirror of whether an episode exists at all; this holds the rest.
+// One server's over-limit episode. `over_limit_until` is the lock-free
+// mirror of whether an episode exists at all; this holds the rest.
 #[derive(Debug, Default)]
 struct OverLimitEpisode {
-    /// Consecutive refused connects; each one doubles the next holdoff.
+    // Consecutive refused connects; each one doubles the next holdoff.
     refusals: u32,
-    /// Epoch ms at which one caller was let through to probe the provider
-    /// after the pause ended, `0` when nobody is probing.
+    // Epoch ms at which one caller was let through to probe the provider
+    // after the pause ended, `0` when nobody is probing.
     probe_started: u64,
-    /// Which probe holds the slot: the count of probes ever admitted for
-    /// this server, so a late report from an earlier one is told apart.
+    // Which probe holds the slot: the count of probes ever admitted for
+    // this server, so a late report from an earlier one is told apart.
     probe_token: u64,
 }
 
-/// How often one server's blocking-lane connect failures may be warned about.
-/// Every dispatch pass retries, so the failures arrive as fast as the scheduler
-/// runs; the warning stands for all of them and carries the count.
+// How often one server's blocking-lane connect failures may be warned about.
+// Every dispatch pass retries, so the failures arrive as fast as the scheduler
+// runs; the warning stands for all of them and carries the count.
 const BLOCKING_CONNECT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 fn unix_epoch_ms() -> u64 {
@@ -284,7 +290,7 @@ fn unix_epoch_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-/// Configuration for creating an NNTP pool.
+// Configuration for creating an NNTP pool.
 pub struct PoolConfig {
     pub servers: Vec<ServerPoolConfig>,
     pub max_idle_age: Duration,
@@ -305,23 +311,23 @@ impl Default for PoolConfig {
     }
 }
 
-/// Per-server pool configuration.
+// Per-server pool configuration.
 pub struct ServerPoolConfig {
     pub server: ServerConfig,
-    /// Durable database identity. Unlike [`ServerId`], this survives reorder
-    /// and client rebuilds.
+    // Durable database identity. Unlike [`ServerId`], this survives reorder
+    // and client rebuilds.
     pub stable_id: StableServerId,
-    /// Shared BODY policy obtained from a long-lived registry.
+    // Shared BODY policy obtained from a long-lived registry.
     pub transfer_control: Option<Arc<ServerTransferControl>>,
     pub max_connections: usize,
-    /// Priority group. Lower values tried first within a tier.
+    // Priority group. Lower values tried first within a tier.
     pub group: u32,
-    /// Backfill servers are ordered after every fill server and are only
-    /// reachable once all fill servers are excluded for a request.
+    // Backfill servers are ordered after every fill server and are only
+    // reachable once all fill servers are excluded for a request.
     pub backfill: bool,
-    /// Days of retention this server is expected to hold (0 = unlimited).
-    /// Inert metadata for the pool: callers translate it into per-request
-    /// exclusions; carrying it here keeps it aligned with server indices.
+    // Days of retention this server is expected to hold (0 = unlimited).
+    // Inert metadata for the pool: callers translate it into per-request
+    // exclusions; carrying it here keeps it aligned with server indices.
     pub retention_days: u32,
 }
 
@@ -339,8 +345,14 @@ impl Default for ServerPoolConfig {
     }
 }
 
+impl Drop for NntpPool {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
 impl NntpPool {
-    /// Create a new multi-server connection pool.
+    // Create a new multi-server connection pool.
     pub fn new(config: PoolConfig) -> Self {
         let server_count = config.servers.len();
         let mut pools = Vec::with_capacity(server_count);
@@ -359,6 +371,7 @@ impl NntpPool {
         let mut blocking_connect_failures_since_warning = Vec::with_capacity(server_count);
         let mut address_plans = Vec::with_capacity(server_count);
         let mut socket_budgets = Vec::with_capacity(server_count);
+        let shutdown = CancellationToken::new();
 
         // A config where every server is backfill has no fill tier to
         // exhaust; treat it as an all-fill config so downloads can proceed.
@@ -372,7 +385,30 @@ impl NntpPool {
                 || crate::socket_budget::SocketBudget::new(spc.max_connections),
                 |control| Arc::clone(&control.socket_budget),
             );
-            budget.configure(spc.max_connections);
+            if let Some((dialer, mut targets)) = spc
+                .server
+                .dialer
+                .as_ref()
+                .and_then(|dialer| dialer.inner.leg_targets().map(|targets| (dialer, targets)))
+            {
+                budget.configure_legs(&targets.borrow_and_update());
+                let watched_budget = budget.clone();
+                let mut sockets = budget.subscribe();
+                let stopped = shutdown.clone();
+                dialer.runtime.spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = stopped.cancelled() => break,
+                            changed = targets.changed() => if changed.is_err() { break; },
+                            changed = sockets.changed() => if changed.is_err() { break; },
+                        }
+                        let current = targets.borrow_and_update().clone();
+                        watched_budget.configure_legs(&current);
+                    }
+                });
+            } else {
+                budget.configure(spc.max_connections);
+            }
             socket_budgets.push(budget);
             if let Some(control) = &spc.transfer_control {
                 assert_eq!(
@@ -420,13 +456,18 @@ impl NntpPool {
         let health = Arc::new(Mutex::new(health));
 
         NntpPool {
+            route_probes_started: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            probe_waits: (0..server_count)
+                .map(|_| tokio::sync::watch::channel((0, None)).0)
+                .collect(),
             pools,
             configs,
             stable_ids,
             transfer_controls,
             semaphores,
             socket_budgets,
-            shutdown: CancellationToken::new(),
+            shutdown,
             max_idle_age: config.max_idle_age,
             health,
             recovery_gates,
@@ -451,27 +492,167 @@ impl NntpPool {
         }
     }
 
-    /// How a new connection to this server picks its address.
+    // How a new connection to this server picks its address.
+    pub(crate) fn start_route_probes(self: &Arc<Self>) {
+        if self.route_probes_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        for (idx, config) in self.configs.iter().enumerate() {
+            let Some(dialer) = &config.dialer else {
+                continue;
+            };
+            let Some(mut targets) = dialer.inner.leg_targets() else {
+                continue;
+            };
+            let weak = Arc::downgrade(self);
+            let stopped = self.shutdown.clone();
+            let semaphore = self.semaphores[idx].clone();
+            let mut sockets = self.socket_budgets[idx].subscribe();
+            let mut recovery = self.recovery_gates[idx].subscribe();
+            dialer.runtime.spawn(async move {
+                // A leg that needs a probe changes the route's leg targets
+                // when its cooldown lapses, so the loop wakes on that change
+                // rather than on a clock. It probes at most once per change;
+                // only a probe held back by this server's own gates (auth
+                // admission, over-limit, health, permits, socket budget)
+                // wakes on the gate's release or its actual retry deadline.
+                let mut retry_at: Option<tokio::time::Instant> = None;
+                let mut wait_permit = false;
+                let mut wait_sockets = false;
+                let mut wait_recovery = false;
+                let mut first = true;
+                loop {
+                    if !first {
+                        #[cfg(test)]
+                        if let Some(pool) = weak.upgrade() {
+                            pool.probe_waits[idx].send_modify(|state| {
+                                state.0 += 1;
+                                state.1 = retry_at;
+                            });
+                        }
+                        tokio::select! {
+                            _ = stopped.cancelled() => break,
+                            result = targets.changed() => if result.is_err() { break; },
+                            result = sockets.changed(), if wait_sockets => if result.is_err() { break; },
+                            result = recovery.changed(), if wait_recovery => if result.is_err() { break; },
+                            result = semaphore.clone().acquire_owned(), if wait_permit => {
+                                if result.is_err() { break; }
+                            },
+                            () = async {
+                                match retry_at {
+                                    Some(at) => tokio::time::sleep_until(at).await,
+                                    None => std::future::pending().await,
+                                }
+                            } => {},
+                        }
+                    }
+                    first = false;
+                    retry_at = None;
+                    wait_permit = false;
+                    wait_sockets = false;
+                    wait_recovery = false;
+                    sockets.borrow_and_update();
+                    recovery.borrow_and_update();
+                    let Some(pool) = weak.upgrade() else {
+                        break;
+                    };
+                    let route = pool.configs[idx].dialer.as_ref().expect("route probe");
+                    if !route.inner.needs_probe() {
+                        continue;
+                    }
+                    if pool.auth_admission[idx].check().is_err() {
+                        let auth = &pool.auth_admission[idx];
+                        let remaining = auth.state.load(Ordering::Acquire).saturating_sub(2).saturating_sub(auth.elapsed_ms());
+                        retry_at = Some(tokio::time::Instant::now() + Duration::from_millis(remaining));
+                        continue;
+                    }
+                    if let Some(until) = pool.over_limit_until_epoch_ms(ServerId(idx)) {
+                        retry_at = Some(tokio::time::Instant::now() + Duration::from_millis(until.saturating_sub(unix_epoch_ms())));
+                        continue;
+                    }
+                    {
+                        let mut health = pool.health.lock().await;
+                        if !health.is_available(idx) {
+                            if let crate::health::ServerState::CoolingDown { until, .. } | crate::health::ServerState::Disabled { until, .. } = health.server(idx).state() {
+                                retry_at = Some(tokio::time::Instant::from_std(*until));
+                            }
+                            wait_recovery = true;
+                            continue;
+                        }
+                    }
+                    let Ok(permit) = pool.semaphores[idx].clone().try_acquire_owned() else {
+                        wait_permit = true;
+                        continue;
+                    };
+                    let Some(slot) = pool.socket_budgets[idx].try_acquire() else {
+                        pool.socket_budgets[idx].recall_idle();
+                        wait_sockets = true;
+                        continue;
+                    };
+                    let Some(health_lease) = pool.recovery_gates[idx].admit(false) else {
+                        wait_recovery = true;
+                        continue;
+                    };
+                    let result = tokio::select! {
+                        _ = stopped.cancelled() => break,
+                        result = pool.connect_server(idx, None) => result,
+                    };
+                    if let Err(error) = &result {
+                        let provider_evidence = !matches!(error, NntpError::Route(route) if route.is_path_evidence() || !route.is_evidence());
+                        if provider_evidence && !matches!(error, NntpError::TooManyConnections | NntpError::ServerOverLimit { .. } | NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::AcquireTimeout(_)) {
+                            let auth = matches!(error, NntpError::AuthenticationFailed | NntpError::AuthenticationRejected | NntpError::AuthenticationRequired | NntpError::AccessDenied);
+                            pool.health.lock().await.record_connection_outcome(idx, &health_lease.0, false, auth);
+                            pool.retire_quarantined_idle(idx);
+                        }
+                        if !matches!(error, NntpError::Route(route) if !route.is_evidence()) {
+                            *pool.last_connect_failure[idx].lock().await = Some(Instant::now());
+                        }
+                    }
+                    if let Ok(mut connection) = result {
+                        *pool.last_connect_failure[idx].lock().await = None;
+                        slot.set_path(connection.route_path.as_ref());
+                        slot.observe_outcome(connection.route_outcome.as_ref());
+                        slot.active();
+                        connection.socket_slot = Some(slot);
+                        connection.health_lease = Some(Arc::new(health_lease));
+                        lock_recovering(&pool.pools[idx]).active_count += 1;
+                        // The normal return path registers exact-socket recall and
+                        // keeps this successfully authenticated probe warm.
+                        drop(PooledConnection {
+                            conn: Some(connection),
+                            pool: pool.pools[idx].clone(),
+                            server_idx: idx,
+                            return_to_pool: true,
+                            shutdown: stopped.clone(),
+                            _permit: Some(permit),
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    // How a new connection to this server picks its address.
     fn address_route(&self, idx: usize) -> AddressRoute {
         AddressRoute {
             plan: Arc::clone(&self.address_plans[idx]),
         }
     }
 
-    /// This server's address plan as it stands.
+    // This server's address plan as it stands.
     pub fn address_plan_snapshot(&self, server: ServerId) -> Option<AddressPlanSnapshot> {
         self.address_plans.get(server.0).map(|plan| plan.snapshot())
     }
 
-    /// Book how long an article fetch on a connection to `ip` took.
+    // Book how long an article fetch on a connection to `ip` took.
     pub fn record_address_body_latency(&self, server: ServerId, ip: IpAddr, elapsed: Duration) {
         if let Some(plan) = self.address_plans.get(server.0) {
             plan.record_body_latency(ip, elapsed);
         }
     }
 
-    /// Book the bytes one warm article fetch on a connection to `ip` moved
-    /// and the wire time they took.
+    // Book the bytes one warm article fetch on a connection to `ip` moved
+    // and the wire time they took.
     pub fn record_address_delivery(
         &self,
         server: ServerId,
@@ -524,7 +705,7 @@ impl NntpPool {
         Ok(connection)
     }
 
-    /// Acquire a connection from a specific server.
+    // Acquire a connection from a specific server.
     pub async fn acquire(&self, server: ServerId) -> Result<PooledConnection> {
         self.acquire_for_group(server, None).await
     }
@@ -591,8 +772,8 @@ impl NntpPool {
             .await
     }
 
-    /// Acquire a connection; a fresh connection to a pipelining server
-    /// selects `initial_group` inside its session-setup write.
+    // Acquire a connection; a fresh connection to a pipelining server
+    // selects `initial_group` inside its session-setup write.
     pub async fn acquire_for_group(
         &self,
         server: ServerId,
@@ -613,14 +794,26 @@ impl NntpPool {
             .await
     }
 
-    /// Whether a normal (in-cap) lease could be taken right now without
-    /// waiting on the server's connection semaphore.
+    // Whether a normal (in-cap) lease could be taken right now without
+    // waiting on the server's connection semaphore.
     pub fn has_available_permit(&self, server: ServerId) -> bool {
         let idx = server.0;
-        idx < self.semaphores.len() && self.semaphores[idx].available_permits() > 0
+        idx < self.semaphores.len()
+            && self.route_available(idx)
+            && self.semaphores[idx].available_permits() > 0
     }
 
-    /// Acquire an explicit over-max connection from a specific server.
+    pub fn route_available(&self, idx: usize) -> bool {
+        self.configs.get(idx).is_some_and(|config| {
+            config
+                .dialer
+                .as_ref()
+                .and_then(|dialer| dialer.inner.leg_targets())
+                .is_none_or(|targets| targets.borrow().iter().any(|target| *target > 0))
+        })
+    }
+
+    // Acquire an explicit over-max connection from a specific server.
     pub async fn acquire_extra(&self, server: ServerId) -> Result<PooledConnection> {
         if self.shutdown.is_cancelled() {
             return Err(NntpError::PoolShutdown);
@@ -633,7 +826,7 @@ impl NntpPool {
         self.acquire_fresh_with_permit(idx, None, None, None).await
     }
 
-    /// Internal: acquire a connection using an already-obtained permit.
+    // Internal: acquire a connection using an already-obtained permit.
     async fn acquire_with_permit(
         &self,
         idx: usize,
@@ -718,7 +911,7 @@ impl NntpPool {
                         .ok_or(NntpError::PoolExhausted)?;
                     let started = tokio::time::Instant::now();
                     let connect = self.connect_server(idx, initial_group);
-                    let connected = if self.configs[idx].proxy.is_some() {
+                    let connected = if self.configs[idx].dialer.is_some() {
                         let result = connect.await;
                         if let Some(deadline) = deadline.as_deref_mut() {
                             *deadline += started.elapsed();
@@ -729,6 +922,8 @@ impl NntpPool {
                     };
                     match connected {
                         Ok(mut c) => {
+                            slot.set_path(c.route_path.as_ref());
+                            slot.observe_outcome(c.route_outcome.as_ref());
                             slot.active();
                             c.socket_slot = Some(slot);
                             c.health_lease = Some(Arc::new(health_lease));
@@ -738,14 +933,52 @@ impl NntpPool {
                             break c;
                         }
                         Err(e) => {
-                            if !matches!(
-                                e,
-                                NntpError::TooManyConnections
-                                    | NntpError::ServerOverLimit { .. }
-                                    | NntpError::PoolExhausted
-                                    | NntpError::PoolShutdown
-                                    | NntpError::AcquireTimeout(_)
-                            ) {
+                            if let NntpError::Route(error) = &e
+                                && let weaver_tunnel::pipe::DialError::AtCapacity(changed) =
+                                    error.as_ref()
+                            {
+                                drop(slot);
+                                drop(health_lease);
+                                let mut notifications: Vec<_> = changed
+                                    .iter()
+                                    .map(|changed| Box::pin(changed.notified()))
+                                    .collect();
+                                for notification in &mut notifications {
+                                    notification.as_mut().enable();
+                                }
+                                if self.configs[idx]
+                                    .dialer
+                                    .as_ref()
+                                    .is_some_and(|d| d.inner.has_capacity())
+                                {
+                                    continue;
+                                }
+                                acquisition_budget(deadline.as_deref(), async {
+                                        tokio::select! {
+                                            _ = self.shutdown.cancelled() => Err(NntpError::PoolShutdown),
+                                            _ = std::future::poll_fn(|cx| {
+                                                for notification in &mut notifications {
+                                                    if std::future::Future::poll(notification.as_mut(), cx).is_ready() {
+                                                        return std::task::Poll::Ready(());
+                                                    }
+                                                }
+                                                std::task::Poll::Pending
+                                            }) => Ok(()),
+                                        }
+                                    }).await?;
+                                continue;
+                            }
+                            let provider_evidence = !matches!(&e, NntpError::Route(error) if error.is_path_evidence() || !error.is_evidence());
+                            if provider_evidence
+                                && !matches!(
+                                    e,
+                                    NntpError::TooManyConnections
+                                        | NntpError::ServerOverLimit { .. }
+                                        | NntpError::PoolExhausted
+                                        | NntpError::PoolShutdown
+                                        | NntpError::AcquireTimeout(_)
+                                )
+                            {
                                 let auth = matches!(
                                     e,
                                     NntpError::AuthenticationFailed
@@ -822,7 +1055,7 @@ impl NntpPool {
             .ok_or(NntpError::PoolExhausted)?;
         let started = tokio::time::Instant::now();
         let connect = self.connect_server(idx, initial_group);
-        let connected = if self.configs[idx].proxy.is_some() {
+        let connected = if self.configs[idx].dialer.is_some() {
             let result = connect.await;
             if let Some(deadline) = deadline {
                 *deadline += started.elapsed();
@@ -833,6 +1066,8 @@ impl NntpPool {
         };
         let conn = match connected {
             Ok(mut conn) => {
+                slot.set_path(conn.route_path.as_ref());
+                slot.observe_outcome(conn.route_outcome.as_ref());
                 slot.active();
                 conn.socket_slot = Some(slot);
                 conn.health_lease = Some(Arc::new(health_lease));
@@ -859,11 +1094,11 @@ impl NntpPool {
         })
     }
 
-    /// Drain all idle connections across all servers.
-    ///
-    /// Called when a network change is suspected (e.g. I/O errors after an
-    /// interface switch). Connections are dropped without recording health
-    /// failures, since the servers themselves are fine.
+    // Drain all idle connections across all servers.
+    //
+    // Called when a network change is suspected (e.g. I/O errors after an
+    // interface switch). Connections are dropped without recording health
+    // failures, since the servers themselves are fine.
     pub async fn drain_all_idle(&self) {
         let mut total = 0usize;
         for pool in &self.pools {
@@ -879,9 +1114,9 @@ impl NntpPool {
         }
     }
 
-    /// Drop the idle connections of one server after one of its sockets
-    /// failed. A single dead socket says nothing about other providers, so
-    /// their warm idle connections are left alone.
+    // Drop the idle connections of one server after one of its sockets
+    // failed. A single dead socket says nothing about other providers, so
+    // their warm idle connections are left alone.
     pub async fn drain_idle_for(&self, idx: usize) {
         let Some(pool) = self.pools.get(idx) else {
             return;
@@ -900,7 +1135,7 @@ impl NntpPool {
         }
     }
 
-    /// Shut down the pool and wait for active leases to drain.
+    // Shut down the pool and wait for active leases to drain.
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
 
@@ -942,34 +1177,34 @@ impl NntpPool {
         debug!("NNTP pool shut down");
     }
 
-    /// The number of configured servers.
+    // The number of configured servers.
     pub fn server_count(&self) -> usize {
         self.pools.len()
     }
 
-    /// Priority group for each server (indexed by pool position).
+    // Priority group for each server (indexed by pool position).
     pub fn server_groups(&self) -> &[u32] {
         &self.groups
     }
 
-    /// Backfill flag for each server (indexed by pool position). An
-    /// all-backfill config is normalized to all-fill at construction.
+    // Backfill flag for each server (indexed by pool position). An
+    // all-backfill config is normalized to all-fill at construction.
     pub fn server_backfill_flags(&self) -> &[bool] {
         &self.backfill
     }
 
-    /// Retention window in days for each server (0 = unlimited), indexed by
-    /// pool position.
+    // Retention window in days for each server (0 = unlimited), indexed by
+    // pool position.
     pub fn server_retention_days(&self) -> &[u32] {
         &self.retention_days
     }
 
-    /// Whether any configured server is a backfill server.
+    // Whether any configured server is a backfill server.
     pub fn has_backfill_servers(&self) -> bool {
         self.backfill.iter().any(|backfill| *backfill)
     }
 
-    /// Total configured connections across fill (non-backfill) servers.
+    // Total configured connections across fill (non-backfill) servers.
     pub fn fill_connection_capacity(&self) -> usize {
         self.backfill
             .iter()
@@ -983,7 +1218,7 @@ impl NntpPool {
         self.max_connections.get(server.0).copied()
     }
 
-    /// Deadline of this server's active over-limit holdoff, if one is running.
+    // Deadline of this server's active over-limit holdoff, if one is running.
     pub fn over_limit_until_epoch_ms(&self, server: ServerId) -> Option<u64> {
         let deadline = self.over_limit_until.get(server.0)?.load(Ordering::Acquire);
         // Zero is the steady state; skip the clock read on the dispatch path
@@ -998,14 +1233,15 @@ impl NntpPool {
         // The pause is over but the episode is not: while one caller's probe
         // is out, everyone else is still held, until that probe answers.
         let probe_started = self.over_limit_episode(server.0)?.probe_started;
-        let probe_until =
-            probe_started.saturating_add(duration_to_epoch_ms(OVER_LIMIT_PROBE_WINDOW));
+        let probe_until = probe_started.saturating_add(duration_to_epoch_ms(
+            crate::plan_timing::timing().over_limit_probe_window,
+        ));
         (probe_started != 0 && probe_until > now).then_some(probe_until)
     }
 
-    /// This server's episode state, readable through a poisoned lock: the
-    /// state is plain data, and refusing to connect because some thread
-    /// panicked elsewhere would be the worse outcome.
+    // This server's episode state, readable through a poisoned lock: the
+    // state is plain data, and refusing to connect because some thread
+    // panicked elsewhere would be the worse outcome.
     fn over_limit_episode(&self, idx: usize) -> Option<SyncMutexGuard<'_, OverLimitEpisode>> {
         let slot = self.over_limit_episodes.get(idx)?;
         Some(match slot.lock() {
@@ -1014,24 +1250,24 @@ impl NntpPool {
         })
     }
 
-    /// Consecutive refused connects in this server's current over-limit
-    /// episode, `0` when none is running.
+    // Consecutive refused connects in this server's current over-limit
+    // episode, `0` when none is running.
     pub fn over_limit_refusals(&self, server: ServerId) -> u32 {
         self.over_limit_episode(server.0)
             .map(|episode| episode.refusals)
             .unwrap_or(0)
     }
 
-    /// Whether a fresh socket to `server` may be opened right now.
-    ///
-    /// [`FreshConnectAdmission::Open`] when no holdoff is running. During a
-    /// holdoff every caller gets [`NntpError::ServerOverLimit`]. Once the
-    /// holdoff ends, exactly one caller is let through as the
-    /// [`FreshConnectAdmission::Probe`] and the rest keep getting the error
-    /// until that probe's outcome is reported through
-    /// [`Self::note_fresh_connect_outcome`] (or one of the outcome methods it
-    /// dispatches to). A probe must report, or its slot stays taken for
-    /// [`OVER_LIMIT_PROBE_WINDOW`].
+    // Whether a fresh socket to `server` may be opened right now.
+    //
+    // [`FreshConnectAdmission::Open`] when no holdoff is running. During a
+    // holdoff every caller gets [`NntpError::ServerOverLimit`]. Once the
+    // holdoff ends, exactly one caller is let through as the
+    // [`FreshConnectAdmission::Probe`] and the rest keep getting the error
+    // until that probe's outcome is reported through
+    // [`Self::note_fresh_connect_outcome`] (or one of the outcome methods it
+    // dispatches to). A probe must report, or its slot stays taken for
+    // [`OVER_LIMIT_PROBE_WINDOW`].
     pub fn admit_fresh_connect(&self, server: ServerId) -> Result<FreshConnectAdmission> {
         let idx = server.0;
         let deadline_slot = self
@@ -1057,9 +1293,9 @@ impl NntpPool {
             });
         }
         if episode.probe_started != 0 {
-            let probe_until = episode
-                .probe_started
-                .saturating_add(duration_to_epoch_ms(OVER_LIMIT_PROBE_WINDOW));
+            let probe_until = episode.probe_started.saturating_add(duration_to_epoch_ms(
+                crate::plan_timing::timing().over_limit_probe_window,
+            ));
             if probe_until > now {
                 return Err(NntpError::ServerOverLimit {
                     until_epoch_ms: probe_until,
@@ -1078,12 +1314,12 @@ impl NntpPool {
         })
     }
 
-    /// Book the result of a connect that passed [`Self::admit_fresh_connect`].
-    ///
-    /// A refusal always counts. Anything else only means something when the
-    /// connect was the probe: an ordinary connect that was already dialling
-    /// when the provider started refusing may well succeed, and must not
-    /// clear the holdoff the refusal just armed.
+    // Book the result of a connect that passed [`Self::admit_fresh_connect`].
+    //
+    // A refusal always counts. Anything else only means something when the
+    // connect was the probe: an ordinary connect that was already dialling
+    // when the provider started refusing may well succeed, and must not
+    // clear the holdoff the refusal just armed.
     pub fn note_fresh_connect_outcome<T>(
         &self,
         server: ServerId,
@@ -1097,11 +1333,11 @@ impl NntpPool {
         }
     }
 
-    /// The provider accepted the probe: whatever over-limit episode was
-    /// running is over, and the next refusal starts a new one from the
-    /// shortest pause. Nothing happens for an [`FreshConnectAdmission::Open`]
-    /// connect, or for a probe whose slot has since been reset by a newer
-    /// refusal or taken over by a later probe.
+    // The provider accepted the probe: whatever over-limit episode was
+    // running is over, and the next refusal starts a new one from the
+    // shortest pause. Nothing happens for an [`FreshConnectAdmission::Open`]
+    // connect, or for a probe whose slot has since been reset by a newer
+    // refusal or taken over by a later probe.
     pub fn note_provider_admitted(&self, server: ServerId, admission: FreshConnectAdmission) {
         let FreshConnectAdmission::Probe { token } = admission else {
             return;
@@ -1124,6 +1360,13 @@ impl NntpPool {
         if let Some(plan) = self.address_plans.get(idx) {
             plan.note_over_limit_cleared();
         }
+        if let Some(route) = self
+            .configs
+            .get(idx)
+            .and_then(|server| server.dialer.as_ref())
+        {
+            route.inner.over_limit_cleared();
+        }
         info!(
             server = idx,
             server_address = %self.server_address(server),
@@ -1132,10 +1375,10 @@ impl NntpPool {
         );
     }
 
-    /// A probe that failed for some reason other than a refusal (a timeout, a
-    /// TLS fault) has answered nothing about the provider's limit. Free the
-    /// probe slot so the next caller can ask instead of waiting out the
-    /// window — if it is still this probe's slot.
+    // A probe that failed for some reason other than a refusal (a timeout, a
+    // TLS fault) has answered nothing about the provider's limit. Free the
+    // probe slot so the next caller can ask instead of waiting out the
+    // window — if it is still this probe's slot.
     pub fn release_over_limit_probe(&self, server: ServerId, admission: FreshConnectAdmission) {
         let FreshConnectAdmission::Probe { token } = admission else {
             return;
@@ -1147,13 +1390,13 @@ impl NntpPool {
         }
     }
 
-    /// Records one blocking-lane connect failure and answers whether this one
-    /// should be warned about.
-    ///
-    /// `Some(n)` means "warn, and say that `n` failures have gone unreported
-    /// since the last warning" — `n` counts this one, so the first failure of a
-    /// window reports `1`. `None` means the window is still open and the
-    /// failure has only been counted.
+    // Records one blocking-lane connect failure and answers whether this one
+    // should be warned about.
+    //
+    // `Some(n)` means "warn, and say that `n` failures have gone unreported
+    // since the last warning" — `n` counts this one, so the first failure of a
+    // window reports `1`. `None` means the window is still open and the
+    // failure has only been counted.
     pub fn note_blocking_connect_warning(&self, server: ServerId) -> Option<u64> {
         let idx = server.0;
         let counter = self.blocking_connect_failures_since_warning.get(idx)?;
@@ -1174,8 +1417,8 @@ impl NntpPool {
         Some(suppressed)
     }
 
-    /// `host:port` of one configured server, for a log line that has to say
-    /// which one it is talking about.
+    // `host:port` of one configured server, for a log line that has to say
+    // which one it is talking about.
     pub fn server_address(&self, server: ServerId) -> String {
         self.configs
             .get(server.0)
@@ -1183,20 +1426,20 @@ impl NntpPool {
             .unwrap_or_default()
     }
 
-    /// Whether fresh connects to this server are currently held off. One
-    /// atomic load, so callers on the dispatch path can ask freely.
+    // Whether fresh connects to this server are currently held off. One
+    // atomic load, so callers on the dispatch path can ask freely.
     pub fn is_over_limit(&self, server: ServerId) -> bool {
         self.over_limit_until_epoch_ms(server).is_some()
     }
 
-    /// Park fresh connects to `server` after the provider refused one.
-    ///
-    /// A client restart can collect one rejection per configured connection in
-    /// a couple of seconds while the provider still holds the previous
-    /// process's sessions open, so only the first rejection of a window arms
-    /// and reports it; the rest are silent until the deadline passes. Each
-    /// window that ends in another refusal (the probe's) doubles the next one,
-    /// from [`OVER_LIMIT_HOLDOFF_INITIAL`] up to [`OVER_LIMIT_HOLDOFF_MAX`].
+    // Park fresh connects to `server` after the provider refused one.
+    //
+    // A client restart can collect one rejection per configured connection in
+    // a couple of seconds while the provider still holds the previous
+    // process's sessions open, so only the first rejection of a window arms
+    // and reports it; the rest are silent until the deadline passes. Each
+    // window that ends in another refusal (the probe's) doubles the next one,
+    // from [`OVER_LIMIT_HOLDOFF_INITIAL`] up to [`OVER_LIMIT_HOLDOFF_MAX`].
     pub fn note_provider_over_limit(&self, server: ServerId) {
         let idx = server.0;
         if let Some(budget) = self.socket_budgets.get(idx) {
@@ -1245,7 +1488,7 @@ impl NntpPool {
         );
     }
 
-    /// Inspect BODY eligibility without allocating or ranking server candidates.
+    // Inspect BODY eligibility without allocating or ranking server candidates.
     pub async fn body_server_availability(
         &self,
         failure_excludes: &[usize],
@@ -1269,6 +1512,7 @@ impl NntpPool {
         let mut retry_after = None;
         for server_idx in 0..self.configs.len() {
             if is_excluded(server_idx)
+                || !self.route_available(server_idx)
                 || (self.backfill[server_idx] && !backfill_unlocked)
                 || self.transfer_controls[server_idx]
                     .as_ref()
@@ -1295,36 +1539,36 @@ impl NntpPool {
         )
     }
 
-    /// Whether every fill (non-backfill) server is in `exclude` — the gate
-    /// that makes backfill servers reachable for a request.
+    // Whether every fill (non-backfill) server is in `exclude` — the gate
+    // that makes backfill servers reachable for a request.
     pub fn fill_servers_exhausted(&self, exclude: &[usize]) -> bool {
         self.backfill
             .iter()
             .enumerate()
             .filter(|(_, backfill)| !**backfill)
-            .all(|(idx, _)| exclude.contains(&idx))
+            .all(|(idx, _)| exclude.contains(&idx) || !self.route_available(idx))
     }
 
-    /// The ordering-side backfill gate: every fill server is either excluded
-    /// for this request or disabled by health for a reason that will not
-    /// heal on its own (`DisableReason::AuthFailure`).
-    ///
-    /// A fill server with bad credentials re-disables on every probe, so it
-    /// never produces the 430 that would exclude it and otherwise pins an
-    /// article forever: the try-order skips the disabled server, the
-    /// remaining fill servers already 430'd, and backfill stays locked because
-    /// the disabled server is not in `exclude`. Counting an auth-disabled
-    /// server here lets the article spill to backfill instead of requeueing
-    /// against a deadline that only the operator can resolve.
-    ///
-    /// Every other health state deliberately does *not* count. `CoolingDown`
-    /// is a 5–10 s transport or capacity blip, and a `ConsecutiveFailures` /
-    /// `FailureRatio` disable is an outage that heals by itself; in both cases
-    /// waiting is far cheaper than spilling the whole queue onto a paid
-    /// backfill account. Note
-    /// this is an *ordering* gate only — disabled servers must never enter a
-    /// request's exclude set, or exhaustion booking would declare the segment
-    /// missing before backfill was ever tried.
+    // The ordering-side backfill gate: every fill server is either excluded
+    // for this request or disabled by health for a reason that will not
+    // heal on its own (`DisableReason::AuthFailure`).
+    //
+    // A fill server with bad credentials re-disables on every probe, so it
+    // never produces the 430 that would exclude it and otherwise pins an
+    // article forever: the try-order skips the disabled server, the
+    // remaining fill servers already 430'd, and backfill stays locked because
+    // the disabled server is not in `exclude`. Counting an auth-disabled
+    // server here lets the article spill to backfill instead of requeueing
+    // against a deadline that only the operator can resolve.
+    //
+    // Every other health state deliberately does *not* count. `CoolingDown`
+    // is a 5–10 s transport or capacity blip, and a `ConsecutiveFailures` /
+    // `FailureRatio` disable is an outage that heals by itself; in both cases
+    // waiting is far cheaper than spilling the whole queue onto a paid
+    // backfill account. Note
+    // this is an *ordering* gate only — disabled servers must never enter a
+    // request's exclude set, or exhaustion booking would declare the segment
+    // missing before backfill was ever tried.
     pub fn fill_servers_exhausted_or_auth_disabled(
         &self,
         exclude: &[usize],
@@ -1336,6 +1580,7 @@ impl NntpPool {
             .filter(|(_, backfill)| !**backfill)
             .all(|(idx, _)| {
                 exclude.contains(&idx)
+                    || !self.route_available(idx)
                     || matches!(
                         health.server(idx).state(),
                         ServerState::Disabled {
@@ -1346,12 +1591,12 @@ impl NntpPool {
             })
     }
 
-    /// Access the health tracker for observability.
+    // Access the health tracker for observability.
     pub fn health(&self) -> &Arc<Mutex<HealthTracker>> {
         &self.health
     }
 
-    /// Server configurations (parallel to health tracker indices).
+    // Server configurations (parallel to health tracker indices).
     pub fn server_configs(&self) -> &[ServerConfig] {
         &self.configs
     }
@@ -1424,7 +1669,7 @@ impl NntpPool {
         result
     }
 
-    /// The config and address route a blocking connection to `server` uses.
+    // The config and address route a blocking connection to `server` uses.
     pub fn blocking_connect_plan(&self, server: ServerId) -> Result<(ServerConfig, AddressRoute)> {
         let idx = server.0;
         if idx >= self.configs.len() {
@@ -1433,10 +1678,10 @@ impl NntpPool {
         Ok((self.configs[idx].clone(), self.address_route(idx)))
     }
 
-    /// Returns `(available_permits, configured_connections)` for the given server.
-    ///
-    /// This is lock-free — it reads semaphore permits and the pre-stored
-    /// max_connections value, so it can be called from synchronous contexts.
+    // Returns `(available_permits, configured_connections)` for the given server.
+    //
+    // This is lock-free — it reads semaphore permits and the pre-stored
+    // max_connections value, so it can be called from synchronous contexts.
     pub fn server_load(&self, idx: usize) -> (usize, usize) {
         (
             self.semaphores[idx].available_permits(),
@@ -1466,12 +1711,12 @@ impl NntpPool {
         }
     }
 
-    /// Currently leased connections for the given server.
+    // Currently leased connections for the given server.
     pub fn active_connections(&self, idx: usize) -> usize {
         self.max_connections[idx].saturating_sub(self.semaphores[idx].available_permits())
     }
 
-    /// Take a healthy idle connection, evicting stale/poisoned ones.
+    // Take a healthy idle connection, evicting stale/poisoned ones.
     fn take_healthy_idle(&self, pool: &mut ServerPool) -> Option<NntpConnection> {
         while let Some(conn) = pool.idle.pop_front() {
             if !conn.accepts_new_work() {
@@ -1494,7 +1739,7 @@ impl NntpPool {
     }
 }
 
-/// RAII guard that returns a connection to the pool on drop.
+// RAII guard that returns a connection to the pool on drop.
 pub struct PooledConnection {
     conn: Option<NntpConnection>,
     pool: Arc<SyncMutex<ServerPool>>,
@@ -1516,8 +1761,8 @@ impl PooledConnection {
         self.remote_addr().map(|addr| addr.ip())
     }
 
-    /// Explicitly discard this connection instead of returning it to the pool.
-    /// Use when the connection is in a bad state.
+    // Explicitly discard this connection instead of returning it to the pool.
+    // Use when the connection is in a bad state.
     pub fn discard(mut self) {
         if self.conn.take().is_some() {
             let mut pool = lock_recovering(&self.pool);
@@ -1543,15 +1788,15 @@ impl DerefMut for PooledConnection {
 }
 
 impl Drop for PooledConnection {
-    /// Return the socket to the idle list here, in the drop itself.
-    ///
-    /// `_permit` is a later field, so it is released only after this body has
-    /// run: by the time the next acquirer can take the permit, the connection
-    /// it should reuse is already on the list. Handing the return to a spawned
-    /// task inverted that — the permit went back first and the return landed
-    /// whenever the runtime got to it, so a caller that re-acquired
-    /// immediately (the probe's per-miss HEAD right after its STAT batch)
-    /// reliably raced past a warm socket and dialled a new one.
+    // Return the socket to the idle list here, in the drop itself.
+    //
+    // `_permit` is a later field, so it is released only after this body has
+    // run: by the time the next acquirer can take the permit, the connection
+    // it should reuse is already on the list. Handing the return to a spawned
+    // task inverted that — the permit went back first and the return landed
+    // whenever the runtime got to it, so a caller that re-acquired
+    // immediately (the probe's per-miss HEAD right after its STAT batch)
+    // reliably raced past a warm socket and dialled a new one.
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             let server_idx = self.server_idx;
@@ -1565,6 +1810,9 @@ impl Drop for PooledConnection {
                 if self.shutdown.is_cancelled() {
                     trace!(server = server_idx, "dropped connection from shutdown pool");
                 } else {
+                    // Register outside the owner lock: an already-retiring route
+                    // can recall synchronously. Recheck before publishing idle.
+                    drop(pool);
                     if let Some(slot) = &conn.socket_slot {
                         let owner = Arc::downgrade(&self.pool);
                         slot.idle(
@@ -1580,8 +1828,11 @@ impl Drop for PooledConnection {
                             }),
                         );
                     }
-                    pool.idle.push_back(conn);
-                    trace!(server = server_idx, "returned connection to pool");
+                    let mut pool = lock_recovering(&self.pool);
+                    if conn.accepts_new_work() && !self.shutdown.is_cancelled() {
+                        pool.idle.push_back(conn);
+                        trace!(server = server_idx, "returned connection to pool");
+                    }
                 }
             } else if healthy {
                 trace!(server = server_idx, "dropped non-poolable connection");
@@ -1602,6 +1853,199 @@ mod recovery_tests;
 mod tests {
     use super::*;
     use crate::health::{HealthConfig, ServerState};
+
+    #[tokio::test]
+    async fn idle_route_probe_opens_one_socket_and_preserves_provider_health() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use weaver_tunnel::pipe::{DialError, DialPath, Dialed, DialedStream, Dialer, Target};
+        struct Probe {
+            needed: AtomicBool,
+            attempts: AtomicUsize,
+            targets: tokio::sync::watch::Sender<Vec<u16>>,
+            attempted: tokio::sync::mpsc::UnboundedSender<usize>,
+            checked: tokio::sync::mpsc::UnboundedSender<()>,
+        }
+        #[async_trait::async_trait]
+        impl Dialer for Probe {
+            fn leg_targets(&self) -> Option<tokio::sync::watch::Receiver<Vec<u16>>> {
+                Some(self.targets.subscribe())
+            }
+            fn needs_probe(&self) -> bool {
+                self.checked.send(()).ok();
+                self.needed.load(Ordering::Acquire)
+            }
+            async fn dial(&self, _: &Target) -> std::result::Result<Dialed, DialError> {
+                assert!(self.needed.swap(false, Ordering::AcqRel));
+                let attempt = self.attempts.fetch_add(1, Ordering::AcqRel);
+                self.attempted.send(attempt).unwrap();
+                if attempt == 0 {
+                    return Err(DialError::Egress(std::io::Error::other("fixture leg down")));
+                }
+                let (stream, peer) = tokio::io::duplex(1024);
+                tokio::spawn(async move {
+                    let (reader, mut writer) = tokio::io::split(peer);
+                    writer.write_all(b"200 ready\r\n").await.unwrap();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let reply = if line == "CAPABILITIES" {
+                            &b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n"[..]
+                        } else {
+                            &b"500 unsupported\r\n"[..]
+                        };
+                        if writer.write_all(reply).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(Dialed {
+                    stream: DialedStream::Tunnel(Box::new(stream)),
+                    outcome: Arc::new(weaver_tunnel::bridge::ConnectionOutcome::default()),
+                    path: DialPath {
+                        leg: Some(0),
+                        ..Default::default()
+                    },
+                    peer: Some("127.0.0.1:119".parse().unwrap()),
+                    source: None,
+                    setup: None,
+                })
+            }
+            fn budget(&self) -> Duration {
+                Duration::from_secs(30)
+            }
+            fn describe(&self) -> String {
+                "probe fixture".into()
+            }
+        }
+        let (attempted, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+        let (checked, mut checks) = tokio::sync::mpsc::unbounded_channel();
+        let probe = Arc::new(Probe {
+            needed: AtomicBool::new(true),
+            attempts: AtomicUsize::new(0),
+            targets: tokio::sync::watch::channel(vec![4]).0,
+            attempted,
+            checked,
+        });
+        let mut config = test_pool_config(4);
+        config.health_config.degraded_threshold = 1;
+        config.servers[0].server.tls = false;
+        config.servers[0].server.dialer = Some(Arc::new(crate::route_dialer::RouteDialer {
+            inner: probe.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            server: 1,
+            egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+        }));
+        let pool = Arc::new(NntpPool::new(config));
+        let mut changed = pool.socket_budgets[0].subscribe();
+        pool.start_route_probes();
+        assert_eq!(attempts.recv().await, Some(0));
+        while pool.socket_budgets[0].snapshot().physical != 0 {
+            changed.changed().await.unwrap();
+        }
+        assert!(matches!(
+            pool.health.lock().await.server(0).state(),
+            ServerState::Healthy
+        ));
+        probe.needed.store(true, Ordering::Release);
+        probe.targets.send_modify(|_| {});
+        assert_eq!(attempts.recv().await, Some(1));
+        while pool.socket_budgets[0].snapshot().async_idle != 1 {
+            changed.changed().await.unwrap();
+        }
+        while checks.try_recv().is_ok() {}
+        pool.start_route_probes();
+        probe.targets.send_modify(|_| {});
+        checks.recv().await.unwrap();
+        assert_eq!(probe.attempts.load(Ordering::Acquire), 2);
+        assert_eq!(pool.socket_budgets[0].snapshot().physical, 1);
+        assert!(matches!(
+            pool.health.lock().await.server(0).state(),
+            ServerState::Healthy
+        ));
+        pool.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_probe_checks_on_target_changes_and_dials_once_per_change() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use weaver_tunnel::pipe::{DialError, Dialed, Dialer, Target};
+        struct Counting {
+            needed: AtomicBool,
+            checks: AtomicUsize,
+            dials: AtomicUsize,
+            targets: tokio::sync::watch::Sender<Vec<u16>>,
+            checked: tokio::sync::mpsc::UnboundedSender<()>,
+            dialed: tokio::sync::mpsc::UnboundedSender<()>,
+        }
+        #[async_trait::async_trait]
+        impl Dialer for Counting {
+            fn leg_targets(&self) -> Option<tokio::sync::watch::Receiver<Vec<u16>>> {
+                Some(self.targets.subscribe())
+            }
+            fn needs_probe(&self) -> bool {
+                self.checks.fetch_add(1, Ordering::AcqRel);
+                self.checked.send(()).ok();
+                self.needed.load(Ordering::Acquire)
+            }
+            async fn dial(&self, _: &Target) -> std::result::Result<Dialed, DialError> {
+                self.dials.fetch_add(1, Ordering::AcqRel);
+                self.dialed.send(()).ok();
+                Err(DialError::Egress(std::io::Error::other("fixture leg down")))
+            }
+            fn budget(&self) -> Duration {
+                Duration::from_secs(30)
+            }
+            fn describe(&self) -> String {
+                "counting fixture".into()
+            }
+        }
+        let (checked, mut checks) = tokio::sync::mpsc::unbounded_channel();
+        let (dialed, mut dials) = tokio::sync::mpsc::unbounded_channel();
+        let route = Arc::new(Counting {
+            needed: AtomicBool::new(false),
+            checks: AtomicUsize::new(0),
+            dials: AtomicUsize::new(0),
+            targets: tokio::sync::watch::channel(vec![4]).0,
+            checked,
+            dialed,
+        });
+        let mut config = test_pool_config(4);
+        config.servers[0].server.tls = false;
+        config.servers[0].server.dialer = Some(Arc::new(crate::route_dialer::RouteDialer {
+            inner: route.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            server: 1,
+            egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+        }));
+        let pool = Arc::new(NntpPool::new(config));
+        pool.start_route_probes();
+        checks.recv().await.unwrap();
+
+        // Observe the parked loop and verify that it armed no timer.
+        let mut waits = pool.probe_waits[0].subscribe();
+        waits.wait_for(|state| state.0 >= 1).await.unwrap();
+        assert!(waits.borrow().1.is_none());
+        assert_eq!(route.checks.load(Ordering::Acquire), 1);
+        assert_eq!(route.dials.load(Ordering::Acquire), 0);
+
+        // A lapse changes the targets: one probe dial for that change, and
+        // none after it while the targets stay put, even though the leg
+        // still reports that it needs one.
+        route.needed.store(true, Ordering::Release);
+        route.targets.send_modify(|_| {});
+        dials.recv().await.unwrap();
+        waits.wait_for(|state| state.0 >= 2).await.unwrap();
+        assert!(waits.borrow().1.is_none());
+        assert_eq!(route.dials.load(Ordering::Acquire), 1);
+
+        // The next lapse gets its own probe.
+        route.targets.send_modify(|_| {});
+        dials.recv().await.unwrap();
+        waits.wait_for(|state| state.0 >= 3).await.unwrap();
+        assert!(waits.borrow().1.is_none());
+        assert_eq!(route.dials.load(Ordering::Acquire), 2);
+        pool.shutdown().await;
+    }
 
     #[test]
     fn cold_auth_admission_fans_out_then_latches_rejection() {
@@ -1776,12 +2220,12 @@ mod tests {
         config
     }
 
-    /// An async caller must not queue behind download lanes that are
-    /// mid-transfer: nothing can be recalled, and nothing frees up until a
-    /// whole article has moved.
-    ///
-    /// The clock is paused, so any timer the call waited on would show as
-    /// elapsed time; a call that never waited leaves it where it was.
+    // An async caller must not queue behind download lanes that are
+    // mid-transfer: nothing can be recalled, and nothing frees up until a
+    // whole article has moved.
+    //
+    // The clock is paused, so any timer the call waited on would show as
+    // elapsed time; a call that never waited leaves it where it was.
     #[tokio::test(start_paused = true)]
     async fn dispatch_permit_fails_fast_when_lanes_hold_every_connection() {
         let pool = NntpPool::new(lane_pool_config(2));
@@ -1796,8 +2240,8 @@ mod tests {
         drop(held);
     }
 
-    /// An idle lane that can hand its socket back is still recalled, and the
-    /// permit that recall releases is the one the acquire takes.
+    // An idle lane that can hand its socket back is still recalled, and the
+    // permit that recall releases is the one the acquire takes.
     #[tokio::test]
     async fn dispatch_permit_takes_the_permit_a_recall_releases() {
         let pool = NntpPool::new(lane_pool_config(1));
@@ -2299,10 +2743,10 @@ mod tests {
         ));
     }
 
-    /// An auth-disabled fill server must make backfill reachable, or an
-    /// article the other fill servers do not have is pinned out of backfill
-    /// for as long as the bad credentials last. A short cooldown and a
-    /// consecutive-failure outage disable must not: both heal on their own.
+    // An auth-disabled fill server must make backfill reachable, or an
+    // article the other fill servers do not have is pinned out of backfill
+    // for as long as the bad credentials last. A short cooldown and a
+    // consecutive-failure outage disable must not: both heal on their own.
     #[tokio::test]
     async fn body_availability_unlocks_backfill_only_for_auth_disabled_fill_servers() {
         let fill_plus_backfill = || {
@@ -2454,9 +2898,9 @@ mod tests {
         assert_eq!(over_limit_holdoff(u32::MAX), Duration::from_secs(600));
     }
 
-    /// The first refusal buys a short pause; when it ends, one caller is let
-    /// through to ask the provider and everyone else keeps waiting on that
-    /// answer. A refused probe doubles the pause.
+    // The first refusal buys a short pause; when it ends, one caller is let
+    // through to ask the provider and everyone else keeps waiting on that
+    // answer. A refused probe doubles the pause.
     #[test]
     fn one_probe_follows_the_holdoff_and_a_refused_probe_doubles_it() {
         let pool = NntpPool::new(test_pool_config(4));
@@ -2502,8 +2946,8 @@ mod tests {
         assert!(third >= unix_epoch_ms() + 119_000 && third <= unix_epoch_ms() + 120_000);
     }
 
-    /// The provider accepting a socket ends the episode outright: no holdoff,
-    /// no probe slot, and the next refusal starts again from the short pause.
+    // The provider accepting a socket ends the episode outright: no holdoff,
+    // no probe slot, and the next refusal starts again from the short pause.
     #[test]
     fn an_admitted_connect_clears_the_holdoff_and_resets_the_backoff() {
         let pool = NntpPool::new(test_pool_config(4));
@@ -2539,9 +2983,9 @@ mod tests {
         assert!(deadline <= unix_epoch_ms() + 30_000);
     }
 
-    /// A connect admitted while nothing was held off, that completes only
-    /// after a refusal has armed the holdoff, proves nothing: the provider
-    /// accepted it before it began refusing. The holdoff stands.
+    // A connect admitted while nothing was held off, that completes only
+    // after a refusal has armed the holdoff, proves nothing: the provider
+    // accepted it before it began refusing. The holdoff stands.
     #[test]
     fn a_connect_that_was_already_dialling_does_not_clear_a_new_holdoff() {
         let pool = NntpPool::new(test_pool_config(4));
@@ -2574,10 +3018,10 @@ mod tests {
         assert!(pool.admit_fresh_connect(ServerId(0)).is_err());
     }
 
-    /// A probe only settles the episode while the slot is still its own. A
-    /// refusal booked after it went out resets the slot and starts a longer
-    /// pause; the probe's late success neither clears that pause nor does
-    /// its late failure free the slot a later probe holds.
+    // A probe only settles the episode while the slot is still its own. A
+    // refusal booked after it went out resets the slot and starts a longer
+    // pause; the probe's late success neither clears that pause nor does
+    // its late failure free the slot a later probe holds.
     #[test]
     fn a_superseded_probe_neither_clears_nor_frees_anything() {
         let pool = NntpPool::new(test_pool_config(4));
@@ -2606,9 +3050,9 @@ mod tests {
         assert!(pool.admit_fresh_connect(ServerId(0)).is_ok());
     }
 
-    /// An episode nobody probed — the queue drained during the pause — does
-    /// not carry its refusal count into the next one. A refusal long after
-    /// the last pause ended starts again from the shortest pause.
+    // An episode nobody probed — the queue drained during the pause — does
+    // not carry its refusal count into the next one. A refusal long after
+    // the last pause ended starts again from the shortest pause.
     #[test]
     fn a_refusal_long_after_the_last_pause_starts_a_new_episode() {
         let pool = NntpPool::new(test_pool_config(4));
@@ -2634,8 +3078,8 @@ mod tests {
         assert!(deadline <= unix_epoch_ms() + 30_000);
     }
 
-    /// A probe whose caller never reported back does not hold the server
-    /// closed for good: after the probe window another caller may ask.
+    // A probe whose caller never reported back does not hold the server
+    // closed for good: after the probe window another caller may ask.
     #[test]
     fn a_stale_probe_slot_is_taken_over() {
         let pool = NntpPool::new(test_pool_config(4));

@@ -91,6 +91,45 @@ fn the_legacy_nzbget_header_selects_the_nzbget_contract() {
 }
 
 #[test]
+fn a_go_source_file_is_listed_and_reads_its_header_from_line_comments() {
+    let root = tempfile::tempdir().unwrap();
+    // Neither file carries the executable bit: the extension lists them.
+    write_script(root.path(), "plain.go", "package main\n\nfunc main() {}\n");
+    write_script(
+        root.path(),
+        "Report.GO",
+        "// ### NZBGET POST-PROCESSING SCRIPT ###\n\
+         // ### OPTIONS ###\n\
+         // #Server=localhost\n\
+         // ### NZBGET POST-PROCESSING SCRIPT ###\n\
+         \n\
+         package main\n\nfunc main() {}\n",
+    );
+    let listing = list_scripts(root.path()).unwrap();
+    assert!(listing.problems.is_empty());
+    let scripts = listing
+        .scripts
+        .iter()
+        .map(|script| {
+            (
+                script.name.as_str(),
+                script.manifest.adapter(),
+                script.manifest.options().len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        scripts,
+        [
+            ("Report.GO", ScriptAdapter::Nzbget, 1),
+            ("plain.go", ScriptAdapter::Sabnzbd, 0),
+        ]
+    );
+    assert_eq!(listing.scripts[0].manifest.entrypoint(), "Report.GO");
+    assert_eq!(listing.scripts[0].root, root.path());
+}
+
+#[test]
 fn a_manifest_package_supplies_the_display_name_adapter_and_options() {
     let root = tempfile::tempdir().unwrap();
     write_manifest_package(root.path(), "email", nzbget_manifest());

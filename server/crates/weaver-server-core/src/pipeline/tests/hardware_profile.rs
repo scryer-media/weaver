@@ -3,9 +3,9 @@ use super::*;
 use crate::HardwareProfileInForce;
 use crate::runtime::HardwareProfile;
 
-/// Twelve cores and 8 GiB. Balanced is recommended; efficient differs from it
-/// in every limit, pool size included; performance is out of reach for want
-/// of memory.
+// Twelve cores and 8 GiB. Balanced is recommended; efficient differs from it
+// in every limit, pool size included; performance is out of reach for want
+// of memory.
 fn twelve_core_machine() -> SystemProfile {
     SystemProfile {
         cpu: CpuProfile {
@@ -64,7 +64,7 @@ async fn schedule(pipeline: &mut Pipeline, profile: Option<HardwareProfile>) {
     received.await.unwrap();
 }
 
-/// Everything a profile decides, as the next activity would find it.
+// Everything a profile decides, as the next activity would find it.
 fn assert_limits_of(pipeline: &Pipeline, profile: HardwareProfile) {
     let tuning = profile.tuning(pipeline.tuner.system_profile());
     assert_eq!(pipeline.tuner.profile_tuning(), tuning);
@@ -157,7 +157,10 @@ async fn a_scheduled_profile_overrides_the_choice_until_the_schedule_lets_go() {
     pipeline
         .handle_command(SchedulerCommand::ApplyScheduleAction {
             action: crate::bandwidth::ScheduleAction::SpeedLimit {
-                bytes_per_sec: 128 * 1024,
+                limits: vec![crate::bandwidth::SpeedLimitChange {
+                    target: crate::bandwidth::SpeedTarget::Global,
+                    bytes_per_sec: 128 * 1024,
+                }],
             },
             reply,
         })
@@ -189,15 +192,6 @@ async fn a_scheduled_profile_overrides_the_choice_until_the_schedule_lets_go() {
 
     // The operator's choice is recorded but waits for the schedule.
     choose(&mut pipeline, HardwareProfile::Balanced).await;
-    assert_limits_of(&pipeline, HardwareProfile::Efficient);
-
-    // Clearing the scheduled pause or speed limit leaves the profile alone.
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ClearScheduleAction { reply })
-        .await;
-    received.await.unwrap();
-    assert_eq!(pipeline.scheduled_rate_limit, None);
     assert_limits_of(&pipeline, HardwareProfile::Efficient);
 
     schedule(&mut pipeline, None).await;

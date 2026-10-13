@@ -1,6 +1,37 @@
 use super::*;
 
 #[tokio::test]
+async fn post_processing_resume_arms_deferred_direct_unpack() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_direct_unpack(&mut pipeline);
+    let job = JobId(41923);
+    let set = "generated_split_store_plain.7z";
+    let files = sevenz_fixture_bytes(set);
+    insert_active_job(&mut pipeline, job, rar_job_spec("Deferred Chase", &files)).await;
+    let (reply, received) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::PausePostProcessing { reply })
+        .await;
+    received.await.unwrap();
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job, index as u32, name, bytes).await;
+    }
+    assert!(!pipeline.direct_unpack.is_armed(job, set));
+    assert!(pipeline.deferred_post_processing.contains(&job));
+    let (reply, received) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::ResumePostProcessing { reply })
+        .await;
+    received.await.unwrap();
+    assert!(pipeline.direct_unpack.is_armed(job, set));
+    assert!(!pipeline.deferred_post_processing.contains(&job));
+    pipeline
+        .direct_unpack_shutdown("deferred chase test teardown")
+        .await;
+}
+
+#[tokio::test]
 async fn new_chases_cannot_join_a_repair_after_the_vouching_snapshot() {
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;

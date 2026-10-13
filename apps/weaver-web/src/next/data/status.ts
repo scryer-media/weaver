@@ -5,10 +5,10 @@ import type { JobData } from "@/lib/job-types";
 import { latestPhase } from "./phase-bars";
 
 /**
- * Status vocabulary shared by every Next screen.
+ * Status vocabulary shared by every screen.
  *
- * Labels come from the same i18n keys the classic UI uses — the redesign is a
- * new interface, not a new set of words for weaver's pipeline states.
+ * Labels come from the shared `status.*` i18n keys, so every screen names
+ * weaver's pipeline states the same way.
  */
 
 export type DownloadGroup = "active" | "paused" | "queued" | "attention";

@@ -1,4 +1,4 @@
-//! Strong extent donation from explicitly published sources.
+// Strong extent donation from explicitly published sources.
 
 use super::*;
 use par3_rs::layout::{BlockLayout, ExtentKind};
@@ -7,10 +7,10 @@ use par3_rs::session::RepairStatus;
 use std::ops::Range;
 
 const READ_LIMIT: u64 = 1 << 30;
-/// Wall time one extent may spend looking for a donor. The byte limit above is
-/// cumulative for the whole job; this one is per extent, so a single pathological
-/// extent cannot hold the worker while other extents still have candidates. It
-/// is checked between placement calls only — no timer is handed to the engine.
+// Wall time one extent may spend looking for a donor. The byte limit above is
+// cumulative for the whole job; this one is per extent, so a single pathological
+// extent cannot hold the worker while other extents still have candidates. It
+// is checked between placement calls only — no timer is handed to the engine.
 const EXTENT_SEARCH_TIME: std::time::Duration = std::time::Duration::from_millis(100);
 type Key = (par3_rs::Fingerprint, usize, SourceId);
 
@@ -26,7 +26,7 @@ struct Attempt {
 pub(super) struct Cache {
     attempts: BTreeMap<Key, Attempt>,
     pub(super) read_bytes: u64,
-    /// Extents abandoned because they reached [`EXTENT_SEARCH_TIME`].
+    // Extents abandoned because they reached [`EXTENT_SEARCH_TIME`].
     pub(super) time_cap_hits: u64,
     pub exhaustive: bool,
     pub exhausted: bool,
@@ -353,7 +353,7 @@ fn locate(
     Ok(result?.matches.into_iter().next())
 }
 
-/// Limit the search window without changing identity, generation, or holes.
+// Limit the search window without changing identity, generation, or holes.
 struct Window<'a> {
     sources: &'a PublishedSources,
     source: SourceId,

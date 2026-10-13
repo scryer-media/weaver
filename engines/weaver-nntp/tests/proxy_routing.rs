@@ -14,6 +14,47 @@ use weaver_tunnel::{
     transport::{TransportKind, TransportProxy},
 };
 
+struct BridgeDialer(Arc<weaver_tunnel::bridge::Bridge>);
+#[async_trait::async_trait]
+impl weaver_tunnel::pipe::Dialer for BridgeDialer {
+    async fn dial(
+        &self,
+        target: &weaver_tunnel::pipe::Target,
+    ) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
+        let (stream, outcome) = self
+            .0
+            .dial(&target.host, target.port)
+            .await
+            .map_err(weaver_tunnel::pipe::DialError::Egress)?;
+        Ok(weaver_tunnel::pipe::Dialed {
+            stream: weaver_tunnel::pipe::DialedStream::Tunnel(Box::new(stream)),
+            outcome,
+            path: Default::default(),
+            peer: None,
+            source: None,
+            setup: None,
+        })
+    }
+    fn budget(&self) -> Duration {
+        self.0.connect_timeout
+    }
+    fn describe(&self) -> String {
+        "fixture bridge".into()
+    }
+}
+fn bridge_dialer(
+    bridge: Arc<weaver_tunnel::bridge::Bridge>,
+) -> Arc<weaver_nntp::route_dialer::RouteDialer> {
+    Arc::new(weaver_nntp::route_dialer::RouteDialer {
+        inner: Arc::new(BridgeDialer(bridge)),
+        egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::with_scope(
+            weaver_nntp::transfer::TransferScope::Egress,
+        )),
+        runtime: tokio::runtime::Handle::current(),
+        server: 0,
+    })
+}
+
 struct Origin {
     addr: SocketAddr,
     ca: PathBuf,
@@ -194,7 +235,7 @@ async fn exercise(kind: u8, implicit: bool, starttls: bool) {
     )
     .unwrap();
     let config = ServerConfig {
-        proxy: Some(bridge.clone()),
+        dialer: Some(bridge_dialer(bridge.clone())),
         host: "provider.invalid".into(),
         port: origin.addr.port(),
         tls: implicit,
@@ -255,7 +296,7 @@ async fn exercise(kind: u8, implicit: bool, starttls: bool) {
             &wrong.host,
             wrong.port,
             Some(&origin.ca),
-            Some(&bridge),
+            wrong.dialer.as_ref(),
         )
         .await
         .unwrap();
@@ -343,7 +384,7 @@ async fn blocking_routed_tls_read_obeys_timeout_and_revocation() {
         )
         .unwrap();
         let config = ServerConfig {
-            proxy: Some(bridge.clone()),
+            dialer: Some(bridge_dialer(bridge.clone())),
             host: "provider.invalid".into(),
             port: origin.addr.port(),
             tls: true,
@@ -374,7 +415,7 @@ async fn blocking_routed_tls_read_obeys_timeout_and_revocation() {
     }
 }
 
-/// An opt-in local transport measurement; wall-clock rates are informational.
+// An opt-in local transport measurement; wall-clock rates are informational.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "local throughput measurement"]
 async fn local_route_throughput() {

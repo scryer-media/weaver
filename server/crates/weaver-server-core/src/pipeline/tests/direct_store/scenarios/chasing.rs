@@ -1,4 +1,4 @@
-//! Chasing the compressed member of the existing RARLAB mixed-member fixture.
+// Chasing the compressed member of the existing RARLAB mixed-member fixture.
 
 use super::*;
 use crate::pipeline::direct_unpack::settings::{DirectUnpackGate, DirectUnpackSettings};
@@ -94,13 +94,15 @@ async fn rar_chase_rejects_unacceptable_extension_before_writing_payload() {
         }
         .await;
         let outcome = pipeline.direct_unpack.outcome(job_id, "mixed").unwrap();
-        assert!(
-            outcome
-                .result
-                .as_ref()
-                .err()
-                .expect("chase must reject the blocked member")
-                .contains("unacceptable extension 'bin'")
+        let error = outcome
+            .result
+            .as_ref()
+            .err()
+            .expect("chase must reject the blocked member");
+        assert!(crate::pipeline::JobExtractionBudget::is_rejection(error));
+        assert_eq!(
+            crate::pipeline::JobExtractionBudget::job_failure_reason(error.clone()),
+            "unwanted extension '.bin' in 'zeros_64k.bin'"
         );
         assert!(!outcome.staging_dir.join("zeros_64k.bin").exists());
     }
@@ -178,10 +180,10 @@ async fn rar_chase_settle_ignores_partial_topology_but_fences_reordered_parts() 
     );
 }
 
-/// Land one article's bytes at their offset, as the decode path does: a
-/// positioned write into the volume, never a truncating rewrite of it. The
-/// chase worker is already reading the first article's bytes, and a truncate
-/// under it hands it an empty header.
+// Land one article's bytes at their offset, as the decode path does: a
+// positioned write into the volume, never a truncating rewrite of it. The
+// chase worker is already reading the first article's bytes, and a truncate
+// under it hands it an empty header.
 fn write_article_in_place(path: &Path, offset: usize, article: &[u8]) {
     use std::io::{Seek, Write};
     let mut file = std::fs::OpenOptions::new()
@@ -195,10 +197,10 @@ fn write_article_in_place(path: &Path, offset: usize, article: &[u8]) {
     file.sync_data().unwrap();
 }
 
-/// Extraction can take a chase before the chase hears that its last part
-/// finished: the commit that completes a part can start extraction before it
-/// publishes the part's floor. The handoff has to tell the chase, or the
-/// worker parks on bytes already on disk until the consumption deadline.
+// Extraction can take a chase before the chase hears that its last part
+// finished: the commit that completes a part can start extraction before it
+// publishes the part's floor. The handoff has to tell the chase, or the
+// worker parks on bytes already on disk until the consumption deadline.
 #[tokio::test]
 async fn handing_a_chase_to_extraction_publishes_parts_that_finished_unheard() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -462,18 +464,18 @@ async fn run_chase(gate: DirectStoreGate, invalidate_for_repair: bool) {
     );
 }
 
-/// A set demoted on its first volume's header must not take its siblings'
-/// outstanding downloads with it.
-///
-/// The whole-set refetch fallback runs when nothing was ever routed, and it is
-/// the only demotion arm that touches every volume of the set at once. The
-/// volumes behind the one that demoted have been dispatched for nothing yet:
-/// their articles are still queued, uncommitted and nobody else's, and the
-/// refetch's own rule — requeue what the deleted routed storage owned, leave
-/// everything else to its owner — must read a queued article as owned by the
-/// queue rather than as work to drop. If it does not, the pass ends with an
-/// empty queue and files nothing ever attempted, and the completion verdict
-/// blames retries that never ran.
+// A set demoted on its first volume's header must not take its siblings'
+// outstanding downloads with it.
+//
+// The whole-set refetch fallback runs when nothing was ever routed, and it is
+// the only demotion arm that touches every volume of the set at once. The
+// volumes behind the one that demoted have been dispatched for nothing yet:
+// their articles are still queued, uncommitted and nobody else's, and the
+// refetch's own rule — requeue what the deleted routed storage owned, leave
+// everything else to its owner — must read a queued article as owned by the
+// queue rather than as work to drop. If it does not, the pass ends with an
+// empty queue and files nothing ever attempted, and the completion verdict
+// blames retries that never ran.
 #[tokio::test]
 async fn a_demotion_on_the_first_volume_leaves_the_rest_of_the_set_queued() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -522,14 +524,14 @@ async fn a_demotion_on_the_first_volume_leaves_the_rest_of_the_set_queued() {
     }
 }
 
-/// A demotion's refetch must not drain a retry that is still in flight for
-/// another article of the job.
-///
-/// The refetch requeues the articles the deleted routed storage owned. Those
-/// are fresh work, not re-entering retries, so they must leave the pending-retry
-/// counters alone. Draining the job-wide counter for them cancels the real
-/// retry sleeping for a different article, the pass-end gate reads the job as
-/// having nothing left, and the job fails before that retry ever fires.
+// A demotion's refetch must not drain a retry that is still in flight for
+// another article of the job.
+//
+// The refetch requeues the articles the deleted routed storage owned. Those
+// are fresh work, not re-entering retries, so they must leave the pending-retry
+// counters alone. Draining the job-wide counter for them cancels the real
+// retry sleeping for a different article, the pass-end gate reads the job as
+// having nothing left, and the job fails before that retry ever fires.
 #[tokio::test]
 async fn a_demotion_refetch_keeps_another_articles_scheduled_retry_pending() {
     let volumes = demotion_fixture_volumes("Copper.Lantern.S02E03.mkv");
@@ -600,17 +602,17 @@ async fn a_demotion_refetch_keeps_another_articles_scheduled_retry_pending() {
     assert!(peek_queued_segments(&mut pipeline, job_id).contains(&(2, 0)));
 }
 
-/// The block size the recovery set below describes its volume on: two blocks
-/// over the fixture, so damage in the first leaves a second the set could
-/// still vouch for.
+// The block size the recovery set below describes its volume on: two blocks
+// over the fixture, so damage in the first leaves a second the set could
+// still vouch for.
 const DAMAGE_SLICE: u64 = 128;
 
-/// A single-volume RAR chase armed on its first article, then completed by a
-/// second article the chase never hears about, with a real recovery set whose
-/// grid holds a Damaged verdict for the volume's first block.
-///
-/// Returns the pipeline, the working directory and the volume bytes. The
-/// chase is still armed and still ungated: what happens next is the test.
+// A single-volume RAR chase armed on its first article, then completed by a
+// second article the chase never hears about, with a real recovery set whose
+// grid holds a Damaged verdict for the volume's first block.
+//
+// Returns the pipeline, the working directory and the volume bytes. The
+// chase is still armed and still ungated: what happens next is the test.
 async fn armed_chase_completed_with_damaged_block_zero(
     temp_dir: &tempfile::TempDir,
     job_id: JobId,
@@ -700,10 +702,10 @@ async fn armed_chase_completed_with_damaged_block_zero(
     (pipeline, working_dir, bytes)
 }
 
-/// A RAR volume that completes after its chase armed publishes what the
-/// recovery data says about it at the completion seam — while the set is still
-/// armed, so the completion check can see the gate, force the authoritative
-/// PAR2 pass, and let the repair resume the chase.
+// A RAR volume that completes after its chase armed publishes what the
+// recovery data says about it at the completion seam — while the set is still
+// armed, so the completion check can see the gate, force the authoritative
+// PAR2 pass, and let the repair resume the chase.
 #[tokio::test]
 async fn a_rar_part_completing_after_arming_gates_the_chase_where_finalize_can_see_it() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -744,10 +746,10 @@ async fn a_rar_part_completing_after_arming_gates_the_chase_where_finalize_can_s
     pipeline.direct_unpack_shutdown("test teardown").await;
 }
 
-/// The handoff to extraction publishes completion, never a gate. A gate raised
-/// as the set leaves `armed` has nobody to lift it: the completion check and
-/// both release paths read gates from armed sets only, and the worker would
-/// park on a vouched prefix of zero until the consumption deadline.
+// The handoff to extraction publishes completion, never a gate. A gate raised
+// as the set leaves `armed` has nobody to lift it: the completion check and
+// both release paths read gates from armed sets only, and the worker would
+// park on a vouched prefix of zero until the consumption deadline.
 #[tokio::test]
 async fn handing_a_chase_to_extraction_never_raises_a_gate() {
     let temp_dir = tempfile::tempdir().unwrap();

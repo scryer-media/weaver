@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   releaseNotification,
   type UpdateStatus,
-} from "../src/features/updates/update-notification.ts";
+} from "../src/next/features/updates/update-notification.ts";
 
 function status(overrides: Partial<UpdateStatus> = {}): UpdateStatus {
   return {

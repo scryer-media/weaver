@@ -15,14 +15,80 @@ pub async fn load_global_pause_from_db(db: &Database) -> Result<bool, String> {
         .unwrap_or(false))
 }
 
+// Pool settings for every active server, in dial order. Startup and every
+// rebuild take their NNTP client from here, so a server's route, adopted
+// certificate and proven pipelining depth apply from the first connection
+// after a restart exactly as they do after a change.
+pub fn nntp_server_pool_configs(
+    configured_servers: &[crate::servers::ServerConfig],
+    proxy_runtime: Option<&crate::proxies::ProxyRuntime>,
+    transfer_registry: &weaver_nntp::transfer::ServerTransferRegistry,
+    buffer_profile: weaver_nntp::connection::NntpBufferProfile,
+) -> Result<Vec<weaver_nntp::pool::ServerPoolConfig>, String> {
+    use weaver_nntp::transfer::StableServerId;
+
+    let mut active: Vec<&crate::servers::ServerConfig> = configured_servers
+        .iter()
+        .filter(|server| server.active)
+        .collect();
+    active.sort_by_key(|server| (server.priority, server.id));
+    active
+        .iter()
+        .map(|server| {
+            Ok(weaver_nntp::pool::ServerPoolConfig {
+                server: weaver_nntp::ServerConfig {
+                    dialer: proxy_runtime
+                        .map(|runtime| {
+                            runtime.network.nntp_dialer(
+                                server.id,
+                                server.connections,
+                                std::time::Duration::from_secs(30),
+                            )
+                        })
+                        .transpose()?,
+                    host: server.host.clone(),
+                    port: server.port,
+                    tls: server.tls,
+                    username: server.username.clone(),
+                    password: server.password.clone(),
+                    tls_ca_cert: server.tls_ca_cert.clone(),
+                    tls_name_mismatch_certificate_der: server
+                        .tls_name_mismatch_certificate_der
+                        .clone(),
+                    buffer_profile,
+                    pipelining: weaver_nntp::PipeliningCapability::Known(
+                        server.supports_pipelining,
+                    ),
+                    pipelining_depth: server.pipelining_depth,
+                    ..Default::default()
+                },
+                max_connections: server.connections as usize,
+                group: server.priority,
+                backfill: server.backfill,
+                retention_days: server.retention_days,
+                stable_id: StableServerId(server.id),
+                transfer_control: Some(transfer_registry.control(StableServerId(server.id))),
+            })
+        })
+        .collect()
+}
+
+// The NNTP client for one generation of pool settings.
+pub fn nntp_client(
+    servers: Vec<weaver_nntp::pool::ServerPoolConfig>,
+) -> weaver_nntp::client::NntpClient {
+    weaver_nntp::client::NntpClient::new(weaver_nntp::client::NntpClientConfig {
+        servers,
+        max_idle_age: std::time::Duration::from_mins(5),
+        max_retries_per_server: 1,
+        soft_timeout: std::time::Duration::from_secs(15),
+    })
+}
+
 pub async fn rebuild_nntp_from_config(
     config: &SharedConfig,
     handle: &SchedulerHandle,
 ) -> Result<NntpRuntimeActivation, SchedulerError> {
-    use weaver_nntp::client::{NntpClient, NntpClientConfig};
-    use weaver_nntp::pool::ServerPoolConfig;
-    use weaver_nntp::transfer::StableServerId;
-
     let policy_registry = handle.server_transfer_policy().ok_or_else(|| {
         SchedulerError::Internal("server transfer policy registry unavailable".to_string())
     })?;
@@ -32,80 +98,44 @@ pub async fn rebuild_nntp_from_config(
     let configured_servers = config.read().await.servers.clone();
     let registry = std::sync::Arc::clone(&policy_registry);
     let servers = configured_servers.clone();
-    tokio::task::spawn_blocking(move || registry.reconfigure(&servers))
-        .await
-        .map_err(|error| {
-            SchedulerError::Internal(format!(
-                "server transfer policy reconfiguration task failed: {error}"
-            ))
-        })?
-        .map_err(|error| {
-            SchedulerError::Internal(format!(
-                "failed to reconfigure server transfer policies: {error}"
-            ))
-        })?;
+    let memory = tokio::task::spawn_blocking(move || {
+        registry
+            .reconfigure(&servers)
+            .map(|()| super::system_probe::detect_memory())
+    })
+    .await
+    .map_err(|error| {
+        SchedulerError::Internal(format!(
+            "server transfer policy reconfiguration task failed: {error}"
+        ))
+    })?
+    .map_err(|error| {
+        SchedulerError::Internal(format!(
+            "failed to reconfigure server transfer policies: {error}"
+        ))
+    })?;
 
-    let (client, total) = {
-        let mut active: Vec<&crate::servers::ServerConfig> = configured_servers
-            .iter()
-            .filter(|server| server.active)
-            .collect();
-        active.sort_by_key(|server| (server.priority, server.id));
-        let servers: Vec<ServerPoolConfig> = active
-            .iter()
-            .map(|server| {
-                Ok::<_, SchedulerError>(ServerPoolConfig {
-                    server: weaver_nntp::ServerConfig {
-                        proxy: proxy_runtime
-                            .as_ref()
-                            .map(|runtime| runtime.nntp_bridge(server.id))
-                            .transpose()
-                            .map_err(SchedulerError::Internal)?
-                            .flatten(),
-                        revocation: proxy_runtime
-                            .as_ref()
-                            .map(|runtime| runtime.nntp_sockets(server.id))
-                            .transpose()
-                            .map_err(SchedulerError::Internal)?,
-                        host: server.host.clone(),
-                        port: server.port,
-                        tls: server.tls,
-                        username: server.username.clone(),
-                        password: server.password.clone(),
-                        tls_ca_cert: server.tls_ca_cert.clone(),
-                        tls_name_mismatch_certificate_der: server
-                            .tls_name_mismatch_certificate_der
-                            .clone(),
-                        pipelining: weaver_nntp::PipeliningCapability::Known(
-                            server.supports_pipelining,
-                        ),
-                        pipelining_depth: server.pipelining_depth,
-                        ..Default::default()
-                    },
-                    max_connections: server.connections as usize,
-                    group: server.priority,
-                    backfill: server.backfill,
-                    retention_days: server.retention_days,
-                    stable_id: StableServerId(server.id),
-                    transfer_control: Some(transfer_registry.control(StableServerId(server.id))),
-                })
-            })
-            .collect::<Result<_, _>>()?;
-
-        let total: usize = servers.iter().map(|server| server.max_connections).sum();
-        tracing::info!(
-            active_server_count = servers.len(),
-            total_connections = total,
-            "building NNTP runtime generation"
-        );
-        let client = NntpClient::new(NntpClientConfig {
-            servers,
-            max_idle_age: std::time::Duration::from_mins(5),
-            max_retries_per_server: 1,
-            soft_timeout: std::time::Duration::from_secs(15),
-        });
-        (client, total)
-    };
+    let servers = nntp_server_pool_configs(
+        &configured_servers,
+        proxy_runtime.as_deref(),
+        &transfer_registry,
+        weaver_nntp::connection::NntpBufferProfile::adaptive(
+            memory.cgroup_limit.unwrap_or(memory.available_bytes),
+            configured_servers
+                .iter()
+                .filter(|server| server.active)
+                .map(|server| server.connections as usize)
+                .sum(),
+        ),
+    )
+    .map_err(SchedulerError::Internal)?;
+    let total: usize = servers.iter().map(|server| server.max_connections).sum();
+    tracing::info!(
+        active_server_count = servers.len(),
+        total_connections = total,
+        "building NNTP runtime generation"
+    );
+    let client = nntp_client(servers);
 
     let pool = std::sync::Arc::clone(client.pool());
     let activation = handle.rebuild_nntp(client, total).await?;
@@ -142,11 +172,7 @@ pub async fn reload_runtime_from_db(
         .await
         .map_err(|error| error.to_string())?;
     handle
-        .set_speed_limit(loaded.max_download_speed.unwrap_or(0))
-        .await
-        .map_err(|error| error.to_string())?;
-    handle
-        .set_bandwidth_cap_policy(loaded.isp_bandwidth_cap.clone())
+        .restore_speed_limit(loaded.max_download_speed.unwrap_or(0))
         .await
         .map_err(|error| error.to_string())?;
     if load_global_pause_from_db(db).await? {
@@ -233,7 +259,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
@@ -269,7 +294,6 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
@@ -289,5 +313,356 @@ mod tests {
         assert!(error.to_string().contains("registry unavailable"));
         assert!(cmd_rx.try_recv().is_err());
         assert!(handle.nntp_pool().is_none());
+    }
+    #[tokio::test]
+    async fn scheduled_server_activation_failure_is_retried_not_treated_as_unchanged() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_server(&server(42)).unwrap();
+        let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+        let (commands, _received) = mpsc::channel(1);
+        let (events, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            commands,
+            events,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        let service =
+            crate::servers::service::ServersService::new(db.clone(), config.clone(), handle);
+        // No transfer-policy registry: activation must fail before a new generation,
+        // and the stored row is put back so a restart retries the same change.
+        for _ in 0..2 {
+            assert!(service.set_active(42, false).await.is_err());
+            assert!(db.load_config().unwrap().servers[0].active);
+            assert!(config.read().await.servers[0].active);
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_server_activation_gates_startup_readiness() {
+        use crate::bandwidth::schedule::{ScheduleServices, spawn_evaluator_with_services};
+        let db = Database::open_in_memory().unwrap();
+        let provider = server(42);
+        db.insert_server(&provider).unwrap();
+        let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+        let registry = Arc::new(
+            crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+                db.clone(),
+                &[provider],
+            )
+            .unwrap(),
+        );
+        let (commands, mut received) = mpsc::channel(1);
+        let (events, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            commands,
+            events,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        handle.set_server_transfer_policy(registry);
+        let schedules = Arc::new(RwLock::new(vec![crate::bandwidth::ScheduleEntry {
+            id: "provider-hold".into(),
+            enabled: true,
+            label: String::new(),
+            days: vec![],
+            time: "00:00".into(),
+            times: vec![],
+            every_hour_at_minute: None,
+            action: crate::bandwidth::ScheduleAction::SetServerActive {
+                server_id: 42,
+                active: false,
+            },
+        }]));
+        let (task, mut ready) = spawn_evaluator_with_services(
+            handle.clone(),
+            schedules,
+            ScheduleServices {
+                servers: Some(crate::servers::service::ServersService::new(
+                    db.clone(),
+                    config,
+                    handle,
+                )),
+                db: Some(db),
+                ..Default::default()
+            },
+        );
+        let crate::SchedulerCommand::RebuildNntp { reply, .. } = received.recv().await.unwrap()
+        else {
+            panic!("expected server runtime rebuild");
+        };
+        tokio::select! {
+            biased;
+            _ = &mut ready => panic!("startup became ready before server hold activated"),
+            () = std::future::ready(()) => {}
+        }
+        reply
+            .send(Ok(NntpRuntimeActivation {
+                generation: 1,
+                configured_connections: 0,
+            }))
+            .unwrap();
+        ready.await.unwrap().unwrap();
+        task.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn scheduled_server_activation_persists_and_only_rebuilds_nntp_generations() {
+        let db = Database::open_in_memory().unwrap();
+        let provider = server(42);
+        db.insert_server(&provider).unwrap();
+        let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+        let registry = Arc::new(
+            crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+                db.clone(),
+                std::slice::from_ref(&provider),
+            )
+            .unwrap(),
+        );
+        let (commands, mut received) = mpsc::channel(2);
+        let (events, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            commands,
+            events,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        handle.set_server_transfer_policy(registry);
+        let (generations, mut activations) = mpsc::channel(2);
+        let pipeline = tokio::spawn(async move {
+            let mut generation = 0;
+            while let Some(command) = received.recv().await {
+                match command {
+                    crate::SchedulerCommand::RebuildNntp {
+                        total_connections,
+                        reply,
+                        ..
+                    } => {
+                        generation += 1;
+                        let activation = NntpRuntimeActivation {
+                            generation,
+                            configured_connections: total_connections,
+                        };
+                        generations
+                            .send((generation, total_connections))
+                            .await
+                            .unwrap();
+                        reply.send(Ok(activation)).unwrap();
+                    }
+                    _ => panic!(
+                        "a server toggle must not alter download, speed, profile or quota tracks"
+                    ),
+                }
+            }
+        });
+        let service =
+            crate::servers::service::ServersService::new(db.clone(), config.clone(), handle);
+        service.set_active(42, false).await.unwrap();
+        assert_eq!(activations.recv().await.unwrap(), (1, 0));
+        assert!(!db.load_config().unwrap().servers[0].active);
+        service.set_active(42, true).await.unwrap();
+        assert_eq!(activations.recv().await.unwrap(), (2, 2));
+        assert!(db.load_config().unwrap().servers[0].active);
+        assert!(config.read().await.servers[0].active);
+        service.set_active(42, true).await.unwrap();
+        assert!(
+            activations.try_recv().is_err(),
+            "an unchanged active state must not rebuild"
+        );
+        config.write().await.servers.clear();
+        assert!(service.set_active(42, false).await.is_err());
+        assert!(
+            db.load_config().unwrap().servers[0].active,
+            "missing runtime entry must not mutate persistence"
+        );
+        assert!(service.set_active(999, true).await.is_err());
+        drop(service);
+        pipeline.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_provider_speed_limit_is_saved_and_put_in_force() {
+        let db = Database::open_in_memory().unwrap();
+        let provider = server(42);
+        db.insert_server(&provider).unwrap();
+        let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+        let (commands, mut received) = mpsc::channel(2);
+        let (events, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            commands,
+            events,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        handle.set_server_transfer_policy(Arc::new(
+            crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+                db.clone(),
+                &config.read().await.servers,
+            )
+            .unwrap(),
+        ));
+        let (rebuilt, mut rebuilds) = mpsc::channel(2);
+        let pipeline = tokio::spawn(async move {
+            let mut generation = 0;
+            while let Some(command) = received.recv().await {
+                let crate::SchedulerCommand::RebuildNntp {
+                    total_connections,
+                    reply,
+                    ..
+                } = command
+                else {
+                    panic!("a provider speed limit only rebuilds the provider generation");
+                };
+                generation += 1;
+                rebuilt.send(generation).await.unwrap();
+                reply
+                    .send(Ok(NntpRuntimeActivation {
+                        generation,
+                        configured_connections: total_connections,
+                    }))
+                    .unwrap();
+            }
+        });
+        let service =
+            crate::servers::service::ServersService::new(db.clone(), config.clone(), handle);
+        service.set_server_speed_limit(42, 2_000_000).await.unwrap();
+        assert_eq!(rebuilds.recv().await.unwrap(), 1);
+        assert_eq!(
+            db.load_config().unwrap().servers[0].max_download_speed,
+            2_000_000
+        );
+        assert_eq!(config.read().await.servers[0].max_download_speed, 2_000_000);
+        // The same value again changes nothing.
+        service.set_server_speed_limit(42, 2_000_000).await.unwrap();
+        assert!(rebuilds.try_recv().is_err());
+        // 0 removes the limit.
+        service.set_server_speed_limit(42, 0).await.unwrap();
+        assert_eq!(rebuilds.recv().await.unwrap(), 2);
+        assert_eq!(db.load_config().unwrap().servers[0].max_download_speed, 0);
+        assert!(service.set_server_speed_limit(999, 1).await.is_err());
+        drop(service);
+        pipeline.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_egress_speed_limit_whose_reload_fails_is_put_back_and_retried() {
+        fn raw(db: &Database, sql: &'static str) {
+            let store = db.datastore();
+            db.run_sql_blocking(async move {
+                SqlRuntime::run_in_transaction(&store, "egress_speed_fixture", |tx| {
+                    Box::pin(async move {
+                        tx.execute(sql, &[]).await?;
+                        Ok(())
+                    })
+                })
+                .await
+            })
+            .unwrap();
+        }
+        let speed = |db: &Database, id: u32| {
+            db.list_egress_interfaces()
+                .unwrap()
+                .into_iter()
+                .find(|egress| egress.id == id)
+                .unwrap()
+                .max_download_speed
+        };
+
+        let db = Database::open_in_memory().unwrap();
+        let egress = db
+            .create_egress_interface(&crate::proxies::EgressInterface {
+                id: 0,
+                name: "second line".into(),
+                binding: crate::proxies::EgressBinding::SourceAddress {
+                    address: "192.0.2.1".parse().unwrap(),
+                },
+                enabled: true,
+                max_download_speed: 0,
+                download_quota: Default::default(),
+            })
+            .unwrap()
+            .id;
+        let config = Arc::new(RwLock::new(db.load_config().unwrap()));
+        let (commands, _received) = mpsc::channel(2);
+        let (events, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            commands,
+            events,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        handle.set_proxy_runtime(
+            crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
+                .unwrap(),
+        );
+        let service = crate::servers::service::ServersService::new(db.clone(), config, handle);
+
+        // A stored route that cannot be read makes the reload fail.
+        raw(
+            &db,
+            "INSERT INTO proxy_routes (consumer, policy) VALUES ('server:9', 'not a route')",
+        );
+        assert!(service.set_egress_speed_limit(egress, 5_000).await.is_err());
+        assert_eq!(speed(&db, egress), 0);
+
+        raw(&db, "DELETE FROM proxy_routes WHERE consumer = 'server:9'");
+        service.set_egress_speed_limit(egress, 5_000).await.unwrap();
+        assert_eq!(speed(&db, egress), 5_000);
+    }
+
+    #[test]
+    fn deleting_server_removes_only_its_schedules() {
+        use crate::bandwidth::{ScheduleAction, ScheduleEntry, SpeedLimitChange, SpeedTarget};
+        let db = Database::open_in_memory().unwrap();
+        for id in [42, 43] {
+            db.insert_server(&server(id)).unwrap();
+        }
+        let rules: Vec<_> = [42, 43]
+            .into_iter()
+            .map(|server_id| ScheduleEntry {
+                id: format!("provider-{server_id}"),
+                enabled: true,
+                label: String::new(),
+                days: vec![],
+                time: "08:00".into(),
+                times: vec![],
+                every_hour_at_minute: None,
+                action: ScheduleAction::SetServerActive {
+                    server_id,
+                    active: false,
+                },
+            })
+            .collect();
+        let speeds = |limits: &[(SpeedTarget, u64)]| ScheduleEntry {
+            id: "speeds".into(),
+            enabled: true,
+            label: String::new(),
+            days: vec![],
+            time: "09:00".into(),
+            times: vec![],
+            every_hour_at_minute: None,
+            action: ScheduleAction::SpeedLimit {
+                limits: limits
+                    .iter()
+                    .map(|&(target, bytes_per_sec)| SpeedLimitChange {
+                        target,
+                        bytes_per_sec,
+                    })
+                    .collect(),
+            },
+        };
+        let mut saved = rules.clone();
+        saved.push(speeds(&[
+            (SpeedTarget::Global, 1_000),
+            (SpeedTarget::Server(42), 2_000),
+            (SpeedTarget::Server(43), 3_000),
+        ]));
+        db.save_schedules(&saved).unwrap();
+        assert!(db.delete_server(42).unwrap());
+        let mut kept = rules[1..].to_vec();
+        kept.push(speeds(&[
+            (SpeedTarget::Global, 1_000),
+            (SpeedTarget::Server(43), 3_000),
+        ]));
+        assert_eq!(db.list_schedules().unwrap(), kept);
+        db.save_schedules(&rules[1..]).unwrap();
+        assert_eq!(db.load_config().unwrap().servers[0].id, 43);
+        assert!(db.save_schedules(&rules).is_err());
+        assert_eq!(db.list_schedules().unwrap(), rules[1..]);
     }
 }

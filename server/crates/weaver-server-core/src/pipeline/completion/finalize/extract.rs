@@ -1,18 +1,20 @@
 use super::rar::{ArchiveSetRetirement, UnmaterializedArchiveSet};
 use super::*;
 use crate::pipeline::extraction::{BudgetedReader, MemoryPermit, RarExtractionOpenRequest};
+use crate::runtime::hardware_profile::ChaseWidening;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::time::Duration;
 
+mod password_candidates;
+use password_candidates::extract_7z_with_password_candidates;
 pub(in crate::pipeline) mod sequential;
 
-/// The decoder an xz file on disk gets: single-threaded over the whole file,
-/// or block-parallel with the job's memory budget charged for exactly what the
-/// workers will hold.
+// The decoder an xz file on disk gets: single-threaded over the whole file,
+// or block-parallel with the job's memory budget charged for exactly what the
+// workers will hold.
 enum FilesystemXzDecoder<R: std::io::Read + std::io::Seek> {
     Sequential {
         decoder: Box<lzma_turbo::xz::XzReader<R>>,
@@ -33,22 +35,346 @@ impl<R: std::io::Read + std::io::Seek> std::io::Read for FilesystemXzDecoder<R> 
     }
 }
 
-/// Bytes an extracted member buffers before touching the filesystem.
-///
-/// Archive entry readers hand back whatever their decoder produces, and some
-/// of them produce very little: a 7z AES entry yields one cipher block group —
-/// 512 bytes — per read, and `std::io::copy` turns each of those into its own
-/// write. A 158 MB member is then three hundred thousand write calls into the
-/// filesystem. A quarter of a megabyte of buffer removes essentially all of
-/// them, and costs one allocation per member.
+// Bytes an extracted member buffers before touching the filesystem.
+//
+// Archive entry readers hand back whatever their decoder produces, and some
+// of them produce very little: a 7z AES entry yields one cipher block group —
+// 512 bytes — per read, and `std::io::copy` turns each of those into its own
+// write. A 158 MB member is then three hundred thousand write calls into the
+// filesystem. A quarter of a megabyte of buffer removes essentially all of
+// them, and costs one allocation per member.
 const EXTRACT_WRITE_BUFFER_BYTES: usize = 256 * 1024;
 
-/// Wrap an extraction output so a decoder's small reads do not become small
-/// writes. The buffer must be flushed explicitly: `BufWriter` flushes on drop
-/// but has nowhere to report a failure, and a member is only extracted once
-/// its last bytes have actually reached the file.
+// Wrap an extraction output so a decoder's small reads do not become small
+// writes. The buffer must be flushed explicitly: `BufWriter` flushes on drop
+// but has nowhere to report a failure, and a member is only extracted once
+// its last bytes have actually reached the file.
 fn buffered_extraction_output<W: Write>(writer: W) -> std::io::BufWriter<W> {
     std::io::BufWriter::with_capacity(EXTRACT_WRITE_BUFFER_BYTES, writer)
+}
+
+fn read_sevenz_start_header(path: &std::path::Path) -> Option<[u8; 32]> {
+    use std::io::Read;
+    let mut head = [0u8; 32];
+    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    if head[..6] != [b'7', b'z', 0xbc, 0xaf, 0x27, 0x1c] || head[6] != 0 {
+        return None;
+    }
+    let mut crc = weaver_yenc::crc::Crc32::new();
+    crc.update(&head[12..]);
+    (crc.finalize() == u32::from_le_bytes(head[8..12].try_into().unwrap())).then_some(head)
+}
+
+// Resolve completed split candidates on the extraction worker. Inputs remain
+// untouched until the selected archive has passed entry length and CRC checks.
+fn verified_sevenz_part_paths(parts: &[(u32, PathBuf)]) -> Result<Vec<PathBuf>, String> {
+    use std::io::Read;
+    let mut groups = std::collections::BTreeMap::<u32, Vec<&PathBuf>>::new();
+    for (index, path) in parts {
+        groups.entry(*index).or_default().push(path);
+    }
+    let first = groups.get(&0).ok_or("missing 7z part 1")?;
+    let mut valid_heads = Vec::new();
+    for path in first {
+        if let Some(head) = read_sevenz_start_header(path) {
+            valid_heads.push((*path, head));
+        }
+    }
+    if valid_heads.is_empty()
+        && groups.range(1..).any(|(_, paths)| {
+            paths
+                .iter()
+                .any(|path| read_sevenz_start_header(path).is_some())
+        })
+    {
+        // A valid start in a later position contradicts the part ordering;
+        // it is not evidence of corrupt member bytes to refetch or repair.
+        return Err("7z start header belongs to a different part index".into());
+    }
+    let (_, header) = valid_heads
+        .first()
+        .ok_or("7z part 1 has no CRC-valid start header")?;
+    if valid_heads.iter().any(|(_, other)| other != header) {
+        return Err("ambiguous duplicate 7z start headers".into());
+    }
+    let offset = u64::from_le_bytes(header[12..20].try_into().unwrap());
+    let size = u64::from_le_bytes(header[20..28].try_into().unwrap());
+    let total = 32u64
+        .checked_add(offset)
+        .and_then(|n| n.checked_add(size))
+        .ok_or("7z container length overflow")?;
+    let chunk = valid_heads
+        .iter()
+        .filter_map(|(path, _)| std::fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .filter(|length| *length >= 32 && (*length <= total || groups.len() == 1))
+        .map(|length| length.min(total))
+        .max()
+        .ok_or("7z part 1 has an invalid length")?;
+    let count = total.div_ceil(chunk);
+    if groups.len() as u64 != count || !groups.keys().copied().map(u64::from).eq(0..count) {
+        return Err("missing 7z part or part index past the container end".into());
+    }
+    let mut selected = Vec::new();
+    for (index, paths) in groups {
+        let expected = chunk.min(total - u64::from(index) * chunk);
+        let candidates: Vec<_> = paths
+            .into_iter()
+            .filter(|path| {
+                std::fs::metadata(path).is_ok_and(|meta| {
+                    if meta.len() == expected {
+                        return true;
+                    }
+                    // A PAR3 envelope can follow the final container part.
+                    // Match the direct router's signature rule; arbitrary
+                    // excess bytes and split-volume size mismatches fail.
+                    if u64::from(index) + 1 != count || meta.len() <= expected {
+                        return false;
+                    }
+                    use std::io::{Seek, SeekFrom};
+                    let Ok(mut file) = std::fs::File::open(path) else {
+                        return false;
+                    };
+                    let mut magic = [0u8; 8];
+                    file.seek(SeekFrom::Start(expected)).is_ok()
+                        && file.read_exact(&mut magic).is_ok()
+                        && magic == *par3_rs::MAGIC
+                }) && (index != 0 || valid_heads.iter().any(|(valid, _)| valid == path))
+            })
+            .collect();
+        let chosen = candidates.first().ok_or_else(|| {
+            format!(
+                "7z part {} has no candidate of the required size {expected}",
+                index + 1
+            )
+        })?;
+        for other in candidates.iter().skip(1) {
+            let mut left = std::fs::File::open(chosen).map_err(|e| e.to_string())?;
+            let mut right = std::fs::File::open(other).map_err(|e| e.to_string())?;
+            let mut a = vec![0u8; 64 * 1024];
+            let mut b = vec![0u8; a.len()];
+            let mut remaining = expected;
+            while remaining != 0 {
+                let n = remaining.min(a.len() as u64) as usize;
+                left.read_exact(&mut a[..n]).map_err(|e| e.to_string())?;
+                right.read_exact(&mut b[..n]).map_err(|e| e.to_string())?;
+                if a[..n] != b[..n] {
+                    return Err(format!("ambiguous duplicate 7z part {}", index + 1));
+                }
+                remaining -= n as u64;
+            }
+        }
+        selected.push((*chosen).clone());
+    }
+    Ok(selected)
+}
+
+struct SevenZipParts {
+    paths: Vec<PathBuf>,
+    lengths: Option<Vec<u64>>,
+}
+
+impl SevenZipParts {
+    fn open(&self) -> std::io::Result<crate::pipeline::archive::split_reader::SplitFileReader> {
+        use crate::pipeline::archive::split_reader::SplitFileReader;
+        match &self.lengths {
+            Some(lengths) => SplitFileReader::open_with_lengths(&self.paths, lengths),
+            None => SplitFileReader::open(&self.paths),
+        }
+    }
+}
+
+// A malformed UU line count can expose up to two zero padding bytes. Only
+// sets with a known UU source qualify for this fallback. A completed sibling
+// can survive restart without its transport cache. The start header fixes the total
+// length, and its end-header CRC must identify one unique split geometry before
+// the ordinary extractor verifies every member. Source files remain untouched.
+fn resolve_sevenz_parts(
+    parts: &[(u32, PathBuf)],
+    uu_paths: &HashSet<PathBuf>,
+) -> Result<SevenZipParts, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let original_error = match verified_sevenz_part_paths(parts) {
+        Ok(paths) => {
+            return Ok(SevenZipParts {
+                paths,
+                lengths: None,
+            });
+        }
+        Err(error) => error,
+    };
+    if parts.is_empty()
+        || !parts.iter().any(|(_, path)| uu_paths.contains(path))
+        || !parts
+            .iter()
+            .enumerate()
+            .all(|(index, (part, _))| *part as usize == index)
+    {
+        return Err(original_error);
+    }
+    let Some(header) = read_sevenz_start_header(&parts[0].1) else {
+        return Err(original_error);
+    };
+    let offset = u64::from_le_bytes(header[12..20].try_into().unwrap());
+    let size = u64::from_le_bytes(header[20..28].try_into().unwrap());
+    let Some(start) = 32u64.checked_add(offset) else {
+        return Err(original_error);
+    };
+    let Some(total) = start.checked_add(size) else {
+        return Err(original_error);
+    };
+    let sizes = parts
+        .iter()
+        .map(|(_, path)| {
+            std::fs::metadata(path)
+                .map(|meta| meta.len())
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut selected = None;
+    for padding in 0..=if parts.len() == 1 { 0 } else { 2 } {
+        let Some(chunk) = sizes[0].checked_sub(padding).filter(|chunk| *chunk >= 32) else {
+            continue;
+        };
+        if total.div_ceil(chunk) != parts.len() as u64 {
+            continue;
+        }
+        let lengths: Vec<_> = (0..parts.len())
+            .map(|index| chunk.min(total - index as u64 * chunk))
+            .collect();
+        let valid_tails =
+            parts
+                .iter()
+                .zip(&sizes)
+                .zip(&lengths)
+                .all(|(((_, path), physical), logical)| {
+                    let Some(excess) = physical.checked_sub(*logical).filter(|excess| *excess <= 2)
+                    else {
+                        return false;
+                    };
+                    let Ok(mut file) = std::fs::File::open(path) else {
+                        return false;
+                    };
+                    let mut tail = [0; 2];
+                    file.seek(SeekFrom::Start(*logical)).is_ok()
+                        && file.read_exact(&mut tail[..excess as usize]).is_ok()
+                        && tail == [0; 2]
+                });
+        if !valid_tails {
+            continue;
+        }
+        let candidate = SevenZipParts {
+            paths: parts.iter().map(|(_, path)| path.clone()).collect(),
+            lengths: Some(lengths),
+        };
+        let mut reader = candidate.open().map_err(|error| error.to_string())?;
+        reader
+            .seek(SeekFrom::Start(start))
+            .map_err(|error| error.to_string())?;
+        let mut remaining = size;
+        let mut buffer = [0; 64 * 1024];
+        let mut crc = weaver_yenc::crc::Crc32::new();
+        while remaining != 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            reader
+                .read_exact(&mut buffer[..count])
+                .map_err(|error| error.to_string())?;
+            crc.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+        if crc.finalize() != u32::from_le_bytes(header[28..32].try_into().unwrap()) {
+            continue;
+        }
+        if selected.is_some() {
+            return Err("ambiguous UU 7z part padding".into());
+        }
+        selected = Some(candidate);
+    }
+    selected.ok_or(original_error)
+}
+
+// The sink a 7z member is written on through: it counts and checksums what
+// the decoder hands over, and refuses a byte past the declared size before
+// it reaches the file.
+struct VerifiedMemberSink<'a, W> {
+    entry: &'a sevenz_turbo::ArchiveEntry,
+    writer: &'a mut W,
+    crc: weaver_yenc::crc::Crc32,
+    copied: u64,
+}
+
+impl<W: Write> Write for VerifiedMemberSink<'_, W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let copied = self
+            .copied
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "7z member length overflow")
+            })?;
+        if copied > self.entry.size() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "7z member {} exceeds declared size {}",
+                    self.entry.name(),
+                    self.entry.size()
+                ),
+            ));
+        }
+        self.crc.update(buffer);
+        self.writer.write_all(buffer)?;
+        self.copied = copied;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+// A decoder can reach EOF before its checksum reader reaches the declared
+// length. Verify both facts before committing the member or its counters.
+//
+// The entry writes itself on from the decoder's own output, so the bytes are
+// handed over in the pieces the decoder made them in rather than read into a
+// buffer of this module's first.
+fn copy_verified_7z_member(
+    entry: &sevenz_turbo::ArchiveEntry,
+    reader: &mut dyn sevenz_turbo::EntryRead,
+    writer: &mut impl Write,
+) -> std::io::Result<u64> {
+    let mut sink = VerifiedMemberSink {
+        entry,
+        writer,
+        crc: weaver_yenc::crc::Crc32::new(),
+        copied: 0,
+    };
+    reader.write_rest(&mut sink)?;
+    let VerifiedMemberSink {
+        crc,
+        copied,
+        writer,
+        ..
+    } = sink;
+    if copied != entry.size() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "7z member {} size mismatch: expected {}, produced {copied}",
+                entry.name(),
+                entry.size()
+            ),
+        ));
+    }
+    if entry.has_crc && u64::from(crc.finalize()) != entry.crc {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("7z member {} CRC mismatch", entry.name()),
+        ));
+    }
+    writer.flush()?;
+    Ok(copied)
 }
 
 struct CountingWriter<W> {
@@ -66,13 +392,13 @@ impl<W> CountingWriter<W> {
     }
 }
 
-/// The times a 7z entry recorded, as a stamp for its output.
-///
-/// 7z stores each time behind its own presence bit; an entry written by a
-/// tool that recorded none has no times to restore, and stamping the 1601
-/// epoch on it would be an invention. Only the modification time is required
-/// for a stamp — that is the one every tool records and the one the user
-/// sees; the access time rides along when present.
+// The times a 7z entry recorded, as a stamp for its output.
+//
+// 7z stores each time behind its own presence bit; an entry written by a
+// tool that recorded none has no times to restore, and stamping the 1601
+// epoch on it would be an invention. Only the modification time is required
+// for a stamp — that is the one every tool records and the one the user
+// sees; the access time rides along when present.
 fn sevenz_entry_times(entry: &sevenz_turbo::ArchiveEntry) -> Option<SevenZipEntryTimes> {
     if !entry.has_last_modified_date {
         return None;
@@ -83,8 +409,8 @@ fn sevenz_entry_times(entry: &sevenz_turbo::ArchiveEntry) -> Option<SevenZipEntr
     })
 }
 
-/// The times a 7z entry recorded, kept apart so they can be stamped either
-/// through an open file handle or, for a directory, by name from its root.
+// The times a 7z entry recorded, kept apart so they can be stamped either
+// through an open file handle or, for a directory, by name from its root.
 #[derive(Clone, Copy)]
 struct SevenZipEntryTimes {
     modified: std::time::SystemTime,
@@ -119,11 +445,11 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
-/// Everything the 7z extraction body needs apart from the archive bytes.
-///
-/// Bundled rather than passed loose because the body is now shared: the
-/// conventional path and the direct-unpack chase differ only in the reader they
-/// hand it, and a struct keeps that the single visible difference.
+// Everything the 7z extraction body needs apart from the archive bytes.
+//
+// Bundled rather than passed loose because the body is now shared: the
+// conventional path and the direct-unpack chase differ only in the reader they
+// hand it, and a struct keeps that the single visible difference.
 pub(in crate::pipeline) struct SevenZipExtractionContext {
     pub(in crate::pipeline) job_id: JobId,
     pub(in crate::pipeline) set_name: String,
@@ -134,104 +460,114 @@ pub(in crate::pipeline) struct SevenZipExtractionContext {
     pub(in crate::pipeline) event_tx: broadcast::Sender<PipelineEvent>,
     pub(in crate::pipeline) phase_counters: Arc<PhaseCounters>,
     pub(in crate::pipeline) decode_memory: SevenZipDecodeMemory,
-    /// Threads the LZMA2 decoder may use for a block that was written with
-    /// dictionary resets. The conventional path, which has every byte on
-    /// disk, uses this many from the first run. A chase decodes on one thread
-    /// at the download frontier and widens towards this many only while
-    /// complete runs are waiting behind it; see [`SevenZipDecodeThreads`].
+    // Threads the LZMA2 decoder may use for a block that was written with
+    // dictionary resets. The conventional path, which has every byte on
+    // disk, uses this many from the first run. A chase decodes on one thread
+    // at the download frontier and widens towards this many only while
+    // complete runs are waiting behind it; see [`SevenZipDecodeThreads`].
     pub(in crate::pipeline) decode_threads: u32,
 }
 
-/// How [`extract_7z_stream`] reserves decoder memory and threads its decode.
-///
-/// Both callers reserve per pass, sized from the archive itself: the metadata
-/// pass holds only enough for the declared end header, and the decode pass
-/// what the archive's own coder properties say its decoders need. Neither
-/// holds the whole ceiling, because a decode that holds the ceiling holds
-/// every other extraction in the process behind it. They differ in how they
-/// pay for threads. Conventional extraction has every byte on disk and wants
-/// the fastest decode. A direct-unpack chase decodes at download speed and
-/// parks — for the tail before it can list anything, at the frontier between
-/// reads, and on a damage gate for as long as a repair takes — so it holds
-/// nothing for threads it is not using.
+// How [`extract_7z_stream`] reserves decoder memory and threads its decode.
+//
+// Both callers reserve per pass, sized from the archive itself: the metadata
+// pass holds only enough for the declared end header, and the decode pass
+// what the archive's own coder properties say its decoders need. Neither
+// holds the whole ceiling, because a decode that holds the ceiling holds
+// every other extraction in the process behind it. They differ in how they
+// pay for threads. Conventional extraction has every byte on disk and wants
+// the fastest decode. A direct-unpack chase decodes at download speed and
+// parks — for the tail before it can list anything, at the frontier between
+// reads, and on a damage gate for as long as a repair takes — so it holds
+// nothing for threads it is not using.
 pub(in crate::pipeline) enum SevenZipDecodeMemory {
-    /// The conventional path: the decode runs on the context's thread count
-    /// from the first run, and its reservation includes room for every one of
-    /// those threads, waited for up front.
+    // The conventional path: the decode runs on the context's thread count
+    // from the first run, and its reservation includes room for every one of
+    // those threads, waited for up front.
     ReservedForFixedThreads {
-        /// `next_header_size` from the signature header.
+        // `next_header_size` from the signature header.
         end_header_bytes: u64,
-        /// Hardware-profile limit for optional, unmeasured decoder allowance.
+        // Hardware-profile limit for optional, unmeasured decoder allowance.
         allowance_cap: u64,
     },
-    /// The chase: one thread at the download frontier, so output starts
-    /// before the block has finished downloading, and more threads only while
-    /// complete runs have arrived faster than that one thread decodes them.
-    /// The decode pass reserves the decoders alone; each thread past the
-    /// first is paid for when the chase widens onto it, only if the memory is
-    /// free then, and held until the decode ends; see [`WideningRoom`].
+    // The chase: one thread at the download frontier, so output starts
+    // before the block has finished downloading, and more threads only while
+    // complete runs have arrived faster than that one thread decodes them.
+    // The decode pass reserves the decoders alone; each thread past the
+    // first is paid for when the chase widens onto it, only if the memory is
+    // free then, and held until the decode ends; see [`WideningRoom`].
     ReservedPerPass {
-        /// `next_header_size` from the signature header — the end header the
-        /// metadata pass buffers whole, and which the decode pass parses again.
+        // `next_header_size` from the signature header — the end header the
+        // metadata pass buffers whole, and which the decode pass parses again.
         end_header_bytes: u64,
+        // How the chase widens onto its threads, from the hardware profile in
+        // force when it started.
+        widening: ChaseWidening,
     },
 }
 
-/// What a chase holds over the declared end header while it lists the archive.
-///
-/// The end header itself is bounded against the ceiling before the chase is
-/// admitted. An *encoded* header is a packed stream of its own with a
-/// declared unpacked size the signature header does not carry, so this margin
-/// stands in for that decode. The conventional path reserves what its reader
-/// is limited to instead; see [`fixed_header_pass_memory_bytes`].
+// What a chase holds over the declared end header while it lists the archive.
+//
+// The end header itself is bounded against the ceiling before the chase is
+// admitted. An *encoded* header is a packed stream of its own with a
+// declared unpacked size the signature header does not carry, so this margin
+// stands in for that decode. The conventional path reserves what its reader
+// is limited to instead; see [`fixed_header_pass_memory_bytes`].
 pub(in crate::pipeline) const CHASE_HEADER_PASS_ALLOWANCE_BYTES: u64 = 16 * 1024 * 1024;
-/// The largest header a conventional listing lets an encoded header decode
-/// to, which is also the reader's own default.
+// The largest header a conventional listing lets an encoded header decode
+// to, which is also the reader's own default.
 const HEADER_PASS_UNPACKED_BYTES: u64 = 64 * 1024 * 1024;
-/// The decoder memory a conventional listing allows each of an encoded
-/// header's coders before it lists the archive again under the ceiling. The
-/// reader holds an LZMA dictionary to the size of what it decodes, so this
-/// covers the dictionary of the largest header the listing accepts and the
-/// decoder's state; only a coder that declares its memory some other way
-/// needs more. The reader checks each coder against it alone, so a header
-/// that chains several sized coders can hold more than the listing reserved.
+// The decoder memory a conventional listing allows each of an encoded
+// header's coders before it lists the archive again under the ceiling. The
+// reader holds an LZMA dictionary to the size of what it decodes, so this
+// covers the dictionary of the largest header the listing accepts and the
+// decoder's state; only a coder that declares its memory some other way
+// needs more. The reader checks each coder against it alone, so a header
+// that chains several sized coders can hold more than the listing reserved.
 const HEADER_PASS_DECODER_BYTES: u64 = 80 * 1024 * 1024;
-/// Everything the chase's decode pass holds beyond the decoders and the end
-/// header: the gated reader's buffer, a member's output writer, the CRC
-/// readers around each block.
+// Everything the chase's decode pass holds beyond the decoders and the end
+// header: the gated reader's buffer, a member's output writer, the CRC
+// readers around each block.
 pub(in crate::pipeline) const CHASE_DECODE_ALLOWANCE_BYTES: u64 = 8 * 1024 * 1024;
-/// What a decode reserves per thread past the first, over the decoders.
-///
-/// A widened decode holds whole runs: the packed input of the runs waiting
-/// and being decoded, and their decoded output until it has been written.
-/// A multi-threaded 7z encoder writes runs of 128 MiB decoded, so this is one
-/// run in and one run out per thread. A conventional decode reserves this for
-/// all its threads up front; a chase reserves it one thread at a time as it
-/// widens.
+// What a decode reserves per thread past the first, over the decoders.
+//
+// A widened decode holds whole runs: the packed input of the runs waiting
+// and being decoded, and their decoded output until it has been written.
+// A multi-threaded 7z encoder writes runs of 128 MiB decoded, so this is one
+// run in and one run out per thread. A conventional decode reserves this for
+// all its threads up front; a chase reserves it one thread at a time as it
+// widens.
 pub(in crate::pipeline) const CHASE_WIDENING_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
-/// How often a chase looks at its decoder's backlog to decide its threads.
-///
-/// A run is at least a dictionary's worth of decoded bytes, so at download
-/// speed runs arrive tenths of a second apart at the fastest; looking more
-/// often than this would find the same backlog.
-const CHASE_WIDEN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Threads a chase's LZMA2 decoder should use with `pending_runs` complete
-/// runs waiting behind the one being decoded, under `ceiling`.
-///
-/// One thread while nothing waits: the decoder is at the frontier, and a
-/// second thread would only idle. One more per waiting run, so a backlog is
-/// cleared as fast as the ceiling allows and the count falls back to one as
-/// soon as it is gone.
-pub(in crate::pipeline) fn chase_decode_thread_target(pending_runs: usize, ceiling: u32) -> u32 {
+// Threads a chase's LZMA2 decoder should use with `pending_runs` complete
+// runs waiting behind the one being decoded, under `ceiling`.
+//
+// One thread while nothing waits: the decoder is at the frontier, and a
+// second thread would only idle. With a backlog, either one more per waiting
+// run, so a backlog is cleared as fast as the ceiling allows and the count
+// falls back to one as soon as it is gone, or, `all_at_once`, the whole
+// ceiling: the wide profile's way, which clears the backlog in the fewest
+// polls at the price of taking every thread's memory on the first one.
+pub(in crate::pipeline) fn chase_decode_thread_target(
+    pending_runs: usize,
+    ceiling: u32,
+    all_at_once: bool,
+) -> u32 {
+    let ceiling = ceiling.max(1);
+    if pending_runs == 0 {
+        return 1;
+    }
+    if all_at_once {
+        return ceiling;
+    }
     u32::try_from(pending_runs)
         .unwrap_or(u32::MAX)
         .saturating_add(1)
-        .clamp(1, ceiling.max(1))
+        .clamp(1, ceiling)
 }
 
-/// Room for a decode on `decode_threads` threads over its decoders. Nothing
-/// for one thread, which holds no runs beyond the one it decodes.
+// Room for a decode on `decode_threads` threads over its decoders. Nothing
+// for one thread, which holds no runs beyond the one it decodes.
 fn chase_widening_bytes(decode_threads: u32) -> u64 {
     if decode_threads <= 1 {
         return 0;
@@ -239,18 +575,18 @@ fn chase_widening_bytes(decode_threads: u32) -> u64 {
     u64::from(decode_threads).saturating_mul(CHASE_WIDENING_BYTES_PER_THREAD)
 }
 
-/// Bytes a 7z extraction reserves while it lists the archive, never more
-/// than the ceiling: an end header past it is refused by the reader.
+// Bytes a 7z extraction reserves while it lists the archive, never more
+// than the ceiling: an end header past it is refused by the reader.
 fn chase_header_pass_memory_bytes(end_header_bytes: u64, ceiling: u64) -> u64 {
     end_header_bytes
         .saturating_add(CHASE_HEADER_PASS_ALLOWANCE_BYTES)
         .min(ceiling)
 }
 
-/// Bytes a conventional 7z extraction reserves while it lists the archive:
-/// everything [`header_pass_archive_limits`] lets the reader allocate for the
-/// header, and the margin a chase holds for the parsed entry table. Never
-/// more than the ceiling.
+// Bytes a conventional 7z extraction reserves while it lists the archive:
+// everything [`header_pass_archive_limits`] lets the reader allocate for the
+// header, and the margin a chase holds for the parsed entry table. Never
+// more than the ceiling.
 fn fixed_header_pass_memory_bytes(end_header_bytes: u64, ceiling: u64) -> u64 {
     end_header_bytes
         .saturating_add(HEADER_PASS_UNPACKED_BYTES)
@@ -259,9 +595,9 @@ fn fixed_header_pass_memory_bytes(end_header_bytes: u64, ceiling: u64) -> u64 {
         .min(ceiling)
 }
 
-/// `next_header_size` from the signature header at the start of a 7z set's
-/// first part, for sizing its metadata pass. Zero when it cannot be read; the
-/// reader then reports the archive's own failure when it opens it.
+// `next_header_size` from the signature header at the start of a 7z set's
+// first part, for sizing its metadata pass. Zero when it cannot be read; the
+// reader then reports the archive's own failure when it opens it.
 fn sevenz_declared_end_header_bytes(first_part: &Path) -> u64 {
     use std::io::Read;
 
@@ -274,19 +610,19 @@ fn sevenz_declared_end_header_bytes(first_part: &Path) -> u64 {
         .map_or(0, |header| header.next_header_size)
 }
 
-/// What the 7z reader may allocate on the strength of an archive's own
-/// header, expressed as the job's extraction limits.
-///
-/// Every number in a 7z header is written by whoever made the archive: the
-/// end header's size, an encoded header's unpacked size, the entry and coder
-/// counts, each block's dictionary. The reader refuses an archive that
-/// exceeds these *before* it allocates for it, which is the only time a
-/// bound on an allocation means anything. The memory limit is the job's
-/// decoder ceiling, so a dictionary the operator's ceiling cannot hold is
-/// refused rather than allocated under a permit that pretends otherwise; it
-/// also bounds what a parallel decode keeps in flight. Entry paths are left
-/// to the extraction root, which checks each one against the directory it
-/// actually extracts into and words the rejection itself.
+// What the 7z reader may allocate on the strength of an archive's own
+// header, expressed as the job's extraction limits.
+//
+// Every number in a 7z header is written by whoever made the archive: the
+// end header's size, an encoded header's unpacked size, the entry and coder
+// counts, each block's dictionary. The reader refuses an archive that
+// exceeds these *before* it allocates for it, which is the only time a
+// bound on an allocation means anything. The memory limit is the job's
+// decoder ceiling, so a dictionary the operator's ceiling cannot hold is
+// refused rather than allocated under a permit that pretends otherwise; it
+// also bounds what a parallel decode keeps in flight. Entry paths are left
+// to the extraction root, which checks each one against the directory it
+// actually extracts into and words the rejection itself.
 fn sevenz_archive_limits(budget: &JobExtractionBudget) -> sevenz_turbo::ArchiveLimits {
     sevenz_turbo::ArchiveLimits {
         memory_limit_bytes: budget.max_memory_bytes(),
@@ -298,11 +634,11 @@ fn sevenz_archive_limits(budget: &JobExtractionBudget) -> sevenz_turbo::ArchiveL
     }
 }
 
-/// The limits a conventional listing reads the archive under: the job's,
-/// with an encoded header's coders and decoded size held to what the listing
-/// was granted of [`fixed_header_pass_memory_bytes`]. A grant that other
-/// jobs' retained state shrank divides what is left over the end header and
-/// the entry table between the two in the proportion of the full amounts.
+// The limits a conventional listing reads the archive under: the job's,
+// with an encoded header's coders and decoded size held to what the listing
+// was granted of [`fixed_header_pass_memory_bytes`]. A grant that other
+// jobs' retained state shrank divides what is left over the end header and
+// the entry table between the two in the proportion of the full amounts.
 fn header_pass_archive_limits(
     budget: &JobExtractionBudget,
     granted_bytes: u64,
@@ -323,8 +659,8 @@ fn header_pass_archive_limits(
     }
 }
 
-/// Whether `listing` held an encoded header to less than `job` does, so a
-/// header it refused may still be listed under the job's limits.
+// Whether `listing` held an encoded header to less than `job` does, so a
+// header it refused may still be listed under the job's limits.
 fn header_limits_are_lowered(
     listing: &sevenz_turbo::ArchiveLimits,
     job: &sevenz_turbo::ArchiveLimits,
@@ -333,12 +669,12 @@ fn header_limits_are_lowered(
         || listing.max_header_unpacked_bytes < job.max_header_unpacked_bytes
 }
 
-/// Whether listing failed because an encoded header needs more memory than
-/// the listing allowed it, which the ceiling may still admit.
-///
-/// An LZMA coder reports its own shortfall and the reader reports a header
-/// that decodes past its limit. A Zstandard coder is only told its largest
-/// window, so a frame past it fails as the decoder's read error.
+// Whether listing failed because an encoded header needs more memory than
+// the listing allowed it, which the ceiling may still admit.
+//
+// An LZMA coder reports its own shortfall and the reader reports a header
+// that decodes past its limit. A Zstandard coder is only told its largest
+// window, so a frame past it fails as the decoder's read error.
 fn header_exceeded_listing_memory(error: &sevenz_turbo::Error) -> bool {
     match error {
         sevenz_turbo::Error::MaxMemLimited { .. } => true,
@@ -349,8 +685,8 @@ fn header_exceeded_listing_memory(error: &sevenz_turbo::Error) -> bool {
     }
 }
 
-/// Refuse an archive whose decoders cannot run under `limits`, as
-/// [`sevenz_turbo::ArchiveReader::with_limits`] does when it opens one.
+// Refuse an archive whose decoders cannot run under `limits`, as
+// [`sevenz_turbo::ArchiveReader::with_limits`] does when it opens one.
 fn check_sevenz_decoder_memory(
     archive: &sevenz_turbo::Archive,
     limits: &sevenz_turbo::ArchiveLimits,
@@ -369,19 +705,19 @@ fn check_sevenz_decoder_memory(
     }
 }
 
-/// List a 7z archive for the metadata pass, under a permit for what the
-/// listing may allocate.
-///
-/// A chase holds a header-sized permit: on its gated reader the listing parks
-/// until the archive's tail arrives, and a park must not sit under the
-/// ceiling. The conventional reader never parks. It reserves what its reader
-/// is limited to for the header, less whatever other jobs' retained state
-/// leaves no room for, and only when an encoded header needs more than it was
-/// granted does it list again admitted up to the ceiling, which is what that
-/// decode may allocate under the job's limits. Reserving the ceiling for
-/// every listing made each one wait for every decoder in the process to
-/// finish; reserving the full amount exactly made it wait for retained state
-/// that is released only when its job ends.
+// List a 7z archive for the metadata pass, under a permit for what the
+// listing may allocate.
+//
+// A chase holds a header-sized permit: on its gated reader the listing parks
+// until the archive's tail arrives, and a park must not sit under the
+// ceiling. The conventional reader never parks. It reserves what its reader
+// is limited to for the header, less whatever other jobs' retained state
+// leaves no room for, and only when an encoded header needs more than it was
+// granted does it list again admitted up to the ceiling, which is what that
+// decode may allocate under the job's limits. Reserving the ceiling for
+// every listing made each one wait for every decoder in the process to
+// finish; reserving the full amount exactly made it wait for retained state
+// that is released only when its job ends.
 fn read_sevenz_archive_for_listing<R, F>(
     decode_memory: &SevenZipDecodeMemory,
     end_header_bytes: u64,
@@ -439,24 +775,24 @@ where
     };
     let archive = archive
         .and_then(|archive| check_sevenz_decoder_memory(&archive, &job_limits).map(|()| archive))
-        .map_err(|e| format!("failed to read 7z archive: {e}"))?;
+        .map_err(|e| sevenz_extraction_error(&e))?;
     Ok((archive, permit))
 }
 
-/// What a 7z decode pass reserves.
+// What a 7z decode pass reserves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SevenZipDecodeReservation {
-    /// Measured from the archive and within the ceiling: exactly these bytes,
-    /// waited for until they fit.
+    // Measured from the archive and within the ceiling: exactly these bytes,
+    // waited for until they fit.
     Measured(u64),
-    /// Not measurable within the ceiling: whatever fits beside the process's
-    /// retained state up to the ceiling, never less than `floor`. See
-    /// [`JobExtractionBudget::reserve_memory_up_to_ceiling_wait`].
+    // Not measurable within the ceiling: whatever fits beside the process's
+    // retained state up to the ceiling, never less than `floor`. See
+    // [`JobExtractionBudget::reserve_memory_up_to_ceiling_wait`].
     UpToCeiling { floor: u64 },
 }
 
 impl SevenZipDecodeReservation {
-    /// Reserve it. The permit's bytes are what the decoder may hold.
+    // Reserve it. The permit's bytes are what the decoder may hold.
     fn reserve(self, budget: &Arc<JobExtractionBudget>) -> Result<MemoryPermit, String> {
         match self {
             Self::Measured(bytes) => budget.reserve_memory_wait(bytes),
@@ -478,9 +814,9 @@ impl SevenZipDecodeReservation {
     }
 }
 
-/// Bytes a chase reserves for its decode pass: its decoders, its end header
-/// and the decode allowance. Nothing for widening, which the chase reserves a
-/// thread at a time when it widens; see [`WideningRoom`].
+// Bytes a chase reserves for its decode pass: its decoders, its end header
+// and the decode allowance. Nothing for widening, which the chase reserves a
+// thread at a time when it widens; see [`WideningRoom`].
 fn chase_decode_memory_bytes(
     job_id: JobId,
     set_name: &str,
@@ -491,9 +827,9 @@ fn chase_decode_memory_bytes(
     sevenz_decode_memory_bytes(job_id, set_name, archive, end_header_bytes, 0, ceiling)
 }
 
-/// Bytes a conventional 7z extraction reserves for its decode pass on
-/// `decode_threads` threads: what a chase reserves, plus room for every
-/// thread past the first.
+// Bytes a conventional 7z extraction reserves for its decode pass on
+// `decode_threads` threads: what a chase reserves, plus room for every
+// thread past the first.
 fn fixed_decode_memory_bytes(
     job_id: JobId,
     set_name: &str,
@@ -512,17 +848,17 @@ fn fixed_decode_memory_bytes(
     )
 }
 
-/// Bytes a 7z decode pass reserves, from what the archive declares and the
-/// `widening_bytes` its threads need beyond the decoders.
-///
-/// Never more than the ceiling: a dictionary past the ceiling is refused by
-/// the reader, which is handed what was granted as its limit. A reservation
-/// that would reach the ceiling is taken up to it rather than for it: a
-/// request for the whole ceiling would wait until no other job in the process
-/// held any retained state. An archive with a coder this cannot size does
-/// that, and says so. The widening room is the first thing trimmed when the
-/// ceiling is near: the decoders are what the decode cannot do without, and
-/// stay the floor of what it is granted; the room is what makes it faster.
+// Bytes a 7z decode pass reserves, from what the archive declares and the
+// `widening_bytes` its threads need beyond the decoders.
+//
+// Never more than the ceiling: a dictionary past the ceiling is refused by
+// the reader, which is handed what was granted as its limit. A reservation
+// that would reach the ceiling is taken up to it rather than for it: a
+// request for the whole ceiling would wait until no other job in the process
+// held any retained state. An archive with a coder this cannot size does
+// that, and says so. The widening room is the first thing trimmed when the
+// ceiling is near: the decoders are what the decode cannot do without, and
+// stay the floor of what it is granted; the room is what makes it faster.
 fn sevenz_decode_memory_bytes(
     job_id: JobId,
     set_name: &str,
@@ -591,45 +927,45 @@ fn sevenz_decode_memory_bytes(
     SevenZipDecodeReservation::Measured(wanted)
 }
 
-/// How the LZMA2 decoder of a 7z decode pass is threaded.
+// How the LZMA2 decoder of a 7z decode pass is threaded.
 pub(in crate::pipeline) enum SevenZipDecodeThreads {
-    /// This many threads from the first run: the conventional path, whose
-    /// input is all on disk.
+    // This many threads from the first run: the conventional path, whose
+    // input is all on disk.
     Fixed(u32),
-    /// One thread at the download frontier, widened towards `ceiling` while
-    /// complete runs wait behind it and narrowed again when they are gone:
-    /// the chase.
-    ///
-    /// The parallel decoder buffers a whole run before decoding any of it,
-    /// so a chase that started wide would emit nothing until the first run
-    /// had downloaded; one that stays narrow leaves a backlog for the
-    /// conventional pass to finish after the download. Widening on backlog is
-    /// the third way: the frontier is chased on one thread, and the runs that
-    /// arrived while that thread was busy are decoded beside it.
-    ///
-    /// Each thread past the first is paid for from `budget` when the decode
-    /// widens onto it, and only if that memory is free then; see
-    /// [`WideningRoom`].
+    // One thread at the download frontier, widened towards `ceiling` while
+    // complete runs wait behind it and narrowed again when they are gone:
+    // the chase.
+    //
+    // The parallel decoder buffers a whole run before decoding any of it,
+    // so a chase that started wide would emit nothing until the first run
+    // had downloaded; one that stays narrow leaves a backlog for the
+    // conventional pass to finish after the download. Widening on backlog is
+    // the third way: the frontier is chased on one thread, and the runs that
+    // arrived while that thread was busy are decoded beside it.
+    //
+    // Each thread past the first is paid for from `budget` when the decode
+    // widens onto it, and only if that memory is free then; see
+    // [`WideningRoom`].
     Adaptive {
         ceiling: u32,
-        /// How often the backlog is looked at.
-        poll: Duration,
+        // How often the backlog is looked at, and how far one look widens.
+        widening: ChaseWidening,
         budget: Arc<JobExtractionBudget>,
     },
 }
 
-/// The widening room an adaptive decode holds: one permit per thread past the
-/// first that it has ever widened onto, kept until the decode ends.
-///
-/// Room is taken without waiting and without registering as a waiter. A chase
-/// that waited for room would hold its decoders while it did, and one that
-/// registered would make every other parked chase yield to what is only a
-/// speed-up. So a chase widens as far as free memory allows at the moment the
-/// backlog appears, and no further.
+// The widening room an adaptive decode holds: one permit per thread past the
+// first that it has ever widened onto, kept until the decode ends.
+//
+// Room is taken without waiting and without registering as a waiter. A chase
+// that waited for room would hold its decoders while it did, and one that
+// registered would make every other parked chase yield to what is only a
+// speed-up. So a chase widens as far as free memory allows at the moment the
+// backlog appears, and no further.
 struct WideningRoom {
     budget: Arc<JobExtractionBudget>,
     held: Vec<MemoryPermit>,
-    /// Threads the decoder is set to, never more than the room paid for.
+    // Threads the decoder is set to, never more than the room paid for.
     threads: u32,
 }
 
@@ -642,23 +978,23 @@ impl WideningRoom {
         }
     }
 
-    /// Threads the decode is set to.
+    // Threads the decode is set to.
     #[cfg(test)]
     fn threads(&self) -> u32 {
         self.threads
     }
 
-    /// Threads the held room pays for.
+    // Threads the held room pays for.
     fn paid(&self) -> u32 {
         u32::try_from(self.held.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1)
     }
 
-    /// Widen to up to `target` threads, reusing room already held before
-    /// taking more a thread at a time, and stopping at the first thread there
-    /// is no room for. Returns the threads the decode is now set to, which is
-    /// never more than `target` unless it already was.
+    // Widen to up to `target` threads, reusing room already held before
+    // taking more a thread at a time, and stopping at the first thread there
+    // is no room for. Returns the threads the decode is now set to, which is
+    // never more than `target` unless it already was.
     fn widen_to(&mut self, target: u32) -> u32 {
         while self.paid() < target {
             match self
@@ -673,34 +1009,34 @@ impl WideningRoom {
         self.threads
     }
 
-    /// Set the decode to `threads`, keeping the room for every thread it
-    /// narrows off.
-    ///
-    /// The decoder applies a narrower count only at its next run boundary,
-    /// nothing it reports says when it has, and its spawned workers outlive a
-    /// narrowing with their runs still in hand. Room given back here could be
-    /// reserved by another extraction while those workers still hold it, so
-    /// the process ceiling would no longer bound them. The room goes back when
-    /// the decode ends, and a later widening reuses it.
+    // Set the decode to `threads`, keeping the room for every thread it
+    // narrows off.
+    //
+    // The decoder applies a narrower count only at its next run boundary,
+    // nothing it reports says when it has, and its spawned workers outlive a
+    // narrowing with their runs still in hand. Room given back here could be
+    // reserved by another extraction while those workers still hold it, so
+    // the process ceiling would no longer bound them. The room goes back when
+    // the decode ends, and a later widening reuses it.
     fn narrow_to(&mut self, threads: u32) {
         self.threads = threads.clamp(1, self.paid());
     }
 }
 
-/// What a decode pass reports about how it ran.
+// What a decode pass reports about how it ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::pipeline) struct SevenZipDecodeReport {
-    /// The most threads the LZMA2 decoder was set to. One for a fixed
-    /// single-threaded decode and for a chase that never found a backlog.
+    // The most threads the LZMA2 decoder was set to. One for a fixed
+    // single-threaded decode and for a chase that never found a backlog.
     pub(in crate::pipeline) widest_threads: u32,
 }
 
-/// Test seam: what an adaptive governor has actually seen.
-///
-/// The governor runs beside the decode, so whether it looks at the backlog
-/// before the decode ends is a question of scheduling. A test that wants to
-/// assert what the governor decided waits here until it has seen the backlog,
-/// instead of racing it; nothing in a release build observes this.
+// Test seam: what an adaptive governor has actually seen.
+//
+// The governor runs beside the decode, so whether it looks at the backlog
+// before the decode ends is a question of scheduling. A test that wants to
+// assert what the governor decided waits here until it has seen the backlog,
+// instead of racing it; nothing in a release build observes this.
 #[cfg(test)]
 pub(in crate::pipeline) mod adaptive_probe {
     use std::collections::HashMap;
@@ -713,16 +1049,16 @@ pub(in crate::pipeline) mod adaptive_probe {
         SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Start watching one job's governor, discarding anything a previous
-    /// decode of the same job left behind.
+    // Start watching one job's governor, discarding anything a previous
+    // decode of the same job left behind.
     pub(in crate::pipeline) fn watch(job_id: u64) {
         seen()
             .get_or_insert_with(HashMap::new)
             .insert(job_id, false);
     }
 
-    /// Block until this job's governor has read a backlog behind the decode.
-    /// What it then did about it is the caller's assertion, not this wait.
+    // Block until this job's governor has read a backlog behind the decode.
+    // What it then did about it is the caller's assertion, not this wait.
     pub(in crate::pipeline) fn wait_for_backlog(job_id: u64) {
         let mut guard = seen();
         loop {
@@ -740,7 +1076,7 @@ pub(in crate::pipeline) mod adaptive_probe {
         }
     }
 
-    /// Stop watching, so a job id can be reused and nothing is retained.
+    // Stop watching, so a job id can be reused and nothing is retained.
     pub(in crate::pipeline) fn forget(job_id: u64) {
         if let Some(jobs) = seen().as_mut() {
             jobs.remove(&job_id);
@@ -769,46 +1105,54 @@ fn note_adaptive_backlog(job_id: JobId, pending_runs: usize) {
 #[cfg(not(test))]
 fn note_adaptive_backlog(_job_id: JobId, _pending_runs: usize) {}
 
-/// The decode pass: the library helper's entry walk, opened under the job's
-/// limits and threaded as `threads` says.
-///
-/// `extract_fn` receives the output directory where the helper would pass a
-/// per-entry destination; the shared extraction body validates every entry
-/// path through the extraction root and never reads that argument.
-///
-/// An adaptive decode is governed from a thread of its own, because the
-/// decoding thread is inside the entry walk — parked on the gated reader, or
-/// writing a member — and cannot look at its own backlog. The governor reads
-/// the decoder's progress at each poll and sets the thread count the backlog
-/// calls for; the decoder applies it at its next run boundary. It is scoped
-/// to the walk, so it is gone before this returns, whatever the walk's
-/// outcome.
+// The decode pass: the library helper's entry walk, opened under the job's
+// limits and threaded as `threads` says.
+//
+// `extract_fn` receives the output directory where the helper would pass a
+// per-entry destination; the shared extraction body validates every entry
+// path through the extraction root and never reads that argument.
+//
+// An adaptive decode is governed from a thread of its own, because the
+// decoding thread is inside the entry walk — parked on the gated reader, or
+// writing a member — and cannot look at its own backlog. The governor reads
+// the decoder's progress at each poll and sets the thread count the backlog
+// calls for; the decoder applies it at its next run boundary. It is scoped
+// to the walk, so it is gone before this returns, whatever the walk's
+// outcome.
 #[allow(clippy::too_many_arguments)]
-fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
+fn decode_7z_streaming<R: std::io::Read + std::io::Seek + Send + 'static>(
     job_id: JobId,
     set_name: &str,
     reader: R,
+    positional: Option<R>,
     output_dir: &Path,
     password: sevenz_turbo::Password,
     limits: sevenz_turbo::ArchiveLimits,
     threads: SevenZipDecodeThreads,
     mut extract_fn: impl FnMut(
         &sevenz_turbo::ArchiveEntry,
-        &mut dyn std::io::Read,
+        &mut dyn sevenz_turbo::EntryRead,
         &PathBuf,
     ) -> Result<bool, sevenz_turbo::Error>,
 ) -> Result<SevenZipDecodeReport, sevenz_turbo::Error> {
     let mut archive_reader = sevenz_turbo::ArchiveReader::with_limits(reader, password, limits)?;
+    // A second handle on the same bytes lets the folders of a non-solid
+    // archive decode on parallel workers, each reading at its own offset.
+    // The reads take turns on the one handle; the decoding does not.
+    if let Some(positional) = positional {
+        archive_reader.set_positional_source(sevenz_turbo::SerialReadAt::new(positional));
+    }
     if !output_dir.exists() {
         std::fs::create_dir_all(output_dir)?;
     }
     let destination = output_dir.to_path_buf();
     let mut walk =
         |archive_reader: &mut sevenz_turbo::ArchiveReader<R>| -> Result<(), sevenz_turbo::Error> {
-            archive_reader.for_each_entries(|entry, reader| extract_fn(entry, reader, &destination))
+            archive_reader
+                .for_each_entries_direct(|entry, reader| extract_fn(entry, reader, &destination))
         };
 
-    let (ceiling, poll, budget) = match threads {
+    let (ceiling, widening, budget) = match threads {
         SevenZipDecodeThreads::Fixed(count) => {
             archive_reader.set_threads(count);
             walk(&mut archive_reader)?;
@@ -818,9 +1162,9 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
         }
         SevenZipDecodeThreads::Adaptive {
             ceiling,
-            poll,
+            widening,
             budget,
-        } => (ceiling.max(1), poll, budget),
+        } => (ceiling.max(1), widening, budget),
     };
 
     archive_reader.set_adaptive_lzma2(ceiling > 1);
@@ -835,12 +1179,16 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
                 let mut room = WideningRoom::new(budget);
                 let mut applied = 1u32;
                 while !finished.load(Ordering::Acquire) {
-                    std::thread::sleep(poll);
+                    std::thread::sleep(widening.poll);
                     let Some(progress) = handle.progress() else {
                         continue;
                     };
                     note_adaptive_backlog(job_id, progress.pending_runs);
-                    let target = chase_decode_thread_target(progress.pending_runs, ceiling);
+                    let target = chase_decode_thread_target(
+                        progress.pending_runs,
+                        ceiling,
+                        widening.all_at_once,
+                    );
                     // Widening is paid for before the decoder is told, and
                     // narrowing keeps its room until the walk ends.
                     let next = if target > applied {
@@ -885,16 +1233,21 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek>(
     Ok(SevenZipDecodeReport { widest_threads })
 }
 
-/// Prefix of a 7z extraction error that says the archive's bytes are wrong: a
-/// block that did not decode, did not match its CRC, or whose read came back
-/// malformed or short. A repair of those bytes can change the answer, so the
-/// scheduler keeps the set for the recovery data to rule on. A method this
-/// build cannot decode, a missing or wrong password, and any other read
-/// failure keep the ordinary wording: no repair changes those.
+// Prefix of a 7z extraction error that says the archive's bytes are wrong: a
+// block that did not decode, did not match its CRC, or whose read came back
+// malformed or short. A repair of those bytes can change the answer, so the
+// scheduler keeps the set for the recovery data to rule on. A method this
+// build cannot decode, a missing or wrong password, and any other read
+// failure keep the ordinary wording: no repair changes those.
 pub(in crate::pipeline) const SEVENZ_BLOCK_DATA_ERROR_PREFIX: &str = "7z block data error: ";
 
 fn sevenz_extraction_error(error: &sevenz_turbo::Error) -> String {
     use sevenz_turbo::BlockErrorKind;
+    if matches!(error, sevenz_turbo::Error::PasswordRequired)
+        || matches!(error, sevenz_turbo::Error::BlockDecode { kind: BlockErrorKind::Password, message, .. } if message == "PasswordRequired")
+    {
+        return "WEAVER_PASSWORD_REQUIRED: the 7z archive requires a valid password".into();
+    }
 
     let bytes_are_wrong = match error {
         sevenz_turbo::Error::BlockDecode {
@@ -918,14 +1271,14 @@ fn sevenz_extraction_error(error: &sevenz_turbo::Error) -> String {
     }
 }
 
-/// The kind of the read failure behind an I/O block error.
-///
-/// The block error carries its cause only as rendered text, the debug form of
-/// the reader's error, and every shape of that form names the kind before
-/// anything else: `Kind(UnexpectedEof)`, or `kind: InvalidData` in the
-/// custom, message and OS shapes. The first kind named is the reader's own,
-/// never one quoted inside its message. Only the two kinds that say the bytes
-/// came back wrong are recognised; anything else is `None` and stays terminal.
+// The kind of the read failure behind an I/O block error.
+//
+// The block error carries its cause only as rendered text, the debug form of
+// the reader's error, and every shape of that form names the kind before
+// anything else: `Kind(UnexpectedEof)`, or `kind: InvalidData` in the
+// custom, message and OS shapes. The first kind named is the reader's own,
+// never one quoted inside its message. Only the two kinds that say the bytes
+// came back wrong are recognised; anything else is `None` and stays terminal.
 fn block_io_error_kind(message: &str) -> Option<std::io::ErrorKind> {
     let start = ["kind: ", "Kind("]
         .iter()
@@ -942,31 +1295,31 @@ fn block_io_error_kind(message: &str) -> Option<std::io::ErrorKind> {
     }
 }
 
-/// Decode one 7z set through `open_reader`, writing members under the context's
-/// extraction root.
-///
-/// # Why a factory and not a reader
-///
-/// The archive is opened twice: once to read the entry table and validate every
-/// member's path and size before a single byte is written, and once to extract.
-/// `ArchiveReader::new` consumes its reader, so the second pass needs a fresh
-/// one. `open_reader` therefore produces a new reader per pass, and owns the
-/// wording of its own open failures — which is what keeps the conventional
-/// path's error strings unchanged.
-///
-/// # What a reader may be
-///
-/// Callers may wrap the archive in a [`std::io::BufReader`], and direct unpack
-/// will: a gated reader returns short reads at the download frontier, and
-/// buffering absorbs those. Nothing here may assume unbuffered access or keep
-/// its own idea of the stream position — position is whatever the reader says
-/// it is, and every seek goes through the reader rather than around it.
+// Decode one 7z set through `open_reader`, writing members under the context's
+// extraction root.
+//
+// # Why a factory and not a reader
+//
+// The archive is opened twice: once to read the entry table and validate every
+// member's path and size before a single byte is written, and once to extract.
+// `ArchiveReader::new` consumes its reader, so the second pass needs a fresh
+// one. `open_reader` therefore produces a new reader per pass, and owns the
+// wording of its own open failures — which is what keeps the conventional
+// path's error strings unchanged.
+//
+// # What a reader may be
+//
+// Callers may wrap the archive in a [`std::io::BufReader`], and direct unpack
+// will: a gated reader returns short reads at the download frontier, and
+// buffering absorbs those. Nothing here may assume unbuffered access or keep
+// its own idea of the stream position — position is whatever the reader says
+// it is, and every seek goes through the reader rather than around it.
 pub(in crate::pipeline) fn extract_7z_stream<R, F>(
     context: &SevenZipExtractionContext,
     mut open_reader: F,
 ) -> Result<FullSetExtractionOutcome, String>
 where
-    R: std::io::Read + std::io::Seek + Send,
+    R: std::io::Read + std::io::Seek + Send + 'static,
     F: FnMut() -> Result<R, String>,
 {
     let SevenZipExtractionContext {
@@ -987,20 +1340,59 @@ where
         SevenZipDecodeMemory::ReservedForFixedThreads {
             end_header_bytes, ..
         }
-        | SevenZipDecodeMemory::ReservedPerPass { end_header_bytes } => *end_header_bytes,
+        | SevenZipDecodeMemory::ReservedPerPass {
+            end_header_bytes, ..
+        } => *end_header_bytes,
     };
 
     // Metadata pass: every member's path and declared size is checked before
     // anything is created on disk.
-    let (known_total, decode_reservation) = {
-        let (archive, _header_permit) = read_sevenz_archive_for_listing(
+    let (known_total, decode_reservation, selected_password) = {
+        let plaintext = read_sevenz_archive_for_listing(
             decode_memory,
             end_header_bytes,
             budget,
-            password,
+            &sevenz_turbo::Password::empty(),
             &|granted| header_pass_archive_limits(budget, granted, end_header_bytes),
             &mut open_reader,
-        )?;
+        );
+        let ((archive, _header_permit), encrypted_headers) = match plaintext {
+            Ok(archive) => (archive, false),
+            Err(error)
+                if error.starts_with("WEAVER_PASSWORD_REQUIRED:") && !password.is_empty() =>
+            {
+                (
+                    read_sevenz_archive_for_listing(
+                        decode_memory,
+                        end_header_bytes,
+                        budget,
+                        password,
+                        &|granted| header_pass_archive_limits(budget, granted, end_header_bytes),
+                        &mut open_reader,
+                    )?,
+                    true,
+                )
+            }
+            Err(error) => return Err(error),
+        };
+        let encrypted = encrypted_headers
+            || archive
+                .blocks
+                .iter()
+                .flat_map(|block| &block.coders)
+                .any(|coder| {
+                    coder.encoder_method_id() == sevenz_turbo::EncoderMethod::ID_AES256_SHA256
+                });
+        let selected_password = if encrypted && !password.is_empty() {
+            let units: Vec<_> = password
+                .as_slice()
+                .chunks_exact(2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .collect();
+            String::from_utf16(&units).ok()
+        } else {
+            None
+        };
         for entry in &archive.files {
             budget.check_member_metadata(entry.name(), entry.size())?;
             root.validate_relative_path(entry.name())
@@ -1040,7 +1432,7 @@ where
                 budget.max_memory_bytes(),
             ),
         };
-        (known_total, decode_reservation)
+        (known_total, decode_reservation, selected_password)
     };
     phase_counters
         .total_bytes
@@ -1068,7 +1460,7 @@ where
     let budget_ref = budget;
 
     let extract_fn = |entry: &sevenz_turbo::ArchiveEntry,
-                      reader: &mut dyn std::io::Read,
+                      reader: &mut dyn sevenz_turbo::EntryRead,
                       _dest: &PathBuf|
      -> Result<bool, sevenz_turbo::Error> {
         let safe_path = root_ref
@@ -1112,8 +1504,7 @@ where
             .map_err(std::io::Error::other)?;
         let attempt = Arc::new(PhaseAttemptCounters::new(Arc::clone(phase_counters)));
         let mut file = buffered_extraction_output(CountingWriter::new(file, Arc::clone(&attempt)));
-        let copied = std::io::copy(reader, &mut file);
-        let copied = copied.and_then(|bytes| file.flush().map(|()| bytes));
+        let copied = copy_verified_7z_member(entry, reader, &mut file);
         let bytes_written = match copied {
             Ok(bytes) => {
                 attempt.commit();
@@ -1162,15 +1553,24 @@ where
 
     let reader = BudgetedReader::new(open_reader()?, Arc::clone(budget));
     let mut limits = sevenz_archive_limits(budget);
+    let mut positional = None;
     let threads = match decode_memory {
         SevenZipDecodeMemory::ReservedForFixedThreads { .. } => {
             // What the decode reserved is what its decoder may hold: the
             // reader keeps a parallel decode's runs in flight within this,
             // and decodes on one thread if it leaves no room to widen.
             limits.memory_limit_bytes = decode_granted;
+            // Every byte is on disk, so the folders of a non-solid archive
+            // can decode on parallel workers reading at their own offsets.
+            // The workers are charged against the same limit. A chase gets
+            // no second handle: it reads at the download frontier, and its
+            // governor widens the one decoder from the backlog it sees.
+            if *decode_threads > 1 {
+                positional = Some(BudgetedReader::new(open_reader()?, Arc::clone(budget)));
+            }
             SevenZipDecodeThreads::Fixed(*decode_threads)
         }
-        SevenZipDecodeMemory::ReservedPerPass { .. } => {
+        SevenZipDecodeMemory::ReservedPerPass { widening, .. } => {
             // The reader's limit is fixed when it opens and cannot follow the
             // room the chase takes as it widens, so it is set to what the
             // chase would hold widened to its ceiling. The thread count is
@@ -1181,7 +1581,7 @@ where
                 .min(budget.max_memory_bytes());
             SevenZipDecodeThreads::Adaptive {
                 ceiling: *decode_threads,
-                poll: CHASE_WIDEN_POLL_INTERVAL,
+                widening: *widening,
                 budget: Arc::clone(budget),
             }
         }
@@ -1190,6 +1590,7 @@ where
         job_id,
         set_name,
         reader,
+        positional,
         output_dir,
         password.clone(),
         limits,
@@ -1214,7 +1615,7 @@ where
     Ok(FullSetExtractionOutcome {
         extracted: extracted_members,
         failed: Vec::new(),
-        selected_password: None,
+        selected_password,
     })
 }
 
@@ -1286,27 +1687,27 @@ fn is_windows_drive_component(value: &str) -> bool {
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
-/// Everything a zstd decoder holds besides the window: the input and output
-/// buffers, the entropy tables, and the literal and sequence workspaces. The
-/// format fixes the block size at 128 KiB and the tables at a few hundred
-/// kilobytes, so a flat couple of megabytes covers any frame with room to
-/// spare, and the window — which is what actually varies, from 1 KiB to over
-/// a gigabyte — is measured.
+// Everything a zstd decoder holds besides the window: the input and output
+// buffers, the entropy tables, and the literal and sequence workspaces. The
+// format fixes the block size at 128 KiB and the tables at a few hundred
+// kilobytes, so a flat couple of megabytes covers any frame with room to
+// spare, and the window — which is what actually varies, from 1 KiB to over
+// a gigabyte — is measured.
 const ZSTD_DECODER_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
 
-/// The longest a frame header can be: magic, descriptor, window descriptor,
-/// dictionary id and frame content size, all at their widest.
+// The longest a frame header can be: magic, descriptor, window descriptor,
+// dictionary id and frame content size, all at their widest.
 const ZSTD_FRAME_HEADER_MAX_BYTES: usize = 4 + 1 + 1 + 4 + 8;
 
-/// Window the decoder of this frame will hold, read from the frame header.
-///
-/// Sizing a zstd reservation from the header rather than from the process
-/// limit is the difference between a reservation that can be granted and one
-/// that can only be granted when nothing else in the process holds a single
-/// byte. The whole-limit request also registers as a waiter, and a waiting
-/// decoder is what makes every running direct unpack yield its own — so one
-/// small archive could evict all of them and then park behind whoever held a
-/// few megabytes.
+// Window the decoder of this frame will hold, read from the frame header.
+//
+// Sizing a zstd reservation from the header rather than from the process
+// limit is the difference between a reservation that can be granted and one
+// that can only be granted when nothing else in the process holds a single
+// byte. The whole-limit request also registers as a waiter, and a waiting
+// decoder is what makes every running direct unpack yield its own — so one
+// small archive could evict all of them and then park behind whoever held a
+// few megabytes.
 fn zstd_frame_window_bytes(header: &[u8]) -> Result<u64, String> {
     const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
     const SKIPPABLE_MASK: u32 = 0xFFFF_FFF0;
@@ -1406,7 +1807,7 @@ fn zstd_frame_window_bytes(header: &[u8]) -> Result<u64, String> {
     }
 }
 
-/// Decoder memory for one zstd file, measured from its first frame header.
+// Decoder memory for one zstd file, measured from its first frame header.
 fn zstd_decoder_memory_bytes(path: &Path, max_memory_bytes: u64) -> Result<u64, String> {
     use std::io::Read;
 
@@ -1434,8 +1835,8 @@ fn zstd_decoder_memory_bytes(path: &Path, max_memory_bytes: u64) -> Result<u64, 
     Ok(needed)
 }
 
-/// Decoder memory for one simple archive, measured from the archive itself
-/// where the format says what the decoder will hold.
+// Decoder memory for one simple archive, measured from the archive itself
+// where the format says what the decoder will hold.
 pub(in crate::pipeline) fn measured_decoder_memory_bytes(
     kind: SimpleArchiveKind,
     path: Option<&Path>,
@@ -1450,15 +1851,15 @@ pub(in crate::pipeline) fn measured_decoder_memory_bytes(
     }
 }
 
-/// The memory the simple-archive task admits before it opens a decoder.
-///
-/// One owner admits a decoder's footprint. `.xz` is opened by
-/// [`open_filesystem_xz_decoder`], which measures what the decoder it actually
-/// builds will hold and reserves that itself; a ceiling-sized permit taken out
-/// here as well would hold the whole job allowance while the inner request
-/// waited for room only this permit could release. `tar.xz` keeps its permit:
-/// its decoder is opened on the sequential path, which reserves nothing of its
-/// own.
+// The memory the simple-archive task admits before it opens a decoder.
+//
+// One owner admits a decoder's footprint. `.xz` is opened by
+// [`open_filesystem_xz_decoder`], which measures what the decoder it actually
+// builds will hold and reserves that itself; a ceiling-sized permit taken out
+// here as well would hold the whole job allowance while the inner request
+// waited for room only this permit could release. `tar.xz` keeps its permit:
+// its decoder is opened on the sequential path, which reserves nothing of its
+// own.
 pub(in crate::pipeline) fn simple_archive_task_memory_permit(
     kind: SimpleArchiveKind,
     path: Option<&Path>,
@@ -1491,18 +1892,18 @@ fn simple_decoder_memory_bytes(kind: SimpleArchiveKind, max_memory_bytes: u64) -
     }
 }
 
-/// How often a chase that is still finishing after the download is mirrored
-/// into the job's Extracting phase.
+// How often a chase that is still finishing after the download is mirrored
+// into the job's Extracting phase.
 const CHASE_MIRROR_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// The chase's bytes as the job's Extracting phase currently shows them.
-///
-/// A chase decodes against counters of its own so the download never shows an
-/// extraction running underneath it. Once every part is in, though, a chase
-/// that is still finishing is the extraction — so its progress is mirrored into
-/// the phase while it is awaited, and withdrawn again unless its members are
-/// installed, leaving a conventional fallback to count from where it would
-/// have started.
+// The chase's bytes as the job's Extracting phase currently shows them.
+//
+// A chase decodes against counters of its own so the download never shows an
+// extraction running underneath it. Once every part is in, though, a chase
+// that is still finishing is the extraction — so its progress is mirrored into
+// the phase while it is awaited, and withdrawn again unless its members are
+// installed, leaving a conventional fallback to count from where it would
+// have started.
 struct ChaseMirror {
     phase: Arc<PhaseCounters>,
     total_bytes: u64,
@@ -1520,9 +1921,9 @@ impl ChaseMirror {
         }
     }
 
-    /// Bring the phase to the chase's current bytes. Completed is read before
-    /// total: the chase reserves a member's total before decoding into it, so
-    /// the mirror never shows more done than there is to do.
+    // Bring the phase to the chase's current bytes. Completed is read before
+    // total: the chase reserves a member's total before decoding into it, so
+    // the mirror never shows more done than there is to do.
     fn sync(&mut self, chase: &PhaseCounters) {
         let completed_bytes = chase.completed_bytes.load(Ordering::Relaxed);
         let total_bytes = chase.total_bytes.load(Ordering::Relaxed);
@@ -1538,7 +1939,7 @@ impl ChaseMirror {
         );
     }
 
-    /// The members were installed: keep their bytes in the phase for good.
+    // The members were installed: keep their bytes in the phase for good.
     fn settle(mut self, total_bytes: u64, completed_bytes: u64) {
         self.show(total_bytes, completed_bytes);
         self.settled = true;
@@ -1774,18 +2175,18 @@ fn extract_zip(
     archive_path: &Path,
     root: &ExtractionRoot,
     budget: &Arc<JobExtractionBudget>,
-    password: Option<&str>,
+    passwords: &[crate::jobs::ArchivePasswordCandidate],
     event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
     job_id: JobId,
     set_name: &str,
     phase_counters: Option<Arc<PhaseCounters>>,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Option<String>), String> {
     let file = std::fs::File::open(archive_path).map_err(|e| format!("failed to open zip: {e}"))?;
-    extract_zip_stream(
+    extract_zip_stream_candidates(
         file,
         root,
         budget,
-        password,
+        passwords,
         event_tx,
         job_id,
         set_name,
@@ -1794,6 +2195,7 @@ fn extract_zip(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(in crate::pipeline) fn extract_zip_stream<R: std::io::Read + std::io::Seek>(
     file: R,
     root: &ExtractionRoot,
@@ -1804,6 +2206,39 @@ pub(in crate::pipeline) fn extract_zip_stream<R: std::io::Read + std::io::Seek>(
     set_name: &str,
     phase_counters: Option<Arc<PhaseCounters>>,
 ) -> Result<Vec<String>, String> {
+    let passwords = password
+        .into_iter()
+        .map(|value| {
+            crate::jobs::ArchivePasswordCandidate::new(
+                crate::jobs::ArchivePasswordSource::Explicit,
+                value.to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    extract_zip_stream_candidates(
+        file,
+        root,
+        budget,
+        &passwords,
+        event_tx,
+        job_id,
+        set_name,
+        phase_counters,
+    )
+    .map(|(members, _)| members)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::pipeline) fn extract_zip_stream_candidates<R: std::io::Read + std::io::Seek>(
+    file: R,
+    root: &ExtractionRoot,
+    budget: &Arc<JobExtractionBudget>,
+    passwords: &[crate::jobs::ArchivePasswordCandidate],
+    event_tx: &tokio::sync::broadcast::Sender<PipelineEvent>,
+    job_id: JobId,
+    set_name: &str,
+    phase_counters: Option<Arc<PhaseCounters>>,
+) -> Result<(Vec<String>, Option<String>), String> {
     let file = BudgetedReader::new(file, Arc::clone(budget));
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| format!("failed to read zip archive: {e}"))?;
@@ -1829,16 +2264,42 @@ pub(in crate::pipeline) fn extract_zip_stream<R: std::io::Read + std::io::Seek>(
             .fetch_add(known_total, Ordering::Relaxed);
     }
 
+    let mut winner: Option<usize> = None;
     for i in 0..archive.len() {
-        let mut entry = if let Some(pw) = password {
-            archive
-                .by_index_decrypt(i, pw.as_bytes())
-                .map_err(|e| format!("failed to read zip entry {i}: {e}"))?
+        let encrypted = archive
+            .by_index_raw(i)
+            .map_err(|error| format!("failed to read zip entry metadata {i}: {error}"))?
+            .encrypted();
+        let selected = if encrypted {
+            let mut selected = None;
+            for index in winner
+                .into_iter()
+                .chain((0..passwords.len()).filter(|index| Some(*index) != winner))
+            {
+                budget
+                    .check_active_io()
+                    .map_err(|error| error.to_string())?;
+                match archive.by_index_decrypt(i, passwords[index].value().as_bytes()) {
+                    Ok(_) => {
+                        selected = Some(index);
+                        break;
+                    }
+                    Err(zip::result::ZipError::InvalidPassword) => continue,
+                    Err(error) => return Err(format!("failed to read zip entry {i}: {error}")),
+                }
+            }
+            Some(selected.ok_or_else(|| {
+                "WEAVER_PASSWORD_REQUIRED: no supplied password could decrypt the ZIP member"
+                    .to_string()
+            })?)
         } else {
-            archive
-                .by_index(i)
-                .map_err(|e| format!("failed to read zip entry {i}: {e}"))?
+            None
         };
+        let mut entry = match selected {
+            Some(index) => archive.by_index_decrypt(i, passwords[index].value().as_bytes()),
+            None => archive.by_index(i),
+        }
+        .map_err(|error| format!("failed to read zip entry {i}: {error}"))?;
         budget.check_member_metadata(entry.name(), entry.size())?;
         let raw_name = entry.name().to_string();
         let safe_path =
@@ -1897,9 +2358,15 @@ pub(in crate::pipeline) fn extract_zip_stream<R: std::io::Read + std::io::Seek>(
         });
         tracing::info!(job_id = job_id.0, member = %name, bytes_written, "zip member extracted");
         extracted.push(name);
+        if selected.is_some() {
+            winner = selected;
+        }
     }
 
-    Ok(extracted)
+    Ok((
+        extracted,
+        winner.map(|index| passwords[index].value().to_string()),
+    ))
 }
 
 fn extract_tar(
@@ -2393,12 +2860,10 @@ impl Pipeline {
     pub(in crate::pipeline) fn blocked_rar_member(
         archive: &unrar_rs::RarArchive,
         policy: &crate::post_processing::model::PostProcessingSettings,
-    ) -> Option<(String, String)> {
+    ) -> Option<String> {
         archive.metadata().members.iter().find_map(|member| {
-            (!member.is_directory)
-                .then(|| policy.unacceptable_extension_match(&member.name))
-                .flatten()
-                .map(|pattern| (member.name.clone(), pattern.to_string()))
+            (!member.is_directory && policy.unacceptable_extension_match(&member.name).is_some())
+                .then(|| member.name.clone())
         })
     }
 
@@ -2465,14 +2930,18 @@ impl Pipeline {
                     self.schedule_job_completion_check(job_id);
                     return Ok(0);
                 }
-                // Something is reading the set; the task below rules on it, as
-                // it did before this guard existed.
-                //
-                // `NotRar` joins it: this whole retirement path reasons in RAR
-                // terms, and a set it cannot describe must not be torn down by
-                // it. Falling through leaves the decision where it was before
-                // the guard existed, which is the conservative direction.
-                ArchiveSetRetirement::Busy | ArchiveSetRetirement::NotRar => {}
+                // The reader or topology refresh re-arms completion when it
+                // finishes. Retiring its tombstone and re-queuing ourselves
+                // here would starve the very result that releases it. No task
+                // starts here, so the entry the caller recorded must go, or
+                // the completion check reads it as an extraction in progress.
+                ArchiveSetRetirement::Busy => {
+                    if let Some(inflight) = self.inflight_extractions.get_mut(&job_id) {
+                        inflight.remove(set_name);
+                    }
+                    return Ok(0);
+                }
+                ArchiveSetRetirement::NotRar => {}
                 ArchiveSetRetirement::StillReferenced => {
                     // A claimed name with no runtime entry of its own is the
                     // shape retirement cannot reach and extraction cannot use:
@@ -2483,6 +2952,18 @@ impl Pipeline {
                     // retirement exit was written to protect.
                     if !self.rar_sets.contains_key(&(job_id, set_name.to_string())) {
                         match self.classify_unmaterialized_archive_set(job_id, set_name) {
+                            UnmaterializedArchiveSet::ReplacedBy(owner) => {
+                                debug!(
+                                    job_id = job_id.0,
+                                    set_name = %set_name,
+                                    owner = %owner,
+                                    "waiting for the verified replacement archive to extract"
+                                );
+                                if let Some(inflight) = self.inflight_extractions.get_mut(&job_id) {
+                                    inflight.remove(set_name);
+                                }
+                                return Ok(0);
+                            }
                             UnmaterializedArchiveSet::ConsumedBy(owner) => {
                                 info!(
                                     job_id = job_id.0,
@@ -2618,10 +3099,10 @@ impl Pipeline {
                         budget: Some(Arc::clone(&budget)),
                     },
                 )?;
-                if let Some((member, pattern)) = Self::blocked_rar_member(&selection.archive, &policy) {
-                    return Err(budget.reject_content_policy(format!(
-                        "unacceptable extension '{pattern}' matched RAR member '{member}' before extraction"
-                    )));
+                if let Some(member) = Self::blocked_rar_member(&selection.archive, &policy) {
+                    return Err(budget.reject_content_policy(
+                        crate::post_processing::model::unwanted_extension_reason(&member),
+                    ));
                 }
                 let _memory_permit =
                     budget.reserve_memory_wait(selection.decoder_memory_bytes)?;
@@ -2722,9 +3203,9 @@ impl Pipeline {
         Ok(0)
     }
 
-    /// Spawn extraction for a list of archives, tracking each in `inflight_extractions`.
-    /// Dispatches to the correct extractor based on archive type. Returns the number
-    /// of extractions successfully spawned.
+    // Spawn extraction for a list of archives, tracking each in `inflight_extractions`.
+    // Dispatches to the correct extractor based on archive type. Returns the number
+    // of extractions successfully spawned.
     pub(super) async fn spawn_extractions(
         &mut self,
         job_id: JobId,
@@ -2811,18 +3292,35 @@ impl Pipeline {
         spawned
     }
 
-    /// The part files of a 7z set, in archive order.
-    ///
-    /// Ordered by the topology's volume map, which is what makes the
-    /// concatenation of these files the archive stream. Direct unpack needs the
-    /// identical list in the identical order — it reads the same bytes through
-    /// a gated view — so the ordering lives here rather than being rebuilt at
-    /// each call site.
+    // The part files of a 7z set, in archive order.
+    //
+    // Ordered by the topology's volume map, which is what makes the
+    // concatenation of these files the archive stream. Direct unpack needs the
+    // identical list in the identical order — it reads the same bytes through
+    // a gated view — so the ordering lives here rather than being rebuilt at
+    // each call site.
     pub(in crate::pipeline) fn archive_set_part_paths(
         &self,
         job_id: JobId,
         set_name: &str,
     ) -> Result<Vec<PathBuf>, String> {
+        let parts = self.archive_set_indexed_part_paths(job_id, set_name)?;
+        if parts.first().is_some_and(|(index, _)| *index != 0) {
+            return Err(format!("missing first archive part in '{set_name}'"));
+        }
+        if parts.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(format!(
+                "duplicate archive part in '{set_name}' requires verification"
+            ));
+        }
+        Ok(parts.into_iter().map(|(_, path)| path).collect())
+    }
+
+    fn archive_set_indexed_part_paths(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<Vec<(u32, PathBuf)>, String> {
         let state = self
             .jobs
             .get(&job_id)
@@ -2862,18 +3360,34 @@ impl Pipeline {
                 parts.push((*vol, path));
             }
         }
-        parts.sort_by_key(|(n, _)| *n);
-        Ok(parts.into_iter().map(|(_, p)| p).collect())
+        parts.sort();
+        Ok(parts)
     }
 
-    /// Extract a single 7z archive set. Only collects files belonging to the named set.
+    // Extract a single 7z archive set. Only collects files belonging to the named set.
     pub(crate) async fn extract_7z_set(
         &mut self,
         job_id: JobId,
         set_name: &str,
     ) -> Result<u32, String> {
-        let file_paths = self.archive_set_part_paths(job_id, set_name)?;
-        let password = self.primary_archive_password_for_job(job_id);
+        let part_candidates = self.archive_set_indexed_part_paths(job_id, set_name)?;
+        let passwords = self.archive_password_candidates_for_set(job_id, set_name);
+        let uu_paths: HashSet<PathBuf> = self
+            .jobs
+            .get(&job_id)
+            .into_iter()
+            .flat_map(|state| {
+                state
+                    .assembly
+                    .files()
+                    .filter(|file| self.uu_files.contains_key(&file.file_id()))
+                    .map(|file| {
+                        state
+                            .working_dir
+                            .join(self.current_filename_for_file(job_id, file))
+                    })
+            })
+            .collect();
 
         let output_dir = self.extraction_staging_dir(job_id);
         let budget = self.extraction_budget(job_id, &output_dir)?;
@@ -2925,16 +3439,9 @@ impl Pipeline {
                 pp_pool.install(move || {
                     let _task_permit = task_permit;
                     let root = _task_permit.root();
-                    if file_paths.is_empty() {
-                        return Err(format!("no 7z files found for set '{set_name_owned}'"));
-                    }
-                    let end_header_bytes = sevenz_declared_end_header_bytes(&file_paths[0]);
-
-                    let pw = if let Some(ref p) = password {
-                        sevenz_turbo::Password::new(p)
-                    } else {
-                        sevenz_turbo::Password::empty()
-                    };
+                    let parts = resolve_sevenz_parts(&part_candidates, &uu_paths)
+                        .map_err(|error| format!("failed to read 7z archive: {error}"))?;
+                    let end_header_bytes = sevenz_declared_end_header_bytes(&parts.paths[0]);
 
                     let context = SevenZipExtractionContext {
                         job_id,
@@ -2942,7 +3449,7 @@ impl Pipeline {
                         output_dir,
                         root,
                         budget,
-                        password: pw,
+                        password: sevenz_turbo::Password::empty(),
                         event_tx,
                         phase_counters,
                         decode_memory: SevenZipDecodeMemory::ReservedForFixedThreads {
@@ -2952,22 +3459,11 @@ impl Pipeline {
                         decode_threads: sevenz_decode_threads,
                     };
 
-                    // A one-part set is a plain file; anything more is the
-                    // concatenation of its parts. That is the only difference
-                    // between the two conventional paths.
-                    if file_paths.len() == 1 {
-                        extract_7z_stream(&context, || {
-                            std::fs::File::open(&file_paths[0])
-                                .map_err(|e| format!("failed to open 7z file: {e}"))
-                        })
-                    } else {
-                        extract_7z_stream(&context, || {
-                            crate::pipeline::archive::split_reader::SplitFileReader::open(
-                                &file_paths,
-                            )
-                            .map_err(|e| format!("failed to open 7z split files: {e}"))
-                        })
-                    }
+                    extract_7z_with_password_candidates(context, &passwords, || {
+                        parts
+                            .open()
+                            .map_err(|error| format!("failed to open 7z parts: {error}"))
+                    })
                 })
             })
             .await;
@@ -2989,18 +3485,18 @@ impl Pipeline {
         Ok(0)
     }
 
-    /// The file a split set's parts join into, when it is already on disk and
-    /// there is reason to believe it is the whole thing.
-    ///
-    /// Two ways to believe it, and either is enough:
-    ///
-    /// - it measures the sum of the parts, which is what a join of those parts
-    ///   would have produced anyway; or
-    /// - the job carries a settled PAR2 verdict and the recovery set describes
-    ///   a file of this name at exactly the length now on disk. That is the
-    ///   stronger arm and the one that matters when a part landed short of its
-    ///   articles: the sum of what arrived is then *under* the true length, and
-    ///   only the recovery set knows what the file should measure.
+    // The file a split set's parts join into, when it is already on disk and
+    // there is reason to believe it is the whole thing.
+    //
+    // Two ways to believe it, and either is enough:
+    //
+    // - it measures the sum of the parts, which is what a join of those parts
+    //   would have produced anyway; or
+    // - the job carries a settled PAR2 verdict and the recovery set describes
+    //   a file of this name at exactly the length now on disk. That is the
+    //   stronger arm and the one that matters when a part landed short of its
+    //   articles: the sum of what arrived is then *under* the true length, and
+    //   only the recovery set knows what the file should measure.
     fn present_split_join_output(
         &self,
         job_id: JobId,
@@ -3035,8 +3531,8 @@ impl Pipeline {
         described.then_some(path)
     }
 
-    /// Extract a simple (non-RAR, non-7z) archive: ZIP, tar, tar.gz, tar.bz2, tar.xz, gz,
-    /// deflate, br, zstd, bz2, xz, or split.
+    // Extract a simple (non-RAR, non-7z) archive: ZIP, tar, tar.gz, tar.bz2, tar.xz, gz,
+    // deflate, br, zstd, bz2, xz, or split.
     pub(crate) async fn extract_simple_archive(
         &mut self,
         job_id: JobId,
@@ -3044,7 +3540,7 @@ impl Pipeline {
         kind: SimpleArchiveKind,
     ) -> Result<u32, String> {
         let file_paths = self.archive_set_part_paths(job_id, set_name)?;
-        let password = self.primary_archive_password_for_job(job_id);
+        let passwords = self.archive_password_candidates_for_set(job_id, set_name);
         let joined_output_already_present = matches!(kind, SimpleArchiveKind::Split)
             .then(|| self.present_split_join_output(job_id, set_name, &file_paths))
             .flatten();
@@ -3104,17 +3600,22 @@ impl Pipeline {
                         &budget,
                     )?;
 
+                    let mut selected_password = None;
                     let extracted_members = match kind {
-                        SimpleArchiveKind::Zip => extract_zip(
-                            &file_paths[0],
-                            &root,
-                            &budget,
-                            password.as_deref(),
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                            Some(Arc::clone(&phase_counters)),
-                        )?,
+                        SimpleArchiveKind::Zip => {
+                            let (members, password) = extract_zip(
+                                &file_paths[0],
+                                &root,
+                                &budget,
+                                &passwords,
+                                &event_tx,
+                                job_id,
+                                &set_name_owned,
+                                Some(Arc::clone(&phase_counters)),
+                            )?;
+                            selected_password = password;
+                            members
+                        }
                         SimpleArchiveKind::Tar => extract_tar(
                             &file_paths[0],
                             &root,
@@ -3211,7 +3712,7 @@ impl Pipeline {
                     Ok(FullSetExtractionOutcome {
                         extracted: extracted_members,
                         failed: Vec::new(),
-                        selected_password: None,
+                        selected_password,
                     })
                 })
             })
@@ -3233,7 +3734,7 @@ impl Pipeline {
         Ok(0)
     }
 
-    /// Persist RAR volume eligibility without deleting source volumes.
+    // Persist RAR volume eligibility without deleting source volumes.
     pub(crate) fn try_delete_volumes(&mut self, job_id: JobId, set_name: &str) {
         let key = (job_id, set_name.to_string());
         if self
@@ -3271,8 +3772,16 @@ impl Pipeline {
         });
         // PAR3 may still need this physical source for verification, content
         // identity, or a different file's repair even after archive extraction
-        // has consumed it. Keep it until the native job verdict settles.
-        let par3_verification_pending = self.par3_verification_pending(job_id);
+        // has consumed it. A late carrier reassesses even a currently complete
+        // set, so keep its sources while any posted PAR3 file is incomplete.
+        // Terminal job cleanup handles carriers that never become complete.
+        let par3_verification_pending = self.par3_verification_pending(job_id)
+            || self.jobs.get(&job_id).is_some_and(|state| {
+                state.assembly.files().any(|file| {
+                    !file.is_complete()
+                        && matches!(file.role(), weaver_model::files::FileRole::Par3 { .. })
+                })
+            });
         let mut deleted_now = Vec::new();
         let mut ownership_ready = Vec::new();
 

@@ -1,4 +1,4 @@
-//! Durable ownership of reconstructed files that have no NZB articles.
+// Durable ownership of reconstructed files that have no NZB articles.
 
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{StateError, jobs::ids::JobId, persistence::Database};
@@ -29,8 +29,8 @@ impl RepairOutput {
         Ok(())
     }
 
-    /// Preserve authenticated relative paths while rejecting non-directory
-    /// ancestors. Native installation checks these components again at write time.
+    // Preserve authenticated relative paths while rejecting non-directory
+    // ancestors. Native installation checks these components again at write time.
     pub fn destination(&self, directory: &std::path::Path) -> Result<std::path::PathBuf, String> {
         self.validate().map_err(|error| error.to_string())?;
         let mut path = directory.to_path_buf();
@@ -52,7 +52,7 @@ impl RepairOutput {
 }
 
 impl Database {
-    /// Reserve all destinations before native installation. Replays must agree.
+    // Reserve all destinations before native installation. Replays must agree.
     pub(crate) fn reserve_repair_outputs(
         &self,
         job: JobId,
@@ -128,8 +128,8 @@ pub(crate) fn identity(output: &RepairOutput) -> super::record::ActiveFileIdenti
     }
 }
 
-/// Recreate output membership, not verification evidence. A regular disk image
-/// at its declared length is available for fresh native verification on restore.
+// Recreate output membership, not verification evidence. A regular disk image
+// at its declared length is available for fresh native verification on restore.
 pub(crate) async fn restore_assembly(
     job: JobId,
     outputs: &[RepairOutput],
@@ -166,7 +166,7 @@ pub(crate) async fn restore_assembly(
             Ok(metadata)
                 if metadata.file_type().is_file() && metadata.len() == output.expected_length =>
             {
-                file.mark_complete();
+                file.mark_complete_decoded(output.expected_length);
                 present.push(output.file_index);
             }
             Ok(metadata) if !metadata.file_type().is_file() => {
@@ -297,7 +297,9 @@ mod tests {
         assert!(present.is_complete());
         assert!(present.is_repair_output());
         assert_eq!(present.total_bytes(), 0);
-        assert_eq!(present.received_bytes(), 0);
+        // The restored image carries its declared length as the decoded
+        // length so length checks and part placement see the whole file.
+        assert_eq!(present.received_bytes(), 7);
         assert_eq!(present.total_segments(), 0);
         let missing = assembly
             .file_mut(NzbFileId {

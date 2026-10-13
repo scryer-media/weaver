@@ -1,10 +1,11 @@
-use super::{Consumer, ProxyProfile, RoutingPolicy};
+use super::{Consumer, NetworkRefusal, ProxyProfile, RoutingPolicy};
 use crate::persistence::{
     encryption::{decrypt_value, encrypt_value},
     sql_runtime::{SqlArg, SqlRuntime},
 };
 use crate::{Database, StateError};
 
+// A storage fault. Input the operator can correct is a `NetworkRefusal`.
 fn error(e: impl std::fmt::Display) -> StateError {
     StateError::Database(e.to_string())
 }
@@ -17,20 +18,10 @@ pub(crate) async fn write_routing(
     let Some(policy) = policy else {
         return Ok(());
     };
-    policy.validate().map_err(error)?;
-    for id in &policy.proxy_ids {
-        if tx
-            .fetch_optional(
-                "SELECT id FROM proxy_profiles WHERE id = {}",
-                &[SqlArg::I64(i64::from(*id))],
-            )
-            .await?
-            .is_none()
-        {
-            return Err(error("routing policy references a missing proxy"));
-        }
-    }
-    tx.execute("INSERT INTO proxy_routes (consumer, policy) VALUES ({}, {}) ON CONFLICT(consumer) DO UPDATE SET policy = excluded.policy", &[SqlArg::Text(consumer.key()), SqlArg::Text(serde_json::to_string(policy).map_err(error)?)]).await?;
+    super::network_persistence::lock_network(tx).await?;
+    let policy = super::network_persistence::validate_policy(tx, consumer, policy).await?;
+    tx.execute("INSERT INTO proxy_routes (consumer, policy) VALUES ({}, {}) ON CONFLICT(consumer) DO UPDATE SET policy = excluded.policy", &[SqlArg::Text(consumer.key()), SqlArg::Text(serde_json::to_string(&policy).map_err(error)?)]).await?;
+    super::network_persistence::validate_stored_network(tx).await?;
     Ok(())
 }
 
@@ -71,7 +62,7 @@ impl Database {
 
     pub fn reset_proxy_host_key(&self, profile: &ProxyProfile) -> Result<ProxyProfile, StateError> {
         if profile.kind != super::ProxyKind::Ssh {
-            return Err(error("only SSH profiles have host-key trust"));
+            return Err(NetworkRefusal::ProxyHostKeyNotSsh.into());
         }
         self.write_proxy_profile(profile, true)
     }
@@ -81,7 +72,12 @@ impl Database {
         profile: &ProxyProfile,
         reset_trust: bool,
     ) -> Result<ProxyProfile, StateError> {
-        profile.validate().map_err(error)?;
+        let mut profile = profile.clone();
+        // SSH authenticates with an Ed25519 key alone, so no password is kept for it.
+        if profile.kind == super::ProxyKind::Ssh {
+            profile.secrets.password = None;
+        }
+        profile.validate()?;
         let key = self
             .encryption_key()
             .ok_or_else(|| error("encryption key required for proxy credentials"))?;
@@ -90,13 +86,20 @@ impl Database {
             &serde_json::to_string(&profile.secrets).map_err(error)?,
         )
         .map_err(error)?;
-        let profile = profile.clone();
         let store = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&store, "save_proxy_profile", |tx| {
                 let mut profile = profile.clone();
                 let password = password.clone();
                 Box::pin(async move {
+                    super::network_persistence::lock_network(tx).await?;
+                    for row in tx.fetch_all("SELECT kind, member_ids FROM proxy_pools", &[]).await? {
+                        let members: Vec<u32> = serde_json::from_str(&row.text("member_ids")?).map_err(error)?;
+                        let kind: super::ProxyKind = serde_json::from_str(&row.text("kind")?).map_err(error)?;
+                        if members.contains(&profile.id) && kind != profile.kind {
+                            return Err(NetworkRefusal::ProxyKindLockedByPool.into());
+                        }
+                    }
                     let id = [SqlArg::I64(i64::from(profile.id))];
                     // A write before the read serializes saves and TOFU pins on
                     // both SQLite and PostgreSQL, including READ COMMITTED.
@@ -104,22 +107,23 @@ impl Database {
                     if let Some(row) = tx.fetch_optional("SELECT config FROM proxy_profiles WHERE id = {}", &id).await? {
                         let existing: ProxyProfile = serde_json::from_str(&row.text("config")?).map_err(error)?;
                         if profile.revision < existing.revision || (reset_trust && profile.revision == existing.revision) {
-                            return Err(error("proxy revision changed"));
+                            return Err(NetworkRefusal::ProxyRevisionChanged.into());
                         }
                         profile.host_key_fingerprint = if reset_trust { None } else { existing.host_key_fingerprint.clone() };
                         // Key rotation rewrites encrypted secrets without changing
                         // the public profile or its runtime revision.
                         if profile.revision == existing.revision && serde_json::to_value(&profile).map_err(error)? != serde_json::to_value(&existing).map_err(error)? {
-                            return Err(error("proxy revision changed"));
+                            return Err(NetworkRefusal::ProxyRevisionChanged.into());
                         }
                     } else if reset_trust {
-                        return Err(error("proxy no longer exists"));
+                        return Err(NetworkRefusal::ProxyGone.into());
                     }
                     tx.execute("INSERT INTO proxy_profiles (id, config, password) VALUES ({}, {}, {}) ON CONFLICT(id) DO UPDATE SET config = excluded.config, password = excluded.password", &[
                         SqlArg::I64(i64::from(profile.id)),
                         SqlArg::Text(serde_json::to_string(&profile).map_err(error)?),
                         SqlArg::Text(password),
                     ]).await?;
+                    super::network_persistence::validate_stored_network(tx).await?;
                     Ok(profile)
                 })
             }).await
@@ -131,11 +135,30 @@ impl Database {
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&store, "delete_proxy", |tx| {
                 Box::pin(async move {
+                    super::network_persistence::lock_network(tx).await?;
+                    for row in tx
+                        .fetch_all("SELECT member_ids FROM proxy_pools", &[])
+                        .await?
+                    {
+                        let members: Vec<u32> =
+                            serde_json::from_str(&row.text("member_ids")?).map_err(error)?;
+                        if members.contains(&id) {
+                            return Err(NetworkRefusal::ProxyInPool.into());
+                        }
+                    }
                     for row in tx.fetch_all("SELECT policy FROM proxy_routes", &[]).await? {
-                        let policy: RoutingPolicy =
-                            serde_json::from_str(&row.text("policy")?).map_err(error)?;
-                        if policy.proxy_ids.contains(&id) {
-                            return Err(error("proxy is referenced by a server or RSS feed"));
+                        let route = super::network_persistence::stored_route(&row.text("policy")?)?;
+                        if route.legs.iter().any(|leg| match &leg.path {
+                            super::LegPath::Direct => false,
+                            super::LegPath::Ladder { rungs, .. } => {
+                                rungs.iter().any(|rung| match rung {
+                                    super::Rung::Proxy { id: referenced } => *referenced == id,
+                                    super::Rung::Chain { ids } => ids.contains(&id),
+                                    super::Rung::Pool { .. } => false,
+                                })
+                            }
+                        }) {
+                            return Err(NetworkRefusal::ProxyInUse.into());
                         }
                     }
                     tx.execute(
@@ -191,7 +214,7 @@ impl Database {
         consumer: Consumer,
         policy: &RoutingPolicy,
     ) -> Result<(), StateError> {
-        policy.validate().map_err(error)?;
+        policy.validate()?;
         let key = consumer.key();
         let policy = policy.clone();
         let store = self.datastore();
@@ -199,10 +222,10 @@ impl Database {
             SqlRuntime::run_in_transaction(&store, "save_proxy_route", |tx| {
                 let key = key.clone(); let policy = policy.clone();
                 Box::pin(async move {
-                    for id in &policy.proxy_ids {
-                        if tx.fetch_optional("SELECT id FROM proxy_profiles WHERE id = {}", &[SqlArg::I64(i64::from(*id))]).await?.is_none() { return Err(error("routing policy references a missing proxy")); }
-                    }
+                    super::network_persistence::lock_network(tx).await?;
+                    let policy = super::network_persistence::validate_policy(tx,consumer,&policy).await?;
                     tx.execute("INSERT INTO proxy_routes (consumer, policy) VALUES ({}, {}) ON CONFLICT(consumer) DO UPDATE SET policy = excluded.policy", &[SqlArg::Text(key), SqlArg::Text(serde_json::to_string(&policy).map_err(error)?)]).await?;
+                    super::network_persistence::validate_stored_network(tx).await?;
                     Ok(())
                 })
             }).await
@@ -228,7 +251,7 @@ impl Database {
         })
     }
 
-    /// Pin only the revision that authenticated; stale handshakes cannot undo an edit.
+    // Pin only the revision that authenticated; stale handshakes cannot undo an edit.
     pub fn pin_proxy_host_key(
         &self,
         id: u32,

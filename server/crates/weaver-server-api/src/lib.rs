@@ -4,6 +4,7 @@ pub mod categories;
 pub mod context;
 pub mod history;
 pub mod jobs;
+pub mod networking;
 mod observability;
 pub mod post_processing;
 pub mod proxies;

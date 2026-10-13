@@ -61,7 +61,7 @@ fn query_count(db: &Database, table: &'static str) -> i64 {
 
 fn build_service(
     mut db: Database,
-    config: Config,
+    mut config: Config,
 ) -> (
     BackupService,
     RuntimeCapture,
@@ -85,6 +85,11 @@ fn build_service(
         .flatten()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from(&config.data_dir));
+    // Persisted source paths remain portable fixture values; retained archives
+    // live in this test database's isolated directory.
+    if config.data_dir == "/old/data" {
+        config.data_dir = restore_locator_dir.display().to_string();
+    }
     let shared_config = StdArc::new(RwLock::new(config));
     let handle = test_scheduler_handle(capture.clone());
     handle.set_server_transfer_policy(StdArc::clone(&transfer_policy));
@@ -107,12 +112,10 @@ fn test_scheduler_handle(capture: RuntimeCapture) -> SchedulerHandle {
                 SchedulerCommand::SetSpeedLimit {
                     bytes_per_sec,
                     reply,
+                    ..
                 } => {
                     capture.speed_limits.lock().unwrap().push(bytes_per_sec);
                     let _ = reply.send(());
-                }
-                SchedulerCommand::SetBandwidthCapPolicy { reply, .. } => {
-                    let _ = reply.send(Ok(()));
                 }
                 SchedulerCommand::RebuildNntp { reply, .. } => {
                     let _ = reply.send(Ok(crate::NntpRuntimeActivation {
@@ -191,7 +194,6 @@ fn sample_config() -> Config {
         ],
         retry: None,
         max_download_speed: Some(1234),
-        isp_bandwidth_cap: None,
         propagation_delay_secs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -248,9 +250,13 @@ async fn password_protected_backup_roundtrip_inspects() {
         .await
         .unwrap();
     assert!(artifact.filename.ends_with(".enc"));
+    assert!(service.backups().await.unwrap().is_empty());
+    let artifact_path = artifact.path.clone();
 
     let temp = tempfile::NamedTempFile::new().unwrap();
     std::fs::copy(&artifact.path, temp.path()).unwrap();
+    drop(artifact);
+    assert!(!artifact_path.exists());
 
     let inspect = service
         .inspect_backup(temp.path(), Some("secret-pass".into()))
@@ -679,11 +685,11 @@ async fn new_backup_requires_a_nonblank_password() {
     ));
 }
 
-/// The SQLite export reads through one read-only snapshot transaction on the
-/// live WAL database instead of a `VACUUM INTO` copy. This pins the property
-/// that decision relies on: rows committed while the export is running must
-/// not appear partially, so every exported `job_events` row still references
-/// an exported `job_history` job.
+// The SQLite export reads through one read-only snapshot transaction on the
+// live WAL database instead of a `VACUUM INTO` copy. This pins the property
+// that decision relies on: rows committed while the export is running must
+// not appear partially, so every exported `job_events` row still references
+// an exported `job_history` job.
 #[tokio::test]
 async fn sqlite_export_snapshot_stays_closed_while_history_grows_concurrently() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1179,7 +1185,6 @@ async fn restore_requires_category_remap_for_external_paths() {
             categories: vec![],
             retry: None,
             max_download_speed: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -1204,7 +1209,6 @@ async fn restore_requires_category_remap_for_external_paths() {
             categories: vec![],
             retry: None,
             max_download_speed: None,
-            isp_bandwidth_cap: None,
             propagation_delay_secs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -1475,7 +1479,19 @@ async fn sqlite_restore_resumes_after_every_promotion_phase() {
 
     let source_db = open_temp_db();
     populate_source_db(&source_db);
+    source_db
+        .set_setting("last_started_version", "0.13.0")
+        .unwrap();
     let (source_service, _, _) = build_service(source_db, sample_config());
+    source_service
+        .update_auto_backup_settings(AutoBackupSettingsInput {
+            enabled: true,
+            daily_time_local: "03:00".into(),
+            set_auto_backup_key: Some("automatic restore password".into()),
+            clear_auto_backup_key: false,
+        })
+        .await
+        .unwrap();
     let artifact = source_service
         .create_backup(Some("crash-secret".into()))
         .await
@@ -1532,6 +1548,14 @@ async fn sqlite_restore_resumes_after_every_promotion_phase() {
         let pending = super::pending::pending_restore_status(current_root.path()).unwrap();
         assert!(pending.error.is_some());
 
+        super::upgrade::prepare_upgrade_backup_for_target(
+            &crate::persistence::database_target::DatabaseTarget::SqlitePath(target_path.clone()),
+            current_root.path(),
+            "0.14.2",
+            |_| panic!("pending restore must promote its key before automatic backup preflight"),
+        )
+        .await
+        .unwrap();
         let reopened = Database::open(&target_path).unwrap();
         let (restored, _) = apply_pending_restore(reopened, current_root.path()).unwrap();
         assert_eq!(
@@ -1545,6 +1569,14 @@ async fn sqlite_restore_resumes_after_every_promotion_phase() {
                 .len(),
             1,
             "restore did not recover after {phase:?}"
+        );
+        assert_eq!(
+            restored
+                .get_setting("last_started_version")
+                .unwrap()
+                .as_deref(),
+            Some("0.13.0"),
+            "preflight must not change the restored version marker"
         );
         assert!(!current_data_dir.join("restore-pending").exists());
         assert!(
@@ -1725,5 +1757,470 @@ async fn sqlite_restore_distinguishes_an_installed_database_from_a_lost_prepared
             );
             assert!(!restored_root.path().join("encryption.key").exists());
         }
+    }
+}
+
+#[tokio::test]
+async fn default_backup_path_supports_relative_data_directories() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(&root.path().join("state.db")).unwrap();
+    let mut config = sample_config();
+    config.data_dir = "relative-data".into();
+    let (service, _, _) = build_service(db, config);
+    let settings = service.backup_settings().await.unwrap();
+    assert_eq!(
+        PathBuf::from(settings.backup_path),
+        std::env::current_dir()
+            .unwrap()
+            .join("relative-data/backups")
+    );
+    assert!(settings.custom_backup_path.is_none());
+    assert!(
+        service
+            .update_backup_settings(Some("relative-custom-backups".into()))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("backup path must be absolute")
+    );
+}
+
+#[tokio::test]
+async fn stored_backup_lifecycle_and_execution_guards() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(&root.path().join("state.db")).unwrap();
+    populate_source_db(&db);
+    let (service, _, _) = build_service(db, sample_config());
+    let directory = root.path().join("stored");
+    service
+        .update_backup_settings(Some(directory.display().to_string()))
+        .await
+        .unwrap();
+    let write_guard = service.inner.op_lock.lock().await;
+    let (manual, manual_done) = service
+        .begin_backup(Some("manual password".into()), BackupTrigger::Manual)
+        .await
+        .unwrap();
+    assert_eq!(manual.status, BackupArtifactStatus::Creating);
+    assert!(
+        service
+            .create_stored_backup(Some("second password".into()))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("manual backup is already running")
+    );
+    let (auto, auto_done) = service
+        .begin_backup(Some("automatic password".into()), BackupTrigger::Auto)
+        .await
+        .unwrap();
+    assert_ne!(manual.filename, auto.filename);
+    assert_eq!(service.backups().await.unwrap().len(), 2);
+    assert!(service.backup_artifact(&manual.filename).await.is_err());
+    assert!(service.delete_backup(&manual.filename).await.is_err());
+    assert!(service.update_backup_settings(None).await.is_err());
+    drop(write_guard);
+    assert_eq!(
+        manual_done.await.unwrap().unwrap().status,
+        BackupArtifactStatus::Ready
+    );
+    assert_eq!(
+        auto_done.await.unwrap().unwrap().status,
+        BackupArtifactStatus::Ready
+    );
+    let artifact = service.backup_artifact(&manual.filename).await.unwrap();
+    let (_, path, _temporary_directory) = artifact.into_parts();
+    assert!(path.exists());
+    let token = service
+        .create_download_token(&manual.filename)
+        .await
+        .unwrap();
+    assert!(
+        service
+            .consume_download_token(&manual.filename, &token)
+            .await
+    );
+    assert!(
+        !service
+            .consume_download_token(&manual.filename, &token)
+            .await
+    );
+    let token = service
+        .create_download_token(&manual.filename)
+        .await
+        .unwrap();
+    assert!(!service.consume_download_token(&auto.filename, &token).await);
+    assert!(service.backup_artifact("../escape.enc").await.is_err());
+    assert!(service.delete_backup(&manual.filename).await.unwrap());
+    assert!(!path.exists());
+    assert!(
+        !directory
+            .join(format!("{}.metadata.json", manual.filename))
+            .exists()
+    );
+    assert!(!service.delete_backup(&manual.filename).await.unwrap());
+}
+
+#[tokio::test]
+async fn backup_shutdown_drains_detached_runs_and_rejects_new_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(&root.path().join("state.db")).unwrap();
+    let (service, _, _) = build_service(db, sample_config());
+    service
+        .update_backup_settings(Some(root.path().join("backups").display().to_string()))
+        .await
+        .unwrap();
+    let write_guard = service.inner.op_lock.lock().await;
+    let (manual, manual_done) = service
+        .begin_backup(Some("archive password".into()), BackupTrigger::Manual)
+        .await
+        .unwrap();
+    let (automatic, automatic_done) = service
+        .begin_backup(Some("archive password".into()), BackupTrigger::Auto)
+        .await
+        .unwrap();
+    // Dropped HTTP/scheduler waiters detach these tasks. The service must still
+    // own their lifecycle through metadata publication and automatic retention.
+    drop(manual_done);
+    drop(automatic_done);
+    let draining = service.clone();
+    let shutdown = tokio::spawn(async move { draining.shutdown().await });
+    while !service
+        .inner
+        .shutting_down
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        service
+            .create_stored_backup(Some("archive password".into()))
+            .await
+            .is_err()
+    );
+    shutdown.await.unwrap();
+    // Cancellation must not wait for admission to the archive writer.
+    drop(write_guard);
+    let rows = service.backups().await.unwrap();
+    for filename in [&manual.filename, &automatic.filename] {
+        let info = rows.iter().find(|row| &row.filename == filename).unwrap();
+        assert_eq!(info.status, BackupArtifactStatus::Failed);
+        assert!(
+            info.error
+                .as_deref()
+                .unwrap()
+                .contains("cancelled during shutdown")
+        );
+    }
+    for trigger in [BackupTrigger::Manual, BackupTrigger::Auto] {
+        let error = match service
+            .begin_backup(Some("archive password".into()), trigger)
+            .await
+        {
+            Ok(_) => panic!("shutdown must reject new backup work"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("shutting down"));
+    }
+    assert!(service.inner.manual_lock.try_lock().is_ok());
+    assert!(service.inner.auto_lock.try_lock().is_ok());
+}
+
+#[tokio::test]
+async fn completed_backup_artifact_keeps_its_original_storage_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(&root.path().join("state.db")).unwrap();
+    let (service, _, _) = build_service(db, sample_config());
+    let original = root.path().join("original");
+    service
+        .update_backup_settings(Some(original.display().to_string()))
+        .await
+        .unwrap();
+    let (info, artifact, finished) = service
+        .begin_backup_with_artifact(Some("archive password".into()), BackupTrigger::Manual)
+        .await
+        .unwrap();
+    finished.await.unwrap().unwrap();
+    service
+        .update_backup_settings(Some(root.path().join("replacement").display().to_string()))
+        .await
+        .unwrap();
+    assert!(service.backups().await.unwrap().is_empty());
+    let (filename, path, _temporary_directory) = artifact.into_parts();
+    assert_eq!(filename, info.filename);
+    assert_eq!(path, original.join(&filename));
+    let unpacked = super::create_backup_temp_dir().unwrap();
+    super::archive::unpack_bundle_archive(&path, unpacked.path(), Some("archive password".into()))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn automatic_backup_key_is_encrypted_and_restored_with_settings() {
+    let root = tempfile::tempdir().unwrap();
+    let mut db = Database::open(&root.path().join("state.db")).unwrap();
+    db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    populate_source_db(&db);
+    let (service, _, _) = build_service(db.clone(), sample_config());
+    let input = |enabled, key, clear| AutoBackupSettingsInput {
+        enabled,
+        daily_time_local: "03:00".into(),
+        set_auto_backup_key: key,
+        clear_auto_backup_key: clear,
+    };
+    assert!(
+        service
+            .update_auto_backup_settings(input(true, None, false))
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .update_auto_backup_settings(input(false, Some(" a b c ".into()), false))
+            .await
+            .is_err()
+    );
+    let settings = service
+        .update_auto_backup_settings(input(true, Some("archive password".into()), false))
+        .await
+        .unwrap();
+    assert!(settings.auto_backup_key_present);
+    assert!(settings.next_run_at.is_some());
+    let stored = db
+        .get_setting(super::automatic::AUTO_SETTINGS_KEY)
+        .unwrap()
+        .unwrap();
+    assert!(!stored.contains("archive password"));
+    assert!(stored.contains("enc:v1:"));
+    assert!(db.has_encrypted_credentials().unwrap());
+    db.validate_encrypted_credentials(db.encryption_key().unwrap())
+        .unwrap();
+    assert!(
+        db.validate_encrypted_credentials(
+            &crate::persistence::encryption::EncryptionKey::generate()
+        )
+        .is_err()
+    );
+    assert!(
+        service
+            .update_auto_backup_settings(input(true, None, true))
+            .await
+            .is_err()
+    );
+    let info = service.run_auto_backup().await.unwrap().unwrap();
+    assert_eq!(info.trigger, BackupTrigger::Auto);
+    assert_eq!(info.status, BackupArtifactStatus::Ready);
+    let (_, artifact, _temporary_directory) = service
+        .backup_artifact(&info.filename)
+        .await
+        .unwrap()
+        .into_parts();
+    let unpacked = super::create_backup_temp_dir().unwrap();
+    let manifest = super::archive::unpack_bundle_archive(
+        &artifact,
+        unpacked.path(),
+        Some("archive password".into()),
+    )
+    .unwrap();
+    let imported = Database::open(&root.path().join("imported.db")).unwrap();
+    imported
+        .import_logical_backup(
+            &unpacked.path().join("tables"),
+            &manifest.tables,
+            manifest.weaver_schema_version,
+        )
+        .unwrap();
+    assert_eq!(
+        imported
+            .get_setting(super::automatic::AUTO_SETTINGS_KEY)
+            .unwrap()
+            .as_deref(),
+        Some(stored.as_str())
+    );
+    let inspect = service
+        .inspect_backup(&artifact, Some("archive password".into()))
+        .await
+        .unwrap();
+    assert!(
+        inspect
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("automatic-backup schedule"))
+    );
+    service
+        .update_auto_backup_settings(input(false, None, true))
+        .await
+        .unwrap();
+    assert!(
+        !service
+            .auto_backup_settings()
+            .await
+            .unwrap()
+            .auto_backup_key_present
+    );
+    assert!(service.run_auto_backup().await.unwrap().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn backup_download_tokens_expire_without_wall_clock_waits() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(&root.path().join("state.db")).unwrap();
+    let (service, _, _) = build_service(db, sample_config());
+    let now = tokio::time::Instant::now();
+    service
+        .inner
+        .download_tokens
+        .lock()
+        .await
+        .insert("expired".into(), ("archive".into(), now));
+    service.inner.download_tokens.lock().await.insert(
+        "live".into(),
+        ("archive".into(), now + std::time::Duration::from_secs(60)),
+    );
+    assert!(!service.consume_download_token("archive", "expired").await);
+    assert!(service.consume_download_token("archive", "live").await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn automatic_scheduler_follows_injected_calendar_and_settings_without_duplicate_runs() {
+    use chrono::TimeZone;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(&root.path().join("state.db")).unwrap();
+    populate_source_db(&db);
+    let (service, _, _) = build_service(db, sample_config());
+    service
+        .update_auto_backup_settings(AutoBackupSettingsInput {
+            enabled: true,
+            daily_time_local: "03:00".into(),
+            set_auto_backup_key: Some("automatic password".into()),
+            clear_auto_backup_key: false,
+        })
+        .await
+        .unwrap();
+    let before = chrono::Local
+        .with_ymd_and_hms(2026, 1, 2, 2, 59, 0)
+        .unwrap();
+    let clock = StdArc::new(AtomicI64::new(before.timestamp()));
+    // Keep Tokio from auto-advancing past blocking database/archive work. Only
+    // the paired calendar + timer advances below move the simulated clocks.
+    let runnable = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let source = clock.clone();
+    let scheduler = service.start_auto_backup_scheduler_with_clock(move || {
+        chrono::Local
+            .timestamp_opt(source.load(Ordering::SeqCst), 0)
+            .unwrap()
+    });
+    let scheduled = (before + chrono::Duration::minutes(1))
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339();
+    while service.inner.next_run.read().unwrap().as_deref() != Some(scheduled.as_str()) {
+        tokio::task::yield_now().await;
+    }
+    assert!(service.backups().await.unwrap().is_empty());
+    clock.fetch_add(60, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    let first = loop {
+        let backups = service.backups().await.unwrap();
+        if let Some(info) = backups
+            .into_iter()
+            .find(|info| info.status == BackupArtifactStatus::Ready)
+        {
+            break info;
+        }
+        tokio::task::yield_now().await;
+    };
+    let tomorrow = (before + chrono::Duration::days(1) + chrono::Duration::minutes(1))
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339();
+    while service.inner.next_run.read().unwrap().as_deref() != Some(tomorrow.as_str()) {
+        tokio::task::yield_now().await;
+    }
+    service
+        .update_auto_backup_settings(AutoBackupSettingsInput {
+            enabled: true,
+            daily_time_local: "04:00".into(),
+            set_auto_backup_key: None,
+            clear_auto_backup_key: false,
+        })
+        .await
+        .unwrap();
+    let changed = (before + chrono::Duration::minutes(61))
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339();
+    while service.inner.next_run.read().unwrap().as_deref() != Some(changed.as_str()) {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(service.backups().await.unwrap().len(), 1);
+    assert_eq!(service.backups().await.unwrap()[0].filename, first.filename);
+    service
+        .update_auto_backup_settings(AutoBackupSettingsInput {
+            enabled: false,
+            daily_time_local: "04:00".into(),
+            set_auto_backup_key: None,
+            clear_auto_backup_key: false,
+        })
+        .await
+        .unwrap();
+    while service.inner.next_run.read().unwrap().is_some() {
+        tokio::task::yield_now().await;
+    }
+    scheduler.abort();
+    runnable.abort();
+}
+
+#[tokio::test]
+async fn failed_automatic_backup_never_prunes_retained_ready_artifacts() {
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open(&root.path().join("state.db")).unwrap();
+    let (service, _, _) = build_service(db.clone(), sample_config());
+    let directory = root.path().join("backups");
+    service
+        .update_backup_settings(Some(directory.display().to_string()))
+        .await
+        .unwrap();
+    let mut filenames = Vec::new();
+    for _ in 0..5 {
+        let mut info = super::stored::new_backup_info(
+            BackupTrigger::Auto,
+            "sqlite",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap();
+        info.status = BackupArtifactStatus::Ready;
+        std::fs::write(directory.join(&info.filename), b"retained fixture").unwrap();
+        super::stored::write_metadata(&directory, &info).unwrap();
+        filenames.push(info.filename);
+    }
+    // Refuse an unclassified table during export, after the Creating row exists.
+    execute_sql(
+        &db,
+        vec!["CREATE TABLE unclassified_backup_fixture (id INTEGER)"],
+    );
+    let (failed, finished) = service
+        .begin_backup(Some("automatic password".into()), BackupTrigger::Auto)
+        .await
+        .unwrap();
+    assert!(finished.await.unwrap().is_err());
+    let rows = service.backups().await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.filename == failed.filename)
+            .unwrap()
+            .status,
+        BackupArtifactStatus::Failed
+    );
+    for filename in filenames {
+        assert!(directory.join(&filename).is_file());
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.filename == filename)
+                .unwrap()
+                .status,
+            BackupArtifactStatus::Ready
+        );
     }
 }

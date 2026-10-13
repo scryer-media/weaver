@@ -215,6 +215,7 @@ impl SystemQuery {
         &self,
         ctx: &Context<'_>,
         path: Option<String>,
+        include_files: Option<bool>,
     ) -> Result<DirectoryBrowseResult> {
         let config = ctx.data::<SharedConfig>()?;
         let default_path = with_timed_config_read(
@@ -234,7 +235,10 @@ impl SystemQuery {
         };
 
         let listing = tokio::task::spawn_blocking(move || {
-            weaver_server_core::operations::browse_directories(&requested_path)
+            weaver_server_core::operations::browse_directories(
+                &requested_path,
+                include_files.unwrap_or(false),
+            )
         })
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
@@ -321,7 +325,7 @@ impl SystemQuery {
         let handle = ctx.data::<SchedulerHandle>()?;
         Ok(handle.is_globally_paused())
     }
-    /// Current global download block state (manual pause or ISP cap).
+    /// Current global download block state (manual pause or download quota).
     async fn download_block(&self, ctx: &Context<'_>) -> Result<DownloadBlock> {
         let handle = ctx.data::<SchedulerHandle>()?;
         Ok(DownloadBlock::from(&handle.get_download_block()))
@@ -469,7 +473,7 @@ fn push_storage_input(
 
 const PATH_STORAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The folder itself when it exists, otherwise the deepest parent that does.
+// The folder itself when it exists, otherwise the deepest parent that does.
 fn nearest_existing_ancestor(path: &std::path::Path) -> PathBuf {
     path.ancestors()
         .find(|candidate| !candidate.as_os_str().is_empty() && candidate.exists())
@@ -598,8 +602,8 @@ fn filesystem_name(value: &weaver_server_core::runtime::system_profile::Filesyst
     }
 }
 
-/// Rebase a monotonic deadline on the wall clock, so a browser can count down
-/// to it. A deadline already in the past has nothing left to show.
+// Rebase a monotonic deadline on the wall clock, so a browser can count down
+// to it. A deadline already in the past has nothing left to show.
 fn instant_to_epoch_ms(until: std::time::Instant) -> Option<u64> {
     let remaining = until.saturating_duration_since(std::time::Instant::now());
     if remaining.is_zero() {
@@ -612,15 +616,15 @@ fn instant_to_epoch_ms(until: std::time::Instant) -> Option<u64> {
     u64::try_from(now.saturating_add(remaining.as_millis())).ok()
 }
 
-/// How many sockets one server has connected, and how many of those are
-/// carrying a request.
-///
-/// The socket budget owns physical sockets, so it is the only place that can
-/// separate "a socket exists" from "a socket is carrying a request": a lane
-/// parked on an open connection is neither a free permit nor a fetch in
-/// flight. A socket still dialing is not open yet; everything else that is
-/// not idling or closing is busy. `serverHealth` and the live metrics stream
-/// both read through here so the two never disagree.
+// How many sockets one server has connected, and how many of those are
+// carrying a request.
+//
+// The socket budget owns physical sockets, so it is the only place that can
+// separate "a socket exists" from "a socket is carrying a request": a lane
+// parked on an open connection is neither a free permit nor a fetch in
+// flight. A socket still dialing is not open yet; everything else that is
+// not idling or closing is busy. `serverHealth` and the live metrics stream
+// both read through here so the two never disagree.
 pub(crate) fn server_socket_counts(pool: &NntpPool, idx: usize) -> (u32, u32) {
     let sockets = pool.socket_budget_snapshot(idx);
     let open = sockets.physical.saturating_sub(sockets.dialing);
@@ -631,10 +635,10 @@ pub(crate) fn server_socket_counts(pool: &NntpPool, idx: usize) -> (u32, u32) {
     (open as u32, busy as u32)
 }
 
-/// Snapshot per-server health from the live NNTP pool. Mirrors the per-server fields
-/// emitted by the Prometheus exporter (`collect_server_health` in the app binary), shaped
-/// for the GraphQL monitoring API. The connection pool orders servers by priority, so the
-/// first entry is the primary and the rest are backups.
+// Snapshot per-server health from the live NNTP pool. Mirrors the per-server fields
+// emitted by the Prometheus exporter (`collect_server_health` in the app binary), shaped
+// for the GraphQL monitoring API. The connection pool orders servers by priority, so the
+// first entry is the primary and the rest are backups.
 async fn collect_server_health(
     pool: &NntpPool,
     runtime_generation: u64,

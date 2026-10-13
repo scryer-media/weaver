@@ -254,6 +254,80 @@ async fn destination_claim_skips_a_directory_populated_by_another_process() {
     assert!(std::fs::read_dir(claimed).unwrap().next().is_none());
 }
 
+fn original_title(title: &str) -> Vec<(String, String)> {
+    vec![(
+        crate::ingest::ORIGINAL_TITLE_METADATA_KEY.to_string(),
+        title.to_string(),
+    )]
+}
+
+#[tokio::test]
+async fn completed_output_folder_is_named_after_the_original_release_title() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("complete");
+    let cases = [
+        // A season pack keeps its season.
+        (
+            "Copper Meadow",
+            original_title("Copper.Meadow.S06.1080p.WEB.h264-GRP"),
+            "Copper.Meadow.S06.1080p.WEB.h264-GRP",
+        ),
+        // A multi-episode release keeps every episode.
+        (
+            "Copper Meadow — S11E42",
+            original_title("Copper.Meadow.S11E42-E43.720p.HDTV.x264-GRP"),
+            "Copper.Meadow.S11E42-E43.720p.HDTV.x264-GRP",
+        ),
+        // A movie keeps its year.
+        (
+            "Lantern Field",
+            original_title("Lantern.Field.2019.2160p.BluRay.x265-GRP"),
+            "Lantern.Field.2019.2160p.BluRay.x265-GRP",
+        ),
+        // A path separator cannot escape the category folder, and a trailing
+        // dot is dropped.
+        (
+            "Lantern Field",
+            original_title("../Lantern/Field.2019.1080p-GRP."),
+            "_Lantern_Field.2019.1080p-GRP",
+        ),
+        // No original title: the display name, as before.
+        ("Copper Meadow", Vec::new(), "Copper Meadow"),
+    ];
+
+    for (job, (display, metadata, expected)) in cases.into_iter().enumerate() {
+        let folder = crate::ingest::completed_folder_name(display, &metadata);
+        assert_eq!(folder, expected);
+        let claimed =
+            claim_complete_destination_path(&parent, &folder, JobId(job as u64), &HashSet::new())
+                .await
+                .unwrap();
+        assert_eq!(claimed.parent(), Some(parent.as_path()), "{expected}");
+        assert_eq!(claimed.file_name().unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn a_second_job_with_the_same_release_title_gets_its_own_folder() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("complete");
+    let metadata = original_title("Copper.Meadow.S06.1080p.WEB.h264-GRP");
+    let folder = crate::ingest::completed_folder_name("Copper Meadow", &metadata);
+
+    let first = claim_complete_destination_path(&parent, &folder, JobId(41), &HashSet::new())
+        .await
+        .unwrap();
+    let second = claim_complete_destination_path(&parent, &folder, JobId(42), &HashSet::new())
+        .await
+        .unwrap();
+
+    assert_eq!(first, parent.join("Copper.Meadow.S06.1080p.WEB.h264-GRP"));
+    assert_eq!(
+        second,
+        parent.join("Copper.Meadow.S06.1080p.WEB.h264-GRP.#42")
+    );
+}
+
 #[tokio::test]
 async fn final_move_does_not_overwrite_existing_destination_file() {
     let temp = tempfile::tempdir().unwrap();
@@ -387,10 +461,10 @@ async fn final_move_refuses_symlink_entries_and_releases_its_empty_destination_c
     assert!(!dest.exists());
 }
 
-/// The seam the rename pass runs at has to see both delivery routes as one set.
-/// Extraction writes members into the working root and direct-store commits
-/// them into staging; only after this move do they share a directory, and the
-/// dominance test that picks the payload is meaningless before then.
+// The seam the rename pass runs at has to see both delivery routes as one set.
+// Extraction writes members into the working root and direct-store commits
+// them into staging; only after this move do they share a directory, and the
+// dominance test that picks the payload is meaningless before then.
 #[tokio::test]
 async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
     let temp = tempfile::tempdir().unwrap();
@@ -429,8 +503,8 @@ async fn the_rename_pass_sees_staging_and_working_output_as_one_delivery() {
     assert!(!dest.join("Yb5drZSkNi20UCMkb.mkv").exists());
 }
 
-/// The pass is a policy, not a stage: with it off the move places exactly what
-/// it was given.
+// The pass is a policy, not a stage: with it off the move places exactly what
+// it was given.
 #[tokio::test]
 async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
     let temp = tempfile::tempdir().unwrap();
@@ -463,9 +537,9 @@ fn prepublication_scan_checks_both_delivery_roots() {
     let working = temp.path().join("working");
     let staging = temp.path().join("staging");
     std::fs::create_dir_all(working.join("nested")).unwrap();
-    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::create_dir_all(staging.join("extras")).unwrap();
     std::fs::write(working.join("safe.mkv"), b"safe").unwrap();
-    std::fs::write(staging.join("nested.exe"), b"rejected").unwrap();
+    std::fs::write(staging.join("extras/Payload.EXE"), b"rejected").unwrap();
 
     let settings = PostProcessingSettings {
         unacceptable_extensions: vec!["EXE".into()],
@@ -475,15 +549,15 @@ fn prepublication_scan_checks_both_delivery_roots() {
     .unwrap();
     let error = validate_delivery_sources(&working, Some(&staging), &settings).unwrap_err();
 
-    assert!(error.contains("unacceptable extension 'exe' matched 'staging/nested.exe'"));
+    assert_eq!(error, "unwanted extension '.exe' in 'extras/Payload.EXE'");
     assert!(working.join("safe.mkv").exists());
-    assert!(staging.join("nested.exe").exists());
+    assert!(staging.join("extras/Payload.EXE").exists());
 }
 
-/// The Windows arm of the guard reads a raw attribute bit rather than asking
-/// `FileType`, so an inverted or mistyped mask would reject every ordinary
-/// delivery instead of just the redirecting ones. The Unix symlink tests
-/// cannot see that: this one runs on every platform.
+// The Windows arm of the guard reads a raw attribute bit rather than asking
+// `FileType`, so an inverted or mistyped mask would reject every ordinary
+// delivery instead of just the redirecting ones. The Unix symlink tests
+// cannot see that: this one runs on every platform.
 #[test]
 fn ordinary_files_and_directories_are_not_treated_as_links() {
     let temp = tempfile::tempdir().unwrap();
