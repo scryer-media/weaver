@@ -236,7 +236,7 @@ async fn dispatch_method(
         "status" => status(ctx).await,
         "listgroups" => listgroups(ctx).await,
         "listfiles" => listfiles(ctx, params).await,
-        "history" => history(ctx).await,
+        "history" => history(ctx, params).await,
         // NZBGet distinguishes current values (`config`) from on-disk values
         // (`loadconfig`); weaver has a single live config. nzb360 reads its
         // category list from `loadconfig`.
@@ -1652,7 +1652,10 @@ fn record_submitted_category(
         && submitted != canonical
     {
         metadata.push((SUBMITTED_CATEGORY_KEY.to_string(), submitted.to_string()));
-        metadata.push((SUBMITTED_CATEGORY_FOR_KEY.to_string(), canonical.to_string()));
+        metadata.push((
+            SUBMITTED_CATEGORY_FOR_KEY.to_string(),
+            canonical.to_string(),
+        ));
     }
 }
 
@@ -1684,17 +1687,29 @@ fn attribute_value(attributes: &[Attribute], key: &str) -> Option<String> {
         .map(|attribute| attribute.value.clone())
 }
 
-async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
+async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
+    // history(Hidden): rows a client removed with HistoryDelete are listed
+    // only when the first parameter is true.
+    let include_hidden = optional_bool_param(&positional_params(params)?, 0)?.unwrap_or(false);
     let db = ctx.db.clone();
-    let rows = tokio::task::spawn_blocking(move || {
-        db.list_job_history(&HistoryFilter {
+    let (mut rows, facade_states) = tokio::task::spawn_blocking(move || {
+        let rows = db.list_job_history(&HistoryFilter {
             limit: Some(1000),
             ..HistoryFilter::default()
-        })
+        })?;
+        let ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
+        let states = db.nzbget_history_states(&ids)?;
+        Ok::<_, weaver_server_core::StateError>((rows, states))
     })
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
+    // A hidden row still shadows its in-memory terminal job below.
+    let persisted_ids = rows.iter().map(|row| row.job_id).collect::<HashSet<_>>();
+    let is_hidden = |job_id: u64| facade_states.get(&job_id).is_some_and(|state| state.hidden);
+    if !include_hidden {
+        rows.retain(|row| !is_hidden(row.job_id));
+    }
     let db = ctx.db.clone();
     let history_job_ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
     let post_processing_results = tokio::task::spawn_blocking(move || {
@@ -1741,19 +1756,12 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
     .unwrap_or_default();
 
-    let persisted_ids = rows.iter().map(|row| row.job_id).collect::<HashSet<_>>();
     let mut seen_terminal_ids = HashSet::with_capacity(terminal_items.len());
     let mut items = terminal_items
         .iter()
-        .filter(|(item, _)| {
-            !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id)
-        })
+        .filter(|(item, _)| !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id))
         .map(|(item, category)| {
-            nzbget_history_queue_item(
-                item,
-                category,
-                history_timings(stage_bounds.get(&item.id)),
-            )
+            nzbget_history_queue_item(item, category, history_timings(stage_bounds.get(&item.id)))
         })
         .collect::<Vec<_>>();
 
@@ -1788,11 +1796,19 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
                 row.category.as_deref(),
                 &weaver_server_core::history::parse_history_metadata(row.metadata.as_deref()),
             );
-            items.push(nzbget_history_item(
+            let mut entry = nzbget_history_item(
                 &item,
                 &category,
                 history_timings(stage_bounds.get(&row.job_id)),
-            ));
+            );
+            // NZBGet lists a history entry kept only for duplicate checks
+            // with Kind DUP.
+            if is_hidden(row.job_id)
+                && let Some(object) = entry.as_object_mut()
+            {
+                object.insert("Kind".to_string(), json!("DUP"));
+            }
+            items.push(entry);
         }
     }
     for item in &mut items {
@@ -2347,9 +2363,8 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
             "groupsetdupemode" => {
                 set_job_parameter(ctx, job_id, "nzbget.dupe_mode", &request.param).await
             }
-            "historydelete" | "historyfinaldelete" => {
-                ctx.handle.delete_history(job_id, false).await.map(|_| ())
-            }
+            "historydelete" => hide_history(ctx, job_id).await,
+            "historyfinaldelete" => ctx.handle.delete_history(job_id, false).await.map(|_| ()),
             "historyreturn" | "historyredownload" => ctx.handle.redownload_job(job_id).await,
             "historyprocess" => ctx.handle.reprocess_job(job_id).await,
             "historymarkgood" => mark_history_good(ctx, job_id).await,
@@ -2368,6 +2383,22 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     }
 
     Ok(json!(true))
+}
+
+// HistoryDelete hides the row from the client's default history listing but
+// keeps it, so duplicate checks still see the release. HistoryFinalDelete
+// erases it.
+async fn hide_history(ctx: &NzbgetFacadeContext, job_id: JobId) -> Result<(), SchedulerError> {
+    let db = ctx.db.clone();
+    let found = tokio::task::spawn_blocking(move || db.set_nzbget_history_hidden(job_id.0, true))
+        .await
+        .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
+        .map_err(SchedulerError::from)?;
+    if found {
+        Ok(())
+    } else {
+        Err(SchedulerError::JobNotFound(job_id))
+    }
 }
 
 async fn group_final_delete(

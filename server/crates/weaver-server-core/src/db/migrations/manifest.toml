@@ -649,3 +649,20 @@ kind = "sql"
 file = "migrations/0059_script_outputs_keep_runs/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 60
+description = "history rows hidden from NZBGet-compatible clients"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0060_nzbget_hidden_history/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0060_nzbget_hidden_history/postgres.sql"
+engine = "postgres"
+scope = "all"

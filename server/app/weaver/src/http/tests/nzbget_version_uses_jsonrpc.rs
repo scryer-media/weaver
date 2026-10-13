@@ -1903,7 +1903,7 @@ async fn nzbget_editqueue_maps_arr_actions() {
         app.clone(),
         serde_json::json!({
             "method": "editqueue",
-            "params": ["HistoryDelete", 0, "", 77],
+            "params": ["HistoryFinalDelete", 0, "", 77],
             "id": "history-delete"
         }),
         "Bearer control-key",
@@ -4118,4 +4118,116 @@ async fn loadextensions_reports_all_declared_kinds_and_event_metadata() {
     }
     assert_eq!(script["QueueEvents"], "NZB_DOWNLOADED,NZB_DELETED");
     assert_eq!(script["TaskTime"], "*:30;04:15");
+}
+
+fn history_ids(entries: &serde_json::Value) -> Vec<u64> {
+    entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["NZBID"].as_u64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn nzbget_history_delete_hides_the_row_and_final_delete_erases_it() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(501, "complete", 1_700_000_100, None))
+        .unwrap();
+    db.insert_job_history(&nzbget_history_row(502, "complete", 1_700_000_200, None))
+        .unwrap();
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let app = nzbget_test_router(
+        db.clone(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    // Sonarr removes an imported item with the pre-v13 shape and a scalar id.
+    let hidden = rpc_result(
+        app.clone(),
+        "editqueue",
+        serde_json::json!(["HistoryDelete", 0, "", 501]),
+    )
+    .await;
+    assert_eq!(hidden, true);
+
+    // The default listing and history(false) leave the hidden row out.
+    for params in [serde_json::json!([]), serde_json::json!([false])] {
+        let entries = rpc_result(app.clone(), "history", params).await;
+        assert_eq!(history_ids(&entries), vec![502]);
+    }
+    // history(true) lists it as a duplicate-check entry.
+    let entries = rpc_result(app.clone(), "history", serde_json::json!([true])).await;
+    let mut ids = history_ids(&entries);
+    ids.sort_unstable();
+    assert_eq!(ids, vec![501, 502]);
+    let hidden_entry = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["NZBID"] == 501)
+        .unwrap();
+    assert_eq!(hidden_entry["Kind"], "DUP");
+    // The row itself is untouched for the web UI and duplicate checks.
+    assert!(db.get_job_history(501).unwrap().is_some());
+
+    // HistoryFinalDelete, in the v13+ shape, erases the row outright.
+    let erased = rpc_result(
+        app.clone(),
+        "editqueue",
+        serde_json::json!(["HistoryFinalDelete", "", [501]]),
+    )
+    .await;
+    assert_eq!(erased, true);
+    assert!(db.get_job_history(501).unwrap().is_none());
+    let entries = rpc_result(app.clone(), "history", serde_json::json!([true])).await;
+    assert_eq!(history_ids(&entries), vec![502]);
+
+    // An id with no history row reports failure instead of hiding nothing.
+    let missing = rpc_result(
+        app,
+        "editqueue",
+        serde_json::json!(["HistoryDelete", 0, "", 999]),
+    )
+    .await;
+    assert_eq!(missing, false);
+}
+
+#[tokio::test]
+async fn nzbget_history_delete_survives_reopening_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("weaver.db");
+    {
+        let db = Database::open(&path).unwrap();
+        db.insert_job_history(&nzbget_history_row(601, "complete", 1_700_000_100, None))
+            .unwrap();
+        let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+        let app = nzbget_test_router(
+            db,
+            handle,
+            test_config(),
+            api_key_cache("control-key", "control"),
+        );
+        let hidden = rpc_result(
+            app,
+            "editqueue",
+            serde_json::json!(["HistoryDelete", 0, "", 601]),
+        )
+        .await;
+        assert_eq!(hidden, true);
+    }
+    let db = Database::open(&path).unwrap();
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let app = nzbget_test_router(
+        db,
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let entries = rpc_result(app.clone(), "history", serde_json::json!([])).await;
+    assert!(history_ids(&entries).is_empty());
+    let entries = rpc_result(app, "history", serde_json::json!([true])).await;
+    assert_eq!(history_ids(&entries), vec![601]);
 }

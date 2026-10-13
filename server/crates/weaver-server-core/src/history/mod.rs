@@ -1,6 +1,7 @@
 pub mod attributes;
 pub mod delete_queue;
 pub mod model;
+pub mod nzbget_state;
 pub mod persistence;
 pub mod queries;
 pub mod record;
@@ -12,5 +13,6 @@ pub use attributes::{
     public_history_attributes, split_history_metadata,
 };
 pub use model::{HistoryFilter, HistoryMetadataEquals};
+pub use nzbget_state::NzbgetHistoryState;
 pub use record::{IntegrationEventRow, JobHistoryRow};
 pub use timeline::JobEvent;
