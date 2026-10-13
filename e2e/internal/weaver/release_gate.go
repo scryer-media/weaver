@@ -154,6 +154,7 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 	advancedNetworkingPartition("routes", []string{"network-ladders.spec.ts", "network-sessions.spec.ts", "network-rss.spec.ts"}, false),
 	advancedNetworkingPartition("pools", []string{"network-pools.spec.ts"}, false),
 	advancedNetworkingPartition("pool-reselection", []string{"network-pools.spec.ts"}, false),
+	speedTestReleaseFlow(),
 	advancedNetworkingNoNetRawReleaseFlow(),
 	advancedNetworkingExtendedReleaseFlow(),
 	eventScriptsReleaseFlow(),

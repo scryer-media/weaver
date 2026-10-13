@@ -352,6 +352,7 @@ func TestAdvancedNetworkingTimeScaleReachesOnlyItsFlows(t *testing.T) {
 		"advanced-networking-pools":            true,
 		"advanced-networking-pool-reselection": true,
 		"advanced-networking-no-net-raw":       true,
+		"speed-test":                           true,
 	}
 	t.Setenv("E2E_WEAVER_NETWORK_TIME_SCALE", "99")
 	for _, spec := range weaverReleaseFlowSpecs {

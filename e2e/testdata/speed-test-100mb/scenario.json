@@ -1,0 +1,12 @@
+{
+  "slug": "speed-test-100mb",
+  "title": "E2E.Test.SpeedTest.100MB-TESTGRP",
+  "description": "The Usenet speed test's reference posting: a 100 MB member in four 25 MiB RAR5 volumes with a 10% PAR2 set, posted at the 700 KiB article size the public reference set uses.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 716800,
+  "expectedOutputBLAKE3": {
+    "100MB-explanation.txt": "bc297ac4b80f7e12430672b4d98ea63650accffc81c178550b8fe38aacdf8c1a",
+    "100MB.bin": "921e2c4464b25d66a7417f7cad7cdb08a7bef38e290d7b380a12e8bb3f382423"
+  }
+}
