@@ -65,6 +65,31 @@
               Condition="NOT Installed AND UILevel &gt;= 4" />
     </InstallExecuteSequence>
 
+    <!-- A major upgrade removes the old product only after the new package's InstallValidate
+         has checked for files in use. With the old tray (and the server it supervises) still
+         running, that check raises the "applications should be closed" prompt from a hidden
+         msiexec window, so the in-app and MSI upgrades look frozen, and a silent upgrade
+         leaves the old binaries running. The old product's own StopTrayBeforeRemoval runs too
+         late to help, so locate the installed tray and ask it to shut down before validation.
+         The tray's shutdown command returns success when no tray is running. -->
+    <Property Id="INSTALLEDTRAYEXE">
+      <DirectorySearch Id="InstalledWeaverFolder" Path="[ProgramFiles64Folder]Scryer Media\Weaver">
+        <FileSearch Id="InstalledWeaverTrayExe" Name="weaver-tray.exe" />
+      </DirectorySearch>
+    </Property>
+    <CustomAction
+        Id="StopInstalledTrayBeforeValidate"
+        Property="INSTALLEDTRAYEXE"
+        ExeCommand="--shutdown"
+        Execute="immediate"
+        Return="ignore"
+        Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="StopInstalledTrayBeforeValidate"
+              Before="InstallValidate"
+              Condition="WIX_UPGRADE_DETECTED AND INSTALLEDTRAYEXE" />
+    </InstallExecuteSequence>
+
     <!-- These commands affect only the uninstalling user: their HKCU Run entry, the
          tray process they own, and their Weaver profile. -->
     <CustomAction
