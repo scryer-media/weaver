@@ -626,71 +626,191 @@ async fn nzbget_append_accepts_base64_payload_with_embedded_whitespace() {
     assert_eq!(handle.list_jobs().len(), 1);
 }
 
-#[tokio::test]
-async fn nzbget_append_canonicalizes_submitted_category_for_facade() {
+fn tv_category_config() -> SharedConfig {
+    let config = test_config();
+    config
+        .try_write()
+        .unwrap()
+        .categories
+        .push(weaver_server_core::categories::CategoryConfig {
+            id: 1,
+            name: "TV".into(),
+            dest_dir: None,
+            aliases: "sonarr, tv-*".into(),
+        });
+    config
+}
+
+async fn append_with_category(app: Router, release: &str, category: &str) -> u64 {
     use base64::Engine as _;
 
-    let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_mock_commands(vec![]);
-    let config = test_config();
-    {
-        let mut config_write = config.write().await;
-        config_write
-            .categories
-            .push(weaver_server_core::categories::CategoryConfig {
-                id: 1,
-                name: "TV".into(),
-                dest_dir: None,
-                aliases: String::new(),
-            });
-    }
-    let app = nzbget_test_router(
-        db,
-        handle.clone(),
-        config,
-        api_key_cache("control-key", "control"),
-    );
-    let nzb_b64 =
-        base64::engine::general_purpose::STANDARD.encode(minimal_nzb("Case.Category.Release"));
-
+    let nzb_b64 = base64::engine::general_purpose::STANDARD.encode(minimal_nzb(release));
     let (status, payload) = post_nzbget(
-        app.clone(),
+        app,
         serde_json::json!({
             "method": "append",
             "params": [
-                "Case.Category.Release.nzb",
+                format!("{release}.nzb"),
                 nzb_b64,
-                "tv",
+                category,
                 0,
                 false,
                 false,
                 "",
                 0,
                 "all",
-                ["drone", "case-category"]
+                ["drone", release]
             ],
             "id": "append-category"
         }),
         "Bearer control-key",
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    payload["result"].as_u64().unwrap()
+}
 
-    assert_eq!(status, StatusCode::OK);
-    assert!(payload["result"].as_u64().unwrap() >= 10_000);
-    assert_eq!(handle.list_jobs()[0].category.as_deref(), Some("TV"));
-
-    let (status, groups_payload) = post_nzbget(
+async fn rpc_result(app: Router, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let (status, payload) = post_nzbget(
         app,
-        serde_json::json!({
-            "method": "listgroups",
-            "params": [],
-            "id": "listgroups"
-        }),
+        serde_json::json!({ "method": method, "params": params, "id": method }),
         "Bearer control-key",
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(groups_payload["result"][0]["Category"], "TV");
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert!(payload.get("error").is_none(), "{payload}");
+    payload["result"].clone()
+}
+
+fn category_of(entries: &serde_json::Value, id: u64) -> String {
+    entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["NZBID"] == id)
+        .unwrap_or_else(|| panic!("{id} missing from {entries}"))["Category"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn nzbget_append_echoes_submitted_category_while_routing_by_the_configured_one() {
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        tv_category_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    // Each spelling an *arr app may be configured with: a case variant of the
+    // configured name, a literal alias, a glob alias, and the name itself.
+    let mut submitted = Vec::new();
+    for (release, category) in [
+        ("Lower.Case", "tv"),
+        ("Mixed.Case", "Tv"),
+        ("Literal.Alias", "sonarr"),
+        ("Glob.Alias", "tv-uhd"),
+        ("Exact.Name", "TV"),
+    ] {
+        let id = append_with_category(app.clone(), release, category).await;
+        submitted.push((id, category));
+    }
+
+    // Routing, output folders and scripts keep using the configured category.
+    for job in handle.list_jobs() {
+        assert_eq!(job.category.as_deref(), Some("TV"), "{}", job.name);
+    }
+    // The client sees exactly the string it sent, which is what its
+    // case-sensitive queue filter compares against.
+    let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+    for (id, category) in &submitted {
+        assert_eq!(category_of(&groups, *id), *category);
+    }
+    // The label stays internal: it is not one of the job's parameters.
+    for group in groups.as_array().unwrap() {
+        for parameter in group["Parameters"].as_array().unwrap() {
+            assert!(
+                !parameter["Name"].as_str().unwrap().contains("weaver."),
+                "{parameter}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn nzbget_category_echo_survives_into_history_and_follows_group_set_category() {
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let app = nzbget_test_router(
+        db,
+        handle.clone(),
+        tv_category_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let recategorised = append_with_category(app.clone(), "Recategorised", "Movies").await;
+    let archived = append_with_category(app.clone(), "Archived", "tv").await;
+
+    // GroupSetCategory resolves like append and echoes the new string.
+    assert_eq!(
+        rpc_result(
+            app.clone(),
+            "editqueue",
+            serde_json::json!(["GroupSetCategory", 0, "sonarr", recategorised]),
+        )
+        .await,
+        true
+    );
+    let job = handle
+        .list_jobs()
+        .into_iter()
+        .find(|job| job.job_id.0 == recategorised)
+        .unwrap();
+    assert_eq!(job.category.as_deref(), Some("TV"));
+    let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+    assert_eq!(category_of(&groups, recategorised), "sonarr");
+
+    // The history row carries the label the job was submitted with.
+    assert_eq!(
+        rpc_result(
+            app.clone(),
+            "editqueue",
+            serde_json::json!(["GroupDelete", 0, "", archived]),
+        )
+        .await,
+        true
+    );
+    let history = rpc_result(app.clone(), "history", serde_json::json!([])).await;
+    assert_eq!(category_of(&history, archived), "tv");
+}
+
+#[tokio::test]
+async fn nzbget_category_label_yields_once_the_job_is_recategorised_elsewhere() {
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        tv_category_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let id = append_with_category(app.clone(), "Moved.Elsewhere", "tv").await;
+
+    // A recategorisation from the web UI changes the category but not the
+    // facade's label; the label must not keep claiming the old category.
+    handle
+        .update_job(
+            weaver_server_core::JobId(id),
+            weaver_server_core::JobUpdate {
+                category: weaver_server_core::FieldUpdate::Set("Movies".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let groups = rpc_result(app, "listgroups", serde_json::json!([])).await;
+    assert_eq!(category_of(&groups, id), "Movies");
 }
 
 #[tokio::test]

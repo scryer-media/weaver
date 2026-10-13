@@ -925,6 +925,20 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
             metadata.push((name.clone(), value.clone()));
         }
     }
+    // An unresolvable category is refused by the submission itself; only a
+    // category that resolves carries a label.
+    let canonical_category = weaver_server_core::ingest::resolve_submission_category(
+        &ctx.config,
+        request.category.as_deref(),
+    )
+    .await
+    .ok()
+    .flatten();
+    record_submitted_category(
+        &mut metadata,
+        request.category.as_deref(),
+        canonical_category.as_deref(),
+    );
     if is_http_url(&request.content_or_url) {
         metadata.push((
             weaver_server_core::post_processing::scan::SOURCE_URL_KEY.into(),
@@ -1434,14 +1448,19 @@ async fn listgroups(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .handle
         .list_jobs()
         .iter()
-        .map(queue_item_from_job)
-        .filter(|item| {
+        .map(|job| (queue_item_from_job(job), job))
+        .filter(|(item, _)| {
             !matches!(
                 item.state,
                 QueueItemState::Completed | QueueItemState::Failed
             )
         })
-        .map(|item| nzbget_group(&item))
+        .map(|(item, job)| {
+            nzbget_group(
+                &item,
+                &reported_category(job.category.as_deref(), &job.metadata),
+            )
+        })
         .collect::<Vec<_>>();
     Ok(Value::Array(groups))
 }
@@ -1455,7 +1474,7 @@ fn nzbget_release_name<'a>(original_title: &'a str, fallback_name: &'a str) -> &
     }
 }
 
-fn nzbget_group(item: &QueueItem) -> Value {
+fn nzbget_group(item: &QueueItem, category: &str) -> Value {
     let total = item.total_bytes;
     let downloaded = item.downloaded_bytes;
     let remaining = total.saturating_sub(downloaded);
@@ -1486,7 +1505,7 @@ fn nzbget_group(item: &QueueItem) -> Value {
         "NZBFilename": release_name,
         "DestDir": output_dir,
         "FinalDir": output_dir,
-        "Category": item.category.clone().unwrap_or_default(),
+        "Category": category,
         "FileSizeLo": file_lo,
         "FileSizeHi": file_hi,
         "FileSizeMB": bytes_to_mib(total),
@@ -1610,6 +1629,54 @@ fn critical_health(item: &QueueItem) -> u64 {
     (payload * 1000) / item.total_bytes
 }
 
+// The category string an NZBGet client submitted, kept beside the canonical
+// category it resolved to. NZBGet clients match their downloads by exact,
+// case-sensitive category equality, so the facade reports the string the
+// client sent while routing keeps using the configured category. The second
+// key pins which canonical category the label belongs to: once the job is
+// recategorised by any other path the label no longer speaks for it.
+const SUBMITTED_CATEGORY_KEY: &str = "weaver.nzbget.category";
+const SUBMITTED_CATEGORY_FOR_KEY: &str = "weaver.nzbget.category_for";
+
+// Replace the submitted-category label in `metadata` for a job whose
+// canonical category is `canonical`. A label equal to the canonical name
+// needs no entry.
+fn record_submitted_category(
+    metadata: &mut Vec<(String, String)>,
+    submitted: Option<&str>,
+    canonical: Option<&str>,
+) {
+    metadata.retain(|(key, _)| key != SUBMITTED_CATEGORY_KEY && key != SUBMITTED_CATEGORY_FOR_KEY);
+    let submitted = submitted.map(str::trim).filter(|value| !value.is_empty());
+    if let (Some(submitted), Some(canonical)) = (submitted, canonical)
+        && submitted != canonical
+    {
+        metadata.push((SUBMITTED_CATEGORY_KEY.to_string(), submitted.to_string()));
+        metadata.push((SUBMITTED_CATEGORY_FOR_KEY.to_string(), canonical.to_string()));
+    }
+}
+
+// The category the facade reports for a job: the string the client
+// submitted when it still belongs to the job's category, otherwise the
+// canonical category.
+fn reported_category(category: Option<&str>, metadata: &[(String, String)]) -> String {
+    let lookup = |wanted: &str| {
+        metadata
+            .iter()
+            .rev()
+            .find(|(key, _)| key == wanted)
+            .map(|(_, value)| value.as_str())
+    };
+    match (
+        category,
+        lookup(SUBMITTED_CATEGORY_KEY),
+        lookup(SUBMITTED_CATEGORY_FOR_KEY),
+    ) {
+        (Some(category), Some(label), Some(owner)) if owner == category => label.to_string(),
+        (category, _, _) => category.unwrap_or_default().to_string(),
+    }
+}
+
 fn attribute_value(attributes: &[Attribute], key: &str) -> Option<String> {
     attributes
         .iter()
@@ -1647,8 +1714,13 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         .handle
         .list_jobs()
         .iter()
-        .map(queue_item_from_job)
-        .filter(|item| {
+        .map(|job| {
+            (
+                queue_item_from_job(job),
+                reported_category(job.category.as_deref(), &job.metadata),
+            )
+        })
+        .filter(|(item, _)| {
             matches!(
                 item.state,
                 QueueItemState::Completed | QueueItemState::Failed
@@ -1658,7 +1730,7 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
 
     let ids: Vec<u64> = terminal_items
         .iter()
-        .map(|item| item.id)
+        .map(|(item, _)| item.id)
         .chain(rows.iter().map(|row| row.job_id))
         .collect();
     let db = ctx.db.clone();
@@ -1673,8 +1745,16 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     let mut seen_terminal_ids = HashSet::with_capacity(terminal_items.len());
     let mut items = terminal_items
         .iter()
-        .filter(|item| !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id))
-        .map(|item| nzbget_history_queue_item(item, history_timings(stage_bounds.get(&item.id))))
+        .filter(|(item, _)| {
+            !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id)
+        })
+        .map(|(item, category)| {
+            nzbget_history_queue_item(
+                item,
+                category,
+                history_timings(stage_bounds.get(&item.id)),
+            )
+        })
         .collect::<Vec<_>>();
 
     // DB-row-derived entries are the immutable-parse path: a history row's
@@ -1704,8 +1784,13 @@ async fn history(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
                 cache.insert(row.job_id, (row.completed_at, item.clone()));
                 item
             });
+            let category = reported_category(
+                row.category.as_deref(),
+                &weaver_server_core::history::parse_history_metadata(row.metadata.as_deref()),
+            );
             items.push(nzbget_history_item(
                 &item,
+                &category,
                 history_timings(stage_bounds.get(&row.job_id)),
             ));
         }
@@ -1867,7 +1952,7 @@ fn history_statuses(cancelled: bool, failed: bool) -> HistoryStatuses {
 fn nzbget_history_entry(
     id: u64,
     name: &str,
-    category: Option<&str>,
+    category: &str,
     total_bytes: u64,
     output_dir: &str,
     history_time: i64,
@@ -1888,7 +1973,7 @@ fn nzbget_history_entry(
         "NZBName": name,
         "NZBNicename": name,
         "NZBFilename": name,
-        "Category": category.unwrap_or_default(),
+        "Category": category,
         "FileSizeLo": file_lo,
         "FileSizeHi": file_hi,
         "FileSizeMB": bytes_to_mib(total_bytes),
@@ -1920,7 +2005,11 @@ fn nzbget_history_entry(
     })
 }
 
-fn nzbget_history_item(item: &weaver_server_api::HistoryItem, timings: HistoryTimings) -> Value {
+fn nzbget_history_item(
+    item: &weaver_server_api::HistoryItem,
+    category: &str,
+    timings: HistoryTimings,
+) -> Value {
     let cancelled = item
         .attention
         .as_ref()
@@ -1929,7 +2018,7 @@ fn nzbget_history_item(item: &weaver_server_api::HistoryItem, timings: HistoryTi
     nzbget_history_entry(
         item.id,
         nzbget_release_name(&item.original_title, &item.name),
-        item.category.as_deref(),
+        category,
         item.total_bytes,
         &item.output_dir.clone().unwrap_or_default(),
         item.completed_at.timestamp(),
@@ -1942,12 +2031,12 @@ fn nzbget_history_item(item: &weaver_server_api::HistoryItem, timings: HistoryTi
     )
 }
 
-fn nzbget_history_queue_item(item: &QueueItem, timings: HistoryTimings) -> Value {
+fn nzbget_history_queue_item(item: &QueueItem, category: &str, timings: HistoryTimings) -> Value {
     let failed = item.state == QueueItemState::Failed;
     nzbget_history_entry(
         item.id,
         nzbget_release_name(&item.original_title, &item.name),
-        item.category.as_deref(),
+        category,
         item.total_bytes,
         &item.output_dir.clone().unwrap_or_default(),
         // Stable per-poll timestamp. Using unix_now_secs() here made HistoryTime
@@ -2331,14 +2420,18 @@ async fn reorder_groups(
 async fn set_job_category(
     ctx: &NzbgetFacadeContext,
     job_id: JobId,
-    category: &str,
+    requested: &str,
 ) -> Result<(), SchedulerError> {
     let category =
-        weaver_server_core::ingest::resolve_submission_category(&ctx.config, Some(category))
+        weaver_server_core::ingest::resolve_submission_category(&ctx.config, Some(requested))
             .await
             .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?;
+    let mut metadata = ctx.handle.get_job(job_id)?.metadata;
+    let submitted = category.as_ref().map(|_| requested);
+    record_submitted_category(&mut metadata, submitted, category.as_deref());
     let update = JobUpdate {
         category: category.map_or(FieldUpdate::Clear, FieldUpdate::Set),
+        metadata: FieldUpdate::Set(metadata),
         ..JobUpdate::default()
     };
     ctx.handle.update_job(job_id, update).await
@@ -2562,7 +2655,7 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
                     .checked_div(total)
                     .unwrap_or(1000),
                 "Priority": nzbget_priority(&item.attributes),
-                "Category": item.category.clone().unwrap_or_default(),
+                "Category": reported_category(info.category.as_deref(), &info.metadata),
             }));
         }
     }
