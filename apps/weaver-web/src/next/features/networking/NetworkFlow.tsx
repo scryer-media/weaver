@@ -172,6 +172,33 @@ function band(points: Point[], width: number) {
   return `M ${x} ${y - half} ${steps(points, -half)} L ${endX} ${endY + half} ${steps(back, half)} Z`;
 }
 
+// A route card draws one box per connection. A full row holds this many; more
+// connections wrap onto further rows of the same size instead of thinning the boxes.
+const CELLS_PER_ROW = 20;
+const CELL_ROW_PITCH = 13;
+const CELL_HEIGHT = 10;
+const MAX_CELLS = 100;
+const ENDPOINT_HEIGHT = 124;
+const ENDPOINT_GAP = 20;
+
+type EndpointCard = { cap: number; cells: number; rows: number; y: number; height: number };
+
+/** Where each route card sits, each as tall as its rows of connection boxes need. */
+function endpointCards(consumers: FlowConsumer[], legs: LegFlow[]): Map<string, EndpointCard> {
+  const cards = new Map<string, EndpointCard>();
+  let y = 58;
+  for (const consumer of consumers) {
+    const own = legs.filter((leg) => leg.consumer === consumer.key);
+    const cap = consumer.cap ?? own.reduce((sum, leg) => sum + leg.target, 0);
+    const cells = Math.min(cap, MAX_CELLS);
+    const rows = Math.max(1, Math.ceil(cells / CELLS_PER_ROW));
+    const height = ENDPOINT_HEIGHT + (rows - 1) * CELL_ROW_PITCH;
+    cards.set(consumer.key, { cap, cells, rows, y, height });
+    y += height + ENDPOINT_GAP;
+  }
+  return cards;
+}
+
 /** A linear map from [0, domain] onto [0, range], clamped at both ends. */
 function scale(domain: number, range: number) {
   return (value: number) => Math.max(0, Math.min(range, (value / Math.max(1, domain)) * range));
@@ -387,6 +414,8 @@ export function NetworkFlow({
     [egresses, flow.legs],
   );
   const grouped = !compact && (used.length > 6 || flow.legs.length > 40);
+  const cards = useMemo(() => endpointCards(consumers, flow.legs), [consumers, flow.legs]);
+  const cardsBottom = [...cards.values()].reduce((bottom, card) => Math.max(bottom, card.y + card.height), 0);
 
   const layout = useMemo(() => {
     const legs = flow.legs
@@ -450,9 +479,9 @@ export function NetworkFlow({
       offset += height + 18;
       return { leg, y, height, cardHeight, note, blocks, bypass, closed };
     });
-    const bottom = Math.max(offset - 16, used.length * 128 + 38, compact ? 0 : consumers.length * 144 + 38);
+    const bottom = Math.max(offset - 16, used.length * 128 + 38, compact ? 0 : cardsBottom);
     return { rows, height: compact ? bottom + 12 : Math.max(bottom + 52, 260) };
-  }, [flow.legs, flow.pools, filter, grouped, group, pools, profiles, used.length, consumers.length, lanes, compact]);
+  }, [flow.legs, flow.pools, filter, grouped, group, pools, profiles, used.length, cardsBottom, lanes, compact]);
 
   const width = scale(Math.max(1, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
   const profile = (id: number | null) => profiles.find((candidate) => candidate.id === id);
@@ -741,7 +770,7 @@ export function NetworkFlow({
 
           {layout.rows.map(({ leg, y, blocks, bypass, closed }) => {
             const egressY = 112 + Math.max(0, used.findIndex((egress) => egress.id === leg.egressId)) * 128;
-            const consumerY = 120 + Math.max(0, consumers.findIndex((consumer) => consumer.key === leg.consumer)) * 144;
+            const consumerY = (cards.get(leg.consumer)?.y ?? 58) + 62;
             const legY = y + LEG_HEIGHT / 2;
             const count = counts[legKey(leg)] ?? leg.open;
             const color = stateColor(leg.state);
@@ -976,16 +1005,15 @@ export function NetworkFlow({
           })}
 
           {ENDPOINTS
-            ? consumers.map((consumer, index) => {
+            ? consumers.map((consumer) => {
                 const legs = flow.legs.filter((leg) => leg.consumer === consumer.key);
-                const cap = consumer.cap ?? legs.reduce((sum, leg) => sum + leg.target, 0);
+                const { cap, cells, y, height } = cards.get(consumer.key)!;
                 const open = legs.reduce((sum, leg) => sum + (counts[legKey(leg)] ?? leg.open), 0);
                 const parked =
                   consumer.route?.failover === "HOLD" ? Math.max(0, cap - legs.reduce((sum, leg) => sum + leg.target, 0)) : 0;
-                const y = 58 + index * 144;
                 const down = legs.length > 0 && legs.every((leg) => leg.state === "DOWN" || leg.state === "BLOCKED");
-                const cells = Math.min(cap, 100);
-                const cellX = scale(Math.max(1, cells), 188);
+                // One row stretches across the card; past a full row the boxes keep their size and wrap.
+                const cellX = scale(Math.max(1, Math.min(cells, CELLS_PER_ROW)), 188);
                 const rss = consumer.key.startsWith("rss:");
                 const x = ENDPOINTS.x + 14;
                 return (
@@ -998,8 +1026,8 @@ export function NetworkFlow({
                       { kind: "route", consumer: consumer.key },
                       routePage(consumer.key),
                       <>
-                        <rect x={ENDPOINTS.x} y={y} width={ENDPOINTS.width} height="124" fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
-                        <StateBar x={ENDPOINTS.x} y={y} height={124} state={down ? "DOWN" : open > 0 ? "UP" : "IDLE"} />
+                        <rect x={ENDPOINTS.x} y={y} width={ENDPOINTS.width} height={height} fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
+                        <StateBar x={ENDPOINTS.x} y={y} height={height} state={down ? "DOWN" : open > 0 ? "UP" : "IDLE"} />
                         <text x={x} y={y + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
                           {consumer.name.slice(0, 24)}
                         </text>
@@ -1026,10 +1054,10 @@ export function NetworkFlow({
                           return (
                             <rect
                               key={cell}
-                              x={x + cellX(cell)}
-                              y={y + 98}
+                              x={x + cellX(cell % CELLS_PER_ROW)}
+                              y={y + 98 + Math.floor(cell / CELLS_PER_ROW) * CELL_ROW_PITCH}
                               width={Math.max(1, cellX(1) - 2)}
-                              height="10"
+                              height={CELL_HEIGHT}
                               fill={boundary < open ? INK.accent : "none"}
                               stroke={reserved ? INK.warn : INK.track}
                               strokeDasharray={reserved ? "2 2" : undefined}
