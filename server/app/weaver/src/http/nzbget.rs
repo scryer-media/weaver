@@ -18,7 +18,7 @@ use weaver_server_api::{
     submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
-use weaver_server_core::history::HistoryFailureKind;
+use weaver_server_core::history::{HistoryFailureKind, NzbgetMarkStatus};
 use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
@@ -1928,6 +1928,19 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
             {
                 object.insert("Kind".to_string(), json!("DUP"));
             }
+            if let Some(mark) = facade_states.get(&row.job_id).and_then(|state| state.mark)
+                && let Some(object) = entry.as_object_mut()
+            {
+                // The per-stage fields keep what happened; the mark only
+                // changes MarkStatus and the compound Status.
+                let status = match mark {
+                    NzbgetMarkStatus::Bad => "FAILURE/BAD",
+                    NzbgetMarkStatus::Good => "SUCCESS/GOOD",
+                    NzbgetMarkStatus::Success => "SUCCESS/MARK",
+                };
+                object.insert("MarkStatus".to_string(), json!(mark.as_str()));
+                object.insert("Status".to_string(), json!(status));
+            }
             items.push(entry);
         }
     }
@@ -2471,20 +2484,11 @@ fn parse_editqueue_params(params: Option<Value>) -> Result<EditQueueRequest, Rpc
 fn is_unsupported_editqueue_command(command: &str) -> bool {
     matches!(
         command,
-        // Anchor-relative moves and sorting have no weaver equivalent; the
-        // absolute moves (top/bottom/offset) map to the manual queue order.
-        "groupmovebefore" | "groupmoveafter" | "groupsort"
-        // Job renaming is not supported; names come from the NZB.
-        | "groupsetname" | "historysetname"
         // Weaver has no per-file scheduling surface.
-        | "filepause" | "fileresume" | "filedelete" | "filesetpriority" | "filemoveoffset"
+        "filepause" | "fileresume" | "filedelete" | "filesetpriority" | "filemoveoffset"
         | "filemovetop" | "filemovebottom" | "filepauseallpars" | "filepauseextrapars"
-        // History rows are immutable snapshots in weaver.
-        | "historysetcategory" | "historysetparameter" | "historysetdupekey"
-        | "historysetdupescore" | "historysetdupemode"
-        // Weaver's duplicate arbitration handles bad-marking through its own
-        // UI flow (candidate promotion), which this facade does not drive.
-        | "historymarkbad" | "historymarksuccess"
+        // Duplicate settings on a finished job have nothing left to steer.
+        | "historysetdupekey" | "historysetdupescore" | "historysetdupemode"
     )
 }
 
@@ -2493,6 +2497,10 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     let command = request.command.to_ascii_lowercase();
     if is_unsupported_editqueue_command(&command) {
         return Ok(json!(false));
+    }
+    // GroupSort with no ids sorts the whole queue.
+    if command == "groupsort" {
+        return sort_groups(ctx, &request).await;
     }
     if request.ids.is_empty() {
         return Ok(json!(false));
@@ -2507,6 +2515,12 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         "groupmovetop" | "groupmovebottom" | "groupmoveoffset" => {
             return reorder_groups(ctx, &request, &command).await;
         }
+        "groupmovebefore" | "groupmoveafter" => {
+            return move_groups_next_to(ctx, &request, command == "groupmoveafter").await;
+        }
+        "groupsetname" | "historysetname" if request.param.trim().is_empty() => {
+            return Ok(json!(false));
+        }
         _ => {}
     }
 
@@ -2514,8 +2528,16 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         let result = match command.as_str() {
             "grouppause" => ctx.handle.pause_job(job_id).await,
             "groupresume" => ctx.handle.resume_job(job_id).await,
-            "groupdelete" | "groupparkdelete" | "groupdupedelete" => {
-                ctx.handle.cancel_job(job_id).await
+            "groupdelete" => ctx.handle.cancel_job(job_id).await,
+            // A parked job keeps what it downloaded.
+            "groupparkdelete" => ctx.handle.cancel_job_keeping_files(job_id).await,
+            "groupdupedelete" => delete_as_duplicate(ctx, job_id).await,
+            "groupsetname" => {
+                let update = JobUpdate {
+                    name: Some(request.param.trim().to_string()),
+                    ..JobUpdate::default()
+                };
+                ctx.handle.update_job(job_id, update).await
             }
             "groupfinaldelete" => group_final_delete(ctx, job_id).await,
             "groupsetcategory" | "groupapplycategory" => {
@@ -2548,7 +2570,31 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
             "historyfinaldelete" => ctx.handle.delete_history(job_id, false).await.map(|_| ()),
             "historyreturn" | "historyredownload" => ctx.handle.redownload_job(job_id).await,
             "historyprocess" => ctx.handle.reprocess_job(job_id).await,
-            "historymarkgood" => mark_history_good(ctx, job_id).await,
+            "historymarkgood" => mark_history(ctx, job_id, NzbgetMarkStatus::Good).await,
+            "historymarkbad" => mark_history(ctx, job_id, NzbgetMarkStatus::Bad).await,
+            "historymarksuccess" => mark_history(ctx, job_id, NzbgetMarkStatus::Success).await,
+            // Weaver cannot fetch only the articles that failed, so a retry
+            // fetches the job again.
+            "historyretryfailed" => ctx.handle.redownload_job(job_id).await,
+            "historysetname" => {
+                let update = JobUpdate {
+                    name: Some(request.param.trim().to_string()),
+                    ..JobUpdate::default()
+                };
+                update_history(ctx, job_id, update).await
+            }
+            "historysetcategory" => set_history_category(ctx, job_id, &request.param).await,
+            "historysetparameter" => {
+                let (name, value) = request.param.split_once('=').ok_or_else(|| {
+                    RpcError::invalid_parameter("HistorySetParameter expects Name=Value")
+                })?;
+                // A finished job's password belongs to the reprocess that
+                // uses it, not to its stored parameters.
+                if name.trim().eq_ignore_ascii_case("*Unpack:Password") {
+                    return Ok(json!(false));
+                }
+                set_history_parameter(ctx, job_id, name, value).await
+            }
             other => return Err(RpcError::invalid_action(other)),
         };
         match result {
@@ -2696,25 +2742,32 @@ async fn set_job_parameter(
     if name.is_empty() {
         return Ok(());
     }
-    // NZBGet exposes the drone id as a plain post-processing parameter, but
-    // weaver stores it under the canonical client-request-id metadata key.
-    let key = if name.eq_ignore_ascii_case("drone") {
-        CLIENT_REQUEST_ID_ATTRIBUTE_KEY
+    let key = parameter_metadata_key(name)?;
+    let value = parameter_metadata_value(name, value);
+    let update = if value.is_empty() { None } else { Some(value) };
+    upsert_job_metadata(ctx, job_id, key, update).await
+}
+
+// NZBGet exposes the drone id as a plain post-processing parameter, but
+// weaver stores it under the canonical client-request-id metadata key.
+fn parameter_metadata_key(name: &str) -> Result<&str, SchedulerError> {
+    if name.eq_ignore_ascii_case("drone") {
+        Ok(CLIENT_REQUEST_ID_ATTRIBUTE_KEY)
+    } else if weaver_server_core::is_public_history_attribute_key(name) {
+        Ok(name)
     } else {
-        if !weaver_server_core::is_public_history_attribute_key(name) {
-            return Err(SchedulerError::InvalidInput(
-                "reserved parameter name".into(),
-            ));
-        }
-        name
-    };
-    let value = if name.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY) {
+        Err(SchedulerError::InvalidInput(
+            "reserved parameter name".into(),
+        ))
+    }
+}
+
+fn parameter_metadata_value(name: &str, value: &str) -> String {
+    if name.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY) {
         normalize_priority_value(value).unwrap_or_else(|_| value.to_string())
     } else {
         value.to_string()
-    };
-    let update = if value.is_empty() { None } else { Some(value) };
-    upsert_job_metadata(ctx, job_id, key, update).await
+    }
 }
 
 // Replace (or remove, when `value` is None) one metadata entry on a job,
@@ -2737,17 +2790,324 @@ async fn upsert_job_metadata(
     ctx.handle.update_job(job_id, update).await
 }
 
-async fn mark_history_good(ctx: &NzbgetFacadeContext, job_id: JobId) -> Result<(), SchedulerError> {
+async fn mark_history(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+    mark: NzbgetMarkStatus,
+) -> Result<(), SchedulerError> {
+    if !history_row_exists(ctx, job_id).await? {
+        return Err(SchedulerError::JobNotFound(job_id));
+    }
     let db = ctx.db.clone();
-    // A missing semantic candidate is not an error: NZBGet lets any history
-    // item be marked good, and for ordinary items there is nothing to record.
+    // A missing duplicate candidate is not an error: NZBGet lets any history
+    // item be marked, and for ordinary items only the mark is recorded.
     tokio::task::spawn_blocking(move || {
-        weaver_server_core::post_processing::hooks::mark_history_good(&db, job_id)
+        weaver_server_core::post_processing::hooks::mark_history(&db, job_id, mark)
     })
     .await
     .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
     .map_err(SchedulerError::from)?;
     Ok(())
+}
+
+async fn history_row(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+) -> Result<Option<weaver_server_core::JobHistoryRow>, SchedulerError> {
+    let db = ctx.db.clone();
+    tokio::task::spawn_blocking(move || db.get_job_history(job_id.0))
+        .await
+        .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
+        .map_err(SchedulerError::from)
+}
+
+async fn history_row_exists(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+) -> Result<bool, SchedulerError> {
+    Ok(history_row(ctx, job_id).await?.is_some())
+}
+
+async fn update_history(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+    update: JobUpdate,
+) -> Result<(), SchedulerError> {
+    let result = ctx.handle.update_history(job_id, update).await;
+    // The parsed row is memoized by completion time, which an edit leaves
+    // alone.
+    ctx.history_cache.lock().await.remove(&job_id.0);
+    result
+}
+
+async fn set_history_category(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+    requested: &str,
+) -> Result<(), SchedulerError> {
+    let Some(row) = history_row(ctx, job_id).await? else {
+        return Err(SchedulerError::JobNotFound(job_id));
+    };
+    let category =
+        weaver_server_core::ingest::resolve_submission_category(&ctx.config, Some(requested))
+            .await
+            .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?;
+    let mut metadata = weaver_server_core::history::parse_history_metadata(row.metadata.as_deref());
+    let submitted = category.as_ref().map(|_| requested);
+    record_submitted_category(&mut metadata, submitted, category.as_deref());
+    let update = JobUpdate {
+        category: category.map_or(FieldUpdate::Clear, FieldUpdate::Set),
+        metadata: FieldUpdate::Set(metadata),
+        ..JobUpdate::default()
+    };
+    update_history(ctx, job_id, update).await
+}
+
+async fn set_history_parameter(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+    name: &str,
+    value: &str,
+) -> Result<(), SchedulerError> {
+    let Some(row) = history_row(ctx, job_id).await? else {
+        return Err(SchedulerError::JobNotFound(job_id));
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+    let key = parameter_metadata_key(name)?;
+    let mut metadata = weaver_server_core::history::parse_history_metadata(row.metadata.as_deref());
+    metadata.retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
+    let value = parameter_metadata_value(name, value);
+    if !value.is_empty() {
+        metadata.push((key.to_string(), value));
+    }
+    let update = JobUpdate {
+        metadata: FieldUpdate::Set(metadata),
+        ..JobUpdate::default()
+    };
+    update_history(ctx, job_id, update).await
+}
+
+// GroupDupeDelete: the job is removed and its history row says it was
+// removed as a duplicate.
+async fn delete_as_duplicate(
+    ctx: &NzbgetFacadeContext,
+    job_id: JobId,
+) -> Result<(), SchedulerError> {
+    ctx.handle.cancel_job(job_id).await?;
+    let db = ctx.db.clone();
+    // The cancel archives the row before it answers.
+    tokio::task::spawn_blocking(move || {
+        db.set_history_failure_kind(job_id.0, Some(HistoryFailureKind::Duplicate))
+    })
+    .await
+    .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
+    .map_err(SchedulerError::from)?;
+    ctx.history_cache.lock().await.remove(&job_id.0);
+    Ok(())
+}
+
+// The live queue in listing order, with each job's reported category.
+fn queue_order(ctx: &NzbgetFacadeContext) -> Vec<(QueueItem, String)> {
+    ctx.handle
+        .list_jobs()
+        .iter()
+        .map(|job| {
+            (
+                queue_item_from_job(job),
+                reported_category(job.category.as_deref(), &job.metadata),
+            )
+        })
+        .filter(|(item, _)| {
+            !matches!(
+                item.state,
+                QueueItemState::Completed | QueueItemState::Failed
+            )
+        })
+        .collect()
+}
+
+// The offset moves that turn `current` into `target`, applied in order the
+// way the scheduler applies a batch of moves.
+fn moves_to_reach(
+    current: &[JobId],
+    target: &[JobId],
+) -> Vec<(JobId, weaver_server_core::QueueMoveTarget)> {
+    let mut order = current.to_vec();
+    let mut moves = Vec::new();
+    for (index, job_id) in target.iter().enumerate() {
+        let Some(position) = order.iter().position(|id| id == job_id) else {
+            continue;
+        };
+        if position == index {
+            continue;
+        }
+        let id = order.remove(position);
+        order.insert(index, id);
+        moves.push((
+            *job_id,
+            weaver_server_core::QueueMoveTarget::Offset(index as i64 - position as i64),
+        ));
+    }
+    moves
+}
+
+async fn apply_queue_order(
+    ctx: &NzbgetFacadeContext,
+    current: &[JobId],
+    target: &[JobId],
+    command: &str,
+) -> Result<Value, RpcError> {
+    let moves = moves_to_reach(current, target);
+    if moves.is_empty() {
+        return Ok(json!(true));
+    }
+    match ctx.handle.reorder_jobs(moves).await {
+        Ok(()) => Ok(json!(true)),
+        Err(SchedulerError::JobNotFound(_)) => Ok(json!(false)),
+        Err(error) => Err(RpcError::invalid_parameter(format!(
+            "{command} failed: {error}"
+        ))),
+    }
+}
+
+// GroupMoveBefore / GroupMoveAfter: the listed jobs, in the order given, land
+// next to the job named by Param.
+async fn move_groups_next_to(
+    ctx: &NzbgetFacadeContext,
+    request: &EditQueueRequest,
+    after: bool,
+) -> Result<Value, RpcError> {
+    let Ok(anchor) = request.param.trim().parse::<u64>().map(JobId) else {
+        return Ok(json!(false));
+    };
+    let current = queue_order(ctx)
+        .into_iter()
+        .map(|(item, _)| JobId(item.id))
+        .collect::<Vec<_>>();
+    let mut moved = Vec::new();
+    for job_id in &request.ids {
+        if *job_id == anchor || moved.contains(job_id) {
+            continue;
+        }
+        if !current.contains(job_id) {
+            return Ok(json!(false));
+        }
+        moved.push(*job_id);
+    }
+    let mut target = current
+        .iter()
+        .copied()
+        .filter(|id| !moved.contains(id))
+        .collect::<Vec<_>>();
+    let Some(anchor_index) = target.iter().position(|id| *id == anchor) else {
+        return Ok(json!(false));
+    };
+    let insert_at = if after {
+        anchor_index + 1
+    } else {
+        anchor_index
+    };
+    target.splice(insert_at..insert_at, moved);
+    apply_queue_order(ctx, &current, &target, &request.command).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortDirection {
+    Ascending,
+    Descending,
+    // No suffix: ascending, unless the jobs already are, then descending.
+    Toggle,
+}
+
+// GroupSort: Param names the key (name, size, left, priority, category, age)
+// with an optional + (ascending) or - (descending). The listed jobs, or the
+// whole queue when none are listed, are sorted within the places they hold.
+// Ascending is A to Z for name and category, smallest first for size and
+// left, highest first for priority, and newest first for age.
+async fn sort_groups(
+    ctx: &NzbgetFacadeContext,
+    request: &EditQueueRequest,
+) -> Result<Value, RpcError> {
+    let param = request.param.trim().to_ascii_lowercase();
+    let (key, direction) = if let Some(key) = param.strip_suffix('+') {
+        (key, SortDirection::Ascending)
+    } else if let Some(key) = param.strip_suffix('-') {
+        (key, SortDirection::Descending)
+    } else {
+        (param.as_str(), SortDirection::Toggle)
+    };
+    if !matches!(
+        key,
+        "name" | "size" | "left" | "priority" | "category" | "age"
+    ) {
+        return Ok(json!(false));
+    }
+    let queue = queue_order(ctx);
+    let current = queue
+        .iter()
+        .map(|(item, _)| JobId(item.id))
+        .collect::<Vec<_>>();
+    let selected = |id: u64| request.ids.is_empty() || request.ids.contains(&JobId(id));
+    let mut picked = queue
+        .iter()
+        .filter(|(item, _)| selected(item.id))
+        .collect::<Vec<_>>();
+    if picked.len() != request.ids.len() && !request.ids.is_empty() {
+        return Ok(json!(false));
+    }
+    let compare = |left: &&(QueueItem, String), right: &&(QueueItem, String)| {
+        let (left, left_category) = left;
+        let (right, right_category) = right;
+        let ordering = match key {
+            "name" => nzbget_release_name(&left.original_title, &left.name)
+                .to_lowercase()
+                .cmp(&nzbget_release_name(&right.original_title, &right.name).to_lowercase()),
+            "size" => left.total_bytes.cmp(&right.total_bytes),
+            "left" => left
+                .total_bytes
+                .saturating_sub(left.downloaded_bytes)
+                .cmp(&right.total_bytes.saturating_sub(right.downloaded_bytes)),
+            "priority" => {
+                nzbget_priority(&right.attributes).cmp(&nzbget_priority(&left.attributes))
+            }
+            "category" => left_category
+                .to_lowercase()
+                .cmp(&right_category.to_lowercase()),
+            "age" => right.created_at.cmp(&left.created_at),
+            _ => return None,
+        };
+        Some(ordering)
+    };
+    let ascending_order = |picked: &mut Vec<&(QueueItem, String)>| {
+        picked.sort_by(|left, right| compare(left, right).unwrap_or(std::cmp::Ordering::Equal));
+    };
+    let already_ascending = picked
+        .windows(2)
+        .all(|pair| compare(&pair[0], &pair[1]) != Some(std::cmp::Ordering::Greater));
+    ascending_order(&mut picked);
+    let descending = match direction {
+        SortDirection::Ascending => false,
+        SortDirection::Descending => true,
+        SortDirection::Toggle => already_ascending,
+    };
+    if descending {
+        picked.reverse();
+    }
+    let mut sorted = picked.into_iter().map(|(item, _)| JobId(item.id));
+    let target = current
+        .iter()
+        .map(|id| {
+            if selected(id.0) {
+                sorted.next().unwrap_or(*id)
+            } else {
+                *id
+            }
+        })
+        .collect::<Vec<_>>();
+    apply_queue_order(ctx, &current, &target, &request.command).await
 }
 
 // Synthetic per-file IDs live above the NZBID range so they never collide

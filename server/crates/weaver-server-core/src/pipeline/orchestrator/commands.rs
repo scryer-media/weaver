@@ -59,9 +59,7 @@ impl Pipeline {
                             )
                         )
                     });
-                let result = if !matches!(origin, crate::jobs::handle::CancellationOrigin::User)
-                    && !semantic_cancel_is_safe
-                {
+                let result = if !origin.is_user() && !semantic_cancel_is_safe {
                     Err(crate::SchedulerError::Conflict(
                         "semantic cancellation is only allowed while queued or downloading"
                             .to_string(),
@@ -72,7 +70,7 @@ impl Pipeline {
                     ))
                 } else if self.jobs.contains_key(&job_id) {
                     self.db.cancel_event_scripts(job_id.0);
-                    if matches!(origin, crate::jobs::handle::CancellationOrigin::User) {
+                    if origin.is_user() {
                         self.raise_queue_script_event(
                             job_id,
                             crate::post_processing::model::QueueEvent::NzbDeleted,
@@ -251,31 +249,38 @@ impl Pipeline {
                         let working_dir = state.working_dir.clone();
                         let staging_dir = state.staging_dir.clone();
                         let cleanup_db = self.db.clone();
-                        tokio::spawn(async move {
-                            // Let a cancelled post-processing script leave its
-                            // process group before its working directory is
-                            // removed. The sender is dropped by the terminal
-                            // completion handler once that run has ended.
-                            if let Some(mut post_processing_done) = post_processing_done {
-                                while post_processing_done.changed().await.is_ok() {}
-                            }
-                            if let Some(extraction_budget) = extraction_cleanup_wait {
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    extraction_budget.wait_for_idle();
-                                })
-                                .await;
-                            }
-                            if let Err(error) = Self::cleanup_cancelled_job_directories(
-                                &cleanup_db,
-                                job_id,
-                                &working_dir,
-                                staging_dir.as_deref(),
-                            )
-                            .await
-                            {
-                                tracing::warn!(job_id = job_id.0, %error, "retaining cancelled job directory while queue scripts are unresolved");
-                            }
-                        });
+                        let keep_files = matches!(
+                            origin,
+                            crate::jobs::handle::CancellationOrigin::UserKeepingFiles
+                        );
+                        // A cancel that keeps the files schedules nothing.
+                        if !keep_files {
+                            tokio::spawn(async move {
+                                // Let a cancelled post-processing script leave its
+                                // process group before its working directory is
+                                // removed. The sender is dropped by the terminal
+                                // completion handler once that run has ended.
+                                if let Some(mut post_processing_done) = post_processing_done {
+                                    while post_processing_done.changed().await.is_ok() {}
+                                }
+                                if let Some(extraction_budget) = extraction_cleanup_wait {
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        extraction_budget.wait_for_idle();
+                                    })
+                                    .await;
+                                }
+                                if let Err(error) = Self::cleanup_cancelled_job_directories(
+                                    &cleanup_db,
+                                    job_id,
+                                    &working_dir,
+                                    staging_dir.as_deref(),
+                                )
+                                .await
+                                {
+                                    tracing::warn!(job_id = job_id.0, %error, "retaining cancelled job directory while queue scripts are unresolved");
+                                }
+                            });
+                        }
 
                         Ok(())
                     }
@@ -295,6 +300,14 @@ impl Pipeline {
             } => {
                 let result = if let Some(state) = self.jobs.get_mut(&job_id) {
                     update.apply_to_spec(&mut state.spec);
+                    let mut update = update;
+                    if update.name.is_some() {
+                        // The new name lives in the metadata, so the metadata
+                        // write carries it.
+                        update.metadata =
+                            crate::jobs::FieldUpdate::Set(state.spec.metadata.clone());
+                        self.rederive_unwritten_working_dir(job_id);
+                    }
                     // Ordered writer queue, not fire-and-forget: category/metadata
                     // are last-write-wins columns, so two quick UpdateJob calls
                     // must persist in order to avoid a stale restored value.
@@ -310,6 +323,49 @@ impl Pipeline {
                     Ok(())
                 } else {
                     Err(crate::SchedulerError::JobNotFound(job_id))
+                };
+                let _ = reply.send(result);
+            }
+            SchedulerCommand::UpdateHistory {
+                job_id,
+                update,
+                reply,
+            } => {
+                if self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|state| !is_terminal_status(&state.status))
+                {
+                    let _ = reply.send(Err(crate::SchedulerError::Conflict(
+                        "the job is still in the queue".into(),
+                    )));
+                    return;
+                }
+                let row_update = update.clone();
+                let result = self
+                    .db_blocking(move |db| db.update_job_history_fields(job_id.0, &row_update))
+                    .await;
+                let result = match result {
+                    Ok(mut found) => {
+                        if let Some(job) = self
+                            .finished_jobs
+                            .iter_mut()
+                            .find(|job| job.job_id == job_id)
+                        {
+                            found = true;
+                            let mut spec_fields =
+                                (job.name.clone(), job.category.clone(), job.metadata.clone());
+                            apply_history_update(&update, &mut spec_fields);
+                            (job.name, job.category, job.metadata) = spec_fields;
+                        }
+                        if found {
+                            self.publish_snapshot();
+                            Ok(())
+                        } else {
+                            Err(crate::SchedulerError::JobNotFound(job_id))
+                        }
+                    }
+                    Err(error) => Err(crate::SchedulerError::State(error)),
                 };
                 let _ = reply.send(result);
             }
@@ -908,6 +964,78 @@ impl Pipeline {
 }
 
 impl Pipeline {
+    // A renamed job moves to a working directory named after its new name,
+    // but only while that directory holds nothing but its ownership marker
+    // and no article is in flight. Anything already written stays where it
+    // is, and so does the directory.
+    pub(crate) fn rederive_unwritten_working_dir(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        if state.downloaded_bytes > 0
+            || state.failed_bytes > 0
+            || state.staging_dir.is_some()
+            || self
+                .active_downloads_by_job
+                .get(&job_id)
+                .is_some_and(|n| *n > 0)
+            || self
+                .active_decodes_by_job
+                .get(&job_id)
+                .is_some_and(|n| *n > 0)
+            || !matches!(
+                (state.download_state, state.post_state),
+                (
+                    crate::jobs::model::DownloadState::Queued,
+                    crate::jobs::model::PostState::Idle
+                )
+            )
+        {
+            return;
+        }
+        let old_dir = state.working_dir.clone();
+        if !old_dir.starts_with(&self.intermediate_dir) || !working_dir_is_unwritten(&old_dir) {
+            return;
+        }
+        let new_dir = crate::jobs::working_dir::compute_working_dir(
+            &self.intermediate_dir,
+            job_id,
+            &state.spec.name,
+        );
+        if new_dir == old_dir {
+            return;
+        }
+        let moved = std::fs::create_dir(&new_dir).and_then(|()| {
+            crate::jobs::working_dir::mark_weaver_owned_working_dir(
+                &self.intermediate_dir,
+                &new_dir,
+                job_id,
+            )
+        });
+        if let Err(error) = moved {
+            tracing::warn!(job_id = job_id.0, %error, "keeping the working directory after a rename");
+            let _ = std::fs::remove_dir_all(&new_dir);
+            return;
+        }
+        if let Err(error) = crate::jobs::working_dir::remove_weaver_owned_working_dir(
+            &self.intermediate_dir,
+            &old_dir,
+        ) {
+            tracing::warn!(job_id = job_id.0, %error, "left the previous working directory after a rename");
+        }
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.working_dir = new_dir.clone();
+        }
+        if let Err(error) =
+            self.db
+                .try_queue_job_write(job_id, "update_active_job_output_dir", move |db| {
+                    db.update_active_job_output_dir(job_id, &new_dir)
+                })
+        {
+            error!(error = %error, "failed to queue the renamed working directory write");
+        }
+    }
+
     pub(crate) async fn cleanup_cancelled_job_directories(
         db: &crate::Database,
         job_id: JobId,
@@ -961,5 +1089,38 @@ impl Pipeline {
             "previous NNTP generation drained; dispatching on the new pool"
         );
         self.dispatch_downloads();
+    }
+}
+
+fn working_dir_is_unwritten(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.into_iter().all(|entry| {
+        entry.is_ok_and(|entry| {
+            entry.file_name() == std::ffi::OsStr::new(crate::jobs::working_dir::WORKING_DIR_MARKER)
+        })
+    })
+}
+
+// The history-row fields of a job update, applied to a finished job's
+// in-memory copy.
+fn apply_history_update(
+    update: &crate::jobs::JobUpdate,
+    (name, category, metadata): &mut (String, Option<String>, Vec<(String, String)>),
+) {
+    match &update.category {
+        crate::jobs::FieldUpdate::Unchanged => {}
+        crate::jobs::FieldUpdate::Clear => *category = None,
+        crate::jobs::FieldUpdate::Set(value) => *category = Some(value.clone()),
+    }
+    match &update.metadata {
+        crate::jobs::FieldUpdate::Unchanged => {}
+        crate::jobs::FieldUpdate::Clear => metadata.clear(),
+        crate::jobs::FieldUpdate::Set(value) => *metadata = value.clone(),
+    }
+    if let Some(value) = &update.name {
+        *name = value.clone();
+        crate::ingest::set_renamed_title(metadata, value);
     }
 }

@@ -87,7 +87,22 @@ pub async fn url_completed(
 }
 
 pub fn mark_history_good(db: &Database, job_id: JobId) -> Result<bool, StateError> {
-    let changed = db.mark_semantic_candidate_good(job_id)?;
+    mark_history(db, job_id, crate::history::NzbgetMarkStatus::Good)
+}
+
+// Record how a client marked a history row and raise NZB_MARKED. GOOD and BAD
+// also settle the row's duplicate candidate, as the web UI's marks do.
+pub fn mark_history(
+    db: &Database,
+    job_id: JobId,
+    mark: crate::history::NzbgetMarkStatus,
+) -> Result<bool, StateError> {
+    let changed = match mark {
+        crate::history::NzbgetMarkStatus::Good => db.mark_semantic_candidate_good(job_id)?,
+        crate::history::NzbgetMarkStatus::Bad => db.mark_semantic_candidate_bad(job_id)?,
+        crate::history::NzbgetMarkStatus::Success => false,
+    };
+    db.set_nzbget_history_mark(job_id.0, mark)?;
     let Some(history) = db.get_job_history(job_id.0)? else {
         return Ok(changed);
     };
@@ -100,7 +115,9 @@ pub fn mark_history_good(db: &Database, job_id: JobId) -> Result<bool, StateErro
         .env
         .insert("NZBNA_LASTID".into(), job_id.0.to_string());
     context.env.insert("NZBNA_NZBNAME".into(), history.name);
-    context.env.insert("NZBNA_MARKSTATUS".into(), "GOOD".into());
+    context
+        .env
+        .insert("NZBNA_MARKSTATUS".into(), mark.as_str().into());
     if let Some(path) = history.output_dir {
         context.env.insert("NZBNA_DIRECTORY".into(), path.clone());
         if std::path::Path::new(&path).is_dir() {

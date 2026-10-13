@@ -15,6 +15,6 @@ pub use attributes::{
 };
 pub use failure_kind::HistoryFailureKind;
 pub use model::{HistoryFilter, HistoryMetadataEquals};
-pub use nzbget_state::NzbgetHistoryState;
+pub use nzbget_state::{NzbgetHistoryState, NzbgetMarkStatus};
 pub use record::{IntegrationEventRow, JobHistoryRow};
 pub use timeline::JobEvent;

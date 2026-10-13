@@ -10,7 +10,8 @@ pub use import::{
     nzb_to_spec,
 };
 pub use metadata::{
-    ORIGINAL_TITLE_METADATA_KEY, append_original_title_metadata, original_release_title,
+    ORIGINAL_TITLE_METADATA_KEY, RENAMED_TITLE_METADATA_KEY, append_original_title_metadata,
+    original_release_title, renamed_title, set_renamed_title,
 };
 pub use naming::{completed_folder_name, derive_release_name, strip_nzb_source_suffix};
 pub use persisted_nzb::{

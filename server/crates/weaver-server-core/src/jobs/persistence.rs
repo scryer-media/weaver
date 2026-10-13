@@ -960,6 +960,29 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_active_job_output_dir(
+        &self,
+        job_id: JobId,
+        output_dir: &std::path::Path,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let output_dir = output_dir.to_string_lossy().into_owned();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "update_active_job_output_dir", |tx| {
+                let output_dir = output_dir.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE active_jobs SET output_dir = {} WHERE job_id = {}",
+                        &[SqlArg::Text(output_dir), SqlArg::I64(job_id.0 as i64)],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
     // Persist the manual queue order as one transaction. Positions are the
     // full current order (small: one row per queued job) so restores sort by
     // `queue_position` and land in the exact user-arranged sequence.

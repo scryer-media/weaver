@@ -759,8 +759,16 @@ pub struct AddJobOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancellationOrigin {
     User,
+    // A user cancel that leaves the job's files on disk.
+    UserKeepingFiles,
     SemanticBad,
     SemanticSuperseded,
+}
+
+impl CancellationOrigin {
+    pub fn is_user(self) -> bool {
+        matches!(self, Self::User | Self::UserKeepingFiles)
+    }
 }
 
 // Which hardware profile's limits the pipeline is running under, and why.
@@ -824,6 +832,12 @@ pub enum SchedulerCommand {
     },
     // Update a job's category and/or metadata.
     UpdateJob {
+        job_id: JobId,
+        update: JobUpdate,
+        reply: oneshot::Sender<Result<(), SchedulerError>>,
+    },
+    // Rename, recategorise or re-parameterise a finished job's history row.
+    UpdateHistory {
         job_id: JobId,
         update: JobUpdate,
         reply: oneshot::Sender<Result<(), SchedulerError>>,
@@ -1133,6 +1147,12 @@ impl SchedulerHandle {
             .await
     }
 
+    // Cancel a job and keep whatever it has written so far.
+    pub async fn cancel_job_keeping_files(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::UserKeepingFiles)
+            .await
+    }
+
     pub async fn cancel_semantic_bad(&self, job_id: JobId) -> Result<(), SchedulerError> {
         self.cancel_job_with_origin(job_id, CancellationOrigin::SemanticBad)
             .await
@@ -1148,7 +1168,7 @@ impl SchedulerHandle {
         job_id: JobId,
         origin: CancellationOrigin,
     ) -> Result<(), SchedulerError> {
-        if matches!(origin, CancellationOrigin::User) {
+        if origin.is_user() {
             self.state.cancel_active_job_work(job_id);
         }
         let (tx, rx) = oneshot::channel();
@@ -1168,6 +1188,24 @@ impl SchedulerHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SchedulerCommand::UpdateJob {
+                job_id,
+                update,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+    }
+
+    // Update a finished job's history row. The password field is ignored.
+    pub async fn update_history(
+        &self,
+        job_id: JobId,
+        update: JobUpdate,
+    ) -> Result<(), SchedulerError> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::UpdateHistory {
                 job_id,
                 update,
                 reply: tx,

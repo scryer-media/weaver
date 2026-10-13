@@ -2134,7 +2134,7 @@ async fn nzbget_editqueue_unsupported_commands_return_false_without_fault() {
         api_key_cache("control-key", "control"),
     );
 
-    for command in ["GroupMoveBefore", "GroupSetName", "FilePause", "GroupSort"] {
+    for command in ["FilePause", "FileDelete", "HistorySetDupeKey"] {
         let (status, payload) = post_nzbget(
             app.clone(),
             serde_json::json!({
@@ -4714,4 +4714,324 @@ async fn nzbget_basic_scheme_is_matched_case_insensitively() {
         assert_eq!(status, StatusCode::OK, "{scheme}: {body}");
         assert!(body.contains("16.0-weaver"), "{scheme}");
     }
+}
+
+fn sort_test_job(job_id: u64, name: &str, total: u64, priority: &str, created_ms: f64) -> JobInfo {
+    let mut job = reorder_test_job(job_id);
+    job.name = name.to_string();
+    job.total_bytes = total;
+    job.metadata = vec![("priority".to_string(), priority.to_string())];
+    job.created_at_epoch_ms = created_ms;
+    job
+}
+
+async fn editqueue(app: Router, params: serde_json::Value) -> serde_json::Value {
+    rpc_result(app, "editqueue", params).await
+}
+
+#[tokio::test]
+async fn nzbget_group_set_name_renames_the_job() {
+    let handle = scheduler_handle_with_mock_commands(vec![reorder_test_job(1)]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let renamed = editqueue(
+        app.clone(),
+        serde_json::json!(["GroupSetName", "Renamed.Release.2024", [1]]),
+    )
+    .await;
+    assert_eq!(renamed, true);
+    let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+    assert_eq!(groups[0]["NZBName"], "Renamed.Release.2024");
+    assert_eq!(
+        handle.get_job(JobId(1)).unwrap().name,
+        "Renamed.Release.2024"
+    );
+
+    // An empty name changes nothing.
+    let refused = editqueue(app.clone(), serde_json::json!(["GroupSetName", " ", [1]])).await;
+    assert_eq!(refused, false);
+    let groups = rpc_result(app, "listgroups", serde_json::json!([])).await;
+    assert_eq!(groups[0]["NZBName"], "Renamed.Release.2024");
+}
+
+#[tokio::test]
+async fn nzbget_group_sort_orders_by_each_key_and_direction() {
+    let handle = scheduler_handle_with_mock_commands(vec![
+        sort_test_job(1, "Charlie", 300, "NORMAL", 1_000.0),
+        sort_test_job(2, "alpha", 100, "LOW", 3_000.0),
+        sort_test_job(3, "Bravo", 200, "HIGH", 2_000.0),
+    ]);
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    for (param, expected) in [
+        ("name+", vec![2, 3, 1]),
+        ("name-", vec![1, 3, 2]),
+        ("size+", vec![2, 3, 1]),
+        ("size-", vec![1, 3, 2]),
+        ("left+", vec![2, 3, 1]),
+        ("priority+", vec![3, 1, 2]),
+        ("priority-", vec![2, 1, 3]),
+        ("age+", vec![2, 3, 1]),
+        ("age-", vec![1, 3, 2]),
+        ("category+", vec![1, 3, 2]),
+    ] {
+        // No ids: the whole queue is sorted.
+        let sorted = editqueue(app.clone(), serde_json::json!(["GroupSort", param, []])).await;
+        assert_eq!(sorted, true, "{param}");
+        assert_eq!(listgroups_ids(app.clone()).await, expected, "{param}");
+    }
+
+    // With no direction a sorted queue flips.
+    editqueue(app.clone(), serde_json::json!(["GroupSort", "name+", []])).await;
+    editqueue(app.clone(), serde_json::json!(["GroupSort", "name", []])).await;
+    assert_eq!(listgroups_ids(app.clone()).await, vec![1, 3, 2]);
+    editqueue(app.clone(), serde_json::json!(["GroupSort", "name", []])).await;
+    assert_eq!(listgroups_ids(app.clone()).await, vec![2, 3, 1]);
+
+    // Listed ids are sorted within the places they hold.
+    editqueue(
+        app.clone(),
+        serde_json::json!(["GroupSort", "size-", [2, 1]]),
+    )
+    .await;
+    assert_eq!(listgroups_ids(app.clone()).await, vec![1, 3, 2]);
+
+    let unknown = editqueue(app.clone(), serde_json::json!(["GroupSort", "colour", []])).await;
+    assert_eq!(unknown, false);
+    let missing = editqueue(app.clone(), serde_json::json!(["GroupSort", "name", [99]])).await;
+    assert_eq!(missing, false);
+    assert_eq!(listgroups_ids(app).await, vec![1, 3, 2]);
+}
+
+#[tokio::test]
+async fn nzbget_group_move_before_and_after_land_next_to_the_anchor() {
+    let handle =
+        scheduler_handle_with_mock_commands((1..=5).map(reorder_test_job).collect::<Vec<_>>());
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let moved = editqueue(
+        app.clone(),
+        serde_json::json!(["GroupMoveBefore", "2", [5, 4]]),
+    )
+    .await;
+    assert_eq!(moved, true);
+    assert_eq!(listgroups_ids(app.clone()).await, vec![1, 5, 4, 2, 3]);
+
+    // Legacy shape: the anchor id rides in Param.
+    let moved = editqueue(
+        app.clone(),
+        serde_json::json!(["GroupMoveAfter", 0, "3", [1]]),
+    )
+    .await;
+    assert_eq!(moved, true);
+    assert_eq!(listgroups_ids(app.clone()).await, vec![5, 4, 2, 3, 1]);
+
+    for params in [
+        serde_json::json!(["GroupMoveAfter", "99", [1]]),
+        serde_json::json!(["GroupMoveAfter", "nope", [1]]),
+        serde_json::json!(["GroupMoveBefore", "2", [98]]),
+    ] {
+        assert_eq!(editqueue(app.clone(), params).await, false);
+    }
+    assert_eq!(listgroups_ids(app).await, vec![5, 4, 2, 3, 1]);
+}
+
+fn history_entry(entries: &serde_json::Value, id: u64) -> serde_json::Value {
+    entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["NZBID"] == id)
+        .unwrap_or_else(|| panic!("{id} missing from {entries}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn nzbget_history_marks_are_kept_and_reported() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("weaver.db");
+    let db = Database::open(&path).unwrap();
+    for id in [601, 602, 603] {
+        db.insert_job_history(&nzbget_history_row(
+            id,
+            "failed",
+            1_700_000_000 + id as i64,
+            None,
+        ))
+        .unwrap();
+    }
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let app = nzbget_test_router(
+        db.clone(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    for (command, id) in [
+        ("HistoryMarkBad", 601),
+        ("HistoryMarkGood", 602),
+        ("HistoryMarkSuccess", 603),
+    ] {
+        assert_eq!(
+            editqueue(app.clone(), serde_json::json!([command, "", [id]])).await,
+            true
+        );
+    }
+    assert_eq!(
+        editqueue(
+            app.clone(),
+            serde_json::json!(["HistoryMarkBad", "", [699]])
+        )
+        .await,
+        false
+    );
+    drop(app);
+    drop(db);
+
+    // The marks are kept on the rows.
+    let db = Database::open(&path).unwrap();
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let app = nzbget_test_router(
+        db,
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let entries = rpc_result(app, "history", serde_json::json!([])).await;
+    for (id, mark, status) in [
+        (601, "BAD", "FAILURE/BAD"),
+        (602, "GOOD", "SUCCESS/GOOD"),
+        (603, "SUCCESS", "SUCCESS/MARK"),
+    ] {
+        let entry = history_entry(&entries, id);
+        assert_eq!(entry["MarkStatus"], mark, "{entry}");
+        assert_eq!(entry["Status"], status, "{entry}");
+        // What happened to the job stays in the per-stage fields.
+        assert_eq!(entry["DeleteStatus"], "HEALTH", "{entry}");
+    }
+}
+
+#[tokio::test]
+async fn nzbget_history_rows_can_be_renamed_recategorised_and_reparameterised() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(701, "complete", 1_700_000_000, None))
+        .unwrap();
+    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let app = nzbget_test_router(
+        db.clone(),
+        handle,
+        tv_category_config(),
+        api_key_cache("control-key", "control"),
+    );
+    // Prime the parsed-row memo so the edits must refresh it.
+    rpc_result(app.clone(), "history", serde_json::json!([])).await;
+
+    for params in [
+        serde_json::json!(["HistorySetName", "Edited.Release", [701]]),
+        serde_json::json!(["HistorySetCategory", "sonarr", [701]]),
+        serde_json::json!(["HistorySetParameter", "drone=abc-123", [701]]),
+        serde_json::json!(["HistorySetParameter", "Custom=Value", [701]]),
+    ] {
+        assert_eq!(
+            editqueue(app.clone(), params.clone()).await,
+            true,
+            "{params}"
+        );
+    }
+    let entry = history_entry(
+        &rpc_result(app.clone(), "history", serde_json::json!([])).await,
+        701,
+    );
+    assert_eq!(entry["NZBName"], "Edited.Release");
+    assert_eq!(entry["Category"], "sonarr");
+    let parameters = entry["Parameters"].as_array().unwrap();
+    assert!(
+        parameters
+            .iter()
+            .any(|p| p["Name"] == "drone" && p["Value"] == "abc-123"),
+        "{entry}"
+    );
+    assert!(
+        parameters
+            .iter()
+            .any(|p| p["Name"] == "Custom" && p["Value"] == "Value"),
+        "{entry}"
+    );
+    let row = db.get_job_history(701).unwrap().unwrap();
+    assert_eq!(row.category.as_deref(), Some("TV"));
+
+    // A finished job's password is not a stored parameter; unknown ids fail.
+    for params in [
+        serde_json::json!(["HistorySetParameter", "*Unpack:Password=secret", [701]]),
+        serde_json::json!(["HistorySetName", "Other", [799]]),
+        serde_json::json!(["HistorySetCategory", "tv", [799]]),
+    ] {
+        assert_eq!(
+            editqueue(app.clone(), params.clone()).await,
+            false,
+            "{params}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn nzbget_dupe_and_park_deletes_report_how_the_job_left() {
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands_and_db(
+        vec![
+            reorder_test_job(801),
+            reorder_test_job(802),
+            reorder_test_job(803),
+        ],
+        db.clone(),
+    );
+    let app = nzbget_test_router(
+        db,
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    for (command, id) in [
+        ("GroupDupeDelete", 801),
+        ("GroupParkDelete", 802),
+        ("GroupDelete", 803),
+    ] {
+        assert_eq!(
+            editqueue(app.clone(), serde_json::json!([command, "", [id]])).await,
+            true
+        );
+    }
+    let entries = rpc_result(app.clone(), "history", serde_json::json!([])).await;
+    for (id, delete, status) in [
+        (801, "DUPE", "DELETED/DUPE"),
+        (802, "MANUAL", "DELETED/MANUAL"),
+        (803, "MANUAL", "DELETED/MANUAL"),
+    ] {
+        let entry = history_entry(&entries, id);
+        assert_eq!(entry["DeleteStatus"], delete, "{entry}");
+        assert_eq!(entry["Status"], status, "{entry}");
+    }
+
+    // A retry of a failed job fetches it again.
+    assert_eq!(
+        editqueue(app, serde_json::json!(["HistoryRetryFailed", "", [801]])).await,
+        true
+    );
 }

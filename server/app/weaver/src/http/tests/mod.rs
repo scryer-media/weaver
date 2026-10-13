@@ -356,7 +356,26 @@ fn scheduler_handle_with_mock_commands_with_db(
                                 job.password = Some(password.clone());
                             }
                         }
+                        if let Some(name) = &update.name {
+                            job.name = name.clone();
+                            weaver_server_core::ingest::set_renamed_title(&mut job.metadata, name);
+                        }
                     });
+                    let _ = reply.send(result);
+                }
+                SchedulerCommand::UpdateHistory {
+                    job_id,
+                    update,
+                    reply,
+                } => {
+                    let result = match &db {
+                        Some(db) => match db.update_job_history_fields(job_id.0, &update) {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Err(SchedulerError::JobNotFound(job_id)),
+                            Err(error) => Err(SchedulerError::State(error)),
+                        },
+                        None => Err(SchedulerError::JobNotFound(job_id)),
+                    };
                     let _ = reply.send(result);
                 }
                 SchedulerCommand::ReorderJob {
