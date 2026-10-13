@@ -2432,8 +2432,12 @@ async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
 #[tokio::test]
 async fn nzbget_history_reports_compound_status_history_time_and_stage_timings() {
     let db = Database::open_in_memory().unwrap();
-    db.insert_job_history(&nzbget_history_row(400, "complete", 1_700_000_400, None))
-        .unwrap();
+    // A fifth of the job was optional recovery data, so it stays repairable
+    // down to 80% health.
+    let mut complete = nzbget_history_row(400, "complete", 1_700_000_400, None);
+    complete.total_bytes = 1_000;
+    complete.optional_recovery_bytes = 200;
+    db.insert_job_history(&complete).unwrap();
     db.insert_job_history(&nzbget_history_row(401, "failed", 1_700_000_500, None))
         .unwrap();
     db.insert_job_history(&nzbget_history_row(402, "cancelled", 1_700_000_600, None))
@@ -2475,6 +2479,8 @@ async fn nzbget_history_reports_compound_status_history_time_and_stage_timings()
     assert_eq!(by_id(400)["DownloadTimeSec"], 300);
     assert_eq!(by_id(400)["RepairTimeSec"], 40);
     assert_eq!(by_id(400)["PostTotalTimeSec"], 40);
+    assert_eq!(by_id(400)["CriticalHealth"], 800);
+    assert_eq!(by_id(401)["CriticalHealth"], 1000);
     assert_eq!(by_id(401)["Status"], "DELETED/HEALTH");
     assert_eq!(by_id(401)["DownloadTimeSec"], 0);
     assert_eq!(by_id(402)["Status"], "DELETED/MANUAL");
@@ -2584,12 +2590,17 @@ async fn nzbget_postqueue_and_group_post_fields_report_stage_progress() {
     );
     queued.post_state = weaver_server_core::PostState::QueuedPostProcessing;
     let handle = scheduler_handle_with_mock_commands(vec![job, queued]);
-    let app = nzbget_test_router(
-        Database::open_in_memory().unwrap(),
-        handle,
-        test_config(),
-        ApiKeyCache::default(),
-    );
+    // Post-processing began with verification 10 s before the repair stage.
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_events(&[weaver_server_core::history::timeline::JobEvent {
+        job_id: 60,
+        timestamp: 1_699_999_990_000,
+        kind: "JobVerificationStarted".into(),
+        message: String::new(),
+        file_id: None,
+    }])
+    .unwrap();
+    let app = nzbget_test_router(db, handle, test_config(), ApiKeyCache::default());
 
     let (status, payload) = post_nzbget(
         app.clone(),
@@ -2603,6 +2614,7 @@ async fn nzbget_postqueue_and_group_post_fields_report_stage_progress() {
     assert_eq!(entry["Stage"], "REPAIRING");
     assert_eq!(entry["StageProgress"], 500);
     assert_eq!(entry["StageTimeSec"], 4);
+    assert_eq!(entry["TotalTimeSec"], 14);
     assert_eq!(payload["result"][1]["NZBID"], 61);
     assert_eq!(payload["result"][1]["Stage"], "QUEUED");
 
@@ -2613,6 +2625,8 @@ async fn nzbget_postqueue_and_group_post_fields_report_stage_progress() {
     )
     .await;
     assert_eq!(status_payload["result"]["PostJobCount"], 2);
+    // Nothing has been downloaded, however long the server has been up.
+    assert_eq!(status_payload["result"]["DownloadTimeSec"], 0);
 
     let (_, groups) = post_nzbget(
         app,
@@ -2624,6 +2638,8 @@ async fn nzbget_postqueue_and_group_post_fields_report_stage_progress() {
     assert_eq!(group["Status"], "REPAIRING");
     assert_eq!(group["PostStageProgress"], 500);
     assert_eq!(group["PostInfoText"], "Repairing (50%)");
+    assert_eq!(group["PostStageTimeSec"], 4);
+    assert_eq!(group["PostTotalTimeSec"], 14);
 }
 
 #[tokio::test]

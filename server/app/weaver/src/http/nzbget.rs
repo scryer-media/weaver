@@ -894,13 +894,18 @@ fn write_xmlrpc_value(out: &mut String, value: &Value) {
             out.push_str("</boolean>");
         }
         Value::Number(value) => {
-            // NZBGet emits unsigned 32-bit Lo/Hi counters as <i4> beyond the
-            // signed 32-bit range; established clients parse them as 64-bit,
-            // so mirroring that keeps large sizes intact.
+            // `<i4>` is a signed 32-bit integer. A value outside that range
+            // goes out as `<i8>`, which keeps it exact; clamping would
+            // silently corrupt a size rebuilt from its Lo and Hi halves.
             if let Some(int) = value.as_i64() {
-                let _ = write!(out, "<i4>{int}</i4>");
-            } else if let Some(int) = value.as_u64() {
-                let _ = write!(out, "<i4>{int}</i4>");
+                if i32::try_from(int).is_ok() {
+                    let _ = write!(out, "<i4>{int}</i4>");
+                } else {
+                    let _ = write!(out, "<i8>{int}</i8>");
+                }
+            } else if value.is_u64() {
+                // Beyond even a signed 64-bit integer.
+                let _ = write!(out, "<double>{}</double>", value.as_f64().unwrap_or(0.0));
             } else {
                 let _ = write!(out, "<double>{}</double>", value.as_f64().unwrap_or(0.0));
             }
@@ -1211,6 +1216,43 @@ fn nzbget_duplicate_mode(
 #[allow(clippy::items_after_test_module)]
 mod append_rejection_tests {
     use super::*;
+
+    #[test]
+    fn xmlrpc_integers_outside_i32_go_out_as_i8() {
+        let write = |value: Value| {
+            let mut out = String::new();
+            write_xmlrpc_value(&mut out, &value);
+            out
+        };
+        for (value, expected) in [
+            (json!(0), "<value><i4>0</i4></value>"),
+            (json!(i32::MAX), "<value><i4>2147483647</i4></value>"),
+            (json!(i32::MIN), "<value><i4>-2147483648</i4></value>"),
+            (
+                json!(2_147_483_648_u64),
+                "<value><i8>2147483648</i8></value>",
+            ),
+            (json!(u32::MAX), "<value><i8>4294967295</i8></value>"),
+            (
+                json!(-2_147_483_649_i64),
+                "<value><i8>-2147483649</i8></value>",
+            ),
+            (
+                json!(i64::MAX),
+                "<value><i8>9223372036854775807</i8></value>",
+            ),
+        ] {
+            assert_eq!(write(value.clone()), expected, "{value}");
+        }
+        // Read back, an `<i8>` is the same number.
+        let call = concat!(
+            "<methodCall><methodName>rate</methodName><params>",
+            "<param><value><i8>4294967295</i8></value></param>",
+            "</params></methodCall>",
+        );
+        let call = parse_xmlrpc_call(call.as_bytes()).unwrap();
+        assert_eq!(call.params, vec![json!(4_294_967_295_u64)]);
+    }
 
     #[test]
     fn parse_xmlrpc_call_resolves_entity_references() {
@@ -1538,7 +1580,7 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
         "PostJobCount": post_job_count,
         "UrlCount": 0,
         "UpTimeSec": uptime_secs,
-        "DownloadTimeSec": uptime_secs,
+        "DownloadTimeSec": ctx.handle.download_time().as_secs(),
         "ServerTime": unix_now_secs(),
         "ResumeTime": resume_time,
         "ServerPaused": download_paused,
@@ -1573,9 +1615,8 @@ fn queue_item_state_in_post_processing(state: QueueItemState) -> bool {
 }
 
 async fn listgroups(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let groups = ctx
-        .handle
-        .list_jobs()
+    let jobs = ctx.handle.list_jobs();
+    let items = jobs
         .iter()
         .map(|job| (queue_item_from_job(job), job))
         .filter(|(item, _)| {
@@ -1584,15 +1625,62 @@ async fn listgroups(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
                 QueueItemState::Completed | QueueItemState::Failed
             )
         })
+        .collect::<Vec<_>>();
+    let post_started = post_started_at(
+        ctx,
+        items
+            .iter()
+            .filter(|(item, _)| queue_item_state_in_post_processing(item.state))
+            .map(|(item, _)| item.id)
+            .collect(),
+    )
+    .await;
+    let groups = items
+        .iter()
         .map(|(item, job)| {
             nzbget_group(
-                &item,
+                item,
                 &reported_category(job.category.as_deref(), &job.metadata),
                 nzbget_priority(&job.metadata),
+                post_started.get(&item.id).copied(),
             )
         })
         .collect::<Vec<_>>();
     Ok(Value::Array(groups))
+}
+
+// Events that mark a job's post-processing under way.
+const POST_START_KINDS: &[&str] = &[
+    "JobVerificationStarted",
+    "VerificationStarted",
+    "RepairStarted",
+    "ExtractionReady",
+    "MoveToCompleteStarted",
+];
+
+// When each of `ids` began post-processing, in epoch milliseconds: the
+// earliest post-stage event recorded for it. A job with none is left out.
+async fn post_started_at(ctx: &NzbgetFacadeContext, ids: Vec<u64>) -> HashMap<u64, i64> {
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+    let db = ctx.db.clone();
+    let bounds =
+        tokio::task::spawn_blocking(move || db.get_job_event_stage_bounds(&ids, POST_START_KINDS))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+    bounds
+        .into_iter()
+        .filter_map(|(id, kinds)| {
+            kinds
+                .iter()
+                .map(|(_, first_ts, _)| *first_ts)
+                .min()
+                .map(|start| (id, start))
+        })
+        .collect()
 }
 
 fn nzbget_release_name<'a>(original_title: &'a str, fallback_name: &'a str) -> &'a str {
@@ -1604,7 +1692,12 @@ fn nzbget_release_name<'a>(original_title: &'a str, fallback_name: &'a str) -> &
     }
 }
 
-fn nzbget_group(item: &QueueItem, category: &str, priority: i64) -> Value {
+fn nzbget_group(
+    item: &QueueItem,
+    category: &str,
+    priority: i64,
+    post_started_at: Option<i64>,
+) -> Value {
     let total = item.total_bytes;
     let downloaded = item.downloaded_bytes;
     let remaining = total.saturating_sub(downloaded);
@@ -1618,7 +1711,7 @@ fn nzbget_group(item: &QueueItem, category: &str, priority: i64) -> Value {
     let (paused_lo, paused_hi) = size_parts(paused);
     let (downloaded_lo, downloaded_hi) = size_parts(downloaded);
     let output_dir = item.output_dir.clone().unwrap_or_default();
-    let post_info = post_progress_info(item);
+    let post_info = post_progress_info(item, post_started_at);
     let critical_health = critical_health(item);
     let release_name = nzbget_release_name(&item.original_title, &item.name);
 
@@ -1697,7 +1790,10 @@ struct PostProgressInfo {
 
 // Derive NZBGet-style post-processing progress from weaver's phase progress
 // entries. Returns "NONE" text when the job is not in a post stage.
-fn post_progress_info(item: &QueueItem) -> PostProgressInfo {
+// `post_started_at` is when the job's post-processing began, in epoch
+// milliseconds: the total time runs from there, the stage time from the
+// current stage's start.
+fn post_progress_info(item: &QueueItem, post_started_at: Option<i64>) -> PostProgressInfo {
     let phase = match item.state {
         QueueItemState::Repairing => Some(QueuePhase::Repairing),
         QueueItemState::Extracting => Some(QueuePhase::Extracting),
@@ -1738,10 +1834,20 @@ fn post_progress_info(item: &QueueItem) -> PostProgressInfo {
         }
         _ => label.to_string(),
     };
+    // Measured to the same moment as the stage time, so the total never
+    // reads less than the stage it contains.
+    let observed_at = progress.map_or_else(
+        || unix_now_secs() as f64 * 1000.0,
+        |entry| entry.updated_at_epoch_ms,
+    );
+    let total_time_sec = post_started_at
+        .map(|start| ((observed_at - start as f64) / 1000.0).max(0.0) as u64)
+        .unwrap_or(0)
+        .max(stage_time_sec);
     PostProgressInfo {
         text,
         stage_progress,
-        total_time_sec: stage_time_sec,
+        total_time_sec,
         stage_time_sec,
     }
 }
@@ -1749,13 +1855,15 @@ fn post_progress_info(item: &QueueItem) -> PostProgressInfo {
 // NZBGet's CriticalHealth: the health floor below which the download cannot
 // be repaired. Approximated from the recovery volume share of the job.
 fn critical_health(item: &QueueItem) -> u64 {
-    if item.total_bytes == 0 {
+    critical_health_of(item.total_bytes, item.optional_recovery_bytes)
+}
+
+fn critical_health_of(total_bytes: u64, optional_recovery_bytes: u64) -> u64 {
+    if total_bytes == 0 {
         return 1000;
     }
-    let payload = item
-        .total_bytes
-        .saturating_sub(item.optional_recovery_bytes);
-    (payload * 1000) / item.total_bytes
+    let payload = total_bytes.saturating_sub(optional_recovery_bytes);
+    (payload * 1000) / total_bytes
 }
 
 // The category string an NZBGet client submitted, kept beside the canonical
@@ -2170,6 +2278,7 @@ fn nzbget_history_entry(
     statuses: HistoryStatuses,
     timings: HistoryTimings,
     health: u32,
+    critical_health: u64,
     message: &str,
     client_request_id: Option<&str>,
     attributes: &[Attribute],
@@ -2205,7 +2314,7 @@ fn nzbget_history_entry(
         "UrlStatus": "NONE",
         "Status": statuses.status,
         "Health": health,
-        "CriticalHealth": 1000,
+        "CriticalHealth": critical_health,
         "Deleted": statuses.delete != "NONE",
         "RetryData": false,
         "Message": message,
@@ -2244,6 +2353,7 @@ fn nzbget_history_item(
         ),
         timings,
         item.health,
+        critical_health_of(item.total_bytes, item.optional_recovery_bytes),
         &item.error.clone().unwrap_or_default(),
         item.client_request_id.as_deref(),
         &item.attributes,
@@ -2269,6 +2379,7 @@ fn nzbget_history_queue_item(item: &QueueItem, category: &str, timings: HistoryT
         ),
         timings,
         item.health,
+        critical_health_of(item.total_bytes, item.optional_recovery_bytes),
         &item.error.clone().unwrap_or_default(),
         item.client_request_id.as_deref(),
         &item.attributes,
@@ -3248,7 +3359,7 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
 }
 
 async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let entries = ctx
+    let items = ctx
         .handle
         .list_jobs()
         .iter()
@@ -3259,8 +3370,12 @@ async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
                 )
         })
         .map(queue_item_from_job)
+        .collect::<Vec<_>>();
+    let post_started = post_started_at(ctx, items.iter().map(|item| item.id).collect()).await;
+    let entries = items
+        .into_iter()
         .map(|item| {
-            let info = post_progress_info(&item);
+            let info = post_progress_info(&item, post_started.get(&item.id).copied());
             let stage = match item.state {
                 QueueItemState::Checking | QueueItemState::Verifying => "VERIFYING_SOURCES",
                 QueueItemState::Repairing => "REPAIRING",

@@ -1372,6 +1372,11 @@ impl SchedulerHandle {
         self.state.metrics_snapshot()
     }
 
+    // How long this process has spent downloading.
+    pub fn download_time(&self) -> std::time::Duration {
+        self.state.metrics().download_time()
+    }
+
     pub fn get_extraction_rejections(&self) -> [u64; 9] {
         self.state.metrics().extraction_rejections()
     }

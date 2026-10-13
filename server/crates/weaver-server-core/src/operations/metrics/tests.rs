@@ -209,3 +209,30 @@ fn variant_lists_cover_every_code() {
         assert_eq!(DownloadPressureReason::from_code(reason.as_code()), reason);
     }
 }
+
+#[test]
+fn download_time_counts_only_the_ticks_in_which_bytes_arrived() {
+    let m = PipelineMetrics::new();
+    let start = Instant::now();
+    let at = |ms: u64| start + std::time::Duration::from_millis(ms);
+    for (ms, downloaded) in [
+        // Downloading for 300 ms.
+        (0, 0),
+        (100, 1_000),
+        (200, 2_000),
+        (300, 3_000),
+        // Idle or paused for 10 s.
+        (5_300, 3_000),
+        (10_300, 3_000),
+        // Downloading again for 200 ms.
+        (10_400, 4_000),
+        (10_500, 5_000),
+    ] {
+        let _ = m
+            .speed_tracker
+            .lock()
+            .unwrap()
+            .update(at(ms), downloaded, 0, 0);
+    }
+    assert_eq!(m.download_time(), std::time::Duration::from_millis(500));
+}
