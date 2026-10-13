@@ -131,6 +131,18 @@ func advancedNetworkingPartition(name string, files []string, restart bool) weav
 	return spec
 }
 
+// The speed test runs on the networking stack, a fresh one of its own: it
+// tests a laddered route against the proxy fixture and pauses the queue.
+func speedTestReleaseFlow() weaverReleaseFlowSpec {
+	spec := advancedNetworkingPartition("speed-test", []string{"speed-test.spec.ts"}, false)
+	spec.Name = "speed-test"
+	spec.PlaywrightScript = "speed-test"
+	spec.Timeout = 30 * time.Minute
+	// The reference posting a Usenet run is pointed at.
+	spec.SeedFixtures = []string{"speed-test-100mb"}
+	return spec
+}
+
 // The Bind refusal needs a Weaver without CAP_NET_RAW, which is a container
 // property, so it runs as its own single-network phase.
 func advancedNetworkingNoNetRawReleaseFlow() weaverReleaseFlowSpec {
