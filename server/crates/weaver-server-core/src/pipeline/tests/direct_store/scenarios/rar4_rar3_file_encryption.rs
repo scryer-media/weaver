@@ -1419,11 +1419,10 @@ async fn a_header_encrypted_set_is_offered_the_whole_list_in_priority_order() {
     );
 }
 
-// A global list longer than the direct store's cap reaches the ring only up
-// to the cap, in priority order; finalize still holds the whole list.
+// A long global list reaches the ring whole, in priority order: the direct
+// store tries exactly the list finalize would, never a prefix of it.
 #[tokio::test]
-async fn a_header_encrypted_set_is_offered_at_most_the_capped_list() {
-    use crate::pipeline::direct_store::wiring::MAX_DIRECT_HEADER_PASSWORD_CANDIDATES;
+async fn a_header_encrypted_set_is_offered_the_whole_list() {
     let member_name = "Silver.Horizon.S04E17.mkv";
     let payload: Vec<u8> = (0..1600u32).map(|index| (index % 167) as u8).collect();
     let volumes = header_encrypted_store_set(
@@ -1433,9 +1432,7 @@ async fn a_header_encrypted_set_is_offered_at_most_the_capped_list() {
         "moonlit-harbour",
         HeaderCheck::For("moonlit-harbour"),
     );
-    let values: Vec<String> = (0..MAX_DIRECT_HEADER_PASSWORD_CANDIDATES + 4)
-        .map(|index| format!("candidate-{index}"))
-        .collect();
+    let values: Vec<String> = (0..12).map(|index| format!("candidate-{index}")).collect();
     let settings: Vec<&str> = values.iter().map(String::as_str).collect();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(45161);
@@ -1458,7 +1455,7 @@ async fn a_header_encrypted_set_is_offered_at_most_the_capped_list() {
             .candidates
             .len(),
         values.len(),
-        "the canonical list itself is not capped"
+        "the canonical list holds every global entry"
     );
     submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
     let set = pipeline
@@ -1466,10 +1463,7 @@ async fn a_header_encrypted_set_is_offered_at_most_the_capped_list() {
         .set(job_id, 0)
         .expect("the job must carry its direct set");
     assert!(set.router.wants_header_password());
-    assert_eq!(
-        set.router.header_candidate_count(),
-        MAX_DIRECT_HEADER_PASSWORD_CANDIDATES
-    );
+    assert_eq!(set.router.header_candidate_count(), values.len());
 }
 
 #[tokio::test]

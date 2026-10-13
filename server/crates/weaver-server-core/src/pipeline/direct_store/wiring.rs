@@ -3658,8 +3658,7 @@ impl Pipeline {
         for set in self.direct_store.sets_mut(job_id) {
             set.router.set_password(Some(password.as_str()));
             // Offering is a no-op once the ring has verified or refused, and a
-            // string compare against the held candidates otherwise, which
-            // `MAX_DIRECT_HEADER_PASSWORD_CANDIDATES` bounds.
+            // string compare against the held candidates otherwise.
             offer_direct_header_candidates(set, Some(password.as_str()), &[]);
         }
     }
@@ -3679,9 +3678,10 @@ impl Pipeline {
     // all along. The same goes for a set whose key lives only in the global
     // `Settings` list or the password file, which finalize would try anyway.
     // The harvest is `Pipeline::archive_password_candidates_for_job`, the
-    // same list every other archive consumer takes, and
-    // `offer_direct_header_candidates` caps what reaches the gate at
-    // `MAX_DIRECT_HEADER_PASSWORD_CANDIDATES`.
+    // same list every other archive consumer takes, offered whole: the
+    // settings store bounds the global half at `MAX_ARCHIVE_PASSWORDS`
+    // entries, so the gate's key-derivation work is bounded there, once, for
+    // every consumer alike.
     //
     // # Why here rather than in `ensure_direct_sets`
     //
@@ -3799,20 +3799,17 @@ impl Pipeline {
     }
 }
 
-// The most harvest candidates one set's header gate is offered.
+// Offers one set's `-hp` gate the job spec's password and the job's whole
+// harvest, in the harvest's own priority order.
 //
-// The job's list is unbounded once the global `Settings` list and the password
-// file are in it, and every candidate the gate tries costs a key derivation:
-// a RAR5 PBKDF2 per candidate at the `-hp` check, and for a 7z `-mhe` end
-// header a SHA-256 chain of 2^19 rounds per candidate on every parse attempt
-// until the container opens. This bounds that work at a few hundred
-// milliseconds. Candidates past the cap are not lost: the set refuses
-// `-hp`/`-mhe` admission, demotes, and finalize tries the job's whole list.
-pub(crate) const MAX_DIRECT_HEADER_PASSWORD_CANDIDATES: usize = 8;
-
-// Offers one set's `-hp` gate the job spec's password and the job's harvest,
-// the harvest's first `MAX_DIRECT_HEADER_PASSWORD_CANDIDATES` entries in its
-// own priority order.
+// Every candidate the gate tries costs a key derivation: a RAR5 PBKDF2 per
+// candidate at the `-hp` check, and for a 7z `-mhe` end header a SHA-256
+// chain of 2^19 rounds per candidate on every parse attempt until the
+// container opens. That work is bounded by the list, not here: the global
+// half is capped at `MAX_ARCHIVE_PASSWORDS` entries by the settings store,
+// and the job half is at most one candidate per source. Offering a prefix
+// instead would send a set whose key sits past the prefix through a demotion
+// and a full redownload to reach the same list at finalize.
 //
 // The one implementation behind both the live seam and the restart seam, so a
 // set rebuilt at restore holds exactly the candidates a live set would.
@@ -3832,7 +3829,7 @@ pub(crate) fn offer_direct_header_candidates(
     if let Some(value) = crate::ingest::normalize_archive_password_candidate(spec_password) {
         set.router.offer_header_password("job_spec", value.as_str());
     }
-    for candidate in harvest.iter().take(MAX_DIRECT_HEADER_PASSWORD_CANDIDATES) {
+    for candidate in harvest {
         set.router
             .offer_header_password(candidate.source().as_str(), candidate.value());
     }
