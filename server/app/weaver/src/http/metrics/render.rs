@@ -2163,6 +2163,16 @@ pub(crate) fn render_tunnel(out: &mut Encoder, metrics: &TunnelMetricsSnapshot) 
             );
         }
     }
+    for &(resolver, outcome, count) in &metrics.cache {
+        out.sample(
+            &f::NETWORK_DNS_CACHE,
+            &[
+                ("resolver", resolver.as_str()),
+                ("outcome", outcome.as_str()),
+            ],
+            count,
+        );
+    }
     for (rung, count) in metrics.rung_cooldowns.iter().enumerate() {
         let rung = rung.to_string();
         out.sample(&f::NETWORK_RUNG_COOLDOWNS, &[("rung", &rung)], *count);

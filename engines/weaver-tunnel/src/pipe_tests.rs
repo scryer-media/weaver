@@ -902,7 +902,7 @@ async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
             },
             endpoint: Some(endpoint),
             timeout: Duration::from_secs(30),
-            naming: Naming::ProxyServers(vec!["10.0.0.2".parse().unwrap()]),
+            naming: Naming::proxy_servers(vec!["10.0.0.2".parse().unwrap()]),
             resolver: Some(provider),
             failure: Default::default(),
         })
@@ -1030,7 +1030,7 @@ fn wireguard_session(
         },
         endpoint: None,
         timeout: Duration::from_secs(30),
-        naming: Naming::ProxyServers(vec!["10.0.0.2".parse().unwrap()]),
+        naming: Naming::proxy_servers(vec!["10.0.0.2".parse().unwrap()]),
         resolver: Some(resolver),
         failure: Default::default(),
     })
@@ -1257,7 +1257,7 @@ async fn each_hop_of_a_chain_resolves_the_next_with_its_own_setting() {
             7,
             &first.addr.ip().to_string(),
             first.addr.port(),
-            Naming::ProxyServers(vec![ROUTED_DNS.parse().unwrap()]),
+            Naming::proxy_servers(vec![ROUTED_DNS.parse().unwrap()]),
             bottom(),
         ),
     );
@@ -1321,10 +1321,7 @@ async fn a_mid_chain_hop_resolved_by_weaver_has_weaver_resolve_the_next_hop() {
             8,
             "second.invalid",
             second.addr.port(),
-            Naming::Servers {
-                servers: vec![ROUTED_DNS.parse().unwrap()],
-                egress: egress.clone(),
-            },
+            Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress.clone()),
             named_hop(
                 7,
                 &first.addr.ip().to_string(),
@@ -1378,10 +1375,7 @@ async fn a_hop_resolved_by_weavers_servers_asks_them_from_the_egress() {
         7,
         &proxy.addr.ip().to_string(),
         proxy.addr.port(),
-        Naming::Servers {
-            servers: vec![ROUTED_DNS.parse().unwrap()],
-            egress: egress.clone(),
-        },
+        Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress.clone()),
         bottom(),
     );
 
@@ -1395,6 +1389,113 @@ async fn a_hop_resolved_by_weavers_servers_asks_them_from_the_egress() {
             .all(|asked| asked == &(ROUTED_DNS.to_string(), 53))
     );
     assert_eq!(asked(&proxy.targets), vec![(PUBLIC.to_string(), 119)]);
+}
+
+fn lookups(dns: &crate::test_support::dns::DnsServerDouble, name: &str) -> usize {
+    dns.queries
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|asked| *asked == name)
+        .count()
+}
+
+// A hop holds what its servers answered for as long as they said, so a
+// second dial within that asks them nothing; an answer for no time at all
+// is asked for again. A day's TTL is held for the hour ceiling, past any
+// run of this test.
+#[tokio::test]
+async fn a_hop_holds_its_servers_answer_for_its_ttl() {
+    for (ttl, held) in [(86_400, true), (0, false)] {
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dns = dns_double(&[("news.invalid", PUBLIC)]).await;
+        dns.ttl.store(ttl, std::sync::atomic::Ordering::Relaxed);
+        let egress = Arc::new(Mapped {
+            to: dns.addr,
+            asked: Mutex::new(Vec::new()),
+        });
+        let proxy = connect_double(&[((PUBLIC, 119), origin.local_addr().unwrap())]).await;
+        let pipe = named_hop(
+            7,
+            &proxy.addr.ip().to_string(),
+            proxy.addr.port(),
+            Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress),
+            bottom(),
+        );
+
+        pipe.dial(&named("news.invalid", 119)).await.unwrap();
+        let _first = origin.accept().await.unwrap();
+        let once = lookups(&dns, "news.invalid");
+        assert!(once > 0);
+        pipe.dial(&named("news.invalid", 119)).await.unwrap();
+        let _second = origin.accept().await.unwrap();
+
+        let expected = if held { once } else { 2 * once };
+        assert_eq!(lookups(&dns, "news.invalid"), expected, "TTL {ttl}");
+        assert_eq!(asked(&proxy.targets).len(), 2);
+    }
+}
+
+// An answer whose address the proxy could not reach is dropped, so the next
+// dial asks the servers again rather than reusing it.
+#[tokio::test]
+async fn a_hop_forgets_an_answer_its_proxy_could_not_reach() {
+    let dns = dns_double(&[("news.invalid", PUBLIC)]).await;
+    dns.ttl.store(86_400, std::sync::atomic::Ordering::Relaxed);
+    let egress = Arc::new(Mapped {
+        to: dns.addr,
+        asked: Mutex::new(Vec::new()),
+    });
+    // A proxy that reaches nothing.
+    let proxy = connect_double(&[]).await;
+    let pipe = named_hop(
+        7,
+        &proxy.addr.ip().to_string(),
+        proxy.addr.port(),
+        Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress),
+        bottom(),
+    );
+
+    let Err(error) = pipe.dial(&named("news.invalid", 119)).await else {
+        panic!("a proxy that reaches nothing connected");
+    };
+    assert!(
+        matches!(&error, DialError::Hop { proxy: 7, source } if crate::transport::is_destination_unreachable(source)),
+        "{error:?}"
+    );
+    let once = lookups(&dns, "news.invalid");
+    assert!(once > 0);
+    assert!(pipe.dial(&named("news.invalid", 119)).await.is_err());
+
+    assert_eq!(lookups(&dns, "news.invalid"), 2 * once);
+}
+
+// A failure shared with callers that waited on the same lookup says what
+// the one that asked was told.
+#[test]
+fn a_shared_dial_failure_keeps_its_kind_and_its_hop() {
+    use crate::resolution::Replicate;
+    let hop = DialError::Hop {
+        proxy: 7,
+        source: TunnelError::Engine("proxy refused".into()),
+    };
+    let DialError::Hop { proxy, source } = hop.replicate() else {
+        panic!("a hop failure changed kind");
+    };
+    assert_eq!(proxy, 7);
+    assert_eq!(
+        source.to_string(),
+        TunnelError::Engine("proxy refused".into()).to_string()
+    );
+    let refused = DialError::Refused(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
+    let DialError::Refused(copy) = refused.replicate() else {
+        panic!("a refusal changed kind");
+    };
+    assert_eq!(copy.kind(), io::ErrorKind::ConnectionRefused);
+    assert_eq!(copy.to_string(), "refused");
+    let unresolved = crate::dns::unresolved().replicate();
+    assert!(matches!(&unresolved, DialError::Destination(_)));
+    assert_eq!(unresolved.to_string(), crate::dns::unresolved().to_string());
 }
 
 // The host's own DNS resolves for a hop set to it, and the proxy is asked
@@ -1437,7 +1538,7 @@ async fn servers_asked_through_an_unreachable_hop_fail_as_the_path() {
         7,
         "192.0.2.1",
         8080,
-        Naming::ProxyServers(vec![ROUTED_DNS.parse().unwrap()]),
+        Naming::proxy_servers(vec![ROUTED_DNS.parse().unwrap()]),
         inner,
     );
     let Err(error) = pipe.dial(&named("news.invalid", 119)).await else {
@@ -1533,12 +1634,12 @@ async fn a_slow_lookup_leaves_the_hop_its_whole_connect_window() {
         7,
         "192.0.2.1",
         8080,
-        Naming::Servers {
-            servers: vec![ROUTED_DNS.parse().unwrap()],
-            egress: Arc::new(SlowDns {
+        Naming::servers(
+            vec![ROUTED_DNS.parse().unwrap()],
+            Arc::new(SlowDns {
                 delay: Duration::from_secs(4),
             }),
-        },
+        ),
         Arc::new(Late {
             delay: Duration::from_secs(25),
         }),

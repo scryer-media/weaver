@@ -3,7 +3,6 @@ use crate::{TunnelError, TunnelProvider, TunnelStream};
 use base64::Engine;
 use std::net::{IpAddr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 #[derive(Clone, Copy, Debug)]
 pub enum TransportKind {
@@ -47,10 +46,16 @@ impl From<TunnelError> for ConnectFailure {
     }
 }
 
+const UNREACHABLE: &str = "proxy could not connect to destination";
+
 fn destination_unreachable(proxy: &str, reason: &str) -> TunnelError {
-    TunnelError::Engine(format!(
-        "{proxy} proxy could not connect to destination: {reason}"
-    ))
+    TunnelError::Engine(format!("{proxy} {UNREACHABLE}: {reason}"))
+}
+
+// Whether `error` is a proxy's answer that it could not reach the
+// destination it was asked for.
+pub(crate) fn is_destination_unreachable(error: &TunnelError) -> bool {
+    matches!(error, TunnelError::Engine(detail) if detail.contains(UNREACHABLE))
 }
 
 // Establish a SOCKS5 CONNECT without resolving the destination locally.
@@ -298,7 +303,7 @@ impl TunnelProvider for TransportProxy {
         Some(self.kind.tunnel_kind())
     }
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        let mut stream = TcpStream::connect((self.host.as_str(), self.port))
+        let mut stream = crate::resolution::connect_host(&self.host, self.port)
             .await
             .map_err(|_| failure("proxy endpoint is unreachable"))?;
         stream

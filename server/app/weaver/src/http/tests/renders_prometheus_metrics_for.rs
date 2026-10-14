@@ -1513,7 +1513,13 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
         &rendered,
         "weaver_network_dns_resolutions_total",
         "resolver",
-        &["routed", "wireguard"],
+        &["host", "routed", "wireguard"],
+    );
+    assert_label_set(
+        &rendered,
+        "weaver_network_dns_cache_total",
+        "outcome",
+        &["hit", "joined", "miss"],
     );
 
     assert!(rendered.contains(

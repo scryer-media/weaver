@@ -12,6 +12,7 @@ pub mod dns;
 pub mod egress;
 pub mod metrics;
 pub mod pipe;
+pub mod resolution;
 pub mod revocation;
 pub use proxy_tunnels::endpoint;
 mod error;

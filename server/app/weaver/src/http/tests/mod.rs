@@ -1299,7 +1299,7 @@ fn sample_network() -> weaver_server_core::proxies::network_metrics::NetworkMetr
 
 fn sample_tunnel() -> weaver_server_core::proxies::network_metrics::tunnel::TunnelMetricsSnapshot {
     use weaver_server_core::proxies::network_metrics::tunnel::{
-        DialResult, RUNGS, Resolver, TunnelKind, TunnelMetricsSnapshot,
+        CacheOutcome, DialResult, RUNGS, Resolver, TunnelKind, TunnelMetricsSnapshot,
     };
     TunnelMetricsSnapshot {
         streams: TunnelKind::ALL
@@ -1316,6 +1316,10 @@ fn sample_tunnel() -> weaver_server_core::proxies::network_metrics::tunnel::Tunn
             .collect(),
         session_retirements: TunnelKind::SESSIONS.into_iter().map(|k| (k, 2)).collect(),
         resolutions: Resolver::ALL.into_iter().map(|r| (r, 10, 2)).collect(),
+        cache: Resolver::ALL
+            .into_iter()
+            .flat_map(|r| CacheOutcome::ALL.into_iter().map(move |o| (r, o, 4)))
+            .collect(),
         rung_cooldowns: vec![1; RUNGS],
         rung_fallbacks: vec![2; RUNGS],
         revocations: 3,

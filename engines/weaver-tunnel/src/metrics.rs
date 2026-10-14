@@ -102,21 +102,45 @@ impl DialResult {
     }
 }
 
-// Which resolver answered a name: routed DNS over a proxy, or the resolver
-// inside a WireGuard tunnel.
+// Which resolver answered a name: the host's own DNS, DNS servers asked
+// from the egress or over a proxy, or the resolver inside a WireGuard
+// tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolver {
+    Host,
     Routed,
     WireGuard,
 }
 
 impl Resolver {
-    pub const ALL: [Self; 2] = [Self::Routed, Self::WireGuard];
+    pub const ALL: [Self; 3] = [Self::Host, Self::Routed, Self::WireGuard];
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Host => "host",
             Self::Routed => "routed",
             Self::WireGuard => "wireguard",
+        }
+    }
+}
+
+// How a resolution cache answered: from an answer it held, by waiting on a
+// lookup already asking for the name, or by asking itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheOutcome {
+    Hit,
+    Joined,
+    Miss,
+}
+
+impl CacheOutcome {
+    pub const ALL: [Self; 3] = [Self::Hit, Self::Joined, Self::Miss];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Joined => "joined",
+            Self::Miss => "miss",
         }
     }
 }
@@ -133,6 +157,8 @@ static SESSION_PREPARES: [[AtomicU64; 2]; KINDS] =
 static SESSION_RETIREMENTS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
 static RESOLUTIONS: [[AtomicU64; 2]; Resolver::ALL.len()] =
     [const { [const { AtomicU64::new(0) }; 2] }; Resolver::ALL.len()];
+static CACHE: [[AtomicU64; CacheOutcome::ALL.len()]; Resolver::ALL.len()] =
+    [const { [const { AtomicU64::new(0) }; CacheOutcome::ALL.len()] }; Resolver::ALL.len()];
 static RUNG_COOLDOWNS: [AtomicU64; RUNGS] = [const { AtomicU64::new(0) }; RUNGS];
 static RUNG_FALLBACKS: [AtomicU64; RUNGS] = [const { AtomicU64::new(0) }; RUNGS];
 static REVOCATIONS: AtomicU64 = AtomicU64::new(0);
@@ -158,6 +184,10 @@ pub fn record_resolution(resolver: Resolver, ok: bool) {
     RESOLUTIONS[resolver as usize][usize::from(ok)].fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn record_cache(resolver: Resolver, outcome: CacheOutcome) {
+    CACHE[resolver as usize][outcome as usize].fetch_add(1, Ordering::Relaxed);
+}
+
 // A rung of a ladder was set aside after its path failed.
 pub fn record_rung_cooldown(index: usize) {
     RUNG_COOLDOWNS[rung(index)].fetch_add(1, Ordering::Relaxed);
@@ -181,6 +211,7 @@ pub struct TunnelMetricsSnapshot {
     pub session_retirements: Vec<(TunnelKind, u64)>,
     // (resolver, succeeded, failed).
     pub resolutions: Vec<(Resolver, u64, u64)>,
+    pub cache: Vec<(Resolver, CacheOutcome, u64)>,
     // Indexed by rung.
     pub rung_cooldowns: Vec<u64>,
     pub rung_fallbacks: Vec<u64>,
@@ -214,6 +245,18 @@ pub fn snapshot() -> TunnelMetricsSnapshot {
             .map(|resolver| {
                 let counts = &RESOLUTIONS[resolver as usize];
                 (resolver, load(&counts[1]), load(&counts[0]))
+            })
+            .collect(),
+        cache: Resolver::ALL
+            .into_iter()
+            .flat_map(|resolver| {
+                CacheOutcome::ALL.into_iter().map(move |outcome| {
+                    (
+                        resolver,
+                        outcome,
+                        load(&CACHE[resolver as usize][outcome as usize]),
+                    )
+                })
             })
             .collect(),
         rung_cooldowns: RUNG_COOLDOWNS.iter().map(load).collect(),

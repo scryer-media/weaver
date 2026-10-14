@@ -69,12 +69,9 @@ impl ProxyProfile {
     pub fn naming(&self, egress: Arc<Egress>) -> Naming {
         match (self.resolver, self.dns_servers.is_empty()) {
             (Resolver::Weaver, true) => Naming::Host,
-            (Resolver::Weaver, false) => Naming::Servers {
-                servers: self.dns_servers.clone(),
-                egress,
-            },
+            (Resolver::Weaver, false) => Naming::servers(self.dns_servers.clone(), egress),
             (Resolver::Proxy, true) => Naming::Proxy,
-            (Resolver::Proxy, false) => Naming::ProxyServers(self.dns_servers.clone()),
+            (Resolver::Proxy, false) => Naming::proxy_servers(self.dns_servers.clone()),
         }
     }
     // The DNS servers asked through the proxy itself.

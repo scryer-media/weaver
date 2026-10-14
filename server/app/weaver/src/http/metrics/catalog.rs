@@ -490,7 +490,9 @@ metric_families! {
     NETWORK_PROXIES = ("weaver_network_proxies", Gauge, ["kind", "enabled"],
         "Configured proxy profiles by kind and whether they are enabled.");
     NETWORK_DNS_RESOLUTIONS = ("weaver_network_dns_resolutions_total", Counter, ["resolver", "result"],
-        "Host name lookups made for routed connections, by resolver and result.");
+        "Host name lookups Weaver made, by resolver and result; answers taken from the cache are not counted.");
+    NETWORK_DNS_CACHE = ("weaver_network_dns_cache_total", Counter, ["resolver", "outcome"],
+        "Host names resolved, by resolver and whether a held answer served them, they joined a lookup already asking, or they asked.");
     NETWORK_RUNG_COOLDOWNS = ("weaver_network_rung_cooldowns_total", Counter, ["rung"],
         "Times a ladder rung entered a cooldown, by rung position.");
     NETWORK_RUNG_FALLBACKS = ("weaver_network_rung_fallbacks_total", Counter, ["rung"],

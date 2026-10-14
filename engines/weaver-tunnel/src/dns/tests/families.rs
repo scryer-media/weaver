@@ -70,7 +70,8 @@ async fn one_family_survives_peer_protocol_or_transport_failure() {
                 "fixture.invalid",
             )
             .await
-            .unwrap();
+            .unwrap()
+            .addresses;
             assert_eq!(addresses.len(), 1);
             assert_eq!(addresses[0].is_ipv4(), failed_family == 28);
             assert_eq!(*resolver.queries.lock().unwrap(), [1, 28]);
@@ -116,7 +117,8 @@ async fn a_silent_family_does_not_consume_the_outer_request_deadline() {
         )
         .await
         .expect("working family must survive before the request deadline")
-        .unwrap();
+        .unwrap()
+        .addresses;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].is_ipv4(), failed_family == 28);
         assert_eq!(*resolver.queries.lock().unwrap(), [1, 28]);
@@ -137,7 +139,8 @@ async fn both_successful_families_are_retained() {
         "fixture.invalid",
     )
     .await
-    .unwrap();
+    .unwrap()
+    .addresses;
     assert_eq!(result.len(), 2);
     assert!(result.iter().any(IpAddr::is_ipv4));
     assert!(result.iter().any(IpAddr::is_ipv6));
