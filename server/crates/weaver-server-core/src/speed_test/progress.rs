@@ -377,9 +377,9 @@ impl Progress {
             }
         });
         // A bandwidth run's speed leaves its warm-up out; with no warm-up
-        // end, the run never got past it and the whole run stands in.
+        // end, or nothing moved after it, the whole run stands in.
         let average_bps = match (&bandwidth, self.warm_up.get()) {
-            (Some(_), Some((at, moved))) if elapsed > *at => {
+            (Some(_), Some((at, moved))) if elapsed > *at && bytes > *moved => {
                 bytes.saturating_sub(*moved) as f64 / (elapsed - *at).as_secs_f64()
             }
             _ => rate(bytes),
@@ -634,3 +634,7 @@ impl TunnelProvider for StreamProvider {
         format!("speed test stream: {}", self.stage.describe())
     }
 }
+
+#[cfg(test)]
+#[path = "progress_tests.rs"]
+mod tests;
