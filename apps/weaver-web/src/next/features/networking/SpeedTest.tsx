@@ -375,7 +375,7 @@ export function TestControls({
               </ControlLabel>
             ) : null}
             {form.providerId ? null : (
-              <ControlLabel label={t("next.networking.speed.url")} className="flex-[1_1_260px]">
+              <ControlLabel label={t("next.networking.speed.url")} className="min-w-0 flex-[0_1_480px]">
                 <TextField
                   label={t("next.networking.speed.url")}
                   value={form.customUrl}
@@ -403,7 +403,7 @@ export function TestControls({
               />
             </ControlLabel>
             {form.nzb === "FILE" ? (
-              <ControlLabel label={t("next.networking.speed.nzbFile")} className="min-w-0 flex-[1_1_260px]">
+              <ControlLabel label={t("next.networking.speed.nzbFile")} className="min-w-0 max-w-[480px]">
                 <div className="flex h-[34px] min-w-0 items-center gap-3">
                   <input
                     ref={fileRef}
@@ -432,7 +432,7 @@ export function TestControls({
               </ControlLabel>
             ) : null}
             {form.nzb === "URL" ? (
-              <ControlLabel label={t("next.networking.speed.nzbUrl")} className="flex-[1_1_260px]">
+              <ControlLabel label={t("next.networking.speed.nzbUrl")} className="min-w-0 flex-[0_1_480px]">
                 <TextField
                   label={t("next.networking.speed.nzbUrl")}
                   value={form.nzbUrl}

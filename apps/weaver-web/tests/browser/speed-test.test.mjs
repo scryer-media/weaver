@@ -227,6 +227,8 @@ test("a feed is tested for bandwidth only, and a custom URL must be HTTPS before
     await page.getByRole("alert").filter({ hasText: "Enter an HTTPS URL." }).waitFor();
     const run = page.getByRole("button", { name: "Run", exact: true });
     assert.equal(await run.isDisabled(), true);
+    // The URL box keeps a bounded width rather than spanning the page.
+    assert.ok((await page.getByLabel("URL", { exact: true }).boundingBox()).width <= 480);
     await page.getByLabel("URL", { exact: true }).fill("https://files.fixture.invalid/blob");
     await flow.getByText("files.fixture.invalid", { exact: true }).waitFor();
     await run.and(page.locator(":enabled")).click();
@@ -286,8 +288,22 @@ test("a Usenet test takes one .nzb file, sent with the start, and runs it again 
     const plan = page.locator("main");
     const run = page.getByRole("button", { name: "Run", exact: true });
     await page.getByRole("radio", { name: "Usenet", exact: true }).click();
+    // However wide the page, the source keeps its own width and Connections follows it one gap on.
+    const connections = page.getByRole("spinbutton", { name: "Connections", exact: true });
+    const cells = async (control) =>
+      page.evaluate(([source, after]) => {
+        let row = source.parentElement;
+        while (!row.contains(after)) row = row.parentElement;
+        const cell = (element) => [...row.children].find((child) => child.contains(element)).getBoundingClientRect();
+        return { width: Math.round(cell(source).width), gap: Math.round(cell(after).left - cell(source).right) };
+      }, [await control.elementHandle(), await connections.elementHandle()]);
+    await page.getByRole("button", { name: "NZB", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: "URL", exact: true }).click();
+    assert.deepEqual(await cells(page.getByRole("textbox", { name: "NZB URL", exact: true })), { width: 480, gap: 12 });
+    await shot(page, "speed-nzb-url");
     await page.getByRole("button", { name: "NZB", exact: true }).click();
     await page.getByRole("menuitemradio", { name: "File", exact: true }).click();
+    assert.equal((await cells(page.getByRole("button", { name: "Choose file", exact: true }))).gap, 12);
     // Until a .nzb file is chosen there is nothing to run.
     await page.getByRole("alert").filter({ hasText: "Choose an .nzb file." }).waitFor();
     assert.equal(await run.isDisabled(), true);
