@@ -2405,8 +2405,9 @@ impl NntpClient {
         &self.pool
     }
 
-    // Feed the fetch times of successful attempts to the address plans of
-    // the servers that served them.
+    // Feed the fetch times of successful attempts to the routes of the
+    // connections that served them; a direct leg books them on its address
+    // plan.
     pub fn record_fetch_attempts(&self, attempts: &[FetchAttemptTrace]) {
         for attempt in attempts {
             if attempt.outcome != FetchAttemptOutcome::Success {
@@ -2414,13 +2415,6 @@ impl NntpClient {
             }
             if let Some(feedback) = &attempt.route_feedback {
                 feedback.body_latency(attempt.elapsed);
-            }
-            if let Some(ip) = attempt.remote_ip {
-                self.pool.record_address_body_latency(
-                    ServerId(attempt.server_idx),
-                    ip,
-                    attempt.elapsed,
-                );
             }
         }
     }
@@ -2445,10 +2439,6 @@ impl NntpClient {
         };
         if let Some(feedback) = &served.route_feedback {
             feedback.delivered(payload_bytes, wire);
-        }
-        if let Some(ip) = served.remote_ip {
-            self.pool
-                .record_address_delivery(ServerId(served.server_idx), ip, payload_bytes, wire);
         }
     }
 

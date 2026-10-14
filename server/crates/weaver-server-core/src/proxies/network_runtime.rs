@@ -502,11 +502,12 @@ impl NetworkRuntime {
             EgressBinding::Interface { name } => SocketEgress::Interface(name.clone()),
             EgressBinding::SourceAddress { address } => SocketEgress::SourceAddress(*address),
         };
-        Ok(Arc::new(Egress {
-            id,
-            binding,
-            timeout,
-        }))
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the runtime builds a route's egress from the saved egress"
+        )]
+        let egress = Egress::new(id, binding, timeout);
+        Ok(Arc::new(egress))
     }
     fn hop(
         &self,
@@ -521,11 +522,15 @@ impl NetworkRuntime {
             return Ok(Arc::new(Unavailable(format!("proxy {id} is disabled"))));
         }
         // A canonical hop has the profile's timeout, independent of its first consumer.
-        let bottom = Arc::new(Egress {
-            id: bottom.id,
-            binding: bottom.binding.clone(),
-            timeout: profile.timeout(),
-        });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a hop's egress is the leg's, with the profile's timeout"
+        )]
+        let bottom = Arc::new(Egress::new(
+            bottom.id(),
+            bottom.binding().clone(),
+            profile.timeout(),
+        ));
         let inner: Arc<dyn Dialer> = if prefix.is_empty() {
             bottom.clone()
         } else {
@@ -539,7 +544,7 @@ impl NetworkRuntime {
             .iter()
             .map(|id| (*id, config.profiles.get(id).map(|p| p.revision)))
             .collect();
-        let key = format!("{}:{:?}:{revisions:?}", bottom.id, bottom.binding);
+        let key = format!("{}:{:?}:{revisions:?}", bottom.id(), bottom.binding());
         let mut sessions = self.sessions.lock().expect("network sessions");
         if let Some(stage) = sessions
             .get(&key)
@@ -650,7 +655,7 @@ impl NetworkRuntime {
                     inner,
                     transport,
                     path: DialPath {
-                        egress: bottom.id,
+                        egress: bottom.id(),
                         proxies: prefix.to_vec(),
                         ..Default::default()
                     },
@@ -681,13 +686,13 @@ impl NetworkRuntime {
                 .pools
                 .lock()
                 .expect("network pools")
-                .get(&(id, bottom.id))
+                .get(&(id, bottom.id()))
             {
                 if self.compiling {
                     self.pool_updates
                         .lock()
                         .expect("staged pools")
-                        .insert((id, bottom.id), Vec::new());
+                        .insert((id, bottom.id()), Vec::new());
                 } else {
                     stage.set_members(Vec::new());
                 }
@@ -706,12 +711,12 @@ impl NetworkRuntime {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let mut pools = self.pools.lock().expect("network pools");
-        let stage = if let Some(stage) = pools.get(&(id, bottom.id)) {
+        let stage = if let Some(stage) = pools.get(&(id, bottom.id())) {
             if self.compiling {
                 self.pool_updates
                     .lock()
                     .expect("staged pools")
-                    .insert((id, bottom.id), members);
+                    .insert((id, bottom.id()), members);
             } else {
                 let revision = stage.revision();
                 stage.set_members(members);
@@ -722,7 +727,7 @@ impl NetworkRuntime {
             stage.clone()
         } else {
             let stage = PoolStage::new(id, members, self.handle.clone());
-            pools.insert((id, bottom.id), stage.clone());
+            pools.insert((id, bottom.id()), stage.clone());
             if !self.compiling {
                 stage.prewarm();
             }
@@ -818,7 +823,7 @@ impl NetworkRuntime {
         let signature = format!(
             "{}:{:?}:{}:{versions:?}:{pool_versions:?}",
             leg.egress_id,
-            bottom.binding,
+            bottom.binding(),
             serde_json::to_string(&leg.path).map_err(|e| e.to_string())?
         );
         Ok(LiveLeg {
@@ -903,8 +908,15 @@ impl NetworkRuntime {
         timeout: Duration,
     ) -> Result<Arc<RouteDialer>, String> {
         let route = self.route(Consumer::Server(id), cap, timeout)?;
+        let plan = route
+            .legs
+            .read()
+            .expect("network route legs")
+            .iter()
+            .find_map(|leg| leg.address_plan.as_ref().map(|plan| plan.plan.clone()));
         Ok(Arc::new(RouteDialer {
             inner: route.weighted.clone(),
+            plan,
             egress_controls: self.egress_controls.clone(),
             runtime: self.handle.clone(),
             server: id,

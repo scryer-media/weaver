@@ -15,15 +15,17 @@ use weaver_nntp::transfer::{ServerTransferRegistry, StableServerId};
     reason = "a bench pool that never dials needs a route to hold"
 )]
 fn idle_route(runtime: &tokio::runtime::Runtime) -> Arc<RouteDialer> {
-    Arc::new(RouteDialer {
-        inner: Arc::new(AddressPlanned::new(
-            "bench".into(),
-            Arc::new(weaver_tunnel::pipe::Egress {
-                id: 0,
-                binding: weaver_nntp::egress::SocketEgress::System,
-                timeout: Duration::from_secs(30),
-            }),
+    let planned = Arc::new(AddressPlanned::new(
+        "bench".into(),
+        Arc::new(weaver_tunnel::pipe::Egress::new(
+            0,
+            weaver_nntp::egress::SocketEgress::System,
+            Duration::from_secs(30),
         )),
+    ));
+    Arc::new(RouteDialer {
+        plan: Some(planned.plan.clone()),
+        inner: planned,
         egress_controls: Arc::new(ServerTransferRegistry::new()),
         runtime: runtime.handle().clone(),
         server: 0,

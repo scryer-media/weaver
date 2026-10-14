@@ -517,12 +517,30 @@ pub trait Dialer: Send + Sync {
 }
 
 pub struct Egress {
-    pub id: u32,
-    pub binding: SocketEgress,
-    pub timeout: Duration,
+    id: u32,
+    binding: SocketEgress,
+    timeout: Duration,
 }
 
 impl Egress {
+    // The egress a route leaves on. Only the proxy runtime builds one, from a
+    // saved egress; a dialer that builds its own takes no route.
+    pub fn new(id: u32, binding: SocketEgress, timeout: Duration) -> Self {
+        Self {
+            id,
+            binding,
+            timeout,
+        }
+    }
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+    pub fn binding(&self) -> &SocketEgress {
+        &self.binding
+    }
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
     pub fn connect_error(&self, error: io::Error) -> DialError {
         if !matches!(self.binding, SocketEgress::System)
             && matches!(

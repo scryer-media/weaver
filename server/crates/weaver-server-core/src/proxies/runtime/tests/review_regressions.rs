@@ -35,6 +35,7 @@ fn bridge_dialer(
 ) -> Arc<weaver_nntp::route_dialer::RouteDialer> {
     Arc::new(weaver_nntp::route_dialer::RouteDialer {
         inner: Arc::new(BridgeDialer(bridge)),
+        plan: None,
         egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::with_scope(
             weaver_nntp::transfer::TransferScope::Egress,
         )),

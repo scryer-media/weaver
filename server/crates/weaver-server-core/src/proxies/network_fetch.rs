@@ -312,7 +312,7 @@ impl NetworkRuntime {
                         }
                         self.pool(&config, id, bottom.clone())?;
                         let pools = self.pools.lock().expect("network pools");
-                        let Some(pool) = pools.get(&(id, bottom.id)) else {
+                        let Some(pool) = pools.get(&(id, bottom.id())) else {
                             continue;
                         };
                         pool.lease_members()

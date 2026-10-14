@@ -39,6 +39,7 @@ impl DraftNetworkRoute {
         let leg = self.legs.get(position).ok_or("draft leg does not exist")?;
         Ok(Arc::new(weaver_nntp::route_dialer::RouteDialer {
             inner: leg.stage.clone(),
+            plan: leg.address_plan.as_ref().map(|plan| plan.plan.clone()),
             egress_controls: self.isolated.egress_controls.clone(),
             runtime: self.handle.clone(),
             server,

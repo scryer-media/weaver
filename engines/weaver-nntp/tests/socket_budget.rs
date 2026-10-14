@@ -12,15 +12,17 @@ use weaver_nntp::{NntpPool, PoolConfig, ServerConfig, ServerId, ServerPoolConfig
     reason = "tests reach their loopback servers on the direct route"
 )]
 fn direct_route() -> Arc<RouteDialer> {
-    Arc::new(RouteDialer {
-        inner: Arc::new(AddressPlanned::new(
-            "socket budget fixture".into(),
-            Arc::new(weaver_tunnel::pipe::Egress {
-                id: 0,
-                binding: weaver_nntp::egress::SocketEgress::System,
-                timeout: Duration::from_secs(30),
-            }),
+    let planned = Arc::new(AddressPlanned::new(
+        "socket budget fixture".into(),
+        Arc::new(weaver_tunnel::pipe::Egress::new(
+            0,
+            weaver_nntp::egress::SocketEgress::System,
+            Duration::from_secs(30),
         )),
+    ));
+    Arc::new(RouteDialer {
+        plan: Some(planned.plan.clone()),
+        inner: planned,
         egress_controls: Arc::new(ServerTransferRegistry::new()),
         runtime: tokio::runtime::Handle::current(),
         server: 0,

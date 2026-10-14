@@ -2,11 +2,7 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn bottom() -> Arc<Egress> {
-    Arc::new(Egress {
-        id: 4,
-        binding: SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
-        timeout: Duration::from_secs(30),
-    })
+    Arc::new(Egress::new(4, SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()), Duration::from_secs(30)))
 }
 fn target(address: SocketAddr) -> Target {
     Target {
@@ -777,20 +773,12 @@ fn unresolved_destination_and_bound_route_failures_have_distinct_evidence() {
             SocketEgress::Interface("fixture-link".into()),
             SocketEgress::SourceAddress("192.0.2.1".parse().unwrap()),
         ] {
-            let egress = Egress {
-                id: 1,
-                binding,
-                timeout: Duration::from_secs(1),
-            };
+            let egress = Egress::new(1, binding, Duration::from_secs(1));
             let failure = egress.connect_error(io::Error::from(kind));
             assert!(failure.is_path_evidence());
             assert!(failure.to_string().contains("no route via"));
         }
-        let system = Egress {
-            id: 0,
-            binding: SocketEgress::System,
-            timeout: Duration::from_secs(1),
-        };
+        let system = Egress::new(0, SocketEgress::System, Duration::from_secs(1));
         assert!(
             !system
                 .connect_error(io::Error::from(kind))

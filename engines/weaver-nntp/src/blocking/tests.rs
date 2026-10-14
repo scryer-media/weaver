@@ -2050,16 +2050,14 @@ fn routed_socket_preserves_implicit_tls_and_starttls_body_delivery() {
             )],
             upgrade,
         );
-        let egress = std::sync::Arc::new(weaver_tunnel::pipe::Egress {
-            id: 0,
-            binding: weaver_tunnel::egress::SocketEgress::System,
-            timeout: config.connect_timeout,
-        });
+        let egress = std::sync::Arc::new(weaver_tunnel::pipe::Egress::new(0, weaver_tunnel::egress::SocketEgress::System, config.connect_timeout));
+        let planned = std::sync::Arc::new(crate::route_dialer::AddressPlanned::new(
+            "fixture".into(),
+            egress,
+        ));
         config.dialer = std::sync::Arc::new(crate::route_dialer::RouteDialer {
-            inner: std::sync::Arc::new(crate::route_dialer::AddressPlanned::new(
-                "fixture".into(),
-                egress,
-            )),
+            plan: Some(planned.plan.clone()),
+            inner: planned,
             egress_controls: std::sync::Arc::new(crate::transfer::ServerTransferRegistry::new()),
             runtime: runtime.handle().clone(),
             server: 1,

@@ -37,8 +37,8 @@ impl Dialer for AddressPlanned {
             return self.egress.dial(target).await;
         }
         let dialer = Arc::new(
-            crate::address_plan::TcpDialer::new(&target.host, target.port, self.egress.timeout)
-                .with_egress(self.egress.binding.clone()),
+            crate::address_plan::TcpDialer::new(&target.host, target.port, self.egress.timeout())
+                .with_egress(self.egress.binding().clone()),
         );
         let plan = self.plan.clone();
         let (socket, peer) = tokio::task::spawn_blocking(move || plan.connect(&dialer))
@@ -60,7 +60,7 @@ impl Dialer for AddressPlanned {
             stream: DialedStream::Socket(stream),
             outcome,
             path: DialPath {
-                egress: self.egress.id,
+                egress: self.egress.id(),
                 ..Default::default()
             },
             peer: Some(peer),
@@ -89,6 +89,9 @@ const ROUTE_BUDGET_BACKSTOP: std::time::Duration = std::time::Duration::from_sec
 
 pub struct RouteDialer {
     pub inner: Arc<dyn Dialer>,
+    // The address plan of the server's direct leg, when it has one; the pool
+    // reports it. Pins, setup and delivery are booked by the dial itself.
+    pub plan: Option<Arc<crate::address_plan::AddressPlan>>,
     pub egress_controls: Arc<crate::transfer::ServerTransferRegistry>,
     pub runtime: tokio::runtime::Handle,
     pub server: u32,
@@ -119,15 +122,17 @@ impl RouteDialer {
                 .build()
                 .expect("test route runtime")
         });
-        Arc::new(Self {
-            inner: Arc::new(AddressPlanned::new(
-                "test direct route".into(),
-                Arc::new(weaver_tunnel::pipe::Egress {
-                    id: 0,
-                    binding: crate::egress::SocketEgress::System,
-                    timeout: std::time::Duration::from_secs(30),
-                }),
+        let planned = Arc::new(AddressPlanned::new(
+            "test direct route".into(),
+            Arc::new(weaver_tunnel::pipe::Egress::new(
+                0,
+                crate::egress::SocketEgress::System,
+                std::time::Duration::from_secs(30),
             )),
+        ));
+        Arc::new(Self {
+            plan: Some(planned.plan.clone()),
+            inner: planned,
             egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
             runtime: runtime.handle().clone(),
             server: 0,
@@ -206,6 +211,7 @@ mod tests {
         let inner = Arc::new(Hung(tokio::sync::Notify::new()));
         let route = RouteDialer {
             inner: inner.clone(),
+            plan: None,
             egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
             runtime: tokio::runtime::Handle::current(),
             server: 1,

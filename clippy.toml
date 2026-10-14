@@ -29,4 +29,5 @@ disallowed-methods = [
     { path = "weaver_tunnel::egress::SocketEgress::connect_blocking", reason = "dial through the proxy runtime, so the connection takes its route" },
     { path = "weaver_tunnel::egress::SocketEgress::bind_udp", reason = "send through the proxy runtime, so the datagrams take their route" },
     { path = "weaver_nntp::route_dialer::AddressPlanned::new", reason = "take the server's dialer from its route in the proxy runtime" },
+    { path = "weaver_tunnel::pipe::Egress::new", reason = "take the egress from the route in the proxy runtime" },
 ]

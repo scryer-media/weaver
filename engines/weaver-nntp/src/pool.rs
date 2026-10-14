@@ -21,7 +21,7 @@ use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
-use crate::address_plan::{AddressPlan, AddressPlanSnapshot};
+use crate::address_plan::AddressPlanSnapshot;
 use crate::connection::{NntpConnection, ServerConfig};
 
 async fn acquisition_budget<T>(
@@ -118,8 +118,6 @@ pub struct NntpPool {
     // would be a log flood; a silent one is what made the condition invisible.
     blocking_connect_warn_after: Vec<AtomicU64>,
     blocking_connect_failures_since_warning: Vec<AtomicU64>,
-    // Per-server choice of which resolved address new connections dial.
-    address_plans: Vec<Arc<AddressPlan>>,
     // Cold connection admission only; established BODY lanes never touch it.
     auth_admission: Vec<AuthAdmission>,
 }
@@ -376,7 +374,6 @@ impl NntpPool {
         let mut over_limit_episodes = Vec::with_capacity(server_count);
         let mut blocking_connect_warn_after = Vec::with_capacity(server_count);
         let mut blocking_connect_failures_since_warning = Vec::with_capacity(server_count);
-        let mut address_plans = Vec::with_capacity(server_count);
         let mut socket_budgets = Vec::with_capacity(server_count);
         let shutdown = CancellationToken::new();
 
@@ -430,10 +427,6 @@ impl NntpPool {
             over_limit_episodes.push(SyncMutex::new(OverLimitEpisode::default()));
             blocking_connect_warn_after.push(AtomicU64::new(0));
             blocking_connect_failures_since_warning.push(AtomicU64::new(0));
-            address_plans.push(Arc::new(AddressPlan::new(format!(
-                "{}:{}",
-                spc.server.host, spc.server.port
-            ))));
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
             configs.push(spc.server.clone());
             pools.push(Arc::new(SyncMutex::new(ServerPool {
@@ -484,7 +477,6 @@ impl NntpPool {
             over_limit_episodes,
             blocking_connect_warn_after,
             blocking_connect_failures_since_warning,
-            address_plans,
             auth_admission: (0..server_count)
                 .map(|_| AuthAdmission {
                     state: AtomicU64::new(0),
@@ -633,30 +625,15 @@ impl NntpPool {
         }
     }
 
-    // This server's address plan as it stands.
+    // The address plan of this server's direct leg as it stands: none for
+    // a server reached only through proxies.
     pub fn address_plan_snapshot(&self, server: ServerId) -> Option<AddressPlanSnapshot> {
-        self.address_plans.get(server.0).map(|plan| plan.snapshot())
-    }
-
-    // Book how long an article fetch on a connection to `ip` took.
-    pub fn record_address_body_latency(&self, server: ServerId, ip: IpAddr, elapsed: Duration) {
-        if let Some(plan) = self.address_plans.get(server.0) {
-            plan.record_body_latency(ip, elapsed);
-        }
-    }
-
-    // Book the bytes one warm article fetch on a connection to `ip` moved
-    // and the wire time they took.
-    pub fn record_address_delivery(
-        &self,
-        server: ServerId,
-        ip: IpAddr,
-        bytes: u64,
-        wire: Duration,
-    ) {
-        if let Some(plan) = self.address_plans.get(server.0) {
-            plan.record_delivery(ip, bytes, wire);
-        }
+        self.configs
+            .get(server.0)?
+            .dialer
+            .plan
+            .as_ref()
+            .map(|plan| plan.snapshot())
     }
 
     async fn connect_server(
@@ -1333,9 +1310,6 @@ impl NntpPool {
         episode.probe_started = 0;
         deadline_slot.store(0, Ordering::Release);
         drop(episode);
-        if let Some(plan) = self.address_plans.get(idx) {
-            plan.note_over_limit_cleared();
-        }
         if let Some(server) = self.configs.get(idx) {
             server.dialer.inner.over_limit_cleared();
         }
@@ -1923,6 +1897,7 @@ mod tests {
         config.servers[0].server.tls = false;
         config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
             inner: probe.clone(),
+            plan: None,
             runtime: tokio::runtime::Handle::current(),
             server: 1,
             egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
@@ -2005,6 +1980,7 @@ mod tests {
         config.servers[0].server.tls = false;
         config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
             inner: route.clone(),
+            plan: None,
             runtime: tokio::runtime::Handle::current(),
             server: 1,
             egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
@@ -2185,14 +2161,11 @@ mod tests {
     fn planned_route(config: &mut PoolConfig) -> Arc<crate::route_dialer::AddressPlanned> {
         let route = Arc::new(crate::route_dialer::AddressPlanned::new(
             "pool test".into(),
-            Arc::new(weaver_tunnel::pipe::Egress {
-                id: 0,
-                binding: crate::egress::SocketEgress::System,
-                timeout: Duration::from_secs(30),
-            }),
+            Arc::new(weaver_tunnel::pipe::Egress::new(0, crate::egress::SocketEgress::System, Duration::from_secs(30))),
         ));
         config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
             inner: route.clone(),
+            plan: Some(route.plan.clone()),
             egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
             runtime: tokio::runtime::Handle::current(),
             server: 1,

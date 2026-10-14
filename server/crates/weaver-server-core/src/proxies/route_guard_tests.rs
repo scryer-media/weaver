@@ -35,6 +35,7 @@ const BANNED: &[&str] = &[
     "weaver_tunnel::egress::SocketEgress::connect_blocking",
     "weaver_tunnel::egress::SocketEgress::bind_udp",
     "weaver_nntp::route_dialer::AddressPlanned::new",
+    "weaver_tunnel::pipe::Egress::new",
 ];
 
 // Every file that lifts the ban, and how many times. Each lift names why the
@@ -59,7 +60,7 @@ const LIFTED: &[(&str, usize)] = &[
     ("server/crates/weaver-server-core/src/lib.rs", 1),
     (
         "server/crates/weaver-server-core/src/proxies/network_runtime.rs",
-        1,
+        3,
     ),
     (
         "server/crates/weaver-server-core/src/proxies/routed_http.rs",

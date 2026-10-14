@@ -100,6 +100,7 @@ pub(crate) async fn run(
         // A fresh egress registry: the speed limits do not apply to a run.
         let dialer = Arc::new(RouteDialer {
             inner: recording,
+            plan: None,
             egress_controls: Arc::new(ServerTransferRegistry::with_scope(TransferScope::Egress)),
             runtime: tokio::runtime::Handle::current(),
             server: server.id,
