@@ -237,6 +237,7 @@ impl ReleaseLane {
 struct SignalForwarder {
     previous_sigint: libc::sigaction,
     previous_sigterm: libc::sigaction,
+    previous_sighup: libc::sigaction,
 }
 
 #[cfg(unix)]
@@ -246,6 +247,7 @@ impl Drop for SignalForwarder {
         unsafe {
             let _ = libc::sigaction(libc::SIGINT, &self.previous_sigint, std::ptr::null_mut());
             let _ = libc::sigaction(libc::SIGTERM, &self.previous_sigterm, std::ptr::null_mut());
+            let _ = libc::sigaction(libc::SIGHUP, &self.previous_sighup, std::ptr::null_mut());
         }
     }
 }
@@ -2701,7 +2703,7 @@ fn build_rust_log(spec: Option<&str>) -> String {
 
 fn stop_port(port: u16) -> Result<()> {
     let mut lsof = Command::new("lsof");
-    lsof.args(["-tiTCP", &port.to_string(), "-sTCP:LISTEN"]);
+    lsof.args([&format!("-tiTCP:{port}"), "-sTCP:LISTEN"]);
     let output = lsof.output()?;
     let pids = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -2718,7 +2720,7 @@ fn stop_port(port: u16) -> Result<()> {
     thread::sleep(std::time::Duration::from_secs(1));
 
     let mut lsof = Command::new("lsof");
-    lsof.args(["-tiTCP", &port.to_string(), "-sTCP:LISTEN"]);
+    lsof.args([&format!("-tiTCP:{port}"), "-sTCP:LISTEN"]);
     let output = lsof.output()?;
     let stubborn = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -2734,12 +2736,11 @@ fn stop_port(port: u16) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_backend(pid: u32, port: u16, log_path: &Path) -> Result<()> {
+fn wait_for_backend(child: &mut Child, port: u16, log_path: &Path) -> Result<()> {
     for _ in 0..60 {
-        let status = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()?;
-        if !status.success() {
+        // `kill -0` succeeds on a child that exited and was not reaped, and
+        // a leftover listener would then answer for it below.
+        if child.try_wait()?.is_some() {
             let tail = tail_file(log_path, 50)?;
             bail!(
                 "Weaver failed to start. Tail of {}:\n{tail}",
@@ -2792,7 +2793,10 @@ fn install_backend_signal_forwarder(process_id: u32) -> Result<SignalForwarder> 
     let action = forward_backend_sigaction();
     let mut previous_sigint = unsafe { std::mem::zeroed() };
     let mut previous_sigterm = unsafe { std::mem::zeroed() };
+    let mut previous_sighup = unsafe { std::mem::zeroed() };
 
+    // The backend has its own process group, so a closed terminal's hangup
+    // reaches it only through this forwarder.
     unsafe {
         if libc::sigaction(libc::SIGINT, &action, &mut previous_sigint) != 0 {
             return Err(io::Error::last_os_error()).context("failed to install SIGINT forwarder");
@@ -2801,11 +2805,17 @@ fn install_backend_signal_forwarder(process_id: u32) -> Result<SignalForwarder> 
             let _ = libc::sigaction(libc::SIGINT, &previous_sigint, std::ptr::null_mut());
             return Err(io::Error::last_os_error()).context("failed to install SIGTERM forwarder");
         }
+        if libc::sigaction(libc::SIGHUP, &action, &mut previous_sighup) != 0 {
+            let _ = libc::sigaction(libc::SIGINT, &previous_sigint, std::ptr::null_mut());
+            let _ = libc::sigaction(libc::SIGTERM, &previous_sigterm, std::ptr::null_mut());
+            return Err(io::Error::last_os_error()).context("failed to install SIGHUP forwarder");
+        }
     }
 
     Ok(SignalForwarder {
         previous_sigint,
         previous_sigterm,
+        previous_sighup,
     })
 }
 
@@ -3240,8 +3250,7 @@ fn bootstrap_state_dir(
         child.env("WEAVER_ENCRYPTION_KEY", key);
     }
     let mut child = child.spawn()?;
-    let pid = child.id();
-    wait_for_backend(pid, backend_port, backend_log)?;
+    wait_for_backend(&mut child, backend_port, backend_log)?;
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
@@ -3390,7 +3399,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     let mut backend = backend.spawn()?;
     let backend_pid = backend.id();
     let backend_signal_forwarder = install_backend_signal_forwarder(backend_pid)?;
-    if let Err(error) = wait_for_backend(backend_pid, backend_port, &backend_log) {
+    if let Err(error) = wait_for_backend(&mut backend, backend_port, &backend_log) {
         backend_signal_forwarder.uninstall();
         terminate_process_group(&mut backend);
         if !keep_data {
@@ -3630,7 +3639,7 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
         .stderr(Stdio::from(log_err));
     let mut child = child.spawn()?;
     let child_id = child.id();
-    if let Err(error) = wait_for_backend(child_id, port, &log_file) {
+    if let Err(error) = wait_for_backend(&mut child, port, &log_file) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
