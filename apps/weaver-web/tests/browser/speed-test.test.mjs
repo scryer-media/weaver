@@ -296,3 +296,31 @@ test("while a job downloads, Run and Run again ask before pausing downloads, and
     await page.close();
   }
 });
+
+test("with no job downloading, a rate on the header gauge does not make Run or Run again ask", async () => {
+  const { page, errors } = await open("?gauge", "news.fixture.invalid");
+  try {
+    const confirm = page.getByRole("dialog", { name: "Pause downloads?", exact: true });
+    const started = (count) =>
+      page.waitForFunction(
+        (count) => document.querySelector('[role="dialog"]') !== null
+          || window.speedFixture.requests.filter((request) => request.name === "StartSpeedTest").length === count,
+        count,
+      );
+    await page.getByRole("button", { name: "Run", exact: true }).click();
+    await started(1);
+    assert.equal(await confirm.count(), 0);
+    assert.equal((await sent(page, "StartSpeedTest")).length, 1);
+
+    await finish(page, 2);
+    const rows = page.locator("main").getByRole("button").filter({ hasText: "Usenet · 100 MB" });
+    await rows.filter({ hasText: "Completed" }).click();
+    await page.getByRole("button", { name: "Run again", exact: true }).first().click();
+    await started(2);
+    assert.equal(await confirm.count(), 0);
+    assert.equal((await sent(page, "StartSpeedTest")).length, 2);
+    assert.equal(errors.length, 0, errors.join("\n"));
+  } finally {
+    await page.close();
+  }
+});
