@@ -198,3 +198,17 @@ fn a_content_policy_rejection_keeps_its_own_sentence() {
     assert!(error.is(ExtractionErrorClass::Rejected));
     assert_eq!(error.job_failure_reason(), failure.job_failure_reason());
 }
+
+#[test]
+fn a_password_failure_reason_opens_with_the_marker_integrations_read() {
+    let error = ExtractionError::password_required("no supplied password opened the archive");
+    assert_eq!(
+        error.job_failure_reason(),
+        "WEAVER_PASSWORD_REQUIRED: no supplied password opened the archive"
+    );
+    assert_eq!(error.message(), "no supplied password opened the archive");
+    assert_eq!(
+        ExtractionError::terminal("a read failed").job_failure_reason(),
+        "a read failed"
+    );
+}

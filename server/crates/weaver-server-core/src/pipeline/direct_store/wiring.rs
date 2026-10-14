@@ -219,9 +219,10 @@ pub(crate) struct DirectStoreRuntime {
     examined: HashSet<JobId>,
     // Each job's archive-password harvest
     // (`Pipeline::archive_password_candidates_for_job`), once one has run with
-    // every source read, for the `-hp` and `-mhe` gates of its sets. Kept rather than only offered because a set can be
-    // admitted after the harvest ran — identity admission binds sets as
-    // volumes are recognised — and it needs the same candidates. Separate from
+    // every source read, for the `-hp` and `-mhe` gates of its sets. Kept
+    // rather than only offered because a set can be admitted after the
+    // harvest ran — identity admission binds sets as volumes are recognised —
+    // and it needs the same candidates. Separate from
     // [`Self::examined`] because a **restored** job is examined without ever
     // passing through the admission seam, and its sets still need candidates.
     header_harvest: HashMap<JobId, Vec<crate::jobs::model::ArchivePasswordCandidate>>,
@@ -3807,9 +3808,9 @@ impl Pipeline {
 // chain of 2^19 rounds per candidate on every parse attempt until the
 // container opens. That work is bounded by the list, not here: the harvest
 // caps it at 80 entries across its four buckets (`MAX_ARCHIVE_PASSWORDS` and
-// its neighbours). Offering a prefix
-// instead would send a set whose key sits past the prefix through a demotion
-// and a full redownload to reach the same list at finalize.
+// its neighbours). Offering a prefix instead would send a set whose key sits
+// past the prefix through a demotion and a full redownload to reach the same
+// list at finalize.
 //
 // The one implementation behind both the live seam and the restart seam, so a
 // set rebuilt at restore holds exactly the candidates a live set would.

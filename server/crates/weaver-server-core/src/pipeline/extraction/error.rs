@@ -40,6 +40,10 @@ pub(crate) enum ExtractionErrorClass {
     Terminal,
 }
 
+// What a job's failure reason opens with when no supplied password opened the
+// archive. Integrations read it to tell a password failure from any other.
+pub(crate) const PASSWORD_REQUIRED_MARKER: &str = "WEAVER_PASSWORD_REQUIRED: ";
+
 #[derive(Debug, Clone)]
 pub(crate) struct ExtractionError {
     class: ExtractionErrorClass,
@@ -144,13 +148,18 @@ impl ExtractionError {
     }
 
     // The reason a job keeps when it fails on this. A content-policy refusal
-    // keeps its own sentence, which the Jobs screen shows as it stands.
+    // keeps its own sentence, which the Jobs screen shows as it stands. A
+    // password failure carries the marker an integration reads it by, which
+    // is the one piece of the reason a consumer is promised.
     pub(crate) fn job_failure_reason(&self) -> String {
         match &self.rejection {
             Some(failure)
                 if failure.reason() == super::safety::ExtractionRejectionReason::ContentPolicy =>
             {
                 failure.job_failure_reason()
+            }
+            _ if self.class == ExtractionErrorClass::PasswordRequired => {
+                format!("{PASSWORD_REQUIRED_MARKER}{}", self.message)
             }
             _ => self.message.clone(),
         }
