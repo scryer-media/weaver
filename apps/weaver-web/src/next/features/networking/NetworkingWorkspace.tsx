@@ -1,9 +1,8 @@
 import { useState, type ReactNode } from "react";
 import { Navigate, useLocation } from "react-router";
 import { useTranslate } from "@/lib/context/translate-context";
-import { EmptyState, MetricCell, MetricStrip } from "../../components/chrome";
+import { EmptyState } from "../../components/chrome";
 import { SecondaryButton } from "../../components/controls";
-import { countLabel } from "../../i18n/labels";
 import {
   SettingsBlocks,
   usePanelStatus,
@@ -17,7 +16,7 @@ import { NetworkFlow, type FlowTarget } from "./NetworkFlow";
 import { PoolsPage } from "./PoolsPage";
 import { RoutesPage } from "./RoutesPage";
 import { SpeedPage } from "./SpeedPage";
-import { formatRate, NoticeBand } from "./presentation";
+import { NoticeBand } from "./presentation";
 
 export type { NetworkingData } from "./data";
 
@@ -89,34 +88,6 @@ export function NetworkingWorkspace({
           ) : null}
           {page === "overview" ? (
             <>
-              <MetricStrip>
-                <MetricCell
-                  variant="strip"
-                  eyebrow={t("next.networking.overview.egresses")}
-                  value={egresses.length}
-                  note={t("next.networking.overview.egressesUp", {
-                    count: egresses.filter((egress) => egress.health === "UP").length,
-                  })}
-                />
-                <MetricCell
-                  variant="strip"
-                  eyebrow={t("next.networking.overview.proxies")}
-                  value={data.proxyProfiles.length}
-                  note={countLabel(t, "next.networking.pools.count", data.proxyPools.length)}
-                />
-                <MetricCell
-                  variant="strip"
-                  eyebrow={t("next.networking.overview.legs")}
-                  value={flow.legs.length}
-                  note={countLabel(t, "next.networking.overview.consumers", consumers.length)}
-                />
-                <MetricCell
-                  variant="strip"
-                  eyebrow={t("next.networking.overview.open")}
-                  value={flow.legs.reduce((sum, leg) => sum + leg.open, 0)}
-                  note={formatRate(flow.legs.reduce((sum, leg) => sum + (leg.bytesPerSecond ?? 0), 0))}
-                />
-              </MetricStrip>
               {workspace.liveError ? (
                 <NoticeBand tone="warn" role="status">
                   {t("next.networking.liveUnavailable")}
@@ -128,7 +99,6 @@ export function NetworkingWorkspace({
                     kind: "custom",
                     id: "flow",
                     title: t("next.networking.overview.flow"),
-                    note: t("next.networking.overview.flowNote"),
                     searchText: [...consumers.map((consumer) => consumer.name), ...egresses.map((egress) => egress.name)].join(" "),
                     body: (
                       <NetworkFlow

@@ -44,7 +44,7 @@ test("create an egress and two-leg route, then disable the egress through GraphQ
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-api.png"),fullPage:true});
  await page.close();
 });
-test("flow displays route evidence, opens editors, exports a frozen SVG, and edits weights without losing capacity",async()=>{
+test("flow displays route evidence, opens editors, and edits weights without losing capacity",async()=>{
  // Tall enough to hold the whole fixture: the page itself does not scroll.
  const page=await browser.newPage({viewport:{width:1440,height:2700}});page.setDefaultTimeout(0);const errors=[];page.on("pageerror",error=>errors.push(error.message));
  await page.goto(`${baseUrl}/tests/browser/networking.html`);
@@ -196,9 +196,8 @@ test("flow displays route evidence, opens editors, exports a frozen SVG, and edi
  if(process.env.NETWORKING_SCREENSHOT)await heldRoute.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-held-route.png")});
  if(process.env.NETWORKING_SCREENSHOT)await own.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-server-route.png")});
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-live.png"),fullPage:true});
- const [download]=await Promise.all([page.waitForEvent("download"),page.getByRole("button",{name:"Download SVG"}).click()]);
- const stream=await download.createReadStream();let exported="";for await(const chunk of stream)exported+=chunk;
- assert.match(exported,/192\.0\.2\.10/);assert.match(exported,/2026-/);assert.match(exported,/<path/);assert.match(exported,/Relay two/);assert.match(exported,/ENDPOINTS/);assert.doesNotMatch(exported,/password|privateKey|credentials/);
+ // The flow is not offered as a file.
+ assert.equal(await page.getByRole("button",{name:"Download SVG"}).count(),0);
  const slider=page.getByRole("slider").first();await slider.focus();await page.keyboard.press("ArrowRight");
  await page.getByLabel("Route weights").filter({hasText:"61,29,10"}).waitFor();
  // A rung may only name a pool with a member in it: the empty one is not offered.

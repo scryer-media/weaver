@@ -34,12 +34,7 @@ export type FlowTarget =
   | { kind: "pool"; id: number }
   | { kind: "proxy"; id: number };
 
-/**
- * The flow is drawn as SVG and can be saved as a file, so its colours and
- * fonts are literal values rather than classes: a stylesheet does not travel
- * with an exported diagram. They are the theme's own tokens. The accent stays
- * a variable on screen and is resolved when the file is written.
- */
+/** The flow's colours: the theme's own tokens, as literal values. The accent stays a variable. */
 const INK = {
   ground: "#1a1b1e",
   card: "#1f2024",
@@ -579,7 +574,6 @@ export function NetworkFlow({
   toggles?: { overrides: PathOverride; onToggle?: (target: DownTarget) => void };
 }) {
   const t = useTranslate();
-  const svg = useRef<SVGSVGElement>(null);
   const [hover, setHover] = useState<Focus | null>(null);
   const [filter, setFilter] = useState("");
   const [group, setGroup] = useState<number | null>(null);
@@ -720,25 +714,9 @@ export function NetworkFlow({
     onPointerEnter: () => setHover(target),
     onPointerLeave: () => setHover(null),
   });
-  function download() {
-    if (!svg.current) {
-      return;
-    }
-    const accent =
-      getComputedStyle(document.documentElement).getPropertyValue("--wv-accent").trim() || "#3fb39c";
-    const markup = new XMLSerializer().serializeToString(svg.current).replaceAll("var(--wv-accent)", accent);
-    const url = URL.createObjectURL(new Blob([markup], { type: "image/svg+xml" }));
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "weaver-network-flow.svg";
-    link.click();
-    URL.revokeObjectURL(url);
-  }
-
   /**
-   * A box that opens the editor for what it stands for. It is a real link to that thing's page, so
-   * the exported file keeps it; on screen the editor opens over the flow instead. Where the flow
-   * is only shown, it is just the box.
+   * A box that opens the editor for what it stands for. It is a real link to that thing's page; on
+   * screen the editor opens over the flow instead. Where the flow is only shown, it is just the box.
    */
   function card(target: FlowTarget | null, href: string, children: ReactNode, label?: string, key?: number) {
     if (!onEdit || !target) {
@@ -980,9 +958,6 @@ export function NetworkFlow({
               ...consumers.map((consumer) => ({ value: consumer.key, label: consumer.name })),
             ]}
           />
-          <SecondaryButton icon="downloadFile" onClick={download} className="ml-auto">
-            {t("next.networking.flow.download")}
-          </SecondaryButton>
         </div>
       )}
       {grouped ? (
@@ -1005,7 +980,6 @@ export function NetworkFlow({
       ) : null}
       <div className="min-w-0 overflow-x-auto bg-wv-app">
         <svg
-          ref={svg}
           xmlns="http://www.w3.org/2000/svg"
           viewBox={`0 0 ${WIDTH} ${layout.height}`}
           role="group"
