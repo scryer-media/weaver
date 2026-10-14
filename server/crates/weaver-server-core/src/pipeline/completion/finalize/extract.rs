@@ -37,12 +37,14 @@ impl<R: std::io::Read + std::io::Seek> std::io::Read for FilesystemXzDecoder<R> 
 
 // Bytes an extracted member buffers before touching the filesystem.
 //
-// Archive entry readers hand back whatever their decoder produces, and some
-// of them produce very little: a 7z AES entry yields one cipher block group —
-// 512 bytes — per read, and `std::io::copy` turns each of those into its own
-// write. A 158 MB member is then three hundred thousand write calls into the
-// filesystem. A quarter of a megabyte of buffer removes essentially all of
-// them, and costs one allocation per member.
+// Archive entry readers hand back whatever their decoder produces. The 7z
+// reader delivers 64 KiB pieces on the Copy, AES, BCJ, Delta and LZMA paths,
+// a mix of 64 KiB and sub-4 KiB pieces on single-threaded LZMA2, and 1 MiB
+// pieces on parallel LZMA2. Gathering the 64 KiB and smaller pieces into a
+// quarter-megabyte buffer costs one copy but a quarter of the write calls,
+// which measured cheaper than writing each piece as it comes. A piece at
+// least as large as the buffer bypasses it, so the 1 MiB pieces already go
+// straight to the file. It costs one allocation per member.
 const EXTRACT_WRITE_BUFFER_BYTES: usize = 256 * 1024;
 
 // Wrap an extraction output so a decoder's small reads do not become small
