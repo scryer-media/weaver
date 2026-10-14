@@ -239,6 +239,11 @@ func parseRealUsenetWireGuard(text, name string) (map[string]any, error) {
 	}
 	profile := map[string]any{"name": name, "kind": "WIRE_GUARD", "enabled": true, "host": host, "port": port,
 		"privateKey": iface["PrivateKey"], "peerPublicKey": peer["PublicKey"], "tunnelAddresses": addresses, "dnsServers": dns}
+	// The tunnel's DNS servers answer inside it; without them Weaver resolves.
+	profile["resolver"] = "WEAVER"
+	if len(dns) > 0 {
+		profile["resolver"] = "PROXY"
+	}
 	if peer["PresharedKey"] != "" {
 		profile["presharedKey"] = peer["PresharedKey"]
 	}

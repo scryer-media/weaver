@@ -22,9 +22,11 @@ export type Egress = {
   sourceAddress: string | null; addresses: string[]; enabled: boolean; maxDownloadSpeed: number;
   health: string; reason: string | null;
 };
+/** Who resolves a name dialled through a proxy: Weaver, or the proxy. */
+export type ProxyResolver = "WEAVER" | "PROXY";
 export type ProxyProfile = {
   id: number; name: string; kind: ProxyKind; enabled: boolean; host: string; port: number;
-  dnsServers: string[]; tunnelAddresses: string[]; peerPublicKey: string | null; tunnelPublicKey: string | null;
+  resolver: ProxyResolver; dnsServers: string[]; tunnelAddresses: string[]; peerPublicKey: string | null; tunnelPublicKey: string | null;
   mtu: number; keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null;
   hasUsername: boolean; hasPassword: boolean; hasPrivateKey: boolean; hasPassphrase: boolean; hasPresharedKey: boolean;
 };
@@ -53,7 +55,7 @@ export type TestResult = {
 };
 
 const EGRESS = "id name bindingKind interfaceName sourceAddress addresses enabled maxDownloadSpeed health reason";
-const PROFILE = `id name kind enabled host port dnsServers tunnelAddresses peerPublicKey tunnelPublicKey mtu
+const PROFILE = `id name kind enabled host port resolver dnsServers tunnelAddresses peerPublicKey tunnelPublicKey mtu
   keepaliveSeconds timeoutSeconds hostKeyFingerprint hasUsername hasPassword hasPrivateKey hasPassphrase hasPresharedKey`;
 const POOL = "id name kind memberIds enabled";
 const PATH = "path { kind directFallback rungs { kind proxyId poolId chainIds } }";
@@ -252,15 +254,16 @@ export async function sourceEgress(request: APIRequestContext, name: string, net
 }
 
 export type ProxyProfileInput = {
-  name: string; kind: ProxyKind; enabled: boolean; host: string; port: number; dnsServers?: string[];
-  tunnelAddresses?: string[]; peerPublicKey?: string | null; mtu?: number; keepaliveSeconds?: number | null;
+  name: string; kind: ProxyKind; enabled: boolean; host: string; port: number;
+  resolver?: ProxyResolver; dnsServers?: string[]; tunnelAddresses?: string[]; peerPublicKey?: string | null; mtu?: number; keepaliveSeconds?: number | null;
   timeoutSeconds?: number; username?: string | null; password?: string | null; privateKey?: string | null;
   passphrase?: string | null; presharedKey?: string | null;
 };
 export async function saveProxyProfile(request: APIRequestContext, input: ProxyProfileInput, id?: number): Promise<ProxyProfile> {
   return (await graphql<{ saveProxyProfile: ProxyProfile }>(request,
     `mutation($id: Int, $input: ProxyProfileInput!) { saveProxyProfile(id: $id, input: $input) { ${PROFILE} } }`,
-    { id: id ?? null, input })).saveProxyProfile;
+    // The proxy resolves unless a test says otherwise, as every proxy did before the choice existed.
+    { id: id ?? null, input: { resolver: "PROXY", ...input } })).saveProxyProfile;
 }
 export async function deleteProxyProfile(request: APIRequestContext, id: number): Promise<void> {
   await graphql(request, "mutation($id: Int!) { deleteProxyProfile(id: $id) }", { id });

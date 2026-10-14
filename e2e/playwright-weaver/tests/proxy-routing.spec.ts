@@ -36,7 +36,7 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
     await updateConfiguredServer(request, "nntp", { active: false });
     await updateConfiguredServer(request, "nntp2", { active: false });
     const profiles = names.map((name, index) => ({
-      name: `e2e-${name}`, kind: index === 1 ? "SOCKS5" : "HTTP_CONNECT",
+      name: `e2e-${name}`, kind: index === 1 ? "SOCKS5" : "HTTP_CONNECT", resolver: "PROXY",
       enabled: true, host: fixture.ip, port: fixture.ports[name],
       username: "fixture", password: "fixture", dnsServers: [fixture.ip], timeoutSeconds: 2,
     }));

@@ -283,12 +283,9 @@ test("F14 reference rules reject unsound ladders", async ({ request }) => {
   const server = await world.server();
   const connect1 = await world.connect("connect1");
   const wg1 = await world.wireguard("wg1");
-  const noDns = await world.profile({ name: `nodns-${Date.now()}`, kind: "HTTP_CONNECT", enabled: true, host: connect1.host, port: connect1.port, username: "fixture", password: "fixture", dnsServers: [] });
-  const feed = await world.feed({ url: "http://feed.proxy.test:8089/redirect" });
   const cases: Array<[string, "SERVER" | "RSS", number, RouteInput, string]> = [
     ["the same proxy twice", "SERVER", server, { legs: [ladderLeg(a.id, [rung.proxy(connect1.id), rung.proxy(connect1.id)], 100)] }, "a proxy cannot appear twice in a ladder"],
     ["WireGuard above CONNECT", "SERVER", server, { legs: [ladderLeg(a.id, [rung.chain([connect1.id, wg1.id])], 100)] }, "WireGuard and HTTP/3 must be the first proxy in a chain"],
-    ["RSS through a proxy without DNS", "RSS", feed, { legs: [ladderLeg(a.id, [rung.proxy(noDns.id)], 100)] }, "every RSS proxy and pool member requires DNS servers"],
   ];
   for (const [label, kind, id, input, message] of cases) {
     expect((await graphqlErrors(request, SAVE_ROUTE, { kind, id, input })).join("\n"), label).toContain(message);
