@@ -44,6 +44,15 @@ function move<T>(items: T[], index: number, delta: number): T[] {
 
 const emptyRung = (): Rung => ({ kind: "PROXY", proxyId: null, poolId: null, chainIds: [] });
 
+/** The arrow from one step of a leg's ladder down to the next. */
+function LadderArrow() {
+  return (
+    <div className="flex justify-center py-1 text-wv-fg">
+      <Icon name="moveDown" size={20} />
+    </div>
+  );
+}
+
 /**
  * A consumer's route: the legs its connections are split across, the path each
  * leg takes from its egress, and what happens to a leg's share when it drops.
@@ -255,11 +264,7 @@ export function RouteEditor({
                 <ol className="flex min-w-0 flex-col">
                   {path.rungs.map((rung, rungIndex) => (
                     <li key={rungIndex} className="flex min-w-0 flex-col">
-                      {rungIndex > 0 ? (
-                        <div className="flex justify-center py-1 text-wv-fg">
-                          <Icon name="moveDown" size={20} />
-                        </div>
-                      ) : null}
+                      {rungIndex > 0 ? <LadderArrow /> : null}
                       <div className="flex min-w-0 flex-wrap items-center gap-2 border border-wv-control bg-wv-app px-3 py-[10px]">
                         <span className="w-[52px] flex-none font-wv-mono text-[11px] text-wv-muted">
                           {t("next.networking.route.rung", { position: rungIndex + 1 })}
@@ -360,9 +365,18 @@ export function RouteEditor({
                 {path.rungs.length === 0 ? (
                   <p className="text-[12px] text-wv-muted">{t("next.networking.route.noRungs")}</p>
                 ) : null}
-                <div className="flex justify-center py-1 text-wv-fg">
-                  <Icon name="moveDown" size={20} />
-                </div>
+                {/* A new rung goes in below the last, so Add sits on the ladder where it lands. */}
+                <LadderArrow />
+                <SecondaryButton
+                  size="compact"
+                  icon="add"
+                  className="self-center"
+                  disabled={path.rungs.length >= MAX_RUNGS}
+                  onClick={() => setRungs(seedRung([...path.rungs, emptyRung()], path.rungs.length, "PROXY"))}
+                >
+                  {t("next.networking.route.addRung")}
+                </SecondaryButton>
+                <LadderArrow />
                 <div className="flex min-w-0 items-center border border-wv-control bg-wv-app px-3 py-[10px]">
                   <CheckRow
                     checked={path.directFallback}
@@ -370,15 +384,6 @@ export function RouteEditor({
                     label={t("next.networking.route.directFallback")}
                   />
                 </div>
-                <SecondaryButton
-                  size="compact"
-                  icon="add"
-                  className="mt-3 self-start"
-                  disabled={path.rungs.length >= MAX_RUNGS}
-                  onClick={() => setRungs(seedRung([...path.rungs, emptyRung()], path.rungs.length, "PROXY"))}
-                >
-                  {t("next.networking.route.addRung")}
-                </SecondaryButton>
               </div>
             ) : null}
 
