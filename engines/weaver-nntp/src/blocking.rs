@@ -23,7 +23,6 @@ use tokio_util::codec::Decoder;
 use tracing::{debug, trace, warn};
 use weaver_yenc::CheckpointPlan;
 
-use crate::address_plan::AddressRoute;
 use crate::client::{
     BodyLaneMode, BodyLaneTraceMeta, DecodedBody, DecodedBodyCpu, DecodedBodyError, DecodedBodyIo,
     DecodedBodyTrace, FetchAttemptOutcome, FetchAttemptTrace, ProbeBatchResult,
@@ -236,15 +235,11 @@ impl BlockingBodyLane {
         self.checkpoint_plan = checkpoint_plan;
     }
 
-    // These are independent lane identity, transfer policy, address-selection,
-    // group, and ownership inputs at the engine boundary.
-    #[allow(clippy::too_many_arguments)]
     pub fn connect(
         server_id: ServerId,
         stable_server_id: StableServerId,
         transfer_control: Option<Arc<ServerTransferControl>>,
         config: &ServerConfig,
-        route: Option<&AddressRoute>,
         groups: &[String],
         soft_timeout: Duration,
         permit: BlockingConnectionPermit,
@@ -259,11 +254,8 @@ impl BlockingBodyLane {
         }
         // On a pipelining server the first candidate group rides in the
         // session-setup write; `select_group` then short-circuits on it.
-        let mut conn = BlockingNntpConnection::connect_for_group(
-            config,
-            route,
-            groups.first().map(String::as_str),
-        )?;
+        let mut conn =
+            BlockingNntpConnection::connect_for_group(config, groups.first().map(String::as_str))?;
         conn.set_transfer_control(transfer_control);
         permit.socket_slot.set_path(conn.route_path.as_ref());
         permit
@@ -1095,80 +1087,47 @@ impl BlockingNntpConnection {
         std::mem::replace(&mut self.last_response_line_wait, Duration::ZERO)
     }
 
-    // Connect to the first resolved address that answers.
+    // Connect through the config's route.
     pub fn connect(config: &ServerConfig) -> Result<Self> {
-        Self::connect_for_group(config, None, None)
+        Self::connect_for_group(config, None)
     }
 
     // Connect and, on a server known to pipeline, select `initial_group`
     // inside the session-setup write. An unselectable group is not an
-    // error here; the lane walks its candidate list afterwards. A direct
-    // connection dials the address `route`'s plan picks, or the first
-    // resolved address that answers when there is no route.
-    pub fn connect_for_group(
-        config: &ServerConfig,
-        route: Option<&AddressRoute>,
-        initial_group: Option<&str>,
-    ) -> Result<Self> {
-        Self::connect_with_backend(config, route, None, initial_group)
+    // error here; the lane walks its candidate list afterwards.
+    pub fn connect_for_group(config: &ServerConfig, initial_group: Option<&str>) -> Result<Self> {
+        Self::connect_with_backend(config, None, initial_group)
     }
 
     // `backend_override` bypasses env/platform backend selection; tests use
     // it to exercise a specific TLS transport deterministically.
     fn connect_with_backend(
         config: &ServerConfig,
-        route: Option<&AddressRoute>,
         backend_override: Option<NntpTlsBackend>,
         initial_group: Option<&str>,
     ) -> Result<Self> {
-        if let Some(dialer) = &config.dialer {
-            let dialed = dialer.runtime.block_on(dialer.dial(config))?;
-            let remote_addr = dialed.stream.tcp().and_then(|s| s.peer_addr().ok());
-            let socket = dialer.blocking_stream(dialed.stream, config)?;
-            let mut result = Self::from_tcp(
-                config,
-                socket,
-                remote_addr,
-                backend_override,
-                initial_group,
-                Some(dialed.outcome),
-                None,
-                dialed.setup,
-            );
-            if let Ok(connection) = &mut result {
-                connection.egress_control = Some(
-                    dialer
-                        .egress_controls
-                        .control(crate::transfer::StableServerId(dialed.path.egress)),
-                );
-                connection.route_path = Some(dialed.path);
-            }
-            return result;
-        }
-        let connect_timeout = config.connect_timeout.max(MIN_TIMEOUT);
-        let (tcp, addr) = match route {
-            Some(route) => route
-                .connect_tcp(&config.host, config.port, connect_timeout)
-                .map_err(NntpError::Io)?,
-            None => connect_first_answering(&config.host, config.port, connect_timeout)?,
-        };
-        tcp.set_nodelay(true).map_err(NntpError::Io)?;
-        tcp.set_read_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
-            .map_err(NntpError::Io)?;
-        tcp.set_write_timeout(Some(config.command_timeout.max(MIN_TIMEOUT)))
-            .map_err(NntpError::Io)?;
-        let remote_addr = Some(tcp.peer_addr().unwrap_or(addr));
-        let setup = route.map(|route| route.watch_setup(addr));
-        Self::from_tcp(
+        let dialer = &config.dialer;
+        let dialed = dialer.runtime.block_on(dialer.dial(config))?;
+        let remote_addr = dialed.stream.tcp().and_then(|s| s.peer_addr().ok());
+        let socket = dialer.blocking_stream(dialed.stream, config)?;
+        let mut result = Self::from_tcp(
             config,
-            tcp,
+            socket,
             remote_addr,
             backend_override,
             initial_group,
-            None,
-            setup,
-            None,
-        )
+            Some(dialed.outcome),
+            dialed.setup,
+        );
+        if let Ok(connection) = &mut result {
+            connection.egress_control = Some(
+                dialer
+                    .egress_controls
+                    .control(crate::transfer::StableServerId(dialed.path.egress)),
+            );
+            connection.route_path = Some(dialed.path);
+        }
+        result
     }
 
     // The TLS backend that carries this server's bytes on an owned lane.
@@ -1228,7 +1187,6 @@ impl BlockingNntpConnection {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn from_tcp(
         config: &ServerConfig,
         tcp: impl Into<BlockingSocket>,
@@ -1236,7 +1194,6 @@ impl BlockingNntpConnection {
         backend_override: Option<NntpTlsBackend>,
         initial_group: Option<&str>,
         route_outcome: Option<Arc<weaver_tunnel::bridge::ConnectionOutcome>>,
-        mut setup: Option<crate::address_plan::SetupWatch>,
         mut pipe_setup: Option<weaver_tunnel::pipe::SetupHandle>,
     ) -> Result<Self> {
         let tcp = tcp.into();
@@ -1298,12 +1255,6 @@ impl BlockingNntpConnection {
             setup.complete(true);
         }
         debug!(code = greeting.code.raw(), msg = %greeting.message, "received blocking NNTP greeting");
-        let upgrades = config.starttls && matches!(conn.transport, BlockingTransport::Plain(_));
-        if (!upgrades || !matches!(greeting.code.raw(), 200 | 201))
-            && let Some(setup) = setup.take()
-        {
-            setup.reached_server();
-        }
         match greeting.code.raw() {
             200 | 201 => {}
             400 => return Err(NntpError::ServiceUnavailable),
@@ -1340,9 +1291,6 @@ impl BlockingNntpConnection {
             conn.codec = NntpCodec::new();
             conn.read_buf.clear();
             debug!(host = %config.host, "blocking STARTTLS upgrade complete");
-            if let Some(setup) = setup.take() {
-                setup.reached_server();
-            }
         }
 
         // Session setup: authentication and nothing else, unless this server
@@ -3117,30 +3065,6 @@ fn nntp_error_to_io(error: NntpError) -> io::Error {
         NntpError::Io(error) => error,
         other => io::Error::other(other),
     }
-}
-
-// Connect to the first of `host`'s resolved addresses that answers.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a connection given no route dialer"
-)]
-fn connect_first_answering(
-    host: &str,
-    port: u16,
-    timeout: Duration,
-) -> Result<(TcpStream, SocketAddr)> {
-    let mut last_error = None;
-    for ip in weaver_tunnel::resolution::host_lookup_blocking(host).map_err(NntpError::Io)? {
-        let addr = SocketAddr::new(ip, port);
-        match crate::egress::SocketEgress::System.connect_blocking(addr, timeout) {
-            Ok(tcp) => return Ok((tcp, addr)),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    weaver_tunnel::resolution::forget_host(host);
-    Err(NntpError::Io(last_error.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "no NNTP address resolved")
-    })))
 }
 
 fn decoded_body_from_article(article: FusedYencArticle) -> DecodedBody {

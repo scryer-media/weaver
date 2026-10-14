@@ -1064,11 +1064,8 @@ fn pin_that_never_reaches_the_server(
     others: &[SocketAddr],
 ) {
     pin(plan, dialer, pinned, others);
-    let route = AddressRoute {
-        plan: Arc::clone(plan),
-    };
-    drop(route.watch_setup(pinned));
-    drop(route.watch_setup(pinned));
+    plan.record_setup(pinned, false);
+    plan.record_setup(pinned, false);
 }
 
 #[test]
@@ -1120,13 +1117,10 @@ fn a_session_that_reaches_the_server_clears_the_pins_failed_setups() {
     let dialer = ScriptedDialer::new(&[pinned, other]);
     let plan = plan();
     pin(&plan, &dialer, pinned, &[other]);
-    let route = AddressRoute {
-        plan: Arc::clone(&plan),
-    };
 
-    drop(route.watch_setup(pinned));
-    route.watch_setup(pinned).reached_server();
-    drop(route.watch_setup(pinned));
+    plan.record_setup(pinned, false);
+    plan.record_setup(pinned, true);
+    plan.record_setup(pinned, false);
     let (_, next) = plan.connect(&dialer).unwrap();
 
     assert_eq!(next, pinned);

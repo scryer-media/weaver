@@ -34,17 +34,19 @@ const BANNED: &[&str] = &[
     "weaver_tunnel::egress::SocketEgress::connect",
     "weaver_tunnel::egress::SocketEgress::connect_blocking",
     "weaver_tunnel::egress::SocketEgress::bind_udp",
+    "weaver_nntp::route_dialer::AddressPlanned::new",
 ];
 
 // Every file that lifts the ban, and how many times. Each lift names why the
 // call there is the route itself, or reaches only this machine; crate roots
 // lift it for their own tests' loopback fixtures.
 const LIFTED: &[(&str, usize)] = &[
+    ("engines/weaver-nntp/benches/body_server_availability.rs", 1),
     ("engines/weaver-nntp/src/address_plan.rs", 2),
-    ("engines/weaver-nntp/src/blocking.rs", 1),
     ("engines/weaver-nntp/src/lib.rs", 1),
-    ("engines/weaver-nntp/src/tls.rs", 2),
+    ("engines/weaver-nntp/src/route_dialer.rs", 1),
     ("engines/weaver-nntp/tests/proxy_routing.rs", 1),
+    ("engines/weaver-nntp/tests/socket_budget.rs", 1),
     ("engines/weaver-nntp/tests/wireguard_throughput.rs", 1),
     ("engines/weaver-tunnel/src/egress.rs", 2),
     ("engines/weaver-tunnel/src/lib.rs", 2),
@@ -55,6 +57,10 @@ const LIFTED: &[(&str, usize)] = &[
     ("server/app/weaver/src/main.rs", 1),
     ("server/app/weaver/src/tray/shared.rs", 1),
     ("server/crates/weaver-server-core/src/lib.rs", 1),
+    (
+        "server/crates/weaver-server-core/src/proxies/network_runtime.rs",
+        1,
+    ),
     (
         "server/crates/weaver-server-core/src/proxies/routed_http.rs",
         2,

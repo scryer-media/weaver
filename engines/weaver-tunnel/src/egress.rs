@@ -120,7 +120,7 @@ impl SocketEgress {
     fn tcp_socket(&self, target: SocketAddr) -> io::Result<Socket> {
         let socket = self.socket(target, Type::STREAM, Protocol::TCP)?;
         socket.set_tcp_nodelay(true)?;
-        // Keepalive is best-effort, as in the existing NNTP connect path.
+        // Keepalive is best-effort.
         let _ = socket.set_tcp_keepalive(
             &TcpKeepalive::new()
                 .with_time(Duration::from_secs(60))

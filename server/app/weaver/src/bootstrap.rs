@@ -238,14 +238,28 @@ pub(crate) async fn apply_server_env_seed(
     // before it is stored. A seeded server is asked the same question here,
     // unless the environment already stated the answer.
     if weaver_server_core::settings::env_seed::server_seed_applies(config, seed) {
+        // A seeded server is asked over its route, as every connection to it
+        // is, so the network routes come up for the probe and go down after.
+        let proxy_db = db.clone();
+        let runtime_handle = tokio::runtime::Handle::current();
+        let proxies = tokio::task::spawn_blocking(move || {
+            weaver_server_core::proxies::ProxyRuntime::new(proxy_db, runtime_handle)
+        })
+        .await
+        .map_err(|error| StateError::Database(error.to_string()))?
+        .map_err(StateError::Database)?;
         let outcomes =
             weaver_server_core::settings::env_seed::probe_seeded_server_pipelining(
                 seed,
-                |server| async move {
-                    weaver_server_core::servers::probe_server_connection(&server).await
+                |server| {
+                    let proxies = proxies.clone();
+                    async move {
+                        weaver_server_core::servers::probe_unsaved_server(&proxies, &server).await
+                    }
                 },
             )
             .await;
+        proxies.stop_all().await;
         for outcome in outcomes {
             match outcome.failure {
                 Some(reason) => warn!(

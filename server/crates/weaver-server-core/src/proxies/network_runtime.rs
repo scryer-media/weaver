@@ -757,6 +757,10 @@ impl NetworkRuntime {
         let stage: Arc<dyn Dialer> = match &leg.path {
             LegPath::Direct => {
                 if matches!(consumer, Consumer::Server(_)) {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a server's direct leg is its route"
+                    )]
                     let plan = Arc::new(AddressPlanned::new(
                         format!("{} leg {}", consumer.key(), position),
                         bottom.clone(),

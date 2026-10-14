@@ -281,62 +281,6 @@ impl AddressDialer for TcpDialer {
     }
 }
 
-// The address plan a new connection to one server goes through.
-#[derive(Clone)]
-pub struct AddressRoute {
-    pub(crate) plan: Arc<AddressPlan>,
-}
-
-impl AddressRoute {
-    // Open a TCP socket to the address this route's plan picks.
-    pub(crate) fn connect_tcp(
-        &self,
-        host: &str,
-        port: u16,
-        timeout: Duration,
-    ) -> io::Result<(TcpStream, SocketAddr)> {
-        let dialer = Arc::new(TcpDialer::new(host, port, timeout));
-        self.plan.connect(&dialer)
-    }
-
-    // Watch the session being set up on a socket this route opened to
-    // `addr`.
-    pub(crate) fn watch_setup(&self, addr: SocketAddr) -> SetupWatch {
-        SetupWatch {
-            plan: Arc::clone(&self.plan),
-            addr,
-            reached: false,
-        }
-    }
-}
-
-// One session's setup on a connected socket, from the connect to the point
-// where the server has answered over it. Dropped before that point, it books
-// a failed setup against the address: a handshake that failed, a greeting
-// that never came, or a setup abandoned because it ran out of time.
-pub(crate) struct SetupWatch {
-    plan: Arc<AddressPlan>,
-    addr: SocketAddr,
-    reached: bool,
-}
-
-impl SetupWatch {
-    // The server answered over this socket. What it said is the server's
-    // answer, not the address's.
-    pub(crate) fn reached_server(mut self) {
-        self.reached = true;
-        self.plan.record_setup(self.addr, true);
-    }
-}
-
-impl Drop for SetupWatch {
-    fn drop(&mut self) {
-        if !self.reached {
-            self.plan.record_setup(self.addr, false);
-        }
-    }
-}
-
 // The address state of one server. See the module docs.
 pub struct AddressPlan {
     label: String,

@@ -40,7 +40,6 @@ fn server_config(
     buffer_profile: weaver_nntp::connection::NntpBufferProfile,
 ) -> weaver_nntp::ServerConfig {
     weaver_nntp::ServerConfig {
-        dialer: Some(dialer),
         host: server.host.clone(),
         port: server.port,
         tls: server.tls,
@@ -51,7 +50,7 @@ fn server_config(
         buffer_profile,
         pipelining: weaver_nntp::PipeliningCapability::Known(server.supports_pipelining),
         pipelining_depth: server.pipelining_depth,
-        ..Default::default()
+        ..weaver_nntp::ServerConfig::new(dialer)
     }
 }
 

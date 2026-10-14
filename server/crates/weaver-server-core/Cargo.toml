@@ -10,8 +10,9 @@ repository.workspace = true
 slow-tests = []
 # Hooks that let other crates' tests move stored state directly instead of
 # waiting on the wall clock. Never enabled outside dev-dependencies. The
-# tunnel's loopback certificate backs the speed test's HTTPS fixture.
-test-support = ["weaver-tunnel/test-support"]
+# tunnel's loopback certificate backs the speed test's HTTPS fixture, and
+# NNTP's direct test route serves servers built with no route of their own.
+test-support = ["weaver-tunnel/test-support", "weaver-nntp/test-support"]
 
 [dependencies]
 weaver-tunnel = { path = "../../../engines/weaver-tunnel" }
@@ -103,6 +104,7 @@ keyring-core = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]
+weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false, features = ["test-support"] }
 weaver-tunnel = { path = "../../../engines/weaver-tunnel", features = ["test-support"] }
 serde_json = { workspace = true }
 # `test-util` for the paused clock: the health-probe reclaim tests assert on

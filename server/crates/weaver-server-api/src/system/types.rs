@@ -1270,10 +1270,7 @@ impl ServerHealth {
         if config.host != self.host || config.port != self.port {
             return Vec::new();
         }
-        let Some(dialer) = &config.dialer else {
-            return Vec::new();
-        };
-        let consumer = format!("server:{}", dialer.server);
+        let consumer = format!("server:{}", config.dialer.server);
         handle
             .proxy_runtime()
             .map(|runtime| {
@@ -1374,55 +1371,6 @@ mod tests {
     use super::*;
     use weaver_server_core::events::model::PipelineEvent;
     use weaver_server_core::jobs::JobId;
-
-    // Two configured servers with the same host and port: a connect through
-    // the second pins its address, and only the second reports a pin.
-    #[test]
-    fn a_pinned_address_belongs_to_its_own_server_not_its_twin() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        // A pin requires an answered session; a TCP accept without a greeting
-        // is failed setup evidence and clears the pin.
-        let (release, finished) = std::sync::mpsc::channel();
-        let acceptor = std::thread::spawn(move || {
-            use std::io::Write;
-            let (mut socket, _) = listener.accept().unwrap();
-            socket.write_all(b"200 fixture ready\r\n").unwrap();
-            // Keep the session open until the client has read the greeting.
-            let _ = finished.recv();
-        });
-        let twin = || weaver_nntp::pool::ServerPoolConfig {
-            server: weaver_nntp::ServerConfig {
-                host: "127.0.0.1".to_string(),
-                port,
-                tls: false,
-                pipelining: weaver_nntp::PipeliningCapability::Known(false),
-                ..Default::default()
-            },
-            max_connections: 1,
-            ..weaver_nntp::pool::ServerPoolConfig::default()
-        };
-        let pool = weaver_nntp::pool::NntpPool::new(weaver_nntp::pool::PoolConfig {
-            servers: vec![twin(), twin()],
-            ..Default::default()
-        });
-
-        let (config, route) = pool
-            .blocking_connect_plan(weaver_nntp::ServerId(1))
-            .unwrap();
-        let _connection =
-            weaver_nntp::BlockingNntpConnection::connect_for_group(&config, Some(&route), None)
-                .unwrap();
-        assert_eq!(pinned_address_in(&pool, 0, "127.0.0.1", port), None);
-        assert_eq!(
-            pinned_address_in(&pool, 1, "127.0.0.1", port).as_deref(),
-            Some("127.0.0.1")
-        );
-        // A row read from a different pool layout does not borrow a pin.
-        assert_eq!(pinned_address_in(&pool, 1, "127.0.0.1", port ^ 1), None);
-        release.send(()).unwrap();
-        acceptor.join().unwrap();
-    }
 
     #[test]
     fn a_switched_off_server_outranks_every_other_signal() {

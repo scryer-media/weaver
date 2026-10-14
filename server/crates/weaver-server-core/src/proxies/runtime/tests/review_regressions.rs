@@ -159,7 +159,7 @@ fn config(route: &Arc<ConsumerRoute>) -> ServerConfig {
         host: "nntp-review.invalid".into(),
         port: 119,
         tls: false,
-        dialer: Some(bridge_dialer(route.bridge().unwrap())),
+        dialer: bridge_dialer(route.bridge().unwrap()),
         connect_timeout: NOT_UNDER_TEST,
         command_timeout: NOT_UNDER_TEST,
         ..Default::default()

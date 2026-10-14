@@ -21,7 +21,7 @@ pub async fn load_global_pause_from_db(db: &Database) -> Result<bool, String> {
 // after a restart exactly as they do after a change.
 pub fn nntp_server_pool_configs(
     configured_servers: &[crate::servers::ServerConfig],
-    proxy_runtime: Option<&crate::proxies::ProxyRuntime>,
+    proxy_runtime: &crate::proxies::ProxyRuntime,
     transfer_registry: &weaver_nntp::transfer::ServerTransferRegistry,
     buffer_profile: weaver_nntp::connection::NntpBufferProfile,
 ) -> Result<Vec<weaver_nntp::pool::ServerPoolConfig>, String> {
@@ -35,17 +35,13 @@ pub fn nntp_server_pool_configs(
     active
         .iter()
         .map(|server| {
+            let dialer = proxy_runtime.network.nntp_dialer(
+                server.id,
+                server.connections,
+                std::time::Duration::from_secs(30),
+            )?;
             Ok(weaver_nntp::pool::ServerPoolConfig {
                 server: weaver_nntp::ServerConfig {
-                    dialer: proxy_runtime
-                        .map(|runtime| {
-                            runtime.network.nntp_dialer(
-                                server.id,
-                                server.connections,
-                                std::time::Duration::from_secs(30),
-                            )
-                        })
-                        .transpose()?,
                     host: server.host.clone(),
                     port: server.port,
                     tls: server.tls,
@@ -60,7 +56,7 @@ pub fn nntp_server_pool_configs(
                         server.supports_pipelining,
                     ),
                     pipelining_depth: server.pipelining_depth,
-                    ..Default::default()
+                    ..weaver_nntp::ServerConfig::new(dialer)
                 },
                 max_connections: server.connections as usize,
                 group: server.priority,
@@ -93,7 +89,9 @@ pub async fn rebuild_nntp_from_config(
         SchedulerError::Internal("server transfer policy registry unavailable".to_string())
     })?;
     let transfer_registry = policy_registry.transfer_registry();
-    let proxy_runtime = handle.proxy_runtime();
+    let proxy_runtime = handle
+        .proxy_runtime()
+        .ok_or_else(|| SchedulerError::Internal("proxy runtime unavailable".to_string()))?;
 
     let configured_servers = config.read().await.servers.clone();
     let registry = std::sync::Arc::clone(&policy_registry);
@@ -117,7 +115,7 @@ pub async fn rebuild_nntp_from_config(
 
     let servers = nntp_server_pool_configs(
         &configured_servers,
-        proxy_runtime.as_deref(),
+        &proxy_runtime,
         &transfer_registry,
         weaver_nntp::connection::NntpBufferProfile::adaptive(
             memory.cgroup_limit.unwrap_or(memory.available_bytes),

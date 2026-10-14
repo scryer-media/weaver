@@ -273,14 +273,8 @@ pub(crate) fn draft_route(
     ctx: &Context<'_>,
     consumer: Consumer,
     input: Option<RoutingPolicy>,
-) -> Result<Option<Arc<proxies::DraftNetworkRoute>>> {
-    let handle = ctx.data::<SchedulerHandle>()?;
-    let Some(runtime) = handle.proxy_runtime() else {
-        if input.as_ref().is_none_or(RoutingPolicy::is_direct) {
-            return Ok(None);
-        }
-        return Err("proxy runtime unavailable".into());
-    };
+) -> Result<Arc<proxies::DraftNetworkRoute>> {
+    let runtime = runtime(ctx)?;
     let policy = input.unwrap_or_else(|| runtime.policy(consumer));
     // A route the operator may not save is refused by its code; a draft that
     // cannot be built for any other reason is reported as it stands.
@@ -291,7 +285,6 @@ pub(crate) fn draft_route(
     runtime
         .network
         .draft_route(consumer, policy, Duration::from_secs(30))
-        .map(Some)
         .map_err(async_graphql::Error::new)
 }
 pub(crate) fn refresh<'a>(

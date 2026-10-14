@@ -44,9 +44,8 @@ impl NntpClientConfig {
     pub fn single(server: ServerConfig, max_connections: usize) -> Self {
         NntpClientConfig {
             servers: vec![ServerPoolConfig {
-                server,
                 max_connections,
-                ..ServerPoolConfig::default()
+                ..ServerPoolConfig::new(server)
             }],
             max_idle_age: Duration::from_secs(300),
             max_retries_per_server: 1,
@@ -2539,9 +2538,9 @@ impl NntpClient {
                     continue;
                 }
             };
-            let (config, route) = self
+            let config = self
                 .pool
-                .blocking_connect_plan(server)
+                .blocking_connect_config(server)
                 .map_err(BlockingBodyLaneAcquireError::Other)?;
             if !supports_blocking_body_lane(&config) {
                 continue;
@@ -2566,7 +2565,6 @@ impl NntpClient {
                     self.pool.stable_server_id(server).unwrap_or_default(),
                     self.pool.server_transfer_control(server),
                     &config,
-                    Some(&route),
                     groups,
                     self.soft_timeout,
                     permit,
@@ -2669,7 +2667,7 @@ impl NntpClient {
             if self.pool.server_load(server.0).1 == 0 {
                 return false;
             }
-            let Ok((config, _)) = self.pool.blocking_connect_plan(server) else {
+            let Ok(config) = self.pool.blocking_connect_config(server) else {
                 return false;
             };
             supports_blocking_body_lane(&config)

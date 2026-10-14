@@ -238,7 +238,6 @@ async fn exercise(kind: u8, implicit: bool, starttls: bool) {
     )
     .unwrap();
     let config = ServerConfig {
-        dialer: Some(bridge_dialer(bridge.clone())),
         host: "provider.invalid".into(),
         port: origin.addr.port(),
         tls: implicit,
@@ -247,7 +246,7 @@ async fn exercise(kind: u8, implicit: bool, starttls: bool) {
         password: Some("nntp-pass".into()),
         tls_ca_cert: Some(origin.ca.clone()),
         connect_timeout: Duration::from_secs(5),
-        ..Default::default()
+        ..ServerConfig::new(bridge_dialer(bridge.clone()))
     };
     let mut client = NntpConnection::connect(&config).await.unwrap();
     assert_eq!(
@@ -299,7 +298,7 @@ async fn exercise(kind: u8, implicit: bool, starttls: bool) {
             &wrong.host,
             wrong.port,
             Some(&origin.ca),
-            wrong.dialer.as_ref(),
+            &wrong.dialer,
         )
         .await
         .unwrap();
@@ -387,14 +386,13 @@ async fn blocking_routed_tls_read_obeys_timeout_and_revocation() {
         )
         .unwrap();
         let config = ServerConfig {
-            dialer: Some(bridge_dialer(bridge.clone())),
             host: "provider.invalid".into(),
             port: origin.addr.port(),
             tls: true,
             tls_ca_cert: Some(origin.ca.clone()),
             connect_timeout: Duration::from_secs(5),
             command_timeout: Duration::from_secs(if revoke { 30 } else { 1 }),
-            ..Default::default()
+            ..ServerConfig::new(bridge_dialer(bridge.clone()))
         };
         let started = std::time::Instant::now();
         let client = tokio::task::spawn_blocking(move || {

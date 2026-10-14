@@ -10,7 +10,7 @@ pub mod transfer_policy;
 pub mod usage;
 
 pub use connectivity::{
-    ServerConnectivityResult, probe_server_connection, probe_server_connection_with_route,
+    ServerConnectivityResult, probe_server_connection, probe_server_route, probe_unsaved_server,
 };
 pub use model::{
     DownloadQuotaFault, MAX_PERSISTED_SERVER_DOWNLOAD_BYTES, ServerConfig,

@@ -3,7 +3,6 @@ use std::io::{self, Cursor, Read, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 #[cfg(not(windows))]
 use bytes::BufMut;
@@ -13,9 +12,7 @@ use rustls_pki_types::{CertificateDer, UnixTime, pem::PemObject};
 use s2n_tls::{config::Config as S2nConfig, security};
 #[cfg(not(windows))]
 use s2n_tls_tokio::{TlsConnector as S2nTlsConnector, TlsStream as S2nTlsStream};
-use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream as RustlsTlsStream;
 use tokio_rustls::rustls::client::{
     WebPkiServerVerifier,
@@ -27,7 +24,6 @@ use tokio_rustls::rustls::{
     Error as RustlsError, RootCertStore, SignatureScheme, SupportedCipherSuite,
 };
 
-use crate::address_plan::AddressRoute;
 use crate::error::NntpError;
 
 // Keeps normal WebPKI verification intact while allowing one explicitly
@@ -1327,93 +1323,6 @@ pub(crate) fn make_server_name(host: &str) -> Result<ServerName<'static>, NntpEr
         .map_err(|_| NntpError::MalformedResponse(format!("invalid hostname for TLS: {host}")))
 }
 
-// Configure TCP keepalive on a socket to prevent connections from silently
-// dying behind NATs/firewalls.
-fn set_keepalive(tcp: &TcpStream) {
-    let sock_ref = SockRef::from(tcp);
-    let ka = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_mins(1))
-        .with_interval(Duration::from_secs(15));
-    let _ = sock_ref.set_tcp_keepalive(&ka);
-}
-
-// Open the TCP socket for a direct connection: to the address `route`'s plan
-// picks when there is one, otherwise to the first resolved address that
-// answers.
-pub(crate) async fn dial_direct(
-    host: &str,
-    port: u16,
-    route: Option<&AddressRoute>,
-    attempt_timeout: Duration,
-) -> Result<(TcpStream, Option<SocketAddr>), NntpError> {
-    let tcp = match route {
-        Some(route) => {
-            let route = route.clone();
-            let host = host.to_string();
-            // The plan dials with blocking sockets so that one race serves
-            // both the async and the blocking connection paths.
-            let (tcp, _) = tokio::task::spawn_blocking(move || {
-                route.connect_tcp(&host, port, attempt_timeout)
-            })
-            .await
-            .map_err(|error| NntpError::Io(std::io::Error::other(error)))??;
-            tcp.set_nonblocking(true)?;
-            TcpStream::from_std(tcp)?
-        }
-        None => {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "a connection given no route dialer resolves with the host resolver"
-            )]
-            let addrs: Vec<SocketAddr> = weaver_tunnel::resolution::host_lookup(host)
-                .await?
-                .into_iter()
-                .map(|ip| SocketAddr::new(ip, port))
-                .collect();
-            connect_first_answering(&addrs)
-                .await
-                .inspect_err(|_| weaver_tunnel::resolution::forget_host(host))?
-        }
-    };
-    let remote_addr = Some(tcp.peer_addr()?);
-    tcp.set_nodelay(true)?;
-    set_keepalive(&tcp);
-    Ok((tcp, remote_addr))
-}
-
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a connection given no route dialer"
-)]
-async fn connect_first_answering(addrs: &[SocketAddr]) -> Result<TcpStream, NntpError> {
-    let mut last_error = None;
-    for addr in addrs {
-        match crate::egress::SocketEgress::System.connect(*addr).await {
-            Ok(tcp) => return Ok(tcp),
-            Err(error) => last_error = Some(error),
-        }
-    }
-
-    Err(NntpError::Io(last_error.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "no resolved addresses",
-        )
-    })))
-}
-
-// Inspect a certificate that failed only normal hostname validation.
-//
-// This performs a TLS handshake only: it never reads the NNTP greeting or
-// sends `MODE READER`, authentication, or any other NNTP command.
-pub async fn inspect_tls_name_mismatch_certificate(
-    host: &str,
-    port: u16,
-    ca_cert_path: Option<&Path>,
-) -> Result<Option<Vec<u8>>, NntpError> {
-    inspect_tls_name_mismatch_certificate_via(host, port, ca_cert_path, None).await
-}
-
 // The hostnames a certificate is issued for, for showing to a person.
 //
 // Returns the certificate's DNS subject alternative names, or its subject
@@ -1492,17 +1401,19 @@ fn der_element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     Some((tag, contents, after))
 }
 
+// Inspect, over `dialer`'s route, a certificate that failed only normal
+// hostname validation.
+//
+// This performs a TLS handshake only: it never reads the NNTP greeting or
+// sends `MODE READER`, authentication, or any other NNTP command.
 pub async fn inspect_tls_name_mismatch_certificate_via(
     host: &str,
     port: u16,
     ca_cert_path: Option<&Path>,
-    dialer: Option<&Arc<crate::route_dialer::RouteDialer>>,
+    dialer: &Arc<crate::route_dialer::RouteDialer>,
 ) -> Result<Option<Vec<u8>>, NntpError> {
-    let timeout = dialer.map_or(std::time::Duration::from_secs(30), |route| {
-        route.inner.budget()
-    });
     tokio::time::timeout(
-        timeout,
+        dialer.inner.budget(),
         inspect_certificate_inner(host, port, ca_cert_path, dialer),
     )
     .await
@@ -1513,39 +1424,26 @@ async fn inspect_certificate_inner(
     host: &str,
     port: u16,
     ca_cert_path: Option<&Path>,
-    dialer: Option<&Arc<crate::route_dialer::RouteDialer>>,
+    dialer: &Arc<crate::route_dialer::RouteDialer>,
 ) -> Result<Option<Vec<u8>>, NntpError> {
     let captured_leaf_der = Arc::new(Mutex::new(None));
     let tls_config =
         build_tls_config_with_name_mismatch_capture(ca_cert_path, captured_leaf_der.clone())?;
     let server_name = make_server_name(host)?;
-    let mut route_setup = None;
-    let mut route_outcome = None;
-    let tcp: RouteStream = if let Some(dialer) = dialer {
-        let dialed = dialer
-            .dial(&crate::ServerConfig {
-                host: host.into(),
-                port,
-                ..Default::default()
-            })
-            .await?;
-        route_setup = dialed.setup;
-        route_outcome = Some(dialed.outcome);
-        dialed.stream.into()
-    } else {
-        dial_direct(host, port, None, Duration::from_secs(30))
-            .await?
-            .0
-            .into()
-    };
+    let dialed = dialer
+        .dial(&crate::ServerConfig {
+            host: host.into(),
+            port,
+            ..crate::ServerConfig::new(dialer.clone())
+        })
+        .await?;
+    let tcp: RouteStream = dialed.stream.into();
 
     let _ = ManualTlsStream::connect(tcp, tls_config, server_name).await;
-    if let Some(setup) = route_setup {
+    if let Some(setup) = dialed.setup {
         setup.complete(true);
     }
-    if let Some(outcome) = route_outcome {
-        outcome.closed();
-    }
+    dialed.outcome.closed();
     Ok(captured_leaf_der
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1562,78 +1460,6 @@ pub fn is_tls_error(error: &(dyn std::error::Error + 'static)) -> bool {
         source = error.source();
     }
     false
-}
-
-// Connect to a host with implicit TLS (e.g. port 563).
-//
-// Performs TCP connect followed by an immediate TLS handshake.
-// If `ca_cert_path` is provided, the certificate is trusted in addition to
-// the Mozilla root store.
-pub async fn connect_tls(
-    host: &str,
-    port: u16,
-    ca_cert_path: Option<&Path>,
-) -> Result<NntpTransport, NntpError> {
-    let (tcp, remote_addr) = dial_direct(host, port, None, Duration::from_secs(30)).await?;
-    connect_tls_over(
-        tcp,
-        remote_addr,
-        host,
-        ca_cert_path,
-        None,
-        TlsCipherPreference::Auto,
-    )
-    .await
-}
-
-// Run the implicit-TLS handshake on an already connected socket. `host` is
-// the name the certificate is checked against.
-pub(crate) async fn connect_tls_over(
-    tcp: TcpStream,
-    remote_addr: Option<SocketAddr>,
-    host: &str,
-    ca_cert_path: Option<&Path>,
-    adopted_name_mismatch_certificate_der: Option<&[u8]>,
-    cipher_preference: TlsCipherPreference,
-) -> Result<NntpTransport, NntpError> {
-    let backend = if adopted_name_mismatch_certificate_der.is_some() {
-        NntpTlsBackend::ManualRustls
-    } else {
-        tls_backend_for_preference(selected_tls_backend()?, cipher_preference)
-    };
-    match backend {
-        NntpTlsBackend::ManualRustls => {
-            let tls_config = build_tls_config_with_name_mismatch_certificate(
-                ca_cert_path,
-                adopted_name_mismatch_certificate_der,
-                cipher_preference,
-            )?;
-            let server_name = make_server_name(host)?;
-            let manual_tls = ManualTlsStream::connect(tcp, tls_config, server_name).await?;
-            Ok(NntpTransport::ManualTls {
-                inner: manual_tls,
-                remote_addr,
-            })
-        }
-        #[cfg(not(windows))]
-        NntpTlsBackend::S2n => {
-            let tls_config = build_s2n_tls_config(ca_cert_path)?;
-            let s2n_tls = connect_s2n_tls(tcp, tls_config, host).await?;
-            Ok(NntpTransport::S2nTls {
-                inner: s2n_tls,
-                remote_addr,
-            })
-        }
-    }
-}
-
-// Connect to a host with plain TCP (e.g. port 119).
-pub async fn connect_plain(host: &str, port: u16) -> Result<NntpTransport, NntpError> {
-    let (tcp, remote_addr) = dial_direct(host, port, None, Duration::from_secs(30)).await?;
-    Ok(NntpTransport::Plain {
-        inner: tcp.into(),
-        remote_addr,
-    })
 }
 
 // Upgrade an existing plain TCP connection to TLS (STARTTLS).
@@ -1792,11 +1618,11 @@ mod tests {
     }
     use std::sync::Arc;
     #[cfg(not(windows))]
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[cfg(not(windows))]
     use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     #[cfg(not(windows))]
     use tokio::sync::oneshot;
     #[cfg(not(windows))]
@@ -2135,34 +1961,6 @@ mod tests {
             error.to_string().contains("unavailable on Windows"),
             "unexpected error: {error}"
         );
-    }
-
-    #[tokio::test]
-    async fn tcp_keepalive_is_configured() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let tcp = TcpStream::connect(addr).await.unwrap();
-        tcp.set_nodelay(true).unwrap();
-        set_keepalive(&tcp);
-
-        let nodelay = tcp.nodelay().unwrap();
-        assert!(nodelay, "TCP_NODELAY should be enabled");
-
-        let sock_ref = SockRef::from(&tcp);
-        let keepalive = sock_ref.keepalive().unwrap();
-        assert!(keepalive, "TCP keepalive should be enabled");
-
-        // socket2 exposes no keepalive time/interval getters on Windows;
-        // setting them via `TcpKeepalive` above still works there.
-        #[cfg(not(windows))]
-        {
-            let ka_time = sock_ref.tcp_keepalive_time().unwrap();
-            assert_eq!(ka_time, Duration::from_mins(1));
-
-            let ka_interval = sock_ref.tcp_keepalive_interval().unwrap();
-            assert_eq!(ka_interval, Duration::from_secs(15));
-        }
     }
 
     #[cfg(not(windows))]

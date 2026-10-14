@@ -101,6 +101,39 @@ impl std::fmt::Debug for RouteDialer {
             .finish()
     }
 }
+#[cfg(any(test, feature = "test-support"))]
+impl RouteDialer {
+    // The direct route out of the System egress, for tests whose servers are
+    // on loopback and that have no route of their own. Blocking dials run on
+    // a runtime of its own, so a test outside any runtime can still connect.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "tests reach their loopback servers on the direct route"
+    )]
+    pub fn direct_for_tests() -> Arc<Self> {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        let runtime = RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("test route runtime")
+        });
+        Arc::new(Self {
+            inner: Arc::new(AddressPlanned::new(
+                "test direct route".into(),
+                Arc::new(weaver_tunnel::pipe::Egress {
+                    id: 0,
+                    binding: crate::egress::SocketEgress::System,
+                    timeout: std::time::Duration::from_secs(30),
+                }),
+            )),
+            egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+            runtime: runtime.handle().clone(),
+            server: 0,
+        })
+    }
+}
 impl RouteDialer {
     pub async fn dial(&self, config: &ServerConfig) -> Result<Dialed, NntpError> {
         let target = Target {
