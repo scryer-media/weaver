@@ -677,6 +677,8 @@ export const nextIt: LocaleDictionary = {
   "next.archivePasswords.title": "Password degli archivi",
   "next.archivePasswords.list": "Password (una per riga)",
   "next.archivePasswords.edit": "Modifica password",
+  "next.archivePasswords.clearTitle": "Cancella le password salvate",
+  "next.archivePasswords.clearBody": "Eliminare l’elenco di password salvato? Non può essere mostrato né ripristinato.",
   "next.archivePasswords.file": "File delle password",
   "next.archivePasswords.password": "Password dell’archivio",
   "next.archivePasswords.show": "Mostra",

@@ -127,7 +127,7 @@ test("a refused save keeps what was typed or chosen and shows the daemon's reaso
   }
 });
 
-test("the password list stays shut until Edit passwords opens it, saves when left, and Clear removes the stored one", async () => {
+test("the password list stays shut until Edit passwords opens it, saves when left, and Clear removes the stored one once confirmed", async () => {
   const { page, errors } = await open();
   try {
     const section = page.getByRole("region", { name: "Archive passwords", exact: true });
@@ -154,8 +154,19 @@ test("the password list stays shut until Edit passwords opens it, saves when lef
     assert.equal(await list.count(), 0);
     assert.deepEqual(await sent(page, "UpdateArchivePasswordSettings"), [{ passwords: ["first-secret", "second-secret"] }]);
 
-    // Clear removes the stored list at once.
+    // Clear asks first; Cancel keeps the stored list and sends nothing.
+    const confirm = page.getByRole("dialog", { name: "Clear stored passwords", exact: true });
     await clear.click();
+    await confirm.waitFor();
+    await shot(confirm, "archive-passwords-clear");
+    await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await confirm.waitFor({ state: "detached" });
+    assert.equal(await clear.isVisible(), true);
+    assert.deepEqual(await sent(page, "UpdateArchivePasswordSettings"), [{ passwords: ["first-secret", "second-secret"] }]);
+
+    // Confirmed, it removes the stored list.
+    await clear.click();
+    await confirm.getByRole("button", { name: "Clear", exact: true }).click();
     await clear.waitFor({ state: "detached" });
     assert.deepEqual(await sent(page, "UpdateArchivePasswordSettings"), [{ passwords: ["first-secret", "second-secret"] }, { passwords: [] }]);
     assert.equal(await list.count(), 0);

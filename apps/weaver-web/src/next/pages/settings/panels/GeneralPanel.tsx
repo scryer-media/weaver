@@ -29,6 +29,7 @@ import {
   type HardwareProfileName,
   type HardwareProfileSettings,
 } from "../../../data/hardware-profiles";
+import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { SecondaryButton, Select, TextArea } from "../../../components/controls";
 import { SettingsBlocks, usePanelStatus, type FieldSpec, type SettingsBlock } from "../framework";
 
@@ -202,6 +203,8 @@ export function GeneralPanel() {
   const [failure, setFailure] = useState<{ key: FieldKey; message: string } | null>(null);
   // The password box stays shut until asked for, so clicking through settings on a shared screen shows none.
   const [editingPasswords, setEditingPasswords] = useState(false);
+  // The stored list never comes back, so clearing it is asked first.
+  const [confirmClear, setConfirmClear] = useState(false);
 
   usePanelStatus(failure?.message ?? (saving > 0 ? t("settings.saving") : null), failure !== null);
 
@@ -477,7 +480,7 @@ export function GeneralPanel() {
                       </SecondaryButton>
                     )}
                     {hasPasswords ? (
-                      <SecondaryButton onClick={clearPasswords}>{t("next.common.clear")}</SecondaryButton>
+                      <SecondaryButton onClick={() => setConfirmClear(true)}>{t("next.common.clear")}</SecondaryButton>
                     ) : null}
                   </div>
                 ),
@@ -595,7 +598,22 @@ export function GeneralPanel() {
       : null,
   ];
 
-  return <SettingsBlocks blocks={blocks} loading={fetching && !data} />;
+  return (
+    <>
+      <SettingsBlocks blocks={blocks} loading={fetching && !data} />
+      <ConfirmDialog
+        open={confirmClear}
+        title={t("next.archivePasswords.clearTitle")}
+        body={t("next.archivePasswords.clearBody")}
+        confirmLabel={t("next.common.clear")}
+        onConfirm={() => {
+          setConfirmClear(false);
+          clearPasswords();
+        }}
+        onDismiss={() => setConfirmClear(false)}
+      />
+    </>
+  );
 }
 
 /**

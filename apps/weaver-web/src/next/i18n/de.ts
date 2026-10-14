@@ -677,6 +677,8 @@ export const nextDe: LocaleDictionary = {
   "next.archivePasswords.title": "Archivpasswörter",
   "next.archivePasswords.list": "Passwörter (eines pro Zeile)",
   "next.archivePasswords.edit": "Passwörter bearbeiten",
+  "next.archivePasswords.clearTitle": "Gespeicherte Passwörter löschen",
+  "next.archivePasswords.clearBody": "Die gespeicherte Passwortliste löschen? Sie lässt sich weder anzeigen noch wiederherstellen.",
   "next.archivePasswords.file": "Passwortdatei",
   "next.archivePasswords.password": "Archivpasswort",
   "next.archivePasswords.show": "Anzeigen",

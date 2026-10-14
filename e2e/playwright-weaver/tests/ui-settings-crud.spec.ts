@@ -180,8 +180,13 @@ test("archive passwords and the password file save, clear and persist without ec
   await expect(list).toHaveValue("");
   await expect(file).toHaveValue(passwordFile);
 
-  // Clearing removes the stored list at once and keeps the file.
-  await savedBy(page, "UpdateArchivePasswordSettings", () => clear.click());
+  // Clearing asks first, then removes the stored list and keeps the file.
+  await clear.click();
+  const confirm = page.getByRole("dialog", { name: "Clear stored passwords", exact: true });
+  await savedBy(page, "UpdateArchivePasswordSettings", () =>
+    confirm.getByRole("button", { name: "Clear", exact: true }).click(),
+  );
+  await expect(confirm).toHaveCount(0);
   await expect(clear).toHaveCount(0);
   await page.reload();
   await expect(clear).toHaveCount(0);
