@@ -35,9 +35,10 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectExtendedLimitInformation, SetInformationJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -71,7 +72,9 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // Silent breakaway is deliberate: only the server itself is in the job, never
 // what it starts. The upgrade helper is a child of the server and has to
 // outlive both the server and the tray it asks to shut down; a job that
-// claimed it would kill the helper in the middle of the upgrade it runs.
+// claimed it would kill the helper in the middle of the upgrade it runs. The
+// helper is spawned asking to break away, which a job allows only with
+// explicit breakaway set as well, so both are.
 pub(crate) struct KillOnCloseJob(HANDLE);
 
 impl KillOnCloseJob {
@@ -87,8 +90,9 @@ impl KillOnCloseJob {
         }
         let job = Self(handle);
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_BREAKAWAY_OK
+            | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
         // SAFETY: `limits` is a fully initialized structure of the class named,
         // and the length passed is its size.
         let set = unsafe {

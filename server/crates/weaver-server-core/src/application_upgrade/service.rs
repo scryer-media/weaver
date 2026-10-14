@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use application_updater::helper_plan::{RebootRequiredOutcome, reboot_required_outcome};
 use application_updater::installation::{
     EligibilityReason, InstallationAssessment, InstallationKind, ManagementOwner,
 };
@@ -118,6 +119,10 @@ pub struct ApplicationUpgradeRun {
     pub error: Option<String>,
     pub started_at_epoch_ms: i64,
     pub completed_at_epoch_ms: Option<i64>,
+    // Where the Windows installer wrote its verbose log for this run, once
+    // one exists. Runs persisted before the field existed read back as none.
+    #[serde(default)]
+    pub installer_log_path: Option<String>,
 }
 
 impl ApplicationUpgradeRun {
@@ -134,6 +139,7 @@ impl ApplicationUpgradeRun {
             error: None,
             started_at_epoch_ms: epoch_ms_now(),
             completed_at_epoch_ms: None,
+            installer_log_path: None,
         }
     }
 
@@ -155,6 +161,7 @@ impl ApplicationUpgradeRun {
                 .written_at
                 .map_or_else(epoch_ms_now, |at| at.timestamp_millis()),
             completed_at_epoch_ms: None,
+            installer_log_path: None,
         }
     }
 }
@@ -988,19 +995,17 @@ impl ApplicationUpgradeService {
             canonical_path(&booted_path) == canonical_path(&journal.executable_path);
 
         if journal.phase == phases::REBOOT_REQUIRED {
-            let boot_time = boot_time.map(DateTime::<Utc>::from);
-            if reboot_required_completion_allowed(
+            let outcome = reboot_required_outcome(
                 journal.written_at,
-                boot_time,
+                boot_time.map(DateTime::<Utc>::from),
                 expected_version_booted,
                 expected_executable_booted,
-            ) {
+            );
+            if outcome == RebootRequiredOutcome::Complete {
                 self.complete_journal_run(&journal, &journal_path)?;
                 return Ok(Vec::new());
             }
-            if let Some(error) =
-                abandoned_reboot_wait(journal.written_at, boot_time, now, expected_version_booted)
-            {
+            if let Some(error) = abandoned_reboot_wait(outcome, journal.written_at, now) {
                 self.fail_abandoned_reboot_wait(&journal, error);
                 return Ok(Vec::new());
             }
@@ -1081,7 +1086,7 @@ impl ApplicationUpgradeService {
     // named still completes the run, and whatever the installer left behind
     // stays for the operator to look at. A journal left over from an older
     // run than the one now published is not allowed to replace it.
-    fn fail_abandoned_reboot_wait(&self, journal: &ApplicationUpgradeJournal, error: String) {
+    fn fail_abandoned_reboot_wait(&self, journal: &ApplicationUpgradeJournal, error: &str) {
         let superseded = self
             .inner
             .state
@@ -1097,7 +1102,20 @@ impl ApplicationUpgradeService {
             running_version = WEAVER_VERSION,
             "application upgrade can no longer be finished by the Windows restart it was waiting for"
         );
+        let error = match self.installer_log_path(&journal.run_id) {
+            Some(log_path) => format!("{error} Installer log: {log_path}"),
+            None => error.to_string(),
+        };
         self.finish_journal_run(journal, ApplicationUpgradeRunStatus::Failed, Some(error));
+    }
+
+    // The verbose log the Windows installer wrote for `run_id`, if it wrote
+    // one. The helper derives the same path from the run id, so neither the
+    // plan nor the journal carries it; only an MSI install creates the file.
+    fn installer_log_path(&self, run_id: &str) -> Option<String> {
+        application_updater::msi_log_path_beside_journal(&self.journal_path(), run_id)
+            .filter(|path| path.is_file())
+            .map(|path| path.display().to_string())
     }
 
     fn complete_journal_run(
@@ -1170,6 +1188,9 @@ impl ApplicationUpgradeService {
         run.phase = journal.phase.clone();
         run.error = error;
         run.completed_at_epoch_ms = Some(epoch_ms_now());
+        run.installer_log_path = self
+            .installer_log_path(&journal.run_id)
+            .or(run.installer_log_path);
         self.publish(run);
     }
 
@@ -1184,7 +1205,9 @@ impl ApplicationUpgradeService {
         {
             return;
         }
-        self.publish(ApplicationUpgradeRun::from_journal(journal));
+        let mut run = ApplicationUpgradeRun::from_journal(journal);
+        run.installer_log_path = self.installer_log_path(&journal.run_id);
+        self.publish(run);
     }
 }
 
@@ -1437,20 +1460,6 @@ fn copy_and_spawn_windows_upgrade_helper(
     .map_err(map_updater_error)
 }
 
-fn reboot_required_completion_allowed(
-    written_at: Option<DateTime<Utc>>,
-    boot_time: Option<DateTime<Utc>>,
-    expected_version_booted: bool,
-    expected_executable_booted: bool,
-) -> bool {
-    application_updater::helper_plan::reboot_required_completion_allowed(
-        written_at,
-        boot_time,
-        expected_version_booted,
-        expected_executable_booted,
-    )
-}
-
 // Why a run waiting on a Windows restart can no longer be finished by it, or
 // `None` while it still can.
 //
@@ -1460,20 +1469,17 @@ fn reboot_required_completion_allowed(
 // `REBOOT_WAIT_LIMIT` is given up on whatever booted. A journal with no
 // written time cannot be judged by either rule and keeps waiting.
 fn abandoned_reboot_wait(
+    outcome: RebootRequiredOutcome,
     written_at: Option<DateTime<Utc>>,
-    boot_time: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
-    expected_version_booted: bool,
-) -> Option<String> {
-    let written_at = written_at?;
-    let rebooted_since = boot_time.is_some_and(|boot_time| boot_time > written_at);
-    if rebooted_since && !expected_version_booted {
-        return Some(REBOOT_DID_NOT_INSTALL_ERROR.to_string());
+) -> Option<&'static str> {
+    match outcome {
+        RebootRequiredOutcome::Complete => None,
+        RebootRequiredOutcome::NotInstalled => Some(REBOOT_DID_NOT_INSTALL_ERROR),
+        RebootRequiredOutcome::AwaitReboot => written_at
+            .filter(|written_at| now.signed_duration_since(*written_at) >= REBOOT_WAIT_LIMIT)
+            .map(|_| REBOOT_WAIT_EXPIRED_ERROR),
     }
-    if now.signed_duration_since(written_at) >= REBOOT_WAIT_LIMIT {
-        return Some(REBOOT_WAIT_EXPIRED_ERROR.to_string());
-    }
-    None
 }
 
 // Whether a run's error is one [`abandoned_reboot_wait`] produced.
@@ -2357,6 +2363,7 @@ mod tests {
             error: Some(error.to_string()),
             started_at_epoch_ms: 1,
             completed_at_epoch_ms: Some(2),
+            installer_log_path: None,
         };
         let temp = tempfile::tempdir().expect("tempdir");
         let service =
@@ -2488,6 +2495,27 @@ mod tests {
         chrono::TimeDelta::hours(hours)
     }
 
+    // The verdict on a reboot wait as the boot-time check reaches it: the
+    // shared classification of this boot, then the time bound.
+    fn judge(
+        written_at: Option<DateTime<Utc>>,
+        boot_time: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        expected_version_booted: bool,
+        expected_executable_booted: bool,
+    ) -> Option<&'static str> {
+        abandoned_reboot_wait(
+            reboot_required_outcome(
+                written_at,
+                boot_time,
+                expected_version_booted,
+                expected_executable_booted,
+            ),
+            written_at,
+            now,
+        )
+    }
+
     #[test]
     fn a_reboot_wait_is_abandoned_only_when_no_restart_can_finish_it() {
         let written = Utc::now() - hours(48);
@@ -2498,54 +2526,122 @@ mod tests {
         // The restart came and the previous build booted: the installer's
         // pending replacement never took.
         assert_eq!(
-            abandoned_reboot_wait(Some(written), rebooted, soon, false).as_deref(),
+            judge(Some(written), rebooted, soon, false, true),
             Some(REBOOT_DID_NOT_INSTALL_ERROR)
         );
-        // No restart yet, or the restart booted the expected build (which the
-        // completion check handles), or no boot time to judge by: wait on.
-        assert_eq!(
-            abandoned_reboot_wait(Some(written), not_rebooted, soon, false),
-            None
-        );
-        assert_eq!(
-            abandoned_reboot_wait(Some(written), rebooted, soon, true),
-            None
-        );
-        assert_eq!(
-            abandoned_reboot_wait(Some(written), None, soon, false),
-            None
-        );
+        // No restart yet, or no boot time to judge by: wait on.
+        assert_eq!(judge(Some(written), not_rebooted, soon, false, true), None);
+        assert_eq!(judge(Some(written), None, soon, false, true), None);
         // A boot exactly at the write is not a boot after it.
-        assert_eq!(
-            abandoned_reboot_wait(Some(written), Some(written), soon, false),
-            None
-        );
+        assert_eq!(judge(Some(written), Some(written), soon, false, true), None);
+        // The expected build from another executable path is not evidence
+        // the install failed: it keeps waiting, as the completion rule does.
+        assert_eq!(judge(Some(written), rebooted, soon, true, false), None);
+        // The expected build where the journal said is a completion, not an
+        // abandonment.
+        assert_eq!(judge(Some(written), rebooted, soon, true, true), None);
 
-        // Past the limit, the wait is given up on whatever booted.
+        // Past the limit, a wait no restart has finished is given up on.
         let expired = written + REBOOT_WAIT_LIMIT;
-        for (boot_time, expected_version_booted) in [
-            (None, false),
-            (not_rebooted, false),
-            (not_rebooted, true),
-            (rebooted, true),
+        for (boot_time, expected_version_booted, expected_executable_booted) in [
+            (None, false, true),
+            (not_rebooted, false, true),
+            (not_rebooted, true, true),
+            (rebooted, true, false),
         ] {
             assert_eq!(
-                abandoned_reboot_wait(Some(written), boot_time, expired, expected_version_booted)
-                    .as_deref(),
+                judge(
+                    Some(written),
+                    boot_time,
+                    expired,
+                    expected_version_booted,
+                    expected_executable_booted
+                ),
                 Some(REBOOT_WAIT_EXPIRED_ERROR),
-                "{boot_time:?} {expected_version_booted}"
+                "{boot_time:?} {expected_version_booted} {expected_executable_booted}"
             );
         }
         assert_eq!(
-            abandoned_reboot_wait(Some(written), None, expired - hours(1), false),
+            judge(Some(written), None, expired - hours(1), false, true),
             None
         );
 
         // A journal with no written time cannot be judged.
+        assert_eq!(judge(None, rebooted, expired + hours(1), false, true), None);
+    }
+
+    // The installer's verbose log is found beside the journal by run id, is
+    // recorded on the run, and is named in the reboot-wait failure.
+    #[tokio::test]
+    async fn an_abandoned_reboot_wait_names_and_records_the_installer_log() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service =
+            service_with_update(temp.path(), Some(TEST_VERSION), portable_assessment(), None).await;
+        let written = Utc::now() - hours(3);
+        let journal = reboot_journal(temp.path(), "99.99.99", written);
+        write_journal(&service.journal_path(), &journal).expect("write journal");
+        let log_path = application_updater::msi_log_path_beside_journal(
+            &service.journal_path(),
+            &journal.run_id,
+        )
+        .expect("a safe run id");
+        fs::write(&log_path, b"MSI (s) log").expect("write the installer log");
+        let log_path = log_path.display().to_string();
+
+        // While the run waits, the republished run already points at the log.
+        let boot_before = SystemTime::from(written - hours(1));
+        service
+            .finalize_journal_at(Some(boot_before), Utc::now())
+            .expect("finalize");
+        let waiting = service.snapshot().active_run.expect("still waiting");
         assert_eq!(
-            abandoned_reboot_wait(None, rebooted, expired + hours(1), false),
-            None
+            waiting.installer_log_path.as_deref(),
+            Some(log_path.as_str())
         );
+
+        let boot_after = SystemTime::from(written + hours(1));
+        service
+            .finalize_journal_at(Some(boot_after), Utc::now())
+            .expect("finalize");
+        let run = service.snapshot().latest_run.expect("published");
+        assert_eq!(run.status, ApplicationUpgradeRunStatus::Failed);
+        assert_eq!(run.installer_log_path.as_deref(), Some(log_path.as_str()));
+        assert_eq!(
+            run.error,
+            Some(format!(
+                "{REBOOT_DID_NOT_INSTALL_ERROR} Installer log: {log_path}"
+            ))
+        );
+        assert!(
+            run.error
+                .as_deref()
+                .is_some_and(is_abandoned_reboot_wait_error),
+            "a later boot of the expected build still recognizes the verdict"
+        );
+        assert!(
+            std::path::Path::new(&log_path).exists(),
+            "the log is left for the operator"
+        );
+    }
+
+    // A run persisted before the log path existed still reads back.
+    #[test]
+    fn a_run_persisted_without_an_installer_log_path_reads_back() {
+        let run: ApplicationUpgradeRun = serde_json::from_value(serde_json::json!({
+            "run_id": "older",
+            "status": "failed",
+            "phase": "restarting",
+            "downloaded_bytes": 0,
+            "total_bytes": 0,
+            "target_version": "1.2.3",
+            "target_tag": "weaver-v1.2.3",
+            "from_version": "1.2.2",
+            "error": null,
+            "started_at_epoch_ms": 1,
+            "completed_at_epoch_ms": 2
+        }))
+        .expect("an older run reads back");
+        assert_eq!(run.installer_log_path, None);
     }
 
     // A Windows restart that still boots the previous build fails the run: the
