@@ -24,10 +24,44 @@ function niceCeiling(value: number): number {
   return ([1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find((step) => step * power >= scaled) ?? 10) * power * unit;
 }
 
+/** How long the chart takes to move on to a newly closed bin; the polls arrive about a second apart. */
+const GLIDE_MS = 1000;
+
+/**
+ * The point on the run's clock the chart shows, gliding on to each newly closed
+ * bin over a second rather than jumping. A clock that goes back is a new run, and
+ * jumps there.
+ */
+function useGlide(target: number): number {
+  const [shown, setShown] = useState(target);
+  const current = useRef(target);
+  useEffect(() => {
+    const from = current.current;
+    if (target <= from || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      current.current = target;
+      setShown(target);
+      return;
+    }
+    const since = performance.now();
+    let frame = requestAnimationFrame(function step(now: number) {
+      const progress = Math.min(1, Math.max(0, (now - since) / GLIDE_MS));
+      current.current = from + (target - from) * progress;
+      setShown(current.current);
+      if (progress < 1) {
+        frame = requestAnimationFrame(step);
+      }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [target]);
+  return shown;
+}
+
 /**
  * A rate as it goes, chasing the newest second: the line draws on to the right
  * until the window is full, then the window slides so the newest second stays
  * at the right edge. Each poll moves it on over a second rather than jumping.
+ * The reveal, the slide and the leading dot all follow one clock, and the dot is
+ * placed on the line as drawn, so it never leaves it.
  */
 export function LiveChart({
   label,
@@ -56,17 +90,27 @@ export function LiveChart({
 
   const latest = points.at(-1);
   const end = latest?.at ?? 0;
+  const shown = useGlide(end);
   const ceiling = niceCeiling(Math.max(0, ...points.filter((point) => point.at > end - WINDOW_MS * 1.5).map((point) => point.rate)));
   const scale = width / WINDOW_MS;
   const y = (rate: number) => HEIGHT - (Math.min(rate, ceiling) / ceiling) * (HEIGHT - HEAD);
   // The line is laid out on the run's own clock from 0; the window is moved over it.
-  const shift = Math.min(0, width - end * scale);
-  const reach = end * scale + shift;
-  const line = [{ at: 0, rate: points[0]?.rate ?? 0 }, ...points]
-    .filter((point, index, all) => (all[index + 1]?.at ?? Infinity) >= end - WINDOW_MS - 2000)
-    .map((point) => `${(point.at * scale).toFixed(1)},${y(point.rate).toFixed(1)}`);
+  const shift = Math.min(0, width - shown * scale);
+  const reach = shown * scale + shift;
+  const vertices = [{ at: 0, rate: points[0]?.rate ?? 0 }, ...points]
+    .filter((point, index, all) => (all[index + 1]?.at ?? Infinity) >= shown - WINDOW_MS - 2000)
+    .map((point) => ({ x: point.at * scale, y: y(point.rate) }));
+  const line = vertices.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`);
   const first = line[0]?.split(",")[0] ?? "0";
-  const motion = "transition-transform duration-1000 ease-linear motion-reduce:transition-none";
+  // Where the line stands at the shown moment, between the two corners either side of it.
+  const at = shown * scale;
+  const after = vertices.findIndex((point) => point.x >= at);
+  const before = vertices[after - 1];
+  const next = vertices[after] ?? vertices.at(-1);
+  const dot =
+    before && next && next.x > before.x
+      ? before.y + ((next.y - before.y) * (at - before.x)) / (next.x - before.x)
+      : (next?.y ?? HEIGHT);
 
   return (
     <div ref={box} className="relative h-[132px] w-full min-w-0" role="img" aria-label={label}>
@@ -79,7 +123,7 @@ export function LiveChart({
             </linearGradient>
             <clipPath id={clip}>
               {/* What has arrived so far, revealed as it arrives. */}
-              <rect x={-width} y={-HEAD} width={width} height={HEIGHT + 2 * HEAD} className={motion} style={{ transform: `translateX(${reach}px)` }} />
+              <rect x={reach - width} y={-HEAD} width={width} height={HEIGHT + 2 * HEAD} />
             </clipPath>
           </defs>
           <line x1={0} x2={width} y1={HEIGHT - 0.5} y2={HEIGHT - 0.5} className="stroke-wv-hairline" />
@@ -89,14 +133,13 @@ export function LiveChart({
           </text>
           {points.length ? (
             <g clipPath={`url(#${clip})`}>
-              <g className={motion} style={{ transform: `translateX(${shift}px)` }}>
+              <g transform={`translate(${shift.toFixed(1)} 0)`}>
                 <polygon points={`${first},${HEIGHT} ${line.join(" ")} ${(end * scale).toFixed(1)},${HEIGHT}`} fill={`url(#${fill})`} />
                 <polyline points={line.join(" ")} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
               </g>
             </g>
           ) : null}
-          {/* Drawn before the first second too, unseen, so it glides in with the line rather than appearing. */}
-          <g className={cn(motion, !latest && "opacity-0")} style={{ transform: `translate(${reach}px, ${y(latest?.rate ?? 0)}px)` }}>
+          <g className={cn(!latest && "opacity-0")} transform={`translate(${reach.toFixed(1)} ${dot.toFixed(1)})`}>
             <circle r={8} fill={color} opacity={0.25} className="origin-center [transform-box:fill-box] motion-safe:animate-ping" />
             <circle r={3.5} fill={color} />
           </g>

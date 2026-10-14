@@ -32,6 +32,25 @@ async function shot(page, name, part) {
     await (part ? part.screenshot({ path }) : page.screenshot({ path, fullPage: true }));
   }
 }
+/** How far, at most, a chart's leading dot sits off its line as drawn, over the next sixty frames, in pixels. */
+const offLine = (chart) =>
+  chart.evaluate(async (element) => {
+    const line = element.querySelector("polyline");
+    const dot = element.querySelector("circle[r='3.5']");
+    let worst = 0;
+    for (let frame = 0; frame < 60; frame += 1) {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const box = dot.getBoundingClientRect();
+      const [x, y] = [box.x + box.width / 2, box.y + box.height / 2];
+      const matrix = line.getScreenCTM();
+      const corners = Array.from(line.points, (point) => new DOMPoint(point.x, point.y).matrixTransform(matrix));
+      const after = corners.findIndex((corner) => corner.x >= x);
+      const [a, b] = after > 0 ? [corners[after - 1], corners[after]] : [corners.at(after), corners.at(after)];
+      const drawn = b.x > a.x ? a.y + ((b.y - a.y) * (x - a.x)) / (b.x - a.x) : b.y;
+      worst = Math.max(worst, Math.abs(drawn - y));
+    }
+    return worst;
+  });
 const sent = (page, name) => page.evaluate((name) => window.speedFixture.requests.filter((request) => request.name === name).map((request) => request.variables), name);
 const finish = (page, id) => page.evaluate((id) => window.speedFixture.finish(id), id);
 /** The stat cell under `eyebrow` in `scope`: its eyebrow, figure and unit as one string. */
@@ -72,6 +91,8 @@ test("a leg taken down is left out of the test, the run is followed to its resul
     for (const name of ["Speed", "Decode"]) {
       const chart = progress.getByRole("img", { name, exact: true });
       await chart.locator("polyline").waitFor({ state: "attached" });
+      // The leading dot rides the line as drawn on every frame while the chart glides on.
+      assert.ok((await offLine(chart)) < 1, name);
       assert.ok((await chart.locator("polyline").getAttribute("points")).split(" ").length >= 12, name);
     }
     await progress.getByText("12.0", { exact: true }).waitFor();
