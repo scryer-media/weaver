@@ -994,14 +994,15 @@ export function NetworkFlow({
                 <title>{tip}</title>
                 {lines.map((line, index) => {
                   const traced = trace && focus !== null && line.lit && line.moves;
-                  // A traced line with nothing open is drawn as the ribbon its leg's connections would fill.
-                  const carried = line.carries && count > 0 ? count : traced ? Math.max(1, leg.target) : 0;
+                  const open = line.carries && count > 0;
+                  // A traced line with nothing open is drawn as the live ribbon its leg's connections would fill.
+                  const carried = open ? count : traced ? Math.max(1, leg.target) : 0;
                   const thickness = Math.max(2, width(carried));
                   return carried > 0 ? (
                     <g key={index}>
                       <path
                         d={band(line.points, thickness)}
-                        fill={line.color}
+                        fill={open ? line.color : stateColor("ACTIVE")}
                         opacity={line.lit ? (focus ? 0.5 : 0.28) : 0.28 * FADE}
                       />
                       {flowing || traced ? (

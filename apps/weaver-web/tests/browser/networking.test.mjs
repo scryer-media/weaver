@@ -90,7 +90,7 @@ test("flow displays route evidence, opens editors, exports a frozen SVG, and edi
  // Nothing moves until a box is pointed at; then only what it lights does.
  const snakes=diagram.locator("animate");
  const fadedSnakes=diagram.locator("g[opacity='0.2'] animate");
- // Every snake runs in a ribbon; a dashed thread never carries one.
+ // Every snake runs in a ribbon of its own green; a dashed thread never carries one.
  const dashed=diagram.locator("path[stroke-dasharray]");
  const ribbons=diagram.locator("g:has(> g > path > animate) > path:not([fill='none'])");
  assert.equal(await snakes.count(),0);
@@ -101,6 +101,7 @@ test("flow displays route evidence, opens editors, exports a frozen SVG, and edi
  assert.equal(await fadedSnakes.count(),0);
  assert.ok(await snakes.count()>0);
  assert.equal(await ribbons.count(),await snakes.count());
+ assert.equal(await ribbons.evaluateAll(paths=>paths.filter(path=>path.getAttribute("fill")!==path.parentElement.querySelector(":scope > g > path").getAttribute("stroke")).length),0);
  assert.equal(await proxy.locator("xpath=..").getAttribute("opacity"),"0.2");
  assert.equal(await killSwitch.locator("xpath=..").getAttribute("opacity"),"0.2");
  assert.equal(await fadedEgresses.count(),2);
@@ -115,6 +116,7 @@ test("flow displays route evidence, opens editors, exports a frozen SVG, and edi
  assert.ok(await snakes.count()>0);
  assert.equal(await fadedSnakes.count(),0);
  assert.equal(await ribbons.count(),await snakes.count());
+ assert.equal(await ribbons.evaluateAll(paths=>paths.filter(path=>path.getAttribute("fill")!==path.parentElement.querySelector(":scope > g > path").getAttribute("stroke")).length),0);
  assert.equal(await fadedEgresses.count(),2);
  assert.equal(await fadedEndpoints.count(),2);
  assert.ok(Number(await archive.getAttribute("opacity"))<0.2);
