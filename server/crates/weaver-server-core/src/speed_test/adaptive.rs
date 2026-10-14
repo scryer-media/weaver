@@ -17,15 +17,22 @@ const RAMP_GAIN: f64 = 1.05;
 const STABLE_TICKS: usize = 7;
 // How far apart they may lie, as a share of the largest.
 const STABLE_BAND: f64 = 0.02;
+// How far the rate over those ticks may lie from the latest average, as a
+// share of it. A mean can settle while the line under it still moves.
+const STEADY_BAND: f64 = 0.05;
 // The least a run measures for before it may stop on a stable average.
 const MIN_MEASURING: Duration = Duration::from_secs(5);
 // The most a run measures for.
 const MAX_MEASURING: Duration = Duration::from_secs(30);
+// How long a run waits for its first byte before it gives up.
+const FIRST_BYTE_WAIT: Duration = Duration::from_secs(10);
 // The most connections a run opens, unless more legs than this are up.
 const MAX_CONNECTIONS: usize = 8;
 // Ticks the ramp waits for a new connection's first byte before it judges
 // the rate without it.
 const FIRST_BYTE_TICKS: usize = 10;
+// Connections a leg may lose before no more go on it.
+const LEG_LOSSES: u8 = 3;
 
 // The run's counters at one tick.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,21 +56,34 @@ pub(crate) enum Decision {
 #[derive(Debug)]
 enum Phase {
     // Waiting for the newest connections to move their first bytes.
-    Settling { ticks: usize },
+    Settling {
+        ticks: usize,
+    },
     // Collecting a window of ticks to judge the rate on.
-    Judging { from: Tick, ticks: usize },
-    // Past the warm-up: the running averages since it ended.
-    Measuring { averages: VecDeque<f64> },
+    Judging {
+        from: Tick,
+        ticks: usize,
+    },
+    // Past the warm-up: the running averages since it ended, and the last
+    // ticks, the warm-up's first, that the recent rate is taken over.
+    Measuring {
+        averages: VecDeque<f64>,
+        recent: VecDeque<Tick>,
+    },
     Stopped,
 }
 
 #[derive(Debug)]
 pub(crate) struct Controller {
     weights: Vec<u8>,
-    // Legs a connection may still go on: up, and none of their connections
-    // has ended on its own.
+    // Legs a connection may still go on: up, and not retired for the
+    // connections they lost.
     usable: Vec<bool>,
+    // Connections open on each leg, counting any that took a lost one's
+    // place.
     opened: Vec<u16>,
+    // Connections each leg has lost.
+    losses: Vec<u8>,
     cap: usize,
     // The averaged rate the last added connection was judged against.
     baseline: f64,
@@ -77,6 +97,7 @@ impl Controller {
         let legs_up = up.iter().filter(|up| **up).count();
         Self {
             opened: vec![0; weights.len()],
+            losses: vec![0; weights.len()],
             weights,
             usable: up,
             cap: MAX_CONNECTIONS.max(legs_up),
@@ -97,11 +118,26 @@ impl Controller {
         legs
     }
 
-    // A connection on `leg` ended on its own; no more go on that leg.
-    pub(crate) fn ended(&mut self, leg: usize) {
-        if let Some(usable) = self.usable.get_mut(leg) {
-            *usable = false;
+    // A connection on `leg` ended on its own. `replaceable` when it moved a
+    // byte and no quota refused it. True when the run opens another on the
+    // same leg in its place; otherwise the leg is retired and its slot freed.
+    // One that never moved a byte cannot reach the URL, and a quota that
+    // refused one refuses the next.
+    pub(crate) fn ended(&mut self, leg: usize, replaceable: bool) -> bool {
+        let Some(losses) = self.losses.get_mut(leg) else {
+            return false;
+        };
+        *losses = losses.saturating_add(1);
+        if replaceable && self.usable[leg] && *losses < LEG_LOSSES {
+            // No judged window straddles the swap.
+            if matches!(self.phase, Phase::Settling { .. } | Phase::Judging { .. }) {
+                self.phase = Phase::Settling { ticks: 0 };
+            }
+            return true;
         }
+        self.usable[leg] = false;
+        self.opened[leg] = self.opened[leg].saturating_sub(1);
+        false
     }
 
     // When the warm-up ended and the bytes moved by then.
@@ -113,7 +149,9 @@ impl Controller {
         if matches!(self.phase, Phase::Stopped) {
             return Decision::Stop;
         }
-        if tick.at >= MAX_MEASURING {
+        // A source that answers and never sends would otherwise hold the run
+        // to its maximum.
+        if tick.at >= MAX_MEASURING || (tick.bytes == 0 && tick.at >= FIRST_BYTE_WAIT) {
             self.phase = Phase::Stopped;
             return Decision::Stop;
         }
@@ -136,30 +174,24 @@ impl Controller {
                 let rate = rate_between(*from, tick);
                 if rate > 0.0 && rate >= self.baseline * RAMP_GAIN {
                     self.baseline = rate;
-                    match self.place() {
-                        Some(leg) => {
-                            self.opened[leg] += 1;
-                            self.phase = Phase::Settling { ticks: 0 };
-                            Decision::Open(leg)
-                        }
-                        // At the cap: judge the next window the same way.
-                        None => {
-                            self.phase = Phase::Judging {
-                                from: tick,
-                                ticks: 0,
-                            };
-                            Decision::Wait
-                        }
+                    if let Some(leg) = self.place() {
+                        self.opened[leg] += 1;
+                        self.phase = Phase::Settling { ticks: 0 };
+                        return Decision::Open(leg);
                     }
-                } else {
-                    self.warm_up = Some((tick.at, tick.bytes));
-                    self.phase = Phase::Measuring {
-                        averages: VecDeque::with_capacity(STABLE_TICKS),
-                    };
-                    Decision::Wait
                 }
+                // No gain, or none left to add at the cap or with no leg
+                // usable: the ramp ends here.
+                self.warm_up = Some((tick.at, tick.bytes));
+                let mut recent = VecDeque::with_capacity(STABLE_TICKS + 1);
+                recent.push_back(tick);
+                self.phase = Phase::Measuring {
+                    averages: VecDeque::with_capacity(STABLE_TICKS),
+                    recent,
+                };
+                Decision::Wait
             }
-            Phase::Measuring { averages } => {
+            Phase::Measuring { averages, recent } => {
                 let (since, moved) = self.warm_up.unwrap_or_default();
                 let span = tick.at.saturating_sub(since).as_secs_f64();
                 if span > 0.0 {
@@ -168,7 +200,16 @@ impl Controller {
                     }
                     averages.push_back(tick.bytes.saturating_sub(moved) as f64 / span);
                 }
-                if tick.at >= MIN_MEASURING && averages.len() == STABLE_TICKS && stable(averages) {
+                if recent.len() > STABLE_TICKS {
+                    recent.pop_front();
+                }
+                recent.push_back(tick);
+                if tick.at >= MIN_MEASURING
+                    && averages.len() == STABLE_TICKS
+                    && recent.len() > STABLE_TICKS
+                    && stable(averages)
+                    && steady(rate_between(recent[0], tick), averages[STABLE_TICKS - 1])
+                {
                     self.phase = Phase::Stopped;
                     return Decision::Stop;
                 }
@@ -202,6 +243,11 @@ fn stable(averages: &VecDeque<f64>) -> bool {
     let max = averages.iter().copied().fold(f64::MIN, f64::max);
     let min = averages.iter().copied().fold(f64::MAX, f64::min);
     max - min <= STABLE_BAND * max
+}
+
+// The rate over the last ticks holds to the running average.
+fn steady(rate: f64, average: f64) -> bool {
+    (rate - average).abs() <= STEADY_BAND * average
 }
 
 #[cfg(test)]

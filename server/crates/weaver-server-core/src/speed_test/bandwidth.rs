@@ -46,7 +46,7 @@ pub(crate) async fn run(plan: BandwidthPlan, progress: Arc<Progress>, mut stop: 
     // The leg of every connection still open, and whether it moved a byte.
     let mut open: HashMap<tokio::task::Id, (usize, Arc<AtomicBool>)> = HashMap::new();
     let spawn =
-        |tasks: &mut tokio::task::JoinSet<()>, open: &mut HashMap<_, _>, position: usize| {
+        |tasks: &mut tokio::task::JoinSet<Ended>, open: &mut HashMap<_, _>, position: usize| {
             let Some(Some(leg)) = plan.legs.get(position) else {
                 return;
             };
@@ -71,13 +71,19 @@ pub(crate) async fn run(plan: BandwidthPlan, progress: Arc<Progress>, mut stop: 
             biased;
             _ = stop.stopped() => break,
             joined = tasks.join_next_with_id() => {
-                let id = match joined {
-                    Some(Ok((id, ()))) => id,
-                    Some(Err(error)) => error.id(),
+                let (id, ended) = match joined {
+                    Some(Ok((id, ended))) => (id, Some(ended)),
+                    Some(Err(error)) => (error.id(), None),
                     None => break,
                 };
-                if let Some((position, _)) = open.remove(&id) {
-                    controller.ended(position);
+                if let Some((position, moved)) = open.remove(&id) {
+                    // Only a connection that failed after reaching the URL
+                    // is worth another try.
+                    let replaceable =
+                        ended == Some(Ended::Failed) && moved.load(Ordering::Relaxed);
+                    if controller.ended(position, replaceable) {
+                        spawn(&mut tasks, &mut open, position);
+                    }
                 }
             }
             _ = ticker.tick() => {
@@ -162,6 +168,17 @@ impl<'a> QuotaSlice<'a> {
     }
 }
 
+// Why a connection ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    // The run stopped it.
+    Stopped,
+    // A dial, a GET or a body failed, or a body was empty.
+    Failed,
+    // Its egress has used its download quota.
+    Quota,
+}
+
 // One connection: GET the URL again each time a body ends, until stopped
 // or until a GET fails.
 async fn connection(
@@ -170,13 +187,13 @@ async fn connection(
     progress: Arc<Progress>,
     mut stop: Stop,
     moved: Arc<AtomicBool>,
-) {
+) -> Ended {
     let recorder = leg.recorder.clone();
     let connect =
         RoutedClient::connect(&leg.http, &plan.url, &plan.options, Some(recorder.clone()));
     let client = tokio::select! {
         biased;
-        _ = stop.stopped() => return,
+        _ = stop.stopped() => return Ended::Stopped,
         connected = connect => match connected {
             Ok(client) => client,
             Err((provider, error)) => {
@@ -187,11 +204,14 @@ async fn connection(
                     }
                 }
                 progress.counted();
-                return;
+                return Ended::Failed;
             }
         },
     };
-    'gets: while !stop.is_stopped() {
+    let ended = 'gets: loop {
+        if stop.is_stopped() {
+            break Ended::Stopped;
+        }
         let mut quota = QuotaSlice::new(&leg);
         // A known size takes its first slice before the GET, so an egress
         // out of quota sends nothing; any other waits for the headers.
@@ -199,18 +219,18 @@ async fn connection(
             && let Err(error) = quota.ready(Some(size))
         {
             client.provider.fail(error);
-            break;
+            break Ended::Quota;
         }
         let response = tokio::select! {
             biased;
-            _ = stop.stopped() => break,
+            _ = stop.stopped() => break Ended::Stopped,
             response = client.get(&plan.url) => response,
         };
         let mut response = match response {
             Ok(response) => response,
             Err(error) => {
                 client.provider.fail(error);
-                break;
+                break Ended::Failed;
             }
         };
         let length = response.content_length().or(plan.size);
@@ -222,11 +242,11 @@ async fn connection(
             let remaining = length.and_then(|length| length.checked_sub(received));
             if let Err(error) = quota.ready(remaining) {
                 client.provider.fail(error);
-                break 'gets;
+                break 'gets Ended::Quota;
             }
             let chunk = tokio::select! {
                 biased;
-                _ = stop.stopped() => break 'gets,
+                _ = stop.stopped() => break 'gets Ended::Stopped,
                 chunk = response.chunk() => chunk,
             };
             match chunk {
@@ -244,7 +264,7 @@ async fn connection(
                     client
                         .provider
                         .fail(format!("reading the body failed: {error}"));
-                    break 'gets;
+                    break 'gets Ended::Failed;
                 }
             }
         }
@@ -252,9 +272,10 @@ async fn connection(
         progress.counted();
         if received == 0 {
             client.provider.fail("the response has no body".into());
-            break;
+            break Ended::Failed;
         }
-    }
+    };
     client.close().await;
     progress.counted();
+    ended
 }
