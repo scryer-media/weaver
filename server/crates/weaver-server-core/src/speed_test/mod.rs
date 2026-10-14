@@ -2,6 +2,7 @@
 // a public source, or a Usenet pull of a test NZB on the server's own
 // connections with the queue paused.
 
+mod adaptive;
 mod bandwidth;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixture;

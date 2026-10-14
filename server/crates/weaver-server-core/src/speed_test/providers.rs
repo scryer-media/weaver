@@ -8,11 +8,13 @@ const GIB: u64 = 1024 * MIB;
 pub struct ProviderInfo {
     pub id: &'static str,
     pub name: &'static str,
-    // The only sizes the provider serves; empty when it serves any size.
-    pub fixed_sizes: &'static [u64],
-    pub any_size: bool,
-    // The largest single GET an any-size provider serves.
-    pub max_size: Option<u64>,
+    // The host a run downloads from; `None` for a list provider, whose
+    // servers each carry their own.
+    pub host: Option<&'static str>,
+    // Where the provider's largest single download lives on `host`.
+    path: &'static str,
+    // Bytes one GET of that download moves.
+    pub download_bytes: u64,
     // Whether the operator picks one server from the provider's list.
     pub needs_server: bool,
 }
@@ -21,42 +23,42 @@ pub const PROVIDERS: &[ProviderInfo] = &[
     ProviderInfo {
         id: "cloudflare",
         name: "Cloudflare",
-        fixed_sizes: &[],
-        any_size: true,
+        host: Some("speed.cloudflare.com"),
         // A larger request is refused with HTTP 403.
-        max_size: Some(99_999_999),
+        path: "/__down?bytes=99999999",
+        download_bytes: 99_999_999,
         needs_server: false,
     },
     ProviderInfo {
         id: "sabnzbd",
         name: "SABnzbd",
-        fixed_sizes: &[100 * MIB],
-        any_size: false,
-        max_size: None,
+        host: Some("sabnzbd.org"),
+        path: "/tests/internetspeed/100MB.bin",
+        download_bytes: 100 * MIB,
         needs_server: false,
     },
     ProviderInfo {
         id: "ovh",
         name: "OVH",
-        fixed_sizes: &[100 * MIB, GIB, 10 * GIB],
-        any_size: false,
-        max_size: None,
+        host: Some("proof.ovh.net"),
+        path: "/files/10Gb.dat",
+        download_bytes: 10 * GIB,
         needs_server: false,
     },
     ProviderInfo {
         id: "hetzner",
         name: "Hetzner",
-        fixed_sizes: &[100 * MIB, GIB, 10 * GIB],
-        any_size: false,
-        max_size: None,
+        host: Some("nbg1-speed.hetzner.com"),
+        path: "/10GB.bin",
+        download_bytes: 10 * GIB,
         needs_server: false,
     },
     ProviderInfo {
         id: "librespeed",
         name: "LibreSpeed",
-        fixed_sizes: &[],
-        any_size: true,
-        max_size: Some(LIBRESPEED_MAX_CHUNKS * MIB),
+        host: None,
+        path: "",
+        download_bytes: LIBRESPEED_MAX_CHUNKS * MIB,
         needs_server: true,
     },
 ];
@@ -70,62 +72,14 @@ pub fn provider(id: &str) -> Option<&'static ProviderInfo> {
     PROVIDERS.iter().find(|provider| provider.id == id)
 }
 
-fn size_name(bytes: u64) -> &'static str {
-    match bytes {
-        b if b == 100 * MIB => "100",
-        b if b == GIB => "1",
-        _ => "10",
-    }
-}
-
-// The URL one stream of a run on a fixed-size or any-size provider GETs.
-// List providers resolve through `list_server_url`.
-pub fn provider_url(provider: &ProviderInfo, bytes: u64) -> Result<reqwest::Url, String> {
-    if !provider.any_size && !provider.fixed_sizes.contains(&bytes) {
-        let sizes = provider
-            .fixed_sizes
-            .iter()
-            .map(|size| format!("{size}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "{} serves only these sizes in bytes: {sizes}",
-            provider.name
-        ));
-    }
-    if bytes == 0 {
-        return Err("a bandwidth run must ask for at least one byte".into());
-    }
-    if let Some(max) = provider.max_size
-        && bytes > max
-    {
-        return Err(format!(
-            "{} serves at most {max} bytes per stream",
-            provider.name
-        ));
-    }
-    let url = match provider.id {
-        "cloudflare" => format!("https://speed.cloudflare.com/__down?bytes={bytes}"),
-        "sabnzbd" => "https://sabnzbd.org/tests/internetspeed/100MB.bin".into(),
-        "ovh" => {
-            let name = match size_name(bytes) {
-                "100" => "100Mb",
-                "1" => "1Gb",
-                _ => "10Gb",
-            };
-            format!("https://proof.ovh.net/files/{name}.dat")
-        }
-        "hetzner" => {
-            let name = match size_name(bytes) {
-                "100" => "100MB",
-                "1" => "1GB",
-                _ => "10GB",
-            };
-            format!("https://nbg1-speed.hetzner.com/{name}.bin")
-        }
-        other => return Err(format!("provider {other} needs a server from its list")),
+// The URL every GET of a run on a fixed provider asks for. List providers
+// resolve through `list_server_url`.
+pub fn provider_url(provider: &ProviderInfo) -> Result<reqwest::Url, String> {
+    let Some(host) = provider.host else {
+        return Err(format!("{} needs a server from its list", provider.name));
     };
-    reqwest::Url::parse(&url).map_err(|error| error.to_string())
+    reqwest::Url::parse(&format!("https://{host}{}", provider.path))
+        .map_err(|error| error.to_string())
 }
 
 // One server of a list provider.
@@ -190,16 +144,13 @@ pub fn parse_librespeed_servers(body: &[u8]) -> Result<Vec<ProviderServer>, Stri
         .collect())
 }
 
-// The URL one stream GETs from a LibreSpeed server, rounded up to whole
-// MiB chunks.
-pub fn list_server_url(server: &ProviderServer, bytes: u64) -> Result<reqwest::Url, String> {
-    let chunks = bytes.div_ceil(MIB).max(1);
-    if chunks > LIBRESPEED_MAX_CHUNKS {
-        return Err(format!(
-            "LibreSpeed serves at most {} bytes per stream",
-            LIBRESPEED_MAX_CHUNKS * MIB
-        ));
-    }
+// The URL every GET of a run on a LibreSpeed server asks for: the most
+// chunks the server serves at once.
+pub fn list_server_url(server: &ProviderServer) -> Result<reqwest::Url, String> {
+    chunked_url(server, LIBRESPEED_MAX_CHUNKS)
+}
+
+fn chunked_url(server: &ProviderServer, chunks: u64) -> Result<reqwest::Url, String> {
     let mut url = reqwest::Url::parse(&server.download_url).map_err(|e| e.to_string())?;
     url.query_pairs_mut()
         .append_pair("ckSize", &chunks.to_string());
@@ -211,21 +162,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_size_providers_refuse_other_sizes() {
-        let ovh = provider("ovh").unwrap();
-        assert_eq!(
-            provider_url(ovh, GIB).unwrap().as_str(),
-            "https://proof.ovh.net/files/1Gb.dat"
-        );
-        assert!(provider_url(ovh, 5 * MIB).is_err());
+    fn every_fixed_provider_downloads_from_its_host() {
+        for info in PROVIDERS.iter().filter(|info| !info.needs_server) {
+            let url = provider_url(info).unwrap();
+            assert_eq!(url.scheme(), "https");
+            assert_eq!(url.host_str(), info.host, "{}", info.id);
+        }
         let cloudflare = provider("cloudflare").unwrap();
         assert_eq!(
-            provider_url(cloudflare, 12345).unwrap().as_str(),
-            "https://speed.cloudflare.com/__down?bytes=12345"
+            provider_url(cloudflare).unwrap().as_str(),
+            "https://speed.cloudflare.com/__down?bytes=99999999"
         );
-        assert!(provider_url(cloudflare, 99_999_999).is_ok());
-        assert!(provider_url(cloudflare, 100_000_000).is_err());
-        assert!(provider_url(provider("librespeed").unwrap(), MIB).is_err());
+        let asked = provider_url(cloudflare)
+            .unwrap()
+            .query_pairs()
+            .find(|(name, _)| name == "bytes")
+            .map(|(_, value)| value.parse::<u64>().unwrap());
+        assert_eq!(asked, Some(cloudflare.download_bytes));
+        assert_eq!(
+            provider_url(provider("ovh").unwrap()).unwrap().as_str(),
+            "https://proof.ovh.net/files/10Gb.dat"
+        );
+        let librespeed = provider("librespeed").unwrap();
+        assert_eq!(librespeed.host, None);
+        assert!(provider_url(librespeed).is_err());
     }
 
     #[test]
@@ -256,11 +216,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            list_server_url(&servers[0], 3 * MIB + 1).unwrap().as_str(),
-            "https://speed.example.test/backend/garbage.php?ckSize=4"
+            list_server_url(&servers[0]).unwrap().as_str(),
+            "https://speed.example.test/backend/garbage.php?ckSize=1024"
         );
-        assert!(list_server_url(&servers[0], 1024 * MIB).is_ok());
-        assert!(list_server_url(&servers[0], 1024 * MIB + 1).is_err());
     }
 }
 

@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use weaver_nntp::socket_budget::ConnectionLoan;
 use weaver_nntp::transfer::{ServerTransferControl, StableServerId};
 
-use super::bandwidth::{self, BandwidthStream};
+use super::bandwidth::{self, BandwidthLeg, BandwidthPlan};
 use super::http::{HttpLeg, HttpOptions, fetch_test_nzb, read_capped, routed_get};
 use super::model::*;
 use super::overrides::{TestedLeg, TestedRoute};
@@ -69,6 +69,9 @@ pub struct ServiceInner {
     revision: watch::Sender<u64>,
     server_lists: tokio::sync::Mutex<HashMap<String, (Instant, Vec<ProviderServer>)>>,
     roots: Mutex<Vec<Vec<u8>>>,
+    // Bandwidth runs measure until cancelled or until every connection has
+    // ended; only tests set it.
+    until_stopped: AtomicBool,
 }
 
 #[derive(Default)]
@@ -126,6 +129,7 @@ impl SpeedTestService {
                 revision: watch::channel(0).0,
                 server_lists: tokio::sync::Mutex::new(HashMap::new()),
                 roots: Mutex::new(Vec::new()),
+                until_stopped: AtomicBool::new(false),
             }),
         }
     }
@@ -157,8 +161,15 @@ impl SpeedTestService {
         *self.inner.roots.lock().expect("speed test roots") = roots;
     }
 
+    // Bandwidth runs end only when cancelled or when every connection has
+    // ended, so a test can end one on a condition.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn measure_until_stopped_for_tests(&self) {
+        self.inner.until_stopped.store(true, Ordering::Release);
+    }
+
     // Bumped on every change of a run's status or phase, and whenever an
-    // article or a stream is counted.
+    // article or a GET is counted.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.inner.revision.subscribe()
     }
@@ -193,6 +204,25 @@ impl SpeedTestService {
             .find(|cell| cell.id == id)
             .cloned()?;
         Some(self.inner.snapshot(&cell))
+    }
+
+    // The uploaded NZB a held run measured with, for another run of it.
+    pub fn held_nzb(&self, run: u32) -> Result<UploadedNzb, SpeedTestError> {
+        self.inner
+            .state
+            .lock()
+            .expect("speed test state")
+            .runs
+            .iter()
+            .find(|cell| cell.id == run)
+            .and_then(|cell| match &cell.request.kind {
+                SpeedTestKind::Usenet {
+                    nzb: TestNzbSource::Upload { nzb, .. },
+                    ..
+                } => Some(nzb.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| SpeedTestError::Invalid(format!("run {run} holds no uploaded NZB")))
     }
 
     // Cancel a running run. False when no run with this id is running.
@@ -305,7 +335,8 @@ impl SpeedTestService {
             return Err(NetworkRefusal::SpeedTestLegDownAll.into());
         }
 
-        // Targets per leg: connections for Usenet, streams for bandwidth.
+        // Connections per leg. A bandwidth run starts with one per leg that
+        // is up and adds more as it ramps.
         let targets = match (&request.kind, &server) {
             (SpeedTestKind::Usenet { connections, .. }, Some(server)) => {
                 let connections = connections.unwrap_or(server.connections);
@@ -328,7 +359,9 @@ impl SpeedTestService {
             (SpeedTestKind::Usenet { .. }, None) => {
                 return Err(NetworkRefusal::SpeedTestUsenetNeedsServer.into());
             }
-            (SpeedTestKind::Bandwidth { streams, .. }, _) => tested.stream_targets(*streams),
+            (SpeedTestKind::Bandwidth { .. }, _) => {
+                tested.healthy().into_iter().map(u16::from).collect()
+            }
         };
 
         // Quotas: a run books its bytes against every quota it crosses.
@@ -382,12 +415,9 @@ impl SpeedTestService {
         let bandwidth_url = match &request.kind {
             SpeedTestKind::Bandwidth {
                 provider: BandwidthProvider::Custom { url },
-                ..
             } => Some(url.clone()),
             SpeedTestKind::Bandwidth {
                 provider: BandwidthProvider::Builtin { id, .. },
-                bytes,
-                ..
             } => {
                 let provider = providers::provider(id).ok_or_else(|| {
                     SpeedTestError::Invalid(format!("no bandwidth provider is called {id}"))
@@ -395,16 +425,13 @@ impl SpeedTestService {
                 if provider.needs_server {
                     None
                 } else {
-                    Some(
-                        providers::provider_url(provider, *bytes)
-                            .map_err(SpeedTestError::Invalid)?,
-                    )
+                    Some(providers::provider_url(provider).map_err(SpeedTestError::Invalid)?)
                 }
             }
             SpeedTestKind::Usenet { .. } => None,
         };
         let nzb_url = match &request.kind {
-            SpeedTestKind::Usenet { nzb, .. } => Some(nzb.url().map_err(SpeedTestError::Invalid)?),
+            SpeedTestKind::Usenet { nzb, .. } => nzb.url().map_err(SpeedTestError::Invalid)?,
             SpeedTestKind::Bandwidth { .. } => None,
         };
 
@@ -508,59 +535,47 @@ impl SpeedTestService {
 }
 
 fn validate_request(request: &SpeedTestRequest) -> Result<(), SpeedTestError> {
-    if request.max_duration.is_zero() || request.max_duration > MAX_DURATION {
-        return Err(SpeedTestError::Invalid(format!(
-            "a run measures for 1 to {} seconds",
-            MAX_DURATION.as_secs()
-        )));
-    }
     match (&request.kind, request.consumer) {
         (SpeedTestKind::Usenet { .. }, Consumer::Rss(_)) => {
             Err(NetworkRefusal::SpeedTestUsenetNeedsServer.into())
         }
+        (SpeedTestKind::Bandwidth { provider }, _) => match provider {
+            BandwidthProvider::Custom { url } if url.scheme() != "https" => Err(
+                SpeedTestError::Invalid("a custom bandwidth URL must use https".into()),
+            ),
+            BandwidthProvider::Builtin { id, server } => {
+                let info = providers::provider(id).ok_or_else(|| {
+                    SpeedTestError::Invalid(format!("no bandwidth provider is called {id}"))
+                })?;
+                if info.needs_server && server.is_none() {
+                    return Err(SpeedTestError::Invalid(format!(
+                        "{} needs a server from its list",
+                        info.name
+                    )));
+                }
+                Ok(())
+            }
+            BandwidthProvider::Custom { .. } => Ok(()),
+        },
         (
-            SpeedTestKind::Bandwidth {
-                streams,
-                bytes,
-                provider,
+            SpeedTestKind::Usenet {
+                nzb, max_duration, ..
             },
-            _,
+            Consumer::Server(_),
         ) => {
-            if *streams == 0 || *streams > MAX_STREAMS {
+            if max_duration.is_zero() || *max_duration > MAX_DURATION {
                 return Err(SpeedTestError::Invalid(format!(
-                    "a bandwidth run opens 1 to {MAX_STREAMS} streams"
+                    "a Usenet run measures for 1 to {} seconds",
+                    MAX_DURATION.as_secs()
                 )));
             }
-            if *bytes == 0 {
-                return Err(SpeedTestError::Invalid(
-                    "a bandwidth run must ask for at least one byte".into(),
-                ));
-            }
-            match provider {
-                BandwidthProvider::Custom { url } if url.scheme() != "https" => Err(
-                    SpeedTestError::Invalid("a custom bandwidth URL must use https".into()),
+            match nzb {
+                TestNzbSource::Url(url) if !matches!(url.scheme(), "http" | "https") => Err(
+                    SpeedTestError::Invalid("a test NZB URL must use http or https".into()),
                 ),
-                BandwidthProvider::Builtin { id, server } => {
-                    let info = providers::provider(id).ok_or_else(|| {
-                        SpeedTestError::Invalid(format!("no bandwidth provider is called {id}"))
-                    })?;
-                    if info.needs_server && server.is_none() {
-                        return Err(SpeedTestError::Invalid(format!(
-                            "{} needs a server from its list",
-                            info.name
-                        )));
-                    }
-                    Ok(())
-                }
-                BandwidthProvider::Custom { .. } => Ok(()),
+                _ => Ok(()),
             }
         }
-        (SpeedTestKind::Usenet { nzb, .. }, Consumer::Server(_)) => match nzb {
-            TestNzbSource::Url(url) if !matches!(url.scheme(), "http" | "https") => Err(
-                SpeedTestError::Invalid("a test NZB URL must use http or https".into()),
-            ),
-            _ => Ok(()),
-        },
     }
 }
 
@@ -723,6 +738,7 @@ struct RunPlan {
     legs: Vec<PlannedLeg>,
     server: Option<crate::servers::ServerConfig>,
     server_control: Option<Arc<ServerTransferControl>>,
+    // `None` for an uploaded NZB, which the request itself holds.
     nzb_url: Option<reqwest::Url>,
     // `None` for a list provider until its server is looked up.
     bandwidth_url: Option<reqwest::Url>,
@@ -795,9 +811,9 @@ impl ServiceInner {
         }
         let url =
             reqwest::Url::parse(providers::LIBRESPEED_SERVER_LIST).map_err(|e| e.to_string())?;
-        let routed = routed_get(leg, &url, &self.options(), None)
+        let routed = routed_get(leg, &url, &self.options())
             .await
-            .map_err(|(_, error)| format!("fetching the server list failed: {error}"))?;
+            .map_err(|error| format!("fetching the server list failed: {error}"))?;
         let body = read_capped(routed, 4 * 1024 * 1024).await?;
         let servers = providers::parse_librespeed_servers(&body)?;
         lists.insert(provider_id.to_owned(), (Instant::now(), servers.clone()));
@@ -828,9 +844,24 @@ impl ServiceInner {
             started_at_ms: cell.started_at_ms,
             finished_at_ms: life.finished_at_ms,
             error: life.error.clone(),
-            tested: cell.tested.clone(),
+            tested: self.tested(cell),
             result,
         }
+    }
+
+    // A bandwidth run's legs are given the connections it has opened on
+    // them so far.
+    fn tested(&self, cell: &RunCell) -> TestedRouteSnapshot {
+        let mut tested = cell.tested.clone();
+        if !cell.usenet() {
+            let opened = cell.progress.connections_per_leg();
+            for leg in &mut tested.legs {
+                if let Some(count) = opened.get(leg.position) {
+                    leg.target = leg.target.max(*count);
+                }
+            }
+        }
+        tested
     }
 
     fn set_phase(&self, cell: &RunCell, phase: SpeedTestPhase) {
@@ -970,8 +1001,8 @@ async fn execute(
     };
 
     // Preparing: everything that can fail before the queue is touched.
-    let articles = match &plan.nzb_url {
-        Some(url) => {
+    let articles = match (&plan.nzb_url, &cell.request.kind) {
+        (Some(url), _) => {
             let leg = match http_leg(first) {
                 Ok(leg) => leg,
                 Err(error) => return Outcome::Failed(error),
@@ -985,16 +1016,27 @@ async fn execute(
                 },
             }
         }
-        None => None,
+        (
+            None,
+            SpeedTestKind::Usenet {
+                nzb: TestNzbSource::Upload { nzb, .. },
+                ..
+            },
+        ) => match nzb.articles() {
+            Ok(articles) => Some(articles),
+            Err(error) => return Outcome::Failed(error),
+        },
+        _ => None,
     };
-    let bandwidth = if let SpeedTestKind::Bandwidth {
-        provider, bytes, ..
-    } = &cell.request.kind
-    {
+    let bandwidth = if let SpeedTestKind::Bandwidth { provider } = &cell.request.kind {
         let (provider_id, server) = match provider {
             BandwidthProvider::Builtin { id, server } => (Some(id.clone()), server.clone()),
             BandwidthProvider::Custom { .. } => (None, None),
         };
+        let size = provider_id
+            .as_deref()
+            .and_then(providers::provider)
+            .map(|provider| provider.download_bytes);
         let url = match (&plan.bandwidth_url, &provider_id, &server) {
             (Some(url), ..) => url.clone(),
             (None, Some(provider_id), Some(server)) => {
@@ -1014,7 +1056,7 @@ async fn execute(
                 let Some(found) = found else {
                     return Outcome::Failed(format!("{provider_id} lists no server {server}"));
                 };
-                match providers::list_server_url(&found, *bytes) {
+                match providers::list_server_url(&found) {
                     Ok(url) => url,
                     Err(error) => return Outcome::Failed(error),
                 }
@@ -1025,10 +1067,10 @@ async fn execute(
             provider_id,
             server,
             url: url.to_string(),
-            streams: plan.legs.iter().map(|leg| u32::from(leg.target)).sum(),
+            connections: 0,
         };
         cell.life.lock().expect("speed test run").bandwidth = Some(result);
-        Some((url, *bytes))
+        Some((url, size))
     } else {
         None
     };
@@ -1051,10 +1093,11 @@ async fn execute(
         _ = metrics.wait_downloads_drained() => {}
     }
 
-    let measure_stop =
-        |stop: &Stop| stop.with_deadline(tokio::time::Instant::now() + cell.request.max_duration);
     match (articles, &plan.server, bandwidth) {
         (Some(articles), Some(server), _) => {
+            let SpeedTestKind::Usenet { max_duration, .. } = cell.request.kind else {
+                return Outcome::Failed("the run has nothing to measure".into());
+            };
             // Lease: the live pool gives the server's connections back.
             inner.set_phase(&cell, SpeedTestPhase::Leasing);
             let connections: u16 = plan.legs.iter().map(|leg| leg.target).sum();
@@ -1145,48 +1188,50 @@ async fn execute(
                 },
                 cell.progress.clone(),
                 metrics,
-                measure_stop(&stop),
+                stop.with_deadline(tokio::time::Instant::now() + max_duration),
             )
             .await;
             sampler.abort();
         }
-        (None, _, Some((url, bytes))) => {
+        (None, _, Some((url, size))) => {
             let runtime = match inner.runtime() {
                 Ok(runtime) => runtime,
                 Err(error) => return Outcome::Failed(error.to_string()),
             };
-            let mut streams = Vec::new();
+            let mut legs: Vec<Option<Arc<BandwidthLeg>>> = vec![None; cell.tested.legs.len()];
             for leg in &plan.legs {
                 let http = match http_leg(leg) {
                     Ok(http) => http,
                     Err(error) => return Outcome::Failed(error),
                 };
-                for _ in 0..leg.target {
-                    streams.push(BandwidthStream {
-                        leg: http.clone(),
-                        recorder: LegRecorder {
-                            progress: cell.progress.clone(),
-                            leg: leg.position,
-                            egress: leg.egress,
-                            rung_map: leg.rung_map.clone(),
-                        },
-                        egress_control: runtime
-                            .network
-                            .egress_controls
-                            .get(StableServerId(leg.egress)),
-                    });
-                }
+                legs[leg.position] = Some(Arc::new(BandwidthLeg {
+                    http,
+                    recorder: LegRecorder {
+                        progress: cell.progress.clone(),
+                        leg: leg.position,
+                        egress: leg.egress,
+                        rung_map: leg.rung_map.clone(),
+                    },
+                    egress_control: runtime
+                        .network
+                        .egress_controls
+                        .get(StableServerId(leg.egress)),
+                }));
             }
             inner.set_phase(&cell, SpeedTestPhase::Measuring);
             cell.progress.start();
             let sampler = spawn_sampler(cell.progress.clone(), None);
             bandwidth::run(
-                streams,
-                url,
-                bytes,
-                options,
+                BandwidthPlan {
+                    legs,
+                    weights: cell.tested.legs.iter().map(|leg| leg.weight).collect(),
+                    url,
+                    size,
+                    options,
+                    until_stopped: inner.until_stopped.load(Ordering::Acquire),
+                },
                 cell.progress.clone(),
-                measure_stop(&stop),
+                stop.clone(),
             )
             .await;
             sampler.abort();
