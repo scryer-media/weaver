@@ -62,18 +62,22 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
       `mutation($id: Int!) { testConfiguredServerConnection(id: $id) { success message } }`, { id: serverId })).testConfiguredServerConnection;
     const status = async () => (await graphql<{ servers: Array<{ id: number; routingStatus: Status }> }>(request,
       `query { servers { id routingStatus { state selectedProxyId failures { proxyId } } } }`)).servers.find(server => server.id === serverId)!.routingStatus;
-    const attempts = async (sequence: number) => (await since(sequence)).filter(event => event.kind === "attempt").map(event => event.route);
+    // These proxies resolve with the fixture's DNS server, asked through the
+    // proxy: a hop dials it once per lookup, A then AAAA, before the server.
+    // A route that refuses the first lookup is left at once.
+    const attempts = async (sequence: number) => (await since(sequence)).filter(event => event.kind === "attempt")
+      .map(event => event.port === fixture.ports.dns ? `${event.route} dns` : event.route);
     const allDown = async () => { for (const route of names) await control({ route, up: false, cut: true, hold: false }); };
     const allUp = async () => { for (const route of names) await control({ route, up: true, hold: false }); };
 
     await step("NNTP connection tests prefer primary and fail over sequentially", async () => {
       const start = await mark();
       expect(await probe()).toMatchObject({ success: true });
-      expect(await attempts(start)).toEqual(["primary"]);
+      expect(await attempts(start)).toEqual(["primary dns", "primary dns", "primary"]);
       await control({ route: "primary", up: false, cut: true });
       const failover = await mark();
       expect(await probe()).toMatchObject({ success: true });
-      expect(await attempts(failover)).toEqual(["primary", "secondary"]);
+      expect(await attempts(failover)).toEqual(["primary dns", "secondary dns", "secondary dns", "secondary"]);
       await noDirect(start);
     });
 
@@ -82,11 +86,11 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
       await control({ route: "secondary", up: false });
       const start = await mark();
       expect(await probe()).toMatchObject({ success: true });
-      expect(await attempts(start)).toEqual(["primary", "secondary", "tertiary"]);
+      expect(await attempts(start)).toEqual(["primary dns", "secondary dns", "tertiary dns", "tertiary dns", "tertiary"]);
       await configure({ proxyIds: [ids[2]!, ids[1]!, ids[0]!], allowDirect: false });
       const order = await mark();
       expect(await probe()).toMatchObject({ success: true });
-      expect(await attempts(order)).toEqual(["tertiary"]);
+      expect(await attempts(order)).toEqual(["tertiary dns", "tertiary dns", "tertiary"]);
       await noDirect(start);
     });
 
@@ -157,7 +161,7 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
       await control({ route: "primary", up: true });
       const cooldown = await mark();
       expect(await sync()).toMatchObject({ itemsSubmitted: 0, errors: [] });
-      expect(await attempts(cooldown)).not.toContain("primary");
+      expect((await attempts(cooldown)).filter(route => route?.startsWith("primary"))).toEqual([]);
       expect(await attempts(cooldown)).toContain("secondary");
       // Configured-server tests intentionally use disposable routes. RSS
       // polling exercises the real consumer cooldown and monotonic deadline.
@@ -165,7 +169,7 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
       const recovery = await mark();
       expect(await sync()).toMatchObject({ itemsSubmitted: 0, errors: [] });
       expect(await attempts(recovery)).toContain("primary");
-      expect(await attempts(recovery)).not.toContain("secondary");
+      expect((await attempts(recovery)).filter(route => route?.startsWith("secondary"))).toEqual([]);
       const events = await since(start);
       expect(events.some(event => event.kind === "routed-dns" && event.name === "feed.proxy.test")).toBeTruthy();
       expect(events.some(event => event.kind === "routed-dns" && event.name === "download.proxy.test")).toBeTruthy();
@@ -216,6 +220,54 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
     fs.mkdirSync(root, { recursive: true });
     fs.writeFileSync(path.join(root, "proxy-routing-evidence.json"), body);
     await info.attach("proxy-routing-evidence", { body, contentType: "application/json" });
+  }
+});
+
+// Weaver resolves the server's name with the host's resolver, here the
+// fixture's canary, and hands the proxy the address it got back.
+test("a proxy Weaver resolves for is handed the address and carries a download", async ({ request }) => {
+  test.setTimeout(4 * 60_000);
+  const events = async (after: number) => {
+    const response = await request.get(`${controlUrl}/events?after=${after}`);
+    expect(response.ok()).toBeTruthy();
+    return await response.json() as { sequence: number; events: Event[] };
+  };
+  const response = await request.get(controlUrl);
+  expect(response.ok()).toBeTruthy();
+  const fixture: Evidence = await response.json();
+  const control = await request.post(controlUrl, { data: { route: "primary", up: true, hold: false, connectStatus: null } });
+  expect(control.ok(), await control.text()).toBeTruthy();
+  await updateConfiguredServer(request, "nntp", { active: false });
+  await updateConfiguredServer(request, "nntp2", { active: false });
+  const saved = await graphql<{ saveProxyProfile: { id: number; resolver: string; dnsServers: string[] } }>(request,
+    `mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id resolver dnsServers } }`,
+    { input: {
+      name: "e2e-weaver-resolves", kind: "HTTP_CONNECT", resolver: "WEAVER", enabled: true,
+      host: fixture.ip, port: fixture.ports.primary, username: "fixture", password: "fixture", dnsServers: [], timeoutSeconds: 2,
+    } });
+  expect(saved.saveProxyProfile).toMatchObject({ resolver: "WEAVER", dnsServers: [] });
+  const name = "weaver-resolves.proxy.test";
+  const input = {
+    host: name, port: fixture.ports.nntp, tls: false, username: "e2e-user", password: "e2e-pass", connections: 1,
+    routing: { proxyIds: [saved.saveProxyProfile.id], allowDirect: false },
+  };
+  const start = (await events(Number.MAX_SAFE_INTEGER)).sequence;
+  const added = await graphql<{ addServer: { id: number } }>(request,
+    `mutation($input: ServerInput!) { addServer(input: $input) { id } }`, { input: { ...input, active: true } });
+  try {
+    const jobId = await startDownload(request, "proxy-weaver-resolves");
+    await expect.poll(async () => await jobState(request, jobId), { timeout: 60_000 }).toBe("COMPLETED");
+    const seen = (await events(start)).events;
+    expect(seen.some(event => event.kind === "direct-dns" && event.name === name), "Weaver asks the host's resolver").toBeTruthy();
+    expect(seen.filter(event => event.kind === "routed-dns" && event.name === name), "the proxy is never asked for the name").toEqual([]);
+    const attempts = seen.filter(event => event.kind === "attempt" && event.route === "primary");
+    expect(attempts.length).toBeGreaterThan(0);
+    expect(attempts.filter(event => event.host !== fixture.ip), "the proxy is handed only the address").toEqual([]);
+    expect(seen.some(event => event.kind === "nntp-bytes" && event.route === "primary")).toBeTruthy();
+    expect(seen.filter(event => event.kind === "direct-nntp"), "no host destination connection").toEqual([]);
+  } finally {
+    await graphql(request, `mutation($id: Int!, $input: ServerInput!) { updateServer(id: $id, input: $input) { id } }`,
+      { id: added.addServer.id, input: { ...input, active: false } });
   }
 });
 

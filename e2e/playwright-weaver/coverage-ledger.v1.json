@@ -725,6 +725,11 @@
       "oracle": "api-metrics"
     },
     {
+      "name": "proxy-weaver-resolves-and-hands-the-address",
+      "owner": "proxy-routing",
+      "oracle": "api-metrics"
+    },
+    {
       "name": "encrypted-backup-restore-matrix",
       "owner": "ui-backup-restore-sqlite-to-sqlite",
       "oracle": "browser"
