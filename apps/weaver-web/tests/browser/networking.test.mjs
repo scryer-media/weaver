@@ -268,20 +268,20 @@ test("an egress is tested alone and a pool member by member, each through a rout
  await dialog.waitFor({state:"detached"});
  await page.keyboard.press("Escape");
  await egress.waitFor({state:"detached"});
- // A pool is tried member by member down every path of the draft, path by path; a disabled member fails where it stands.
+ // A pool is tried member by member down the draft's one leg; a disabled member fails where it stands.
  await diagram.locator("a").filter({hasText:"Europe · pool"}).click();
  await button(page.getByRole("dialog",{name:"Europe",exact:true}),"Test pool").click();
  await dialog.getByText("Europe · WireGuard",{exact:true}).waitFor();
  assert.equal(await button(dialog,"Egress").textContent(),"System");
- await button(dialog,"Add leg").click();
- await button(dialog.getByRole("group",{name:"Leg 2",exact:true}),"Egress").click();
+ assert.equal(await button(dialog,"Add leg").count(),0);
+ await button(dialog,"Egress").click();
  await page.getByRole("menuitemradio",{name:"WAN Fiber",exact:true}).click();
  await run.click();
- assert.deepEqual(await paths(6),[["System > Frankfurt",[]],["System > Lisbon",["Lisbon"]],["System > Amsterdam",[]],["WAN Fiber > Frankfurt",[]],["WAN Fiber > Lisbon",["Lisbon"]],["WAN Fiber > Amsterdam",[]]]);
+ assert.deepEqual(await paths(3),[["WAN Fiber > Frankfurt",[]],["WAN Fiber > Lisbon",["Lisbon"]],["WAN Fiber > Amsterdam",[]]]);
  await rows.nth(1).getByText("Failed at Lisbon",{exact:true}).waitFor();
  await rows.nth(1).getByText("The proxy is disabled or could not be set up.",{exact:true}).waitFor();
  const sent=(await tests()).at(-1);
- assert.deepEqual([sent.subject,sent.target,sent.route.legs.map(leg=>leg.egressId)],[{pool:1},null,[0,1]]);
+ assert.deepEqual([sent.subject,sent.target,sent.route.legs.map(leg=>leg.egressId)],[{pool:1},null,[1]]);
  assert.equal(errors.length,0,errors.join("\n"));
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-test-pool.png")});
  await page.close();

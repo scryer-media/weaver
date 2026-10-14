@@ -55,8 +55,11 @@ function LadderArrow() {
 }
 
 /**
- * A consumer's route: the legs its connections are split across, the path each
- * leg takes from its egress, and what happens to a leg's share when it drops.
+ * A consumer's route: its legs and the path each leg takes from its egress.
+ * A server's connections are split across the legs by weight, and the route
+ * says what happens to a leg's share when it drops. Anything else fetches one
+ * request at a time, so it gets one leg and nothing about shares; a route
+ * saved with more keeps them listed until they are removed.
  *
  * Built narrow-first. It lives in the routes page's dialog and in a server's
  * or feed's own editor, where it gets a third of the dialog, so every row
@@ -78,11 +81,13 @@ export function RouteEditor({
   profiles: ProxyProfile[];
   pools: ProxyPool[];
   cap?: number;
-  /** What owns the route. Only a server's connections are split; anything else takes the first healthy leg. */
+  /** What owns the route. Only a server's connections are split across legs; anything else has one. */
   kind?: ConsumerKind;
   status?: LegFlow[];
 }) {
   const t = useTranslate();
+  // Only a server's connections are shared out across legs by weight.
+  const split = kind === "SERVER";
   const [down, setDown] = useState<Set<number>>(new Set());
   const update = (index: number, leg: Leg) =>
     onChange({ ...value, legs: value.legs.map((current, position) => (position === index ? leg : current)) });
@@ -139,53 +144,55 @@ export function RouteEditor({
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
-      {kind === "OUTBOUND" ? null : (
+      {split ? (
         <p className="text-[12.5px] leading-[1.5] text-pretty text-wv-muted">
-          {kind === "SERVER" ? t("next.networking.route.intro", { count: cap }) : t("next.networking.route.introRss")}
+          {t("next.networking.route.intro", { count: cap })}
         </p>
-      )}
+      ) : null}
 
-      <div
-        aria-label={t("next.networking.route.distribution")}
-        className="flex h-8 min-w-0 border border-wv-control"
-      >
-        {value.legs.map((leg, index) => (
-          <div
-            key={index}
-            className="relative flex min-w-0 items-center justify-center font-wv-mono text-[11.5px] font-medium"
-            style={{ flex: leg.weight, background: legColor(index), color: WV.onSpan }}
-          >
-            <span className="truncate px-1">{leg.weight}%</span>
-            {index < value.legs.length - 1 ? (
-              <div
-                role="slider"
-                tabIndex={0}
-                aria-label={t("next.networking.route.legWeight", { position: index + 1 })}
-                aria-valuemin={1}
-                aria-valuemax={leg.weight + value.legs[index + 1]!.weight - 1}
-                aria-valuenow={leg.weight}
-                className="absolute -top-[5px] -right-[5px] z-[1] h-[40px] w-[10px] cursor-ew-resize touch-none border-2 border-wv-app bg-wv-fg outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-wv-accent"
-                onPointerDown={(event) => event.currentTarget.setPointerCapture(event.pointerId)}
-                onPointerMove={(event) => {
-                  if (!event.currentTarget.hasPointerCapture(event.pointerId)) {
-                    return;
-                  }
-                  const bounds = event.currentTarget.parentElement!.parentElement!.getBoundingClientRect();
-                  const prior = value.legs.slice(0, index).reduce((sum, current) => sum + current.weight, 0);
-                  weight(index, ((event.clientX - bounds.left) / bounds.width) * 100 - prior);
-                }}
-                onPointerUp={(event) => event.currentTarget.releasePointerCapture(event.pointerId)}
-                onKeyDown={(event) => {
-                  if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
-                    event.preventDefault();
-                    weight(index, leg.weight + (event.key === "ArrowLeft" ? -1 : 1));
-                  }
-                }}
-              />
-            ) : null}
-          </div>
-        ))}
-      </div>
+      {split ? (
+        <div
+          aria-label={t("next.networking.route.distribution")}
+          className="flex h-8 min-w-0 border border-wv-control"
+        >
+          {value.legs.map((leg, index) => (
+            <div
+              key={index}
+              className="relative flex min-w-0 items-center justify-center font-wv-mono text-[11.5px] font-medium"
+              style={{ flex: leg.weight, background: legColor(index), color: WV.onSpan }}
+            >
+              <span className="truncate px-1">{leg.weight}%</span>
+              {index < value.legs.length - 1 ? (
+                <div
+                  role="slider"
+                  tabIndex={0}
+                  aria-label={t("next.networking.route.legWeight", { position: index + 1 })}
+                  aria-valuemin={1}
+                  aria-valuemax={leg.weight + value.legs[index + 1]!.weight - 1}
+                  aria-valuenow={leg.weight}
+                  className="absolute -top-[5px] -right-[5px] z-[1] h-[40px] w-[10px] cursor-ew-resize touch-none border-2 border-wv-app bg-wv-fg outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-wv-accent"
+                  onPointerDown={(event) => event.currentTarget.setPointerCapture(event.pointerId)}
+                  onPointerMove={(event) => {
+                    if (!event.currentTarget.hasPointerCapture(event.pointerId)) {
+                      return;
+                    }
+                    const bounds = event.currentTarget.parentElement!.parentElement!.getBoundingClientRect();
+                    const prior = value.legs.slice(0, index).reduce((sum, current) => sum + current.weight, 0);
+                    weight(index, ((event.clientX - bounds.left) / bounds.width) * 100 - prior);
+                  }}
+                  onPointerUp={(event) => event.currentTarget.releasePointerCapture(event.pointerId)}
+                  onKeyDown={(event) => {
+                    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                      event.preventDefault();
+                      weight(index, leg.weight + (event.key === "ArrowLeft" ? -1 : 1));
+                    }
+                  }}
+                />
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
 
       {down.size > 0 ? (
         <p role="status" className="border-l-2 border-wv-warn pl-3 text-[12px] leading-[1.5] text-wv-secondary">
@@ -200,18 +207,22 @@ export function RouteEditor({
         return (
           <fieldset key={index} className="flex min-w-0 flex-col gap-3 border border-wv-control bg-wv-chrome px-3 pt-1 pb-3 sm:px-4">
             <legend className="flex items-center gap-2 px-1 font-wv-title text-[12.5px] font-semibold text-wv-fg">
-              <Square color={legColor(index)} />
+              {split ? <Square color={legColor(index)} /> : null}
               {t("next.networking.route.leg", { position: index + 1 })}
             </legend>
             {live ? (
               <StatusMark
                 state={live.state}
                 label={stateLabel(t, live.state)}
-                detail={t("next.networking.route.live", {
-                  open: live.open,
-                  target: live.target,
-                  source: live.sourceAddress ?? t("next.networking.route.noSource"),
-                })}
+                detail={
+                  split
+                    ? t("next.networking.route.live", {
+                        open: live.open,
+                        target: live.target,
+                        source: live.sourceAddress ?? t("next.networking.route.noSource"),
+                      })
+                    : live.sourceAddress ?? t("next.networking.route.noSource")
+                }
               />
             ) : null}
             <div className="flex min-w-0 flex-wrap items-end gap-3">
@@ -229,17 +240,19 @@ export function RouteEditor({
                     }))}
                 />
               </ControlLabel>
-              <ControlLabel label={t("next.networking.route.weight")}>
-                <NumberField
-                  label={t("next.networking.route.weight")}
-                  value={leg.weight}
-                  min={1}
-                  max={100}
-                  suffix="%"
-                  disabled={value.legs.length === 1}
-                  onChange={(next) => weight(index, next)}
-                />
-              </ControlLabel>
+              {split ? (
+                <ControlLabel label={t("next.networking.route.weight")}>
+                  <NumberField
+                    label={t("next.networking.route.weight")}
+                    value={leg.weight}
+                    min={1}
+                    max={100}
+                    suffix="%"
+                    disabled={value.legs.length === 1}
+                    onChange={(next) => weight(index, next)}
+                  />
+                </ControlLabel>
+              ) : null}
             </div>
             <ControlLabel label={t("next.networking.route.path")}>
               <Segmented
@@ -390,72 +403,78 @@ export function RouteEditor({
               </div>
             ) : null}
 
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-wv-hairline pt-3">
-              {kind === "SERVER" ? (
-                <span className="font-wv-mono text-[11.5px] text-wv-muted">
-                  {t("next.networking.route.target", { count: targets[index] ?? 0 })}
-                </span>
-              ) : null}
-              <CheckRow
-                checked={down.has(index)}
-                label={t("next.networking.route.simulateDown")}
-                onChange={(checked) =>
-                  setDown((current) => {
-                    const next = new Set(current);
-                    if (checked) {
-                      next.add(index);
-                    } else {
-                      next.delete(index);
-                    }
-                    return next;
-                  })
-                }
-              />
-              <div className="ml-auto flex flex-none items-center gap-1">
-                <IconButton
-                  icon="moveUp"
-                  label={t("next.networking.route.legUp")}
-                  disabled={index === 0}
-                  onClick={() => reorder(move(value.legs, index, -1))}
-                />
-                <IconButton
-                  icon="moveDown"
-                  label={t("next.networking.route.legDown")}
-                  disabled={index === value.legs.length - 1}
-                  onClick={() => reorder(move(value.legs, index, 1))}
-                />
-                <IconButton
-                  icon="remove"
-                  label={t("next.networking.route.removeLeg")}
-                  disabled={value.legs.length === 1}
-                  onClick={() => reorder(removeLeg(value.legs, index))}
-                />
+            {split || value.legs.length > 1 ? (
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-wv-hairline pt-3">
+                {split ? (
+                  <>
+                    <span className="font-wv-mono text-[11.5px] text-wv-muted">
+                      {t("next.networking.route.target", { count: targets[index] ?? 0 })}
+                    </span>
+                    <CheckRow
+                      checked={down.has(index)}
+                      label={t("next.networking.route.simulateDown")}
+                      onChange={(checked) =>
+                        setDown((current) => {
+                          const next = new Set(current);
+                          if (checked) {
+                            next.add(index);
+                          } else {
+                            next.delete(index);
+                          }
+                          return next;
+                        })
+                      }
+                    />
+                  </>
+                ) : null}
+                <div className="ml-auto flex flex-none items-center gap-1">
+                  <IconButton
+                    icon="moveUp"
+                    label={t("next.networking.route.legUp")}
+                    disabled={index === 0}
+                    onClick={() => reorder(move(value.legs, index, -1))}
+                  />
+                  <IconButton
+                    icon="moveDown"
+                    label={t("next.networking.route.legDown")}
+                    disabled={index === value.legs.length - 1}
+                    onClick={() => reorder(move(value.legs, index, 1))}
+                  />
+                  <IconButton
+                    icon="remove"
+                    label={t("next.networking.route.removeLeg")}
+                    disabled={value.legs.length === 1}
+                    onClick={() => reorder(removeLeg(value.legs, index))}
+                  />
+                </div>
               </div>
-            </div>
+            ) : null}
           </fieldset>
         );
       })}
 
-      <div className="flex flex-wrap items-end gap-x-4 gap-y-3">
-        <SecondaryButton
-          icon="add"
-          disabled={value.legs.length >= MAX_LEGS}
-          onClick={() => onChange({ ...value, legs: appendLeg(value.legs) })}
-        >
-          {t("next.networking.route.addLeg")}
-        </SecondaryButton>
-        <ControlLabel label={t("next.networking.route.failover")}>
-          <Segmented
-            label={t("next.networking.route.failover")}
-            value={value.failover}
-            onChange={(failover) => onChange({ ...value, failover })}
-            options={[
-              { value: "REDISTRIBUTE", label: t("next.networking.route.redistribute") },
-              { value: "HOLD", label: t("next.networking.route.hold") },
-            ]}
-          />
-        </ControlLabel>
-      </div>
+      {split ? (
+        <div className="flex flex-wrap items-end gap-x-4 gap-y-3">
+          <SecondaryButton
+            icon="add"
+            disabled={value.legs.length >= MAX_LEGS}
+            onClick={() => onChange({ ...value, legs: appendLeg(value.legs) })}
+          >
+            {t("next.networking.route.addLeg")}
+          </SecondaryButton>
+          <ControlLabel label={t("next.networking.route.failover")}>
+            <Segmented
+              label={t("next.networking.route.failover")}
+              value={value.failover}
+              onChange={(failover) => onChange({ ...value, failover })}
+              options={[
+                { value: "REDISTRIBUTE", label: t("next.networking.route.redistribute") },
+                { value: "HOLD", label: t("next.networking.route.hold") },
+              ]}
+            />
+          </ControlLabel>
+        </div>
+      ) : null}
 
       {problem ? (
         <p role="alert" className={cn("text-[12.5px] leading-[1.5] text-wv-error-text")}>

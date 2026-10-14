@@ -328,9 +328,15 @@ test("Default outbound's route comes first and is edited with nothing said about
     await row.getByRole("button", { name: "Edit route", exact: true }).click();
     const editor = page.getByRole("dialog", { name: "Route for Default outbound", exact: true });
     await editor.getByRole("group", { name: "Leg 1", exact: true }).waitFor();
-    // It splits nothing: no word above the legs, and no target on one.
+    // It splits nothing, so it has one leg: no word above it, no target, no
+    // weight, preview or share to hold, and no leg to add, move or remove.
     assert.equal(await editor.getByText(/^Split up to|^Feeds try/).count(), 0);
     assert.equal(await editor.getByText(/^Target: /).count(), 0);
+    assert.equal(await editor.getByRole("slider").count(), 0);
+    assert.equal(await editor.getByLabel("Weight", { exact: true }).count(), 0);
+    assert.equal(await editor.getByText("Simulate leg down", { exact: true }).count(), 0);
+    assert.equal(await editor.getByText("When a leg goes down", { exact: true }).count(), 0);
+    assert.equal(await editor.getByRole("button", { name: /^(Add leg|Remove leg)$/ }).count(), 0);
     await shot(page, "speed-outbound-dialog");
     await editor.getByRole("button", { name: "Save route", exact: true }).click();
     await editor.waitFor({ state: "detached" });

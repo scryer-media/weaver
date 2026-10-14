@@ -282,10 +282,14 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
           <Cell key="host" mono className="text-wv-muted">
             {profile.host}:{profile.port}
           </Cell>,
-          <Cell key="health" mono className="text-wv-muted">
+          <Cell key="health" mono className="text-wv-muted" title={health[profile.id]}>
             {health[profile.id] ?? "—"}
           </Cell>,
-          <span key="actions" className="ml-auto flex items-center gap-2" onClick={(event) => event.stopPropagation()}>
+          <span
+            key="actions"
+            className="ml-auto flex flex-wrap items-center justify-end gap-2"
+            onClick={(event) => event.stopPropagation()}
+          >
             <SecondaryButton icon="test" className="h-7 px-2" onClick={() => setTestingId(profile.id)}>
               {t("next.proxies.testVia")}
             </SecondaryButton>

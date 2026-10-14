@@ -91,8 +91,8 @@ const egress = (id: number, name: string, enabled: boolean) => ({
 });
 const egresses = [egress(4, "Backup", false), egress(0, "System", true), egress(5, "Fiber", true)];
 const SILENT = 2;
-/* The daemon allows 64 results; this one allows three, so a test can reach the limit. */
-const RESULT_LIMIT = 3;
+/* The daemon allows 64 results; this one allows three, or `?limit`, so a test can reach the limit. */
+const resultLimit = () => Number(query.get("limit") ?? 3);
 type RungInput = { proxy?: number; pool?: number; chain?: number[] };
 type LegInput = { egressId: number; path: { direct?: boolean; ladder?: { directFallback: boolean; rungs: RungInput[] } } };
 const members = (pool: number) => pools.proxyPools.find((candidate) => candidate.id === pool)?.memberIds ?? [];
@@ -122,7 +122,7 @@ function testVia(variables: Record<string, unknown>) {
   });
   if (paths.some((path) => path.carrierIds.some((id) => tested.includes(id)))) return refusal("TEST_SUBJECT_IN_ROUTE");
   const onTop: (number | null)[] = subject ? tested : [null];
-  if (paths.length * onTop.length > RESULT_LIMIT) return refusal("TEST_PATH_COUNT", { limit: RESULT_LIMIT });
+  if (paths.length * onTop.length > resultLimit()) return refusal("TEST_PATH_COUNT", { limit: resultLimit() });
   return {
     data: {
       testVia: paths.flatMap((path) => onTop.map((proxyId) => {

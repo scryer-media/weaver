@@ -522,6 +522,10 @@ test("a proxy is tested through a route drafted for it, which cannot use the pro
     // The draft starts direct on the first egress that is turned on.
     assert.equal(await action(dialog, "Egress").textContent(), "System");
     assert.equal(await option(dialog, "Direct").getAttribute("aria-checked"), "true");
+    // A test tries every path, so the draft has no weights or share to hold.
+    assert.equal(await dialog.getByRole("slider").count(), 0);
+    assert.equal(await dialog.getByText("Simulate leg down", { exact: true }).count(), 0);
+    assert.equal(await dialog.getByText("When a leg goes down", { exact: true }).count(), 0);
 
     await option(dialog, "Proxy ladder").click();
     // The proxy under test cannot carry itself, so it is not offered.
@@ -569,21 +573,19 @@ test("a proxy is tested through a route drafted for it, which cannot use the pro
 });
 
 test("a test the daemon refuses says why in our words, and leaves no rows", async () => {
-  const page = await open();
+  const page = await open("?limit=2");
   try {
     const dialog = await testingVia(page, "Relay");
+    // A draft has one leg: nothing to add.
+    assert.equal(await action(dialog, "Add leg").count(), 0);
     await option(dialog, "Proxy ladder").click();
     await action(dialog, "Add rung").click();
-    await action(dialog, "Add leg").click();
-    const second = dialog.getByRole("group", { name: "Leg 2", exact: true });
-    await action(second, "Egress").click();
-    await page.getByRole("menuitemradio", { name: "Fiber", exact: true }).click();
     await action(dialog, "Test").click();
-    await dialog.getByRole("alert").getByText("A test can try at most 3 paths. Use fewer legs, rungs or pool members.", { exact: true }).waitFor();
+    await dialog.getByRole("alert").getByText("A test can try at most 2 paths. Use fewer rungs or pool members.", { exact: true }).waitFor();
     assert.equal(await dialog.getByRole("list", { name: "Paths", exact: true }).count(), 0);
     await shot(page, "test-via-refused");
     await action(dialog, "Close").click();
-    await line(page, "Relay").getByText("A test can try at most 3 paths. Use fewer legs, rungs or pool members.", { exact: true }).waitFor();
+    await line(page, "Relay").getByText("A test can try at most 2 paths. Use fewer rungs or pool members.", { exact: true }).waitFor();
   } finally { await page.close(); }
 });
 
