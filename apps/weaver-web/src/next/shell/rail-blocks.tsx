@@ -236,7 +236,7 @@ export function useAttentionItems(): AttentionItem[] {
                 ? formatDayClock(downloadBlock.windowEndsAtEpochMs)
                 : formatClock(downloadBlock.windowEndsAtEpochMs),
           })
-        : t("next.attention.seeBandwidth"),
+        : t("next.monitoring.egressLink"),
       color: WV.warn,
     });
   }

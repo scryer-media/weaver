@@ -269,7 +269,7 @@ async function createSourceMarkersThroughUI(
   request: Parameters<typeof seedRestorableHistoryMetadata>[0],
   matrix: BackupMatrixState,
 ) {
-  await page.goto("/settings/bandwidth");
+  await page.goto("/settings/networking/egress");
   const ceiling = page.getByRole("spinbutton", { name: "Download ceiling", exact: true });
   await ceiling.fill(downloadCeiling(matrix));
   await ceiling.press("Tab");
@@ -428,7 +428,7 @@ async function expectProductMarkers(
   matrix: BackupMatrixState,
   present: boolean,
 ) {
-  await page.goto("/settings/bandwidth");
+  await page.goto("/settings/networking/egress");
   const ceiling = page.getByRole("spinbutton", { name: "Download ceiling", exact: true });
   await expect(ceiling).toBeVisible();
   if (present) {

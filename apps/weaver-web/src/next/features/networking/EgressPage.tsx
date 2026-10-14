@@ -1,6 +1,7 @@
-import { useState } from "react";
-import { useClient } from "urql";
+import { useEffect, useMemo, useState } from "react";
+import { useClient, useMutation, useQuery } from "urql";
 import { CREATE_EGRESS, DELETE_EGRESS, RESET_EGRESS_USAGE, TEST_EGRESS, UPDATE_EGRESS } from "@/graphql/networking";
+import { SETTINGS_QUERY, UPDATE_SETTINGS_MUTATION } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { Egress } from "@/lib/networking";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
@@ -8,10 +9,18 @@ import { Dialog } from "../../components/Dialog";
 import { RecordEditor } from "../../components/RecordEditor";
 import { PrimaryButton, SecondaryButton, TextField } from "../../components/controls";
 import { Cell } from "../../components/rows";
-import { FieldRows, SettingsBlocks, type FieldSpec, type SettingsBlock } from "../../pages/settings/framework";
+import {
+  FieldRows,
+  SettingsBlocks,
+  useDraft,
+  usePanelState,
+  type FieldSpec,
+  type SettingsBlock,
+  type SettingsSectionModel,
+} from "../../pages/settings/framework";
 import { quotaDraft, quotaFields, quotaInput, quotaProblem } from "../../pages/settings/quota";
 import { egressInput, liveAddresses, type NetworkingAction, type NetworkingData } from "./data";
-import { metered, quotaSummary } from "./egress-quota";
+import { QuotaCell, quotaSearchText } from "./egress-quota";
 import { bindingLabel, formatLimit, Hint, MIB, stateLabel, StatusMark } from "./presentation";
 
 const NEW_EGRESS: Egress = {
@@ -29,32 +38,129 @@ const NEW_EGRESS: Egress = {
 /** The system egress is the operating system's own routing; it can be limited, never renamed or rebound. */
 const isSystem = (egress: Egress) => egress.id === 0;
 
+/**
+ * The global download ceiling, over every egress together. It is a daemon
+ * setting rather than an egress's, so it saves through the settings and owns
+ * the top bar's Save and Revert. The status line it publishes also carries
+ * what the egress table last wrote, unless the ceiling has an edit pending.
+ */
+function useDownloadCeiling(busy: boolean, message: string | null, failed: boolean) {
+  const t = useTranslate();
+  const [{ data, fetching }, reexecute] = useQuery<{ settings: { maxDownloadSpeed: number } }>({
+    query: SETTINGS_QUERY,
+  });
+  const [updateState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
+  const [status, setStatus] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // A write to an egress takes the status line over from the ceiling's last save.
+  useEffect(() => {
+    if (busy) {
+      setStatus(null);
+      setError(null);
+    }
+  }, [busy]);
+
+  const source = useMemo<{ maxDownloadSpeed: number } | null>(() => {
+    const settings = data?.settings;
+    return settings ? { maxDownloadSpeed: settings.maxDownloadSpeed ?? 0 } : null;
+  }, [data?.settings]);
+
+  const draft = useDraft(source, () => {
+    setStatus(null);
+    setError(null);
+  });
+  const values = draft.value;
+  const actionMessage = draft.dirty ? null : message;
+
+  usePanelState({
+    dirty: draft.dirty,
+    busy: updateState.fetching,
+    status: error ?? status ?? actionMessage,
+    failed: error !== null || (status === null && actionMessage !== null && failed),
+    revert: () => {
+      setError(null);
+      draft.revert();
+    },
+    save: () => {
+      if (!values) {
+        return;
+      }
+      setError(null);
+      void updateSettings({ input: { maxDownloadSpeed: values.maxDownloadSpeed } }).then((result) => {
+        if (result.error || !result.data?.updateSettings) {
+          setError(result.error?.message ?? t("next.bandwidth.saveFailed"));
+          return;
+        }
+        draft.markSaved();
+        setStatus(t("next.settings.saved"));
+        void reexecute({ requestPolicy: "network-only" });
+      });
+    },
+  });
+
+  const block: SettingsSectionModel | null = values
+    ? {
+        kind: "section",
+        id: "limits",
+        title: t("next.bandwidth.limits"),
+        fields: [
+          {
+            id: "maxDownloadSpeed",
+            label: t("next.bandwidth.ceiling"),
+            help: t("next.bandwidth.ceilingHelp"),
+            keywords: "speed limit throttle rate",
+            // The same field as the speed-limit dialog, so the ceiling reads and
+            // edits identically wherever it is set.
+            control: {
+              kind: "number",
+              value: Math.round((values.maxDownloadSpeed / MIB) * 10) / 10,
+              min: 0,
+              onChange: (next) => draft.set({ maxDownloadSpeed: Math.round(Math.max(0, next) * MIB) }),
+              suffix: "MB/s",
+            },
+          },
+        ],
+      }
+    : null;
+
+  return { block, loading: fetching && !data };
+}
+
 export function EgressPage({
   data,
   egresses,
   action,
   busy,
+  message = null,
+  failed = false,
 }: {
   data: NetworkingData;
   egresses: Egress[];
   action: NetworkingAction;
   busy: boolean;
+  /** The outcome of the last write, for the status line. */
+  message?: string | null;
+  failed?: boolean;
 }) {
   const t = useTranslate();
   const [editing, setEditing] = useState<Egress | null>(null);
+  const ceiling = useDownloadCeiling(busy, message, failed);
   const kinds = data.platformNetworking.egressBindingKinds;
+  const listed = [...egresses.filter(isSystem), ...egresses.filter((egress) => !isSystem(egress))];
 
   const open = (egress: Egress | null) =>
     setEditing(
       egress ?? { ...NEW_EGRESS, bindingKind: kinds.includes("INTERFACE") ? "INTERFACE" : "SOURCE_ADDRESS" },
     );
 
-  const blocks: SettingsBlock[] = [
+  const blocks: (SettingsBlock | null)[] = [
+    ceiling.block,
     {
       kind: "table",
       id: "egress",
       title: t("next.networking.egress.title"),
-      columns: "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 0.9fr) 104px minmax(0, 1fr) 124px",
+      columns: "minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 0.8fr) 104px minmax(0, 1.4fr) 124px",
       headers: [
         t("next.networking.egress.name"),
         t("next.networking.egress.bindingColumn"),
@@ -71,12 +177,20 @@ export function EgressPage({
           open(egress);
         }
       },
-      rows: egresses.map((egress) => {
+      rows: listed.map((egress) => {
         const addresses = liveAddresses(egress, data).join(", ");
         const binding = egress.interfaceName ?? egress.sourceAddress ?? bindingLabel(t, "SYSTEM");
         return {
           id: String(egress.id),
-          searchText: `${egress.name} ${binding} ${addresses} ${egress.health}`,
+          searchText: [
+            egress.name,
+            binding,
+            addresses,
+            egress.health,
+            t("next.networking.egress.quotaSection"),
+            t("next.bandwidth.allowance"),
+            quotaSearchText(t, egress),
+          ].join(" "),
           cells: [
             <Cell key="name" title={egress.name}>
               {egress.name}
@@ -100,15 +214,7 @@ export function EgressPage({
             <Cell key="limit" mono className={egress.maxDownloadSpeed ? undefined : "text-wv-muted"}>
               {formatLimit(t, egress.maxDownloadSpeed)}
             </Cell>,
-            <Cell
-              key="quota"
-              mono
-              className={
-                egress.downloadQuotaUsage?.blocked ? "text-wv-warn" : metered(egress) ? undefined : "text-wv-muted"
-              }
-            >
-              {quotaSummary(egress)}
-            </Cell>,
+            <QuotaCell key="quota" t={t} egress={egress} />,
             <span key="edit" className="ml-auto" onClick={(event) => event.stopPropagation()}>
               <SecondaryButton size="compact" onClick={() => open(egress)}>
                 {t("next.networking.egress.edit")}
@@ -123,7 +229,7 @@ export function EgressPage({
   return (
     <>
       {data.platformNetworking.sourceAddressHint ? <Hint>{data.platformNetworking.sourceAddressHint}</Hint> : null}
-      <SettingsBlocks blocks={blocks} />
+      <SettingsBlocks blocks={blocks} loading={ceiling.loading} />
       {editing ? (
         <EgressEditor
           key={editing.id}

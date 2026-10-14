@@ -43,7 +43,7 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
   await expect(srrdbLookup).toBeVisible();
   if (afterRestart) {
     await expect(srrdbLookup).toBeChecked();
-    await page.goto("/settings/bandwidth");
+    await page.goto("/settings/networking/egress");
     await expect(page.getByRole("spinbutton", { name: "Download ceiling", exact: true })).toHaveValue("8");
     const editor = await openSystemEgress(page);
     await expect(editor.getByRole("switch", { name: "Enforce a download quota", exact: true })).toBeChecked();
@@ -60,7 +60,7 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
   await page.reload();
   await expect(srrdbLookup).toBeChecked();
 
-  await page.goto("/settings/bandwidth");
+  await page.goto("/settings/networking/egress");
   const ceiling = page.getByRole("spinbutton", { name: "Download ceiling", exact: true });
   await ceiling.fill("8");
   await ceiling.press("Tab");
