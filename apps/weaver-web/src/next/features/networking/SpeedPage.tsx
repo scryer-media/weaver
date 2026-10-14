@@ -587,7 +587,7 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
             </ControlLabel>
           </div>
           <TestControls form={form} onChange={setForm} consumer={consumer} providers={providers} />
-          <SpeedTestRunner consumer={consumer} route={null} overrides={overrides} form={form} providers={providers} speedTest={speedTest} />
+          <SpeedTestRunner consumer={consumer} overrides={overrides} form={form} providers={providers} speedTest={speedTest} />
         </>
       ),
     },

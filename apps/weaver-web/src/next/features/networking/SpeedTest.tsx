@@ -9,10 +9,8 @@ import {
 } from "@/graphql/networking";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import {
-  routeInput,
   type BandwidthProvider,
   type BandwidthProviderServer,
-  type NetworkRoute,
   type PathOverride,
   type SabTestSize,
   type SpeedTestInput,
@@ -147,10 +145,9 @@ export function formProblem(
 /** Only a single `.nzb` file is taken: no archives of them, and no other kind of file. */
 const isNzbFile = (file: File | null): file is File => file !== null && /\.nzb$/i.test(file.name);
 
-/** The request a form makes, for a consumer's saved route (`route` null) or a draft of it. */
+/** The request a form makes, for a consumer's saved route. */
 export function speedTestInput(
   consumer: Pick<Consumer, "kind" | "id">,
-  route: NetworkRoute | null,
   overrides: PathOverride,
   form: TestForm,
   provider: BandwidthProvider | undefined,
@@ -160,9 +157,6 @@ export function speedTestInput(
     id: consumer.id,
     overrides,
   };
-  if (route) {
-    input.route = routeInput(route);
-  }
   if (form.kind === "BANDWIDTH") {
     // The daemon picks the download, the connections and when to stop.
     input.bandwidth = form.providerId
@@ -687,7 +681,6 @@ export function RunResult({ run, better = {} }: { run: SpeedTestRun; better?: Be
  */
 export function SpeedTestRunner({
   consumer,
-  route,
   overrides,
   form,
   providers,
@@ -695,8 +688,6 @@ export function SpeedTestRunner({
   extra,
 }: {
   consumer: Pick<Consumer, "kind" | "id" | "cap">;
-  /** A draft to test instead of the saved route. */
-  route: NetworkRoute | null;
   overrides: PathOverride;
   form: TestForm;
   providers: BandwidthProvider[];
@@ -715,7 +706,7 @@ export function SpeedTestRunner({
         <PrimaryButton
           icon="go"
           disabled={busy || running || problem !== null}
-          onClick={() => start(speedTestInput(consumer, route, overrides, form, provider))}
+          onClick={() => start(speedTestInput(consumer, overrides, form, provider))}
         >
           {t("next.networking.speed.run")}
         </PrimaryButton>

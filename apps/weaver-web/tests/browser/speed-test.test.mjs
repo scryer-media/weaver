@@ -299,29 +299,16 @@ test("picking another route keeps the test as it was set, and a feed takes it as
   }
 });
 
-test("the route editor tests the draft as it stands, unsaved", async () => {
+test("the route editor has no speed test of its own: the speed test page runs every test", async () => {
   const { page, errors } = await open("?routes", "news.fixture.invalid");
   try {
     await page.getByRole("button", { name: "Edit route", exact: true }).first().click();
     const editor = page.getByRole("dialog", { name: "Route for news.fixture.invalid", exact: true });
     await editor.waitFor();
-    await editor.getByRole("button", { name: "Speed test", exact: true }).click();
-    const test = editor.getByRole("region", { name: "Speed test", exact: true });
-    await test.getByRole("radio", { name: "Usenet", exact: true }).click();
-    await test.getByRole("button", { name: "Run", exact: true }).click();
-    await test.getByRole("region", { name: "Progress", exact: true }).waitFor();
-    const [start] = await sent(page, "StartSpeedTest");
-    assert.equal(start.input.kind, "SERVER");
-    assert.equal(start.input.id, 1);
-    assert.deepEqual(start.input.route.legs.map((leg) => leg.weight), [60, 40]);
-    assert.deepEqual(start.input.usenet, { sabSize: "MB_100", connections: 20, maxDurationSeconds: 120 });
-    await finish(page, 2);
-    const result = test.getByRole("region", { name: "Result", exact: true });
-    await stat(result, "Decoded").waitFor();
+    assert.equal(await editor.getByRole("button", { name: "Speed test", exact: true }).count(), 0);
+    assert.equal(await editor.getByRole("button", { name: "Run", exact: true }).count(), 0);
+    assert.equal(await editor.getByRole("region", { name: "Speed test", exact: true }).count(), 0);
     await shot(page, "speed-dialog");
-    await shot(page, "speed-result", result);
-    // Nothing was saved: the test ran the draft, not a saved route.
-    assert.equal((await sent(page, "SaveRoute")).length, 0);
     assert.equal(errors.length, 0, errors.join("\n"));
   } finally {
     await page.close();
