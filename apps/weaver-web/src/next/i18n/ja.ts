@@ -677,8 +677,6 @@ export const nextJa: LocaleDictionary = {
   "next.archivePasswords.title": "アーカイブのパスワード",
   "next.archivePasswords.list": "パスワード（1行に1つ）",
   "next.archivePasswords.edit": "パスワードを編集",
-  "next.archivePasswords.cleared": "保存時に削除されます",
-  "next.archivePasswords.keep": "保持",
   "next.archivePasswords.file": "パスワードファイル",
   "next.archivePasswords.password": "アーカイブのパスワード",
   "next.archivePasswords.show": "表示",

@@ -677,8 +677,6 @@ export const nextPt: LocaleDictionary = {
   "next.archivePasswords.title": "Senhas de arquivos",
   "next.archivePasswords.list": "Senhas (uma por linha)",
   "next.archivePasswords.edit": "Editar senhas",
-  "next.archivePasswords.cleared": "Removido ao salvar",
-  "next.archivePasswords.keep": "Manter",
   "next.archivePasswords.file": "Arquivo de senhas",
   "next.archivePasswords.password": "Senha do arquivo",
   "next.archivePasswords.show": "Mostrar",

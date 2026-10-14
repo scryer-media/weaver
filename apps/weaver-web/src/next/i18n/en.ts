@@ -684,8 +684,6 @@ export const nextEn: LocaleDictionary = {
   "next.archivePasswords.title": "Archive passwords",
   "next.archivePasswords.list": "Passwords (one per line)",
   "next.archivePasswords.edit": "Edit passwords",
-  "next.archivePasswords.cleared": "Removed on save",
-  "next.archivePasswords.keep": "Keep",
   "next.archivePasswords.file": "Password file",
   "next.archivePasswords.password": "Archive password",
   "next.archivePasswords.show": "Show",
