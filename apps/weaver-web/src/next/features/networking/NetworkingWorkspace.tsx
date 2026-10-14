@@ -264,7 +264,7 @@ function EgressLimit({ egress, action, busy }: { egress: Egress; action: Network
       />
       <SecondaryButton
         size="compact"
-        disabled={busy || limit === saved}
+        disabled={busy}
         onClick={() =>
           void action(UPDATE_EGRESS, {
             id: egress.id,

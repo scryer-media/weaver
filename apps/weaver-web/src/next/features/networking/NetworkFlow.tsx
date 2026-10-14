@@ -469,8 +469,8 @@ function Traffic({ points, width, still }: { points: Point[]; width: number; sti
  * `endpoint` it ends at that one box instead, the far end a speed test
  * measures against. With `traffic` the lines carrying a leg that has
  * connections open move. With `trace`, pointing at a box sets the routes it
- * lights moving the same way, along the way each leg takes (or the one way
- * pointed at); a line that is down, failing or blocked stays still.
+ * lights moving the same way, each in its ribbon, along the way each leg takes
+ * (or the one way pointed at); a line that is down, failing or blocked stays still.
  */
 export function NetworkFlow({
   flow,
@@ -994,31 +994,32 @@ export function NetworkFlow({
                 <title>{tip}</title>
                 {lines.map((line, index) => {
                   const traced = trace && focus !== null && line.lit && line.moves;
-                  return line.carries && count > 0 ? (
+                  // A traced line with nothing open is drawn as the ribbon its leg's connections would fill.
+                  const carried = line.carries && count > 0 ? count : traced ? Math.max(1, leg.target) : 0;
+                  const thickness = Math.max(2, width(carried));
+                  return carried > 0 ? (
                     <g key={index}>
                       <path
-                        d={band(line.points, Math.max(2, width(count)))}
+                        d={band(line.points, thickness)}
                         fill={line.color}
                         opacity={line.lit ? (focus ? 0.5 : 0.28) : 0.28 * FADE}
                       />
                       {flowing || traced ? (
                         <g opacity={line.lit ? undefined : FADE}>
-                          <Traffic points={line.points} width={Math.min(4, Math.max(2, width(count) / 2))} still={still} />
+                          <Traffic points={line.points} width={Math.min(4, Math.max(2, thickness / 2))} still={still} />
                         </g>
                       ) : null}
                     </g>
                   ) : (
-                    <g key={index}>
-                      <path
-                        d={thread(line.points)}
-                        fill="none"
-                        stroke={line.color}
-                        strokeWidth={focus && line.lit ? 2 : 1.4}
-                        strokeDasharray="4 5"
-                        opacity={line.lit ? undefined : FADE}
-                      />
-                      {traced ? <Traffic points={line.points} width={2} still={still} /> : null}
-                    </g>
+                    <path
+                      key={index}
+                      d={thread(line.points)}
+                      fill="none"
+                      stroke={line.color}
+                      strokeWidth={focus && line.lit ? 2 : 1.4}
+                      strokeDasharray="4 5"
+                      opacity={line.lit ? undefined : FADE}
+                    />
                   );
                 })}
               </g>
