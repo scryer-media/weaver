@@ -60,6 +60,7 @@ fn seed_history_job_with_facts(h: &TestHarness, job_id: u64, facts: Option<Strin
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         password_override: None,
+        supplied_password_candidates: Vec::new(),
     })
     .unwrap();
     if facts.is_some() {

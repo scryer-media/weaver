@@ -109,6 +109,10 @@ pub struct SubmissionOptions {
     pub semantic_duplicate: Option<SemanticDuplicate>,
     pub origin: SubmissionOrigin,
     pub idempotency: Option<CallerScopedIdempotency>,
+    // Archive passwords supplied beside the job's own: a calling integration's
+    // (`integration_archive_password_candidates`), then those weaver read from
+    // its own NZB fetch (`header_archive_password_candidates`), in that order.
+    pub supplied_password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
 }
 
 impl Default for SubmissionOptions {
@@ -119,6 +123,7 @@ impl Default for SubmissionOptions {
             semantic_duplicate: None,
             origin: SubmissionOrigin::Api,
             idempotency: None,
+            supplied_password_candidates: Vec::new(),
         }
     }
 }
@@ -288,6 +293,15 @@ async fn submit_prepared_nzb(
         }
 
         let resolved_category = resolve_submission_category(config, category.as_deref()).await?;
+        // With no password from the caller, the first supplied one is the
+        // job's primary password, ahead of anything the NZB names.
+        let password = crate::ingest::normalize_archive_password_candidate(password.as_deref())
+            .or_else(|| {
+                options
+                    .supplied_password_candidates
+                    .first()
+                    .map(|candidate| candidate.value().to_string())
+            });
         let spec = nzb_to_submission_spec(
             nzb,
             filename.as_deref(),
@@ -462,6 +476,7 @@ async fn submit_prepared_nzb(
                 initially_paused: options.add_paused || duplicate_pause,
                 semantic_materialization_generation,
                 semantic_promotion_generation: None,
+                supplied_password_candidates: options.supplied_password_candidates.clone(),
             },
         )
         .await
@@ -882,10 +897,31 @@ pub async fn submit_nzb_bytes_with_options(
     .await
 }
 
+// An NZB weaver fetched itself: its bytes, the file name the response named,
+// and every `X-DNZB-Password` value the response carried, raw and in the order
+// received.
+pub struct FetchedNzb {
+    pub bytes: Vec<u8>,
+    pub filename: Option<String>,
+    pub header_passwords: Vec<String>,
+}
+
+impl std::fmt::Debug for FetchedNzb {
+    // Never prints a password.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FetchedNzb")
+            .field("bytes", &self.bytes.len())
+            .field("filename", &self.filename)
+            .field("header_passwords", &self.header_passwords.len())
+            .finish()
+    }
+}
+
 pub async fn fetch_nzb_from_url(
     _client: &reqwest::Client,
     url: &str,
-) -> Result<(Vec<u8>, Option<String>), SubmitNzbError> {
+) -> Result<FetchedNzb, SubmitNzbError> {
     fetch_nzb_from_url_with_resolver(url, |current_url| async move {
         resolve_fetch_target(&current_url, false).await
     })
@@ -895,7 +931,7 @@ pub async fn fetch_nzb_from_url(
 async fn fetch_nzb_from_url_with_resolver<R, Fut>(
     url: &str,
     mut resolve_target: R,
-) -> Result<(Vec<u8>, Option<String>), SubmitNzbError>
+) -> Result<FetchedNzb, SubmitNzbError>
 where
     R: FnMut(reqwest::Url) -> Fut,
     Fut: Future<Output = Result<ResolvedFetchTarget, String>>,
@@ -948,6 +984,9 @@ where
         }
 
         let filename = extract_filename_from_response(&response, current_url.as_str());
+        // Only the response that carries the NZB speaks for its passwords; a
+        // redirect's headers are not read.
+        let header_passwords = crate::ingest::dnzb_header_passwords(response.headers());
         let nzb_bytes =
             read_response_with_limit(response, limits.nzb_decompressed_limit_bytes).await?;
 
@@ -956,7 +995,11 @@ where
         }
 
         // Submission runs Scan scripts before parsing these fetched bytes.
-        return Ok((nzb_bytes, filename));
+        return Ok(FetchedNzb {
+            bytes: nzb_bytes,
+            filename,
+            header_passwords,
+        });
     }
 
     Err(SubmitNzbError::Fetch("too many redirects".to_string()))
@@ -1430,17 +1473,276 @@ mod tests {
         });
 
         let url = format!("http://public.test:{}/download.nzb", addr.port());
-        let (bytes, filename) = fetch_nzb_from_url_with_resolver(&url, move |url| async move {
+        let FetchedNzb {
+            bytes,
+            filename,
+            header_passwords,
+        } = fetch_nzb_from_url_with_resolver(&url, move |url| async move {
             Ok(pinned_target(url, addr))
         })
         .await
         .unwrap();
         let request = server.await.unwrap();
+        assert!(header_passwords.is_empty());
 
         assert_eq!(filename.as_deref(), Some("Pinned.Release.nzb"));
         assert!(!bytes.is_empty());
         assert!(request.starts_with("GET /download.nzb HTTP/1.1"));
         assert!(request.contains(&format!("host: public.test:{}", addr.port())));
+    }
+
+    fn numbered(prefix: &str, count: usize) -> Vec<String> {
+        (1..=count)
+            .map(|index| format!("{prefix}-{index:02}"))
+            .collect()
+    }
+
+    fn labelled(candidates: &[crate::jobs::ArchivePasswordCandidate]) -> Vec<(&'static str, &str)> {
+        candidates
+            .iter()
+            .map(|candidate| (candidate.source().as_str(), candidate.value()))
+            .collect()
+    }
+
+    fn bucket(label: &'static str, values: &[String]) -> Vec<(&'static str, String)> {
+        values.iter().map(|value| (label, value.clone())).collect()
+    }
+
+    fn owned(pairs: Vec<(&'static str, &str)>) -> Vec<(&'static str, String)> {
+        pairs
+            .into_iter()
+            .map(|(label, value)| (label, value.to_string()))
+            .collect()
+    }
+
+    fn settings_candidates(values: &[String]) -> Vec<crate::jobs::ArchivePasswordCandidate> {
+        values
+            .iter()
+            .map(|value| {
+                crate::jobs::ArchivePasswordCandidate::new(
+                    crate::jobs::ArchivePasswordSource::Settings,
+                    value.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn twelve_meta_nzb() -> weaver_nzb::Nzb {
+        // `meta-01` twice: a repeat inside the NZB takes no slot either.
+        let metas: String = std::iter::once("meta-01".to_string())
+            .chain(numbered("meta", 12))
+            .map(|value| format!(r#"<meta type="password">{value}</meta>"#))
+            .collect();
+        let xml = minimal_nzb("Capped.Meta")
+            .replace("<file ", &format!("<head>{metas}</head>\n  <file "));
+        let nzb = weaver_nzb::parse_nzb(xml.as_bytes()).unwrap();
+        assert!(nzb.meta.passwords.len() >= 12);
+        nzb
+    }
+
+    #[test]
+    fn integration_bucket_keeps_the_spec_password_then_nine_given() {
+        let given = numbered("given", 12);
+        let supplied = crate::ingest::integration_archive_password_candidates(
+            std::iter::once("  ").chain(given.iter().map(String::as_str)),
+        );
+        let candidates =
+            crate::pipeline::assemble_archive_password_candidates(Some("spec"), &supplied, &[]);
+        let mut expected = vec![("explicit", "spec".to_string())];
+        expected.extend(bucket("integration", &given[..9]));
+        assert_eq!(owned(labelled(&candidates)), expected);
+
+        // The spec password repeating a given one frees that slot.
+        let candidates =
+            crate::pipeline::assemble_archive_password_candidates(Some("given-03"), &supplied, &[]);
+        let mut expected = vec![("explicit", "given-03".to_string())];
+        expected.extend(
+            bucket("integration", &given[..10])
+                .into_iter()
+                .filter(|(_, v)| v != "given-03"),
+        );
+        assert_eq!(candidates.len(), 10);
+        assert_eq!(owned(labelled(&candidates)), expected);
+    }
+
+    #[test]
+    fn header_bucket_keeps_ten_in_the_order_received() {
+        let received = numbered("header", 12);
+        let supplied = crate::ingest::header_archive_password_candidates(
+            std::iter::once("header-01").chain(received.iter().map(String::as_str)),
+        );
+        let candidates =
+            crate::pipeline::assemble_archive_password_candidates(None, &supplied, &[]);
+        assert_eq!(
+            owned(labelled(&candidates)),
+            bucket("dnzb_header", &received[..10])
+        );
+
+        // Values the integration bucket already holds take no header slot.
+        let mut carried =
+            crate::ingest::integration_archive_password_candidates(["header-01", "header-02"]);
+        carried.extend(supplied);
+        let candidates = crate::pipeline::assemble_archive_password_candidates(None, &carried, &[]);
+        let mut expected = bucket("integration", &received[..2]);
+        expected.extend(bucket("dnzb_header", &received[2..12]));
+        assert_eq!(owned(labelled(&candidates)), expected);
+    }
+
+    #[test]
+    fn nzb_bucket_keeps_ten_meta_in_document_order_with_the_file_name_last() {
+        let nzb = twelve_meta_nzb();
+        let meta = numbered("meta", 12);
+        let path = std::path::Path::new("Capped.Meta{{from-name}}.nzb");
+
+        let carried = crate::ingest::nzb_password_candidates(&nzb, path, None);
+        let candidates = crate::pipeline::assemble_archive_password_candidates(None, &carried, &[]);
+        assert_eq!(
+            owned(labelled(&candidates)),
+            bucket("nzb_meta", &meta[..10])
+        );
+
+        // The file name's password counts inside the bucket, after the meta.
+        let few = weaver_nzb::parse_nzb(
+            minimal_nzb("Few.Meta")
+                .replace(
+                    "<file ",
+                    "<head><meta type=\"password\">meta-01</meta></head>\n  <file ",
+                )
+                .as_bytes(),
+        )
+        .unwrap();
+        let carried = crate::ingest::nzb_password_candidates(&few, path, None);
+        let candidates = crate::pipeline::assemble_archive_password_candidates(None, &carried, &[]);
+        assert_eq!(
+            labelled(&candidates),
+            vec![
+                ("nzb_meta", "meta-01"),
+                ("filename_convention", "from-name")
+            ]
+        );
+
+        // Values an earlier bucket holds take no NZB slot, and a restart's
+        // re-harvest of the same NZB keeps enough to fill it.
+        let mut carried =
+            crate::ingest::integration_archive_password_candidates(["meta-01", "meta-02"]);
+        carried.extend(crate::ingest::nzb_password_candidates(&nzb, path, None));
+        let candidates = crate::pipeline::assemble_archive_password_candidates(None, &carried, &[]);
+        let mut expected = bucket("integration", &meta[..2]);
+        expected.extend(bucket("nzb_meta", &meta[2..12]));
+        assert_eq!(owned(labelled(&candidates)), expected);
+    }
+
+    #[test]
+    fn global_bucket_keeps_fifty() {
+        let global = numbered("global", 60);
+        let candidates = crate::pipeline::assemble_archive_password_candidates(
+            None,
+            &[],
+            &settings_candidates(&global),
+        );
+        assert_eq!(
+            owned(labelled(&candidates)),
+            bucket("settings", &global[..50])
+        );
+    }
+
+    #[test]
+    fn four_full_buckets_make_eighty_in_bucket_order() {
+        use crate::settings::archive_passwords::{
+            MAX_ARCHIVE_PASSWORDS, MAX_HEADER_ARCHIVE_PASSWORDS, MAX_INTEGRATION_ARCHIVE_PASSWORDS,
+            MAX_NZB_ARCHIVE_PASSWORDS,
+        };
+        assert_eq!(
+            MAX_INTEGRATION_ARCHIVE_PASSWORDS
+                + MAX_HEADER_ARCHIVE_PASSWORDS
+                + MAX_NZB_ARCHIVE_PASSWORDS
+                + MAX_ARCHIVE_PASSWORDS,
+            80
+        );
+        let given = numbered("given", 12);
+        let received = numbered("header", 12);
+        let meta = numbered("meta", 12);
+        let global = numbered("global", 60);
+
+        let mut carried = crate::ingest::integration_archive_password_candidates(
+            given.iter().map(String::as_str),
+        );
+        carried.extend(crate::ingest::header_archive_password_candidates(
+            received.iter().map(String::as_str),
+        ));
+        carried.extend(crate::ingest::nzb_password_candidates(
+            &twelve_meta_nzb(),
+            std::path::Path::new("Capped.Meta{{from-name}}.nzb"),
+            None,
+        ));
+        let candidates = crate::pipeline::assemble_archive_password_candidates(
+            Some("spec"),
+            &carried,
+            &settings_candidates(&global),
+        );
+
+        assert_eq!(candidates.len(), 80);
+        let mut expected = vec![("explicit", "spec".to_string())];
+        expected.extend(bucket("integration", &given[..9]));
+        expected.extend(bucket("dnzb_header", &received[..10]));
+        expected.extend(bucket("nzb_meta", &meta[..10]));
+        expected.extend(bucket("settings", &global[..50]));
+        assert_eq!(owned(labelled(&candidates)), expected);
+    }
+
+    // The header is repeatable and each occurrence is one password, matched
+    // case-insensitively; a value holding a comma is one password, not two.
+    #[tokio::test]
+    async fn fetch_nzb_reads_every_dnzb_password_header_value() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let xml = minimal_nzb("Header.Passwords");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/x-nzb\r\n\
+                 X-DNZB-Password: first-key\r\n\
+                 x-dnzb-password: second-key\r\n\
+                 X-Dnzb-Password: comma,in,one\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                xml.len(),
+                xml
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let url = format!("http://public.test:{}/download.nzb", addr.port());
+        let fetched = fetch_nzb_from_url_with_resolver(&url, move |url| async move {
+            Ok(pinned_target(url, addr))
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            fetched.header_passwords,
+            ["first-key", "second-key", "comma,in,one"]
+        );
+        let candidates = crate::ingest::header_archive_password_candidates(
+            fetched.header_passwords.iter().map(String::as_str),
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| (candidate.source().as_str(), candidate.value()))
+                .collect::<Vec<_>>(),
+            [
+                ("dnzb_header", "first-key"),
+                ("dnzb_header", "second-key"),
+                ("dnzb_header", "comma,in,one"),
+            ]
+        );
+        assert!(!format!("{fetched:?}").contains("first-key"));
     }
 
     #[tokio::test]
@@ -1459,11 +1761,12 @@ mod tests {
             stream.write_all(payload).await.unwrap();
         });
         let url = format!("http://public.test:{}/repairable.nzb", addr.port());
-        let (bytes, _) = fetch_nzb_from_url_with_resolver(&url, move |url| async move {
+        let bytes = fetch_nzb_from_url_with_resolver(&url, move |url| async move {
             Ok(pinned_target(url, addr))
         })
         .await
-        .unwrap();
+        .unwrap()
+        .bytes;
         server.await.unwrap();
         assert_eq!(bytes, payload);
         assert!(weaver_nzb::parse_nzb(&bytes).is_err());

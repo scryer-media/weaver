@@ -1658,6 +1658,7 @@ impl Database {
                 "SELECT password FROM rss_feeds WHERE password IS NOT NULL",
                 "SELECT password FROM proxy_profiles WHERE password IS NOT NULL",
                 "SELECT password FROM active_jobs WHERE password IS NOT NULL",
+                "SELECT password_candidates AS password FROM active_jobs WHERE password_candidates IS NOT NULL",
                 "SELECT source_password AS password FROM semantic_duplicate_candidates WHERE source_password IS NOT NULL",
                 "SELECT value AS password FROM secrets",
                 "SELECT value AS password FROM settings WHERE key = 'archive_passwords'",
@@ -1728,6 +1729,10 @@ impl Database {
                 (
                     "archive job",
                     "SELECT job_id AS id, password FROM active_jobs WHERE password IS NOT NULL",
+                ),
+                (
+                    "archive job candidates",
+                    "SELECT job_id AS id, password_candidates AS password FROM active_jobs WHERE password_candidates IS NOT NULL",
                 ),
                 (
                     "archive candidate",

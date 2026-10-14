@@ -74,6 +74,7 @@ fn postgres_sample_job(job_id: crate::jobs::ids::JobId) -> ActiveJob {
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         password_override: None,
+        supplied_password_candidates: Vec::new(),
     }
 }
 
@@ -2827,6 +2828,7 @@ async fn postgres_runtime_smoke_when_configured() {
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         password_override: None,
+        supplied_password_candidates: Vec::new(),
     })
     .unwrap();
     db.upsert_file_progress_batch(&[ActiveFileProgress {

@@ -700,3 +700,20 @@ kind = "sql"
 file = "migrations/0062_nzbget_mark_status/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 63
+description = "indexer-supplied archive passwords kept on active jobs"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0063_active_job_password_candidates/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0063_active_job_password_candidates/postgres.sql"
+engine = "postgres"
+scope = "all"

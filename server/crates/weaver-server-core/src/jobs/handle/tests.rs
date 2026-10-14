@@ -671,6 +671,7 @@ async fn add_job_with_options_can_start_paused_and_resume_to_queued() {
                 initially_paused: true,
                 semantic_materialization_generation: None,
                 semantic_promotion_generation: None,
+                supplied_password_candidates: Vec::new(),
             },
         )
         .await

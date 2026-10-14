@@ -1797,6 +1797,7 @@ async fn a_run_of_a_job_still_in_the_queue_shows_the_jobs_name() {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             password_override: None,
+            supplied_password_candidates: Vec::new(),
         })
         .unwrap();
     retain_output(

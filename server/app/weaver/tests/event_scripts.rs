@@ -80,6 +80,7 @@ fn job(db: &Database, directory: &Path) -> JobExecutionContext {
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         password_override: Some("private-password".into()),
+        supplied_password_candidates: Vec::new(),
     })
     .unwrap();
     JobExecutionContext {

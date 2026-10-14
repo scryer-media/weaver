@@ -24,6 +24,10 @@ pub struct ActiveJob {
     // Effective unpack password for restore. Database writes encrypt this
     // value; `None` keeps the NZB password and an empty string explicitly clears it.
     pub password_override: Option<String>,
+    // Archive passwords handed over with the job (`Integration`) and read from
+    // its NZB fetch (`DnzbHeader`), in order. Database writes encrypt them as
+    // one value; they are not in the NZB bytes, so a restart reads them from here.
+    pub supplied_password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

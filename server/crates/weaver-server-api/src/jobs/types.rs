@@ -794,6 +794,9 @@ pub struct SubmitNzbInput {
     pub nzb_upload: Option<Upload>,
     pub filename: Option<String>,
     pub password: Option<String>,
+    // Further archive passwords the caller hands over beside `password`, in
+    // the order to try them.
+    pub password_candidates: Option<Vec<String>>,
     pub category: Option<String>,
     pub attributes: Option<Vec<AttributeInput>>,
     pub client_request_id: Option<String>,

@@ -8,6 +8,7 @@ use crate::jobs::ids::JobId;
 use crate::jobs::{
     ArchivePasswordCandidate, ArchivePasswordSource, FileSpec, JobSpec, SegmentSpec,
 };
+use crate::settings::archive_passwords;
 use weaver_model::files::{FileRole, unique_download_filenames};
 use weaver_nzb::{Nzb, parse_nzb};
 
@@ -112,6 +113,62 @@ pub fn normalize_archive_password_candidate(raw: Option<&str>) -> Option<String>
         .map(str::to_string)
 }
 
+// Passwords a calling integration handed over beside the job's own one, in
+// the order given: normalized the way the spec password is, blanks and repeats
+// dropped, at most the integration bucket's cap kept.
+pub fn integration_archive_password_candidates<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> Vec<ArchivePasswordCandidate> {
+    bounded_password_candidates(
+        ArchivePasswordSource::Integration,
+        values,
+        archive_passwords::MAX_INTEGRATION_ARCHIVE_PASSWORDS,
+    )
+}
+
+// `X-DNZB-Password` values from weaver's own NZB fetch, in the order received,
+// normalized and de-duplicated the same way. It keeps the header bucket's cap
+// plus the integration bucket's, so the bucket still fills when the harvest
+// drops values the integration already handed over.
+pub fn header_archive_password_candidates<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> Vec<ArchivePasswordCandidate> {
+    bounded_password_candidates(
+        ArchivePasswordSource::DnzbHeader,
+        values,
+        archive_passwords::MAX_HEADER_ARCHIVE_PASSWORDS
+            + archive_passwords::MAX_INTEGRATION_ARCHIVE_PASSWORDS,
+    )
+}
+
+fn bounded_password_candidates<'a>(
+    source: ArchivePasswordSource,
+    values: impl IntoIterator<Item = &'a str>,
+    keep: usize,
+) -> Vec<ArchivePasswordCandidate> {
+    let mut candidates: Vec<ArchivePasswordCandidate> = Vec::new();
+    for value in values {
+        if candidates.len() >= keep {
+            break;
+        }
+        push_password_candidate(&mut candidates, source, Some(value));
+    }
+    candidates
+}
+
+// Every `X-DNZB-Password` value on an indexer's NZB response, in the order
+// received. The header is repeatable and each occurrence is one password; a
+// value is never split on commas, because a password may contain one. Header
+// names are case-insensitive, which `HeaderMap` already guarantees.
+pub fn dnzb_header_passwords(headers: &reqwest::header::HeaderMap) -> Vec<String> {
+    headers
+        .get_all("x-dnzb-password")
+        .iter()
+        .filter_map(|value| std::str::from_utf8(value.as_bytes()).ok())
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn nzb_password_candidates(
     nzb: &Nzb,
     nzb_path: &Path,
@@ -123,17 +180,28 @@ pub fn nzb_password_candidates(
         ArchivePasswordSource::Explicit,
         explicit_password,
     );
-    push_password_candidate(
-        &mut candidates,
-        ArchivePasswordSource::NzbMeta,
-        nzb.meta.password.as_deref(),
+    // The parsed NZB stays faithful; the bound applies here, so a restart that
+    // re-harvests the persisted NZB keeps the same entries. It is the NZB
+    // bucket's cap plus the two buckets ahead of it, so the bucket still fills
+    // when the harvest drops values those buckets already hold.
+    let keep = archive_passwords::MAX_NZB_ARCHIVE_PASSWORDS
+        + archive_passwords::MAX_INTEGRATION_ARCHIVE_PASSWORDS
+        + archive_passwords::MAX_HEADER_ARCHIVE_PASSWORDS;
+    let meta_passwords = std::iter::once(nzb.meta.password.as_deref()).chain(
+        nzb.meta
+            .passwords
+            .iter()
+            .map(|password| Some(password.as_str())),
     );
-    for password in &nzb.meta.passwords {
-        push_password_candidate(
-            &mut candidates,
-            ArchivePasswordSource::NzbMeta,
-            Some(password),
-        );
+    for password in meta_passwords {
+        let kept = candidates
+            .iter()
+            .filter(|candidate| candidate.source() == ArchivePasswordSource::NzbMeta)
+            .count();
+        if kept >= keep {
+            break;
+        }
+        push_password_candidate(&mut candidates, ArchivePasswordSource::NzbMeta, password);
     }
 
     if let Some(stem) = nzb_path.file_stem().and_then(|segment| segment.to_str())

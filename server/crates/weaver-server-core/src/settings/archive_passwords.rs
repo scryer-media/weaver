@@ -9,12 +9,22 @@ const PASSWORDS: &str = "archive_passwords";
 const PASSWORD_FILE: &str = "archive_password_file";
 const MAX_PASSWORD_BYTES: usize = 64 * 1024;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
-// The most global archive passwords any consumer is handed, Settings list and
-// password file together. Every candidate an archive gate tries costs a key
-// derivation, so this is the one place the list is bounded: the Settings list
-// refuses to save past it, and the password file fills whatever the Settings
-// list leaves. Every consumer, direct store and finalize alike, tries the
-// whole bounded list.
+// A job's archive-password candidate list is four buckets in this order, each
+// with its own cap, so no job is ever offered more than 80 candidates: every
+// candidate costs a key derivation at every archive gate the job reaches.
+// - integration, 10: the job's own password first, then the passwords a
+//   calling integration handed over beside it;
+// - header, 10: `X-DNZB-Password` values from weaver's own NZB fetch, in the
+//   order received;
+// - NZB, 10: the NZB's `<meta type="password">` entries in document order,
+//   then its file name's `{{password}}`;
+// - global, 50: the Settings list, then the password file. The Settings list
+//   refuses to save past it and the password file fills what the list leaves.
+// The buckets are de-duplicated by value across the list, the earliest keeping
+// its label, and a value dropped as a repeat does not take a slot.
+pub(crate) const MAX_INTEGRATION_ARCHIVE_PASSWORDS: usize = 10;
+pub(crate) const MAX_HEADER_ARCHIVE_PASSWORDS: usize = 10;
+pub(crate) const MAX_NZB_ARCHIVE_PASSWORDS: usize = 10;
 pub(crate) const MAX_ARCHIVE_PASSWORDS: usize = 50;
 
 impl Database {
@@ -109,10 +119,17 @@ impl Database {
     pub(crate) fn global_archive_password_candidates(
         &self,
     ) -> Result<Vec<ArchivePasswordCandidate>, StateError> {
+        // Read past the global cap by the three job buckets' caps, so the
+        // harvest still fills its global bucket after dropping the values a job
+        // bucket already holds; the harvest applies `MAX_ARCHIVE_PASSWORDS`.
+        let keep = MAX_ARCHIVE_PASSWORDS
+            + MAX_INTEGRATION_ARCHIVE_PASSWORDS
+            + MAX_HEADER_ARCHIVE_PASSWORDS
+            + MAX_NZB_ARCHIVE_PASSWORDS;
         let (passwords, file) = self.load_archive_password_settings()?;
         let mut candidates: Vec<_> = passwords
             .into_iter()
-            .take(MAX_ARCHIVE_PASSWORDS)
+            .take(keep)
             .map(|password| {
                 ArchivePasswordCandidate::new(ArchivePasswordSource::Settings, password)
             })
@@ -121,7 +138,7 @@ impl Database {
             match read_password_file(&file) {
                 Ok(passwords) => {
                     for password in passwords {
-                        if candidates.len() >= MAX_ARCHIVE_PASSWORDS {
+                        if candidates.len() >= keep {
                             break;
                         }
                         if !candidates
@@ -222,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_passwords_are_bounded_at_fifty_across_both_sources() {
+    fn global_archive_passwords_are_bounded_at_fifty_across_both_sources() {
         let db = Database::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("passwords.txt");
@@ -256,7 +273,9 @@ mod tests {
             Some(Some(path.to_str().unwrap().into())),
         )
         .unwrap();
-        let candidates = db.global_archive_password_candidates().unwrap();
+        let loaded = db.global_archive_password_candidates().unwrap();
+        assert_eq!(loaded.len(), 70);
+        let candidates = crate::pipeline::assemble_archive_password_candidates(None, &[], &loaded);
         assert_eq!(candidates.len(), MAX_ARCHIVE_PASSWORDS);
         assert_eq!(
             candidates

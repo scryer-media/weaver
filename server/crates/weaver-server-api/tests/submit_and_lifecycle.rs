@@ -194,6 +194,47 @@ async fn submit_valid_nzb() {
     );
 }
 
+// `passwordCandidates` reaches the scheduler as integration-supplied passwords,
+// normalized, with blanks and repeats dropped, behind `password`.
+#[tokio::test]
+async fn submit_keeps_password_candidates_on_the_job() {
+    let h = TestHarness::new().await;
+    let nzb_b64 = encode_nzb(&minimal_nzb("candidates-test"));
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{
+                submitNzb(input: {{
+                    nzbBase64: "{nzb_b64}",
+                    password: "first-key",
+                    passwordCandidates: ["first-key", "second-key", "  ", "second-key", "third-key"]
+                }}) {{
+                    accepted
+                    item {{ id }}
+                }}
+            }}"#
+        ))
+        .await;
+
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert!(data["submitNzb"]["accepted"].as_bool().unwrap());
+    let id = data["submitNzb"]["item"]["id"].as_u64().unwrap();
+    let supplied =
+        h.supplied_passwords.lock().unwrap()[&weaver_server_core::jobs::ids::JobId(id)].clone();
+    assert_eq!(
+        supplied
+            .iter()
+            .map(|candidate| (candidate.source().as_str(), candidate.value()))
+            .collect::<Vec<_>>(),
+        [
+            ("integration", "first-key"),
+            ("integration", "second-key"),
+            ("integration", "third-key"),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn submit_with_upload() {
     let h = TestHarness::new().await;

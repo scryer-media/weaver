@@ -978,9 +978,9 @@ pub(super) enum ParseOutcome {
 //
 // Every keyed attempt costs the reader a key derivation, and this loop runs on
 // every parse attempt until the container opens, so its length is the cost.
-// The list is the set's header ring: the job's whole candidate list, whose
-// global half the settings store caps at `MAX_ARCHIVE_PASSWORDS` entries,
-// plus the spec's password and the no-key attempt.
+// The list is the set's header ring: the job's whole candidate list, which the
+// harvest caps at 80 entries across its four buckets (`MAX_ARCHIVE_PASSWORDS`
+// and its neighbours), plus the spec's password and the no-key attempt.
 pub(super) fn parse_container(
     mut image: ContainerImage,
     total: u64,
