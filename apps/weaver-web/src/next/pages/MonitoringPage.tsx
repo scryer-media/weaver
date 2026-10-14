@@ -419,7 +419,7 @@ export function MonitoringPage() {
 /**
  * How much of each egress's download quota the current window has spent.
  *
- * The same counters Settings → Bandwidth lists, here because this is the
+ * The same counters the egress table lists, here because this is the
  * screen someone watching a download's pace is already on.
  */
 function EgressQuotaSection() {

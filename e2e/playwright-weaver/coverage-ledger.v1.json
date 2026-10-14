@@ -47,11 +47,6 @@
       "oracle": "browser"
     },
     {
-      "path": "/settings/networking/bandwidth",
-      "owner": "ui-settings-crud",
-      "oracle": "browser"
-    },
-    {
       "path": "/settings/security",
       "owner": "ui-security",
       "oracle": "browser"

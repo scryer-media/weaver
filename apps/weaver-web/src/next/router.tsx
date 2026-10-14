@@ -1,6 +1,7 @@
 import type { ComponentType } from "react";
 import { createBrowserRouter, Navigate } from "react-router";
 import { RouteErrorPage } from "@/lib/error-page";
+import { SETTINGS_REDIRECTS } from "./pages/settings/redirects";
 import { NextRouteFallback } from "./shell/route-states";
 
 const basename = window.__WEAVER_BASE__ || "/";
@@ -50,11 +51,7 @@ export const nextRouter = createBrowserRouter(
           path: "settings",
           children: [
             { index: true, element: <Navigate to="general" replace /> },
-            { path: "proxies", element: <Navigate to="/settings/networking/proxies" replace /> },
-            { path: "bandwidth", element: <Navigate to="/settings/networking/bandwidth" replace /> },
-            { path: "networking", element: <Navigate to="/settings/networking/overview" replace /> },
-            { path: "post-processing", element: <Navigate to="/settings/scripts/configuration" replace /> },
-            { path: "scripts", element: <Navigate to="/settings/scripts/configuration" replace /> },
+            ...SETTINGS_REDIRECTS,
             {
               path: ":panel/*",
               ...lazyRoute(() => import("./pages/settings/SettingsPage"), "SettingsPage"),

@@ -14,8 +14,9 @@ const MIB = 1024 * 1024;
  * The download ceiling dialog, opened from the queue header and the rail's
  * Throughput gauge.
  *
- * It writes the same `maxDownloadSpeed` setting as Settings → Bandwidth, so the
- * two never disagree and a limit set here outlives a restart. The ceiling it
+ * It writes the same `maxDownloadSpeed` setting as the download ceiling on
+ * Settings → Networking → Egress, so the two never disagree and a limit set
+ * here outlives a restart. The ceiling it
  * starts from is the one the live metrics stream carries, so every opener sees
  * a change within a tick without refetching the settings.
  */

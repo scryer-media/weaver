@@ -43,7 +43,7 @@ export type Consumer = {
   route: NetworkRoute | null;
 };
 
-export const NETWORKING_PAGES = ["overview", "egress", "proxies", "routes", "speed", "bandwidth"] as const;
+export const NETWORKING_PAGES = ["overview", "egress", "proxies", "routes", "speed"] as const;
 export type NetworkingPage = (typeof NETWORKING_PAGES)[number];
 
 /** The speed test page with a server or feed selected. */

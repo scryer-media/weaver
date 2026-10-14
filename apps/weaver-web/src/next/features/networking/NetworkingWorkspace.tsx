@@ -1,33 +1,23 @@
 import { useState, type ReactNode } from "react";
 import { Navigate, useLocation } from "react-router";
-import { UPDATE_EGRESS } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
-import type { Egress } from "@/lib/networking";
 import { EmptyState, MetricCell, MetricStrip } from "../../components/chrome";
-import { NumberField, SecondaryButton } from "../../components/controls";
+import { SecondaryButton } from "../../components/controls";
 import { countLabel } from "../../i18n/labels";
 import {
-  FieldRows,
   SettingsBlocks,
   usePanelStatus,
   useSearchReport,
   useSettingsPanelSlug,
-  type FieldSpec,
 } from "../../pages/settings/framework";
-import {
-  egressInput,
-  NETWORKING_PAGES,
-  useNetworkingWorkspace,
-  type NetworkingAction,
-  type NetworkingPage,
-} from "./data";
+import { NETWORKING_PAGES, useNetworkingWorkspace, type NetworkingPage } from "./data";
 import { EgressPage } from "./EgressPage";
 import { FlowEditor } from "./FlowEditor";
 import { NetworkFlow, type FlowTarget } from "./NetworkFlow";
 import { PoolsPage } from "./PoolsPage";
 import { RoutesPage } from "./RoutesPage";
 import { SpeedPage } from "./SpeedPage";
-import { formatRate, Hint, MIB, NoticeBand } from "./presentation";
+import { formatRate, NoticeBand } from "./presentation";
 
 export type { NetworkingData } from "./data";
 
@@ -46,12 +36,10 @@ function ActionStatus({ message, failed }: { message: string | null; failed: boo
  */
 export function NetworkingWorkspace({
   proxies,
-  bandwidth,
   proxyEditor,
 }: {
   /** The stored proxies' table. It calls back when one is saved or removed. */
   proxies: (onChanged: () => void) => ReactNode;
-  bandwidth: ReactNode;
   /** One stored proxy's editor, for a proxy picked in the flow. */
   proxyEditor: (id: number, onClose: () => void, onChanged: () => void) => ReactNode;
 }) {
@@ -76,8 +64,8 @@ export function NetworkingWorkspace({
 
   return (
     <>
-      {/* The bandwidth page's own settings own the status bar there. */}
-      {page === "bandwidth" ? null : <ActionStatus message={message} failed={failed} />}
+      {/* The egress page's download ceiling owns the status bar there, and reports these actions with its own. */}
+      {page === "egress" ? null : <ActionStatus message={message} failed={failed} />}
       {error ? (
         <EmptyState
           title={t("next.networking.loadFailed")}
@@ -169,111 +157,16 @@ export function NetworkingWorkspace({
               />
             </>
           ) : null}
-          {page === "egress" ? <EgressPage data={data} egresses={egresses} action={action} busy={busy} /> : null}
+          {page === "egress" ? (
+            <EgressPage data={data} egresses={egresses} action={action} busy={busy} message={message} failed={failed} />
+          ) : null}
           {page === "proxies" ? <PoolsPage data={data} action={action} busy={busy} proxies={proxies(workspace.retry)} /> : null}
           {page === "routes" ? (
             <RoutesPage key={location.search} data={data} consumers={consumers} flow={flow} action={action} busy={busy} />
           ) : null}
           {page === "speed" ? <SpeedPage key={location.search} data={data} consumers={consumers} /> : null}
-          {page === "bandwidth" ? (
-            <>
-              {bandwidth}
-              <EgressLimits egresses={egresses} action={action} busy={busy} message={message} failed={failed} />
-            </>
-          ) : null}
         </>
       ) : null}
     </>
-  );
-}
-
-/** Each egress's own ceiling, on top of the global and per-server ones above it. */
-function EgressLimits({
-  egresses,
-  action,
-  busy,
-  message,
-  failed,
-}: {
-  egresses: Egress[];
-  action: NetworkingAction;
-  busy: boolean;
-  message: string | null;
-  failed: boolean;
-}) {
-  const t = useTranslate();
-  const fields: FieldSpec[] = egresses.map((egress) => ({
-    id: `egress-${egress.id}`,
-    label: egress.name,
-    help: t("next.networking.egress.limitHelp"),
-    control: {
-      kind: "custom",
-      control: <EgressLimit key={`${egress.id}:${egress.maxDownloadSpeed}`} egress={egress} action={action} busy={busy} />,
-    },
-  }));
-  return (
-    <SettingsBlocks
-      blocks={[
-        {
-          kind: "custom",
-          id: "egress-limits",
-          title: t("next.networking.limits.title"),
-          searchText: [
-            t("next.networking.limits.note"),
-            t("next.networking.egress.limitHelp"),
-            ...fields.map((field) => field.label),
-          ].join(" "),
-          body: (
-            <>
-              <Hint>{t("next.networking.limits.note")}</Hint>
-              <FieldRows fields={fields} />
-              {message ? (
-                <div
-                  role={failed ? "alert" : "status"}
-                  className={
-                    failed
-                      ? "px-4 py-3 text-[12.5px] text-wv-error-text sm:px-6"
-                      : "px-4 py-3 text-[12.5px] text-wv-muted sm:px-6"
-                  }
-                >
-                  {message}
-                </div>
-              ) : null}
-            </>
-          ),
-        },
-      ]}
-    />
-  );
-}
-
-function EgressLimit({ egress, action, busy }: { egress: Egress; action: NetworkingAction; busy: boolean }) {
-  const t = useTranslate();
-  const saved = egress.maxDownloadSpeed / MIB;
-  const [limit, setLimit] = useState(saved);
-  return (
-    <div className="flex items-center gap-[10px]">
-      <NumberField
-        label={t("next.networking.limits.limitFor", { name: egress.name })}
-        value={limit}
-        min={0}
-        step={0.1}
-        precision={1}
-        suffix="MiB/s"
-        onChange={setLimit}
-      />
-      <SecondaryButton
-        size="compact"
-        disabled={busy}
-        onClick={() =>
-          void action(UPDATE_EGRESS, {
-            id: egress.id,
-            input: egressInput({ ...egress, maxDownloadSpeed: Math.round(limit * MIB) }),
-          })
-        }
-      >
-        {t("next.networking.limits.save")}
-      </SecondaryButton>
-    </div>
   );
 }

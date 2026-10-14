@@ -3,7 +3,6 @@ import { EGRESS_QUOTAS_QUERY } from "@/graphql/networking";
 import type { Translate } from "@/lib/context/translate-context";
 import type { Egress } from "@/lib/networking";
 import { formatDayClock, formatSize } from "../../data/format";
-import type { SettingsTableModel } from "../../pages/settings/framework";
 import { Cell } from "../../components/rows";
 
 /** The egress weaver falls back to; it always exists, so it is always listed. */
@@ -23,6 +22,29 @@ export function quotaSummary(egress: EgressQuotaRow): string {
   }
   const used = egress.downloadQuotaUsage?.usedBytes ?? 0;
   return `${formatSize(used)} / ${formatSize(egress.downloadQuota?.limitBytes ?? 0)}`;
+}
+
+/** What the current window has left and when it resets, for a metered egress. */
+function quotaDetail(t: Translate, egress: EgressQuotaRow): string {
+  const usage = egress.downloadQuotaUsage;
+  if (!metered(egress) || !usage) {
+    return "";
+  }
+  return [
+    ...(usage.remainingBytes != null ? [t("next.quota.remaining", { size: formatSize(usage.remainingBytes) })] : []),
+    ...(usage.windowEndsAtEpochMs
+      ? [t("next.monitoring.resetsAt", { time: formatDayClock(usage.windowEndsAtEpochMs) })]
+      : []),
+  ].join(" · ");
+}
+
+/** Everything the quota cell says, for the settings search. */
+export function quotaSearchText(t: Translate, egress: EgressQuotaRow): string {
+  return [
+    quotaSummary(egress),
+    quotaDetail(t, egress),
+    egress.downloadQuotaUsage?.blocked ? t("next.quota.blocked") : "",
+  ].join(" ");
 }
 
 /**
@@ -48,76 +70,34 @@ export function useEgressQuotas(t: Translate) {
 
 function BlockedChip({ t }: { t: Translate }) {
   return (
-    <span className="inline-flex h-[18px] flex-none items-center self-start border border-wv-warn/60 px-[6px] font-wv-mono text-[10px] leading-none font-medium tracking-[0.1em] whitespace-nowrap text-wv-warn uppercase">
+    <span className="inline-flex h-[18px] flex-none items-center border border-wv-warn/60 px-[6px] font-wv-mono text-[10px] leading-none font-medium tracking-[0.1em] whitespace-nowrap text-wv-warn uppercase">
       {t("next.quota.blocked")}
     </span>
   );
 }
 
-/** One usage row per egress: name, used, allowance, remaining, when the window resets, and whether it is refusing. */
-export function egressQuotaTable(t: Translate, rows: EgressQuotaRow[]): SettingsTableModel {
-  return {
-    kind: "table",
-    id: "egressQuotas",
-    title: t("next.quota.usageTitle"),
-    note: t("next.quota.usageNote"),
-    columns: "minmax(0, 1.2fr) minmax(0, 0.8fr) minmax(0, 0.8fr) minmax(0, 0.8fr) minmax(0, 1fr) 84px",
-    headers: [
-      t("next.networking.egress.name"),
-      t("next.quota.used"),
-      t("next.bandwidth.allowance"),
-      t("next.monitoring.remaining"),
-      t("next.quota.resets"),
-      t("next.quota.state"),
-    ],
-    rows: rows.map((egress) => {
-      const usage = egress.downloadQuotaUsage;
-      const on = metered(egress);
-      const dash = (key: string) => (
-        <Cell key={key} mono className="text-wv-muted">
-          —
+/**
+ * The egress table's quota cell: used against the allowance, then what the
+ * window has left and when it resets, and whether it is refusing downloads.
+ * A dash for an egress with no allowance.
+ */
+export function QuotaCell({ t, egress }: { t: Translate; egress: EgressQuotaRow }) {
+  const blocked = Boolean(egress.downloadQuotaUsage?.blocked);
+  const detail = quotaDetail(t, egress);
+  const zone = egress.downloadQuotaUsage?.timezoneName;
+  return (
+    <div className="flex min-w-0 flex-col gap-[3px]">
+      <div className="flex min-w-0 items-center gap-2">
+        <Cell mono className={blocked ? "text-wv-warn" : metered(egress) ? undefined : "text-wv-muted"}>
+          {quotaSummary(egress)}
         </Cell>
-      );
-      return {
-        id: String(egress.id),
-        searchText: `${egress.name} quota allowance used remaining`,
-        cells: [
-          <Cell key="name" title={egress.name}>
-            {egress.name}
-          </Cell>,
-          <Cell key="used" mono>
-            {formatSize(usage?.usedBytes ?? 0)}
-          </Cell>,
-          on ? (
-            <Cell key="allowance" mono>
-              {formatSize(egress.downloadQuota?.limitBytes ?? 0)}
-            </Cell>
-          ) : (
-            dash("allowance")
-          ),
-          on && usage?.remainingBytes != null ? (
-            <Cell key="remaining" mono>
-              {formatSize(usage.remainingBytes)}
-            </Cell>
-          ) : (
-            dash("remaining")
-          ),
-          on && usage?.windowEndsAtEpochMs ? (
-            <Cell key="resets" mono title={usage.timezoneName || undefined}>
-              {formatDayClock(usage.windowEndsAtEpochMs)}
-            </Cell>
-          ) : (
-            dash("resets")
-          ),
-          usage?.blocked ? (
-            <BlockedChip key="state" t={t} />
-          ) : (
-            <Cell key="state" mono className="text-wv-muted">
-              {on ? t("next.quota.open") : "—"}
-            </Cell>
-          ),
-        ],
-      };
-    }),
-  };
+        {blocked ? <BlockedChip t={t} /> : null}
+      </div>
+      {detail ? (
+        <Cell mono className="text-[11px] text-wv-muted" title={zone ? `${detail} · ${zone}` : detail}>
+          {detail}
+        </Cell>
+      ) : null}
+    </div>
+  );
 }

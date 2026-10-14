@@ -17,8 +17,8 @@ import { WatchFolderPanel } from "./WatchFolderPanel";
 /**
  * The settings panels, in rail order.
  *
- * The former proxies and bandwidth slugs redirect into Networking, and the former
- * post-processing slug into Scripts, so existing bookmarks keep working.
+ * Former slugs redirect to where their settings live now (see `../redirects`),
+ * so existing bookmarks keep working.
  */
 
 export type PanelGroup = "networking" | "scripts";
@@ -119,14 +119,6 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     label: "next.networking.speed.title",
     note: "settings.networkingDesc",
     icon: "speedTest",
-    Component: NetworkingPanel,
-  },
-  {
-    slug: "networking/bandwidth",
-    group: "networking",
-    label: "next.settings.panel.bandwidth",
-    note: "settings.networkingDesc",
-    icon: "bandwidth",
     Component: NetworkingPanel,
   },
   {
