@@ -19,6 +19,7 @@ import { EmptyState } from "../../components/chrome";
 import { SecondaryButton, Select } from "../../components/controls";
 import { Icon } from "../../components/icons";
 import { countLabel } from "../../i18n/labels";
+import { metered, quotaSummary } from "./egress-quota";
 import { formatRate, stateColor, stateLabel, stateTone } from "./presentation";
 
 type FlowConsumer = { key: string; name: string; cap?: number; route?: NetworkRoute | null };
@@ -85,7 +86,7 @@ const COMPACT: Lanes = {
 const COMPACT_ENDPOINT: Lanes = { ...COMPACT, ENDPOINTS: lane(782, 170), WIDTH: 960 };
 const ENDPOINT_BOX_HEIGHT = 76;
 const EGRESS_HEIGHT = 108;
-/** The row an egress card adds at its bottom for its speed limit. */
+/** The row an egress card adds at its bottom for each limit it is held to. */
 const EGRESS_LIMIT_ROW = 20;
 const EGRESS_GAP = 20;
 const LEG_HEIGHT = 64;
@@ -134,6 +135,12 @@ type Focus =
 const FADE = 0.2;
 
 const legKey = (leg: LegFlow) => `${leg.consumer}:${leg.position}`;
+
+/** The limits an egress is held to, each a row at the bottom of its card: its speed limit, then its quota. */
+const heldTo = (egress: Egress) => [
+  ...(egress.maxDownloadSpeed > 0 ? (["speed"] as const) : []),
+  ...(metered(egress) ? (["quota"] as const) : []),
+];
 
 /** Monospaced text cut to the width it has, ending in an ellipsis when it was cut. */
 function fit(text: string, width: number, size: number) {
@@ -528,7 +535,7 @@ export function NetworkFlow({
   const egressCards = useMemo(() => {
     let top = 58;
     return used.map((egress) => {
-      const card = { egress, y: top, height: EGRESS_HEIGHT + (egress.maxDownloadSpeed > 0 ? EGRESS_LIMIT_ROW : 0) };
+      const card = { egress, y: top, height: EGRESS_HEIGHT + heldTo(egress).length * EGRESS_LIMIT_ROW };
       top += card.height + EGRESS_GAP;
       return card;
     });
@@ -1085,17 +1092,27 @@ export function NetworkFlow({
                             })}
                       </text>
                     )}
-                    {egress.maxDownloadSpeed > 0 ? (
-                      <g color={INK.muted}>
-                        <title>{t("next.networking.egress.downloadLimit")}</title>
-                        <g transform={`translate(${x} ${y + height - 23})`}>
-                          <Icon name="bandwidth" size={12} />
+                    {heldTo(egress).map((limit, row) => {
+                      const baseline = y + EGRESS_HEIGHT + 7 + row * EGRESS_LIMIT_ROW;
+                      const tone = limit === "quota" && egress.downloadQuotaUsage?.blocked ? stateColor("HOLD") : INK.muted;
+                      return (
+                        <g key={limit} color={tone}>
+                          <title>
+                            {t(limit === "speed" ? "next.networking.egress.downloadLimit" : "next.networking.egress.quotaSection")}
+                          </title>
+                          <g transform={`translate(${x} ${baseline - 10})`}>
+                            <Icon name={limit === "speed" ? "bandwidth" : "quota"} size={12} />
+                          </g>
+                          <text x={x + 18} y={baseline} fill={tone} fontSize="10">
+                            {limit === "speed"
+                              ? formatRate(egress.maxDownloadSpeed)
+                              : egress.downloadQuotaUsage?.blocked
+                                ? `${quotaSummary(egress)} · ${t("next.quota.blocked")}`
+                                : quotaSummary(egress)}
+                          </text>
                         </g>
-                        <text x={x + 18} y={y + height - 13} fill={INK.muted} fontSize="10">
-                          {formatRate(egress.maxDownloadSpeed)}
-                        </text>
-                      </g>
-                    ) : null}
+                      );
+                    })}
                   </>,
                 )}
               </g>
