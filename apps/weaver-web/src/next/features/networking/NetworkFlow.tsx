@@ -57,30 +57,13 @@ const TITLE_FONT = '"Sora Variable", ui-sans-serif, system-ui, sans-serif';
 
 type Lane = { x: number; width: number; end: number };
 const lane = (x: number, width: number): Lane => ({ x, width, end: x + width });
-type Lanes = { EGRESS: Lane; LEGS: Lane; PROXY: Lane; ENDPOINTS: Lane | null; WIDTH: number; HOP_GAP: number };
 /** The four lanes, left to right. Ribbons cross the gaps between them. */
-const FULL: Lanes = {
-  EGRESS: lane(16, 214),
-  LEGS: lane(286, 300),
-  PROXY: lane(642, 440),
-  ENDPOINTS: lane(1138, 214),
-  WIDTH: 1368,
-  HOP_GAP: 26,
-};
-/**
- * One endpoint's own flow, narrow enough to sit inside that endpoint's editor.
- * The editor is the endpoint, so the last lane is left out.
- */
-const COMPACT: Lanes = {
-  EGRESS: lane(8, 170),
-  LEGS: lane(202, 246),
-  PROXY: lane(472, 270),
-  ENDPOINTS: null,
-  WIDTH: 750,
-  HOP_GAP: 14,
-};
-/** A compact flow that ends at the one endpoint a speed test measures against. */
-const COMPACT_ENDPOINT: Lanes = { ...COMPACT, ENDPOINTS: lane(798, 170), WIDTH: 976 };
+const EGRESS = lane(16, 214);
+const LEGS = lane(286, 300);
+const PROXY = lane(642, 440);
+const ENDPOINTS = lane(1138, 214);
+const WIDTH = 1368;
+const HOP_GAP = 26;
 const ENDPOINT_BOX_HEIGHT = 76;
 const EGRESS_HEIGHT = 108;
 /** The row an egress card adds at its bottom for each limit it is held to. */
@@ -607,10 +590,9 @@ function Traffic({ points, width, still }: { points: Point[]; width: number; sti
  * editor for what it stands for, through `onEdit`; without one the flow is
  * only shown.
  *
- * `compact` draws one endpoint's flow for that endpoint's own editor: no
- * controls, and no endpoint lane, since the editor is the endpoint. With
- * `endpoint` it ends at that one box instead, the far end a speed test
- * measures against. With `traffic` the lines carrying a leg that is moving
+ * With `endpoint` it is one route's flow, ending at that box instead of the
+ * route's own card: the far end a speed test measures against. It then has no
+ * endpoint picker, egress groups or sample time. With `traffic` the lines carrying a leg that is moving
  * bytes move, except those a pointed-at box fades. With `trace`, pointing at
  * a box sets the routes it lights moving the same way, each in its ribbon,
  * along the way each leg takes (or the one way pointed at); a line that is
@@ -624,7 +606,6 @@ export const NetworkFlow = memo(function NetworkFlow({
   pools,
   consumers,
   onEdit,
-  compact = false,
   endpoint,
   traffic = false,
   trace = false,
@@ -636,7 +617,6 @@ export const NetworkFlow = memo(function NetworkFlow({
   pools: ProxyPool[];
   consumers: FlowConsumer[];
   onEdit?: (target: FlowTarget) => void;
-  compact?: boolean;
   endpoint?: FlowEndpoint;
   traffic?: boolean;
   trace?: boolean;
@@ -653,13 +633,12 @@ export const NetworkFlow = memo(function NetworkFlow({
   const [group, setGroup] = useState<number | null>(null);
   const counts = useMeasurements(flow.legs);
   const still = useLessMotion();
-  const lanes = compact ? (endpoint ? COMPACT_ENDPOINT : COMPACT) : FULL;
+  const single = endpoint !== undefined;
   const onToggle = toggles?.onToggle;
   const overrides = toggles?.overrides;
   const switchWords = [t("next.networking.speed.upSwitch"), t("next.networking.speed.downSwitch")] as const;
   const half = switchHalf(switchWords);
   const toggleWidth = onToggle ? 2 * half : 0;
-  const { EGRESS, LEGS, PROXY, ENDPOINTS, WIDTH, HOP_GAP } = lanes;
   // With one route picked, the flow is that route alone: its legs, the
   // egresses they leave through and its own card.
   const shownLegs = useMemo(
@@ -689,7 +668,7 @@ export const NetworkFlow = memo(function NetworkFlow({
     return placed;
   }, [used]);
   const egressBottom = egressCards.reduce((bottom, card) => Math.max(bottom, card.y + card.height), 38);
-  const grouped = !compact && (used.length > 6 || shownLegs.length > 40);
+  const grouped = !single && (used.length > 6 || shownLegs.length > 40);
   const cards = useMemo(() => endpointCards(shown, flow.legs), [shown, flow.legs]);
   const cardsBottom = [...cards.values()].reduce((bottom, card) => Math.max(bottom, card.y + card.height), 0);
 
@@ -717,7 +696,7 @@ export const NetworkFlow = memo(function NetworkFlow({
           const measured = member != null && (member.connectMs != null || member.bytesPerSecond != null);
           const carrying = (member?.open ?? 0) > 0;
           const said = member?.blocked ?? (failing?.proxyId === id ? failing.reason : null);
-          const note = said ? wrap(said, lanes.PROXY.width - 45 - toggleWidth, 9.5, 2) : [];
+          const note = said ? wrap(said, PROXY.width - 45 - toggleWidth, 9.5, 2) : [];
           return {
             id,
             live: member,
@@ -738,8 +717,8 @@ export const NetworkFlow = memo(function NetworkFlow({
         // A failing hop says why inside its own box: the hop's in a chain, the member's row in a pool.
         const boxWidth =
           rung.kind === "CHAIN"
-            ? (lanes.PROXY.width - (rung.chainIds.length - 1) * lanes.HOP_GAP) / rung.chainIds.length
-            : lanes.PROXY.width;
+            ? (PROXY.width - (rung.chainIds.length - 1) * HOP_GAP) / rung.chainIds.length
+            : PROXY.width;
         const note =
           failing && !members.some((member) => member.id === failing.proxyId)
             ? wrap(failing.reason, boxWidth - 26, 9.5, rung.kind === "CHAIN" ? 4 : 2)
@@ -771,7 +750,7 @@ export const NetworkFlow = memo(function NetworkFlow({
       const bypass = leg.path.kind === "DIRECT" ? LEG_HEIGHT / 2 : leg.path.directFallback ? bottom + 26 : null;
       // A kill switch stands where the ladder's first rung would.
       const closed = closedPath(leg.path);
-      const note = leg.reason ? wrap(leg.reason, lanes.LEGS.width - 28, 9.5, 2) : [];
+      const note = leg.reason ? wrap(leg.reason, LEGS.width - 28, 9.5, 2) : [];
       const cardHeight = LEG_HEIGHT + noteHeight(note.length);
       const y = offset;
       const height = Math.max(cardHeight, closed ? BOX_HEIGHT : bypass == null ? bottom - 8 : bypass + 16);
@@ -784,11 +763,10 @@ export const NetworkFlow = memo(function NetworkFlow({
     const bottom = Math.max(
       offset - 16,
       egressBottom,
-      compact ? 0 : cardsBottom,
-      lanes === COMPACT_ENDPOINT ? endpointY + ENDPOINT_BOX_HEIGHT : 0,
+      single ? endpointY + ENDPOINT_BOX_HEIGHT : cardsBottom,
     );
-    return { rows, endpointY, height: compact ? bottom + 12 : Math.max(bottom + 52, 260) };
-  }, [shownLegs, flow.pools, grouped, group, pools, profiles, egressBottom, cardsBottom, lanes, compact, toggleWidth, overrides, t]);
+    return { rows, endpointY, height: single ? bottom + 12 : Math.max(bottom + 52, 260) };
+  }, [shownLegs, flow.pools, grouped, group, pools, profiles, egressBottom, cardsBottom, single, toggleWidth, overrides, t]);
 
   const width = scale(Math.max(RIBBON_FULL, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
   const profile = (id: number | null) => profiles.find((candidate) => candidate.id === id);
@@ -1052,7 +1030,7 @@ export const NetworkFlow = memo(function NetworkFlow({
 
   return (
     <div className="flex min-w-0 flex-col">
-      {compact ? null : (
+      {single ? null : (
         <div className="flex flex-wrap items-center gap-[10px] border-b border-wv-hairline px-4 py-3 sm:px-6">
           <Select
             label={t("next.networking.flow.consumer")}
@@ -1090,18 +1068,14 @@ export const NetworkFlow = memo(function NetworkFlow({
           viewBox={`0 0 ${WIDTH} ${layout.height}`}
           role="group"
           aria-label={t("next.networking.flow.diagram")}
-          className={
-            compact ? (endpoint ? "block w-full min-w-[720px]" : "block w-full min-w-[560px]") : "block w-full min-w-[1160px]"
-          }
+          className="block w-full min-w-[1160px]"
           style={{ background: INK.ground, fontFamily: FONT }}
         >
           {[
             [EGRESS.x, t("next.networking.flow.egressColumn")],
             [LEGS.x, t("next.networking.flow.legsColumn")],
             [PROXY.x, t("next.networking.flow.proxyColumn")],
-            ...(ENDPOINTS
-              ? [[ENDPOINTS.x, t(endpoint ? "next.networking.flow.endpointColumn" : "next.networking.flow.consumersColumn")]]
-              : []),
+            [ENDPOINTS.x, t(single ? "next.networking.flow.endpointColumn" : "next.networking.flow.consumersColumn")],
           ].map(([x, label]) => (
             <text key={String(x)} x={Number(x) + 4} y="30" fill={INK.faint} fontSize="10.5" fontWeight="600" letterSpacing="1.5" fontFamily={TITLE_FONT}>
               {String(label).toUpperCase()}
@@ -1160,17 +1134,14 @@ export const NetworkFlow = memo(function NetworkFlow({
                   [LEGS.end, legY],
                   [PROXY.x, way.at],
                 ];
-                // With no endpoint lane the flow ends at the far edge of the proxies.
-                const leave: Point[] = ENDPOINTS
-                  ? [
-                      [PROXY.end, way.at],
-                      [ENDPOINTS.x, consumerY],
-                    ]
-                  : [];
+                const leave: Point[] = [
+                  [PROXY.end, way.at],
+                  [ENDPOINTS.x, consumerY],
+                ];
                 if (!way.boxed) {
-                  return [{ ...line, points: ENDPOINTS ? [...enter, ...leave] : [...enter, [PROXY.end, way.at] as Point] }];
+                  return [{ ...line, points: [...enter, ...leave] }];
                 }
-                return [{ ...line, points: enter }, ...(ENDPOINTS ? [{ ...line, points: leave }] : [])];
+                return [{ ...line, points: enter }, { ...line, points: leave }];
               }),
             ];
             return (
@@ -1305,7 +1276,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                     <rect x={LEGS.x} y={y} width={LEGS.width} height={height} fill={INK.card} stroke={INK.line} />
                     <StateBar x={LEGS.x} y={y} height={height} state={leg.state} />
                     <text x={x} y={y + 21} fill={INK.fg} fontSize="12">
-                      {compact
+                      {single
                         ? t("next.networking.flow.legShort", { position: leg.position + 1, weight: leg.weight })
                         : t("next.networking.flow.legTitle", {
                             name: fit(consumerName(leg), 130, 12),
@@ -1389,7 +1360,7 @@ export const NetworkFlow = memo(function NetworkFlow({
             );
           })}
 
-          {ENDPOINTS && endpoint ? (
+          {endpoint ? (
             <g
               opacity={consumers[0] && !endpointLit(consumers[0].key) ? FADE : undefined}
               {...(consumers[0] ? point({ kind: "endpoint", key: consumers[0].key }) : {})}
@@ -1410,8 +1381,8 @@ export const NetworkFlow = memo(function NetworkFlow({
                 label={fit(endpoint.label, ENDPOINTS.width - 41, 10.5)}
               />
             </g>
-          ) : ENDPOINTS
-            ? shown.map((consumer) => {
+          ) : (
+            shown.map((consumer) => {
                 const legs = flow.legs.filter((leg) => leg.consumer === consumer.key);
                 const { cap, cells, y, height } = cards.get(consumer.key)!;
                 const open = legs.reduce((sum, leg) => sum + (counts[legKey(leg)] ?? leg.open), 0);
@@ -1490,14 +1461,14 @@ export const NetworkFlow = memo(function NetworkFlow({
                   </g>
                 );
               })
-            : null}
+          )}
 
           {layout.rows.length ? null : (
             <text x={LEGS.x} y="85" fill={INK.muted} fontSize="12">
               {grouped ? t("next.networking.flow.expandGroup") : t("next.networking.flow.noLegs")}
             </text>
           )}
-          {compact ? null : (
+          {single ? null : (
             <text x="20" y={layout.height - 15} fill={INK.faint} fontSize="10">
               {`Weaver · ${flow.sampledAt ? new Date(flow.sampledAt * 1000).toISOString() : t("next.networking.flow.waiting")}`}
             </text>

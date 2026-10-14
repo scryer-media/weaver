@@ -17,7 +17,7 @@ import { NetworkFlow, type FlowEndpoint } from "./NetworkFlow";
 export type LiveLeg = { connections: number; rung: number | null | undefined; bytesPerSecond: number };
 
 /**
- * A route as a speed test takes it: the compact flow of one consumer, drawn
+ * A route as a speed test takes it: the overview's flow of one consumer, drawn
  * from a route that need not be the saved one (a draft, or the snapshot a run
  * kept), with what is down drawn down and each leg's share as the test gives it.
  * With `onToggle` every box carries the Down switch that changes it. While a
@@ -88,7 +88,6 @@ export function RoutePlanView({
   );
   return (
     <NetworkFlow
-      compact
       flow={flow}
       egresses={drawn}
       profiles={profiles}
@@ -96,6 +95,7 @@ export function RoutePlanView({
       consumers={[{ ...consumer, route }]}
       endpoint={endpoint}
       traffic={!!live}
+      trace
       toggles={{ overrides, onToggle }}
     />
   );
