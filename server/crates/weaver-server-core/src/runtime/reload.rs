@@ -234,6 +234,9 @@ mod tests {
             )
             .unwrap(),
         );
+        let proxies =
+            crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
+                .unwrap();
         let datastore = db.datastore();
         db.run_sql_blocking(async move {
             SqlRuntime::execute(
@@ -271,6 +274,7 @@ mod tests {
         let state = SharedPipelineState::new(PipelineMetrics::new(), Vec::new());
         let handle = SchedulerHandle::new(cmd_tx, event_tx, state);
         handle.set_server_transfer_policy(policy);
+        handle.set_proxy_runtime(proxies);
         let error = rebuild_nntp_from_config(&config, &handle)
             .await
             .expect_err("policy failure must not replace the active generation");
@@ -357,6 +361,10 @@ mod tests {
             SharedPipelineState::new(PipelineMetrics::new(), vec![]),
         );
         handle.set_server_transfer_policy(registry);
+        handle.set_proxy_runtime(
+            crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
+                .unwrap(),
+        );
         let schedules = Arc::new(RwLock::new(vec![crate::bandwidth::ScheduleEntry {
             id: "provider-hold".into(),
             enabled: true,
@@ -423,6 +431,10 @@ mod tests {
             SharedPipelineState::new(PipelineMetrics::new(), vec![]),
         );
         handle.set_server_transfer_policy(registry);
+        handle.set_proxy_runtime(
+            crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
+                .unwrap(),
+        );
         let (generations, mut activations) = mpsc::channel(2);
         let pipeline = tokio::spawn(async move {
             let mut generation = 0;
@@ -495,6 +507,10 @@ mod tests {
             )
             .unwrap(),
         ));
+        handle.set_proxy_runtime(
+            crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
+                .unwrap(),
+        );
         let (rebuilt, mut rebuilds) = mpsc::channel(2);
         let pipeline = tokio::spawn(async move {
             let mut generation = 0;
