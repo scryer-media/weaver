@@ -1,4 +1,6 @@
 // Opt-in encrypted download measurements using only loopback fixtures.
+#![allow(clippy::disallowed_methods)]
+
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

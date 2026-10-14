@@ -1,0 +1,31 @@
+# Every outbound connection leaves on a saved route. Only the routing layer
+# dials, resolves names or builds HTTP clients; everything else fetches with
+# `weaver_server_core::proxies::routed_fetch` or `with_routed_client`. Each
+# exception carries `#[expect(clippy::disallowed_methods, reason = ...)]` and
+# is pinned by the route guard test in
+# server/crates/weaver-server-core/src/proxies/route_guard_tests.rs.
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "fetch with proxies::routed_fetch or proxies::with_routed_client, so the request takes its route" },
+    { path = "reqwest::ClientBuilder::build", reason = "fetch with proxies::routed_fetch or proxies::with_routed_client, so the request takes its route" },
+    { path = "reqwest::get", reason = "fetch with proxies::routed_fetch, so the request takes its route" },
+    { path = "application_updater::pipeline::application_upgrade_http_client", reason = "hand the updater a client from proxies::with_routed_client, so the upgrade takes its route" },
+    { path = "tokio_tungstenite::connect_async", reason = "connect through the proxy runtime, so the connection takes its route" },
+    { path = "tokio::net::TcpStream::connect", reason = "dial through the proxy runtime, so the connection takes its route" },
+    { path = "tokio::net::TcpSocket::connect", reason = "dial through the proxy runtime, so the connection takes its route" },
+    { path = "std::net::TcpStream::connect", reason = "dial through the proxy runtime, so the connection takes its route" },
+    { path = "std::net::TcpStream::connect_timeout", reason = "dial through the proxy runtime, so the connection takes its route" },
+    { path = "socket2::Socket::connect", reason = "dial through the proxy runtime, so the connection takes its route" },
+    { path = "socket2::Socket::connect_timeout", reason = "dial through the proxy runtime, so the connection takes its route" },
+    { path = "tokio::net::UdpSocket::bind", reason = "send through the proxy runtime, so the datagrams take their route" },
+    { path = "std::net::UdpSocket::bind", reason = "send through the proxy runtime, so the datagrams take their route" },
+    { path = "quinn::Endpoint::client", reason = "connect through the proxy runtime, so the connection takes its route" },
+    { path = "tokio::net::lookup_host", reason = "resolve through the route's path, so the name never reaches the host resolver" },
+    { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "resolve through the route's path, so the name never reaches the host resolver" },
+    # The routing layer's own direct primitives.
+    { path = "weaver_tunnel::resolution::connect_host", reason = "dial through the proxy runtime, so the connection takes its route" },
+    { path = "weaver_tunnel::resolution::host_lookup", reason = "resolve through the route's path, so the name never reaches the host resolver" },
+    { path = "weaver_tunnel::resolution::host_lookup_blocking", reason = "resolve through the route's path, so the name never reaches the host resolver" },
+    { path = "weaver_tunnel::egress::SocketEgress::connect", reason = "dial through the proxy runtime, so the connection takes its route" },
+    { path = "weaver_tunnel::egress::SocketEgress::connect_blocking", reason = "dial through the proxy runtime, so the connection takes its route" },
+    { path = "weaver_tunnel::egress::SocketEgress::bind_udp", reason = "send through the proxy runtime, so the datagrams take their route" },
+]

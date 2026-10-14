@@ -1,3 +1,6 @@
+// Tests dial their own loopback fixtures.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod application_upgrade;
 pub mod auth;
 pub mod bandwidth;

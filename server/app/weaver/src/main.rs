@@ -1,3 +1,6 @@
+// Tests dial their own loopback fixtures.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 // Windows and everything else get different allocators, so the module that
 // `allocator` names differs by target; both define the same three items.
 #[cfg(target_os = "windows")]

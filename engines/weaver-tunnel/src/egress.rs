@@ -129,6 +129,10 @@ impl SocketEgress {
         Ok(socket)
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the egress socket a route's direct leg dials from"
+    )]
     pub fn connect_blocking(&self, target: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
         let socket = self.tcp_socket(target)?;
         let result = socket.connect_timeout(&target.into(), timeout);
@@ -160,6 +164,10 @@ impl SocketEgress {
     }
 
     // Dropping the connect future closes the bound socket without a detached dial.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the egress socket a route's direct leg dials from"
+    )]
     pub async fn connect(&self, target: SocketAddr) -> io::Result<tokio::net::TcpStream> {
         let socket = self.tcp_socket(target)?;
         socket.set_nonblocking(true)?;

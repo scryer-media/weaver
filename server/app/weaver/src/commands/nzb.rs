@@ -81,6 +81,10 @@ fn graphql_endpoint(base: &str) -> String {
     format!("{}/graphql", base.trim_end_matches('/'))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the CLI asks the operator's own Weaver server"
+)]
 async fn fetch_job_report(
     base: &str,
     api_key: Option<&str>,

@@ -408,6 +408,10 @@ static HOST: LazyLock<ResolutionCache<io::Error>> = LazyLock::new(ResolutionCach
 
 // The addresses the host's own DNS gives for `host`, in the order it gives
 // them, without repeats.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the host resolver every Host-resolved leg shares"
+)]
 pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
     HOST.resolve(Resolver::Host, host, || async {
         let found = tokio::net::lookup_host((host, 0)).await;
@@ -418,6 +422,10 @@ pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
 }
 
 // `host_lookup` for a thread that may block.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the host resolver every Host-resolved leg shares"
+)]
 pub fn host_lookup_blocking(host: &str) -> io::Result<Vec<IpAddr>> {
     HOST.resolve_blocking(Resolver::Host, host, || {
         let found = std::net::ToSocketAddrs::to_socket_addrs(&(host, 0));
@@ -434,6 +442,10 @@ pub fn forget_host(host: &str) {
 // Connects to the first of `host`'s addresses that answers, as
 // `TcpStream::connect` does, resolving with the host's own DNS. When none
 // answers, the name is asked afresh next time.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a leg that dials directly with the host resolver"
+)]
 pub async fn connect_host(host: &str, port: u16) -> io::Result<TcpStream> {
     let mut last = None;
     for ip in host_lookup(host).await? {

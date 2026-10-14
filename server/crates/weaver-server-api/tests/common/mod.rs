@@ -249,11 +249,18 @@ impl TestHarness {
             .expect("failed to create server transfer policy registry"),
         );
         handle.set_server_transfer_policy(Arc::clone(&server_transfer_policy));
+        // Fetches leave only on a route; with nothing saved, each is direct.
+        let proxies = weaver_server_core::proxies::ProxyRuntime::new(
+            db.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        handle.set_proxy_runtime(proxies.clone());
 
         let scheduled_resume =
             weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
-        let update_check = weaver_server_core::update_check::UpdateCheckService::new(db.clone())
-            .expect("failed to create update checker");
+        let update_check =
+            weaver_server_core::update_check::UpdateCheckService::new(db.clone(), proxies.clone());
         // The upgrade surface is part of the schema, so the harness carries one
         // too. Its profile directory is the test's own temporary tree: nothing
         // here may touch a real installation.
@@ -264,6 +271,7 @@ impl TestHarness {
                 tempdir.path(),
                 weaver_server_core::application_upgrade::collect_installation_assessment(),
                 None,
+                proxies,
             );
         let schema = build_schema(SchemaContext {
             handle: handle.clone(),

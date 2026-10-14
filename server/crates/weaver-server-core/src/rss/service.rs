@@ -253,7 +253,11 @@ impl RssService {
         let feed_url =
             reqwest::Url::parse(&feed.url).map_err(|e| RssServiceError::Http(e.to_string()))?;
         let url = reqwest::Url::parse(url).map_err(|e| RssServiceError::Http(e.to_string()))?;
-        let runtime = self.inner.handle.proxy_runtime();
+        let runtime = self
+            .inner
+            .handle
+            .proxy_runtime()
+            .ok_or_else(|| RssServiceError::Http("RSS request has no route".into()))?;
         let options = FetchOptions {
             label: "RSS",
             timeout: Duration::from_secs(30),
@@ -263,7 +267,7 @@ impl RssService {
             allow_private_network: self.inner.security.rss_allow_private_network,
         };
         routed_fetch(
-            runtime.as_deref(),
+            &runtime,
             Consumer::Rss(feed.id),
             &url,
             &options,

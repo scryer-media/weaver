@@ -811,6 +811,7 @@ fn list_port_pids(ctx: &TaskContext, port: u16, probe: &mut PortProbeState) -> R
         .collect())
 }
 
+#[expect(clippy::disallowed_methods, reason = "tooling probes a local port")]
 fn port_accepts_tcp(port: u16) -> bool {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&address, TCP_PORT_PROBE_TIMEOUT).is_ok()

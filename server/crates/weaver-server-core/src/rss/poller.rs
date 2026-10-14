@@ -352,11 +352,12 @@ impl RssService {
     // Between the row insert and the proxy runtime reload that installs its
     // route, a new feed has none, so a sweep leaves it for the wake the
     // reload sends instead of polling it unrouted or recording a failure.
+    // Without a runtime no feed has a route.
     fn has_route(&self, feed_id: u32) -> bool {
         self.inner
             .handle
             .proxy_runtime()
-            .is_none_or(|runtime| runtime.routes_consumer(crate::proxies::Consumer::Rss(feed_id)))
+            .is_some_and(|runtime| runtime.routes_consumer(crate::proxies::Consumer::Rss(feed_id)))
     }
 
     async fn sync_feed(

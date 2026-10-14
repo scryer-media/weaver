@@ -917,12 +917,10 @@ impl std::fmt::Debug for FetchedNzb {
     }
 }
 
-// Fetches an NZB on the Default outbound route, or directly without a
-// runtime.
+// Fetches an NZB on the Default outbound route.
 pub async fn fetch_nzb_from_url(
-    runtime: Option<&crate::proxies::ProxyRuntime>,
+    runtime: &crate::proxies::ProxyRuntime,
     url: &str,
-    allow_private_network: bool,
 ) -> Result<FetchedNzb, SubmitNzbError> {
     let limits = RuntimeSecurityConfig::from_env_or_default_for_tests();
     let url = reqwest::Url::parse(url).map_err(|error| SubmitNzbError::Fetch(error.to_string()))?;
@@ -932,7 +930,7 @@ pub async fn fetch_nzb_from_url(
         redirects: MAX_FETCH_REDIRECTS,
         user_agent: "weaver/0.1",
         https_only: false,
-        allow_private_network,
+        allow_private_network: runtime.allow_private_network(),
     };
     let response = crate::proxies::routed_fetch(
         runtime,
@@ -1395,7 +1393,9 @@ mod tests {
             bytes,
             filename,
             header_passwords,
-        } = fetch_nzb_from_url(None, &url, true).await.unwrap();
+        } = fetch_nzb_from_url(&crate::proxies::direct_runtime(), &url)
+            .await
+            .unwrap();
         let request = server.await.unwrap();
         assert!(header_passwords.is_empty());
 
@@ -1631,7 +1631,9 @@ mod tests {
         });
 
         let url = format!("http://{addr}/download.nzb");
-        let fetched = fetch_nzb_from_url(None, &url, true).await.unwrap();
+        let fetched = fetch_nzb_from_url(&crate::proxies::direct_runtime(), &url)
+            .await
+            .unwrap();
         server.await.unwrap();
 
         assert_eq!(
@@ -1671,7 +1673,10 @@ mod tests {
             stream.write_all(payload).await.unwrap();
         });
         let url = format!("http://{addr}/repairable.nzb");
-        let bytes = fetch_nzb_from_url(None, &url, true).await.unwrap().bytes;
+        let bytes = fetch_nzb_from_url(&crate::proxies::direct_runtime(), &url)
+            .await
+            .unwrap()
+            .bytes;
         server.await.unwrap();
         assert_eq!(bytes, payload);
         assert!(weaver_nzb::parse_nzb(&bytes).is_err());
@@ -1683,7 +1688,9 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/private.nzb", listener.local_addr().unwrap());
 
-        let error = fetch_nzb_from_url(None, &url, false).await.unwrap_err();
+        let runtime = crate::proxies::direct_runtime();
+        runtime.set_allow_private_network(false);
+        let error = fetch_nzb_from_url(&runtime, &url).await.unwrap_err();
 
         assert!(error.to_string().contains("not allowed"), "{error}");
         // Nothing connected: the refusal came before any request.

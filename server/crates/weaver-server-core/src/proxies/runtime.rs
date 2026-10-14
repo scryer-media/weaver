@@ -308,6 +308,7 @@ impl TunnelProvider for BridgeLadder {
 struct DirectProvider;
 #[async_trait::async_trait]
 impl TunnelProvider for DirectProvider {
+    #[expect(clippy::disallowed_methods, reason = "a route's direct leg")]
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
         weaver_tunnel::resolution::connect_host(host, port)
             .await
@@ -360,6 +361,7 @@ impl TunnelProvider for Ladder {
                 _ => attempt.fail("proxy connection failed"),
             }
         }
+        #[expect(clippy::disallowed_methods, reason = "a route's direct fallback")]
         if route.policy.allow_direct
             && !route.is_revoked()
             && let Ok(Ok(stream)) = tokio::time::timeout(
@@ -387,11 +389,14 @@ pub struct ProxyRuntime {
     handle: tokio::runtime::Handle,
     profiles: RwLock<HashMap<u32, Arc<ProxyHop>>>,
     policies: RwLock<HashMap<String, RoutingPolicy>>,
-    consumers: RwLock<std::collections::HashSet<String>>,
-    routes: Mutex<HashMap<String, Arc<ConsumerRoute>>>,
+    consumers: RwLock<std::collections::HashSet<Consumer>>,
+    routes: Mutex<HashMap<Consumer, Arc<ConsumerRoute>>>,
     pub mutations: tokio::sync::Mutex<()>,
     updating: AtomicBool,
     stopped: AtomicBool,
+    // Whether feeds and Default outbound may reach private addresses: the
+    // one switch, `WEAVER_RSS_ALLOW_PRIVATE_NETWORK`.
+    allow_private_network: AtomicBool,
 }
 impl ProxyRuntime {
     #[cfg(test)]
@@ -460,21 +465,22 @@ impl ProxyRuntime {
             mutations: tokio::sync::Mutex::new(()),
             updating: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            allow_private_network: AtomicBool::new(true),
         }))
     }
     pub(super) fn load_consumers(
         db: &Database,
-    ) -> Result<std::collections::HashSet<String>, crate::StateError> {
+    ) -> Result<std::collections::HashSet<Consumer>, crate::StateError> {
         Ok(db
             .list_servers()?
             .into_iter()
-            .map(|s| Consumer::Server(s.id).key())
+            .map(|s| Consumer::Server(s.id))
             .chain(
                 db.list_rss_feeds()?
                     .into_iter()
-                    .map(|f| Consumer::Rss(f.id).key()),
+                    .map(|f| Consumer::Rss(f.id)),
             )
-            .chain(std::iter::once(Consumer::Outbound.key()))
+            .chain(std::iter::once(Consumer::Outbound))
             .collect())
     }
     // Whether the runtime knows this consumer, so a route for it can be
@@ -484,7 +490,13 @@ impl ProxyRuntime {
         self.consumers
             .read()
             .expect("proxy consumers")
-            .contains(&consumer.key())
+            .contains(&consumer)
+    }
+    pub fn set_allow_private_network(&self, allow: bool) {
+        self.allow_private_network.store(allow, Ordering::Release);
+    }
+    pub fn allow_private_network(&self) -> bool {
+        self.allow_private_network.load(Ordering::Acquire)
     }
     pub fn policy(&self, consumer: Consumer) -> RoutingPolicy {
         self.policies
@@ -499,7 +511,6 @@ impl ProxyRuntime {
         consumer: Consumer,
         timeout: Duration,
     ) -> Result<Arc<ConsumerRoute>, String> {
-        let key = consumer.key();
         let mut routes = self.routes.lock().expect("proxy routes");
         if self.updating.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
             return Err("proxy runtime is changing or stopped".into());
@@ -508,18 +519,18 @@ impl ProxyRuntime {
             .consumers
             .read()
             .expect("proxy consumers")
-            .contains(&key)
+            .contains(&consumer)
         {
             return Err("routing consumer no longer exists".into());
         }
-        if let Some(route) = routes.get(&key) {
+        if let Some(route) = routes.get(&consumer) {
             return Ok(route.clone());
         }
         let route = self.draft_route(self.policy(consumer), timeout)?;
         if routes.len() >= 4096 {
             return Err("too many active consumer routes".into());
         }
-        routes.insert(key, route.clone());
+        routes.insert(consumer, route.clone());
         Ok(route)
     }
     pub fn draft_route(
@@ -601,11 +612,11 @@ impl ProxyRuntime {
                 let keys: Vec<_> =
                     routes
                         .iter()
-                        .filter(|(key, route)| {
-                            !consumers.contains(*key)
+                        .filter(|(consumer, route)| {
+                            !consumers.contains(*consumer)
                                 || legacy_policy_changed(
                                     &route.policy,
-                                    &policies.get(*key).cloned().unwrap_or_default(),
+                                    &policies.get(&consumer.key()).cloned().unwrap_or_default(),
                                 )
                                 || route.policy.proxy_ids.iter().zip(&route.hops).any(
                                     |(id, prior)| match (prior, profiles.get(id)) {
@@ -615,11 +626,11 @@ impl ProxyRuntime {
                                     },
                                 )
                         })
-                        .map(|(key, _)| key.clone())
+                        .map(|(consumer, _)| *consumer)
                         .collect();
                 let obsolete: Vec<_> = keys
                     .into_iter()
-                    .filter_map(|key| routes.remove(&key))
+                    .filter_map(|consumer| routes.remove(&consumer))
                     .collect();
                 for route in &obsolete {
                     route.revoked.store(true, Ordering::Release);
@@ -631,12 +642,14 @@ impl ProxyRuntime {
                     &mut *self.consumers.write().expect("proxy consumers"),
                     consumers,
                 );
-                let new_feeds = self
-                    .consumers
-                    .read()
-                    .expect("proxy consumers")
-                    .iter()
-                    .any(|key| key.starts_with("rss:") && !previous.contains(key));
+                let new_feeds =
+                    self.consumers
+                        .read()
+                        .expect("proxy consumers")
+                        .iter()
+                        .any(|consumer| {
+                            matches!(consumer, Consumer::Rss(_)) && !previous.contains(consumer)
+                        });
                 (obsolete, new_feeds)
             };
         let (obsolete, new_feeds) = obsolete;
@@ -709,6 +722,10 @@ impl ProxyRuntime {
                     if let Some(dns) = profile.proxy_dns_servers().first() {
                         let _stream = hop.provider.dial(&dns.to_string(), 53).await?;
                     } else {
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "a proxy test reaches the proxy server itself"
+                        )]
                         weaver_tunnel::resolution::connect_host(&profile.host, profile.port)
                             .await
                             .map_err(|_| {

@@ -262,6 +262,7 @@ impl TcpDialer {
 impl AddressDialer for TcpDialer {
     type Stream = TcpStream;
 
+    #[expect(clippy::disallowed_methods, reason = "the address plan's direct leg")]
     fn resolve(&self) -> io::Result<Vec<SocketAddr>> {
         Ok(weaver_tunnel::resolution::host_lookup_blocking(&self.host)?
             .into_iter()
@@ -270,6 +271,7 @@ impl AddressDialer for TcpDialer {
             .collect())
     }
 
+    #[expect(clippy::disallowed_methods, reason = "the address plan's direct leg")]
     fn dial(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         self.egress.connect_blocking(addr, self.timeout)
     }

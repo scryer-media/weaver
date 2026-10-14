@@ -303,6 +303,10 @@ impl TunnelProvider for TransportProxy {
         Some(self.kind.tunnel_kind())
     }
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a proxy hop dials its proxy server"
+        )]
         let mut stream = crate::resolution::connect_host(&self.host, self.port)
             .await
             .map_err(|_| failure("proxy endpoint is unreachable"))?;

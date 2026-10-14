@@ -38,6 +38,9 @@
 // # }
 // ```
 
+// Tests dial their own loopback fixtures.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 mod address_plan;
 pub mod blocking;
 pub mod candidate_plan;

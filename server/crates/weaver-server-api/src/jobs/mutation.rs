@@ -1144,8 +1144,10 @@ async fn submit_from_facade_input(
             (Some(bytes), None, input.filename)
         }
         (None, Some(url), None) => {
-            let runtime = handle.proxy_runtime();
-            let fetched = fetch_nzb_from_url(runtime.as_deref(), &url, false).await;
+            let fetched = match handle.proxy_runtime() {
+                Some(runtime) => fetch_nzb_from_url(&runtime, &url).await,
+                None => Err(SubmitNzbError::Fetch("NZB request has no route".into())),
+            };
             if fetched.is_err() {
                 raise_url_completed(db, &url, input.category.as_deref(), UrlStatus::Failure).await;
             }

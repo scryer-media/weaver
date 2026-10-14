@@ -3120,6 +3120,10 @@ fn nntp_error_to_io(error: NntpError) -> io::Error {
 }
 
 // Connect to the first of `host`'s resolved addresses that answers.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a connection given no route dialer"
+)]
 fn connect_first_answering(
     host: &str,
     port: u16,

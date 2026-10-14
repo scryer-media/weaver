@@ -38,6 +38,7 @@ use super::error::{
 use super::manifest::{UpgradeArtifact, UpgradeManifest};
 use super::product::{JOURNAL_SCHEMA, WEAVER_PRODUCT};
 use crate::persistence::Database;
+use crate::proxies::{Consumer, ProxyRuntime, with_routed_client};
 use crate::runtime::restart::RestartController;
 use crate::update_check::{UpdateCheckService, release_tag_for_version};
 
@@ -236,6 +237,8 @@ struct Inner {
     assessment: InstallationAssessment,
     // The running program file as startup evidence saw it.
     executable_path: Option<PathBuf>,
+    // Carries the manifest and artifact fetches over Default outbound.
+    proxies: Arc<ProxyRuntime>,
     state: watch::Sender<Option<ApplicationUpgradeRun>>,
     // Single-flight: held for the whole run, so a second start is refused
     // rather than queued.
@@ -260,6 +263,7 @@ impl ApplicationUpgradeService {
         profile_dir: &Path,
         assessment: InstallationAssessment,
         executable_path: Option<PathBuf>,
+        proxies: Arc<ProxyRuntime>,
     ) -> Self {
         let persisted = load_persisted_run(&db);
         let (state, _rx) = watch::channel(persisted);
@@ -270,6 +274,7 @@ impl ApplicationUpgradeService {
                 root: profile_dir.join(UPGRADE_DIR_NAME),
                 assessment,
                 executable_path,
+                proxies,
                 state,
                 admission: Arc::new(Mutex::new(())),
                 restart: RwLock::new(None),
@@ -454,29 +459,39 @@ impl ApplicationUpgradeService {
         run: &ApplicationUpgradeRun,
         request: &UpgradeJobRequest,
     ) -> ApplicationUpgradeResult<()> {
-        let client = application_upgrade_http_client()?;
-        // v2 first, v1 only when the v2 asset is absent for this tag. Every
-        // other v2 failure is fatal, because a client that downgrades on
-        // failure hands an attacker a downgrade oracle.
-        let fetched = fetch_upgrade_manifest(&client, &request.expected_tag).await?;
-        debug!(
-            run_id = %run.run_id,
-            tag = %request.expected_tag,
-            generation = ?fetched.generation,
-            "resolved upgrade manifest generation"
-        );
-        self.run_pipeline_with_dependencies(
-            run,
-            request,
-            &fetched.manifest,
-            UpgradePipelineDependencies {
-                client: &client,
-                artifact_url_override: None,
-                ensure_available_space,
-                rename: rename_path,
+        // The route's bridge lives until the run is done with the client.
+        with_routed_client(
+            &self.inner.proxies,
+            Consumer::Outbound,
+            "Upgrade",
+            upgrade_http_client,
+            |client| async move {
+                // v2 first, v1 only when the v2 asset is absent for this tag.
+                // Every other v2 failure is fatal, because a client that
+                // downgrades on failure hands an attacker a downgrade oracle.
+                let fetched = fetch_upgrade_manifest(&client, &request.expected_tag).await?;
+                debug!(
+                    run_id = %run.run_id,
+                    tag = %request.expected_tag,
+                    generation = ?fetched.generation,
+                    "resolved upgrade manifest generation"
+                );
+                self.run_pipeline_with_dependencies(
+                    run,
+                    request,
+                    &fetched.manifest,
+                    UpgradePipelineDependencies {
+                        client: &client,
+                        artifact_url_override: None,
+                        ensure_available_space,
+                        rename: rename_path,
+                    },
+                )
+                .await
             },
         )
         .await
+        .map_err(ApplicationUpgradeError::Repository)?
     }
 
     async fn run_pipeline_with_dependencies(
@@ -1267,9 +1282,14 @@ fn epoch_ms_now() -> i64 {
 // ordering are the shared core's.
 // ---------------------------------------------------------------------------
 
-fn application_upgrade_http_client() -> ApplicationUpgradeResult<reqwest::Client> {
-    application_updater::pipeline::application_upgrade_http_client(&WEAVER_PRODUCT)
-        .map_err(map_updater_error)
+// The shared core's upgrade client settings, as a builder the route can
+// carry.
+fn upgrade_http_client() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(WEAVER_PRODUCT.http_operation_timeout)
 }
 
 // Fetch, verify and validate this release's manifest, preferring v2.
@@ -1630,7 +1650,14 @@ mod tests {
             true,
         );
         let _ = update_check.run_check().await;
-        ApplicationUpgradeService::new(db, update_check, profile_dir, assessment, executable_path)
+        ApplicationUpgradeService::new(
+            db,
+            update_check,
+            profile_dir,
+            assessment,
+            executable_path,
+            crate::proxies::direct_runtime(),
+        )
     }
 
     fn test_request(executable_path: PathBuf) -> UpgradeJobRequest {
@@ -2904,6 +2931,7 @@ mod tests {
             temp.path(),
             portable_assessment(),
             None,
+            crate::proxies::direct_runtime(),
         );
         let request = test_request(temp.path().join("weaver"));
         let mut run = ApplicationUpgradeRun::checking("persisted-run".to_string(), &request);
@@ -2916,6 +2944,7 @@ mod tests {
             temp.path(),
             portable_assessment(),
             None,
+            crate::proxies::direct_runtime(),
         );
         assert_eq!(restarted.snapshot().latest_run, Some(run));
         assert!(
@@ -2943,6 +2972,7 @@ mod tests {
             temp.path(),
             portable_assessment(),
             None,
+            crate::proxies::direct_runtime(),
         );
         let request = test_request(temp.path().join("weaver"));
         let started = ApplicationUpgradeRun::checking("late-failure".to_string(), &request);

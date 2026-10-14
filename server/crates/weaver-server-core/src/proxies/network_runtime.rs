@@ -58,7 +58,11 @@ impl Configuration {
                     1,
                 )))
                 .collect(),
-            consumers: ProxyRuntime::load_consumers(db).map_err(|e| e.to_string())?,
+            consumers: ProxyRuntime::load_consumers(db)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(Consumer::key)
+                .collect(),
             egresses: db
                 .list_egress_interfaces()
                 .map_err(|e| e.to_string())?

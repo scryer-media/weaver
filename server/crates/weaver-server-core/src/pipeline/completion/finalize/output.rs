@@ -947,6 +947,7 @@ impl Pipeline {
         let srrdb = srrdb_from_config.then(|| SrrdbInputs {
             base_url: deobfuscate::SRRDB_API_BASE.to_string(),
             crc32_by_member_path: HashMap::new(),
+            proxies: self.shared_state.proxy_runtime(),
         });
         let srrdb = match srrdb {
             Some(mut inputs) => {

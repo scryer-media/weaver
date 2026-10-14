@@ -1,6 +1,6 @@
 use super::*;
 use crate::Database;
-use crate::proxies::{ProxyKind, ProxyProfile, ProxySecrets, Resolver, RoutingPolicy};
+use crate::proxies::{ProxyKind, outbound_only_through};
 use axum::Router;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
@@ -135,7 +135,7 @@ async fn fetch(
 ) -> Result<reqwest::Response, AttemptError> {
     let path: Arc<dyn FetchPath> = path.clone();
     fetch_on(
-        Some(&path),
+        &path,
         &url.parse().unwrap(),
         &options(allow_private_network),
         &|request, _, _| request,
@@ -268,7 +268,7 @@ async fn the_outbound_route_goes_direct_when_none_is_saved() {
     .unwrap();
     let url = format!("http://{addr}/start").parse().unwrap();
     let response = routed_fetch(
-        Some(runtime.as_ref()),
+        &runtime,
         Consumer::Outbound,
         &url,
         &options(true),
@@ -295,45 +295,158 @@ async fn the_outbound_route_fails_closed_when_its_proxies_fail() {
         HashMap::new(),
     )
     .await;
-    let db = Database::open_in_memory().unwrap();
-    db.save_proxy_profile(&ProxyProfile {
-        id: 1,
-        name: "refusing".into(),
-        kind: ProxyKind::Socks5,
-        enabled: true,
-        host: "127.0.0.1".into(),
-        port: proxy.addr.port(),
-        resolver: Resolver::Proxy,
-        dns_servers: vec![],
-        tunnel_addresses: vec![],
-        peer_public_key: None,
-        mtu: 1280,
-        keepalive_seconds: None,
-        timeout_seconds: 300,
-        host_key_fingerprint: None,
-        revision: 1,
-        secrets: ProxySecrets::default(),
-    })
-    .unwrap();
-    db.save_proxy_routing_policy(
-        Consumer::Outbound,
-        &RoutingPolicy {
-            proxy_ids: vec![1],
-            allow_direct: false,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let runtime = ProxyRuntime::new(db, tokio::runtime::Handle::current()).unwrap();
+    let runtime = outbound_only_through(ProxyKind::Socks5, proxy.addr.port());
     let url = format!("http://localhost:{}/start", addr.port())
         .parse()
         .unwrap();
     let error = routed_fetch(
-        Some(runtime.as_ref()),
+        &runtime,
         Consumer::Outbound,
         &url,
         &options(true),
         |request, _, _| request,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, "TEST request failed on all permitted routes");
+    assert_eq!(
+        proxy.targets.lock().unwrap().clone(),
+        [("localhost".to_owned(), addr.port())]
+    );
+    assert!(requests(&log).is_empty());
+    runtime.stop_all().await;
+    task.abort();
+}
+
+// A client a library drives over `path`: it follows redirects itself.
+fn client_on(path: &Arc<Mapped>, allow_private_network: bool) -> (reqwest::Client, Arc<Bridge>) {
+    let checked = Arc::new(Checked {
+        path: path.clone(),
+        label: "TEST",
+        allow_private_network,
+        failure: Default::default(),
+    });
+    let bridge = bridge_onto(checked, Duration::from_secs(30)).unwrap();
+    let client = through_bridge(
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(3)),
+        &bridge,
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+    (client, bridge)
+}
+
+#[tokio::test]
+async fn a_client_following_redirects_has_each_name_checked_on_its_path() {
+    let (addr, log, task) = origin().await;
+    let path = Mapped::new(
+        addr,
+        Some(&[
+            ("first.test", [203, 0, 113, 7]),
+            ("second.test", [203, 0, 113, 8]),
+        ]),
+    );
+    let (client, _bridge) = client_on(&path, false);
+    let response = client
+        .get("http://first.test/to-second")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), "fetched");
+    assert_eq!(
+        path.dials(),
+        [
+            (
+                "first.test".to_owned(),
+                vec![IpAddr::from([203, 0, 113, 7])]
+            ),
+            (
+                "second.test".to_owned(),
+                vec![IpAddr::from([203, 0, 113, 8])]
+            ),
+        ]
+    );
+    assert_eq!(
+        requests(&log),
+        [
+            pair("/to-second", "first.test"),
+            pair("/final", "second.test")
+        ]
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_client_redirected_to_a_private_address_never_dials_it() {
+    let (addr, log, task) = origin().await;
+    let path = Mapped::new(addr, None);
+    let (client, _bridge) = client_on(&path, false);
+    assert!(
+        client
+            .get("http://first.test/to-private")
+            .send()
+            .await
+            .is_err()
+    );
+    assert_eq!(path.dials(), [("first.test".to_owned(), Vec::new())]);
+    assert_eq!(requests(&log), [pair("/to-private", "first.test")]);
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_routed_client_goes_direct_when_no_route_is_saved() {
+    let (addr, log, task) = origin().await;
+    let runtime = ProxyRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let body = with_routed_client(
+        &runtime,
+        Consumer::Outbound,
+        "TEST",
+        reqwest::Client::builder,
+        |client| async move {
+            client
+                .get(format!("http://{addr}/start"))
+                .send()
+                .await?
+                .text()
+                .await
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(body, "fetched");
+    assert_eq!(requests(&log), [pair("/start", &addr.to_string())]);
+    runtime.stop_all().await;
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_routed_client_fails_closed_when_its_proxies_fail() {
+    let (addr, log, task) = origin().await;
+    let proxy = weaver_tunnel::test_support::proxy::ProxyServerDouble::start(
+        weaver_tunnel::transport::TransportKind::Socks5,
+        None,
+        HashMap::new(),
+    )
+    .await;
+    let runtime = outbound_only_through(ProxyKind::Socks5, proxy.addr.port());
+    let error = with_routed_client(
+        &runtime,
+        Consumer::Outbound,
+        "TEST",
+        reqwest::Client::builder,
+        |client| async move {
+            client
+                .get(format!("http://localhost:{}/start", addr.port()))
+                .send()
+                .await
+                .map(drop)
+        },
     )
     .await
     .unwrap_err();

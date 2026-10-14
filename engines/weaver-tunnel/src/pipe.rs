@@ -175,6 +175,7 @@ fn routed(addresses: Vec<IpAddr>) -> Result<Vec<IpAddr>, DialError> {
 }
 
 // What the host's own DNS resolves `host` to.
+#[expect(clippy::disallowed_methods, reason = "a Host-resolved leg")]
 async fn lookup(host: &str) -> Result<Vec<IpAddr>, DialError> {
     let mut addresses = crate::resolution::host_lookup(host)
         .await
@@ -541,6 +542,10 @@ impl Egress {
         }
         DialError::destination(error)
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an egress leg dials the destination"
+    )]
     pub async fn connect_address(&self, peer: SocketAddr) -> Result<Dialed, DialError> {
         let stream = tokio::time::timeout(self.timeout, self.binding.connect(peer))
             .await
@@ -567,6 +572,7 @@ impl Egress {
 }
 
 impl UdpSocketFactory for Egress {
+    #[expect(clippy::disallowed_methods, reason = "an egress leg's datagram socket")]
     fn bind(&self, peer: SocketAddr) -> io::Result<std::net::UdpSocket> {
         self.binding.bind_udp(peer)
     }
@@ -574,6 +580,10 @@ impl UdpSocketFactory for Egress {
 
 #[async_trait::async_trait]
 impl Dialer for Egress {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an egress leg resolves with the host resolver"
+    )]
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         let started = tokio::time::Instant::now();
         let attempt = async {
@@ -627,6 +637,10 @@ impl Dialer for Egress {
             (_, result) => result,
         }
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an egress leg resolves with the host resolver"
+    )]
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
         let peers = tokio::time::timeout(self.timeout, crate::resolution::host_lookup(host))
             .await

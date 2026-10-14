@@ -1,3 +1,6 @@
+// The test dials its own loopback fixtures.
+#![allow(clippy::disallowed_methods)]
+
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

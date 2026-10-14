@@ -159,6 +159,7 @@ pub(crate) async fn run(
         )
     })
     .await??;
+    proxies.set_allow_private_network(security.rss_allow_private_network);
     let nntp = wiring::build_nntp_client(&config, &profile, &server_transfer_policy, &proxies)?;
     let total_connections: usize = config
         .servers
@@ -355,7 +356,8 @@ pub(crate) async fn run(
         db.clone(),
         shared_config.clone(),
     );
-    let update_check = weaver_server_core::update_check::UpdateCheckService::new(db.clone())?;
+    let update_check =
+        weaver_server_core::update_check::UpdateCheckService::new(db.clone(), proxies.clone());
 
     // The in-application upgrade. The installation is classified once, here,
     // from the running process: an install someone else manages (a container, a
@@ -368,6 +370,7 @@ pub(crate) async fn run(
             &restore_locator_dir,
             weaver_server_core::application_upgrade::collect_installation_assessment(),
             weaver_server_core::runtime::restart::resolvable_executable(),
+            proxies.clone(),
         );
     // An upgrade that promoted before this boot is settled now, before anything
     // serves: the journal is the only record that survives the restart, and

@@ -1022,10 +1022,23 @@ async fn nzbget_append_add_paused_is_initially_paused() {
     assert_eq!(groups_payload["result"][0]["Status"], "PAUSED");
 }
 
+// Routes fetches the way WEAVER_RSS_ALLOW_PRIVATE_NETWORK=false does: no
+// private destination is reached.
+fn refuse_private_destinations(handle: &SchedulerHandle, db: &Database) {
+    let runtime = weaver_server_core::proxies::ProxyRuntime::new(
+        db.clone(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    runtime.set_allow_private_network(false);
+    handle.set_proxy_runtime(runtime);
+}
+
 #[tokio::test]
 async fn nzbget_append_rejects_private_url_payloads_for_prowlarr_shape() {
     let db = Database::open_in_memory().unwrap();
     let handle = scheduler_handle_with_mock_commands(vec![]);
+    refuse_private_destinations(&handle, &db);
     let app = nzbget_test_router(
         db,
         handle.clone(),
@@ -2723,9 +2736,12 @@ async fn nzbget_log_and_loadlog_expose_job_events() {
 
 #[tokio::test]
 async fn nzbget_appendurl_validates_url_and_shape() {
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_mock_commands(vec![]);
+    refuse_private_destinations(&handle, &db);
     let app = nzbget_test_router(
-        Database::open_in_memory().unwrap(),
-        scheduler_handle_with_mock_commands(vec![]),
+        db,
+        handle,
         test_config(),
         api_key_cache("control-key", "control"),
     );

@@ -105,7 +105,7 @@ impl RoutedClient {
             })?;
         let bridge = start_bridge(provider.clone())
             .map_err(|error| (Some(provider.clone()), error.into()))?;
-        match Self::build(&bridge, &admitted, url, options) {
+        match Self::build(&bridge, &admitted, options) {
             Ok(client) => Ok(Self {
                 client,
                 host: admitted.host,
@@ -119,10 +119,13 @@ impl RoutedClient {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the client rides the leg's bridge"
+    )]
     fn build(
         bridge: &Bridge,
         admitted: &Admitted,
-        url: &reqwest::Url,
         options: &HttpOptions,
     ) -> Result<reqwest::Client, String> {
         let same_host = admitted.host.clone();
@@ -159,15 +162,9 @@ impl RoutedClient {
                 .map_err(|e| e.to_string())?;
             builder = builder.tls_certs_only(roots);
         }
-        pinned(
-            builder,
-            url,
-            &admitted.host,
-            admitted.port,
-            &admitted.addresses,
-        )
-        .build()
-        .map_err(|e| e.to_string())
+        pinned(builder, &admitted.host, admitted.port, &admitted.addresses)
+            .build()
+            .map_err(|e| e.to_string())
     }
 
     // One GET, refused unless it answers with a success status.

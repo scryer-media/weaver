@@ -363,6 +363,10 @@ fn post_graphql(port: u16, cookie: Option<&str>) -> Option<HttpResponse> {
 //
 // `Connection: close` is what makes reading to EOF a complete response, so
 // this needs no keep-alive framing of its own.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the tray asks the local Weaver over loopback"
+)]
 fn http_exchange(port: u16, request: &[u8], timeout: Duration) -> Option<HttpResponse> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&address, timeout).ok()?;

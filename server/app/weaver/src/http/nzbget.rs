@@ -958,8 +958,11 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
     let request = parse_append_params(params).map_err(|error| append_refused("", error))?;
     let requested_name = request.filename.clone().unwrap_or_default();
     let (nzb_bytes, fetched_filename, header_passwords) = if is_http_url(&request.content_or_url) {
-        let runtime = ctx.handle.proxy_runtime();
-        match fetch_nzb_from_url(runtime.as_deref(), &request.content_or_url, false).await {
+        let fetched = match ctx.handle.proxy_runtime() {
+            Some(runtime) => fetch_nzb_from_url(&runtime, &request.content_or_url).await,
+            None => Err(SubmitNzbError::Fetch("NZB request has no route".into())),
+        };
+        match fetched {
             Ok(fetched) => (fetched.bytes, fetched.filename, fetched.header_passwords),
             Err(error) => {
                 raise_url_completed(

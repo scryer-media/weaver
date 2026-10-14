@@ -1361,6 +1361,10 @@ pub(crate) async fn dial_direct(
             TcpStream::from_std(tcp)?
         }
         None => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a connection given no route dialer resolves with the host resolver"
+            )]
             let addrs: Vec<SocketAddr> = weaver_tunnel::resolution::host_lookup(host)
                 .await?
                 .into_iter()
@@ -1377,6 +1381,10 @@ pub(crate) async fn dial_direct(
     Ok((tcp, remote_addr))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a connection given no route dialer"
+)]
 async fn connect_first_answering(addrs: &[SocketAddr]) -> Result<TcpStream, NntpError> {
     let mut last_error = None;
     for addr in addrs {

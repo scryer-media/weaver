@@ -24,9 +24,9 @@ pub struct FetchAttempt {
     // The leg's final attempt this sync: no later rung, and no direct
     // fallback, remains after it.
     last_attempt: bool,
-    // The addresses the fetch checked for its host, so a direct dial uses
-    // exactly those instead of resolving again.
-    addresses: Mutex<Option<(String, Vec<IpAddr>)>>,
+    // The addresses the fetch checked for each host, so a dial uses exactly
+    // those instead of resolving again.
+    addresses: Mutex<HashMap<String, Vec<IpAddr>>>,
 }
 impl FetchAttempt {
     pub async fn cancelled(&self) {
@@ -87,7 +87,10 @@ impl FetchPath for FetchAttempt {
     }
     // Pins the checked addresses a direct dial of `host` uses.
     fn pin(&self, host: &str, addresses: Vec<IpAddr>) {
-        *self.addresses.lock().expect("fetch addresses") = Some((host.to_owned(), addresses));
+        self.addresses
+            .lock()
+            .expect("fetch addresses")
+            .insert(host.to_owned(), addresses);
     }
     fn budget(&self) -> Duration {
         self.stage.budget()
@@ -112,9 +115,8 @@ impl TunnelProvider for FetchAttempt {
             .addresses
             .lock()
             .expect("fetch addresses")
-            .as_ref()
-            .filter(|(pinned, _)| pinned == host)
-            .map(|(_, addresses)| addresses.clone())
+            .get(host)
+            .cloned()
             .unwrap_or_default();
         let target = Target {
             host: host.into(),
@@ -340,7 +342,7 @@ impl NetworkRuntime {
                         setups: Mutex::new(Vec::new()),
                         last_member: member_index + 1 == count,
                         last_attempt: false,
-                        addresses: Mutex::new(None),
+                        addresses: Mutex::default(),
                     });
                 }
             }
@@ -369,7 +371,7 @@ impl NetworkRuntime {
                     setups: Mutex::new(Vec::new()),
                     last_member: true,
                     last_attempt: false,
-                    addresses: Mutex::new(None),
+                    addresses: Mutex::default(),
                 });
             }
             if let Some(last) = leg_attempts.last_mut() {
