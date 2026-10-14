@@ -37,7 +37,7 @@ const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 // shutdown command and while the session ends, and both of those are bounded
 // by someone else.
 #[cfg(windows)]
-pub(crate) const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 // The names the wrapper and the server are installed under. Both binaries
 // ship in the same directory, which is what lets the wrapper find the server
@@ -1282,33 +1282,7 @@ fn send_stop_request(child: &Child) -> bool {
 // with its graceful teardown.
 #[cfg(windows)]
 fn send_stop_request(child: &Child) -> bool {
-    crate::windows_process::request_console_interrupt(child.id())
-}
-
-// Whether `image` is one of the executables `names` installed directly in
-// `install_dir`, which is how a stop recognizes a Weaver process it did not
-// start. Windows paths compare without regard to case or to which separator
-// was used, and a verbatim `\\?\` prefix on either side is ignored. A file in
-// a subdirectory of the install directory does not count.
-pub(crate) fn is_installed_executable(image: &str, install_dir: &str, names: &[&str]) -> bool {
-    fn normalize(path: &str) -> String {
-        let path = path.strip_prefix(r"\\?\").unwrap_or(path);
-        path.replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_lowercase()
-    }
-    let image = normalize(image);
-    let install_dir = normalize(install_dir);
-    if install_dir.is_empty() {
-        return false;
-    }
-    let Some((parent, file_name)) = image.rsplit_once('\\') else {
-        return false;
-    };
-    parent == install_dir
-        && names
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(file_name))
+    application_updater::windows_process::request_console_interrupt(child.id())
 }
 
 // The port in a `GetExtendedTcpTable` row. The table stores it in network
@@ -1377,59 +1351,13 @@ mod tests {
     use super::{
         HttpResponse, PopoverContent, QueueRow, SMOKE_BODY, SMOKE_RESPONSE, app_origin, app_url,
         build_server_command, decode_chunked, desktop_profile_dir_from, format_bytes, format_speed,
-        http_origin, is_installed_executable, is_weaver_document, last_logged_error,
-        logged_error_message, note_version_change, opens_in_external_browser, parse_http_response,
-        parse_setup_code_line, popover_content_from_graphql, remove_desktop_profile, row_detail,
-        set_cookie_value, tcp_table_port,
+        http_origin, is_weaver_document, last_logged_error, logged_error_message,
+        note_version_change, opens_in_external_browser, parse_http_response, parse_setup_code_line,
+        popover_content_from_graphql, remove_desktop_profile, row_detail, set_cookie_value,
+        tcp_table_port,
     };
     #[cfg(unix)]
     use super::{RELAUNCH_PENDING_MESSAGE, ServerSupervisor, SupervisedServer};
-
-    const INSTALLED: [&str; 2] = ["weaver.exe", "weaver-tray.exe"];
-    const INSTALL_DIR: &str = r"C:\Program Files\Scryer Media\Weaver";
-
-    #[test]
-    fn an_installed_server_or_tray_is_recognized_whatever_the_spelling() {
-        for image in [
-            r"C:\Program Files\Scryer Media\Weaver\weaver.exe",
-            r"c:\program files\scryer media\weaver\WEAVER-TRAY.EXE",
-            r"\\?\C:\Program Files\Scryer Media\Weaver\weaver.exe",
-            "C:/Program Files/Scryer Media/Weaver/weaver.exe",
-        ] {
-            assert!(
-                is_installed_executable(image, INSTALL_DIR, &INSTALLED),
-                "{image}"
-            );
-        }
-        assert!(is_installed_executable(
-            r"C:\Program Files\Scryer Media\Weaver\weaver.exe",
-            r"C:\Program Files\Scryer Media\Weaver\",
-            &INSTALLED
-        ));
-    }
-
-    #[test]
-    fn nothing_outside_the_install_directory_is_taken_for_weaver() {
-        for image in [
-            // The upgrade helper is a copy of the server under the profile.
-            r"C:\Users\example\AppData\Local\Scryer Media\Weaver\application-upgrade\helper\weaver-upgrade-helper.exe",
-            // A portable copy somewhere else.
-            r"D:\Tools\Weaver\weaver.exe",
-            // A file below the install directory, not in it.
-            r"C:\Program Files\Scryer Media\Weaver\old\weaver.exe",
-            // A neighbouring directory whose name merely starts the same.
-            r"C:\Program Files\Scryer Media\Weaver2\weaver.exe",
-            // Another program in the install directory.
-            r"C:\Program Files\Scryer Media\Weaver\msiexec.exe",
-            "weaver.exe",
-        ] {
-            assert!(
-                !is_installed_executable(image, INSTALL_DIR, &INSTALLED),
-                "{image}"
-            );
-        }
-        assert!(!is_installed_executable(r"C:\weaver.exe", "", &INSTALLED));
-    }
 
     #[test]
     fn a_tcp_table_port_is_read_out_of_network_byte_order() {

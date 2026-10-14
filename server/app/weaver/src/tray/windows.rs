@@ -8,7 +8,7 @@
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -85,9 +85,13 @@ use super::tray_ipc::{
     WEBVIEW_FAILED_MESSAGE,
 };
 
+use application_updater::windows_process::{
+    StopPolicy, find_product_processes, stop_product_processes,
+};
+
 use super::shared::{
-    self, DEFAULT_PORT, GRACEFUL_STOP_TIMEOUT, PopoverContent, QueueRow, SERVER_EXECUTABLE,
-    SMOKE_SUCCESS_LINE, SMOKE_TIMEOUT, ServerSupervisor, WRAPPER_EXECUTABLE,
+    self, DEFAULT_PORT, PopoverContent, QueueRow, SERVER_EXECUTABLE, SMOKE_SUCCESS_LINE,
+    SMOKE_TIMEOUT, ServerSupervisor, WRAPPER_EXECUTABLE,
 };
 use super::windows_process;
 use crate::windows_startup::{register_startup, startup_enabled, unregister_startup};
@@ -107,21 +111,32 @@ const FLYOUT_WINDOW_CLASS: &str = "ScryerMedia.Weaver.Desktop.v1.Flyout";
 // actually exit before it stops waiting and kills the child.
 const SERVER_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-// The whole budget of `--shutdown`. The installer runs it before it checks
-// for files in use and the upgrade helper runs it before the installer, and
-// both wait on it, so it must finish on its own clock whatever it finds.
-const SHUTDOWN_COMMAND_BUDGET: Duration = Duration::from_secs(19);
-// How much of that budget the running tray gets to stop itself and the server
-// it owns. Its own stop is graceful-first and bounded by
-// `GRACEFUL_STOP_TIMEOUT` per server, so this covers an owned server and an
-// adopted one with time to spare.
+// `--shutdown` runs before the installer checks for files in use, and the
+// upgrade helper runs it before the installer; both wait on it, so it finishes
+// on its own clock whatever it finds: at most `SHUTDOWN_TRAY_EXIT_WAIT` for
+// the running tray, then `SHUTDOWN_STOP_POLICY`'s budget for whatever is left,
+// nineteen seconds in all.
+//
+// The running tray's own exit stops its server graceful-first within
+// `shared::GRACEFUL_STOP_TIMEOUT`, then an adopted one within
+// `EXIT_STOP_POLICY`'s budget, which this wait covers with time to spare.
 const SHUTDOWN_TRAY_EXIT_WAIT: Duration = Duration::from_secs(13);
-// What is left at the end for `TerminateProcess` to take effect.
-const SHUTDOWN_TERMINATE_WAIT: Duration = Duration::from_secs(2);
+// Ask whatever is still running from the installation to exit, poll eight
+// times half a second apart, then terminate it and give that two seconds.
+const SHUTDOWN_STOP_POLICY: StopPolicy = StopPolicy {
+    ask_attempts: 8,
+    ask_interval: Duration::from_millis(500),
+    terminate_wait: Duration::from_secs(2),
+};
 
-// How long a tray that is exiting gives a server it did not start to stop
-// before it ends the process.
-const ADOPTED_SERVER_TERMINATE_WAIT: Duration = Duration::from_secs(1);
+// How a tray that is exiting stops the server it adopted rather than started.
+// Short, because it follows the owned server's graceful stop and
+// `--shutdown` may be waiting on this tray while it runs.
+const EXIT_STOP_POLICY: StopPolicy = StopPolicy {
+    ask_attempts: 4,
+    ask_interval: Duration::from_millis(500),
+    terminate_wait: Duration::from_secs(1),
+};
 
 // The argument Windows restarts the tray with after it closed it for an
 // installer or a restart: the sign-in start, which brings the server back
@@ -482,12 +497,13 @@ fn signal_existing_instance(message: u32) -> Result<(), String> {
 //
 // The running tray is asked first, because it stops its own server
 // gracefully. Whatever is still running from the install directory after
-// that gets a console Ctrl+C, a bounded wait, and then `TerminateProcess`.
-// The whole command is bounded by `SHUTDOWN_COMMAND_BUDGET`, and it succeeds
-// when nothing it was able to reach is left.
+// that — this process aside — is asked to exit, then terminated once
+// `SHUTDOWN_STOP_POLICY` runs out. A process this command may not open, such
+// as another user's seen from an unelevated run, is not found at all; the
+// installer runs this elevated, where nothing is out of reach. It succeeds
+// when nothing it found is left running.
 fn shutdown_existing_instance() -> Result<(), String> {
     let started = Instant::now();
-    let deadline = started + SHUTDOWN_COMMAND_BUDGET;
     // Held until the sweep is done, so a tray launched meanwhile finds an
     // owner and does not start a server under the stop.
     let instance = InstanceGuard::acquire()?;
@@ -500,38 +516,33 @@ fn shutdown_existing_instance() -> Result<(), String> {
         }
     }
 
-    let install_dir = std::env::current_exe()
-        .map_err(|error| format!("failed to resolve weaver-tray.exe path: {error}"))?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "weaver-tray.exe has no parent directory".to_string())?;
-    let names = [SERVER_EXECUTABLE, WRAPPER_EXECUTABLE];
-    let candidates = windows_process::processes_named(&names);
-    let terminate_from = deadline - SHUTDOWN_TERMINATE_WAIT;
-    let graceful_until = (Instant::now() + GRACEFUL_STOP_TIMEOUT).min(terminate_from);
-    let outcome = windows_process::stop_installed_processes(
-        &candidates,
+    let install_dir = installation_dir()?;
+    let report = stop_product_processes(
+        &[SERVER_EXECUTABLE, WRAPPER_EXECUTABLE],
         &install_dir,
-        &names,
-        graceful_until,
-        deadline,
+        &[],
+        SHUTDOWN_STOP_POLICY,
     );
     drop(instance);
 
-    // Another user's process, seen from an unelevated command, cannot be
-    // stopped from here and is not this user's to stop; the installer runs
-    // this elevated, where nothing is out of reach.
-    for process in &outcome.inaccessible {
-        eprintln!("Weaver: not permitted to stop {process}");
-    }
-    if outcome.survivors.is_empty() {
+    if report.all_stopped() {
         Ok(())
     } else {
         Err(format!(
-            "Weaver is still running after the shutdown request: {}",
-            outcome.survivors.join("; ")
+            "Weaver processes {:?} in {} are still running after being asked to stop and terminated",
+            report.remaining,
+            install_dir.display()
         ))
     }
+}
+
+// The directory this tray, and the server beside it, are installed in.
+fn installation_dir() -> Result<PathBuf, String> {
+    std::env::current_exe()
+        .map_err(|error| format!("failed to resolve weaver-tray.exe path: {error}"))?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "weaver-tray.exe has no parent directory".to_string())
 }
 
 // Wait for this session's tray window to go away, or for `deadline`.
@@ -1221,22 +1232,21 @@ impl TrayState {
         let Some(owner) = windows_process::listening_port_owner(self.supervisor.port()) else {
             return;
         };
-        let Some(install_dir) = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-        else {
+        let Ok(install_dir) = installation_dir() else {
             return;
         };
-        let graceful_until = Instant::now() + GRACEFUL_STOP_TIMEOUT;
-        let outcome = windows_process::stop_installed_processes(
-            &[owner],
-            &install_dir,
-            &[SERVER_EXECUTABLE],
-            graceful_until,
-            graceful_until + ADOPTED_SERVER_TERMINATE_WAIT,
-        );
-        for problem in outcome.survivors.iter().chain(&outcome.inaccessible) {
-            eprintln!("Weaver: could not stop the server the tray adopted: {problem}");
+        // The shared stop takes everything that matches but what it is told to
+        // leave alone, so every other installed server is left alone; when the
+        // port's owner is not among the installed servers, there is nothing to
+        // stop.
+        let names = [SERVER_EXECUTABLE];
+        let others: Vec<u32> = find_product_processes(&names, &install_dir, &[])
+            .into_iter()
+            .filter(|&process_id| process_id != owner)
+            .collect();
+        let report = stop_product_processes(&names, &install_dir, &others, EXIT_STOP_POLICY);
+        if !report.all_stopped() {
+            eprintln!("Weaver: could not stop the server the tray adopted (pid {owner})");
         }
     }
 }

@@ -97,11 +97,6 @@ windows-sys = { workspace = true, features = [
   # `GetExtendedTcpTable`, which finds the process listening on the tray's
   # port when the tray did not start it.
   "Win32_NetworkManagement_IpHelper",
-  # `AttachConsole` and `GenerateConsoleCtrlEvent`, which deliver the
-  # graceful Ctrl+C stop to the windowless server.
-  "Win32_System_Console",
-  # The process snapshot `--shutdown` finds installed Weaver processes with.
-  "Win32_System_Diagnostics_ToolHelp",
   # The kill-on-close job the tray starts the server in.
   "Win32_System_JobObjects",
   # `RegisterApplicationRestart`.
