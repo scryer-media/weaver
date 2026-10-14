@@ -350,6 +350,9 @@ test("a rung starts on the first target it offers, and a chain's hops offer only
     // A new chain takes the first two proxies that can ride one another, and no third.
     assert.deepEqual(await hops(), ["Amsterdam · WireGuard", "Seedbox · SSH", "None"]);
     assert.deepEqual(await Promise.all([1, 2, 3].map((position) => hop(position).isDisabled())), [false, false, false]);
+    // The three share one row, however long the names in them.
+    const tops = await Promise.all([1, 2, 3].map(async (position) => (await hop(position).boundingBox()).y));
+    assert.equal(new Set(tops).size, 1, `hops sit at ${tops.join(", ")}`);
     // Under each hop, whether the chain needs it: the first two, and not the third.
     const notes = editor.locator("span").filter({ hasText: /^(\* Required|Optional)$/ });
     assert.deepEqual(await notes.allTextContents(), ["* Required", "* Required", "Optional"]);

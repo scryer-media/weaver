@@ -296,37 +296,40 @@ export function RouteEditor({
                           />
                         </div>
                         {rung.kind === "CHAIN" ? (
-                          <div className="flex w-full min-w-0 flex-wrap gap-2">
-                            {[0, 1, 2].map((hop) => (
-                              <div key={hop} className="flex w-full min-w-0 flex-col gap-1 sm:w-[200px]">
-                                <Select
-                                  label={t("next.networking.route.hop", { position: hop + 1 })}
-                                  value={rung.chainIds[hop] == null ? "" : String(rung.chainIds[hop])}
-                                  className="w-full min-w-0"
-                                  disabled={hop > rung.chainIds.length}
-                                  onChange={(next) => {
-                                    const limits = chainLimits(path.rungs, rungIndex);
-                                    // A required hop the change cut is filled again from the top of its list.
-                                    const chainIds = fillChain(
-                                      withChainHop(profiles, rung.chainIds, hop, next ? Number(next) : null, limits),
-                                      limits,
-                                    );
-                                    setRungs(path.rungs.map((current, n) => (n === rungIndex ? { ...current, chainIds } : current)));
-                                  }}
-                                  options={[
-                                    ...(hop < 2 ? [] : [{ value: "", label: t("next.networking.route.noHop") }]),
-                                    ...chainHopProfiles(profiles, rung.chainIds, hop, chainLimits(path.rungs, rungIndex))
-                                      .map((profile) => ({
-                                        value: String(profile.id),
-                                        label: `${profile.name} · ${proxyLabels[profile.kind]}`,
-                                      })),
-                                  ]}
-                                />
-                                <span className="font-wv-mono text-[11px] text-wv-muted">
-                                  {hop < 2 ? t("next.networking.route.hopRequired") : t("next.networking.route.hopOptional")}
-                                </span>
-                              </div>
-                            ))}
+                          // The three hops share one row, or stack when the rung is too narrow for three.
+                          <div className="@container w-full min-w-0">
+                            <div className="grid grid-cols-1 gap-2 @lg:grid-cols-3">
+                              {[0, 1, 2].map((hop) => (
+                                <div key={hop} className="flex min-w-0 flex-col gap-1">
+                                  <Select
+                                    label={t("next.networking.route.hop", { position: hop + 1 })}
+                                    value={rung.chainIds[hop] == null ? "" : String(rung.chainIds[hop])}
+                                    className="w-full min-w-0"
+                                    disabled={hop > rung.chainIds.length}
+                                    onChange={(next) => {
+                                      const limits = chainLimits(path.rungs, rungIndex);
+                                      // A required hop the change cut is filled again from the top of its list.
+                                      const chainIds = fillChain(
+                                        withChainHop(profiles, rung.chainIds, hop, next ? Number(next) : null, limits),
+                                        limits,
+                                      );
+                                      setRungs(path.rungs.map((current, n) => (n === rungIndex ? { ...current, chainIds } : current)));
+                                    }}
+                                    options={[
+                                      ...(hop < 2 ? [] : [{ value: "", label: t("next.networking.route.noHop") }]),
+                                      ...chainHopProfiles(profiles, rung.chainIds, hop, chainLimits(path.rungs, rungIndex))
+                                        .map((profile) => ({
+                                          value: String(profile.id),
+                                          label: `${profile.name} · ${proxyLabels[profile.kind]}`,
+                                        })),
+                                    ]}
+                                  />
+                                  <span className="font-wv-mono text-[11px] text-wv-muted">
+                                    {hop < 2 ? t("next.networking.route.hopRequired") : t("next.networking.route.hopOptional")}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
                           </div>
                         ) : (
                           <div className="flex w-full min-w-0 flex-wrap gap-2">
