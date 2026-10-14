@@ -1677,7 +1677,6 @@ export const nextZh: LocaleDictionary = {
   "next.networking.flow.openKillSwitch": "为 {{name}} 设置路由",
   "next.networking.flow.legTitle": "{{name}} · 分支 {{position}} · {{weight}}%",
   "next.networking.flow.legShort": "分支 {{position}} · {{weight}}%",
-  "next.networking.flow.direct": "直连 · 无隧道",
   "next.networking.flow.killSwitchNote": "无代理，直连已关闭",
   "next.networking.flow.pool": "代理池",
   "next.networking.flow.poolRung": "{{name}} · 代理池",

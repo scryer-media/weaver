@@ -1352,7 +1352,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                       y={y + bypass - 18}
                       size={9.5}
                       state={status}
-                      label={`${t("next.networking.flow.direct")} · ${stateLabel(t, status)}`}
+                      label={`${t("next.networking.route.direct")} · ${stateLabel(t, status)}`}
                     />
                   </g>
                 )}

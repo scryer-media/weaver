@@ -1677,7 +1677,6 @@ export const nextFr: LocaleDictionary = {
   "next.networking.flow.openKillSwitch": "Définir une route pour {{name}}",
   "next.networking.flow.legTitle": "{{name}} · branche {{position}} · {{weight}} %",
   "next.networking.flow.legShort": "Branche {{position}} · {{weight}} %",
-  "next.networking.flow.direct": "Direct · sans tunnel",
   "next.networking.flow.killSwitchNote": "aucun proxy, direct désactivé",
   "next.networking.flow.pool": "Pool",
   "next.networking.flow.poolRung": "{{name}} · pool",

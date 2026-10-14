@@ -1677,7 +1677,6 @@ export const nextKo: LocaleDictionary = {
   "next.networking.flow.openKillSwitch": "{{name}} 경로 설정",
   "next.networking.flow.legTitle": "{{name}} · 레그 {{position}} · {{weight}}%",
   "next.networking.flow.legShort": "레그 {{position}} · {{weight}}%",
-  "next.networking.flow.direct": "직접 · 터널 없음",
   "next.networking.flow.killSwitchNote": "프록시 없음, 직접 연결 꺼짐",
   "next.networking.flow.pool": "풀",
   "next.networking.flow.poolRung": "{{name}} · 풀",

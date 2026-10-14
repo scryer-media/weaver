@@ -1677,7 +1677,6 @@ export const nextEs: LocaleDictionary = {
   "next.networking.flow.openKillSwitch": "Definir una ruta para {{name}}",
   "next.networking.flow.legTitle": "{{name}} · tramo {{position}} · {{weight}} %",
   "next.networking.flow.legShort": "Tramo {{position}} · {{weight}} %",
-  "next.networking.flow.direct": "Directo · sin túnel",
   "next.networking.flow.killSwitchNote": "sin proxy y sin ruta directa",
   "next.networking.flow.pool": "Grupo",
   "next.networking.flow.poolRung": "{{name}} · grupo",

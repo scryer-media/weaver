@@ -67,7 +67,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
  assert.deepEqual(await pool.locator("text").allTextContents(),["Europe · pool","24 connections","Active · pinned to Amsterdam"]);
  const chain=diagram.getByRole("group",{name:"Relay one > Relay two > Exit",exact:true});
  assert.deepEqual(await chain.locator("text").allTextContents(),["Relay one","Up",">","Relay two","Failing","endpoint","unreachable:","connection refused",">","Exit","Unreached"]);
- await diagram.getByText("Direct · no tunnel · Active",{exact:true}).first().waitFor();
+ await diagram.getByText("Direct · Active",{exact:true}).first().waitFor();
  const proxy=diagram.locator("a").filter({hasText:"Frankfurt · WireGuard"});
  assert.deepEqual(await proxy.locator("text").allTextContents(),["Frankfurt · WireGuard","Failing","handshake did not complete"]);
  await diagram.locator("a").filter({hasText:"Amsterdam · WireGuard"}).getByText("Active",{exact:true}).waitFor();

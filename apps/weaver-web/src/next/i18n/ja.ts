@@ -1677,7 +1677,6 @@ export const nextJa: LocaleDictionary = {
   "next.networking.flow.openKillSwitch": "{{name}} のルートを設定",
   "next.networking.flow.legTitle": "{{name}} · レッグ {{position}} · {{weight}}%",
   "next.networking.flow.legShort": "レッグ {{position}} · {{weight}}%",
-  "next.networking.flow.direct": "直接 · トンネルなし",
   "next.networking.flow.killSwitchNote": "プロキシなし、直接は無効",
   "next.networking.flow.pool": "プール",
   "next.networking.flow.poolRung": "{{name}} · プール",
