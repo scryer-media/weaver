@@ -54,7 +54,7 @@
 use crate::candidate_plan::{CandidatePlan, Next};
 type PlanState = CandidatePlan<SocketAddr>;
 use std::io;
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
@@ -231,6 +231,9 @@ pub(crate) trait AddressDialer: Send + Sync + 'static {
     fn resolve(&self) -> io::Result<Vec<SocketAddr>>;
 
     fn dial(&self, addr: SocketAddr) -> io::Result<Self::Stream>;
+
+    // Drops the answer `resolve` holds, after none of its addresses answered.
+    fn forget(&self) {}
 }
 
 // Plain TCP to a hostname's resolved addresses.
@@ -260,14 +263,19 @@ impl AddressDialer for TcpDialer {
     type Stream = TcpStream;
 
     fn resolve(&self) -> io::Result<Vec<SocketAddr>> {
-        Ok((self.host.as_str(), self.port)
-            .to_socket_addrs()?
-            .filter(|a| self.egress.supports_address(a.ip()))
+        Ok(weaver_tunnel::resolution::host_lookup_blocking(&self.host)?
+            .into_iter()
+            .filter(|ip| self.egress.supports_address(*ip))
+            .map(|ip| SocketAddr::new(ip, self.port))
             .collect())
     }
 
     fn dial(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         self.egress.connect_blocking(addr, self.timeout)
+    }
+
+    fn forget(&self) {
+        weaver_tunnel::resolution::forget_host(&self.host);
     }
 }
 
@@ -536,6 +544,7 @@ impl AddressPlan {
         for addr in slow {
             self.record_connect(addr, None);
         }
+        dialer.forget();
         let error = last_error.unwrap_or_else(|| {
             io::Error::new(io::ErrorKind::AddrNotAvailable, "no address answered")
         });

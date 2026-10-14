@@ -6,7 +6,7 @@ mod s2n_io;
 #[cfg(not(windows))]
 use std::ffi::{CStr, CString};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 #[cfg(not(windows))]
 use std::os::fd::AsRawFd;
 #[cfg(not(windows))]
@@ -3126,12 +3126,14 @@ fn connect_first_answering(
     timeout: Duration,
 ) -> Result<(TcpStream, SocketAddr)> {
     let mut last_error = None;
-    for addr in (host, port).to_socket_addrs().map_err(NntpError::Io)? {
+    for ip in weaver_tunnel::resolution::host_lookup_blocking(host).map_err(NntpError::Io)? {
+        let addr = SocketAddr::new(ip, port);
         match crate::egress::SocketEgress::System.connect_blocking(addr, timeout) {
             Ok(tcp) => return Ok((tcp, addr)),
             Err(error) => last_error = Some(error),
         }
     }
+    weaver_tunnel::resolution::forget_host(host);
     Err(NntpError::Io(last_error.unwrap_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "no NNTP address resolved")
     })))

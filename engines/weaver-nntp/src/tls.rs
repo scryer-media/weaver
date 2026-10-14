@@ -15,7 +15,7 @@ use s2n_tls::{config::Config as S2nConfig, security};
 use s2n_tls_tokio::{TlsConnector as S2nTlsConnector, TlsStream as S2nTlsStream};
 use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpStream, lookup_host};
+use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream as RustlsTlsStream;
 use tokio_rustls::rustls::client::{
     WebPkiServerVerifier,
@@ -1361,8 +1361,14 @@ pub(crate) async fn dial_direct(
             TcpStream::from_std(tcp)?
         }
         None => {
-            let addrs: Vec<SocketAddr> = lookup_host((host, port)).await?.collect();
-            connect_first_answering(&addrs).await?
+            let addrs: Vec<SocketAddr> = weaver_tunnel::resolution::host_lookup(host)
+                .await?
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect();
+            connect_first_answering(&addrs)
+                .await
+                .inspect_err(|_| weaver_tunnel::resolution::forget_host(host))?
         }
     };
     let remote_addr = Some(tcp.peer_addr()?);

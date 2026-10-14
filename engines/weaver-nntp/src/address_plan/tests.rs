@@ -25,6 +25,7 @@ struct ScriptedDialer {
     resolved: Mutex<Option<Vec<SocketAddr>>>,
     answers: Mutex<HashMap<SocketAddr, Answer>>,
     dialled: Mutex<Vec<SocketAddr>>,
+    forgotten: Mutex<usize>,
 }
 
 impl ScriptedDialer {
@@ -33,6 +34,7 @@ impl ScriptedDialer {
             resolved: Mutex::new(Some(resolved.to_vec())),
             answers: Mutex::new(HashMap::new()),
             dialled: Mutex::new(Vec::new()),
+            forgotten: Mutex::new(0),
         })
     }
 
@@ -83,6 +85,10 @@ impl AddressDialer for ScriptedDialer {
             let _ = gate.recv();
         }
         Ok(addr)
+    }
+
+    fn forget(&self) {
+        *self.forgotten.lock().unwrap() += 1;
     }
 }
 
@@ -965,6 +971,25 @@ fn a_failed_first_race_holds_further_races_off_for_a_while() {
     let snapshot = plan.snapshot();
     assert_eq!(snapshot.races_won, 1);
     assert_eq!(snapshot.pinned, Some(second));
+}
+
+// A race in which no address answered drops the answer the resolver holds,
+// so the next race asks it again; a race that is won keeps it.
+#[test]
+fn a_race_no_address_answered_drops_the_held_answer() {
+    let (first, second) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[first, second]);
+    dialer.answer(first, Answer::Refuse);
+    dialer.answer(second, Answer::Refuse);
+    plan().connect(&dialer).unwrap_err();
+    settle_all(&dialer);
+    assert_eq!(*dialer.forgotten.lock().unwrap(), 1);
+
+    let dialer = ScriptedDialer::new(&[first, second]);
+    dialer.answer(first, Answer::Refuse);
+    plan().connect(&dialer).unwrap();
+    settle_all(&dialer);
+    assert_eq!(*dialer.forgotten.lock().unwrap(), 0);
 }
 
 #[test]
