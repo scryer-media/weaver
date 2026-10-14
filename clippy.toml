@@ -9,6 +9,8 @@ disallowed-methods = [
     { path = "reqwest::ClientBuilder::build", reason = "fetch with proxies::routed_fetch or proxies::with_routed_client, so the request takes its route" },
     { path = "reqwest::get", reason = "fetch with proxies::routed_fetch, so the request takes its route" },
     { path = "application_updater::pipeline::application_upgrade_http_client", reason = "hand the updater a client from proxies::with_routed_client, so the upgrade takes its route" },
+    { path = "artifact_trust::prime_sigstore_trust_roots", reason = "prime with prime_sigstore_trust_roots_with and a client from proxies::with_routed_client, so the refresh takes its route" },
+    { path = "artifact_trust::refresh_sigstore_trusted_root", reason = "refresh with refresh_sigstore_trusted_root_with and a client from proxies::with_routed_client, so the refresh takes its route" },
     { path = "tokio_tungstenite::connect_async", reason = "connect through the proxy runtime, so the connection takes its route" },
     { path = "tokio::net::TcpStream::connect", reason = "dial through the proxy runtime, so the connection takes its route" },
     { path = "tokio::net::TcpSocket::connect", reason = "dial through the proxy runtime, so the connection takes its route" },

@@ -16,6 +16,8 @@ const BANNED: &[&str] = &[
     "reqwest::ClientBuilder::build",
     "reqwest::get",
     "application_updater::pipeline::application_upgrade_http_client",
+    "artifact_trust::prime_sigstore_trust_roots",
+    "artifact_trust::refresh_sigstore_trusted_root",
     "tokio_tungstenite::connect_async",
     "tokio::net::TcpStream::connect",
     "tokio::net::TcpSocket::connect",

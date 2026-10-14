@@ -393,7 +393,7 @@ pub(crate) async fn run(
     // not started either: the opt-out means no upgrade traffic at all.
     weaver_server_core::application_upgrade::install_default_rustls_provider();
     if update_check.enabled() {
-        weaver_server_core::application_upgrade::spawn_sigstore_trust_root_priming();
+        weaver_server_core::application_upgrade::spawn_sigstore_trust_root_priming(proxies.clone());
     }
 
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
