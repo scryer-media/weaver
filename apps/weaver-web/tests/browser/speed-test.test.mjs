@@ -60,17 +60,39 @@ test("a leg taken down is left out of the test, the run is followed to its resul
   const { page, errors } = await open("", "news.fixture.invalid");
   try {
     const plan = page.locator("main");
-    const legSwitch = plan.getByRole("switch", { name: "Leg 2 down", exact: true });
+    const legSwitch = plan.getByRole("radiogroup", { name: "Leg 2", exact: true });
     await legSwitch.waitFor();
-    assert.equal(await legSwitch.getAttribute("aria-checked"), "false");
-    // Every box the route passes through has its switch: both egresses, both legs, the pool's rung and each of its members.
-    for (const name of ["WAN Fiber down", "System down", "Leg 1 down", "Leg 1 rung 1 down", "Amsterdam down", "Frankfurt down"]) {
-      await plan.getByRole("switch", { name, exact: true }).waitFor();
+    // Every box the route passes through has its Up/Down switch, Up until it is turned: both egresses, both legs, the pool's rung and each of its members.
+    for (const name of ["WAN Fiber", "System", "Leg 1", "Leg 2", "Leg 1 rung 1", "Amsterdam", "Frankfurt"]) {
+      const choices = plan.getByRole("radiogroup", { name, exact: true }).getByRole("radio");
+      assert.deepEqual(await choices.allTextContents(), ["Up", "Down"], name);
+      assert.deepEqual(await choices.evaluateAll((all) => all.map((one) => one.getAttribute("aria-checked"))), ["true", "false"], name);
     }
-    await legSwitch.click();
-    await plan.getByRole("switch", { name: "Leg 2 down", checked: true, exact: true }).waitFor();
+    const [up, down] = [legSwitch.getByRole("radio", { name: "Up", exact: true }), legSwitch.getByRole("radio", { name: "Down", exact: true })];
+    // Up is green and Down red, each only while it is the one chosen.
+    const fill = (radio) => radio.locator("rect").first().getAttribute("fill");
+    const [upOn, downOff] = [await fill(up), await fill(down)];
+    await down.click();
+    await legSwitch.getByRole("radio", { name: "Down", checked: true, exact: true }).waitFor();
+    const [upOff, downOn] = [await fill(up), await fill(down)];
+    assert.equal(upOff, downOff);
+    assert.notEqual(upOn, upOff);
+    assert.notEqual(downOn, downOff);
+    assert.notEqual(upOn, downOn);
+    // A click leaves no focus ring behind.
+    assert.equal(await down.evaluate((radio) => radio === document.activeElement), false);
+    // The keyboard moves between the two and shows where it is.
+    await down.focus();
+    await page.keyboard.press("ArrowLeft");
+    await up.and(page.locator(":focus-visible")).waitFor();
+    await legSwitch.getByRole("radio", { name: "Up", checked: true, exact: true }).waitFor();
+    await page.keyboard.press("ArrowRight");
+    await legSwitch.getByRole("radio", { name: "Down", checked: true, exact: true }).waitFor();
+    await shot(page, "speed-switches", plan.locator("svg").first());
 
-    // A server is tested over Usenet by default; a feed could not be. The route's flow ends at the server.
+    // A run measures bandwidth until Usenet is picked; a feed could not pick it. The route's flow ends at the server.
+    await page.getByRole("radio", { name: "Bandwidth", checked: true, exact: true }).waitFor();
+    await page.getByRole("radio", { name: "Usenet", exact: true }).click();
     await page.getByRole("radio", { name: "Usenet", checked: true, exact: true }).waitFor();
     await plan.locator("svg").getByText("Usenet · 100 MB", { exact: true }).waitFor();
     await page.getByRole("spinbutton", { name: "Max duration", exact: true }).waitFor();
@@ -153,6 +175,10 @@ test("a leg taken down is left out of the test, the run is followed to its resul
     await feed.click();
     // The run's flow ends at the host it measured against.
     await page.locator("main svg").getByText("speed.fixture.invalid", { exact: true }).waitFor();
+    // A bandwidth result is its rates; how much it downloaded is not one of its figures.
+    const feedResult = page.getByRole("region", { name: "Result", exact: true }).filter({ has: stat(page, "Peak") }).last();
+    await stat(feedResult, "Average").waitFor();
+    assert.equal(await feedResult.getByText("Downloaded", { exact: true }).count(), 0);
     const runAgain = page.getByRole("button", { name: "Run again", exact: true });
     await runAgain.and(page.locator(":enabled")).waitFor();
     assert.equal(await runAgain.count(), 1);
@@ -196,6 +222,7 @@ test("a feed is tested for bandwidth only, and a custom URL must be HTTPS before
     await progress.getByText("Measuring", { exact: true }).waitFor();
     await progress.getByRole("img", { name: "Speed", exact: true }).locator("polyline").waitFor({ state: "attached" });
     assert.equal(await progress.getByRole("img", { name: "Decode", exact: true }).count(), 0);
+    assert.equal(await progress.getByText("Downloaded", { exact: true }).count(), 0);
     await shot(page, "speed-progress-bandwidth", progress);
     const [start] = await sent(page, "StartSpeedTest");
     assert.deepEqual(start.input, {
@@ -217,6 +244,7 @@ test("the route editor tests the draft as it stands, unsaved", async () => {
     await editor.waitFor();
     await editor.getByRole("button", { name: "Speed test", exact: true }).click();
     const test = editor.getByRole("region", { name: "Speed test", exact: true });
+    await test.getByRole("radio", { name: "Usenet", exact: true }).click();
     await test.getByRole("button", { name: "Run", exact: true }).click();
     await test.getByRole("region", { name: "Progress", exact: true }).waitFor();
     const [start] = await sent(page, "StartSpeedTest");
@@ -242,6 +270,7 @@ test("a Usenet test takes one .nzb file, sent with the start, and runs it again 
   try {
     const plan = page.locator("main");
     const run = page.getByRole("button", { name: "Run", exact: true });
+    await page.getByRole("radio", { name: "Usenet", exact: true }).click();
     await page.getByRole("button", { name: "NZB", exact: true }).click();
     await page.getByRole("menuitemradio", { name: "File", exact: true }).click();
     // Until a .nzb file is chosen there is nothing to run.
@@ -291,6 +320,7 @@ test("while a job downloads, Run and Run again ask before pausing downloads, and
   const { page, errors } = await open("?downloading", "news.fixture.invalid");
   try {
     const confirm = page.getByRole("dialog", { name: "Pause downloads?", exact: true });
+    await page.getByRole("radio", { name: "Usenet", exact: true }).click();
     await page.getByRole("button", { name: "Run", exact: true }).click();
     await confirm.getByText("Downloads pause while the test runs and resume when it ends.", { exact: true }).waitFor();
     await shot(page, "speed-pause-confirm");
@@ -322,6 +352,7 @@ test("with no job downloading, a rate on the header gauge does not make Run or R
   const { page, errors } = await open("?gauge", "news.fixture.invalid");
   try {
     const confirm = page.getByRole("dialog", { name: "Pause downloads?", exact: true });
+    await page.getByRole("radio", { name: "Usenet", exact: true }).click();
     const started = (count) =>
       page.waitForFunction(
         (count) => document.querySelector('[role="dialog"]') !== null

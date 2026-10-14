@@ -55,7 +55,7 @@ const FETCHING = new Set(["DOWNLOADING", "FETCHING_REPAIR_DATA", "FINALIZING_DOW
 
 export function defaultForm(consumer: Pick<Consumer, "kind" | "cap">): TestForm {
   return {
-    kind: consumer.kind === "RSS" ? "BANDWIDTH" : "USENET",
+    kind: "BANDWIDTH",
     providerId: "cloudflare",
     server: "",
     customUrl: "",
@@ -577,7 +577,7 @@ export function RunProgress({ run, onCancel }: { run: SpeedTestRun; onCancel: ()
         ) : null}
       </div>
       <MetricStrip min={132}>
-        <MetricCell variant="stat" eyebrow={t("next.networking.speed.downloaded")} value={bytes.value} unit={bytes.unit} />
+        {usenet ? <MetricCell variant="stat" eyebrow={t("next.networking.speed.downloaded")} value={bytes.value} unit={bytes.unit} /> : null}
         {usenet ? <MetricCell variant="stat" eyebrow={t("next.networking.speed.decoded")} value={decoded.value} unit={decoded.unit} /> : null}
         {run.tested.legs
           .filter((leg) => !leg.down)
@@ -661,16 +661,16 @@ export function RunResult({ run, better = {} }: { run: SpeedTestRun; better?: Be
             <MetricCell variant="hero" eyebrow={t("next.networking.speed.average")} {...figure("average", splitSpeed(result.averageBps))} />
             <MetricCell variant="hero" eyebrow={t("next.networking.speed.peak")} {...figure("peak", splitSpeed(result.peakBps))} />
           </MetricStrip>
-          <MetricStrip min={140}>
-            <MetricCell variant="stat" eyebrow={t("next.networking.speed.downloaded")} {...figure("downloaded", splitBytes(result.bytes))} />
-            {run.kind === "USENET" ? (
+          {run.kind === "USENET" ? (
+            <MetricStrip min={140}>
+              <MetricCell variant="stat" eyebrow={t("next.networking.speed.downloaded")} {...figure("downloaded", splitBytes(result.bytes))} />
               <MetricCell
                 variant="stat"
                 eyebrow={t("next.networking.speed.decoded")}
                 {...figure("decoded", splitBytes(result.usenet?.decodedBytes ?? 0))}
               />
-            ) : null}
-          </MetricStrip>
+            </MetricStrip>
+          ) : null}
         </>
       ) : null}
     </section>
