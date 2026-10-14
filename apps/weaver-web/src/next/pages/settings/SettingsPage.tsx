@@ -38,7 +38,7 @@ function SearchOutcomeState({ search, registry }: { search: string; registry: Se
  * One panel is mounted at a time; the top bar's Search, Revert and Save and
  * the status bar's dirty line belong to the shell, and the panel publishes
  * what they act on through `usePanelState`. Panels that write immediately —
- * the list-shaped ones — simply never publish, and the two buttons stay in
+ * the list-shaped ones and General — simply never publish, and the two buttons stay in
  * their resting state, which is exactly what the handoff draws.
  *
  * The search box searches every panel, not only the open one: while it holds
