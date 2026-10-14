@@ -10,6 +10,7 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { proxyLabels, type ProxyKind, type ProxyProfile, type ProxyResolver } from "@/lib/proxies";
 import { cn } from "@/lib/utils";
+import { proxyTestSentence } from "@/lib/proxy-fault";
 import { refusalMessage } from "@/lib/refusal";
 import {
   WIREGUARD_KEY,
@@ -252,8 +253,14 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
     const outcome = result.data?.testProxyProfile;
     setHealth((current) => ({
       ...current,
-      [profile.id]: outcome ? (outcome.message || (outcome.success ? t("next.proxies.reachable") : t("next.proxies.failed")))
-        : (result.error?.message ?? t("next.proxies.failed")),
+      [profile.id]: outcome
+        ? proxyTestSentence(t, {
+            ...outcome,
+            message: outcome.message || (outcome.success ? t("next.proxies.reachable") : t("next.proxies.failed")),
+          })
+        : result.error
+          ? refusalMessage(t, result.error)
+          : t("next.proxies.failed"),
     }));
   };
 

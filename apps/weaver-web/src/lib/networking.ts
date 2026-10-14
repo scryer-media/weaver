@@ -12,8 +12,11 @@ export type DownloadQuota = { enabled: boolean; period: QuotaPeriod; limitBytes:
 export type DownloadQuotaUsage = { usedBytes: number; reservedBytes: number; remainingBytes: number | null; blocked: boolean; windowStartsAtEpochMs: number | null; windowEndsAtEpochMs: number | null; timezoneName: string };
 export type ProxyPool = { id: number; name: string; kind: ProxyKind; memberIds: number[]; enabled: boolean };
 export type LegFlow = Leg & { rungStates?:string[]; consumer: string; position: number; target: number; open: number; opening: number; state: string; reason: string | null; pinnedAddress: string | null; sourceAddress?:string|null;bytesPerSecond?:number;selectedRung?:number|null;selectedProxyId?:number|null;failingHops?:FailingHop[] };
-/** The first proxy hop on a ladder rung known to be failing, and what its last attempt came to. */
-export type FailingHop = { rung: number; proxyId: number; reason: string };
+/**
+ * The first proxy hop on a ladder rung known to be failing, and what its last
+ * attempt came to: a code, the values its sentence names, and the daemon's English.
+ */
+export type FailingHop = { rung: number; proxyId: number; reason: string; code: string; params?: unknown };
 export type PoolMemberFlow = { state?:string; id: number; open: number; opening: number; warmed: boolean; blocked: string | null; connectMs: number | null; bytesPerSecond: number | null; liveBytesPerSecond: number; samples: number; failures: number };
 export type NetworkFlow = { consumers?:{key:string;id:number;name:string;kind:ConsumerKind;cap:number;route:NetworkRoute}[]; proxies?:import("./proxies").ProxyProfile[]; proxyPools?:ProxyPool[]; egresses?:Egress[]; sampledAt?:number;legs: LegFlow[]; pools: PoolFlow[] };
 /** A pool on one egress as it runs: `liveBytesPerSecond` on a member is what it carries now, `bytesPerSecond` what the pool judges it by. */

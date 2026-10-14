@@ -70,10 +70,10 @@ test("flow displays route evidence, opens editors, and edits weights without los
  const pool=diagram.locator("a").filter({hasText:"Europe · pool"});
  assert.deepEqual(await pool.locator("text").allTextContents(),["Europe · pool","24 connections","Active"]);
  const chain=diagram.getByRole("group",{name:"Relay one > Relay two > Exit",exact:true});
- assert.deepEqual(await chain.locator("text").allTextContents(),["Relay one","Up",">","Relay two","Failing","endpoint","unreachable:","connection refused",">","Exit","Unreached"]);
+ assert.deepEqual(await chain.locator("text").allTextContents(),["Relay one","Up",">","Relay two","Failing","The connection was","refused. Check the","port and that the","proxy is running.",">","Exit","Unreached"]);
  await diagram.getByText("Direct · Active",{exact:true}).first().waitFor();
  const proxy=diagram.locator("a").filter({hasText:"Frankfurt · WireGuard"});
- assert.deepEqual(await proxy.locator("text").allTextContents(),["Frankfurt · WireGuard","Failing","handshake did not complete"]);
+ assert.deepEqual(await proxy.locator("text").allTextContents(),["Frankfurt · WireGuard","Failing","No handshake within 12 seconds. Check the endpoint, and that the","server's peer list has public key Fixture+peer+key=."]);
  await diagram.locator("a").filter({hasText:"Amsterdam · WireGuard"}).getByText("Active",{exact:true}).waitFor();
  assert.equal(await diagram.locator("a[href='/settings/networking/proxies']").count(),9);
  // A server behind a kill switch has no rung and may not go direct: the kill switch is the box its line stops at.

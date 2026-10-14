@@ -15,6 +15,7 @@ import {
   type ProxyPool,
   type Rung,
 } from "@/lib/networking";
+import { proxyFaultSentence } from "@/lib/proxy-fault";
 import { proxyLabels, type ProxyProfile } from "@/lib/proxies";
 import { EmptyState } from "../../components/chrome";
 import { SecondaryButton, Select } from "../../components/controls";
@@ -708,7 +709,9 @@ export const NetworkFlow = memo(function NetworkFlow({
             ? flow.pools.find((candidate) => candidate.poolId === rung.poolId && candidate.egressId === leg.egressId)
             : undefined;
         const configured = rung.kind === "POOL" ? pools.find((candidate) => candidate.id === rung.poolId) : undefined;
-        const failing = leg.failingHops?.find((hop) => hop.rung === rungIndex);
+        const hop = leg.failingHops?.find((candidate) => candidate.rung === rungIndex);
+        // The hop's failure in our sentence for its code.
+        const failing = hop && { ...hop, reason: proxyFaultSentence(t, { ...hop, message: hop.reason }) };
         const members: Member[] = (configured?.memberIds ?? live?.members.map((member) => member.id) ?? []).map((id) => {
           const member = live?.members.find((candidate) => candidate.id === id);
           const measured = member != null && (member.connectMs != null || member.bytesPerSecond != null);
@@ -785,7 +788,7 @@ export const NetworkFlow = memo(function NetworkFlow({
       lanes === COMPACT_ENDPOINT ? endpointY + ENDPOINT_BOX_HEIGHT : 0,
     );
     return { rows, endpointY, height: compact ? bottom + 12 : Math.max(bottom + 52, 260) };
-  }, [shownLegs, flow.pools, grouped, group, pools, profiles, egressBottom, cardsBottom, lanes, compact, toggleWidth, overrides]);
+  }, [shownLegs, flow.pools, grouped, group, pools, profiles, egressBottom, cardsBottom, lanes, compact, toggleWidth, overrides, t]);
 
   const width = scale(Math.max(RIBBON_FULL, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
   const profile = (id: number | null) => profiles.find((candidate) => candidate.id === id);

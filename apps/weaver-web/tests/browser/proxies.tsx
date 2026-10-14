@@ -76,7 +76,7 @@ function graphql(name: string, variables: Record<string, unknown>) {
     else profiles.push(saved);
     return { data: { saveProxyProfile: { id: saved.id } } };
   }
-  return { data: { proxyProfiles: profiles.map(view), testProxyProfile: { success: true, message: "" } } };
+  return { data: { proxyProfiles: profiles.map(view), testProxyProfile: { success: true, code: "REACHABLE", message: "", params: {} } } };
 }
 /* Every pool save the pools page sends, as it sends it. */
 const poolSaves: Record<string, unknown>[] = [];

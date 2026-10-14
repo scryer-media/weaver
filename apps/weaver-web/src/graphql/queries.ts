@@ -173,7 +173,7 @@ export const PARSED_RELEASE_FIELDS = `
 const SERVER_FIELDS = `
   fragment ServerFields on Server {
     routing: route { failover legs { egressId weight path { kind directFallback rungs { kind proxyId poolId chainIds } } } }
-    routingStatus { state selectedProxyId failures { proxyId message } }
+    routingStatus { state selectedProxyId failures { proxyId message code params } }
     id
     host
     port
@@ -209,7 +209,7 @@ const SERVER_FIELDS = `
 const SERVER_DETAILS_FIELDS = `
   fragment ServerDetailsFields on ServerDetails {
     routing: route { failover legs { egressId weight path { kind directFallback rungs { kind proxyId poolId chainIds } } } }
-    routingStatus { state selectedProxyId failures { proxyId message } }
+    routingStatus { state selectedProxyId failures { proxyId message code params } }
     id
     host
     port
@@ -594,7 +594,7 @@ const RSS_RULE_FIELDS = `
 const RSS_FEED_FIELDS = `
   fragment RssFeedFields on RssFeed {
     routing: route { failover legs { egressId weight path { kind directFallback rungs { kind proxyId poolId chainIds } } } }
-    routingStatus { state selectedProxyId failures { proxyId message } }
+    routingStatus { state selectedProxyId failures { proxyId message code params } }
     id
     name
     url

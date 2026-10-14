@@ -17,7 +17,7 @@ export function routeFields(policy: RoutingPolicy) {
   const route=policyAsRoute(policy);
   return route.legs.length===1&&closedPath(route.legs[0]!.path)?{routing:blockedRouting}:{route:routeInput(route)};
 }
-export type RoutingStatus = { state: string; selectedProxyId: number | null; failures: { proxyId: number; message: string }[] };
+export type RoutingStatus = { state: string; selectedProxyId: number | null; failures: { proxyId: number; message: string; code: string; params?: unknown }[] };
 export const directRouting: RoutingPolicy = { proxyIds: [], allowDirect: true };
 /** The daemon accepts at most this many proxy routes in one policy. */
 export const MAX_PROXY_ROUTES = 8;
