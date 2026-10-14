@@ -1,22 +1,23 @@
+use std::sync::Arc;
 use std::time::Duration;
 
+use super::http::{NZB_LIMIT, TestArticle, parse_test_nzb};
 use crate::proxies::{Consumer, Failover, LegPath, Route};
 
 // What a run measures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpeedTestKind {
-    // HTTPS GETs from a speed-test endpoint through the route. `bytes` is
-    // what each stream asks for.
+    // Repeated HTTPS GETs of the provider's largest download through the
+    // route, over as many connections as the line takes.
     Bandwidth {
         provider: BandwidthProvider,
-        bytes: u64,
-        streams: u8,
     },
     // The live fused article fetch of every article in a test NZB from the
     // server. `None` takes the server's whole connection allowance.
     Usenet {
         nzb: TestNzbSource,
         connections: Option<u16>,
+        max_duration: Duration,
     },
 }
 
@@ -83,16 +84,60 @@ impl SabTestSize {
 pub enum TestNzbSource {
     SabnzbdTest { size: SabTestSize },
     Url(reqwest::Url),
+    // An uploaded NZB; `run` is the held run it was taken from, when it was.
+    Upload { nzb: UploadedNzb, run: Option<u32> },
 }
 
 impl TestNzbSource {
-    pub fn url(&self) -> Result<reqwest::Url, String> {
+    // Where the NZB is fetched from; `None` for an upload.
+    pub fn url(&self) -> Result<Option<reqwest::Url>, String> {
         match self {
-            Self::SabnzbdTest { size } => {
-                reqwest::Url::parse(size.url()).map_err(|e| e.to_string())
-            }
-            Self::Url(url) => Ok(url.clone()),
+            Self::SabnzbdTest { size } => reqwest::Url::parse(size.url())
+                .map(Some)
+                .map_err(|e| e.to_string()),
+            Self::Url(url) => Ok(Some(url.clone())),
+            Self::Upload { .. } => Ok(None),
         }
+    }
+}
+
+// An NZB uploaded with a request. It is held in memory only, for as long as
+// the run that holds it is.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UploadedNzb {
+    filename: String,
+    bytes: Arc<[u8]>,
+}
+
+impl UploadedNzb {
+    // Refused past the size a fetched test NZB may have, and when it does not
+    // read as a fetched one would.
+    pub fn read(filename: String, bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > NZB_LIMIT {
+            return Err(format!("the test NZB is larger than {NZB_LIMIT} bytes"));
+        }
+        parse_test_nzb(bytes)?;
+        Ok(Self {
+            filename,
+            bytes: bytes.into(),
+        })
+    }
+
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    pub(crate) fn articles(&self) -> Result<Vec<TestArticle>, String> {
+        parse_test_nzb(&self.bytes)
+    }
+}
+
+impl std::fmt::Debug for UploadedNzb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadedNzb")
+            .field("filename", &self.filename)
+            .field("bytes", &self.bytes.len())
+            .finish()
     }
 }
 
@@ -125,13 +170,10 @@ pub struct SpeedTestRequest {
     pub route: Option<Route>,
     pub overrides: PathOverride,
     pub kind: SpeedTestKind,
-    pub max_duration: Duration,
 }
 
-// The longest a run may measure for.
+// The longest a Usenet run may measure for.
 pub const MAX_DURATION: Duration = Duration::from_secs(15 * 60);
-// The most streams a bandwidth run may open.
-pub const MAX_STREAMS: u8 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpeedTestStatus {
@@ -199,7 +241,7 @@ pub struct TestedLegSnapshot {
     // The leg's path as the route has it; the run's overrides say which of
     // its rungs, members and hops were down.
     pub path: LegPath,
-    // Connections (Usenet) or streams (bandwidth) the leg was given.
+    // Connections the leg was given; a bandwidth run's grow as it ramps.
     pub target: u16,
 }
 
@@ -262,7 +304,8 @@ pub struct BandwidthResult {
     pub provider_id: Option<String>,
     pub server: Option<String>,
     pub url: String,
-    pub streams: u32,
+    // Parallel connections the run ended with.
+    pub connections: u32,
 }
 
 // Bytes one leg moved in one second of the measurement.
@@ -271,6 +314,8 @@ pub struct Sample {
     pub at_ms: u64,
     pub leg: usize,
     pub bytes: u64,
+    // Decoded bytes the leg produced in that second; Usenet only.
+    pub decoded_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

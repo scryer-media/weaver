@@ -32,7 +32,7 @@ type SpeedTestRun = {
     bytes: number; averageBps: number; peakBps: number;
     connections: Array<{ leg: number; path: DialPath; bytes: number; error: string | null }>;
     usenet: { articlesRequested: number; delivered: number; missing: number; failed: number; declaredBytes: number; decodedBytes: number } | null;
-    bandwidth: { providerId: string | null; url: string; streams: number } | null;
+    bandwidth: { providerId: string | null; url: string; connections: number } | null;
   } | null;
 };
 
@@ -41,7 +41,7 @@ const RUN_FIELDS = `id consumer consumerName kind status phase error
   result { bytes averageBps peakBps
     connections { leg bytes error path { egressId rung poolId memberId proxyIds } }
     usenet { articlesRequested delivered missing failed declaredBytes decodedBytes }
-    bandwidth { providerId url streams } }`;
+    bandwidth { providerId url connections } }`;
 
 async function speedTestRun(request: APIRequestContext, id: number): Promise<SpeedTestRun> {
   const run = (await graphql<{ speedTestRun: SpeedTestRun | null }>(request,
@@ -60,7 +60,7 @@ async function startRefusal(request: APIRequestContext, server: number, nzbUrl: 
   // The session is already established by the calls before this one.
   const response = await request.post(weaverRoute("/graphql"), { data: {
     query: "mutation($input: SpeedTestInput!) { startSpeedTest(input: $input) { id } }",
-    variables: { input: { kind: "SERVER", id: server, usenet: { nzbUrl }, maxDurationSeconds: 900 } },
+    variables: { input: { kind: "SERVER", id: server, usenet: { nzbUrl, maxDurationSeconds: 900 } } },
   } });
   const body = await response.json() as { errors?: Array<{ message: string; extensions?: { code?: string } }> };
   expect(body.errors ?? [], "one refusal").toHaveLength(1);
@@ -165,7 +165,7 @@ class SpeedPage {
   }
 
   get runButton(): Locator {
-    return this.test.getByRole("button", { name: "Run · pauses downloads", exact: true });
+    return this.test.getByRole("button", { name: "Run", exact: true });
   }
 
   // The switch that takes leg `position` (1-based) down for the next run.
@@ -181,20 +181,12 @@ class SpeedPage {
     await expect(this.test.getByRole("alert")).toHaveText(message);
   }
 
-  // A bandwidth run against Cloudflare, `streams` streams of the largest
-  // size it serves, allowed long enough to finish on a slow uplink.
-  async useCloudflare(streams: number): Promise<void> {
+  // A bandwidth run against Cloudflare. The run picks its own connections
+  // and length.
+  async useCloudflare(): Promise<void> {
     await this.test.getByRole("radio", { name: "Bandwidth", exact: true }).click();
     await expect(this.test.getByRole("radio", { name: "Bandwidth", exact: true })).toHaveAttribute("aria-checked", "true");
     await expect(this.test.getByRole("button", { name: "Provider", exact: true })).toContainText("Cloudflare");
-    const count = this.test.getByRole("spinbutton", { name: "Streams", exact: true });
-    await count.fill(String(streams));
-    await count.press("Tab");
-    await expect(count).toHaveValue(String(streams));
-    const duration = this.test.getByRole("spinbutton", { name: "Max duration", exact: true });
-    await duration.fill("900");
-    await duration.press("Tab");
-    await expect(duration).toHaveValue("900");
   }
 
   // Press Run and return the id the start answered with.
@@ -402,20 +394,16 @@ test("ST03 cancelling a run ends it Cancelled and resumes the queue it paused", 
   await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
 });
 
-// The largest download Cloudflare serves in one request; a larger one is
-// refused with 403, so the provider caps the size at it.
-const CLOUDFLARE_MAX_BYTES = 99_999_999;
 const CLOUDFLARE_HOST = "speed.cloudflare.com";
 
 test("ST04 a bandwidth run against Cloudflare measures through the proxy rung and books nothing as downloaded", async ({ cleanPage: page, request }) => {
   test.setTimeout(0);
-  const streams = 1;
   const { a, connect1, server } = await ladderedServer();
   const queueControl = await downloadsTab(page);
   await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
   const speed = new SpeedPage(page);
   await speed.open(server);
-  await speed.useCloudflare(streams);
+  await speed.useCloudflare();
 
   const before = await bytesDownloaded(request);
   const mark = await fixtureMark(request);
@@ -424,12 +412,14 @@ test("ST04 a bandwidth run against Cloudflare measures through the proxy rung an
   const run = await speedTestRun(request, id);
   expect(run).toMatchObject({ status: "COMPLETED", kind: "BANDWIDTH", consumer: `server:${server}`, error: null });
   const result = run.result!;
-  expect(result.bandwidth).toMatchObject({ providerId: "cloudflare", streams });
+  expect(result.bandwidth).toMatchObject({ providerId: "cloudflare" });
   expect(result.bandwidth!.url).toContain(CLOUDFLARE_HOST);
+  expect(result.bandwidth!.connections).toBeGreaterThanOrEqual(1);
   expect(result.usenet).toBeNull();
-  expect(result.bytes).toBe(CLOUDFLARE_MAX_BYTES * streams);
+  expect(result.bytes).toBeGreaterThan(0);
   expect(result.averageBps).toBeGreaterThan(0);
-  expect(result.connections.length).toBeGreaterThan(0);
+  // One row per connection the run opened.
+  expect(result.connections).toHaveLength(result.bandwidth!.connections);
   for (const connection of result.connections) {
     expect(connection.path, "every connection dials the proxy rung").toMatchObject({ egressId: a.id, rung: 0, proxyIds: [connect1.id] });
     expect(connection.error).toBeNull();

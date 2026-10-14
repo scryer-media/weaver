@@ -408,21 +408,25 @@ fn hold_parks_a_downed_legs_connections() {
     assert_eq!(first.connection_targets(7).unwrap(), vec![0, 2, 1]);
 }
 
+fn shares(tested: &TestedRoute, count: u32) -> Vec<u16> {
+    weight_shares(&tested.weights(), &tested.healthy(), count)
+}
+
 #[test]
-fn streams_follow_weight_with_at_least_one_per_leg_up() {
+fn shares_follow_weight_with_at_least_one_per_leg_up() {
     let route = route(
         vec![leg(0, 60, LegPath::Direct), leg(1, 40, LegPath::Direct)],
         Failover::Redistribute,
     );
     let all = down(PathOverride::default(), &route);
     assert_eq!(
-        all.stream_targets(4),
+        shares(&all, 4),
         vec![2, 2],
         "2.4 and 1.6: the larger remainder wins"
     );
-    assert_eq!(all.stream_targets(5), vec![3, 2]);
-    assert_eq!(all.stream_targets(10), vec![6, 4]);
-    assert_eq!(all.stream_targets(1), vec![1, 1], "a leg never gets zero");
+    assert_eq!(shares(&all, 5), vec![3, 2]);
+    assert_eq!(shares(&all, 10), vec![6, 4]);
+    assert_eq!(shares(&all, 1), vec![1, 1], "a leg never gets zero");
     let second = down(
         PathOverride {
             down_legs: vec![0],
@@ -430,17 +434,43 @@ fn streams_follow_weight_with_at_least_one_per_leg_up() {
         },
         &route,
     );
-    assert_eq!(second.stream_targets(4), vec![0, 4]);
+    assert_eq!(shares(&second, 4), vec![0, 4]);
     let three = down(PathOverride::default(), &three_legs(Failover::Hold));
-    assert_eq!(three.stream_targets(5), vec![3, 1, 1]);
+    assert_eq!(shares(&three, 5), vec![3, 1, 1]);
     let lopsided = Route {
         legs: vec![leg(0, 90, LegPath::Direct), leg(1, 10, LegPath::Direct)],
         failover: Failover::Redistribute,
     };
     let lopsided = down(PathOverride::default(), &lopsided);
     assert_eq!(
-        lopsided.stream_targets(4),
+        shares(&lopsided, 4),
         vec![3, 1],
         "the light leg's one comes from the heavy leg"
     );
+}
+
+#[test]
+fn the_next_connection_goes_to_the_leg_furthest_below_its_share() {
+    let weights = [60, 40];
+    let both = [true, true];
+    let mut opened = vec![1u16, 1];
+    let mut placed = Vec::new();
+    for _ in 0..8 {
+        let leg = next_leg(&weights, &both, &opened).unwrap();
+        opened[leg] += 1;
+        placed.push(leg);
+    }
+    assert_eq!(placed, vec![0, 1, 0, 0, 1, 0, 1, 0]);
+    assert_eq!(opened, vec![6, 4], "ten connections split as the shares do");
+    assert_eq!(
+        next_leg(&[50, 50], &both, &[1, 1]),
+        Some(0),
+        "an even tie goes to the earlier leg"
+    );
+    assert_eq!(
+        next_leg(&weights, &[false, true], &[3, 1]),
+        Some(1),
+        "a leg that is not usable is never picked"
+    );
+    assert_eq!(next_leg(&weights, &[false, false], &[1, 1]), None);
 }

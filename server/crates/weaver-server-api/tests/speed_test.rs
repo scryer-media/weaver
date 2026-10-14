@@ -1,6 +1,8 @@
 mod common;
+use async_graphql::{Request, UploadValue, Variables};
 use common::{TestHarness, assert_no_errors, response_data};
 use std::sync::atomic::Ordering;
+use weaver_server_api::auth::{CallerIdentity, CallerScope};
 use weaver_server_core::proxies::ProxyRuntime;
 use weaver_server_core::speed_test::SpeedTestStatus;
 use weaver_server_core::speed_test::fixture::{FixtureArticle, HttpFixture, NntpFixture, nzb};
@@ -41,7 +43,7 @@ async fn add_server(h: &TestHarness, nntp: &NntpFixture) -> u64 {
 
 const DIRECT: &str = "{legs:[{egressId:0,weight:100,path:{direct:true}}]}";
 
-const RUN_SHAPE: &str = "id consumer consumerName kind request{bandwidth{providerId server customUrl bytes streams} usenet{sabSize nzbUrl connections} maxDurationSeconds} status phase startedAt finishedAt error tested{legs{position egressId weight down downReason target path{kind}} failover overrides{downLegs downRungs{leg rung} downProxies downEgresses} names{kind id name}} result{bytes elapsedMs averageBps peakBps legs{position bytes connections sourceAddresses} connections{leg connectMs bytes error sourceAddress path{egressId rung poolId memberId proxyIds}} usenet{articlesRequested delivered missing failed declaredBytes decodedBytes pipelining tls tlsCipherSuite} bandwidth{url} samples{atMs leg bytes}}";
+const RUN_SHAPE: &str = "id consumer consumerName kind request{bandwidth{providerId server customUrl} usenet{sabSize nzbUrl nzbFilename nzbRunId connections maxDurationSeconds}} status phase startedAt finishedAt error tested{legs{position egressId weight down downReason target path{kind}} failover overrides{downLegs downRungs{leg rung} downProxies downEgresses} names{kind id name}} result{bytes elapsedMs averageBps peakBps legs{position bytes connections sourceAddresses} connections{leg connectMs bytes error sourceAddress path{egressId rung poolId memberId proxyIds}} usenet{articlesRequested delivered missing failed declaredBytes decodedBytes pipelining tls tlsCipherSuite} bandwidth{providerId server url connections} samples{atMs leg bytes decodedBytes}}";
 
 async fn start(h: &TestHarness, input: &str) -> serde_json::Value {
     let response = h
@@ -51,6 +53,40 @@ async fn start(h: &TestHarness, input: &str) -> serde_json::Value {
         .await;
     assert_no_errors(&response);
     response_data(&response)["startSpeedTest"].clone()
+}
+
+// Start a run whose `usenet` input carries `upload` as its `nzbUpload`,
+// beside `usenet`'s other fields.
+async fn start_with_upload(
+    h: &TestHarness,
+    server: u64,
+    usenet: serde_json::Value,
+    upload: &[u8],
+) -> async_graphql::Response {
+    let mut usenet = usenet;
+    usenet["nzbUpload"] = serde_json::Value::Null;
+    let mut request = Request::new(format!(
+        "mutation Start($input: SpeedTestInput!){{startSpeedTest(input:$input){{{RUN_SHAPE}}}}}"
+    ))
+    .data(CallerScope::Local)
+    .data(CallerIdentity::Local([7; 32]))
+    .variables(Variables::from_json(serde_json::json!({
+        "input": {
+            "kind": "SERVER",
+            "id": server,
+            "route": {"legs": [{"egressId": 0, "weight": 100, "path": {"direct": true}}]},
+            "usenet": usenet,
+        }
+    })));
+    request.set_upload(
+        "variables.input.usenet.nzbUpload",
+        UploadValue {
+            filename: "test.nzb".into(),
+            content_type: Some("application/x-nzb".into()),
+            content: upload.to_vec().into(),
+        },
+    );
+    h.schema.execute(request).await
 }
 
 async fn run(h: &TestHarness, id: u64) -> serde_json::Value {
@@ -82,10 +118,10 @@ async fn finished(h: &TestHarness, id: u64) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn providers_are_listed_with_their_sizes() {
+async fn providers_are_listed_with_their_hosts() {
     let h = harness().await;
     let response = h
-        .execute("{bandwidthProviders{id name fixedSizes anySize maxBytes needsServer}}")
+        .execute("{bandwidthProviders{id name host needsServer}}")
         .await;
     assert_no_errors(&response);
     let providers = response_data(&response)["bandwidthProviders"].clone();
@@ -99,10 +135,73 @@ async fn providers_are_listed_with_their_sizes() {
         ids,
         ["cloudflare", "sabnzbd", "ovh", "hetzner", "librespeed"]
     );
+    let hosts: serde_json::Value = providers
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["host"].clone())
+        .collect();
+    assert_eq!(
+        hosts,
+        serde_json::json!([
+            "speed.cloudflare.com",
+            "sabnzbd.org",
+            "proof.ovh.net",
+            "nbg1-speed.hetzner.com",
+            null
+        ])
+    );
     assert_eq!(providers[4]["needsServer"], true);
-    assert_eq!(providers[0]["anySize"], true);
-    assert_eq!(providers[0]["maxBytes"], 99_999_999.0);
-    assert_eq!(providers[2]["maxBytes"], serde_json::Value::Null);
+    assert_eq!(providers[0]["needsServer"], false);
+}
+
+#[tokio::test]
+async fn the_removed_size_stream_and_duration_fields_are_refused_by_the_schema() {
+    let h = harness().await;
+    for (body, field) in [
+        (
+            r#"bandwidth:{customUrl:"https://127.0.0.1/blob",bytes:1000}"#,
+            "bytes",
+        ),
+        (
+            r#"bandwidth:{customUrl:"https://127.0.0.1/blob",streams:3}"#,
+            "streams",
+        ),
+        (
+            r#"maxDurationSeconds:30,bandwidth:{customUrl:"https://127.0.0.1/blob"}"#,
+            "maxDurationSeconds",
+        ),
+    ] {
+        let response = h
+            .execute(&format!(
+                "mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},{body}}}){{id}}}}"
+            ))
+            .await;
+        assert_eq!(response.errors.len(), 1, "{body}");
+        assert!(
+            response.errors[0]
+                .message
+                .contains(&format!("unknown field \"{field}\"")),
+            "{}",
+            response.errors[0].message
+        );
+    }
+    for query in [
+        "{bandwidthProviders{fixedSizes}}",
+        "{bandwidthProviders{anySize}}",
+        "{bandwidthProviders{maxBytes}}",
+        "{speedTestRuns{request{maxDurationSeconds}}}",
+        "{speedTestRuns{request{bandwidth{bytes}}}}",
+        "{speedTestRuns{result{bandwidth{streams}}}}",
+    ] {
+        let response = h.execute(query).await;
+        assert_eq!(response.errors.len(), 1, "{query}");
+        assert!(
+            response.errors[0].message.starts_with("Unknown field"),
+            "{}",
+            response.errors[0].message
+        );
+    }
 }
 
 #[tokio::test]
@@ -110,7 +209,7 @@ async fn a_run_takes_exactly_one_of_bandwidth_and_usenet() {
     let h = harness().await;
     for body in [
         "",
-        r#"bandwidth:{customUrl:"https://127.0.0.1/blob",bytes:1000},usenet:{sabSize:MB_100}"#,
+        r#"bandwidth:{customUrl:"https://127.0.0.1/blob"},usenet:{sabSize:MB_100}"#,
     ] {
         let response = h
             .execute(&format!(
@@ -143,7 +242,7 @@ async fn usenet_on_a_feed_and_an_all_down_route_are_refused_by_code() {
     );
     let response = h
         .execute(&format!(
-            r#"mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},overrides:{{downLegs:[0]}},bandwidth:{{customUrl:"https://127.0.0.1/blob",bytes:1000}}}}){{id}}}}"#
+            r#"mutation{{startSpeedTest(input:{{kind:RSS,id:1,route:{DIRECT},overrides:{{downLegs:[0]}},bandwidth:{{customUrl:"https://127.0.0.1/blob"}}}}){{id}}}}"#
         ))
         .await;
     assert_eq!(refusal(&response).1, "SPEED_TEST_LEG_DOWN_ALL");
@@ -199,9 +298,11 @@ async fn a_usenet_run_books_raw_bytes_counts_missing_articles_and_gives_the_queu
             "usenet": {
                 "sabSize": null,
                 "nzbUrl": format!("http://{}/test.nzb", http.addr),
+                "nzbFilename": null,
+                "nzbRunId": null,
                 "connections": null,
+                "maxDurationSeconds": 120,
             },
-            "maxDurationSeconds": 120,
         })
     );
     let result = &done["result"];
@@ -211,6 +312,13 @@ async fn a_usenet_run_books_raw_bytes_counts_missing_articles_and_gives_the_queu
     assert_eq!(usenet["missing"], 1);
     assert_eq!(usenet["failed"], 0);
     assert_eq!(usenet["decodedBytes"], 60_000.0);
+    let decoded_bins: f64 = result["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|sample| sample["decodedBytes"].as_f64().unwrap())
+        .sum();
+    assert_eq!(decoded_bins, 60_000.0);
     assert_eq!(usenet["declaredBytes"], 93_000.0);
     assert_eq!(usenet["tls"], false);
     assert_eq!(usenet["tlsCipherSuite"], serde_json::Value::Null);
@@ -225,7 +333,150 @@ async fn a_usenet_run_books_raw_bytes_counts_missing_articles_and_gives_the_queu
 }
 
 #[tokio::test]
-async fn a_run_reports_the_bandwidth_request_it_accepted() {
+async fn a_usenet_run_takes_an_uploaded_nzb_as_its_one_source() {
+    let h = harness().await;
+    let nntp = NntpFixture::start(
+        vec![
+            FixtureArticle::patterned("one@fixture", 30_000),
+            FixtureArticle::patterned("two@fixture", 30_000),
+        ],
+        None,
+        None,
+    )
+    .await;
+    let server = add_server(&h, &nntp).await;
+    let upload = nzb(&[("one@fixture", 31_000), ("two@fixture", 31_000)]);
+
+    for (usenet, message) in [
+        (
+            serde_json::json!({"sabSize": "MB_100"}),
+            "a Usenet test takes exactly one of sabSize, nzbUrl, nzbUpload and nzbRunId",
+        ),
+        (
+            serde_json::json!({"nzbRunId": 1}),
+            "a Usenet test takes exactly one of sabSize, nzbUrl, nzbUpload and nzbRunId",
+        ),
+    ] {
+        let response = start_with_upload(&h, server, usenet, upload.as_bytes()).await;
+        assert_eq!(refusal(&response), (message.into(), "INVALID_INPUT".into()));
+    }
+    let response = h
+        .execute(&format!(
+            "mutation{{startSpeedTest(input:{{kind:SERVER,id:{server},route:{DIRECT},usenet:{{}}}}){{id}}}}"
+        ))
+        .await;
+    assert_eq!(refusal(&response).1, "INVALID_INPUT");
+    let response = start_with_upload(&h, server, serde_json::json!({}), b"not an nzb").await;
+    let (message, code) = refusal(&response);
+    assert!(
+        message.starts_with("the test NZB is not readable: "),
+        "{message}"
+    );
+    assert_eq!(code, "INVALID_INPUT");
+
+    let response = start_with_upload(&h, server, serde_json::json!({}), upload.as_bytes()).await;
+    assert_no_errors(&response);
+    let id = response_data(&response)["startSpeedTest"]["id"]
+        .as_u64()
+        .unwrap();
+    let done = finished(&h, id).await;
+
+    assert_eq!(done["status"], "COMPLETED", "{done}");
+    assert_eq!(
+        done["request"]["usenet"],
+        serde_json::json!({
+            "sabSize": null,
+            "nzbUrl": null,
+            "nzbFilename": "test.nzb",
+            "nzbRunId": null,
+            "connections": null,
+            "maxDurationSeconds": 120,
+        })
+    );
+    assert_eq!(done["result"]["usenet"]["delivered"], 2);
+    assert_eq!(done["result"]["usenet"]["decodedBytes"], 60_000.0);
+}
+
+#[tokio::test]
+async fn a_held_run_s_uploaded_nzb_runs_again_until_the_run_is_let_go() {
+    let h = harness().await;
+    let nntp = NntpFixture::start(
+        vec![FixtureArticle::patterned("one@fixture", 20_000)],
+        None,
+        None,
+    )
+    .await;
+    let server = add_server(&h, &nntp).await;
+    let response = start_with_upload(
+        &h,
+        server,
+        serde_json::json!({}),
+        nzb(&[("one@fixture", 21_000)]).as_bytes(),
+    )
+    .await;
+    assert_no_errors(&response);
+    let uploaded = response_data(&response)["startSpeedTest"]["id"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(finished(&h, uploaded).await["status"], "COMPLETED");
+
+    // A run started from a held run holds the same NZB, so it can be run
+    // again in turn.
+    let mut from = uploaded;
+    for _ in 0..2 {
+        let again = start(
+            &h,
+            &format!("{{kind:SERVER,id:{server},route:{DIRECT},usenet:{{nzbRunId:{from}}}}}"),
+        )
+        .await;
+        let done = finished(&h, again["id"].as_u64().unwrap()).await;
+        assert_eq!(done["status"], "COMPLETED", "{done}");
+        assert_eq!(done["request"]["usenet"]["nzbRunId"], from);
+        assert_eq!(done["request"]["usenet"]["nzbFilename"], "test.nzb");
+        assert_eq!(done["result"]["usenet"]["delivered"], 1);
+        from = again["id"].as_u64().unwrap();
+    }
+
+    // Runs without an upload have none to give, and enough of them push the
+    // uploaded runs out of the ten held.
+    let mut last = 0;
+    for _ in 0..10 {
+        let started = start(
+            &h,
+            &format!(
+                r#"{{kind:SERVER,id:{server},route:{DIRECT},bandwidth:{{customUrl:"https://127.0.0.1:1/payload.bin"}}}}"#
+            ),
+        )
+        .await;
+        last = started["id"].as_u64().unwrap();
+        finished(&h, last).await;
+    }
+    for held in [last, uploaded, from] {
+        let response = h
+            .execute(&format!(
+                "mutation{{startSpeedTest(input:{{kind:SERVER,id:{server},route:{DIRECT},usenet:{{nzbRunId:{held}}}}}){{id}}}}"
+            ))
+            .await;
+        assert_eq!(
+            refusal(&response),
+            (
+                format!("run {held} holds no uploaded NZB"),
+                "INVALID_INPUT".into()
+            )
+        );
+    }
+    let response = h.execute("{speedTestRuns{id}}").await;
+    assert_eq!(
+        response_data(&response)["speedTestRuns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+}
+
+#[tokio::test]
+async fn a_bandwidth_run_starts_on_its_source_alone_and_reports_it() {
     let h = harness().await;
     let nntp = NntpFixture::start(Vec::new(), None, None).await;
     let server = add_server(&h, &nntp).await;
@@ -233,11 +484,11 @@ async fn a_run_reports_the_bandwidth_request_it_accepted() {
     let url = "https://127.0.0.1:1/payload.bin";
     let started = start(
         &h,
-        &format!(
-            r#"{{kind:SERVER,id:{server},route:{DIRECT},maxDurationSeconds:30,bandwidth:{{customUrl:"{url}",bytes:1048576,streams:3}}}}"#
-        ),
+        &format!(r#"{{kind:SERVER,id:{server},route:{DIRECT},bandwidth:{{customUrl:"{url}"}}}}"#),
     )
     .await;
+    assert_eq!(started["status"], "RUNNING");
+    assert_eq!(started["kind"], "BANDWIDTH");
     let id = started["id"].as_u64().unwrap();
     let done = finished(&h, id).await;
     assert_eq!(
@@ -247,13 +498,17 @@ async fn a_run_reports_the_bandwidth_request_it_accepted() {
                 "providerId": null,
                 "server": null,
                 "customUrl": url,
-                "bytes": 1048576.0,
-                "streams": 3,
             },
             "usenet": null,
-            "maxDurationSeconds": 30,
         })
     );
+    // One connection per leg up, and none added while nothing moves.
+    assert_eq!(done["status"], "FAILED", "{done}");
+    assert_eq!(done["result"]["bandwidth"]["connections"], 1);
+    assert_eq!(done["result"]["bandwidth"]["url"], url);
+    let connections = done["result"]["connections"].as_array().unwrap();
+    assert_eq!(connections.len(), 1, "{done}");
+    assert!(connections[0]["error"].is_string(), "{done}");
 }
 
 #[tokio::test]

@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use async_graphql::{Context, Enum, InputObject, Object, Result, SimpleObject};
+use async_graphql::{Context, Enum, InputObject, Object, Result, SimpleObject, Upload};
 use weaver_server_core::proxies as core_proxies;
 use weaver_server_core::speed_test as core;
 
-use crate::auth::AdminGuard;
+use crate::auth::{AdminGuard, graphql_error};
 use crate::networking::{LegPathGql, NetworkConsumerKind, RouteFailover, RouteInput, RouteLegGql};
 use crate::observability::refusal_error;
 
@@ -76,10 +76,9 @@ impl From<SabTestSize> for core::SabTestSize {
 pub struct BandwidthProvider {
     pub id: String,
     pub name: String,
-    pub fixed_sizes: Vec<f64>,
-    pub any_size: bool,
-    // The largest per-stream size an any-size provider serves.
-    pub max_bytes: Option<f64>,
+    // The host a run downloads from; absent for a list provider, whose
+    // servers each carry their own.
+    pub host: Option<String>,
     pub needs_server: bool,
 }
 
@@ -133,17 +132,20 @@ pub struct BandwidthTestInput {
     pub provider_id: Option<String>,
     pub server: Option<String>,
     pub custom_url: Option<String>,
-    // Bytes each stream asks for.
-    pub bytes: f64,
-    #[graphql(default = 4)]
-    pub streams: u32,
 }
 
+// Exactly one of `sab_size`, `nzb_url`, `nzb_upload` and `nzb_run_id`.
 #[derive(Clone, Debug, InputObject)]
 pub struct UsenetTestInput {
     pub sab_size: Option<SabTestSize>,
     pub nzb_url: Option<String>,
+    // One NZB file, read the way a fetched test NZB is.
+    pub nzb_upload: Option<Upload>,
+    // A held run whose uploaded NZB this run reuses.
+    pub nzb_run_id: Option<u32>,
     pub connections: Option<u32>,
+    #[graphql(default = 120)]
+    pub max_duration_seconds: u32,
 }
 
 #[derive(Clone, Debug, InputObject)]
@@ -154,12 +156,18 @@ pub struct SpeedTestInput {
     pub overrides: Option<PathOverrideInput>,
     pub bandwidth: Option<BandwidthTestInput>,
     pub usenet: Option<UsenetTestInput>,
-    #[graphql(default = 120)]
-    pub max_duration_seconds: u32,
+}
+
+fn invalid(message: impl Into<String>) -> async_graphql::Error {
+    graphql_error("INVALID_INPUT", message)
 }
 
 impl SpeedTestInput {
-    fn request(self) -> Result<core::SpeedTestRequest> {
+    fn request(
+        self,
+        ctx: &Context<'_>,
+        service: &core::SpeedTestService,
+    ) -> Result<core::SpeedTestRequest> {
         let consumer = self.kind.consumer(self.id);
         let kind = match (self.bandwidth, self.usenet) {
             (Some(bandwidth), None) => {
@@ -170,35 +178,46 @@ impl SpeedTestInput {
                     },
                     (None, Some(url)) => core::BandwidthProvider::Custom {
                         url: reqwest::Url::parse(&url)
-                            .map_err(|e| async_graphql::Error::new(format!("customUrl: {e}")))?,
+                            .map_err(|e| invalid(format!("customUrl: {e}")))?,
                     },
                     _ => {
-                        return Err(async_graphql::Error::new(
+                        return Err(invalid(
                             "a bandwidth test takes exactly one of providerId and customUrl",
                         ));
                     }
                 };
-                if !bandwidth.bytes.is_finite() || bandwidth.bytes < 1.0 {
-                    return Err(async_graphql::Error::new(
-                        "a bandwidth run must ask for at least one byte",
-                    ));
-                }
-                core::SpeedTestKind::Bandwidth {
-                    provider,
-                    bytes: bandwidth.bytes as u64,
-                    streams: u8::try_from(bandwidth.streams).unwrap_or(u8::MAX),
-                }
+                core::SpeedTestKind::Bandwidth { provider }
             }
             (None, Some(usenet)) => {
-                let nzb = match (usenet.sab_size, usenet.nzb_url) {
-                    (Some(size), None) => core::TestNzbSource::SabnzbdTest { size: size.into() },
-                    (None, Some(url)) => core::TestNzbSource::Url(
-                        reqwest::Url::parse(&url)
-                            .map_err(|e| async_graphql::Error::new(format!("nzbUrl: {e}")))?,
+                let nzb = match (
+                    usenet.sab_size,
+                    usenet.nzb_url,
+                    usenet.nzb_upload,
+                    usenet.nzb_run_id,
+                ) {
+                    (Some(size), None, None, None) => {
+                        core::TestNzbSource::SabnzbdTest { size: size.into() }
+                    }
+                    (None, Some(url), None, None) => core::TestNzbSource::Url(
+                        reqwest::Url::parse(&url).map_err(|e| invalid(format!("nzbUrl: {e}")))?,
                     ),
+                    (None, None, Some(upload), None) => {
+                        let upload = upload
+                            .value(ctx)
+                            .map_err(|e| invalid(format!("invalid upload: {e}")))?;
+                        // The upload arrives in memory and stays there; it is
+                        // never written anywhere.
+                        let nzb = core::UploadedNzb::read(upload.filename, &upload.content[..])
+                            .map_err(invalid)?;
+                        core::TestNzbSource::Upload { nzb, run: None }
+                    }
+                    (None, None, None, Some(run)) => core::TestNzbSource::Upload {
+                        nzb: service.held_nzb(run).map_err(speed_test_error)?,
+                        run: Some(run),
+                    },
                     _ => {
-                        return Err(async_graphql::Error::new(
-                            "a Usenet test takes exactly one of sabSize and nzbUrl",
+                        return Err(invalid(
+                            "a Usenet test takes exactly one of sabSize, nzbUrl, nzbUpload and nzbRunId",
                         ));
                     }
                 };
@@ -207,10 +226,11 @@ impl SpeedTestInput {
                     connections: usenet
                         .connections
                         .map(|c| u16::try_from(c).unwrap_or(u16::MAX)),
+                    max_duration: Duration::from_secs(u64::from(usenet.max_duration_seconds)),
                 }
             }
             _ => {
-                return Err(async_graphql::Error::new(
+                return Err(invalid(
                     "a speed test takes exactly one of bandwidth and usenet",
                 ));
             }
@@ -220,7 +240,6 @@ impl SpeedTestInput {
             route: self.route.map(RouteInput::route).transpose()?,
             overrides: self.overrides.map(Into::into).unwrap_or_default(),
             kind,
-            max_duration: Duration::from_secs(u64::from(self.max_duration_seconds)),
         })
     }
 }
@@ -314,7 +333,8 @@ pub struct BandwidthResult {
     pub provider_id: Option<String>,
     pub server: Option<String>,
     pub url: String,
-    pub streams: u32,
+    // Parallel connections the run ended with.
+    pub connections: u32,
 }
 
 #[derive(Clone, Debug, SimpleObject)]
@@ -322,6 +342,8 @@ pub struct Sample {
     pub at_ms: u32,
     pub leg: u32,
     pub bytes: f64,
+    // Usenet only; 0 for a bandwidth run.
+    pub decoded_bytes: f64,
 }
 
 #[derive(Clone, Debug, SimpleObject)]
@@ -343,17 +365,19 @@ pub struct BandwidthTestRequest {
     pub provider_id: Option<String>,
     pub server: Option<String>,
     pub custom_url: Option<String>,
-    // Bytes each stream asks for.
-    pub bytes: f64,
-    pub streams: u32,
 }
 
 #[derive(Clone, Debug, SimpleObject)]
 pub struct UsenetTestRequest {
     pub sab_size: Option<SabTestSize>,
     pub nzb_url: Option<String>,
+    // The uploaded NZB's filename; absent for a SAB size or a URL.
+    pub nzb_filename: Option<String>,
+    // The held run whose uploaded NZB this run reused.
+    pub nzb_run_id: Option<u32>,
     // Absent takes the server's whole connection allowance.
     pub connections: Option<u32>,
+    pub max_duration_seconds: u32,
 }
 
 // Exactly one of `bandwidth` and `usenet` is set.
@@ -362,17 +386,12 @@ pub struct UsenetTestRequest {
 pub struct SpeedTestRequestGql {
     pub bandwidth: Option<BandwidthTestRequest>,
     pub usenet: Option<UsenetTestRequest>,
-    pub max_duration_seconds: u32,
 }
 
 impl From<&core::SpeedTestRequest> for SpeedTestRequestGql {
     fn from(request: &core::SpeedTestRequest) -> Self {
         let (bandwidth, usenet) = match &request.kind {
-            core::SpeedTestKind::Bandwidth {
-                provider,
-                bytes,
-                streams,
-            } => {
+            core::SpeedTestKind::Bandwidth { provider } => {
                 let (provider_id, server, custom_url) = match provider {
                     core::BandwidthProvider::Builtin { id, server } => {
                         (Some(id.clone()), server.clone(), None)
@@ -384,32 +403,38 @@ impl From<&core::SpeedTestRequest> for SpeedTestRequestGql {
                         provider_id,
                         server,
                         custom_url,
-                        bytes: *bytes as f64,
-                        streams: u32::from(*streams),
                     }),
                     None,
                 )
             }
-            core::SpeedTestKind::Usenet { nzb, connections } => {
-                let (sab_size, nzb_url) = match nzb {
-                    core::TestNzbSource::SabnzbdTest { size } => (Some((*size).into()), None),
-                    core::TestNzbSource::Url(url) => (None, Some(url.to_string())),
+            core::SpeedTestKind::Usenet {
+                nzb,
+                connections,
+                max_duration,
+            } => {
+                let (sab_size, nzb_url, nzb_filename, nzb_run_id) = match nzb {
+                    core::TestNzbSource::SabnzbdTest { size } => {
+                        (Some((*size).into()), None, None, None)
+                    }
+                    core::TestNzbSource::Url(url) => (None, Some(url.to_string()), None, None),
+                    core::TestNzbSource::Upload { nzb, run } => {
+                        (None, None, Some(nzb.filename().to_owned()), *run)
+                    }
                 };
                 (
                     None,
                     Some(UsenetTestRequest {
                         sab_size,
                         nzb_url,
+                        nzb_filename,
+                        nzb_run_id,
                         connections: connections.map(u32::from),
+                        max_duration_seconds: small(max_duration.as_secs()),
                     }),
                 )
             }
         };
-        Self {
-            bandwidth,
-            usenet,
-            max_duration_seconds: small(request.max_duration.as_secs()),
-        }
+        Self { bandwidth, usenet }
     }
 }
 
@@ -493,7 +518,7 @@ impl From<core::SpeedTestResult> for SpeedTestResult {
                 provider_id: b.provider_id,
                 server: b.server,
                 url: b.url,
-                streams: b.streams,
+                connections: b.connections,
             }),
             samples: r
                 .samples
@@ -502,6 +527,7 @@ impl From<core::SpeedTestResult> for SpeedTestResult {
                     at_ms: small(s.at_ms),
                     leg: index(s.leg),
                     bytes: s.bytes as f64,
+                    decoded_bytes: s.decoded_bytes as f64,
                 })
                 .collect(),
         }
@@ -579,7 +605,7 @@ fn service(ctx: &Context<'_>) -> Result<core::SpeedTestService> {
 fn speed_test_error(error: core::SpeedTestError) -> async_graphql::Error {
     match error {
         core::SpeedTestError::Refused(refusal) => refusal_error(refusal),
-        core::SpeedTestError::Invalid(message) => async_graphql::Error::new(message),
+        core::SpeedTestError::Invalid(message) => invalid(message),
     }
 }
 
@@ -595,9 +621,7 @@ impl SpeedTestQuery {
             .map(|p| BandwidthProvider {
                 id: p.id.into(),
                 name: p.name.into(),
-                fixed_sizes: p.fixed_sizes.iter().map(|size| *size as f64).collect(),
-                any_size: p.any_size,
-                max_bytes: p.max_size.map(|size| size as f64),
+                host: p.host.map(Into::into),
                 needs_server: p.needs_server,
             })
             .collect()
@@ -649,11 +673,9 @@ impl SpeedTestMutation {
         ctx: &Context<'_>,
         input: SpeedTestInput,
     ) -> Result<SpeedTestRun> {
-        let request = input.request()?;
-        let run = service(ctx)?
-            .start(request)
-            .await
-            .map_err(speed_test_error)?;
+        let service = service(ctx)?;
+        let request = input.request(ctx, &service)?;
+        let run = service.start(request).await.map_err(speed_test_error)?;
         Ok(run.into())
     }
 

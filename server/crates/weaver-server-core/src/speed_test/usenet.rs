@@ -192,10 +192,7 @@ impl Worker {
                 Ok(body) => {
                     self.booking.book(body.raw_size, &mut permits);
                     progress.usenet.delivered.fetch_add(1, Ordering::Relaxed);
-                    progress
-                        .usenet
-                        .decoded
-                        .fetch_add(body.io.decoded_bytes_written, Ordering::Relaxed);
+                    progress.add_decoded(leg, body.io.decoded_bytes_written);
                 }
                 Err(DecodedBodyError::Decode { raw_size, .. }) => {
                     // A decode error still books its raw size.

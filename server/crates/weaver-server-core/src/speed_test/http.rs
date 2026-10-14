@@ -29,11 +29,10 @@ pub(crate) struct HttpOptions {
     pub roots: Vec<Vec<u8>>,
 }
 
-// A response whose body is still to be read, with the path that carries it.
+// A response whose body is still to be read, with the bridge that carries it.
 pub(crate) struct RoutedResponse {
     pub response: reqwest::Response,
     pub bridge: Arc<Bridge>,
-    pub provider: Arc<StreamProvider>,
 }
 
 impl RoutedResponse {
@@ -43,144 +42,196 @@ impl RoutedResponse {
     }
 }
 
-// GET `url` through one leg, the way the RSS routed GET does: resolve on the
-// leg, apply the egress block rules unless private destinations are allowed,
-// pin the checked addresses, and send reqwest through the leg's bridge.
+// GET `url` once through one leg.
 pub(crate) async fn routed_get(
     leg: &HttpLeg,
     url: &reqwest::Url,
     options: &HttpOptions,
-    recorder: Option<LegRecorder>,
-) -> Result<RoutedResponse, (Option<Arc<StreamProvider>>, String)> {
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err((None, "URL must use http or https".into()));
-    }
-    let host = url
-        .host_str()
-        .ok_or((None, "URL must include a host".to_string()))?
-        .trim_matches(['[', ']'])
-        .to_owned();
-    let port = url
-        .port_or_known_default()
-        .ok_or((None, "URL has no port".to_string()))?;
-    let addresses = match leg
-        .stage
-        .resolve(&host)
+) -> Result<RoutedResponse, String> {
+    let client = RoutedClient::connect(leg, url, options, None)
         .await
-        .map_err(|e| (None, e.to_string()))?
-    {
-        Resolution::Addresses(addresses) => addresses,
-        Resolution::Unresolved => {
-            if host.parse::<IpAddr>().is_err() && leg.dns_servers.is_empty() {
-                return Err((
-                    None,
-                    format!(
-                        "the leg's proxies have no DNS servers, so {host} cannot be resolved through the route"
-                    ),
-                ));
-            }
-            let resolver = StreamProvider::new(leg.stage.clone(), None);
-            weaver_tunnel::dns::resolve(resolver.as_ref(), &leg.dns_servers, &host)
-                .await
-                .map_err(|e| (None, format!("could not resolve {host}: {e}")))?
-        }
-    };
-    if addresses.is_empty() {
-        return Err((None, format!("no address resolved for {host}")));
-    }
-    if !options.allow_private_network && addresses.iter().any(|ip| is_blocked_egress_ip(*ip)) {
-        return Err((
-            None,
-            format!("{host} resolves to an address that is not allowed"),
-        ));
-    }
-    let provider = StreamProvider::new(leg.stage.clone(), recorder);
-    provider.pin(&host, addresses.clone());
-    let mut secret = [0u8; 32];
-    getrandom::fill(&mut secret)
-        .map_err(|_| (None, "could not generate bridge credentials".to_string()))?;
-    let bridge = Bridge::start(
-        &tokio::runtime::Handle::current(),
-        provider.clone(),
-        leg.stage.budget(),
-        ("weaver".into(), hex::encode(secret)),
-    )
-    .map_err(|e| (Some(provider.clone()), e.to_string()))?;
-    let fail = |message: String| (Some(provider.clone()), message);
-    let addr = bridge.addr().map_err(|e| fail(e.to_string()))?;
-    let same_host = host.clone();
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .user_agent(concat!("weaver/", env!("CARGO_PKG_VERSION")))
-        .read_timeout(Duration::from_secs(30))
-        // Ask for the body as stored: a compressed transfer would count
-        // decoded bytes, not the bytes the route carried.
-        .no_gzip()
-        .no_brotli()
-        .no_deflate()
-        .no_zstd()
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() > REDIRECT_LIMIT {
-                return attempt.error("too many redirects");
-            }
-            let url = attempt.url();
-            if matches!(url.scheme(), "http" | "https")
-                && url.host_str().map(|h| h.trim_matches(['[', ']'])) == Some(same_host.as_str())
-            {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }))
-        .proxy(
-            reqwest::Proxy::all(format!("socks5h://{addr}"))
-                .map_err(|e| fail(e.to_string()))?
-                .basic_auth(bridge.credentials().0, bridge.credentials().1),
-        );
-    if !options.roots.is_empty() {
-        let roots = options
-            .roots
-            .iter()
-            .map(|der| reqwest::Certificate::from_der(der))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| fail(e.to_string()))?;
-        builder = builder.tls_certs_only(roots);
-    }
-    let target = ResolvedFetchTarget {
-        url: url.clone(),
-        host: host.clone(),
-        addrs: addresses
-            .iter()
-            .map(|ip| SocketAddr::new(*ip, port))
-            .collect(),
-    };
-    let client = target
-        .apply_dns_override(builder)
-        .build()
-        .map_err(|e| fail(e.to_string()))?;
-    let response = match client.get(url.clone()).send().await {
-        Ok(response) => response,
+        .map_err(|(_, error)| error)?;
+    match client.get(url).await {
+        Ok(response) => Ok(RoutedResponse {
+            response,
+            bridge: client.bridge,
+        }),
         Err(error) => {
-            bridge.revoke().await;
-            let message = if weaver_nntp::tls::is_tls_error(&error) {
-                format!("TLS verification failed for {host}")
+            client.bridge.revoke().await;
+            Err(error)
+        }
+    }
+}
+
+// A client whose GETs all go through one leg, over one bridge that stays up
+// until the client is closed.
+pub(crate) struct RoutedClient {
+    client: reqwest::Client,
+    host: String,
+    pub bridge: Arc<Bridge>,
+    pub provider: Arc<StreamProvider>,
+}
+
+impl RoutedClient {
+    // Set up the way the RSS routed GET does: resolve on the leg, apply the
+    // egress block rules unless private destinations are allowed, pin the
+    // checked addresses, and point reqwest at the leg's bridge.
+    pub(crate) async fn connect(
+        leg: &HttpLeg,
+        url: &reqwest::Url,
+        options: &HttpOptions,
+        recorder: Option<LegRecorder>,
+    ) -> Result<Self, (Option<Arc<StreamProvider>>, String)> {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err((None, "URL must use http or https".into()));
+        }
+        let host = url
+            .host_str()
+            .ok_or((None, "URL must include a host".to_string()))?
+            .trim_matches(['[', ']'])
+            .to_owned();
+        let port = url
+            .port_or_known_default()
+            .ok_or((None, "URL has no port".to_string()))?;
+        let addresses = match leg
+            .stage
+            .resolve(&host)
+            .await
+            .map_err(|e| (None, e.to_string()))?
+        {
+            Resolution::Addresses(addresses) => addresses,
+            Resolution::Unresolved => {
+                if host.parse::<IpAddr>().is_err() && leg.dns_servers.is_empty() {
+                    return Err((
+                        None,
+                        format!(
+                            "the leg's proxies have no DNS servers, so {host} cannot be resolved through the route"
+                        ),
+                    ));
+                }
+                let resolver = StreamProvider::new(leg.stage.clone(), None);
+                weaver_tunnel::dns::resolve(resolver.as_ref(), &leg.dns_servers, &host)
+                    .await
+                    .map_err(|e| (None, format!("could not resolve {host}: {e}")))?
+            }
+        };
+        if addresses.is_empty() {
+            return Err((None, format!("no address resolved for {host}")));
+        }
+        if !options.allow_private_network && addresses.iter().any(|ip| is_blocked_egress_ip(*ip)) {
+            return Err((
+                None,
+                format!("{host} resolves to an address that is not allowed"),
+            ));
+        }
+        let provider = StreamProvider::new(leg.stage.clone(), recorder);
+        provider.pin(&host, addresses.clone());
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret)
+            .map_err(|_| (None, "could not generate bridge credentials".to_string()))?;
+        let bridge = Bridge::start(
+            &tokio::runtime::Handle::current(),
+            provider.clone(),
+            leg.stage.budget(),
+            ("weaver".into(), hex::encode(secret)),
+        )
+        .map_err(|e| (Some(provider.clone()), e.to_string()))?;
+        let built = Self::build(&bridge, &host, port, url, &addresses, options);
+        match built {
+            Ok(client) => Ok(Self {
+                client,
+                host,
+                bridge,
+                provider,
+            }),
+            Err(error) => {
+                bridge.revoke().await;
+                Err((Some(provider), error))
+            }
+        }
+    }
+
+    fn build(
+        bridge: &Bridge,
+        host: &str,
+        port: u16,
+        url: &reqwest::Url,
+        addresses: &[IpAddr],
+        options: &HttpOptions,
+    ) -> Result<reqwest::Client, String> {
+        let addr = bridge.addr().map_err(|e| e.to_string())?;
+        let same_host = host.to_owned();
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .user_agent(concat!("weaver/", env!("CARGO_PKG_VERSION")))
+            .read_timeout(Duration::from_secs(30))
+            // Ask for the body as stored: a compressed transfer would count
+            // decoded bytes, not the bytes the route carried.
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() > REDIRECT_LIMIT {
+                    return attempt.error("too many redirects");
+                }
+                let url = attempt.url();
+                if matches!(url.scheme(), "http" | "https")
+                    && url.host_str().map(|h| h.trim_matches(['[', ']']))
+                        == Some(same_host.as_str())
+                {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
+            .proxy(
+                reqwest::Proxy::all(format!("socks5h://{addr}"))
+                    .map_err(|e| e.to_string())?
+                    .basic_auth(bridge.credentials().0, bridge.credentials().1),
+            );
+        if !options.roots.is_empty() {
+            let roots = options
+                .roots
+                .iter()
+                .map(|der| reqwest::Certificate::from_der(der))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            builder = builder.tls_certs_only(roots);
+        }
+        let target = ResolvedFetchTarget {
+            url: url.clone(),
+            host: host.to_owned(),
+            addrs: addresses
+                .iter()
+                .map(|ip| SocketAddr::new(*ip, port))
+                .collect(),
+        };
+        target
+            .apply_dns_override(builder)
+            .build()
+            .map_err(|e| e.to_string())
+    }
+
+    // One GET, refused unless it answers with a success status.
+    pub(crate) async fn get(&self, url: &reqwest::Url) -> Result<reqwest::Response, String> {
+        let response = self.client.get(url.clone()).send().await.map_err(|error| {
+            if weaver_nntp::tls::is_tls_error(&error) {
+                format!("TLS verification failed for {}", self.host)
             } else {
                 format!("GET {url} failed: {error}")
-            };
-            return Err(fail(message));
+            }
+        })?;
+        if !response.status().is_success() {
+            return Err(format!("GET {url} answered HTTP {}", response.status()));
         }
-    };
-    if !response.status().is_success() {
-        let status = response.status();
-        drop(response);
-        bridge.revoke().await;
-        return Err(fail(format!("GET {url} answered HTTP {status}")));
+        Ok(response)
     }
-    Ok(RoutedResponse {
-        response,
-        bridge,
-        provider,
-    })
+
+    pub(crate) async fn close(self) {
+        drop(self.client);
+        self.bridge.revoke().await;
+    }
 }
 
 // Read a small body whole, refusing one larger than `limit`.
@@ -231,13 +282,19 @@ pub(crate) async fn fetch_test_nzb(
     url: &reqwest::Url,
     options: &HttpOptions,
 ) -> Result<Vec<TestArticle>, String> {
-    let routed = routed_get(leg, url, options, None)
+    let routed = routed_get(leg, url, options)
         .await
-        .map_err(|(_, error)| format!("fetching the test NZB failed: {error}"))?;
+        .map_err(|error| format!("fetching the test NZB failed: {error}"))?;
     let body = read_capped(routed, NZB_LIMIT)
         .await
         .map_err(|error| format!("fetching the test NZB failed: {error}"))?;
-    let nzb = weaver_nzb::parse_nzb(&body)
+    parse_test_nzb(&body)
+}
+
+// The articles of a test NZB, read the same way whether it was fetched or
+// uploaded.
+pub(crate) fn parse_test_nzb(body: &[u8]) -> Result<Vec<TestArticle>, String> {
+    let nzb = weaver_nzb::parse_nzb(body)
         .map_err(|error| format!("the test NZB is not readable: {error}"))?;
     let articles: Vec<TestArticle> = nzb
         .files

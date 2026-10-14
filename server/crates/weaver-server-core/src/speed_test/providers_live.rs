@@ -46,9 +46,9 @@ async fn probe(leg: &HttpLeg, provider: &str, url: &reqwest::Url, expected: u64,
         elapsed: Duration::ZERO,
         error: None,
     };
-    let mut routed = match routed_get(leg, url, &HttpOptions::default(), None).await {
+    let mut routed = match routed_get(leg, url, &HttpOptions::default()).await {
         Ok(routed) => routed,
-        Err((_, error)) => {
+        Err(error) => {
             row.elapsed = started.elapsed();
             row.error = Some(error);
             return row;
@@ -123,23 +123,13 @@ async fn every_public_endpoint_answers() {
     let mut rows = Vec::new();
 
     for info in PROVIDERS.iter().filter(|info| !info.needs_server) {
-        let sizes: Vec<(u64, u64)> = if info.any_size {
-            vec![(MIB, MIB), (info.max_size.expect("any-size bound"), PREFIX)]
-        } else {
-            info.fixed_sizes
-                .iter()
-                .map(|size| (*size, PREFIX))
-                .collect()
-        };
-        for (size, read) in sizes {
-            let url = provider_url(info, size).expect("provider URL");
-            rows.push(probe(&leg, info.id, &url, size, read).await);
-        }
+        let url = provider_url(info).expect("provider URL");
+        rows.push(probe(&leg, info.id, &url, info.download_bytes, PREFIX).await);
     }
 
     let list = reqwest::Url::parse(LIBRESPEED_SERVER_LIST).unwrap();
     let started = Instant::now();
-    let servers = match routed_get(&leg, &list, &HttpOptions::default(), None).await {
+    let servers = match routed_get(&leg, &list, &HttpOptions::default()).await {
         Ok(routed) => {
             let status = routed.response.status().as_u16().to_string();
             match read_capped(routed, 4 * 1024 * 1024).await {
@@ -172,7 +162,7 @@ async fn every_public_endpoint_answers() {
                 }
             }
         }
-        Err((_, error)) => {
+        Err(error) => {
             rows.push(Row {
                 provider: "librespeed list".into(),
                 url: list.to_string(),
@@ -185,7 +175,7 @@ async fn every_public_endpoint_answers() {
         }
     };
     for server in servers.iter().take(LIBRESPEED_SERVERS) {
-        let url = list_server_url(server, MIB).expect("LibreSpeed URL");
+        let url = chunked_url(server, 1).expect("LibreSpeed URL");
         let label = format!("librespeed {} ({})", server.id, server.name);
         rows.push(probe(&leg, &label, &url, MIB, 2 * MIB).await);
     }

@@ -53,6 +53,8 @@ impl ConnectionRecord {
 struct LegCounters {
     bytes: AtomicU64,
     sampled: AtomicU64,
+    decoded: AtomicU64,
+    decoded_sampled: AtomicU64,
 }
 
 #[derive(Default)]
@@ -84,8 +86,10 @@ pub(crate) struct Progress {
     gauge_peak: AtomicU64,
     pub usenet: UsenetCounters,
     usenet_facts: OnceLock<UsenetFacts>,
-    // Told when an article or a stream is counted, so a reader can wait on
-    // the counts instead of on time.
+    // When a bandwidth run's warm-up ended and the bytes moved by then.
+    warm_up: OnceLock<(Duration, u64)>,
+    // Told when an article or a GET is counted, so a reader can wait on the
+    // counts instead of on time.
     notify: OnceLock<tokio::sync::watch::Sender<u64>>,
 }
 
@@ -100,6 +104,7 @@ impl Progress {
             gauge_peak: AtomicU64::new(0),
             usenet: UsenetCounters::default(),
             usenet_facts: OnceLock::new(),
+            warm_up: OnceLock::new(),
             notify: OnceLock::new(),
         })
     }
@@ -108,7 +113,7 @@ impl Progress {
         let _ = self.notify.set(notify);
     }
 
-    // An article or a stream was counted.
+    // An article or a GET was counted.
     pub(crate) fn counted(&self) {
         if let Some(notify) = self.notify.get() {
             notify.send_modify(|revision| *revision = revision.wrapping_add(1));
@@ -140,12 +145,24 @@ impl Progress {
         }
     }
 
+    // Decoded bytes a leg produced, counted for the run and for the leg.
+    pub(crate) fn add_decoded(&self, leg: usize, bytes: u64) {
+        self.usenet.decoded.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(counters) = self.legs.get(leg) {
+            counters.decoded.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn note_gauge(&self, bytes_per_second: u64) {
         self.gauge_peak
             .fetch_max(bytes_per_second, Ordering::Relaxed);
     }
 
-    fn elapsed(&self) -> Duration {
+    pub(crate) fn mark_warm_up(&self, at: Duration, bytes: u64) {
+        let _ = self.warm_up.set((at, bytes));
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
         match (self.started.get(), self.finished.get()) {
             (Some(started), Some(finished)) => finished.saturating_duration_since(*started),
             (Some(started), None) => started.elapsed(),
@@ -153,7 +170,8 @@ impl Progress {
         }
     }
 
-    // Close one sample bin per leg: the bytes each leg moved since the last.
+    // Close one sample bin per leg: the bytes each leg moved, and decoded,
+    // since the last.
     pub(crate) fn sample(&self) {
         if !self.measuring() {
             return;
@@ -167,10 +185,13 @@ impl Progress {
         for (leg, counters) in self.legs.iter().enumerate() {
             let total = counters.bytes.load(Ordering::Relaxed);
             let previous = counters.sampled.swap(total, Ordering::Relaxed);
+            let decoded = counters.decoded.load(Ordering::Relaxed);
+            let decoded_previous = counters.decoded_sampled.swap(decoded, Ordering::Relaxed);
             samples.1.push(Sample {
                 at_ms: at.as_millis() as u64,
                 leg,
                 bytes: total.saturating_sub(previous),
+                decoded_bytes: decoded.saturating_sub(decoded_previous),
             });
         }
     }
@@ -221,6 +242,22 @@ impl Progress {
             None,
             Some(error),
         );
+    }
+
+    // Connections recorded on each leg.
+    pub(crate) fn connections_per_leg(&self) -> Vec<u16> {
+        let mut counts = vec![0u16; self.legs.len()];
+        for record in self
+            .connections
+            .lock()
+            .expect("speed test connections")
+            .iter()
+        {
+            if let Some(count) = counts.get_mut(record.leg) {
+                *count = count.saturating_add(1);
+            }
+        }
+        counts
     }
 
     pub(crate) fn bytes(&self) -> u64 {
@@ -339,10 +376,22 @@ impl Progress {
                 tls_cipher_suite: facts.tls_cipher_suite,
             }
         });
+        // A bandwidth run's speed leaves its warm-up out; with no warm-up
+        // end, the run never got past it and the whole run stands in.
+        let average_bps = match (&bandwidth, self.warm_up.get()) {
+            (Some(_), Some((at, moved))) if elapsed > *at => {
+                bytes.saturating_sub(*moved) as f64 / (elapsed - *at).as_secs_f64()
+            }
+            _ => rate(bytes),
+        };
+        let bandwidth = bandwidth.map(|bandwidth| super::model::BandwidthResult {
+            connections: connections.len() as u32,
+            ..bandwidth
+        });
         Some(SpeedTestResult {
             bytes,
             elapsed_ms: elapsed.as_millis() as u64,
-            average_bps: rate(bytes),
+            average_bps,
             peak_bps: peak,
             legs,
             connections,
@@ -374,7 +423,6 @@ pub(crate) struct LegRecorder {
 
 impl LegRecorder {
     fn dialed(&self, connect: Duration, dialed: &mut Dialed) -> Arc<ConnectionRecord> {
-        dialed.path.leg = Some(self.leg);
         let record = self.progress.record(
             self.leg,
             connect,
@@ -382,14 +430,20 @@ impl LegRecorder {
             dialed.source,
             None,
         );
+        self.watch(&record, dialed);
+        record
+    }
+
+    // A failure of the dialed socket ends `record`.
+    fn watch(&self, record: &Arc<ConnectionRecord>, dialed: &mut Dialed) {
+        dialed.path.leg = Some(self.leg);
         let failed = record.clone();
         dialed
             .outcome
             .on_failure(move || failed.fail("connection failed"));
-        record
     }
 
-    fn failed(&self, connect: Duration, error: &DialError) {
+    fn failed(&self, connect: Duration, error: &DialError) -> Arc<ConnectionRecord> {
         self.progress.record(
             self.leg,
             connect,
@@ -399,7 +453,21 @@ impl LegRecorder {
             },
             None,
             Some(error.to_string()),
-        );
+        )
+    }
+
+    // A connection that ended before it dialed anything.
+    pub(crate) fn error_row(&self, error: String) -> Arc<ConnectionRecord> {
+        self.progress.record(
+            self.leg,
+            Duration::ZERO,
+            SpeedTestDialPath {
+                egress_id: self.egress,
+                ..Default::default()
+            },
+            None,
+            Some(error),
+        )
     }
 }
 
@@ -465,7 +533,9 @@ impl Dialer for RecordingDialer {
 }
 
 // A leg's dialing stage for HTTP, fronted by a bridge for reqwest. It dials
-// only the addresses the run checked for the host.
+// only the addresses the run checked for the host. With a recorder it is one
+// connection of a run: every socket it dials, the first and any reopened
+// after the server closed one, is recorded on the same row.
 pub(crate) struct StreamProvider {
     stage: Arc<dyn Dialer>,
     pins: Mutex<Option<(String, Vec<IpAddr>)>>,
@@ -490,22 +560,17 @@ impl StreamProvider {
             record.add_bytes(bytes);
         }
     }
-    // Record the error that ended the stream on its connection, or on its
-    // own when no connection was opened.
+    // Record the error that ended the connection on its row, opening the
+    // row when nothing was dialed yet.
     pub(crate) fn fail(&self, error: String) {
-        let current = self.current.lock().expect("stream connection").clone();
-        match (current, &self.recorder) {
-            (Some(record), _) => record.fail(error),
-            (None, Some(recorder)) => {
-                recorder
-                    .progress
-                    .end_leg_connection(recorder.leg, recorder.egress, error);
-            }
-            (None, None) => {}
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        let mut current = self.current.lock().expect("stream connection");
+        match &*current {
+            Some(record) => record.fail(error),
+            None => *current = Some(recorder.error_row(error)),
         }
-    }
-    pub(crate) fn dialed_any(&self) -> bool {
-        self.current.lock().expect("stream connection").is_some()
     }
 }
 
@@ -540,7 +605,11 @@ impl TunnelProvider for StreamProvider {
             Ok(dialed) => dialed,
             Err(error) => {
                 if let Some(recorder) = &self.recorder {
-                    recorder.failed(started.elapsed(), &error);
+                    let mut current = self.current.lock().expect("stream connection");
+                    match &*current {
+                        Some(record) => record.fail(error.to_string()),
+                        None => *current = Some(recorder.failed(started.elapsed(), &error)),
+                    }
                 }
                 return Err(match error {
                     DialError::Fatal(error) => error,
@@ -549,8 +618,11 @@ impl TunnelProvider for StreamProvider {
             }
         };
         if let Some(recorder) = &self.recorder {
-            let record = recorder.dialed(started.elapsed(), &mut dialed);
-            *self.current.lock().expect("stream connection") = Some(record);
+            let mut current = self.current.lock().expect("stream connection");
+            match &*current {
+                Some(record) => recorder.watch(record, &mut dialed),
+                None => *current = Some(recorder.dialed(started.elapsed(), &mut dialed)),
+            }
         }
         let upstream = dialed.outcome.clone();
         observed.on_failure(move || upstream.failed());
