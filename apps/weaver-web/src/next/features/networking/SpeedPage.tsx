@@ -398,7 +398,9 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
   const [form, setForm] = useState<TestForm>(() => defaultForm(consumer ?? { kind: "SERVER", cap: 1 }));
   const [allRoutes, setAllRoutes] = useState(false);
   const [open, setOpen] = useState<Set<number>>(new Set());
-  const [checked, setChecked] = useState<number[]>([]);
+  // Compare mode, and the run picked into each side of it: left first, then right.
+  const [comparing, setComparing] = useState(false);
+  const [picked, setPicked] = useState<[number | null, number | null]>([null, null]);
   const { providers, runs, refresh } = useSpeedTestData();
   const speedTest = useSpeedTestRun(refresh);
   const { run: active, setRun } = speedTest;
@@ -466,7 +468,16 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
   };
 
   const shown = allRoutes ? runs : runs.filter((run) => run.consumer === consumer.key);
-  const compared = checked.map((id) => runs.find((run) => run.id === id)).filter((run): run is SpeedTestRun => !!run);
+  const pick = (id: number) =>
+    setPicked(([left, right]) => {
+      if (left === id) return [null, right];
+      if (right === id) return [left, null];
+      if (left === null) return [id, right];
+      if (right === null) return [left, id];
+      // Both sides taken: the left gives way and the newest pick takes the right.
+      return [right, id];
+    });
+  const compared = picked.map((id) => runs.find((run) => run.id === id));
   const detail = (run: SpeedTestRun, compare?: { better: BetterStats; className: string }) => (
     <RunDetail run={run} data={data} providers={providers} onRunAgain={runAgain} busy={speedTest.busy} {...compare} />
   );
@@ -551,31 +562,37 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
         t("next.networking.speed.statusColumn"),
       ],
       empty: t("next.networking.speed.runsEmpty"),
+      // While comparing, a row picks its run rather than opening.
       onRowClick: (id) =>
-        setOpen((current) => {
-          const next = new Set(current);
-          if (!next.delete(Number(id))) {
-            next.add(Number(id));
-          }
-          return next;
-        }),
+        comparing
+          ? pick(Number(id))
+          : setOpen((current) => {
+              const next = new Set(current);
+              if (!next.delete(Number(id))) {
+                next.add(Number(id));
+              }
+              return next;
+            }),
       rows: shown.map((run) => {
         const result = run.result;
         const startedAt = new Date(run.startedAt);
         return {
           id: String(run.id),
           searchText: `${run.consumerName} ${run.kind}`,
-          expanded: open.has(run.id),
-          detail: open.has(run.id) ? detail(run) : undefined,
+          expanded: comparing ? undefined : open.has(run.id),
+          detail: !comparing && open.has(run.id) ? detail(run) : undefined,
           cells: [
-            <CheckBox
-              key="compare"
-              checked={checked.includes(run.id)}
-              label={t("next.networking.speed.compareRun", { id: run.id })}
-              onChange={(next) =>
-                setChecked((current) => (next ? [...current.filter((id) => id !== run.id), run.id].slice(-2) : current.filter((id) => id !== run.id)))
-              }
-            />,
+            // The box keeps its column while hidden, so the row does not shift when comparing starts.
+            comparing ? (
+              <CheckBox
+                key="compare"
+                checked={picked.includes(run.id)}
+                label={t("next.networking.speed.compareRun", { id: run.id })}
+                onChange={() => pick(run.id)}
+              />
+            ) : (
+              <span key="compare" />
+            ),
             <Cell key="started" mono title={startedAt.toLocaleString()}>
               {startedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
             </Cell>,
@@ -608,33 +625,49 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
         };
       }),
       footer: <CheckRow checked={allRoutes} onChange={setAllRoutes} label={t("next.networking.speed.allRoutes")} />,
-    },
-    compared.length === 2
-      ? {
-          kind: "custom",
-          id: "speed-compare",
-          title: t("next.networking.speed.compare"),
-          searchText: "",
-          body: (
-            // Side by side, each run's eight parts sit on rows the two share, so like lines up with like.
-            <div className="grid min-w-0 items-center gap-6 px-4 py-6 sm:px-6 xl:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] xl:gap-y-0">
-              {compared.map((run, index) => (
-                <Fragment key={run.id}>
-                  {index > 0 ? (
-                    <span aria-hidden="true" className="text-center font-wv-title text-[44px] font-semibold leading-none text-wv-accent xl:row-span-8">
-                      {t("next.networking.speed.versus")}
-                    </span>
-                  ) : null}
-                  {detail(run, {
-                    better: betterStats(run, compared[1 - index]!),
+      action: comparing
+        ? { label: t("next.networking.speed.stopComparing"), icon: "close", onClick: () => setComparing(false) }
+        : {
+            label: t("next.networking.speed.compare"),
+            icon: "compare",
+            onClick: () => {
+              setComparing(true);
+              setOpen(new Set());
+              setPicked([null, null]);
+            },
+          },
+      below: comparing ? (
+        // Side by side, each run's eight parts sit on rows the two share, so like lines up with like.
+        // A side with no run picked yet holds its place with a hint.
+        <section
+          aria-label={t("next.networking.speed.compare")}
+          className="grid min-w-0 items-center gap-6 border-b border-wv-hairline px-4 pb-6 pt-3 sm:px-6 xl:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] xl:gap-y-0"
+        >
+          {compared.map((run, index) => {
+            const other = compared[1 - index];
+            return (
+              <Fragment key={run?.id ?? `side-${index}`}>
+                {index > 0 ? (
+                  <span aria-hidden="true" className="text-center font-wv-title text-[44px] font-semibold leading-none text-wv-accent xl:row-span-8">
+                    {t("next.networking.speed.versus")}
+                  </span>
+                ) : null}
+                {run ? (
+                  detail(run, {
+                    better: other ? betterStats(run, other) : {},
                     className: "self-stretch border-2 border-wv-accent p-6 sm:p-8 xl:row-span-8 xl:grid xl:grid-rows-subgrid",
-                  })}
-                </Fragment>
-              ))}
-            </div>
-          ),
-        }
-      : null,
+                  })
+                ) : (
+                  <div className="flex min-h-[140px] items-center justify-center self-stretch border-2 border-wv-faint p-6 text-center text-[13px] text-wv-muted xl:row-span-8">
+                    {t("next.networking.speed.pickResult")}
+                  </div>
+                )}
+              </Fragment>
+            );
+          })}
+        </section>
+      ) : undefined,
+    },
   ];
 
   return (

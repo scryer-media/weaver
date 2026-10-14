@@ -1903,6 +1903,8 @@ export const nextZh: LocaleDictionary = {
   "next.networking.speed.compareRun": "对比运行 {{id}}",
   "next.networking.speed.versus": "vs",
   "next.networking.speed.compare": "对比",
+  "next.networking.speed.pickResult": "从上方选择一个结果",
+  "next.networking.speed.stopComparing": "停止",
   "next.networking.speed.runAgain": "再次运行",
   "next.networking.speed.legs": "各段",
   "next.networking.speed.leg": "段",

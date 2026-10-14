@@ -1903,6 +1903,8 @@ export const nextJa: LocaleDictionary = {
   "next.networking.speed.compareRun": "実行 {{id}} を比較",
   "next.networking.speed.versus": "vs",
   "next.networking.speed.compare": "比較",
+  "next.networking.speed.pickResult": "上の結果から選択",
+  "next.networking.speed.stopComparing": "停止",
   "next.networking.speed.runAgain": "再実行",
   "next.networking.speed.legs": "レグ",
   "next.networking.speed.leg": "レグ",

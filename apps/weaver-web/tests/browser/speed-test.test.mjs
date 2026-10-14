@@ -141,15 +141,29 @@ test("a leg taken down is left out of the test, the run is followed to its resul
     await page.locator("main").getByRole("button").filter({ hasText: "Feed mirror" }).waitFor();
     await rows.filter({ hasText: "leg 2" }).first().waitFor();
 
-    // A run opens on its own detail, and two runs checked are compared side by side.
+    // A run opens on its own detail; until Compare is pressed a row has no box to check.
     await rows.first().click();
     await page.getByRole("table", { name: "Legs", exact: true }).first().waitFor();
     await page.getByRole("table", { name: "Articles", exact: true }).first().waitFor();
-    await page.getByRole("checkbox", { name: "Compare run 1", exact: true }).click();
-    await page.getByRole("checkbox", { name: "Compare run 2", exact: true }).click();
-    await page.getByText("Compare", { exact: true }).waitFor();
-    // Each figure one run beat the other on carries the margin; the Usenet run's decoded bytes have nothing to beat.
+    assert.equal(await page.getByRole("checkbox", { name: "Compare run 2", exact: true }).count(), 0);
+    // Compare closes every open row and holds two sides open, each asking for a result.
+    await page.getByRole("button", { name: "Compare", exact: true }).click();
+    await page.getByRole("button", { name: "Stop", exact: true }).waitFor();
+    await page.getByRole("table", { name: "Articles", exact: true }).waitFor({ state: "detached" });
     const compare = page.getByRole("region", { name: "Compare", exact: true });
+    const hint = "Pick a result from above";
+    assert.equal(await compare.getByText(hint, { exact: true }).count(), 2);
+    await shot(page, "speed-compare-empty");
+    // The whole row is the box's target, and a row no longer opens: the first pick takes the left side, the next the right.
+    const runRow = (id) => page.locator(`main [data-row-id="${id}"]`);
+    await runRow(2).click();
+    await page.getByRole("checkbox", { name: "Compare run 2", checked: true, exact: true }).waitFor();
+    assert.equal(await runRow(2).getAttribute("aria-expanded"), null);
+    assert.deepEqual(await compare.locator(":scope > *").evaluateAll((sides) => sides.map((side) => side.textContent === "Pick a result from above")), [false, false, true]);
+    await page.getByRole("checkbox", { name: "Compare run 1", exact: true }).click();
+    await page.getByRole("checkbox", { name: "Compare run 1", checked: true, exact: true }).waitFor();
+    assert.equal(await compare.getByText(hint, { exact: true }).count(), 0);
+    // Each figure one run beat the other on carries the margin; the Usenet run's decoded bytes have nothing to beat.
     for (const margin of ["+100%", "+150%", "+140%"]) await compare.getByText(margin, { exact: true }).waitFor();
     assert.equal(await compare.getByText(/^\+/).count(), 3);
     await shot(page, "speed-compare", compare);
@@ -167,10 +181,11 @@ test("a leg taken down is left out of the test, the run is followed to its resul
     // Cancelled before it measured, it has a status and no result.
     await page.locator("main").getByRole("button").filter({ hasText: "Cancelled" }).waitFor();
 
+    // Stop puts the boxes away and the rows open again.
+    await page.getByRole("button", { name: "Stop", exact: true }).click();
+    await compare.waitFor({ state: "detached" });
+    assert.equal(await page.getByRole("checkbox", { name: "Compare run 2", exact: true }).count(), 0);
     // A run started elsewhere runs again exactly as the daemon kept its request.
-    await page.getByRole("checkbox", { name: "Compare run 2", exact: true }).click();
-    await rows.filter({ hasText: "leg 2" }).filter({ hasText: "Completed" }).click();
-    await page.getByRole("table", { name: "Articles", exact: true }).waitFor({ state: "detached" });
     const feed = page.locator("main").getByRole("button").filter({ hasText: "Feed mirror" });
     await feed.click();
     // The run's flow ends at the host it measured against.

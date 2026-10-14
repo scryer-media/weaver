@@ -28,6 +28,7 @@ import {
   Toggle,
 } from "@/next/components/controls";
 import { FormRow } from "@/next/components/rows";
+import type { IconName } from "@/next/components/icons";
 import { cn } from "@/lib/utils";
 import { filterBlocks, type SearchRegistry } from "./search";
 
@@ -370,6 +371,13 @@ export interface SettingsTableModel {
    */
   add?: { label: string; onClick: () => void; disabled?: boolean };
   /**
+   * The one action a list with no Add is worked through, such as Compare,
+   * centred under the table where an Add would be.
+   */
+  action?: { label: string; icon: IconName; onClick: () => void };
+  /** What the action opens, drawn under it. */
+  below?: ReactNode;
+  /**
    * A trailing row of the table's other actions, such as "Clear history".
    * The top bar carries a panel's actions; a table that owns more than one
    * list carries the ones that belong to that list.
@@ -516,6 +524,7 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
     const line = (
       <div
         key={disclosure ? undefined : entry.id}
+        data-row-id={entry.id}
         {...(interactive
           ? {
               role: "button",
@@ -621,6 +630,14 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
           </PrimaryButton>
         </div>
       )}
+      {block.action === undefined ? null : (
+        <div className="flex flex-none justify-center px-4 sm:px-6 py-3">
+          <PrimaryButton icon={block.action.icon} onClick={block.action.onClick}>
+            {block.action.label}
+          </PrimaryButton>
+        </div>
+      )}
+      {block.below}
     </>
   );
 }

@@ -1903,6 +1903,8 @@ export const nextKo: LocaleDictionary = {
   "next.networking.speed.compareRun": "실행 {{id}} 비교",
   "next.networking.speed.versus": "vs",
   "next.networking.speed.compare": "비교",
+  "next.networking.speed.pickResult": "위에서 결과를 선택하세요",
+  "next.networking.speed.stopComparing": "중지",
   "next.networking.speed.runAgain": "다시 실행",
   "next.networking.speed.legs": "레그",
   "next.networking.speed.leg": "레그",

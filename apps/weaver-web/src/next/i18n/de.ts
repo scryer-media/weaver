@@ -1903,6 +1903,8 @@ export const nextDe: LocaleDictionary = {
   "next.networking.speed.compareRun": "Lauf {{id}} vergleichen",
   "next.networking.speed.versus": "vs.",
   "next.networking.speed.compare": "Vergleich",
+  "next.networking.speed.pickResult": "Wähle oben ein Ergebnis",
+  "next.networking.speed.stopComparing": "Beenden",
   "next.networking.speed.runAgain": "Erneut starten",
   "next.networking.speed.legs": "Strecken",
   "next.networking.speed.leg": "Strecke",

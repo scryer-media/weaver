@@ -202,7 +202,7 @@ class SpeedPage {
   }
 
   row(id: number): Locator {
-    return this.runs.getByRole("button").filter({ has: this.page.getByRole("checkbox", { name: `Compare run ${id}`, exact: true }) });
+    return this.runs.locator(`[data-row-id="${id}"]`);
   }
 
   // Wait for run `id` to reach `status` in the Runs table.
@@ -520,7 +520,8 @@ test("ST05 a two-leg route splits the connections, a leg taken down gives them a
   expect((await speedTestRuns(request)).length).toBe(runsBefore);
   expect((await queueState(request)).isPaused).toBe(false);
 
-  // Two runs ticked in the Runs table are shown side by side.
+  // Compare mode: two runs ticked in the Runs table are shown side by side.
+  await page.getByRole("button", { name: "Compare", exact: true }).click();
   await speed.runs.getByRole("checkbox", { name: `Compare run ${first}`, exact: true }).check();
   await speed.runs.getByRole("checkbox", { name: `Compare run ${second}`, exact: true }).check();
   const compare = page.getByRole("region", { name: "Compare", exact: true });
