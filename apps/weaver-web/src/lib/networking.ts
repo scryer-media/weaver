@@ -169,10 +169,17 @@ export type SpeedTestRequest = {
     connections: number | null; maxDurationSeconds: number;
   } | null;
 };
+/** Why a run failed: the web words each code; OTHER, or a code it does not know, shows `message`. */
+export type SpeedTestFailureCode =
+  | "RATE_LIMITED" | "HTTP_STATUS" | "TLS_VERIFICATION" | "UNRESOLVED" | "NO_DNS_SERVERS" | "ADDRESS_NOT_ALLOWED"
+  | "EGRESS_QUOTA_USED" | "NO_LEG_UP" | "LEASE_REFUSED" | "SERVER_LEFT_POOL" | "STOPPED" | "STOPPED_UNEXPECTEDLY"
+  | "NO_BYTES" | "OTHER";
+/** `message` is the daemon's own account, naming the URL, host or status; `params` holds what the sentence names. */
+export type SpeedTestFailure = { code: SpeedTestFailureCode; message: string; params: Record<string, unknown> };
 export type SpeedTestRun = {
   id: number; consumer: string; consumerName: string; kind: SpeedTestKind; request: SpeedTestRequest; status: SpeedTestStatus; phase: string | null;
   /** Epoch milliseconds. */
-  startedAt: number; finishedAt: number | null; error: string | null;
+  startedAt: number; finishedAt: number | null; failure: SpeedTestFailure | null;
   tested: { legs: TestedLeg[]; failover: NetworkRoute["failover"]; overrides: PathOverride; names: { kind: string; id: number; name: string }[] };
   result: SpeedTestResult | null;
 };

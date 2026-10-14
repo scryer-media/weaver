@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { refusalKey, refusalMessage } from "../src/lib/refusal.ts";
+import { codedSentence, refusalKey, refusalMessage } from "../src/lib/refusal.ts";
 import { nextEn } from "../src/next/i18n/en.ts";
 
 const SENTENCES: Record<string, string> = { [refusalKey("ROUTE_PROXY_REPEATED")]: "Ours, for a repeated proxy." };
@@ -68,4 +68,30 @@ test("every code the daemon refuses with has a sentence here", () => {
     .filter((key) => key.startsWith(refusalKey("")))
     .map((key) => key.slice(refusalKey("").length));
   assert.deepEqual([...worded, ...UNWORDED].sort(), codes);
+});
+
+const failureKey = (code: string) => `next.networking.speed.failure.${code}`;
+
+test("a speed test failure reads as our sentence for its code, and in the daemon's words for OTHER", () => {
+  assert.equal(
+    codedSentence(english, failureKey("HTTP_STATUS"), { url: "https://speed.fixture.invalid/", status: 503 }, "GET https://speed.fixture.invalid/ answered HTTP 503 Service Unavailable"),
+    "The provider answered HTTP 503.",
+  );
+  assert.equal(codedSentence(english, failureKey("OTHER"), {}, "the response has no body"), "the response has no body");
+});
+
+test("every kind of speed test failure but OTHER has a sentence here", () => {
+  const source = readFileSync(
+    new URL("../../../server/crates/weaver-server-api/src/speed_test.rs", import.meta.url),
+    "utf8",
+  );
+  const body = source.match(/pub enum SpeedTestFailureCode \{([^}]*)\}/)?.[1] ?? "";
+  const codes = [...body.matchAll(/^\s*([A-Z][A-Za-z]*),$/gm)]
+    .map((match) => match[1]!.replace(/(?<=[a-z])(?=[A-Z])/g, "_").toUpperCase())
+    .sort();
+  assert.ok(codes.includes("RATE_LIMITED"), "the failure codes were not found where they are defined");
+  const worded = Object.keys(nextEn)
+    .filter((key) => key.startsWith(failureKey("")))
+    .map((key) => key.slice(failureKey("").length));
+  assert.deepEqual([...worded, "OTHER"].sort(), codes);
 });

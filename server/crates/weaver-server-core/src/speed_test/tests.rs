@@ -560,3 +560,81 @@ async fn usenet_on_a_feed_is_refused() {
         SpeedTestError::Refused(crate::proxies::NetworkRefusal::SpeedTestUsenetNeedsServer)
     );
 }
+
+// Start a bandwidth run of `path` on an HTTPS fixture serving `blob_len`
+// bytes at `/blob`, and wait for it to finish.
+async fn bandwidth_run_of(path: &str, blob_len: usize) -> (SpeedTestRun, String) {
+    let rig = rig().await;
+    let (acceptor, cert_der, _) = loopback_tls();
+    let http = HttpFixture::start(String::new(), blob_len, Some(acceptor)).await;
+    rig.service.trust_roots_for_tests(vec![cert_der]);
+    let url = format!("https://127.0.0.1:{}{path}", http.addr.port());
+    let started = rig
+        .service
+        .start(bandwidth_request(url.clone()))
+        .await
+        .unwrap();
+    (finished(&rig, started.id).await, url)
+}
+
+#[tokio::test]
+async fn a_provider_answering_429_fails_the_run_as_rate_limited() {
+    let (run, url) = bandwidth_run_of("/limited", 0).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Failed);
+    assert_eq!(
+        run.error,
+        Some(SpeedTestFailure::RateLimited { url: url.clone() })
+    );
+    let failure = run.error.unwrap();
+    assert_eq!(
+        failure.to_string(),
+        format!("GET {url} answered HTTP 429 Too Many Requests")
+    );
+    assert_eq!(failure.params().get("url"), Some(&serde_json::json!(url)));
+    let result = run.result.unwrap();
+    assert_eq!(result.bytes, 0);
+    assert!(
+        result.connections.iter().all(|c| c.error.as_deref()
+            == Some(format!("GET {url} answered HTTP 429 Too Many Requests").as_str())),
+        "{:?}",
+        result.connections
+    );
+}
+
+#[tokio::test]
+async fn a_provider_answering_another_error_status_fails_the_run_with_that_status() {
+    let (run, url) = bandwidth_run_of("/missing", 0).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Failed);
+    let failure = run.error.unwrap();
+    assert_eq!(
+        failure,
+        SpeedTestFailure::HttpStatus {
+            url: url.clone(),
+            status: 404
+        }
+    );
+    assert_eq!(
+        failure.to_string(),
+        format!("GET {url} answered HTTP 404 Not Found")
+    );
+    assert_eq!(
+        failure.params().get("status"),
+        Some(&serde_json::json!(404))
+    );
+}
+
+#[tokio::test]
+async fn a_failure_with_no_kind_of_its_own_keeps_its_detail() {
+    let (run, _) = bandwidth_run_of("/blob", 0).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Failed);
+    assert_eq!(
+        run.error,
+        Some(SpeedTestFailure::Other(
+            "no bytes were received: the response has no body".into()
+        ))
+    );
+    assert!(run.error.unwrap().params().is_empty());
+}

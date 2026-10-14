@@ -19,7 +19,7 @@ import {
   type SpeedTestKind,
   type SpeedTestRun,
 } from "@/lib/networking";
-import { refusalMessage } from "@/lib/refusal";
+import { codedSentence, refusalMessage } from "@/lib/refusal";
 import { cn } from "@/lib/utils";
 import { Eyebrow, MetricCell, MetricStrip } from "../../components/chrome";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
@@ -626,6 +626,10 @@ export function betterStats(run: SpeedTestRun, other: SpeedTestRun): BetterStats
   return better;
 }
 
+/** Why a run failed, in our words for its code; the daemon's own for a code we have none for. */
+const failureMessage = (t: Translate, failure: NonNullable<SpeedTestRun["failure"]>) =>
+  codedSentence(t, `next.networking.speed.failure.${failure.code}`, failure.params, failure.message);
+
 /**
  * What a finished run measured: its average with its peak beside it, large,
  * then the bytes it moved. A Usenet run shows what came off the wire and what
@@ -651,8 +655,8 @@ export function RunResult({ run, better = {} }: { run: SpeedTestRun; better?: Be
   return (
     <section aria-label={t("next.networking.speed.result")} className="flex flex-col border-b border-wv-hairline">
       {failed ? (
-        <p role={run.status === "FAILED" ? "alert" : "status"} className="px-4 py-3 text-[12.5px] text-wv-error-text sm:px-6">
-          {run.error ? `${t(`next.networking.speed.status.${run.status}`)} · ${run.error}` : t(`next.networking.speed.status.${run.status}`)}
+        <p role={run.status === "FAILED" ? "alert" : "status"} title={run.failure?.message} className="px-4 py-3 text-[12.5px] text-wv-error-text sm:px-6">
+          {run.failure ? `${t(`next.networking.speed.status.${run.status}`)} · ${failureMessage(t, run.failure)}` : t(`next.networking.speed.status.${run.status}`)}
         </p>
       ) : null}
       {result ? (

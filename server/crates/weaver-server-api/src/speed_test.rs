@@ -438,6 +438,65 @@ impl From<&core::SpeedTestRequest> for SpeedTestRequestGql {
     }
 }
 
+// Why a run failed. A client words each kind itself and falls back to the
+// failure's message for OTHER, or for a kind it does not know.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+pub enum SpeedTestFailureCode {
+    // The provider answered HTTP 429.
+    RateLimited,
+    // The provider answered another status that is not a success.
+    HttpStatus,
+    TlsVerification,
+    Unresolved,
+    NoDnsServers,
+    AddressNotAllowed,
+    EgressQuotaUsed,
+    NoLegUp,
+    LeaseRefused,
+    ServerLeftPool,
+    Stopped,
+    StoppedUnexpectedly,
+    NoBytes,
+    Other,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "SpeedTestFailure")]
+pub struct SpeedTestFailureGql {
+    pub code: SpeedTestFailureCode,
+    // The daemon's own account, naming the URL, host or status.
+    pub message: String,
+    // The values the client's sentence for the code may name.
+    pub params: async_graphql::Json<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl From<core::SpeedTestFailure> for SpeedTestFailureGql {
+    fn from(failure: core::SpeedTestFailure) -> Self {
+        use core::SpeedTestFailure as F;
+        let code = match &failure {
+            F::RateLimited { .. } => SpeedTestFailureCode::RateLimited,
+            F::HttpStatus { .. } => SpeedTestFailureCode::HttpStatus,
+            F::TlsVerification { .. } => SpeedTestFailureCode::TlsVerification,
+            F::Unresolved { .. } => SpeedTestFailureCode::Unresolved,
+            F::NoDnsServers { .. } => SpeedTestFailureCode::NoDnsServers,
+            F::AddressNotAllowed { .. } => SpeedTestFailureCode::AddressNotAllowed,
+            F::EgressQuotaUsed { .. } => SpeedTestFailureCode::EgressQuotaUsed,
+            F::NoLegUp => SpeedTestFailureCode::NoLegUp,
+            F::LeaseRefused { .. } => SpeedTestFailureCode::LeaseRefused,
+            F::ServerLeftPool => SpeedTestFailureCode::ServerLeftPool,
+            F::Stopped => SpeedTestFailureCode::Stopped,
+            F::StoppedUnexpectedly => SpeedTestFailureCode::StoppedUnexpectedly,
+            F::NoBytes => SpeedTestFailureCode::NoBytes,
+            F::Other(_) => SpeedTestFailureCode::Other,
+        };
+        Self {
+            code,
+            message: failure.to_string(),
+            params: async_graphql::Json(failure.params()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, SimpleObject)]
 pub struct SpeedTestRun {
     pub id: u32,
@@ -453,7 +512,8 @@ pub struct SpeedTestRun {
     // Epoch milliseconds.
     pub started_at: f64,
     pub finished_at: Option<f64>,
-    pub error: Option<String>,
+    // Why a failed run failed.
+    pub failure: Option<SpeedTestFailureGql>,
     pub tested: TestedRoute,
     pub result: Option<SpeedTestResult>,
 }
@@ -548,7 +608,7 @@ impl From<core::SpeedTestRun> for SpeedTestRun {
             phase,
             started_at: run.started_at_ms as f64,
             finished_at: run.finished_at_ms.map(|at| at as f64),
-            error: run.error,
+            failure: run.error.map(Into::into),
             tested: TestedRoute {
                 legs: tested
                     .legs

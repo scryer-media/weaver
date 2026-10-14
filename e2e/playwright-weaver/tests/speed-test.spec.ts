@@ -26,7 +26,8 @@ test.afterEach(async ({ request }, info) => {
 
 type DialPath = { egressId: number; rung: number | null; poolId: number | null; memberId: number | null; proxyIds: number[] };
 type SpeedTestRun = {
-  id: number; consumer: string; consumerName: string; kind: string; status: string; phase: string | null; error: string | null;
+  id: number; consumer: string; consumerName: string; kind: string; status: string; phase: string | null;
+  failure: { code: string; message: string } | null;
   tested: { legs: Array<{ position: number; down: boolean }>; overrides: { downRungs: Array<{ leg: number; rung: number }> } };
   result: {
     bytes: number; averageBps: number; peakBps: number;
@@ -36,7 +37,7 @@ type SpeedTestRun = {
   } | null;
 };
 
-const RUN_FIELDS = `id consumer consumerName kind status phase error
+const RUN_FIELDS = `id consumer consumerName kind status phase failure { code message }
   tested { legs { position down } overrides { downRungs { leg rung } } }
   result { bytes averageBps peakBps
     connections { leg bytes error path { egressId rung poolId memberId proxyIds } }
@@ -249,7 +250,7 @@ test("ST01 a Usenet run measures through the proxy rung, the same run with that 
   const first = await speed.run();
   const firstRow = await speed.finished(first, "Completed");
   const run1 = await speedTestRun(request, first);
-  expect(run1).toMatchObject({ status: "COMPLETED", kind: "USENET", consumer: `server:${server}`, error: null });
+  expect(run1).toMatchObject({ status: "COMPLETED", kind: "USENET", consumer: `server:${server}`, failure: null });
   const result1 = run1.result!;
   expect(result1.averageBps).toBeGreaterThan(0);
   expect(result1.bytes).toBeGreaterThan(0);
@@ -289,7 +290,7 @@ test("ST01 a Usenet run measures through the proxy rung, the same run with that 
   const second = await speed.run();
   const secondRow = await speed.finished(second, "Completed");
   const run2 = await speedTestRun(request, second);
-  expect(run2).toMatchObject({ status: "COMPLETED", error: null });
+  expect(run2).toMatchObject({ status: "COMPLETED", failure: null });
   expect(run2.tested.overrides.downRungs).toEqual([{ leg: 0, rung: 0 }]);
   expect(run2.tested.legs).toMatchObject([{ position: 0, down: false }]);
   const result2 = run2.result!;
@@ -351,7 +352,7 @@ test("ST02 a run started while the queue is paused leaves it paused", async ({ c
   await speed.useNzbUrl(nzb.url);
   const id = await speed.run();
   await speed.finished(id, "Completed");
-  expect(await speedTestRun(request, id)).toMatchObject({ status: "COMPLETED", error: null });
+  expect(await speedTestRun(request, id)).toMatchObject({ status: "COMPLETED", failure: null });
   // The run did not pause the queue, so it does not resume it.
   expect((await queueState(request)).isPaused).toBe(true);
   await expect(queueControl).toHaveText("Resume all", { timeout: 0 });
@@ -389,7 +390,7 @@ test("ST03 cancelling a run ends it Cancelled and resumes the queue it paused", 
 
   await speed.finished(id, "Cancelled");
   await expect(speed.test.getByRole("region", { name: "Result", exact: true }).getByRole("status")).toHaveText("Cancelled");
-  expect(await speedTestRun(request, id)).toMatchObject({ status: "CANCELLED", error: null });
+  expect(await speedTestRun(request, id)).toMatchObject({ status: "CANCELLED", failure: null });
   expect((await queueState(request)).isPaused).toBe(false);
   await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
 });
@@ -410,7 +411,7 @@ test("ST04 a bandwidth run against Cloudflare measures through the proxy rung an
   const id = await speed.run();
   const row = await speed.finished(id, "Completed");
   const run = await speedTestRun(request, id);
-  expect(run).toMatchObject({ status: "COMPLETED", kind: "BANDWIDTH", consumer: `server:${server}`, error: null });
+  expect(run).toMatchObject({ status: "COMPLETED", kind: "BANDWIDTH", consumer: `server:${server}`, failure: null });
   const result = run.result!;
   expect(result.bandwidth).toMatchObject({ providerId: "cloudflare" });
   expect(result.bandwidth!.url).toContain(CLOUDFLARE_HOST);
@@ -472,7 +473,7 @@ test("ST05 a two-leg route splits the connections, a leg taken down gives them a
   const first = await speed.run();
   await speed.finished(first, "Completed");
   const run1 = await speedTestRun(request, first);
-  expect(run1).toMatchObject({ status: "COMPLETED", error: null });
+  expect(run1).toMatchObject({ status: "COMPLETED", failure: null });
   expect(run1.tested.legs).toMatchObject([{ position: 0, down: false }, { position: 1, down: false }]);
   const result1 = run1.result!;
   expect(result1.usenet).toMatchObject({ articlesRequested: parts, delivered: parts });
@@ -493,7 +494,7 @@ test("ST05 a two-leg route splits the connections, a leg taken down gives them a
   const second = await speed.run();
   const secondRow = await speed.finished(second, "Completed");
   const run2 = await speedTestRun(request, second);
-  expect(run2).toMatchObject({ status: "COMPLETED", error: null });
+  expect(run2).toMatchObject({ status: "COMPLETED", failure: null });
   expect(run2.tested.legs).toMatchObject([{ position: 0, down: false }, { position: 1, down: true }]);
   const result2 = run2.result!;
   expect(result2.usenet).toMatchObject({ articlesRequested: parts, delivered: parts });
@@ -548,7 +549,7 @@ test("ST06 a Usenet run of the seeded 100 MB posting over a plaintext direct leg
   const id = await speed.run();
   const row = await speed.finished(id, "Completed");
   const run = await speedTestRun(request, id);
-  expect(run).toMatchObject({ status: "COMPLETED", kind: "USENET", consumer: `server:${server}`, error: null });
+  expect(run).toMatchObject({ status: "COMPLETED", kind: "USENET", consumer: `server:${server}`, failure: null });
   const result = run.result!;
   expect(result.usenet).toMatchObject({
     articlesRequested: declared.length, delivered: declared.length, missing: 0, failed: 0,
@@ -589,9 +590,11 @@ test("ST07 a run whose NZB URL does not serve an NZB fails, says why, and leaves
   const row = await speed.finished(id, "Failed");
   const run = await speedTestRun(request, id);
   expect(run).toMatchObject({ status: "FAILED", kind: "USENET" });
-  expect(run.error, "the failure names its cause").toBeTruthy();
+  // A cause with no sentence of its own is shown in the daemon's words.
+  expect(run.failure, "the failure names its cause").toMatchObject({ code: "OTHER" });
+  expect(run.failure!.message, "the failure names its cause").toBeTruthy();
   const result = speed.test.getByRole("region", { name: "Result", exact: true });
-  await expect(result.getByRole("alert")).toHaveText(`Failed · ${run.error}`);
+  await expect(result.getByRole("alert")).toHaveText(`Failed · ${run.failure!.message}`);
   await expect(row).toContainText("Failed");
   expect((await queueState(request)).isPaused).toBe(false);
   await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
@@ -619,7 +622,7 @@ test("ST08 a run reaching its maximum duration completes with what it measured",
   const id = await speed.run();
   await speed.finished(id, "Completed");
   const run = await speedTestRun(request, id);
-  expect(run).toMatchObject({ status: "COMPLETED", error: null });
+  expect(run).toMatchObject({ status: "COMPLETED", failure: null });
   const result = run.result!;
   expect(result.bytes).toBeGreaterThan(0);
   expect(result.usenet!.delivered).toBeGreaterThan(0);
@@ -648,7 +651,7 @@ test("ST09 a run books against the server's download quota, stops at it, and is 
   const id = await speed.run();
   await speed.finished(id, "Completed");
   const run = await speedTestRun(request, id);
-  expect(run).toMatchObject({ status: "COMPLETED", error: null });
+  expect(run).toMatchObject({ status: "COMPLETED", failure: null });
   const result = run.result!;
   expect(result.bytes).toBeGreaterThan(0);
   expect(result.usenet!.delivered).toBeGreaterThan(0);

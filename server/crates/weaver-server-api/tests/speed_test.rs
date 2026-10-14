@@ -45,7 +45,7 @@ async fn add_server(h: &TestHarness, nntp: &NntpFixture) -> u64 {
 
 const DIRECT: &str = "{legs:[{egressId:0,weight:100,path:{direct:true}}]}";
 
-const RUN_SHAPE: &str = "id consumer consumerName kind request{bandwidth{providerId server customUrl} usenet{sabSize nzbUrl nzbFilename nzbRunId connections maxDurationSeconds}} status phase startedAt finishedAt error tested{legs{position egressId weight down downReason target path{kind}} failover overrides{downLegs downRungs{leg rung} downProxies downEgresses} names{kind id name}} result{bytes elapsedMs averageBps peakBps legs{position bytes connections sourceAddresses} connections{leg connectMs bytes error sourceAddress path{egressId rung poolId memberId proxyIds}} usenet{articlesRequested delivered missing failed declaredBytes decodedBytes pipelining tls tlsCipherSuite} bandwidth{providerId server url connections} samples{atMs leg bytes decodedBytes}}";
+const RUN_SHAPE: &str = "id consumer consumerName kind request{bandwidth{providerId server customUrl} usenet{sabSize nzbUrl nzbFilename nzbRunId connections maxDurationSeconds}} status phase startedAt finishedAt failure{code message params} tested{legs{position egressId weight down downReason target path{kind}} failover overrides{downLegs downRungs{leg rung} downProxies downEgresses} names{kind id name}} result{bytes elapsedMs averageBps peakBps legs{position bytes connections sourceAddresses} connections{leg connectMs bytes error sourceAddress path{egressId rung poolId memberId proxyIds}} usenet{articlesRequested delivered missing failed declaredBytes decodedBytes pipelining tls tlsCipherSuite} bandwidth{providerId server url connections} samples{atMs leg bytes decodedBytes}}";
 
 async fn start(h: &TestHarness, input: &str) -> serde_json::Value {
     let response = h
@@ -511,6 +511,17 @@ async fn a_bandwidth_run_starts_on_its_source_alone_and_reports_it() {
     let connections = done["result"]["connections"].as_array().unwrap();
     assert_eq!(connections.len(), 1, "{done}");
     assert!(connections[0]["error"].is_string(), "{done}");
+    // A refused connection has no kind of its own: its words stand.
+    assert_eq!(done["failure"]["code"], "OTHER", "{done}");
+    assert_eq!(
+        done["failure"]["message"],
+        format!(
+            "no bytes were received: {}",
+            connections[0]["error"].as_str().unwrap()
+        ),
+        "{done}"
+    );
+    assert_eq!(done["failure"]["params"], serde_json::json!({}), "{done}");
 }
 
 // Give egress 0 a download quota of `limit` bytes.
@@ -557,7 +568,7 @@ async fn a_bandwidth_run_over_https_completes_with_its_result() {
     let done = finished(&h, started["id"].as_u64().unwrap()).await;
 
     assert_eq!(done["status"], "COMPLETED", "{done}");
-    assert_eq!(done["error"], serde_json::Value::Null);
+    assert_eq!(done["failure"], serde_json::Value::Null);
     let result = &done["result"];
     assert_eq!(result["bytes"], 400_000.0);
     assert!(result["averageBps"].as_f64().unwrap() > 0.0, "{done}");
@@ -580,6 +591,33 @@ async fn a_bandwidth_run_over_https_completes_with_its_result() {
         );
     }
     assert_eq!(result["legs"][0]["bytes"], 400_000.0);
+}
+
+#[tokio::test]
+async fn a_bandwidth_run_a_provider_rate_limits_fails_as_rate_limited() {
+    let h = harness().await;
+    let (acceptor, cert_der, _) = loopback_tls();
+    let http = HttpFixture::start(String::new(), 0, Some(acceptor)).await;
+    let service = SpeedTestService::for_handle(&h.handle, h.config.clone(), h.db.clone(), true);
+    service.trust_roots_for_tests(vec![cert_der]);
+    let url = format!("https://127.0.0.1:{}/limited", http.addr.port());
+
+    let started = start(
+        &h,
+        &format!(r#"{{kind:RSS,id:1,route:{DIRECT},bandwidth:{{customUrl:"{url}"}}}}"#),
+    )
+    .await;
+    let done = finished(&h, started["id"].as_u64().unwrap()).await;
+
+    assert_eq!(done["status"], "FAILED", "{done}");
+    assert_eq!(
+        done["failure"],
+        serde_json::json!({
+            "code": "RATE_LIMITED",
+            "message": format!("GET {url} answered HTTP 429 Too Many Requests"),
+            "params": { "url": url },
+        })
+    );
 }
 
 #[tokio::test]

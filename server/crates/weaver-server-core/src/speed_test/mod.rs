@@ -4,6 +4,7 @@
 
 mod adaptive;
 mod bandwidth;
+mod failure;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixture;
 mod http;
@@ -18,6 +19,7 @@ mod usenet;
 #[cfg(test)]
 mod tests;
 
+pub use failure::SpeedTestFailure;
 pub use model::*;
 pub use overrides::{TestedLeg, TestedRoute};
 pub use providers::{PROVIDERS, ProviderInfo, ProviderServer};

@@ -209,7 +209,8 @@ async fn serve_nntp(stream: Box<dyn Io>, shared: Arc<NntpShared>) -> std::io::Re
 }
 
 // An HTTP/1.1 source: `/test.nzb` answers the NZB, `/blob` answers
-// `blob_len` bytes. With `tls`, HTTPS.
+// `blob_len` bytes, `/limited` answers HTTP 429 as a rate-limiting provider
+// does, and any other path answers HTTP 404. With `tls`, HTTPS.
 pub struct HttpFixture {
     pub addr: SocketAddr,
     requests: watch::Sender<usize>,
@@ -273,6 +274,14 @@ async fn serve_http(
     let body: Vec<u8> = match path {
         "/test.nzb" => nzb.as_bytes().to_vec(),
         "/blob" => (0..blob_len).map(|i| (i % 253) as u8).collect(),
+        "/limited" => {
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await?;
+            return stream.flush().await;
+        }
         _ => {
             stream
                 .write_all(

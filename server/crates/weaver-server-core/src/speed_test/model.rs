@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::failure::SpeedTestFailure;
 use super::http::{NZB_LIMIT, TestArticle, parse_test_nzb};
 use crate::proxies::{Consumer, Failover, LegPath, Route};
 
@@ -345,7 +346,8 @@ pub struct SpeedTestRun {
     // Epoch milliseconds.
     pub started_at_ms: i64,
     pub finished_at_ms: Option<i64>,
-    pub error: Option<String>,
+    // Why a failed run failed.
+    pub error: Option<SpeedTestFailure>,
     pub tested: TestedRouteSnapshot,
     // Partial while the run measures; absent when it never reached measuring.
     pub result: Option<SpeedTestResult>,

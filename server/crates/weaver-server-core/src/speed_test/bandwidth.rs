@@ -6,6 +6,7 @@ use tokio::sync::watch;
 use weaver_nntp::transfer::{BodyTransferPermit, ServerTransferControl};
 
 use super::adaptive::{Controller, Decision, TICK, Tick};
+use super::failure::SpeedTestFailure;
 use super::http::{HttpLeg, HttpOptions, RoutedClient};
 use super::progress::{LegRecorder, Progress};
 use super::runner::Stop;
@@ -139,7 +140,7 @@ impl<'a> QuotaSlice<'a> {
     // Hold a slice with room before more of the GET is read. `remaining` is
     // what is left of the GET when its length is known; a slice is never
     // larger than that, and none is taken once it is all in.
-    fn ready(&mut self, remaining: Option<u64>) -> Result<(), String> {
+    fn ready(&mut self, remaining: Option<u64>) -> Result<(), SpeedTestFailure> {
         let Some(control) = &self.leg.egress_control else {
             return Ok(());
         };
@@ -149,12 +150,11 @@ impl<'a> QuotaSlice<'a> {
         // Dropping the used slice books what was read under it.
         self.permit = None;
         let size = remaining.map_or(QUOTA_SLICE, |remaining| remaining.min(QUOTA_SLICE));
-        let permit = control.try_reserve(size).map_err(|_| {
-            format!(
-                "egress {} has used its download quota",
-                self.leg.recorder.egress
-            )
-        })?;
+        let permit = control
+            .try_reserve(size)
+            .map_err(|_| SpeedTestFailure::EgressQuotaUsed {
+                egress: self.leg.recorder.egress,
+            })?;
         self.permit = Some(permit);
         self.room = size;
         Ok(())
@@ -271,7 +271,7 @@ async fn connection(
         drop(quota);
         progress.counted();
         if received == 0 {
-            client.provider.fail("the response has no body".into());
+            client.provider.fail("the response has no body");
             break Ended::Failed;
         }
     };

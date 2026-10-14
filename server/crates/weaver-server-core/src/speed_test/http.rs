@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use weaver_tunnel::bridge::Bridge;
-use weaver_tunnel::pipe::{Dialer, Resolution};
+use weaver_tunnel::pipe::{DialError, Dialer, Resolution};
 
+use super::failure::SpeedTestFailure;
 use super::progress::{LegRecorder, StreamProvider};
 use crate::security::{ResolvedFetchTarget, is_blocked_egress_ip};
 
@@ -50,7 +51,7 @@ pub(crate) async fn routed_get(
 ) -> Result<RoutedResponse, String> {
     let client = RoutedClient::connect(leg, url, options, None)
         .await
-        .map_err(|(_, error)| error)?;
+        .map_err(|(_, error)| error.to_string())?;
     match client.get(url).await {
         Ok(response) => Ok(RoutedResponse {
             response,
@@ -58,7 +59,7 @@ pub(crate) async fn routed_get(
         }),
         Err(error) => {
             client.bridge.revoke().await;
-            Err(error)
+            Err(error.to_string())
         }
     }
 }
@@ -81,61 +82,66 @@ impl RoutedClient {
         url: &reqwest::Url,
         options: &HttpOptions,
         recorder: Option<LegRecorder>,
-    ) -> Result<Self, (Option<Arc<StreamProvider>>, String)> {
+    ) -> Result<Self, (Option<Arc<StreamProvider>>, SpeedTestFailure)> {
         if !matches!(url.scheme(), "http" | "https") {
             return Err((None, "URL must use http or https".into()));
         }
         let host = url
             .host_str()
-            .ok_or((None, "URL must include a host".to_string()))?
+            .ok_or((None, "URL must include a host".into()))?
             .trim_matches(['[', ']'])
             .to_owned();
         let port = url
             .port_or_known_default()
-            .ok_or((None, "URL has no port".to_string()))?;
-        let addresses = match leg
-            .stage
-            .resolve(&host)
-            .await
-            .map_err(|e| (None, e.to_string()))?
-        {
+            .ok_or((None, "URL has no port".into()))?;
+        let addresses = match leg.stage.resolve(&host).await.map_err(|error| {
+            let failure = match error {
+                // The local resolver found nothing for the host.
+                DialError::Destination(error) => SpeedTestFailure::Unresolved {
+                    host: host.clone(),
+                    reason: Some(error.to_string()),
+                },
+                error => error.to_string().into(),
+            };
+            (None, failure)
+        })? {
             Resolution::Addresses(addresses) => addresses,
             Resolution::Unresolved => {
                 if host.parse::<IpAddr>().is_err() && leg.dns_servers.is_empty() {
-                    return Err((
-                        None,
-                        format!(
-                            "the leg's proxies have no DNS servers, so {host} cannot be resolved through the route"
-                        ),
-                    ));
+                    return Err((None, SpeedTestFailure::NoDnsServers { host }));
                 }
                 let resolver = StreamProvider::new(leg.stage.clone(), None);
                 weaver_tunnel::dns::resolve(resolver.as_ref(), &leg.dns_servers, &host)
                     .await
-                    .map_err(|e| (None, format!("could not resolve {host}: {e}")))?
+                    .map_err(|e| {
+                        (
+                            None,
+                            SpeedTestFailure::Unresolved {
+                                host: host.clone(),
+                                reason: Some(e.to_string()),
+                            },
+                        )
+                    })?
             }
         };
         if addresses.is_empty() {
-            return Err((None, format!("no address resolved for {host}")));
+            return Err((None, SpeedTestFailure::Unresolved { host, reason: None }));
         }
         if !options.allow_private_network && addresses.iter().any(|ip| is_blocked_egress_ip(*ip)) {
-            return Err((
-                None,
-                format!("{host} resolves to an address that is not allowed"),
-            ));
+            return Err((None, SpeedTestFailure::AddressNotAllowed { host }));
         }
         let provider = StreamProvider::new(leg.stage.clone(), recorder);
         provider.pin(&host, addresses.clone());
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret)
-            .map_err(|_| (None, "could not generate bridge credentials".to_string()))?;
+            .map_err(|_| (None, "could not generate bridge credentials".into()))?;
         let bridge = Bridge::start(
             &tokio::runtime::Handle::current(),
             provider.clone(),
             leg.stage.budget(),
             ("weaver".into(), hex::encode(secret)),
         )
-        .map_err(|e| (Some(provider.clone()), e.to_string()))?;
+        .map_err(|e| (Some(provider.clone()), e.to_string().into()))?;
         let built = Self::build(&bridge, &host, port, url, &addresses, options);
         match built {
             Ok(client) => Ok(Self {
@@ -146,7 +152,7 @@ impl RoutedClient {
             }),
             Err(error) => {
                 bridge.revoke().await;
-                Err((Some(provider), error))
+                Err((Some(provider), error.into()))
             }
         }
     }
@@ -214,16 +220,21 @@ impl RoutedClient {
     }
 
     // One GET, refused unless it answers with a success status.
-    pub(crate) async fn get(&self, url: &reqwest::Url) -> Result<reqwest::Response, String> {
+    pub(crate) async fn get(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<reqwest::Response, SpeedTestFailure> {
         let response = self.client.get(url.clone()).send().await.map_err(|error| {
             if weaver_nntp::tls::is_tls_error(&error) {
-                format!("TLS verification failed for {}", self.host)
+                SpeedTestFailure::TlsVerification {
+                    host: self.host.clone(),
+                }
             } else {
-                format!("GET {url} failed: {error}")
+                format!("GET {url} failed: {error}").into()
             }
         })?;
         if !response.status().is_success() {
-            return Err(format!("GET {url} answered HTTP {}", response.status()));
+            return Err(SpeedTestFailure::answered(url, response.status()));
         }
         Ok(response)
     }
