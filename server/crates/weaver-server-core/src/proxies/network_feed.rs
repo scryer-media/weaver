@@ -14,7 +14,6 @@ pub struct FeedAttempt {
     position: usize,
     feed: u32,
     pacing: Option<Arc<weaver_nntp::transfer::ServerTransferControl>>,
-    dns_servers: Vec<IpAddr>,
     legacy_status: Arc<ConsumerRoute>,
     selected_proxy: Option<u32>,
     ladder: Option<Arc<Fallback>>,
@@ -79,16 +78,13 @@ impl FeedAttempt {
             error,
         );
     }
-    pub async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, DialError> {
+    // The addresses `host` is reached at, as the attempt's exit resolves
+    // it, or `Unresolved` when the exit proxy is handed the name.
+    pub async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
         if self.guard.is_revoked() {
             return Err(DialError::Skipped("leg revoked".into()));
         }
-        match self.stage.resolve(host).await? {
-            Resolution::Addresses(addresses) => Ok(addresses),
-            Resolution::Unresolved => weaver_tunnel::dns::resolve(self, &self.dns_servers, host)
-                .await
-                .map_err(|source| DialError::Destination(std::io::Error::other(source))),
-        }
+        self.stage.resolve(host).await
     }
     pub fn bridge(self: &Arc<Self>) -> Result<Arc<Bridge>, String> {
         let mut secret = [0u8; 32];
@@ -330,11 +326,6 @@ impl NetworkRuntime {
                             .get(weaver_nntp::transfer::StableServerId(
                                 leg.definition.egress_id,
                             )),
-                        dns_servers: config
-                            .profiles
-                            .get(&last)
-                            .map(|p| p.dns_servers.clone())
-                            .unwrap_or_default(),
                         legacy_status: legacy_status.clone(),
                         selected_proxy: Some(last),
                         ladder: leg.ladder.clone(),
@@ -364,7 +355,6 @@ impl NetworkRuntime {
                         .get(weaver_nntp::transfer::StableServerId(
                             leg.definition.egress_id,
                         )),
-                    dns_servers: Vec::new(),
                     legacy_status: legacy_status.clone(),
                     selected_proxy: None,
                     ladder: leg.ladder.clone(),

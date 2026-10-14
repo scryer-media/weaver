@@ -12,8 +12,8 @@ use crate::migration_assets::{
 };
 use crate::persistence::sql_runtime::SqlConn;
 use crate::schema_migrations::{
-    MigrationMode, egress_quotas_v53, script_concurrency_v58, script_instances_v55,
-    unwanted_extensions_v56,
+    MigrationMode, egress_quotas_v53, proxy_resolver_v64, script_concurrency_v58,
+    script_instances_v55, unwanted_extensions_v56,
 };
 
 #[derive(Clone, Debug)]
@@ -595,6 +595,9 @@ async fn run_postgres_rust_hook(
         script_concurrency_v58::HOOK_ID => {
             script_concurrency_v58::raise_script_concurrency(&mut SqlConn::Postgres(tx)).await
         }
+        proxy_resolver_v64::HOOK_ID => {
+            proxy_resolver_v64::name_proxy_resolvers(&mut SqlConn::Postgres(tx)).await
+        }
         other => Err(StateError::Database(format!(
             "PostgreSQL migration hook '{other}' is not implemented"
         ))),
@@ -608,6 +611,7 @@ fn implemented_postgres_rust_hooks() -> &'static [&'static str] {
         script_instances_v55::HOOK_ID,
         unwanted_extensions_v56::HOOK_ID,
         script_concurrency_v58::HOOK_ID,
+        proxy_resolver_v64::HOOK_ID,
     ]
 }
 

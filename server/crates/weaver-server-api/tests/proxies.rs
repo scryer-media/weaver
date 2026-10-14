@@ -16,7 +16,7 @@ async fn harness() -> TestHarness {
 async fn profile_crud_redacts_secrets_and_preserves_omitted_credentials() {
     let h = harness().await;
     let create = r#"mutation { saveProxyProfile(input: {
-        name: "gateway", kind: SOCKS5, enabled: true, host: "127.0.0.1", port: 1080,
+        name: "gateway", kind: SOCKS5, resolver: PROXY, enabled: true, host: "127.0.0.1", port: 1080,
         username: "private-user", password: "private-password", dnsServers: ["192.0.2.53"]
     }) { id kind hasUsername hasPassword } }"#;
     assert_has_errors(&h.execute_as(create, CallerScope::Control).await);
@@ -29,7 +29,7 @@ async fn profile_crud_redacts_secrets_and_preserves_omitted_credentials() {
     let result = h
         .execute(&format!(
             r#"mutation {{ saveProxyProfile(id: {id}, input: {{
-        name: "renamed", kind: SOCKS5, enabled: false, host: "127.0.0.1", port: 1080,
+        name: "renamed", kind: SOCKS5, resolver: PROXY, enabled: false, host: "127.0.0.1", port: 1080,
         dnsServers: ["192.0.2.53"]
     }}) {{ id enabled hasUsername hasPassword }} }}"#
         ))
@@ -74,7 +74,7 @@ async fn an_ssh_profile_is_refused_a_password() {
     let result = h
         .execute(
             r#"mutation { saveProxyProfile(input: {
-        name: "seedbox", kind: SSH, enabled: true, host: "127.0.0.1", port: 22,
+        name: "seedbox", kind: SSH, resolver: PROXY, enabled: true, host: "127.0.0.1", port: 22,
         username: "operator", password: "fixture-password"
     }) { id } }"#,
         )
@@ -95,7 +95,7 @@ async fn http3_profiles_round_trip_and_feed_routes_keep_credentials_private() {
     let result = h
         .execute(
             r#"mutation { saveProxyProfile(input: {
-        name: "QUIC gateway", kind: HTTP3_CONNECT, enabled: true,
+        name: "QUIC gateway", kind: HTTP3_CONNECT, resolver: PROXY, enabled: true,
         host: "proxy.invalid", port: 443, dnsServers: ["192.0.2.53"],
         username: "fixture-user", password: "fixture-password"
     }) { id kind hasUsername hasPassword } }"#,
@@ -123,7 +123,7 @@ async fn http3_profiles_round_trip_and_feed_routes_keep_credentials_private() {
     let result = h
         .execute(&format!(
             r#"mutation {{ saveProxyProfile(id: {id}, input: {{
-        name: "renamed", kind: HTTP3_CONNECT, enabled: false,
+        name: "renamed", kind: HTTP3_CONNECT, resolver: PROXY, enabled: false,
         host: "proxy.invalid", port: 443, dnsServers: ["192.0.2.53"]
     }}) {{ kind enabled hasUsername hasPassword }} }}"#
         ))
@@ -153,7 +153,7 @@ async fn feed_policy_is_atomic_preserved_and_blocks_referenced_profile_deletion(
     let result = h
         .execute(
             r#"mutation { saveProxyProfile(input: {
-        name: "gateway", kind: HTTP_CONNECT, enabled: true, host: "127.0.0.1", port: 8080,
+        name: "gateway", kind: HTTP_CONNECT, resolver: PROXY, enabled: true, host: "127.0.0.1", port: 8080,
         dnsServers: ["192.0.2.53"]
     }) { id } }"#,
         )

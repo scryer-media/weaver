@@ -683,7 +683,7 @@ async fn a_cancel_mid_run_ends_cancelled_with_the_bytes_moved_so_far() {
 #[tokio::test]
 async fn a_downed_rung_is_absent_from_every_connection_path() {
     let h = harness().await;
-    let response = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080}){id}}"#).await;
+    let response = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,resolver:PROXY,enabled:false,host:"127.0.0.1",port:1080}){id}}"#).await;
     assert_no_errors(&response);
     let proxy = response_data(&response)["saveProxyProfile"]["id"]
         .as_u64()

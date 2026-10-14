@@ -561,6 +561,7 @@ impl NetworkRuntime {
                 },
                 inner,
                 timeout: profile.timeout(),
+                naming: profile.naming(bottom.clone()),
                 failure: Default::default(),
             }),
             _ => {
@@ -650,6 +651,7 @@ impl NetworkRuntime {
                         .ok()
                         .map(|ip| std::net::SocketAddr::new(ip, profile.port)),
                     timeout: profile.timeout(),
+                    naming: profile.naming(bottom.clone()),
                     resolver,
                     failure: Default::default(),
                 })

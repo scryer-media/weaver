@@ -53,8 +53,6 @@ pub enum NetworkRefusal {
     RoutingProxyRepeated,
     RoutingProxyCount,
     RouteChainTransport,
-    RouteRssProxyNeedsDns,
-    RssRouteProxyNeedsDns,
     RouteHasAdvancedLegs,
     RouteConsumerGone,
 
@@ -75,6 +73,7 @@ pub enum NetworkRefusal {
     ProxyTimeoutRange,
     ProxyAddressCount,
     ProxyDnsServerInvalid,
+    ProxyWireGuardNeedsDnsServers,
     ProxyCredentialTooLarge,
     ProxySshUsernameRequired,
     ProxySshKeyRequired,
@@ -172,9 +171,6 @@ impl NetworkRefusal {
             Self::RouteProxyRepeated | Self::RoutingProxyRepeated => "ROUTE_PROXY_REPEATED",
             Self::RoutingProxyCount => "ROUTE_PROXY_COUNT",
             Self::RouteChainTransport => "ROUTE_CHAIN_TRANSPORT",
-            Self::RouteRssProxyNeedsDns | Self::RssRouteProxyNeedsDns => {
-                "ROUTE_RSS_PROXY_NEEDS_DNS"
-            }
             Self::RouteHasAdvancedLegs => "ROUTE_HAS_ADVANCED_LEGS",
             Self::RouteConsumerGone => "ROUTE_CONSUMER_NOT_FOUND",
 
@@ -186,6 +182,7 @@ impl NetworkRefusal {
             Self::ProxyTimeoutRange => "PROXY_TIMEOUT_RANGE",
             Self::ProxyAddressCount => "PROXY_ADDRESS_COUNT",
             Self::ProxyDnsServerInvalid => "PROXY_DNS_SERVER_INVALID",
+            Self::ProxyWireGuardNeedsDnsServers => "PROXY_WIREGUARD_NEEDS_DNS_SERVERS",
             Self::ProxyCredentialTooLarge => "PROXY_CREDENTIAL_TOO_LARGE",
             Self::ProxySshUsernameRequired => "PROXY_SSH_USERNAME_REQUIRED",
             Self::ProxySshKeyRequired => "PROXY_SSH_KEY_REQUIRED",
@@ -307,8 +304,6 @@ impl std::fmt::Display for NetworkRefusal {
             Self::RouteChainTransport => {
                 "WireGuard and HTTP/3 must be the first proxy in a chain, directly above the egress; WireGuard may also sit directly on another WireGuard proxy"
             }
-            Self::RouteRssProxyNeedsDns => "every RSS proxy and pool member requires DNS servers",
-            Self::RssRouteProxyNeedsDns => "RSS proxy routes require configured DNS servers",
             Self::RouteHasAdvancedLegs => {
                 "this route has advanced legs; edit it in Networking instead of replacing its legacy projection"
             }
@@ -347,6 +342,9 @@ impl std::fmt::Display for NetworkRefusal {
             Self::ProxyTimeoutRange => "proxy timeout must be between 1 and 300 seconds",
             Self::ProxyAddressCount => "too many DNS servers or tunnel addresses",
             Self::ProxyDnsServerInvalid => "DNS servers must be IP addresses",
+            Self::ProxyWireGuardNeedsDnsServers => {
+                "a WireGuard proxy resolves names only through DNS servers"
+            }
             Self::ProxyCredentialTooLarge => "proxy credential is too large",
             Self::ProxySshUsernameRequired => "SSH requires a username",
             Self::ProxySshKeyRequired => "SSH requires an Ed25519 private key",

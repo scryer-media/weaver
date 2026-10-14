@@ -30,7 +30,6 @@ fn direct_leg() -> HttpLeg {
             binding: weaver_tunnel::egress::SocketEgress::System,
             timeout: Duration::from_secs(30),
         }),
-        dns_servers: Vec::new(),
     }
 }
 

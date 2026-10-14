@@ -177,12 +177,7 @@ pub(super) async fn validate_policy(
         .collect::<Result<HashMap<_, _>, _>>()?;
     let profiles = profiles(tx).await?;
     let route = policy.route();
-    route.validate_references(
-        &egresses,
-        &profiles,
-        &pools,
-        matches!(consumer, super::Consumer::Rss(_)),
-    )?;
+    route.validate_references(&egresses, &profiles, &pools)?;
     Ok(RoutingPolicy::from_route(route, &pools))
 }
 
@@ -232,12 +227,7 @@ pub(super) async fn validate_stored_network(tx: &mut SqlTx<'_>) -> Result<(), St
                 });
         }
         if route.legacy_policy().is_none() {
-            route.validate_references(
-                &restored_egresses,
-                &profiles,
-                &pools,
-                row.text("consumer")?.starts_with("rss:"),
-            )?;
+            route.validate_references(&restored_egresses, &profiles, &pools)?;
         }
         routes.push(route);
     }
@@ -389,7 +379,6 @@ impl Database {
                     // Revalidate all consumers that use this pool before changing its members.
                     // Disabled egresses are runtime state, so only path references are checked here.
                     for row in tx.fetch_all("SELECT consumer, policy FROM proxy_routes", &[]).await? {
-                        let require_dns = row.text("consumer")?.starts_with("rss:");
                         let route = stored_route(&row.text("policy")?)?;
                         for leg in route.legs {
                             let LegPath::Ladder { rungs, .. } = leg.path else { continue };
@@ -403,9 +392,6 @@ impl Database {
                                 };
                                 for id in ids {
                                     if !seen.insert(id) { return Err(NetworkRefusal::PoolEditRepeatsProxy.into()); }
-                                    if require_dns && profiles.get(&id).is_none_or(|profile| profile.dns_servers.is_empty()) {
-                                        return Err(NetworkRefusal::RouteRssProxyNeedsDns.into());
-                                    }
                                 }
                             }
                         }

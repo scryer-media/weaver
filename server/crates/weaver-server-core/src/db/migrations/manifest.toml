@@ -717,3 +717,13 @@ kind = "sql"
 file = "migrations/0063_active_job_password_candidates/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 64
+description = "every saved proxy names who resolves the names dialled through it"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "name_proxy_resolvers_v64"
+scope = "upgrade_only"

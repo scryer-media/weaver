@@ -13,6 +13,7 @@ fn profile(id: u32) -> ProxyProfile {
         enabled: true,
         host: "127.0.0.1".into(),
         port: 9,
+        resolver: Resolver::Proxy,
         dns_servers: vec!["192.0.2.53".parse().unwrap()],
         tunnel_addresses: vec![],
         peer_public_key: None,
@@ -91,7 +92,6 @@ fn controlled_route() -> ControlledRoute {
             Arc::new(ProxyHop {
                 profile: profile(provider.id),
                 provider: provider.clone(),
-                wireguard: None,
             }),
         );
     }

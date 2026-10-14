@@ -4,6 +4,7 @@ use crate::{
     security::{ResolvedFetchTarget, is_blocked_egress_ip, resolve_fetch_target},
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
+use weaver_tunnel::pipe::Resolution;
 
 enum AttemptError {
     Route,
@@ -136,21 +137,29 @@ impl RssService {
             let port = url
                 .port_or_known_default()
                 .ok_or_else(|| AttemptError::Destination("invalid URL port".into()))?;
-            let addresses = attempt
+            let addresses = match attempt
                 .resolve(host.trim_matches(['[', ']']))
                 .await
-                .map_err(|error| AttemptError::Routed(Arc::new(error)))?;
-            if addresses.is_empty() {
-                return Err(AttemptError::Route);
-            }
-            if !self.inner.security.rss_allow_private_network
-                && addresses.iter().any(|ip| is_blocked_egress_ip(*ip))
+                .map_err(|error| AttemptError::Routed(Arc::new(error)))?
             {
-                return Err(AttemptError::Destination(
-                    "RSS destination address is not allowed".into(),
-                ));
-            }
-            attempt.pin_addresses(host.trim_matches(['[', ']']), addresses.clone());
+                Resolution::Addresses(addresses) => {
+                    if addresses.is_empty() {
+                        return Err(AttemptError::Route);
+                    }
+                    if !self.inner.security.rss_allow_private_network
+                        && addresses.iter().any(|ip| is_blocked_egress_ip(*ip))
+                    {
+                        return Err(AttemptError::Destination(
+                            "RSS destination address is not allowed".into(),
+                        ));
+                    }
+                    attempt.pin_addresses(host.trim_matches(['[', ']']), addresses.clone());
+                    addresses
+                }
+                // The exit proxy resolves the name: there is no address here
+                // to check or pin.
+                Resolution::Unresolved => Vec::new(),
+            };
             ResolvedFetchTarget {
                 url: url.clone(),
                 host: host.to_owned(),

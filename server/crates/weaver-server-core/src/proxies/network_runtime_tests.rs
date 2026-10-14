@@ -8,6 +8,7 @@ fn proxy() -> ProxyProfile {
         enabled: true,
         host: "proxy.invalid".into(),
         port: 1080,
+        resolver: Resolver::Proxy,
         dns_servers: vec![],
         tunnel_addresses: vec![],
         peer_public_key: None,
@@ -689,6 +690,7 @@ fn wireguard_profile(
         kind: ProxyKind::WireGuard,
         host,
         port,
+        resolver: Resolver::Proxy,
         dns_servers: spec.dns_servers.clone(),
         tunnel_addresses: vec![format!(
             "{}/32",

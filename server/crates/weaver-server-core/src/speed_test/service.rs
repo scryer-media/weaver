@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -268,7 +267,7 @@ impl SpeedTestService {
         }
         let runtime = self.inner.runtime()?;
         let policy = runtime.policy(consumer);
-        let (_, profiles, pools) = runtime.network.configuration_snapshot();
+        let (_, _, pools) = runtime.network.configuration_snapshot();
         let tested = PathOverride::default()
             .apply(&policy.route(), &pool_map(pools))
             .map_err(SpeedTestError::Invalid)?;
@@ -279,12 +278,6 @@ impl SpeedTestService {
         let leg = first_leg_up(&tested).ok_or(NetworkRefusal::SpeedTestLegDownAll)?;
         let http = HttpLeg {
             stage: draft.leg_stage(leg).map_err(SpeedTestError::Invalid)?,
-            dns_servers: leg_dns_servers(
-                &tested.legs[leg],
-                &profile_map(profiles),
-                &pool_map_of(&runtime),
-                &[],
-            ),
         };
         let servers = self
             .inner
@@ -336,7 +329,7 @@ impl SpeedTestService {
             },
             None => runtime.policy(consumer),
         };
-        runtime.network.validate_policy(consumer, &policy)?;
+        runtime.network.validate_policy(&policy)?;
         let route = policy.route();
         let (egresses, profiles, pools) = runtime.network.configuration_snapshot();
         let egress_names: HashMap<u32, String> =
@@ -477,12 +470,6 @@ impl SpeedTestService {
                     target: targets[position],
                     egress: tested.original.legs[position].egress_id,
                     rung_map: rung_map.clone().into(),
-                    dns_servers: leg_dns_servers(
-                        leg,
-                        &profiles,
-                        &pools,
-                        &request.overrides.down_proxies,
-                    ),
                 }),
                 _ => None,
             })
@@ -602,60 +589,8 @@ fn pool_map(pools: Vec<ProxyPool>) -> HashMap<u32, ProxyPool> {
     pools.into_iter().map(|p| (p.id, p)).collect()
 }
 
-fn pool_map_of(runtime: &ProxyRuntime) -> HashMap<u32, ProxyPool> {
-    pool_map(runtime.network.configuration_snapshot().2)
-}
-
 fn first_leg_up(tested: &TestedRoute) -> Option<usize> {
     tested.legs.iter().position(TestedLeg::is_up)
-}
-
-// The DNS servers of the proxies a leg exits through, for resolving a host
-// through a ladder.
-fn leg_dns_servers(
-    leg: &TestedLeg,
-    profiles: &HashMap<u32, ProxyProfile>,
-    pools: &HashMap<u32, ProxyPool>,
-    down_proxies: &[u32],
-) -> Vec<IpAddr> {
-    let TestedLeg::Up {
-        leg:
-            crate::proxies::RouteLeg {
-                path: LegPath::Ladder { rungs, .. },
-                ..
-            },
-        ..
-    } = leg
-    else {
-        return Vec::new();
-    };
-    let mut exits = Vec::new();
-    for rung in rungs {
-        match rung {
-            Rung::Proxy { id } => exits.push(*id),
-            Rung::Chain { ids } => exits.extend(ids.last()),
-            Rung::Pool { id } => exits.extend(
-                pools
-                    .get(id)
-                    .into_iter()
-                    .flat_map(|pool| pool.member_ids.iter())
-                    .filter(|member| !down_proxies.contains(member)),
-            ),
-        }
-    }
-    let mut servers = Vec::new();
-    for exit in exits {
-        for server in profiles
-            .get(&exit)
-            .map(|p| p.dns_servers.as_slice())
-            .unwrap_or(&[])
-        {
-            if !servers.contains(server) {
-                servers.push(*server);
-            }
-        }
-    }
-    servers
 }
 
 fn tested_snapshot(
@@ -741,7 +676,6 @@ struct PlannedLeg {
     target: u16,
     egress: u32,
     rung_map: Arc<[usize]>,
-    dns_servers: Vec<IpAddr>,
 }
 
 struct RunPlan {
@@ -1016,7 +950,6 @@ async fn execute(
     let http_leg = |leg: &PlannedLeg| -> Result<HttpLeg, String> {
         Ok(HttpLeg {
             stage: plan.draft.leg_stage(leg.position)?,
-            dns_servers: leg.dns_servers.clone(),
         })
     };
     let Some(first) = plan.legs.first() else {

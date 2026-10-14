@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    net::IpAddr,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -49,7 +48,6 @@ impl TunnelObserver for Observer {
 pub struct ProxyHop {
     pub profile: ProxyProfile,
     pub provider: Arc<dyn TunnelProvider>,
-    wireguard: Option<Arc<WireGuardTunnelProvider>>,
 }
 impl ProxyHop {
     fn new(profile: ProxyProfile, db: &Database) -> Result<Arc<Self>, String> {
@@ -59,21 +57,16 @@ impl ProxyHop {
             id: profile.id,
             revision: profile.revision,
         });
-        let mut wireguard = None;
         let provider: Arc<dyn TunnelProvider> = match profile.kind {
             ProxyKind::Http3Connect => Arc::new(
                 Http3TunnelProvider::new(profile.http3_spec().map_err(|e| e.to_string())?)
                     .map_err(|e| e.to_string())?,
             ),
             ProxyKind::Ssh => Arc::new(SshTunnelProvider::new(profile.ssh_spec(), observer)),
-            ProxyKind::WireGuard => {
-                let wg = Arc::new(WireGuardTunnelProvider::new(
-                    profile.wireguard_spec().map_err(|e| e.to_string())?,
-                    observer,
-                ));
-                wireguard = Some(wg.clone());
-                wg
-            }
+            ProxyKind::WireGuard => Arc::new(WireGuardTunnelProvider::new(
+                profile.wireguard_spec().map_err(|e| e.to_string())?,
+                observer,
+            )),
             kind @ (ProxyKind::HttpConnect | ProxyKind::Socks5) => Arc::new(TransportProxy {
                 kind: if kind == ProxyKind::Socks5 {
                     TransportKind::Socks5
@@ -86,19 +79,7 @@ impl ProxyHop {
                 password: profile.secrets.password.clone(),
             }),
         };
-        Ok(Arc::new(Self {
-            profile,
-            provider,
-            wireguard,
-        }))
-    }
-    pub async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>, TunnelError> {
-        if let Some(wg) = &self.wireguard {
-            wg.resolve_host(host).await
-        } else {
-            weaver_tunnel::dns::resolve(self.provider.as_ref(), &self.profile.dns_servers, host)
-                .await
-        }
+        Ok(Arc::new(Self { profile, provider }))
     }
 }
 
@@ -418,14 +399,7 @@ impl ProxyRuntime {
         let mut profiles = self.profiles.write().unwrap();
         let profile = profiles.get(&id).unwrap().profile.clone();
         assert_eq!(profile.kind, ProxyKind::Http3Connect);
-        profiles.insert(
-            id,
-            Arc::new(ProxyHop {
-                profile,
-                provider,
-                wireguard: None,
-            }),
-        );
+        profiles.insert(id, Arc::new(ProxyHop { profile, provider }));
     }
 
     pub fn nntp_sockets(
@@ -516,23 +490,6 @@ impl ProxyRuntime {
             .get(&consumer.key())
             .cloned()
             .unwrap_or_default()
-    }
-    pub fn validate_policy(
-        &self,
-        consumer: Consumer,
-        policy: &RoutingPolicy,
-    ) -> Result<(), NetworkRefusal> {
-        policy.validate()?;
-        let profiles = self.profiles.read().expect("proxy profiles");
-        for id in &policy.proxy_ids {
-            let hop = profiles
-                .get(id)
-                .ok_or(NetworkRefusal::RoutingProxyMissing)?;
-            if matches!(consumer, Consumer::Rss(_)) && hop.profile.dns_servers.is_empty() {
-                return Err(NetworkRefusal::RssRouteProxyNeedsDns);
-            }
-        }
-        Ok(())
     }
     pub fn route(
         &self,
@@ -715,7 +672,7 @@ impl ProxyRuntime {
     pub async fn test_profile(&self, profile: &ProxyProfile) -> Result<String, String> {
         profile.validate().map_err(|e| e.to_string())?;
         if profile.kind == ProxyKind::Http3Connect {
-            let dns = profile.dns_servers.first().ok_or(
+            let dns = profile.proxy_dns_servers().first().ok_or(
                 "Configure a routed DNS server IP to test HTTP/3 forwarding, or test an assigned NNTP server",
             )?;
             let hop = ProxyHop::new(profile.clone(), &self.db)?;
@@ -741,7 +698,7 @@ impl ProxyRuntime {
                 ProxyKind::WireGuard => { WireGuardTunnelProvider::handshake(profile.wireguard_spec()?, observer).await?; }
                 _ => {
                     let hop = ProxyHop::new(profile.clone(), &self.db).map_err(TunnelError::Configuration)?;
-                    if let Some(dns) = profile.dns_servers.first() { let _stream = hop.provider.dial(&dns.to_string(), 53).await?; }
+                    if let Some(dns) = profile.proxy_dns_servers().first() { let _stream = hop.provider.dial(&dns.to_string(), 53).await?; }
                     else { tokio::net::TcpStream::connect((profile.host.as_str(), profile.port)).await.map_err(|_| TunnelError::Engine("proxy endpoint unreachable".into()))?; return Ok("Endpoint reachable; configure routed DNS or test an assigned consumer to verify forwarding".to_string()); }
                 }
             }

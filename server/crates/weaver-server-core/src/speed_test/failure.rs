@@ -22,10 +22,6 @@ pub enum SpeedTestFailure {
         host: String,
         reason: Option<String>,
     },
-    // The leg's proxies have no DNS servers to resolve the host through.
-    NoDnsServers {
-        host: String,
-    },
     // The host resolves to an address the egress block rules refuse.
     AddressNotAllowed {
         host: String,
@@ -75,7 +71,6 @@ impl SpeedTestFailure {
             }
             Self::TlsVerification { host }
             | Self::Unresolved { host, .. }
-            | Self::NoDnsServers { host }
             | Self::AddressNotAllowed { host } => serde_json::json!({ "host": host }),
             Self::EgressQuotaUsed { egress } => serde_json::json!({ "egressId": egress }),
             Self::LeaseRefused {
@@ -116,10 +111,6 @@ impl std::fmt::Display for SpeedTestFailure {
                 reason: Some(reason),
             } => write!(f, "could not resolve {host}: {reason}"),
             Self::Unresolved { host, reason: None } => write!(f, "no address resolved for {host}"),
-            Self::NoDnsServers { host } => write!(
-                f,
-                "the leg's proxies have no DNS servers, so {host} cannot be resolved through the route"
-            ),
             Self::AddressNotAllowed { host } => {
                 write!(f, "{host} resolves to an address that is not allowed")
             }

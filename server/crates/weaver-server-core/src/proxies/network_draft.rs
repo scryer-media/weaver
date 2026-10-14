@@ -162,22 +162,15 @@ impl NetworkRuntime {
             ),
         })
     }
-    pub fn validate_policy(
-        &self,
-        consumer: Consumer,
-        policy: &RoutingPolicy,
-    ) -> Result<(), NetworkRefusal> {
+    pub fn validate_policy(&self, policy: &RoutingPolicy) -> Result<(), NetworkRefusal> {
         policy.validate()?;
         let config = self.configuration.read().expect("network configuration");
         if policy.legs.is_empty() && policy.proxy_ids.is_empty() && !policy.allow_direct {
             return Ok(());
         }
-        policy.route().validate_references(
-            &config.egresses,
-            &config.profiles,
-            &config.pools,
-            matches!(consumer, Consumer::Rss(_)),
-        )
+        policy
+            .route()
+            .validate_references(&config.egresses, &config.profiles, &config.pools)
     }
     pub fn draft_route(
         &self,
@@ -196,7 +189,7 @@ impl NetworkRuntime {
         timeout: Duration,
         removed: &[u32],
     ) -> Result<Arc<DraftNetworkRoute>, String> {
-        self.validate_policy(consumer, &policy)?;
+        self.validate_policy(&policy)?;
         // Drafts share unchanged live carriers. Carried tunnels are sized
         // by the provider in the same way before and after saving the route.
         let isolated = self.isolated_probe_runtime();

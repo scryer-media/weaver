@@ -140,7 +140,6 @@ fn route(modes: &[Mode], timeout: Duration) -> Arc<ConsumerRoute> {
             Arc::new(ProxyHop {
                 profile: profile(id),
                 provider: Arc::new(NntpFixture { mode: *mode }),
-                wireguard: None,
             }),
         );
     }

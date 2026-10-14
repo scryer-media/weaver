@@ -1295,7 +1295,8 @@ pub struct ResolvedFetchTarget {
 
 impl ResolvedFetchTarget {
     pub fn apply_dns_override(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-        if self.host.parse::<IpAddr>().is_ok() {
+        // No addresses: the proxy the request goes through resolves the name.
+        if self.host.parse::<IpAddr>().is_ok() || self.addrs.is_empty() {
             builder
         } else {
             builder.resolve_to_addrs(&self.host, &self.addrs)

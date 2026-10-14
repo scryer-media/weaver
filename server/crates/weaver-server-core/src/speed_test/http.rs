@@ -18,9 +18,6 @@ const REDIRECT_LIMIT: usize = 3;
 #[derive(Clone)]
 pub(crate) struct HttpLeg {
     pub stage: Arc<dyn Dialer>,
-    // The DNS servers of the proxies the leg exits through, for a ladder
-    // that cannot resolve on its own.
-    pub dns_servers: Vec<IpAddr>,
 }
 
 #[derive(Clone, Default)]
@@ -94,6 +91,8 @@ impl RoutedClient {
         let port = url
             .port_or_known_default()
             .ok_or((None, "URL has no port".into()))?;
+        // `None` when the proxy the leg exits through resolves the name:
+        // nothing here to check or pin.
         let addresses = match leg.stage.resolve(&host).await.map_err(|error| {
             let failure = match error {
                 // The local resolver found nothing for the host.
@@ -105,33 +104,25 @@ impl RoutedClient {
             };
             (None, failure)
         })? {
-            Resolution::Addresses(addresses) => addresses,
-            Resolution::Unresolved => {
-                if host.parse::<IpAddr>().is_err() && leg.dns_servers.is_empty() {
-                    return Err((None, SpeedTestFailure::NoDnsServers { host }));
-                }
-                let resolver = StreamProvider::new(leg.stage.clone(), None);
-                weaver_tunnel::dns::resolve(resolver.as_ref(), &leg.dns_servers, &host)
-                    .await
-                    .map_err(|e| {
-                        (
-                            None,
-                            SpeedTestFailure::Unresolved {
-                                host: host.clone(),
-                                reason: Some(e.to_string()),
-                            },
-                        )
-                    })?
-            }
+            Resolution::Addresses(addresses) => Some(addresses),
+            Resolution::Unresolved => None,
         };
-        if addresses.is_empty() {
+        if addresses.as_ref().is_some_and(Vec::is_empty) {
             return Err((None, SpeedTestFailure::Unresolved { host, reason: None }));
         }
-        if !options.allow_private_network && addresses.iter().any(|ip| is_blocked_egress_ip(*ip)) {
+        if !options.allow_private_network
+            && addresses
+                .iter()
+                .flatten()
+                .any(|ip| is_blocked_egress_ip(*ip))
+        {
             return Err((None, SpeedTestFailure::AddressNotAllowed { host }));
         }
         let provider = StreamProvider::new(leg.stage.clone(), recorder);
-        provider.pin(&host, addresses.clone());
+        if let Some(addresses) = &addresses {
+            provider.pin(&host, addresses.clone());
+        }
+        let addresses = addresses.unwrap_or_default();
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret)
             .map_err(|_| (None, "could not generate bridge credentials".into()))?;

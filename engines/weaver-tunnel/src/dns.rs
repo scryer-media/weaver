@@ -1,7 +1,12 @@
-// Bounded DNS-over-TCP through a selected proxy. Never uses the host resolver.
-use crate::{TunnelError, TunnelProvider};
+// Bounded DNS-over-TCP through a selected proxy or egress. Never uses the
+// host resolver.
+use crate::{
+    TunnelError, TunnelProvider, TunnelStream,
+    pipe::{DialError, Dialer, Purpose, Target},
+};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn invalid() -> TunnelError {
@@ -12,6 +17,52 @@ static NEXT_ID: AtomicU16 = AtomicU16::new(1);
 // Ceiling on one address-family query, dial and CNAME walk included.
 const FAMILY_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+// What a query is asked over.
+#[async_trait::async_trait]
+trait Carrier: Send + Sync {
+    async fn open(&self, server: IpAddr) -> Result<Box<dyn TunnelStream>, TunnelError>;
+}
+
+struct Provider<'a>(&'a dyn TunnelProvider);
+
+#[async_trait::async_trait]
+impl Carrier for Provider<'_> {
+    async fn open(&self, server: IpAddr) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        self.0.dial(&server.to_string(), 53).await
+    }
+}
+
+// A pipe stage carrying the queries. It keeps why it could not reach a
+// server, so a lookup that reached none fails as the stage failed.
+struct Stage<'a> {
+    dialer: &'a dyn Dialer,
+    reached: AtomicBool,
+    failure: Mutex<Option<DialError>>,
+}
+
+#[async_trait::async_trait]
+impl Carrier for Stage<'_> {
+    async fn open(&self, server: IpAddr) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        let target = Target {
+            host: server.to_string(),
+            port: 53,
+            purpose: Purpose::Dns,
+            addresses: vec![server],
+        };
+        match self.dialer.dial(&target).await {
+            Ok(dialed) => {
+                self.reached.store(true, Ordering::Relaxed);
+                Ok(dialed.into_observed_stream())
+            }
+            Err(error) => {
+                let said = TunnelError::Engine(error.to_string());
+                *self.failure.lock().expect("dns stage failure") = Some(error);
+                Err(said)
+            }
+        }
+    }
+}
+
 pub async fn resolve(
     provider: &dyn TunnelProvider,
     servers: &[IpAddr],
@@ -20,13 +71,40 @@ pub async fn resolve(
     if let Ok(ip) = host.parse() {
         return Ok(vec![ip]);
     }
-    let resolved = resolve_name(provider, servers, host).await;
+    let resolved = resolve_name(&Provider(provider), servers, host).await;
     crate::metrics::record_resolution(crate::metrics::Resolver::Routed, resolved.is_ok());
     resolved
 }
 
+// Resolves `host` by asking `servers` in order through `dialer`. When no
+// server could be reached at all, the error is the stage's own, so a dead
+// path counts against the path and not against the name.
+pub async fn resolve_through(
+    dialer: &dyn Dialer,
+    servers: &[IpAddr],
+    host: &str,
+) -> Result<Vec<IpAddr>, DialError> {
+    if let Ok(ip) = host.parse() {
+        return Ok(vec![ip]);
+    }
+    let stage = Stage {
+        dialer,
+        reached: AtomicBool::new(false),
+        failure: Mutex::new(None),
+    };
+    let resolved = resolve_name(&stage, servers, host).await;
+    crate::metrics::record_resolution(crate::metrics::Resolver::Routed, resolved.is_ok());
+    resolved.map_err(|error| {
+        let failure = stage.failure.into_inner().expect("dns stage failure");
+        match failure {
+            Some(failure) if !stage.reached.into_inner() => failure,
+            _ => DialError::Destination(std::io::Error::other(error)),
+        }
+    })
+}
+
 async fn resolve_name(
-    provider: &dyn TunnelProvider,
+    provider: &dyn Carrier,
     servers: &[IpAddr],
     host: &str,
 ) -> Result<Vec<IpAddr>, TunnelError> {
@@ -70,7 +148,7 @@ async fn resolve_name(
 }
 
 async fn query(
-    provider: &dyn TunnelProvider,
+    provider: &dyn Carrier,
     server: IpAddr,
     host: &str,
     qtype: u16,
@@ -94,7 +172,7 @@ async fn query(
         packet.push(0);
         packet.extend_from_slice(&qtype.to_be_bytes());
         packet.extend_from_slice(&[0, 1]);
-        let mut stream = provider.dial(&server.to_string(), 53).await?;
+        let mut stream = provider.open(server).await?;
         *reached = true;
         stream
             .write_u16(packet.len() as u16)

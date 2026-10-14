@@ -1,5 +1,5 @@
 use super::*;
-use crate::proxies::{Failover, ProxyKind, ProxySecrets, RouteLeg};
+use crate::proxies::{Failover, ProxyKind, ProxySecrets, Resolver, RouteLeg};
 
 // The code of the refusal a write was turned away with. A storage fault has
 // none, so a refusal that degrades into one fails here.
@@ -31,6 +31,7 @@ fn profile(id: u32) -> ProxyProfile {
         enabled: true,
         host: "proxy.example".into(),
         port: 1080,
+        resolver: Resolver::Proxy,
         dns_servers: vec!["192.0.2.53".parse().unwrap()],
         tunnel_addresses: vec![],
         peer_public_key: None,

@@ -349,7 +349,6 @@ impl Route {
         egresses: &HashMap<u32, EgressInterface>,
         profiles: &HashMap<u32, ProxyProfile>,
         pools: &HashMap<u32, ProxyPool>,
-        require_dns: bool,
     ) -> Result<(), NetworkRefusal> {
         self.validate_shape()?;
         for leg in &self.legs {
@@ -394,9 +393,6 @@ impl Route {
                         && !carried
                     {
                         return Err(NetworkRefusal::RouteChainTransport);
-                    }
-                    if require_dns && profile.dns_servers.is_empty() {
-                        return Err(NetworkRefusal::RouteRssProxyNeedsDns);
                     }
                 }
             }

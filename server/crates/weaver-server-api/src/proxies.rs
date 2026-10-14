@@ -45,6 +45,29 @@ impl From<proxies::ProxyKind> for ProxyKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "ProxyResolver")]
+pub enum ProxyResolver {
+    Weaver,
+    Proxy,
+}
+impl From<ProxyResolver> for proxies::Resolver {
+    fn from(v: ProxyResolver) -> Self {
+        match v {
+            ProxyResolver::Weaver => Self::Weaver,
+            ProxyResolver::Proxy => Self::Proxy,
+        }
+    }
+}
+impl From<proxies::Resolver> for ProxyResolver {
+    fn from(v: proxies::Resolver) -> Self {
+        match v {
+            proxies::Resolver::Weaver => Self::Weaver,
+            proxies::Resolver::Proxy => Self::Proxy,
+        }
+    }
+}
+
 #[derive(Clone, Debug, InputObject)]
 pub struct RoutingPolicyInput {
     pub proxy_ids: Vec<u32>,
@@ -103,6 +126,7 @@ pub struct ProxyProfileGql {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
+    pub resolver: ProxyResolver,
     pub dns_servers: Vec<String>,
     pub tunnel_addresses: Vec<String>,
     pub peer_public_key: Option<String>,
@@ -131,6 +155,7 @@ impl From<ProxyProfile> for ProxyProfileGql {
             enabled: p.enabled,
             host: p.host,
             port: p.port,
+            resolver: p.resolver.into(),
             dns_servers: p.dns_servers.iter().map(ToString::to_string).collect(),
             tunnel_addresses: p.tunnel_addresses,
             peer_public_key: p.peer_public_key,
@@ -155,6 +180,7 @@ pub struct ProxyProfileInput {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
+    pub resolver: ProxyResolver,
     #[graphql(default)]
     pub dns_servers: Vec<String>,
     #[graphql(default)]
@@ -201,6 +227,7 @@ impl ProxyProfileInput {
             enabled: self.enabled,
             host: self.host.trim().trim_matches(['[', ']']).into(),
             port: self.port,
+            resolver: self.resolver.into(),
             dns_servers: self
                 .dns_servers
                 .iter()
@@ -245,7 +272,7 @@ pub(crate) fn draft_route(
     // cannot be built for any other reason is reported as it stands.
     runtime
         .network
-        .validate_policy(consumer, &policy)
+        .validate_policy(&policy)
         .map_err(refusal_error)?;
     runtime
         .network
@@ -340,19 +367,6 @@ impl ProxiesMutation {
                 .ok_or("proxy IDs exhausted")?,
         );
         let profile = input.profile(id, existing)?;
-        // Removing DNS from an RSS-assigned profile would invalidate its policy.
-        if profile.dns_servers.is_empty() {
-            let read_db = db.clone();
-            let routes =
-                spawn_blocking_db("proxies.references", move || read_db.list_proxy_routes())
-                    .await?;
-            if routes
-                .iter()
-                .any(|(key, policy)| key.starts_with("rss:") && policy.proxy_ids.contains(&id))
-            {
-                return Err(refusal_error(NetworkRefusal::RssRouteProxyNeedsDns));
-            }
-        }
         let saved = profile.clone();
         let profile =
             spawn_blocking_db("proxies.save", move || db.save_proxy_profile(&saved)).await?;

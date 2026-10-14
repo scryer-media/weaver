@@ -144,7 +144,7 @@ fn refusal(response: &async_graphql::Response) -> (String, String, serde_json::V
 
 // A feed to route, and a proxy to route it through.
 async fn feed_and_proxy(h: &TestHarness) -> (u64, u64) {
-    let result = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}){id}}"#).await;
+    let result = h.execute(r#"mutation{saveProxyProfile(input:{name:"Gateway",kind:SOCKS5,resolver:PROXY,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}){id}}"#).await;
     assert_no_errors(&result);
     let proxy = response_data(&result)["saveProxyProfile"]["id"]
         .as_u64()
@@ -361,7 +361,7 @@ async fn pool_route_keeps_member_projection_and_prevents_pool_deletion() {
     let h = harness().await;
     let mut ids = Vec::new();
     for name in ["Primary", "Secondary"] {
-        let result=h.execute(&format!(r#"mutation{{saveProxyProfile(input:{{name:"{name}",kind:SOCKS5,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}}){{id}}}}"#)).await;
+        let result=h.execute(&format!(r#"mutation{{saveProxyProfile(input:{{name:"{name}",kind:SOCKS5,resolver:PROXY,enabled:false,host:"127.0.0.1",port:1080,dnsServers:["192.0.2.53"]}}){{id}}}}"#)).await;
         assert_no_errors(&result);
         ids.push(
             response_data(&result)["saveProxyProfile"]["id"]
