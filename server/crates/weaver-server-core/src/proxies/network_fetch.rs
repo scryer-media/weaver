@@ -55,7 +55,7 @@ impl FetchAttempt {
         }
         match (error, self.selected_proxy) {
             (Some(error), Some(id)) if error.is_path_evidence() => {
-                self.legacy_status.fail(id, &error.to_string())
+                self.legacy_status.fail_dial(id, error)
             }
             (None, id) => self.legacy_status.success(id),
             _ => {}

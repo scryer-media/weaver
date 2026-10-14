@@ -15,17 +15,9 @@ use weaver_tunnel::{
     Http3TunnelProvider, SshTunnelProvider, TunnelError, TunnelObserver, TunnelProvider,
     TunnelStream, WireGuardTunnelProvider,
     bridge::Bridge,
+    fault,
     transport::{TransportKind, TransportProxy},
 };
-
-// A host and port as a person types them: an IPv6 address goes in brackets.
-fn endpoint(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
 
 fn bridge_credentials() -> Result<(String, String), String> {
     let mut secret = [0u8; 32];
@@ -61,19 +53,20 @@ pub struct ProxyHop {
 impl ProxyHop {
     fn new(profile: ProxyProfile, db: &Database) -> Result<Arc<Self>, String> {
         profile.validate().map_err(|e| e.to_string())?;
+        Self::provide(profile, db).map_err(|e| e.to_string())
+    }
+    // A hop for a profile that has been validated.
+    fn provide(profile: ProxyProfile, db: &Database) -> Result<Arc<Self>, TunnelError> {
         let observer = Arc::new(Observer {
             db: db.clone(),
             id: profile.id,
             revision: profile.revision,
         });
         let provider: Arc<dyn TunnelProvider> = match profile.kind {
-            ProxyKind::Http3Connect => Arc::new(
-                Http3TunnelProvider::new(profile.http3_spec().map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?,
-            ),
+            ProxyKind::Http3Connect => Arc::new(Http3TunnelProvider::new(profile.http3_spec()?)?),
             ProxyKind::Ssh => Arc::new(SshTunnelProvider::new(profile.ssh_spec(), observer)),
             ProxyKind::WireGuard => Arc::new(WireGuardTunnelProvider::new(
-                profile.wireguard_spec().map_err(|e| e.to_string())?,
+                profile.wireguard_spec()?,
                 observer,
             )),
             kind @ (ProxyKind::HttpConnect | ProxyKind::Socks5) => Arc::new(TransportProxy {
@@ -157,7 +150,7 @@ impl ConsumerRoute {
             finished: false,
         })
     }
-    pub fn fail(&self, id: u32, message: &str) {
+    pub fn fail(&self, id: u32, fault: ProxyFault) {
         self.cooldowns.lock().expect("route cooldown").insert(
             id,
             Cooldown {
@@ -167,10 +160,13 @@ impl ConsumerRoute {
         );
         let mut status = self.status.lock().expect("route status");
         status.failures.retain(|(prior, _)| *prior != id);
-        status
-            .failures
-            .push((id, message.chars().take(256).collect()));
+        status.failures.push((id, fault));
         status.failures.truncate(8);
+    }
+    // Records a failed dial through proxy `id`, by what it came to in this
+    // route's time.
+    pub fn fail_dial(&self, id: u32, error: &weaver_tunnel::pipe::DialError) {
+        self.fail(id, error.fault(self.timeout));
     }
     pub fn success(&self, id: Option<u32>) {
         if let Some(id) = id {
@@ -265,8 +261,8 @@ impl RouteAttempt {
         self.route.success(Some(self.id));
         self.finished = true;
     }
-    pub fn fail(mut self, message: &str) {
-        self.route.fail(self.id, message);
+    pub fn fail(mut self, fault: ProxyFault) {
+        self.route.fail(self.id, fault);
         self.finished = true;
     }
 }
@@ -349,7 +345,7 @@ impl TunnelProvider for Ladder {
                 continue;
             };
             let Some(hop) = hop.as_ref().filter(|h| h.profile.enabled) else {
-                attempt.fail("proxy is disabled or unavailable");
+                attempt.fail(ProxyFault::ProxyUnavailable);
                 continue;
             };
             match tokio::time::timeout(route.timeout, hop.provider.dial(host, port)).await {
@@ -359,22 +355,20 @@ impl TunnelProvider for Ladder {
                     let id = *id;
                     outcome.on_failure(move || {
                         if let Some(route) = route.upgrade().filter(|r| !r.is_revoked()) {
-                            route.fail(id, "NNTP response transport failed");
+                            route.fail(id, ProxyFault::StreamFailed);
                         }
                     });
                     return Ok(stream);
                 }
                 Ok(Err(error @ TunnelError::HostKeyMismatch { .. })) => {
-                    attempt.fail(&error.to_string());
+                    attempt.fail(fault::classify(&error, route.timeout));
                     route.blocked();
                     return Err(error);
                 }
-                Ok(Err(error)) => attempt.fail(&error.to_string()),
-                Err(_) => attempt.fail(&format!(
-                    "{} did not answer within {} seconds",
-                    endpoint(&hop.profile.host, hop.profile.port),
-                    route.timeout.as_secs()
-                )),
+                Ok(Err(error)) => attempt.fail(fault::classify(&error, route.timeout)),
+                Err(_) => attempt.fail(ProxyFault::TimedOut {
+                    seconds: fault::seconds(route.timeout),
+                }),
             }
         }
         #[expect(clippy::disallowed_methods, reason = "a route's direct fallback")]
@@ -701,40 +695,51 @@ impl ProxyRuntime {
             hop.provider.shutdown().await;
         }
     }
-    pub async fn test_profile(&self, profile: &ProxyProfile) -> Result<String, String> {
+    // A profile that is not valid is refused before anything is dialled.
+    pub async fn test_profile(
+        &self,
+        profile: &ProxyProfile,
+    ) -> Result<Result<ProxyTestPass, ProxyFault>, NetworkRefusal> {
+        profile.validate()?;
         let outcome = self.test_profile_once(profile).await;
-        if let Err(error) = &outcome {
-            tracing::warn!(proxy_id = profile.id, kind = ?profile.kind, error = %error, "proxy test failed");
+        if let Err(fault) = &outcome {
+            tracing::warn!(
+                proxy_id = profile.id,
+                kind = ?profile.kind,
+                code = fault.code(),
+                error = %fault,
+                "proxy test failed"
+            );
         }
-        outcome
+        Ok(outcome)
     }
-    // The test's answer names what failed and where, as the tunnel reported it,
-    // so the person reading it knows what to fix.
-    async fn test_profile_once(&self, profile: &ProxyProfile) -> Result<String, String> {
-        profile.validate().map_err(|e| e.to_string())?;
-        let endpoint = endpoint(&profile.host, profile.port);
-        let timed_out = || {
-            format!(
-                "{endpoint} did not answer within {} seconds",
-                profile.timeout().as_secs()
-            )
+    // The test's answer names what failed, as the tunnel reported it, so the
+    // person reading it knows what to fix.
+    async fn test_profile_once(&self, profile: &ProxyProfile) -> Result<ProxyTestPass, ProxyFault> {
+        let wait = profile.timeout();
+        let timed_out = || ProxyFault::TimedOut {
+            seconds: fault::seconds(wait),
         };
         if profile.kind == ProxyKind::Http3Connect {
-            let dns = profile.proxy_dns_servers().first().ok_or(
-                "Testing HTTP/3 forwarding needs DNS servers the proxy resolves with; test an assigned NNTP server instead",
-            )?;
-            let hop = ProxyHop::new(profile.clone(), &self.db)?;
-            let result = tokio::time::timeout(profile.timeout(), async {
+            let dns = profile
+                .proxy_dns_servers()
+                .first()
+                .ok_or(ProxyFault::TestNeedsDns)?;
+            let hop = ProxyHop::provide(profile.clone(), &self.db)
+                .map_err(|error| fault::classify(&error, wait))?;
+            let result = tokio::time::timeout(wait, async {
                 let _stream = hop.provider.dial(&dns.to_string(), 53).await?;
                 Ok::<_, TunnelError>(())
             })
             .await;
             hop.provider.shutdown().await;
             return match result {
-                Ok(Ok(())) => Ok("HTTP/3 proxy TLS, authentication and forwarding succeeded".into()),
-                Ok(Err(error)) => Err(error.to_string()),
+                Ok(Ok(())) => Ok(ProxyTestPass::Forwarded),
+                Ok(Err(error)) => Err(fault::classify(&error, wait)),
                 // QUIC rides UDP, which a network can drop without a word.
-                Err(_) => Err(format!("{} over UDP", timed_out())),
+                Err(_) => Err(ProxyFault::UdpTimedOut {
+                    seconds: fault::seconds(wait),
+                }),
             };
         }
         let observer = Arc::new(Observer {
@@ -742,27 +747,31 @@ impl ProxyRuntime {
             id: profile.id,
             revision: profile.revision,
         });
-        let result = tokio::time::timeout(profile.timeout(), async {
+        let classify = |error: TunnelError| fault::classify(&error, wait);
+        let result = tokio::time::timeout(wait, async {
             match profile.kind {
                 ProxyKind::Ssh => {
                     SshTunnelProvider::handshake(profile.ssh_spec(), observer)
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(classify)?;
+                    Ok(ProxyTestPass::Connected)
                 }
                 ProxyKind::WireGuard => {
-                    let spec = profile.wireguard_spec().map_err(|error| error.to_string())?;
+                    let spec = profile.wireguard_spec().map_err(classify)?;
                     WireGuardTunnelProvider::handshake(spec, observer)
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(classify)?;
+                    Ok(ProxyTestPass::Connected)
                 }
                 _ => {
-                    let hop = ProxyHop::new(profile.clone(), &self.db)?;
+                    let hop = ProxyHop::provide(profile.clone(), &self.db).map_err(classify)?;
                     if let Some(dns) = profile.proxy_dns_servers().first() {
                         let _stream = hop
                             .provider
                             .dial(&dns.to_string(), 53)
                             .await
-                            .map_err(|error| error.to_string())?;
+                            .map_err(classify)?;
+                        Ok(ProxyTestPass::Forwarded)
                     } else {
                         #[expect(
                             clippy::disallowed_methods,
@@ -770,15 +779,11 @@ impl ProxyRuntime {
                         )]
                         weaver_tunnel::resolution::connect_host(&profile.host, profile.port)
                             .await
-                            .map_err(|error| format!("could not connect to {endpoint}: {error}"))?;
-                        return Ok(
-                            "Endpoint reachable; test an assigned consumer to verify forwarding"
-                                .to_string(),
-                        );
+                            .map_err(|error| fault::from_io(&error, wait))?;
+                        Ok(ProxyTestPass::Reachable)
                     }
                 }
             }
-            Ok("Proxy connection succeeded".to_string())
         })
         .await;
         result.unwrap_or_else(|_| Err(timed_out()))

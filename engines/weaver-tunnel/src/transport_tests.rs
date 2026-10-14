@@ -80,7 +80,14 @@ async fn failed_inner_negotiation_is_reported_without_a_second_dial() {
             .negotiate(&mut inner, "news.example", 563)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("authentication method rejected"));
+        assert_eq!(error, failure(Said::SocksAuthRequired));
     };
     tokio::join!(server, client);
+}
+
+#[test]
+fn every_said_text_reads_back_as_itself() {
+    for said in Said::ALL {
+        assert_eq!(Said::find(said.text()), Some(said), "{}", said.text());
+    }
 }

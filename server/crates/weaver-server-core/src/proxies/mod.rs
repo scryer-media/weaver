@@ -1,3 +1,4 @@
+mod fault;
 mod interfaces;
 mod model;
 mod network;
@@ -12,6 +13,7 @@ mod route_guard_tests;
 mod routed_http;
 mod runtime;
 mod weighted;
+pub use fault::{ProxyFault, ProxyTestPass, fault_params};
 pub use interfaces::*;
 pub use model::*;
 pub use network::*;

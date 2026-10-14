@@ -196,6 +196,43 @@ async fn http3_profiles_round_trip_and_feed_routes_keep_credentials_private() {
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
+// A test answers with a code the client words, and dials nothing it cannot
+// use: an HTTP/3 proxy is tested through a DNS server it resolves with.
+#[tokio::test]
+async fn a_proxy_test_answers_with_a_code() {
+    let h = harness().await;
+    let result = h
+        .execute(
+            r#"mutation { saveProxyProfile(input: {
+        name: "QUIC gateway", kind: HTTP3_CONNECT, resolver: PROXY, enabled: true,
+        host: "proxy.invalid", port: 443
+    }) { id } }"#,
+        )
+        .await;
+    assert_no_errors(&result);
+    let id = response_data(&result)["saveProxyProfile"]["id"]
+        .as_u64()
+        .unwrap();
+    let result = h
+        .execute(&format!(
+            "mutation {{ testProxyProfile(id: {id}) {{ success code message params }} }}"
+        ))
+        .await;
+    assert_no_errors(&result);
+    let test = &response_data(&result)["testProxyProfile"];
+    assert_eq!(test["success"], false);
+    assert_eq!(test["code"], "TEST_NEEDS_DNS");
+    assert_eq!(test["params"], serde_json::json!({}));
+    assert!(!test["message"].as_str().unwrap().is_empty());
+    let missing = h
+        .execute("mutation { testProxyProfile(id: 999) { success } }")
+        .await;
+    assert_eq!(missing.errors.len(), 1, "{:?}", missing.errors);
+    let error = serde_json::to_value(&missing.errors[0]).unwrap();
+    assert_eq!(error["extensions"]["code"], "PROXY_NOT_FOUND");
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
 #[tokio::test]
 async fn feed_policy_is_atomic_preserved_and_blocks_referenced_profile_deletion() {
     let h = harness().await;

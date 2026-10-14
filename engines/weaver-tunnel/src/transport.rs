@@ -1,7 +1,10 @@
 // TCP proxy adapters. Only the proxy endpoint is resolved on the host.
-use crate::{TunnelError, TunnelProvider, TunnelStream};
+use crate::{TunnelError, TunnelProvider, TunnelStream, fault::authority};
 use base64::Engine;
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Clone, Copy, Debug)]
@@ -17,6 +20,12 @@ impl TransportKind {
             Self::Socks5 => crate::metrics::TunnelKind::Socks5,
         }
     }
+    fn protocol(self) -> &'static str {
+        match self {
+            Self::Socks5 => "SOCKS",
+            Self::HttpConnect => "HTTP",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -28,8 +37,116 @@ pub struct TransportProxy {
     pub password: Option<String>,
 }
 
-fn failure(message: &'static str) -> TunnelError {
-    TunnelError::Engine(message.into())
+// What these adapters say when a proxy fails them. The tunnel error type
+// carries a stream proxy's failure as engine text, so each sentence is
+// written here only, and `fault` reads it back by the same words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Said {
+    SocksClosed,
+    NotSocks,
+    SocksAuthRequired,
+    SocksMethodRejected,
+    SocksCredentialLength,
+    SocksAuthClosed,
+    SocksCredentialsRejected,
+    SocksConnectClosed,
+    SocksReplyInvalid,
+    InvalidDestination,
+    InvalidConnectDestination,
+    HttpConnectClosed,
+    HttpHeadersTooLarge,
+    HttpResponseInvalid,
+    HttpAuthRequired,
+    HttpCredentialsRejected,
+    SocketSetup,
+}
+
+impl Said {
+    const ALL: [Self; 17] = [
+        Self::SocksClosed,
+        Self::NotSocks,
+        Self::SocksAuthRequired,
+        Self::SocksMethodRejected,
+        Self::SocksCredentialLength,
+        Self::SocksAuthClosed,
+        Self::SocksCredentialsRejected,
+        Self::SocksConnectClosed,
+        Self::SocksReplyInvalid,
+        Self::InvalidDestination,
+        Self::InvalidConnectDestination,
+        Self::HttpConnectClosed,
+        Self::HttpHeadersTooLarge,
+        Self::HttpResponseInvalid,
+        Self::HttpAuthRequired,
+        Self::HttpCredentialsRejected,
+        Self::SocketSetup,
+    ];
+    pub(crate) fn text(self) -> &'static str {
+        match self {
+            Self::SocksClosed => "SOCKS negotiation failed",
+            Self::NotSocks => "the server did not answer as a SOCKS5 proxy",
+            Self::SocksAuthRequired => "SOCKS proxy requires authentication",
+            Self::SocksMethodRejected => "SOCKS authentication method rejected",
+            Self::SocksCredentialLength => "invalid SOCKS credential length",
+            Self::SocksAuthClosed => "SOCKS authentication failed",
+            Self::SocksCredentialsRejected => "SOCKS credentials rejected",
+            Self::SocksConnectClosed => "SOCKS CONNECT failed",
+            Self::SocksReplyInvalid => "invalid SOCKS reply",
+            Self::InvalidDestination => "invalid proxy destination",
+            Self::InvalidConnectDestination => "invalid CONNECT destination",
+            Self::HttpConnectClosed => "HTTP proxy CONNECT failed",
+            Self::HttpHeadersTooLarge => "HTTP proxy response headers too large",
+            Self::HttpResponseInvalid => "invalid HTTP proxy response",
+            Self::HttpAuthRequired => "HTTP proxy requires authentication",
+            Self::HttpCredentialsRejected => "HTTP proxy rejected the credentials",
+            Self::SocketSetup => "proxy socket setup failed",
+        }
+    }
+    // Which of these `text` says, wherever in it, however it was wrapped.
+    pub(crate) fn find(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|said| text.contains(said.text()))
+    }
+}
+
+fn failure(said: Said) -> TunnelError {
+    TunnelError::Engine(said.text().into())
+}
+
+// What a proxy answered when it did not open a stream to a destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reply {
+    Socks(u8),
+    Http(u16),
+    // Nothing, before the hop's time ran out.
+    Silent,
+}
+
+impl fmt::Display for Reply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Socks(code) => write!(f, "{SOCKS_REPLY}{code}"),
+            Self::Http(status) => write!(f, "{HTTP_REPLY}{status}"),
+            Self::Silent => f.write_str(SILENT),
+        }
+    }
+}
+
+const SOCKS_REPLY: &str = "SOCKS reply ";
+const HTTP_REPLY: &str = "HTTP ";
+const SILENT: &str = "no answer";
+
+impl Reply {
+    pub(crate) fn read(text: &str) -> Option<Self> {
+        if text == SILENT {
+            return Some(Self::Silent);
+        }
+        if let Some(code) = text.strip_prefix(SOCKS_REPLY) {
+            return code.parse().ok().map(Self::Socks);
+        }
+        text.strip_prefix(HTTP_REPLY)?.parse().ok().map(Self::Http)
+    }
 }
 
 // Why a proxy that was asked for a destination did not open a stream to it.
@@ -38,7 +155,7 @@ pub(crate) enum ConnectFailure {
     // The proxy failed, refused, or answered out of turn.
     Proxy(TunnelError),
     // The proxy answered that it could not reach the destination.
-    Unreachable(&'static str),
+    Unreachable(Reply),
 }
 impl From<TunnelError> for ConnectFailure {
     fn from(error: TunnelError) -> Self {
@@ -46,10 +163,24 @@ impl From<TunnelError> for ConnectFailure {
     }
 }
 
-const UNREACHABLE: &str = "proxy could not connect to destination";
+// The words every proxy's own refusal of a destination carries, and the
+// prefix a hop's failure to reach the next hop's endpoint carries.
+pub(crate) const UNREACHABLE: &str = " proxy could not connect to ";
+pub(crate) const HOP_BEFORE: &str = "the hop before it could not reach ";
+pub(crate) const REJECTED: &str = "HTTP proxy rejected CONNECT to ";
+pub(crate) const REJECTED_STATUS: &str = " with HTTP ";
 
-fn destination_unreachable(proxy: &str, reason: &str) -> TunnelError {
-    TunnelError::Engine(format!("{proxy} {UNREACHABLE}: {reason}"))
+fn destination_unreachable(protocol: &str, host: &str, port: u16, reply: Reply) -> TunnelError {
+    TunnelError::Engine(format!(
+        "{protocol}{UNREACHABLE}{}: {reply}",
+        authority(host, port)
+    ))
+}
+
+// What the hop before a proxy said when it could not reach that proxy's
+// endpoint, charged to that proxy.
+pub(crate) fn hop_before(host: &str, port: u16, reply: Reply) -> TunnelError {
+    TunnelError::Engine(format!("{HOP_BEFORE}{}: {reply}", authority(host, port)))
 }
 
 // Whether `error` is a proxy's answer that it could not reach the
@@ -70,7 +201,9 @@ pub async fn socks_connect<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
         .await
         .map_err(|failure| match failure {
             ConnectFailure::Proxy(error) => error,
-            ConnectFailure::Unreachable(reason) => destination_unreachable("SOCKS", reason),
+            ConnectFailure::Unreachable(reply) => {
+                destination_unreachable("SOCKS", host, port, reply)
+            }
         })
 }
 
@@ -83,18 +216,25 @@ async fn socks_greet<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
     stream
         .write_all(&[5, 1, method])
         .await
-        .map_err(|_| failure("SOCKS negotiation failed"))?;
+        .map_err(|_| failure(Said::SocksClosed))?;
     let mut reply = [0; 2];
     stream
         .read_exact(&mut reply)
         .await
-        .map_err(|_| failure("SOCKS negotiation failed"))?;
-    if reply != [5, method] {
-        return Err(failure("SOCKS authentication method rejected"));
+        .map_err(|_| failure(Said::SocksClosed))?;
+    if reply[0] != 5 {
+        return Err(failure(Said::NotSocks));
+    }
+    if reply[1] != method {
+        return Err(failure(if credentials.is_some() {
+            Said::SocksMethodRejected
+        } else {
+            Said::SocksAuthRequired
+        }));
     }
     if let Some((user, pass)) = credentials {
         if user.is_empty() || user.len() > 255 || pass.len() > 255 {
-            return Err(failure("invalid SOCKS credential length"));
+            return Err(failure(Said::SocksCredentialLength));
         }
         let mut auth = vec![1, user.len() as u8];
         auth.extend_from_slice(user.as_bytes());
@@ -103,13 +243,13 @@ async fn socks_greet<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
         stream
             .write_all(&auth)
             .await
-            .map_err(|_| failure("SOCKS authentication failed"))?;
+            .map_err(|_| failure(Said::SocksAuthClosed))?;
         stream
             .read_exact(&mut reply)
             .await
-            .map_err(|_| failure("SOCKS authentication failed"))?;
+            .map_err(|_| failure(Said::SocksAuthClosed))?;
         if reply != [1, 0] {
-            return Err(failure("SOCKS credentials rejected"));
+            return Err(failure(Said::SocksCredentialsRejected));
         }
     }
     Ok(())
@@ -125,22 +265,21 @@ async fn socks_open<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
     stream
         .write_all(&request)
         .await
-        .map_err(|_| failure("SOCKS CONNECT failed"))?;
+        .map_err(|_| failure(Said::SocksConnectClosed))?;
     let mut header = [0; 4];
     stream
         .read_exact(&mut header)
         .await
-        .map_err(|_| failure("SOCKS CONNECT failed"))?;
-    if header[..3] != [5, 0, 0] {
+        .map_err(|_| failure(Said::SocksConnectClosed))?;
+    match (header[0], header[1], header[2]) {
+        (5, 0, 0) => {}
         // These replies report what became of the proxy's own connection
         // attempt. Every other one is the proxy declining or failing.
-        return Err(match (header[0], header[1]) {
-            (5, 3) => ConnectFailure::Unreachable("network unreachable"),
-            (5, 4) => ConnectFailure::Unreachable("host unreachable"),
-            (5, 5) => ConnectFailure::Unreachable("connection refused"),
-            (5, 6) => ConnectFailure::Unreachable("TTL expired"),
-            _ => failure("SOCKS proxy could not connect to destination").into(),
-        });
+        (5, code @ 3..=6, _) => return Err(ConnectFailure::Unreachable(Reply::Socks(code))),
+        (5, code @ 1.., _) => {
+            return Err(destination_unreachable("SOCKS", host, port, Reply::Socks(code)).into());
+        }
+        _ => return Err(failure(Said::SocksReplyInvalid).into()),
     }
     let len = match header[3] {
         1 => 4,
@@ -148,14 +287,14 @@ async fn socks_open<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
         3 => stream
             .read_u8()
             .await
-            .map_err(|_| failure("invalid SOCKS reply"))? as usize,
-        _ => return Err(failure("invalid SOCKS reply").into()),
+            .map_err(|_| failure(Said::SocksReplyInvalid))? as usize,
+        _ => return Err(failure(Said::SocksReplyInvalid).into()),
     };
     let mut tail = vec![0; len + 2];
     stream
         .read_exact(&mut tail)
         .await
-        .map_err(|_| failure("invalid SOCKS reply"))?;
+        .map_err(|_| failure(Said::SocksReplyInvalid))?;
     Ok(())
 }
 
@@ -172,7 +311,7 @@ pub fn socks_request(host: &str, port: u16) -> Result<Vec<u8>, TunnelError> {
         }
         Err(_) => {
             if host.is_empty() || host.len() > 255 || host.bytes().any(|b| b.is_ascii_control()) {
-                return Err(failure("invalid proxy destination"));
+                return Err(failure(Said::InvalidDestination));
             }
             request.extend_from_slice(&[3, host.len() as u8]);
             request.extend_from_slice(host.as_bytes());
@@ -195,19 +334,20 @@ impl TransportProxy {
             .await
             .map_err(|failure| match failure {
                 ConnectFailure::Proxy(error) => error,
-                ConnectFailure::Unreachable(reason) => self.destination_unreachable(reason),
+                ConnectFailure::Unreachable(reply) => {
+                    self.destination_unreachable(host, port, reply)
+                }
             })
     }
 
     // The proxy's own failure to reach a destination it was asked for.
-    pub(crate) fn destination_unreachable(&self, reason: &str) -> TunnelError {
-        destination_unreachable(
-            match self.kind {
-                TransportKind::Socks5 => "SOCKS",
-                TransportKind::HttpConnect => "HTTP",
-            },
-            reason,
-        )
+    pub(crate) fn destination_unreachable(
+        &self,
+        host: &str,
+        port: u16,
+        reply: Reply,
+    ) -> TunnelError {
+        destination_unreachable(self.kind.protocol(), host, port, reply)
     }
 
     // Everything the proxy asks of a client before it takes a destination.
@@ -245,7 +385,7 @@ impl TransportProxy {
                         .bytes()
                         .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
                 {
-                    return Err(failure("invalid CONNECT destination").into());
+                    return Err(failure(Said::InvalidConnectDestination).into());
                 }
                 let authority = match host.parse::<IpAddr>() {
                     Ok(ip) => SocketAddr::new(ip, port).to_string(),
@@ -261,21 +401,21 @@ impl TransportProxy {
                 stream
                     .write_all(request.as_bytes())
                     .await
-                    .map_err(|_| failure("HTTP proxy CONNECT failed"))?;
+                    .map_err(|_| failure(Said::HttpConnectClosed))?;
                 let mut header = Vec::new();
                 while !header.ends_with(b"\r\n\r\n") {
                     if header.len() >= 16384 {
-                        return Err(failure("HTTP proxy response headers too large").into());
+                        return Err(failure(Said::HttpHeadersTooLarge).into());
                     }
                     header.push(
                         stream
                             .read_u8()
                             .await
-                            .map_err(|_| failure("HTTP proxy CONNECT failed"))?,
+                            .map_err(|_| failure(Said::HttpConnectClosed))?,
                     );
                 }
                 let line = std::str::from_utf8(&header)
-                    .map_err(|_| failure("invalid HTTP proxy response"))?
+                    .map_err(|_| failure(Said::HttpResponseInvalid))?
                     .lines()
                     .next()
                     .unwrap_or("");
@@ -287,10 +427,21 @@ impl TransportProxy {
                     Some(200..=299) => Ok(()),
                     // A gateway status reports what became of the proxy's own
                     // connection attempt. Any other is the proxy declining.
-                    Some(502) => Err(ConnectFailure::Unreachable("bad gateway (502)")),
-                    Some(503) => Err(ConnectFailure::Unreachable("service unavailable (503)")),
-                    Some(504) => Err(ConnectFailure::Unreachable("gateway timeout (504)")),
-                    _ => Err(failure("HTTP proxy rejected CONNECT").into()),
+                    Some(status @ 502..=504) => {
+                        Err(ConnectFailure::Unreachable(Reply::Http(status)))
+                    }
+                    Some(407) => Err(failure(if self.username.is_some() {
+                        Said::HttpCredentialsRejected
+                    } else {
+                        Said::HttpAuthRequired
+                    })
+                    .into()),
+                    Some(status) => Err(TunnelError::Engine(format!(
+                        "{REJECTED}{}{REJECTED_STATUS}{status}",
+                        crate::fault::authority(host, port)
+                    ))
+                    .into()),
+                    None => Err(failure(Said::HttpResponseInvalid).into()),
                 }
             }
         }
@@ -309,10 +460,14 @@ impl TunnelProvider for TransportProxy {
         )]
         let mut stream = crate::resolution::connect_host(&self.host, self.port)
             .await
-            .map_err(|_| failure("proxy endpoint is unreachable"))?;
+            // The system's own words name what went wrong, and `fault`
+            // reads them.
+            .map_err(|error| {
+                TunnelError::Engine(format!("proxy endpoint is unreachable: {error}"))
+            })?;
         stream
             .set_nodelay(true)
-            .map_err(|_| failure("proxy socket setup failed"))?;
+            .map_err(|_| failure(Said::SocketSetup))?;
         self.negotiate(&mut stream, host, port).await?;
         Ok(Box::new(stream))
     }

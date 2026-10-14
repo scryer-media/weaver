@@ -135,7 +135,7 @@ async fn ladder_order_cooldown_and_primary_recovery() {
 #[tokio::test(start_paused = true)]
 async fn one_recovery_probe_and_cancellation_releases_it() {
     let (route, _, _) = controlled_route();
-    route.fail(1, "unreachable");
+    route.fail(1, ProxyFault::ConnectionRefused);
     assert!(route.begin(1).is_none());
     tokio::time::advance(Duration::from_secs(30)).await;
     let attempt = route.begin(1).unwrap();

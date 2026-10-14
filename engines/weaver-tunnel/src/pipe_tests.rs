@@ -2,7 +2,11 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn bottom() -> Arc<Egress> {
-    Arc::new(Egress::new(4, SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()), Duration::from_secs(30)))
+    Arc::new(Egress::new(
+        4,
+        SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
+        Duration::from_secs(30),
+    ))
 }
 fn target(address: SocketAddr) -> Target {
     Target {
@@ -256,7 +260,7 @@ async fn a_chain_names_its_first_failing_hop() {
         first,
         &FailingHop {
             proxy: 7,
-            reason: "endpoint unreachable: fixture refusal".into(),
+            fault: ProxyFault::ConnectionRefused,
         }
     );
     assert_eq!(failing[1], None);
@@ -276,12 +280,15 @@ async fn a_hop_is_failing_until_it_carries_a_dial() {
         proxy.dial(&target).await,
         Err(DialError::Hop { proxy: 8, .. })
     ));
-    // The hop is named beside its reason, so the reason is the cause alone.
+    // The hop is named beside its fault, so the fault names the destination
+    // alone.
     assert_eq!(
         proxy.failing_hop(),
         Some(FailingHop {
             proxy: 8,
-            reason: "HTTP proxy rejected CONNECT".into(),
+            fault: ProxyFault::DestinationForbidden {
+                target: "192.0.2.9:119".into()
+            },
         })
     );
     *stage.reply.lock().unwrap() = b"HTTP/1.1 200 Connection established\r\n\r\n";
@@ -310,7 +317,10 @@ async fn a_chain_blames_the_hop_its_proxy_could_not_reach() {
         chain.failing_hop(),
         Some(FailingHop {
             proxy: 8,
-            reason: "endpoint unreachable: bad gateway (502)".into(),
+            fault: ProxyFault::DestinationUnreachable {
+                target: "192.0.2.2:8080".into(),
+                reply: "HTTP 502".into()
+            },
         })
     );
     assert!(matches!(
@@ -321,7 +331,10 @@ async fn a_chain_blames_the_hop_its_proxy_could_not_reach() {
         first.failing_hop(),
         Some(FailingHop {
             proxy: 7,
-            reason: "HTTP proxy could not connect to destination: bad gateway (502)".into(),
+            fault: ProxyFault::DestinationUnreachable {
+                target: "192.0.2.9:119".into(),
+                reply: "HTTP 502".into()
+            },
         })
     );
     // A proxy that refuses to forward at all is failing itself, whichever
@@ -335,7 +348,9 @@ async fn a_chain_blames_the_hop_its_proxy_could_not_reach() {
         chain.failing_hop(),
         Some(FailingHop {
             proxy: 7,
-            reason: "HTTP proxy rejected CONNECT".into(),
+            fault: ProxyFault::DestinationForbidden {
+                target: "192.0.2.2:8080".into()
+            },
         })
     );
     // Each proxy answers its own request, and no hop is failing any longer.
@@ -378,7 +393,9 @@ async fn a_socks_reply_names_the_hop_that_refused() {
         chain.failing_hop(),
         Some(FailingHop {
             proxy: 8,
-            reason: "endpoint unreachable: connection refused".into(),
+            fault: ProxyFault::DestinationRefused {
+                target: "192.0.2.2:8080".into()
+            },
         })
     );
     assert!(matches!(
@@ -389,7 +406,9 @@ async fn a_socks_reply_names_the_hop_that_refused() {
         first.failing_hop(),
         Some(FailingHop {
             proxy: 7,
-            reason: "SOCKS proxy could not connect to destination: connection refused".into(),
+            fault: ProxyFault::DestinationRefused {
+                target: "192.0.2.9:119".into()
+            },
         })
     );
 }
@@ -415,7 +434,9 @@ async fn a_silent_proxy_is_charged_to_the_hop_it_was_asked_for() {
         chain.failing_hop(),
         Some(FailingHop {
             proxy: 8,
-            reason: "endpoint unreachable: no answer through the hop before it".into(),
+            fault: ProxyFault::DestinationTimedOut {
+                target: "192.0.2.2:8080".into()
+            },
         })
     );
     assert!(matches!(

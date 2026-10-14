@@ -10,8 +10,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+// What routed DNS says when it fails, and `fault` reads back.
+pub(crate) const INVALID: &str = "routed DNS returned an invalid response";
+pub(crate) const UNRESOLVED: &str = "routed DNS could not resolve the destination";
+
 fn invalid() -> TunnelError {
-    TunnelError::Engine("routed DNS returned an invalid response".into())
+    TunnelError::Engine(INVALID.into())
 }
 static NEXT_ID: AtomicU16 = AtomicU16::new(1);
 
@@ -62,7 +66,7 @@ impl Carrier for Stage<'_> {
 // The failure of a lookup that found no address for the destination.
 pub fn unresolved() -> DialError {
     DialError::Destination(std::io::Error::other(TunnelError::Engine(
-        "routed DNS could not resolve the destination".into(),
+        UNRESOLVED.into(),
     )))
 }
 
@@ -179,7 +183,7 @@ async fn resolve_name(
             ttl: Ttl::Seconds(ttl),
         }),
         None => Err(Unanswered {
-            error: TunnelError::Engine("routed DNS could not resolve the destination".into()),
+            error: TunnelError::Engine(UNRESOLVED.into()),
             reached: reached_any,
         }),
     }

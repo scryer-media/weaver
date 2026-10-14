@@ -455,13 +455,12 @@ pub async fn connect_host(host: &str, port: u16) -> io::Result<TcpStream> {
         }
     }
     forget_host(host);
-    Err(last.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "could not resolve to any address",
-        )
-    }))
+    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, NO_ADDRESS)))
 }
+
+// What `connect_host` says of a name with no address, as std says it; `fault`
+// reads it back.
+pub(crate) const NO_ADDRESS: &str = "could not resolve to any address";
 
 fn untimed(found: impl Iterator<Item = IpAddr>) -> Lookup {
     let mut addresses = Vec::new();

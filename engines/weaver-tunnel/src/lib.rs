@@ -13,6 +13,7 @@ pub mod bridge;
 pub mod direct;
 pub mod dns;
 pub mod egress;
+pub mod fault;
 pub mod metrics;
 pub mod pipe;
 pub mod resolution;

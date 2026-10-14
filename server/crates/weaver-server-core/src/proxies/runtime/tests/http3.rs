@@ -9,12 +9,9 @@ async fn http3_profile_test_never_falls_back_to_tcp_when_dns_is_missing() {
     p.kind = ProxyKind::Http3Connect;
     p.port = listener.local_addr().unwrap().port();
     p.dns_servers.clear();
-    assert!(
-        runtime
-            .test_profile(&p)
-            .await
-            .unwrap_err()
-            .contains("DNS servers the proxy resolves with")
+    assert_eq!(
+        runtime.test_profile(&p).await.unwrap(),
+        Err(ProxyFault::TestNeedsDns)
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(50), listener.accept())

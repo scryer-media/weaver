@@ -27,10 +27,16 @@ use crate::{
     bridge::ConnectionOutcome,
     egress::SocketEgress,
     endpoint::{DatagramTransport, EndpointStream, EndpointTransport, UdpSocketFactory},
+    fault::{self, ProxyFault},
     metrics::Resolver,
     resolution::{Lookup, Replicate, ResolutionCache, Ttl},
-    transport::{ConnectFailure, TransportProxy},
+    transport::{ConnectFailure, Reply, TransportProxy},
 };
+
+// What a lookup or an egress says when it fails, and `fault` reads back.
+pub(crate) const NO_ADDRESS_RESOLVED: &str = "no address resolved for the destination";
+pub(crate) const RESOLVE_TIMED_OUT: &str = "name resolution timed out";
+pub(crate) const NO_ROUTE_VIA: &str = "no route via ";
 
 #[derive(Clone, Debug)]
 pub enum Purpose {
@@ -141,7 +147,7 @@ impl Naming {
             .map_err(|_| {
                 DialError::Destination(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("resolving {host} timed out"),
+                    format!("{RESOLVE_TIMED_OUT}: {host}"),
                 ))
             })??;
         Ok(match resolved {
@@ -317,7 +323,7 @@ impl Dialed {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("no address resolved for the destination")]
+#[error("{}", NO_ADDRESS_RESOLVED)]
 pub struct ResolutionFailed;
 
 #[derive(Debug, thiserror::Error)]
@@ -416,7 +422,7 @@ impl Replicate for DialError {
 
 // An SSH server refuses a forwarding request it will not serve with
 // `administratively prohibited`; the destination was never tried.
-fn is_forwarding_refusal(detail: &str) -> bool {
+pub(crate) fn is_forwarding_refusal(detail: &str) -> bool {
     detail.contains("AdministrativelyProhibited")
 }
 
@@ -424,49 +430,44 @@ fn is_forwarding_refusal(detail: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FailingHop {
     pub proxy: u32,
-    pub reason: String,
+    pub fault: ProxyFault,
 }
 
 // What a proxy hop's own last attempt came to. The hop keeps it itself, so
 // a path can name its first failing hop however the failure travelled up: a
 // hop stacked on a broken one fails too, and its error names only itself.
+// `wait` is the hop's own timeout, which a fault that ran out of time names.
 #[derive(Default)]
-pub struct HopFailure(Mutex<Option<String>>);
+pub struct HopFailure(Mutex<Option<ProxyFault>>);
 impl HopFailure {
     // Records `error` when it is evidence against the hop. A destination
     // the hop answered for clears the record, and an attempt that was never
     // made, such as one skipped for capacity, says nothing either way.
-    fn note(&self, error: &DialError) {
+    fn note(&self, error: &DialError, wait: Duration) {
         match error {
-            // The hop is named beside its reason, so the reason leaves it out.
-            DialError::Hop { source, .. } => self.blame(source),
-            error if error.is_path_evidence() => self.record(error.to_string()),
+            DialError::Hop { source, .. } => self.blame(source, wait),
+            error if error.is_path_evidence() => self.record(error.fault(wait)),
             error if error.is_evidence() => self.clear(),
             _ => {}
         }
     }
     // The hop's own endpoint could not be reached from the stage beneath.
-    fn unreachable(&self, source: &io::Error) {
-        self.record(format!("endpoint unreachable: {source}"));
+    fn unreachable(&self, source: &io::Error, wait: Duration) {
+        self.record(fault::from_io(source, wait));
     }
-    // Records what the hop's tunnel said. A stream proxy reports through
-    // the engine variant, whose own wording is about an engine that could
-    // not start, so what the proxy said stands alone.
-    fn blame(&self, source: &TunnelError) {
-        self.record(match source {
-            TunnelError::Engine(said) => said.clone(),
-            source => source.to_string(),
-        });
+    // Records what the hop's tunnel said.
+    fn blame(&self, source: &TunnelError, wait: Duration) {
+        self.record(fault::classify(source, wait));
     }
-    fn record(&self, reason: String) {
-        *self.0.lock().expect("hop failure") = Some(reason);
+    fn record(&self, fault: ProxyFault) {
+        *self.0.lock().expect("hop failure") = Some(fault);
     }
     fn clear(&self) {
         self.0.lock().expect("hop failure").take();
     }
     fn of(&self, proxy: u32) -> Option<FailingHop> {
-        let reason = self.0.lock().expect("hop failure").clone()?;
-        Some(FailingHop { proxy, reason })
+        let fault = self.0.lock().expect("hop failure").clone()?;
+        Some(FailingHop { proxy, fault })
     }
 }
 
@@ -555,7 +556,7 @@ impl Egress {
             };
             return DialError::Egress(io::Error::new(
                 error.kind(),
-                format!("no route via {via}: {error}"),
+                format!("{NO_ROUTE_VIA}{via}: {error}"),
             ));
         }
         DialError::destination(error)
@@ -665,7 +666,7 @@ impl Dialer for Egress {
             .map_err(|_| {
                 DialError::Destination(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "local DNS timed out",
+                    format!("{RESOLVE_TIMED_OUT}: {host}"),
                 ))
             })?
             .map_err(DialError::Destination)?;
@@ -722,9 +723,9 @@ impl TransportHop {
             Purpose::ProxyEndpoint { proxy } => Some(proxy),
             _ => None,
         };
-        let unreachable = |proxy, reason: &str| DialError::Hop {
+        let unreachable = |proxy, reply| DialError::Hop {
             proxy,
-            source: TunnelError::Engine(format!("endpoint unreachable: {reason}")),
+            source: crate::transport::hop_before(destination, target.port, reply),
         };
         let connected = tokio::time::timeout_at(
             deadline,
@@ -734,14 +735,15 @@ impl TransportHop {
         match (connected, next) {
             (Ok(Ok(())), _) => Ok(()),
             (Ok(Err(ConnectFailure::Proxy(error))), _) => Err(DialError::hop(self.id, error)),
-            (Ok(Err(ConnectFailure::Unreachable(reason))), Some(proxy)) => {
-                Err(unreachable(proxy, reason))
+            (Ok(Err(ConnectFailure::Unreachable(reply))), Some(proxy)) => {
+                Err(unreachable(proxy, reply))
             }
-            (Ok(Err(ConnectFailure::Unreachable(reason))), None) => Err(DialError::hop(
+            (Ok(Err(ConnectFailure::Unreachable(reply))), None) => Err(DialError::hop(
                 self.id,
-                self.spec.destination_unreachable(reason),
+                self.spec
+                    .destination_unreachable(destination, target.port, reply),
             )),
-            (Err(_), Some(proxy)) => Err(unreachable(proxy, "no answer through the hop before it")),
+            (Err(_), Some(proxy)) => Err(unreachable(proxy, Reply::Silent)),
             (Err(_), None) => Err(timed_out()),
         }
     }
@@ -771,11 +773,11 @@ impl Dialer for TransportHop {
                     // dial, so failing to reach it is this hop's failure.
                     DialError::Egress(source)
                     | DialError::Destination(source)
-                    | DialError::Refused(source) => self.failure.unreachable(source),
+                    | DialError::Refused(source) => self.failure.unreachable(source, self.timeout),
                     // The proxy hop beneath was reached and could not reach
                     // this endpoint through its own proxy.
                     DialError::Hop { proxy, source } if *proxy == self.id => {
-                        self.failure.blame(source)
+                        self.failure.blame(source, self.timeout)
                     }
                     // Any other failure belongs to the stage beneath.
                     _ => {}
@@ -795,7 +797,7 @@ impl Dialer for TransportHop {
                 Ok(()) => self.failure.clear(),
                 // The proxy answered for the next hop, so it is working.
                 Err(DialError::Hop { proxy, .. }) if *proxy != self.id => self.failure.clear(),
-                Err(error) => self.failure.note(error),
+                Err(error) => self.failure.note(error, self.timeout),
             }
             match negotiated {
                 Ok(()) => {
@@ -1030,7 +1032,7 @@ impl Dialer for SessionHop {
         }
         match &result {
             Ok(()) => self.failure.clear(),
-            Err(error) => self.failure.note(error),
+            Err(error) => self.failure.note(error, self.timeout),
         }
         if result.is_err() {
             self.retire_idle().await;
@@ -1097,7 +1099,7 @@ impl Dialer for SessionHop {
                 stream
             }
             Err(error) => {
-                self.failure.note(&error);
+                self.failure.note(&error, self.timeout);
                 if unreached(target, &error) {
                     self.naming.forget(&target.host);
                 }
@@ -1160,7 +1162,7 @@ impl Dialer for SessionHop {
                         ttl: Ttl::Unknown,
                     })
                     .map_err(|error| DialError::hop(self.id, error))
-                    .inspect_err(|error| self.failure.note(error))
+                    .inspect_err(|error| self.failure.note(error, self.timeout))
             })
             .await
             .map(Resolution::Addresses)

@@ -107,7 +107,21 @@ pub enum RoutingState {
 #[derive(SimpleObject)]
 pub struct RoutingFailure {
     pub proxy_id: u32,
+    // The failure in English, for a client with no sentence for its code.
     pub message: String,
+    pub code: String,
+    // The values the client's sentence for the code may name.
+    pub params: async_graphql::Json<serde_json::Map<String, serde_json::Value>>,
+}
+impl RoutingFailure {
+    fn new(proxy_id: u32, fault: &proxies::ProxyFault) -> Self {
+        Self {
+            proxy_id,
+            message: fault.to_string(),
+            code: fault.code().into(),
+            params: async_graphql::Json(proxies::fault_params(fault)),
+        }
+    }
 }
 #[derive(SimpleObject)]
 pub struct RoutingStatus {
@@ -333,7 +347,29 @@ impl ProxiesQuery {
 #[derive(SimpleObject)]
 pub struct ProxyTestResult {
     pub success: bool,
+    pub code: String,
+    // The outcome in English, for a client with no sentence for its code.
     pub message: String,
+    // The values the client's sentence for the code may name.
+    pub params: async_graphql::Json<serde_json::Map<String, serde_json::Value>>,
+}
+impl ProxyTestResult {
+    fn passed(pass: proxies::ProxyTestPass) -> Self {
+        Self {
+            success: true,
+            code: pass.code().into(),
+            message: pass.to_string(),
+            params: async_graphql::Json(serde_json::Map::new()),
+        }
+    }
+    fn failed(fault: &proxies::ProxyFault) -> Self {
+        Self {
+            success: false,
+            code: fault.code().into(),
+            message: fault.to_string(),
+            params: async_graphql::Json(proxies::fault_params(fault)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -425,19 +461,16 @@ impl ProxiesMutation {
             .await?
             .into_iter()
             .find(|p| p.id == id)
-            .ok_or("proxy not found")?;
-        let test: std::pin::Pin<
-            Box<dyn std::future::Future<Output = std::result::Result<String, String>> + Send + '_>,
-        > = Box::pin(runtime.test_profile(&profile));
-        Ok(match test.await {
-            Ok(message) => ProxyTestResult {
-                success: true,
-                message,
-            },
-            Err(message) => ProxyTestResult {
-                success: false,
-                message,
-            },
+            .ok_or_else(|| refusal_error(NetworkRefusal::ProxyNotFound))?;
+        type Tested = std::result::Result<
+            std::result::Result<proxies::ProxyTestPass, proxies::ProxyFault>,
+            NetworkRefusal,
+        >;
+        let test: std::pin::Pin<Box<dyn std::future::Future<Output = Tested> + Send + '_>> =
+            Box::pin(runtime.test_profile(&profile));
+        Ok(match test.await.map_err(refusal_error)? {
+            Ok(pass) => ProxyTestResult::passed(pass),
+            Err(fault) => ProxyTestResult::failed(&fault),
         })
     }
 }
@@ -498,7 +531,7 @@ fn status_for(ctx: &Context<'_>, consumer: Consumer) -> Result<RoutingStatus> {
         failures: status
             .failures
             .into_iter()
-            .map(|(proxy_id, message)| RoutingFailure { proxy_id, message })
+            .map(|(proxy_id, fault)| RoutingFailure::new(proxy_id, &fault))
             .collect(),
     })
 }

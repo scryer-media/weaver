@@ -369,7 +369,7 @@ pub enum RouteState {
 pub struct RoutingStatus {
     pub state: RouteState,
     pub selected_proxy_id: Option<u32>,
-    pub failures: Vec<(u32, String)>,
+    pub failures: Vec<(u32, super::ProxyFault)>,
 }
 impl Default for RoutingStatus {
     fn default() -> Self {

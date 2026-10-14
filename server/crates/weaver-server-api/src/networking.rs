@@ -501,7 +501,11 @@ pub struct NetworkLegFlow {
 pub struct NetworkFailingHop {
     pub rung: usize,
     pub proxy_id: u32,
+    // The failure in English, for a client with no sentence for its code.
     pub reason: String,
+    pub code: String,
+    // The values the client's sentence for the code may name.
+    pub params: async_graphql::Json<serde_json::Map<String, serde_json::Value>>,
 }
 #[derive(Clone, PartialEq, SimpleObject)]
 pub struct NetworkConsumerFlow {
@@ -610,7 +614,9 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                         hop.map(|hop| NetworkFailingHop {
                             rung,
                             proxy_id: hop.proxy,
-                            reason: hop.reason,
+                            reason: hop.fault.to_string(),
+                            code: hop.fault.code().into(),
+                            params: async_graphql::Json(core::fault_params(&hop.fault)),
                         })
                     })
                     .collect(),
