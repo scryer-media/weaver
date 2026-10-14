@@ -18,9 +18,12 @@ import { proxyLabels, type ProxyProfile } from "@/lib/proxies";
 import { EmptyState } from "../../components/chrome";
 import { SecondaryButton, Select } from "../../components/controls";
 import { countLabel } from "../../i18n/labels";
-import { formatRate, stateColor, stateLabel } from "./presentation";
+import { formatRate, stateColor, stateLabel, stateTone } from "./presentation";
 
 type FlowConsumer = { key: string; name: string; cap?: number; route?: NetworkRoute | null };
+
+/** The far end a speed test measures against: what it is, where it is, and what it is doing. */
+export type FlowEndpoint = { title: string; detail: string; state: string; label: string };
 
 /** What a box in the flow stands for, and so what picking it edits. */
 export type FlowTarget =
@@ -77,6 +80,9 @@ const COMPACT: Lanes = {
   WIDTH: 734,
   HOP_GAP: 14,
 };
+/** A compact flow that ends at the one endpoint a speed test measures against. */
+const COMPACT_ENDPOINT: Lanes = { ...COMPACT, ENDPOINTS: lane(782, 170), WIDTH: 960 };
+const ENDPOINT_BOX_HEIGHT = 76;
 const LEG_HEIGHT = 64;
 const BOX_HEIGHT = 44;
 const NOTE_LINE = 12;
@@ -425,6 +431,18 @@ function DownToggle({
   );
 }
 
+/** Whether the reader has asked for less motion; traffic then stands still. */
+const lessMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+
+/** Traffic on a line: dashes that crawl from the egress out toward the endpoint. */
+function Traffic({ points, width, still }: { points: Point[]; width: number; still: boolean }) {
+  return (
+    <path d={thread(points)} fill="none" stroke={stateColor("ACTIVE")} strokeWidth={width} strokeLinecap="round" strokeDasharray="18 30">
+      {still ? null : <animate attributeName="stroke-dashoffset" from="48" to="0" dur="0.8s" repeatCount="indefinite" />}
+    </path>
+  );
+}
+
 /**
  * Where every connection leaves, which route leg carries it, what it tunnels
  * through, and which endpoint it serves: egress cards on the left, then the
@@ -447,7 +465,12 @@ function DownToggle({
  * only shown.
  *
  * `compact` draws one endpoint's flow for that endpoint's own editor: no
- * controls, and no endpoint lane, since the editor is the endpoint.
+ * controls, and no endpoint lane, since the editor is the endpoint. With
+ * `endpoint` it ends at that one box instead, the far end a speed test
+ * measures against. With `traffic` the lines carrying a leg that has
+ * connections open move. With `trace`, pointing at a box sets the routes it
+ * lights moving the same way, along the way each leg takes (or the one way
+ * pointed at); a line that is down, failing or blocked stays still.
  */
 export function NetworkFlow({
   flow,
@@ -457,6 +480,9 @@ export function NetworkFlow({
   consumers,
   onEdit,
   compact = false,
+  endpoint,
+  traffic = false,
+  trace = false,
   toggles,
 }: {
   flow: Flow;
@@ -466,6 +492,9 @@ export function NetworkFlow({
   consumers: FlowConsumer[];
   onEdit?: (target: FlowTarget) => void;
   compact?: boolean;
+  endpoint?: FlowEndpoint;
+  traffic?: boolean;
+  trace?: boolean;
   /**
    * What a speed test leaves out, and with `onToggle` a Down switch on every
    * egress, leg, rung, chain hop and pool member to change it. Downed proxies
@@ -479,7 +508,8 @@ export function NetworkFlow({
   const [filter, setFilter] = useState("");
   const [group, setGroup] = useState<number | null>(null);
   const counts = useMeasurements(flow.legs);
-  const lanes = compact ? COMPACT : FULL;
+  const [still] = useState(lessMotion);
+  const lanes = compact ? (endpoint ? COMPACT_ENDPOINT : COMPACT) : FULL;
   const onToggle = toggles?.onToggle;
   const overrides = toggles?.overrides;
   const toggleRow = onToggle ? TOGGLE_ROW : 0;
@@ -559,8 +589,16 @@ export function NetworkFlow({
       offset += height + 18;
       return { leg, y, height, cardHeight, note, blocks, bypass, closed };
     });
-    const bottom = Math.max(offset - 16, used.length * 128 + 38, compact ? 0 : cardsBottom);
-    return { rows, height: compact ? bottom + 12 : Math.max(bottom + 52, 260) };
+    // The one endpoint stands level with the middle of everything that leads to it.
+    const middle = (58 + Math.max(offset - 18, used.length * 128 + 38)) / 2;
+    const endpointY = Math.max(58, Math.round(middle - ENDPOINT_BOX_HEIGHT / 2));
+    const bottom = Math.max(
+      offset - 16,
+      used.length * 128 + 38,
+      compact ? 0 : cardsBottom,
+      lanes === COMPACT_ENDPOINT ? endpointY + ENDPOINT_BOX_HEIGHT : 0,
+    );
+    return { rows, endpointY, height: compact ? bottom + 12 : Math.max(bottom + 52, 260) };
   }, [flow.legs, flow.pools, filter, grouped, group, pools, profiles, used.length, cardsBottom, lanes, compact, toggleRow, overrides]);
 
   const width = scale(Math.max(1, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
@@ -869,14 +907,18 @@ export function NetworkFlow({
           viewBox={`0 0 ${WIDTH} ${layout.height}`}
           role="group"
           aria-label={t("next.networking.flow.diagram")}
-          className={compact ? "block w-full min-w-[560px]" : "block w-full min-w-[1160px]"}
+          className={
+            compact ? (endpoint ? "block w-full min-w-[720px]" : "block w-full min-w-[560px]") : "block w-full min-w-[1160px]"
+          }
           style={{ background: INK.ground, fontFamily: FONT }}
         >
           {[
             [EGRESS.x, t("next.networking.flow.egressColumn")],
             [LEGS.x, t("next.networking.flow.legsColumn")],
             [PROXY.x, t("next.networking.flow.proxyColumn")],
-            ...(ENDPOINTS ? [[ENDPOINTS.x, t("next.networking.flow.consumersColumn")]] : []),
+            ...(ENDPOINTS
+              ? [[ENDPOINTS.x, t(endpoint ? "next.networking.flow.endpointColumn" : "next.networking.flow.consumersColumn")]]
+              : []),
           ].map(([x, label]) => (
             <text key={String(x)} x={Number(x) + 4} y="30" fill={INK.faint} fontSize="10.5" fontWeight="600" letterSpacing="1.5" fontFamily={TITLE_FONT}>
               {String(label).toUpperCase()}
@@ -885,9 +927,12 @@ export function NetworkFlow({
 
           {layout.rows.map(({ leg, y, blocks, bypass, closed }) => {
             const egressY = 112 + Math.max(0, used.findIndex((egress) => egress.id === leg.egressId)) * 128;
-            const consumerY = (cards.get(leg.consumer)?.y ?? 58) + 62;
+            const consumerY = endpoint
+              ? layout.endpointY + ENDPOINT_BOX_HEIGHT / 2
+              : (cards.get(leg.consumer)?.y ?? 58) + 62;
             const legY = y + LEG_HEIGHT / 2;
             const count = counts[legKey(leg)] ?? leg.open;
+            const flowing = traffic && leg.open > 0;
             const color = stateColor(leg.state);
             const tip = [
               t("next.networking.flow.connections", { open: leg.open, target: leg.target }),
@@ -907,7 +952,9 @@ export function NetworkFlow({
               ...(closed ? [{ at: y + BOX_HEIGHT / 2, boxed: true, status: "BLOCKED" }] : []),
             ];
             const taken = ways.find((way) => way.status === "ACTIVE") ?? ways[leg.selectedRung ?? 0] ?? ways[0];
-            const lines: { points: Point[]; carries: boolean; color: string; lit: boolean }[] = [
+            const passable = stateTone(leg.state) !== "bad";
+            // `moves`: what a pointed-at route sets moving, the way the leg takes or the one pointed at.
+            const lines: { points: Point[]; carries: boolean; color: string; lit: boolean; moves: boolean }[] = [
               {
                 points: [
                   [EGRESS.end, egressY],
@@ -916,12 +963,14 @@ export function NetworkFlow({
                 carries: true,
                 color,
                 lit: onRoute(leg),
+                moves: passable,
               },
               ...ways.flatMap((way, index) => {
                 const line = {
                   carries: way === taken,
                   color: way === taken ? color : stateColor(way.status),
                   lit: onWay(leg, index),
+                  moves: passable && stateTone(way.status) !== "bad" && (way === taken || focus?.kind === "way"),
                 };
                 const enter: Point[] = [
                   [LEGS.end, legY],
@@ -943,26 +992,35 @@ export function NetworkFlow({
             return (
               <g key={`ribbon:${legKey(leg)}`}>
                 <title>{tip}</title>
-                {lines.map((line, index) =>
-                  line.carries && count > 0 ? (
-                    <path
-                      key={index}
-                      d={band(line.points, Math.max(2, width(count)))}
-                      fill={line.color}
-                      opacity={line.lit ? (focus ? 0.5 : 0.28) : 0.28 * FADE}
-                    />
+                {lines.map((line, index) => {
+                  const traced = trace && focus !== null && line.lit && line.moves;
+                  return line.carries && count > 0 ? (
+                    <g key={index}>
+                      <path
+                        d={band(line.points, Math.max(2, width(count)))}
+                        fill={line.color}
+                        opacity={line.lit ? (focus ? 0.5 : 0.28) : 0.28 * FADE}
+                      />
+                      {flowing || traced ? (
+                        <g opacity={line.lit ? undefined : FADE}>
+                          <Traffic points={line.points} width={Math.min(4, Math.max(2, width(count) / 2))} still={still} />
+                        </g>
+                      ) : null}
+                    </g>
                   ) : (
-                    <path
-                      key={index}
-                      d={thread(line.points)}
-                      fill="none"
-                      stroke={line.color}
-                      strokeWidth={focus && line.lit ? 2 : 1.4}
-                      strokeDasharray="4 5"
-                      opacity={line.lit ? undefined : FADE}
-                    />
-                  ),
-                )}
+                    <g key={index}>
+                      <path
+                        d={thread(line.points)}
+                        fill="none"
+                        stroke={line.color}
+                        strokeWidth={focus && line.lit ? 2 : 1.4}
+                        strokeDasharray="4 5"
+                        opacity={line.lit ? undefined : FADE}
+                      />
+                      {traced ? <Traffic points={line.points} width={2} still={still} /> : null}
+                    </g>
+                  );
+                })}
               </g>
             );
           })}
@@ -1127,7 +1185,28 @@ export function NetworkFlow({
             );
           })}
 
-          {ENDPOINTS
+          {ENDPOINTS && endpoint ? (
+            <g
+              opacity={consumers[0] && !endpointLit(consumers[0].key) ? FADE : undefined}
+              {...(consumers[0] ? point({ kind: "endpoint", key: consumers[0].key }) : {})}
+            >
+              <title>{`${endpoint.title} · ${endpoint.detail}`}</title>
+              <rect x={ENDPOINTS.x} y={layout.endpointY} width={ENDPOINTS.width} height={ENDPOINT_BOX_HEIGHT} fill={INK.card} stroke={INK.line} />
+              <StateBar x={ENDPOINTS.x} y={layout.endpointY} height={ENDPOINT_BOX_HEIGHT} state={endpoint.state} />
+              <text x={ENDPOINTS.x + 14} y={layout.endpointY + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
+                {fit(endpoint.title, ENDPOINTS.width - 28, 12.5)}
+              </text>
+              <text x={ENDPOINTS.x + 14} y={layout.endpointY + 41} fill={INK.muted} fontSize="9.5">
+                {fit(endpoint.detail, ENDPOINTS.width - 28, 9.5)}
+              </text>
+              <StateText
+                x={ENDPOINTS.x + 14}
+                y={layout.endpointY + 61}
+                state={endpoint.state}
+                label={fit(endpoint.label, ENDPOINTS.width - 41, 10.5)}
+              />
+            </g>
+          ) : ENDPOINTS
             ? consumers.map((consumer) => {
                 const legs = flow.legs.filter((leg) => leg.consumer === consumer.key);
                 const { cap, cells, y, height } = cards.get(consumer.key)!;

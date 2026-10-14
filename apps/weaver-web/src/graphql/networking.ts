@@ -43,16 +43,16 @@ export const SAVE_ROUTE = gql`mutation SaveNetworkRoute($kind:NetworkConsumerKin
 const PATH_FIELDS = "kind directFallback rungs { kind proxyId poolId chainIds }";
 /** A speed test run as every speed test screen reads it: the route it took and what it measured. */
 const SPEED_TEST_RUN_FIELDS = `id consumer consumerName kind status phase startedAt finishedAt error
-  request { bandwidth { providerId server customUrl bytes streams } usenet { sabSize nzbUrl connections } maxDurationSeconds }
+  request { bandwidth { providerId server customUrl } usenet { sabSize nzbUrl nzbFilename nzbRunId connections maxDurationSeconds } }
   tested { legs { position egressId weight down downReason target path { ${PATH_FIELDS} } } failover
     overrides { downLegs downRungs { leg rung } downProxies downEgresses } names { kind id name } }
   result { bytes elapsedMs averageBps peakBps
     legs { position bytes averageBps peakBps connections sourceAddresses }
     connections { leg connectMs path { egressId rung poolId memberId proxyIds } sourceAddress bytes error }
     usenet { articlesRequested delivered missing failed declaredBytes decodedBytes pipelining tls tlsCipherSuite }
-    bandwidth { providerId server url streams }
-    samples { atMs leg bytes } }`;
-export const SPEED_TEST_QUERY = gql`query SpeedTest { bandwidthProviders { id name fixedSizes anySize maxBytes needsServer } speedTestRuns { ${SPEED_TEST_RUN_FIELDS} } }`;
+    bandwidth { providerId server url connections }
+    samples { atMs leg bytes decodedBytes } }`;
+export const SPEED_TEST_QUERY = gql`query SpeedTest { bandwidthProviders { id name host needsServer } speedTestRuns { ${SPEED_TEST_RUN_FIELDS} } }`;
 export const SPEED_TEST_RUN_QUERY = gql`query SpeedTestRun($id:Int!) { speedTestRun(id:$id) { ${SPEED_TEST_RUN_FIELDS} } }`;
 export const BANDWIDTH_PROVIDER_SERVERS_QUERY = gql`query BandwidthProviderServers($providerId:String!,$kind:NetworkConsumerKind!,$id:Int!) { bandwidthProviderServers(providerId:$providerId,kind:$kind,id:$id) { id name location host } }`;
 export const START_SPEED_TEST = gql`mutation StartSpeedTest($input:SpeedTestInput!) { startSpeedTest(input:$input) { ${SPEED_TEST_RUN_FIELDS} } }`;

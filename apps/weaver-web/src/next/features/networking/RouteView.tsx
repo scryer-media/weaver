@@ -14,7 +14,10 @@ import {
 } from "@/lib/networking";
 import type { ProxyProfile } from "@/lib/proxies";
 import { EMPTY_FLOW, flowConsumers, plannedFlow, speedPage, type Consumer, type NetworkingData } from "./data";
-import { NetworkFlow } from "./NetworkFlow";
+import { NetworkFlow, type FlowEndpoint } from "./NetworkFlow";
+
+/** One leg while a test measures: its connections, the rung they went by (null for direct), and its rate now. */
+export type LiveLeg = { connections: number; rung: number | null | undefined; bytesPerSecond: number };
 
 /**
  * A server's or a feed's route, shown inside its own editor.
@@ -91,7 +94,9 @@ export function RouteView({
  * A route as a speed test takes it: the compact flow of one consumer, drawn
  * from a route that need not be the saved one (a draft, or the snapshot a run
  * kept), with what is down drawn down and each leg's share as the test gives it.
- * With `onToggle` every box carries the Down switch that changes it.
+ * With `onToggle` every box carries the Down switch that changes it. While a
+ * test measures, `live` has each leg's connections and rate, and the lines
+ * that carry them move.
  */
 export function RoutePlanView({
   consumer,
@@ -102,11 +107,13 @@ export function RoutePlanView({
   profiles,
   pools,
   legDown,
+  live,
+  endpoint,
   onToggle,
 }: {
   consumer: Pick<Consumer, "key" | "name" | "cap">;
   route: NetworkRoute;
-  /** The connections or streams each leg is given. */
+  /** The connections each leg is given. */
   targets: number[];
   overrides: PathOverride;
   egresses: Egress[];
@@ -114,6 +121,9 @@ export function RoutePlanView({
   pools: ProxyPool[];
   /** Which legs were down, when the daemon has said; otherwise worked out from `overrides`. */
   legDown?: boolean[];
+  live?: LiveLeg[];
+  /** What the test measures against, drawn as the box the flow ends at. */
+  endpoint?: FlowEndpoint;
   onToggle?: (target: DownTarget) => void;
 }) {
   const plan = testedPlan(route, overrides, pools);
@@ -122,14 +132,20 @@ export function RoutePlanView({
     pools: [],
     legs: route.legs.map((leg, position) => {
       const rungs = leg.path.kind === "DIRECT" ? [] : leg.path.rungs;
+      const now = down[position] ? undefined : live?.[position];
+      const open = now?.connections ?? 0;
+      const firstUp = plan.rungDown[position]?.findIndex((rungDown) => !rungDown) ?? 0;
       return {
         ...leg,
         consumer: consumer.key,
         position,
-        target: targets[position] ?? 0,
-        open: 0,
+        target: Math.max(targets[position] ?? 0, open),
+        open,
         opening: 0,
-        state: down[position] ? "DOWN" : closedPath(leg.path) ? "BLOCKED" : "IDLE",
+        bytesPerSecond: now?.bytesPerSecond ?? 0,
+        // Unknown until a connection says, so the first rung still up stands in, then going direct.
+        selectedRung: now?.rung !== undefined ? now.rung : rungs.length && firstUp >= 0 ? firstUp : null,
+        state: down[position] ? "DOWN" : closedPath(leg.path) ? "BLOCKED" : open > 0 ? "ACTIVE" : "IDLE",
         reason: null,
         pinnedAddress: null,
         // The rungs, then going direct.
@@ -150,6 +166,8 @@ export function RoutePlanView({
       profiles={profiles}
       pools={pools}
       consumers={[{ ...consumer, route }]}
+      endpoint={endpoint}
+      traffic={!!live}
       toggles={{ overrides, onToggle }}
     />
   );

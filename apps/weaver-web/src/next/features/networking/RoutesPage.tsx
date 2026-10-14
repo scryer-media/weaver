@@ -215,6 +215,7 @@ function DraftSpeedTest({ consumer, route }: { consumer: Consumer; route: Networ
     <section aria-label={t("next.networking.speed.title")} className="flex flex-none flex-col border-t border-wv-hairline">
       <TestControls form={form} onChange={setForm} consumer={consumer} providers={providers} />
       <SpeedTestRunner consumer={consumer} route={route} overrides={noOverrides()} form={form} providers={providers} speedTest={speedTest} />
+      {speedTest.dialog}
     </section>
   );
 }

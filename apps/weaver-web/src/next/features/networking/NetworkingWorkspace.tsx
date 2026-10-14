@@ -150,6 +150,7 @@ export function NetworkingWorkspace({
                         pools={measured.proxyPools ?? data.proxyPools}
                         consumers={consumers}
                         onEdit={setEditing}
+                        trace
                       />
                     ),
                   },

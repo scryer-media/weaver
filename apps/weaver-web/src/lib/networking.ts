@@ -128,23 +128,24 @@ export function testedPlan(route: NetworkRoute, overrides: PathOverride, pools: 
     (leg.path.kind === "LADDER" && !leg.path.directFallback && rungDown[position]!.every(Boolean)));
   return { legDown, rungDown };
 }
-/** Bandwidth streams over the healthy legs by weight, at least one each. */
-export function streamTargets(route: NetworkRoute, streams: number, down: ReadonlySet<number>): number[] {
-  const healthy = route.legs.filter((_, i) => !down.has(i)).length;
-  const targets = allocation(route.legs.map((leg, i) => down.has(i) ? 0 : leg.weight), Math.max(streams, healthy));
-  return targets.map((target, i) => down.has(i) ? 0 : Math.max(1, target));
-}
 export type SpeedTestKind = "BANDWIDTH" | "USENET";
 export type SpeedTestStatus = "RUNNING" | "COMPLETED" | "CANCELLED" | "FAILED";
 export type SabTestSize = "MB_100" | "GB_1" | "GB_10";
-/** `maxBytes` caps what one stream may ask for; null for a provider of fixed sizes. */
-export type BandwidthProvider = { id: string; name: string; fixedSizes: number[]; anySize: boolean; maxBytes: number | null; needsServer: boolean };
+/** `host` is where a run downloads from; null for a provider whose servers each carry their own. */
+export type BandwidthProvider = { id: string; name: string; host: string | null; needsServer: boolean };
 export type BandwidthProviderServer = { id: string; name: string; location: string | null; host: string };
+/**
+ * A bandwidth run picks its own connections and ends itself once its rate holds steady.
+ * A Usenet run takes exactly one NZB source: a SAB size, a URL, an uploaded file, or a
+ * held run's uploaded file again.
+ */
 export type SpeedTestInput = {
   kind: "SERVER" | "RSS"; id: number; route?: ReturnType<typeof routeInput> | null; overrides?: PathOverride | null;
-  bandwidth?: { providerId?: string | null; server?: string | null; customUrl?: string | null; bytes: number; streams: number } | null;
-  usenet?: { sabSize?: SabTestSize | null; nzbUrl?: string | null; connections?: number | null } | null;
-  maxDurationSeconds: number;
+  bandwidth?: { providerId?: string | null; server?: string | null; customUrl?: string | null } | null;
+  usenet?: {
+    sabSize?: SabTestSize | null; nzbUrl?: string | null; nzbUpload?: File | null; nzbRunId?: number | null;
+    connections?: number | null; maxDurationSeconds: number;
+  } | null;
 };
 export type TestedLeg = { position: number; egressId: number; weight: number; down: boolean; downReason: string | null; path: Leg["path"]; target: number };
 export type SpeedTestResult = {
@@ -152,14 +153,21 @@ export type SpeedTestResult = {
   legs: { position: number; bytes: number; averageBps: number; peakBps: number; connections: number; sourceAddresses: string[] }[];
   connections: { leg: number; connectMs: number; path: { egressId: number; rung: number | null; poolId: number | null; memberId: number | null; proxyIds: number[] }; sourceAddress: string | null; bytes: number; error: string | null }[];
   usenet: { articlesRequested: number; delivered: number; missing: number; failed: number; declaredBytes: number; decodedBytes: number; pipelining: boolean; tls: boolean; tlsCipherSuite: string | null } | null;
-  bandwidth: { providerId: string | null; server: string | null; url: string; streams: number } | null;
-  samples: { atMs: number; leg: number; bytes: number }[];
+  /** `connections` is how many the run had open when it ended. */
+  bandwidth: { providerId: string | null; server: string | null; url: string; connections: number } | null;
+  /** One per leg each second; `decodedBytes` is 0 for a bandwidth run. */
+  samples: { atMs: number; leg: number; bytes: number; decodedBytes: number }[];
 };
-/** What a run was asked for, as the daemon kept it: exactly one of bandwidth and usenet. `bytes` is per stream. */
+/**
+ * What a run was asked for, as the daemon kept it: exactly one of bandwidth and usenet.
+ * An uploaded NZB is named by `nzbFilename`; `nzbRunId` is set when it came from an earlier run.
+ */
 export type SpeedTestRequest = {
-  bandwidth: { providerId: string | null; server: string | null; customUrl: string | null; bytes: number; streams: number } | null;
-  usenet: { sabSize: SabTestSize | null; nzbUrl: string | null; connections: number | null } | null;
-  maxDurationSeconds: number;
+  bandwidth: { providerId: string | null; server: string | null; customUrl: string | null } | null;
+  usenet: {
+    sabSize: SabTestSize | null; nzbUrl: string | null; nzbFilename: string | null; nzbRunId: number | null;
+    connections: number | null; maxDurationSeconds: number;
+  } | null;
 };
 export type SpeedTestRun = {
   id: number; consumer: string; consumerName: string; kind: SpeedTestKind; request: SpeedTestRequest; status: SpeedTestStatus; phase: string | null;

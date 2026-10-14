@@ -96,9 +96,10 @@ export function MetricStrip({ min = 146, children }: { min?: number; children: R
  * `eyebrow` is a node rather than a string because the Storage cell turns its
  * eyebrow row into a menu trigger.
  *
- * The variants are the three sizes the system uses: `wide` is the flex row two
+ * The variants are the sizes the system uses: `wide` is the flex row two
  * or three big numbers sit in, `strip` and `stat` are cells of a `MetricStrip`
- * — `stat` being the smaller one a single job's numbers take.
+ * — `stat` being the smaller one a single job's numbers take — and `hero` is
+ * the headline figure a measurement leads with, such as a speed test's rate.
  */
 export function MetricCell({
   eyebrow,
@@ -115,7 +116,7 @@ export function MetricCell({
   unit?: ReactNode;
   note?: ReactNode;
   valueClassName?: string;
-  variant?: "wide" | "strip" | "stat";
+  variant?: "wide" | "strip" | "stat" | "hero";
   /** Anything absolutely positioned against the cell, e.g. the storage menu. */
   children?: ReactNode;
   last?: boolean;
@@ -128,6 +129,7 @@ export function MetricCell({
         wide && "flex-1 gap-2 border-t border-wv-hairline px-4 py-4 sm:px-6 lg:border-t-0",
         variant === "strip" && "gap-2 border-t border-wv-hairline px-4 sm:px-[22px] py-[15px]",
         variant === "stat" && "gap-[7px] border-t border-wv-hairline px-5 py-[14px]",
+        variant === "hero" && "gap-[10px] border-t border-wv-hairline px-5 py-5 sm:px-6",
         (!wide || !last) && "border-r border-wv-hairline",
       )}
     >
@@ -136,20 +138,20 @@ export function MetricCell({
         <span
           className={cn(
             "truncate font-semibold leading-none tracking-[-0.02em]",
-            wide ? "text-[25px]" : variant === "strip" ? "text-[24px]" : "text-[21px]",
+            wide ? "text-[25px]" : variant === "strip" ? "text-[24px]" : variant === "hero" ? "text-[44px] tracking-[-0.03em] tabular-nums sm:text-[56px]" : "text-[21px]",
             valueClassName ?? "text-wv-fg",
           )}
         >
           {value}
         </span>
         {unit === undefined ? null : (
-          <span className="min-w-0 truncate text-[12px] text-wv-muted">{unit}</span>
+          <span className={cn("min-w-0 truncate text-wv-muted", variant === "hero" ? "text-[16px]" : "text-[12px]")}>{unit}</span>
         )}
       </div>
       <div
         className={cn(
           "truncate font-wv-mono",
-          variant === "stat" ? "text-[10.5px] text-wv-faint" : "text-[11px] text-wv-muted",
+          variant === "stat" || variant === "hero" ? "text-[10.5px] text-wv-faint" : "text-[11px] text-wv-muted",
         )}
       >
         {note ?? " "}
