@@ -274,6 +274,8 @@ pub struct ConnectionResult {
     pub path: SpeedTestDialPath,
     pub source_address: Option<String>,
     pub bytes: u64,
+    // The connection's rate over the newest sample bin.
+    pub bytes_per_second: u64,
     pub error: Option<String>,
 }
 

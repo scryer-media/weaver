@@ -12,6 +12,7 @@ import {
   type BandwidthProvider,
   type Egress,
   type PathOverride,
+  type PoolFlow,
   type ProxyPool,
   type SpeedTestInput,
   type SpeedTestRun,
@@ -141,6 +142,42 @@ function liveLegs(run: SpeedTestRun): LiveLeg[] {
       bytesPerSecond: now.legs.get(leg.position) ?? 0,
     };
   });
+}
+
+/** The pool members a running test's connections hold, by pool and egress, and what each carries now. */
+function livePools(run: SpeedTestRun): PoolFlow[] {
+  const pools: PoolFlow[] = [];
+  for (const connection of run.result?.connections ?? []) {
+    const { egressId, poolId, memberId } = connection.path;
+    if (connection.error !== null || poolId == null || memberId == null) {
+      continue;
+    }
+    let pool = pools.find((candidate) => candidate.poolId === poolId && candidate.egressId === egressId);
+    if (!pool) {
+      pool = { poolId, egressId, pinnedMember: null, members: [] };
+      pools.push(pool);
+    }
+    let member = pool.members.find((candidate) => candidate.id === memberId);
+    if (!member) {
+      member = {
+        id: memberId,
+        open: 0,
+        opening: 0,
+        warmed: true,
+        blocked: null,
+        handshakeMs: null,
+        connectMs: null,
+        bytesPerSecond: null,
+        liveBytesPerSecond: 0,
+        samples: 0,
+        failures: 0,
+      };
+      pool.members.push(member);
+    }
+    member.open += 1;
+    member.liveBytesPerSecond += connection.bytesPerSecond;
+  }
+  return pools;
 }
 
 /**
@@ -507,6 +544,7 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
               profiles={data.proxyProfiles}
               pools={data.proxyPools}
               live={liveLegs(measuring)}
+              livePools={livePools(measuring)}
               endpoint={endpoint}
             />
           ) : (

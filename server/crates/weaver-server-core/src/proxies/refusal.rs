@@ -33,6 +33,7 @@ pub enum NetworkRefusal {
     PoolGone,
     PoolInUse,
     PoolEditRepeatsProxy,
+    PoolInUseEmpty,
 
     // Routes.
     RouteLegCount,
@@ -45,6 +46,7 @@ pub enum NetworkRefusal {
     RouteEgressMissing,
     RouteEgressDisabled,
     RoutePoolMissing,
+    RoutePoolEmpty,
     RouteProxyMissing,
     RoutingProxyMissing,
     RouteProxyRepeated,
@@ -153,6 +155,7 @@ impl NetworkRefusal {
             Self::PoolGone => "POOL_NOT_FOUND",
             Self::PoolInUse => "POOL_IN_USE",
             Self::PoolEditRepeatsProxy => "POOL_EDIT_REPEATS_PROXY",
+            Self::PoolInUseEmpty => "POOL_IN_USE_EMPTY",
 
             Self::RouteLegCount => "ROUTE_LEG_COUNT",
             Self::RouteLegWeightRange => "ROUTE_LEG_WEIGHT_RANGE",
@@ -164,6 +167,7 @@ impl NetworkRefusal {
             Self::RouteEgressMissing => "ROUTE_EGRESS_MISSING",
             Self::RouteEgressDisabled => "ROUTE_EGRESS_DISABLED",
             Self::RoutePoolMissing => "ROUTE_POOL_MISSING",
+            Self::RoutePoolEmpty => "ROUTE_POOL_EMPTY",
             Self::RouteProxyMissing | Self::RoutingProxyMissing => "ROUTE_PROXY_MISSING",
             Self::RouteProxyRepeated | Self::RoutingProxyRepeated => "ROUTE_PROXY_REPEATED",
             Self::RoutingProxyCount => "ROUTE_PROXY_COUNT",
@@ -271,13 +275,16 @@ impl std::fmt::Display for NetworkRefusal {
             Self::EgressInUse => "egress is referenced by a server or RSS feed",
 
             Self::PoolNameLength => "pool name must contain 1–128 characters",
-            Self::PoolMemberCount => "a pool requires between two and sixteen members",
+            Self::PoolMemberCount => "a pool takes at most sixteen members",
             Self::PoolProxyRepeated => "a proxy cannot appear twice in a pool",
             Self::PoolProxyMissing => "pool references a missing proxy",
             Self::PoolMemberKindMismatch => "all pool members must have the pool's proxy kind",
             Self::PoolGone => "proxy pool no longer exists",
             Self::PoolInUse => "pool is referenced by a server or RSS feed",
             Self::PoolEditRepeatsProxy => "pool edit would repeat a proxy in an existing ladder",
+            Self::PoolInUseEmpty => {
+                "a pool referenced by a server or RSS feed needs at least one member"
+            }
 
             Self::RouteLegCount => "a route requires between one and eight legs",
             Self::RouteLegWeightRange => "leg weights must be between 1 and 100",
@@ -289,6 +296,7 @@ impl std::fmt::Display for NetworkRefusal {
             Self::RouteEgressMissing => "route references a missing egress",
             Self::RouteEgressDisabled => "route references a disabled egress",
             Self::RoutePoolMissing => "route references a missing pool",
+            Self::RoutePoolEmpty => "route references a pool with no members",
             Self::RouteProxyMissing => "route references a missing proxy",
             Self::RoutingProxyMissing => "routing policy references a missing proxy",
             Self::RouteProxyRepeated => {

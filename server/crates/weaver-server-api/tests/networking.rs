@@ -246,7 +246,10 @@ async fn egress_and_pool_refusals_carry_their_codes() {
             "EGRESS_NOT_FOUND",
         ),
         (
-            format!(r#"createProxyPool(input:{{name:"Alone",kind:SOCKS5,memberIds:[{proxy}]}}){{id}}"#),
+            format!(
+                r#"createProxyPool(input:{{name:"Crowded",kind:SOCKS5,memberIds:[{}]}}){{id}}"#,
+                vec![proxy.to_string(); 17].join(",")
+            ),
             "POOL_MEMBER_COUNT",
         ),
         (
@@ -269,6 +272,18 @@ async fn egress_and_pool_refusals_carry_their_codes() {
     let (message, code, _) = refusal(&response);
     assert_eq!(code, "PROXY_IN_USE");
     assert_eq!(message, "proxy is referenced by a server or RSS feed");
+    // A pool saves empty, but no route can name it until it has a member.
+    let response = h
+        .execute(r#"mutation{createProxyPool(input:{name:"Empty",kind:SOCKS5,memberIds:[]}){id}}"#)
+        .await;
+    assert_no_errors(&response);
+    let pool = response_data(&response)["createProxyPool"]["id"]
+        .as_u64()
+        .unwrap();
+    let response = h.execute(&format!("mutation{{saveNetworkRoute(kind:RSS,id:{feed},input:{{legs:[{{egressId:0,weight:100,path:{{ladder:{{rungs:[{{pool:{pool}}}],directFallback:false}}}}}}]}}){{consumer}}}}")).await;
+    let (message, code, _) = refusal(&response);
+    assert_eq!(code, "ROUTE_POOL_EMPTY");
+    assert_eq!(message, "route references a pool with no members");
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 #[tokio::test]

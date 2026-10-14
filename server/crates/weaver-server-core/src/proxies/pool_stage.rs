@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -18,6 +18,8 @@ use weaver_nntp::{
 use weaver_tunnel::pipe::{DialError, Dialed, Dialer, Resolution, SetupHandle, Target};
 
 const POOL_IDLE_RETIRE: Duration = Duration::from_secs(600);
+// How far back a member's rate looks, as far as a leg's does.
+const MEMBER_RATE_WINDOW: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Debug)]
 pub struct PoolMemberStatus {
@@ -27,6 +29,47 @@ pub struct PoolMemberStatus {
     pub session_handshake: Option<Duration>,
     pub blocked: Option<String>,
     pub warmed: bool,
+    // What the member's connections carry now, over the last few seconds.
+    pub bytes_per_second: u64,
+}
+
+// A member's rate, read off the bytes its connections carried whenever the
+// pool is looked at. Readings are kept at least a second apart and the rate
+// spans the oldest one still inside the window, so a pool looked at every
+// second reports what each member moved over the last few. Nothing runs
+// while nobody looks.
+#[derive(Default)]
+struct MemberRate {
+    readings: VecDeque<(Instant, u64)>,
+    rate: u64,
+}
+impl MemberRate {
+    fn read(&mut self, total: u64, now: Instant) -> u64 {
+        while self
+            .readings
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > MEMBER_RATE_WINDOW)
+        {
+            self.readings.pop_front();
+        }
+        match self.readings.front() {
+            Some(&(at, bytes)) if now.duration_since(at) >= Duration::from_secs(1) => {
+                self.rate = (total.saturating_sub(bytes) as f64
+                    / now.duration_since(at).as_secs_f64()) as u64;
+            }
+            // A reading less than a second old is too short a span to rate.
+            Some(_) => {}
+            None => self.rate = 0,
+        }
+        if self
+            .readings
+            .back()
+            .is_none_or(|(at, _)| now.duration_since(*at) >= Duration::from_secs(1))
+        {
+            self.readings.push_back((now, total));
+        }
+        self.rate
+    }
 }
 
 struct Member {
@@ -38,8 +81,41 @@ struct Member {
     session_gate: tokio::sync::Mutex<()>,
     retiring: AtomicBool,
     outcomes: Mutex<Vec<std::sync::Weak<weaver_tunnel::bridge::ConnectionOutcome>>>,
+    read: AtomicU64,
+    rate: Mutex<MemberRate>,
 }
 impl Member {
+    fn new(id: u32, dialer: Arc<dyn Dialer>) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            streams: weaver_tunnel::pipe::Revocable::new(dialer.clone()),
+            dialer,
+            status: Mutex::new(PoolMemberStatus {
+                id,
+                open: 0,
+                opening: 0,
+                session_handshake: None,
+                blocked: None,
+                warmed: false,
+                bytes_per_second: 0,
+            }),
+            idle_since: Mutex::new(Instant::now()),
+            session_gate: tokio::sync::Mutex::new(()),
+            retiring: AtomicBool::new(false),
+            outcomes: Mutex::new(Vec::new()),
+            read: AtomicU64::new(0),
+            rate: Mutex::new(MemberRate::default()),
+        })
+    }
+    fn status(&self, now: Instant) -> PoolMemberStatus {
+        let mut status = self.status.lock().expect("pool member").clone();
+        status.bytes_per_second = self
+            .rate
+            .lock()
+            .expect("member rate")
+            .read(self.read.load(Ordering::Relaxed), now);
+        status
+    }
     fn recall(&self) {
         self.retiring.store(true, Ordering::Release);
         let outcomes = std::mem::take(&mut *self.outcomes.lock().expect("member outcomes"));
@@ -147,6 +223,10 @@ impl MemberOpening {
         if self.member.retiring.load(Ordering::Acquire) {
             dialed.outcome.retire();
         }
+        let member = self.member.clone();
+        dialed.outcome.on_read(move |bytes| {
+            member.read.fetch_add(bytes as u64, Ordering::Relaxed);
+        });
         let member = self.member.clone();
         dialed.outcome.on_close(move || {
             let mut status = member.status.lock().expect("pool member");
@@ -451,28 +531,7 @@ impl PoolStage {
         );
         let members = members
             .into_iter()
-            .map(|(id, dialer)| {
-                (
-                    id,
-                    Arc::new(Member {
-                        id,
-                        streams: weaver_tunnel::pipe::Revocable::new(dialer.clone()),
-                        dialer,
-                        status: Mutex::new(PoolMemberStatus {
-                            id,
-                            open: 0,
-                            opening: 0,
-                            session_handshake: None,
-                            blocked: None,
-                            warmed: false,
-                        }),
-                        idle_since: Mutex::new(Instant::now()),
-                        session_gate: tokio::sync::Mutex::new(()),
-                        retiring: AtomicBool::new(false),
-                        outcomes: Mutex::new(Vec::new()),
-                    }),
-                )
-            })
+            .map(|(id, dialer)| (id, Member::new(id, dialer)))
             .collect();
         let state = Arc::new(PoolState {
             id,
@@ -515,19 +574,20 @@ impl PoolStage {
         })
     }
     pub fn snapshot(&self) -> (PlanSnapshot<u32>, Vec<PoolMemberStatus>) {
+        let now = Instant::now();
         let plan = self
             .state
             .plan
             .lock()
             .expect("pool plan")
-            .snapshot_at(Instant::now().into_std());
+            .snapshot_at(now.into_std());
         let mut members: Vec<_> = self
             .state
             .members
             .read()
             .expect("pool members")
             .values()
-            .map(|m| m.status.lock().expect("pool member").clone())
+            .map(|m| m.status(now))
             .collect();
         members.sort_by_key(|m| m.id);
         (plan, members)
@@ -572,25 +632,7 @@ impl PoolStage {
                     .get(&id)
                     .filter(|m| Arc::ptr_eq(&m.dialer, &dialer))
                     .cloned()
-                    .unwrap_or_else(|| {
-                        Arc::new(Member {
-                            id,
-                            streams: weaver_tunnel::pipe::Revocable::new(dialer.clone()),
-                            dialer,
-                            status: Mutex::new(PoolMemberStatus {
-                                id,
-                                open: 0,
-                                opening: 0,
-                                session_handshake: None,
-                                blocked: None,
-                                warmed: false,
-                            }),
-                            idle_since: Mutex::new(Instant::now()),
-                            session_gate: tokio::sync::Mutex::new(()),
-                            retiring: AtomicBool::new(false),
-                            outcomes: Mutex::new(Vec::new()),
-                        })
-                    });
+                    .unwrap_or_else(|| Member::new(id, dialer));
                 (id, member)
             })
             .collect();

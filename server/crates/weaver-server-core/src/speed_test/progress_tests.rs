@@ -44,3 +44,31 @@ fn a_run_that_never_got_past_its_warm_up_averages_the_whole_run() {
 fn a_run_that_moved_nothing_after_its_warm_up_averages_the_whole_run() {
     assert_eq!(run(10, 1_000, Some((5, 1_000))), 100.0);
 }
+
+#[test]
+fn each_connection_is_rated_over_the_newest_bin() {
+    let progress = Progress::new(1);
+    let started = Instant::now();
+    let _ = progress.started.set(started);
+    let _ = progress.finished.set(started + Duration::from_secs(2));
+    let path = |member| crate::speed_test::model::SpeedTestDialPath {
+        egress_id: 1,
+        rung: Some(0),
+        pool_id: Some(4),
+        member_id: Some(member),
+        proxy_ids: vec![member],
+    };
+    let carrying = progress.record(0, Duration::ZERO, path(7), None, None);
+    let idle = progress.record(0, Duration::ZERO, path(8), None, None);
+    carrying.add_bytes(4 << 20);
+    progress.add_leg_bytes(0, 4 << 20);
+    progress.sample();
+    drop((carrying, idle));
+    let result = progress.result(false, bandwidth()).expect("measuring");
+    let rates: Vec<_> = result
+        .connections
+        .iter()
+        .map(|connection| (connection.path.member_id, connection.bytes_per_second))
+        .collect();
+    assert_eq!(rates, [(Some(7), 2 << 20), (Some(8), 0)]);
+}

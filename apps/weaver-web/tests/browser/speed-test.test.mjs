@@ -109,6 +109,12 @@ test("a leg taken down is left out of the test, the run is followed to its resul
     await plan.locator("svg animate").first().waitFor({ state: "attached" });
     // The endpoint and the large figure both give the newest second's rate: 12 MiB on the one leg up.
     await plan.locator("svg").getByText("Active · 12.0 MB/s", { exact: true }).waitFor();
+    // The pool member the leg's connection went through says so, with what it carries now; the other stands by.
+    const members = plan.locator("svg").getByRole("group", { name: "Europe pool members", exact: true });
+    await members.getByText("Frankfurt · Active", { exact: true }).waitFor();
+    await members.getByText("1 open · 12.00 MiB/s", { exact: true }).waitFor();
+    await members.getByText("Amsterdam · Standby", { exact: true }).waitFor();
+    assert.equal(await plan.locator("svg").getByText(/Unmeasured/).count(), 0);
     // A Usenet run charts what it downloads and what that decodes to, each chasing its newest second.
     for (const name of ["Speed", "Decode"]) {
       const chart = progress.getByRole("img", { name, exact: true });

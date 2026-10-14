@@ -104,6 +104,8 @@ type Member = {
   state: string;
   live: PoolMemberFlow | undefined;
   measured: boolean;
+  /** The member holds connections for the pool right now. */
+  carrying: boolean;
   /** Why the member is out of use, broken to fit its row. */
   note: string[];
   height: number;
@@ -245,7 +247,11 @@ function rungStatus(leg: LegFlow, rungIndex: number, direct: boolean): string {
   return leg.state === "DOWN" || state === "FAILING" ? "FAILING" : "STANDBY";
 }
 
-/** What a pool member is doing, in the one word the diagram shows for it. */
+/**
+ * What a pool member is doing, in the one word the diagram shows for it. A
+ * member holding connections is active; one held in reserve is on standby,
+ * as an idle rung is, whether or not the pool has measured it yet.
+ */
 function memberState(member: PoolMemberFlow | undefined, pinned: boolean, enabled: boolean): string {
   if (!enabled || member?.state === "DISABLED") {
     return "DISABLED";
@@ -253,8 +259,14 @@ function memberState(member: PoolMemberFlow | undefined, pinned: boolean, enable
   if (member?.blocked) {
     return "BLOCKED";
   }
+  if ((member?.open ?? 0) > 0) {
+    return "ACTIVE";
+  }
   if (pinned) {
     return "PINNED";
+  }
+  if ((member?.opening ?? 0) > 0) {
+    return "PROBING";
   }
   if (member?.state === "SUSPECT" || member?.state === "CHALLENGER" || member?.state === "PROBING") {
     return member.state;
@@ -262,7 +274,7 @@ function memberState(member: PoolMemberFlow | undefined, pinned: boolean, enable
   if (member?.failures) {
     return "FAILING";
   }
-  return member?.warmed ? "READY" : "UNMEASURED";
+  return "STANDBY";
 }
 
 /**
@@ -616,6 +628,7 @@ export function NetworkFlow({
           const member = live?.members.find((candidate) => candidate.id === id);
           const measured =
             member != null && (member.handshakeMs != null || member.connectMs != null || member.bytesPerSecond != null);
+          const carrying = (member?.open ?? 0) > 0;
           const said = member?.blocked ?? (failing?.proxyId === id ? failing.reason : null);
           const note = said ? wrap(said, lanes.PROXY.width - 45 - toggleWidth, 9.5, 2) : [];
           return {
@@ -630,8 +643,9 @@ export function NetworkFlow({
                     profiles.find((profile) => profile.id === id)?.enabled !== false,
                   ),
             measured,
+            carrying,
             note,
-            height: (measured ? 32 : 20) + note.length * NOTE_LINE,
+            height: (measured || carrying ? 32 : 20) + note.length * NOTE_LINE,
           };
         });
         // A failing hop says why inside its own box: the hop's in a chain, the member's row in a pool.
@@ -852,40 +866,45 @@ export function NetworkFlow({
             {members.map((member) => {
               const top = memberY;
               memberY += member.height;
-              const open = member.live?.open ?? 0;
+              const timing = member.measured
+                ? t("next.networking.flow.memberTiming", {
+                    session: member.live?.handshakeMs?.toFixed(0) ?? "—",
+                    open: member.live?.connectMs?.toFixed(0) ?? "—",
+                    rate:
+                      member.live?.bytesPerSecond == null
+                        ? t("next.networking.flow.noEvidence")
+                        : formatRate(member.live.bytesPerSecond),
+                  })
+                : null;
+              // A member carrying traffic shows what it carries now; its timings move to the hover.
+              const detail = member.carrying
+                ? t("next.networking.flow.egressLoad", {
+                    open: member.live?.open ?? 0,
+                    rate: formatRate(member.live?.liveBytesPerSecond ?? 0),
+                  })
+                : timing;
               return card(
                 proxyTarget(member.id),
                 PROXIES_PAGE,
                 <g opacity={member.state === "DISABLED" ? 0.6 : 1}>
-                  {open > 0 ? <title>{countLabel(t, "next.networking.flow.holding", open)}</title> : null}
+                  {member.carrying && timing ? <title>{timing}</title> : null}
                   <rect
                     x={PROXY.x + 8}
                     y={top}
                     width={PROXY.width - 16}
                     height={member.height - 2}
-                    fill={open > 0 ? INK.rowActive : INK.row}
+                    fill={member.carrying ? INK.rowActive : INK.row}
                   />
                   <rect x={PROXY.x + 16} y={top + 6} width="7" height="7" fill={stateColor(member.state)} />
                   <text x={PROXY.x + 29} y={top + 13} fill={INK.secondary} fontSize="10">
                     {`${fit(name(member.id), PROXY.width / 2 - 20, 10)} · ${stateLabel(t, member.state)}`}
                   </text>
-                  {member.measured ? (
+                  {detail ? (
                     <text x={PROXY.x + 29} y={top + 25} fill={INK.muted} fontSize="9.5">
-                      {fit(
-                        t("next.networking.flow.memberTiming", {
-                          session: member.live?.handshakeMs?.toFixed(0) ?? "—",
-                          open: member.live?.connectMs?.toFixed(0) ?? "—",
-                          rate:
-                            member.live?.bytesPerSecond == null
-                              ? t("next.networking.flow.noEvidence")
-                              : formatRate(member.live.bytesPerSecond),
-                        }),
-                        PROXY.width - 45,
-                        9.5,
-                      )}
+                      {fit(detail, PROXY.width - 45, 9.5)}
                     </text>
                   ) : null}
-                  <Note x={PROXY.x + 29} y={top + (member.measured ? 37 : 25)} lines={member.note} />
+                  <Note x={PROXY.x + 29} y={top + (detail ? 37 : 25)} lines={member.note} />
                   {toggle({ kind: "proxy", id: member.id }, name(member.id))?.(
                     PROXY.end - 16 - toggleWidth,
                     top + 2,

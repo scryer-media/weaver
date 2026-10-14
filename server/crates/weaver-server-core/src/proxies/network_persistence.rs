@@ -394,6 +394,7 @@ impl Database {
                         for leg in route.legs {
                             let LegPath::Ladder { rungs, .. } = leg.path else { continue };
                             if !rungs.iter().any(|rung| matches!(rung, Rung::Pool { id } if *id == pool.id)) { continue; }
+                            if pool.member_ids.is_empty() { return Err(NetworkRefusal::PoolInUseEmpty.into()); }
                             let mut seen = std::collections::HashSet::new();
                             for rung in rungs {
                                 let ids = match rung {

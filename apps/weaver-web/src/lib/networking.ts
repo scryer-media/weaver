@@ -14,8 +14,10 @@ export type ProxyPool = { id: number; name: string; kind: ProxyKind; memberIds: 
 export type LegFlow = Leg & { rungStates?:string[]; consumer: string; position: number; target: number; open: number; opening: number; state: string; reason: string | null; pinnedAddress: string | null; sourceAddress?:string|null;bytesPerSecond?:number;selectedRung?:number|null;selectedProxyId?:number|null;failingHops?:FailingHop[] };
 /** The first proxy hop on a ladder rung known to be failing, and what its last attempt came to. */
 export type FailingHop = { rung: number; proxyId: number; reason: string };
-export type PoolMemberFlow = { state?:string; id: number; open: number; opening: number; warmed: boolean; blocked: string | null; handshakeMs: number | null; connectMs: number | null; bytesPerSecond: number | null; samples: number; failures: number };
-export type NetworkFlow = { consumers?:{key:string;id:number;name:string;kind:"SERVER"|"RSS";cap:number;route:NetworkRoute}[]; proxies?:import("./proxies").ProxyProfile[]; proxyPools?:ProxyPool[]; egresses?:Egress[]; sampledAt?:number;legs: LegFlow[]; pools: { poolId: number; egressId: number; pinnedMember: number | null; members: PoolMemberFlow[] }[] };
+export type PoolMemberFlow = { state?:string; id: number; open: number; opening: number; warmed: boolean; blocked: string | null; handshakeMs: number | null; connectMs: number | null; bytesPerSecond: number | null; liveBytesPerSecond: number; samples: number; failures: number };
+export type NetworkFlow = { consumers?:{key:string;id:number;name:string;kind:"SERVER"|"RSS";cap:number;route:NetworkRoute}[]; proxies?:import("./proxies").ProxyProfile[]; proxyPools?:ProxyPool[]; egresses?:Egress[]; sampledAt?:number;legs: LegFlow[]; pools: PoolFlow[] };
+/** A pool on one egress as it runs: `liveBytesPerSecond` on a member is what it carries now, `bytesPerSecond` what the pool judges it by. */
+export type PoolFlow = { poolId: number; egressId: number; pinnedMember: number | null; members: PoolMemberFlow[] };
 export const directLeg = (): Leg => ({ egressId: 0, weight: 100, path: { kind: "DIRECT", rungs: [], directFallback: false } });
 /** A path nothing can take: a ladder with no rung on it and no going direct. It is how a kill switch is stored. */
 export const closedPath = (path: Leg["path"]) => path.kind === "LADDER" && !path.rungs.length && !path.directFallback;
@@ -151,7 +153,7 @@ export type TestedLeg = { position: number; egressId: number; weight: number; do
 export type SpeedTestResult = {
   bytes: number; elapsedMs: number; averageBps: number; peakBps: number;
   legs: { position: number; bytes: number; averageBps: number; peakBps: number; connections: number; sourceAddresses: string[] }[];
-  connections: { leg: number; connectMs: number; path: { egressId: number; rung: number | null; poolId: number | null; memberId: number | null; proxyIds: number[] }; sourceAddress: string | null; bytes: number; error: string | null }[];
+  connections: { leg: number; connectMs: number; path: { egressId: number; rung: number | null; poolId: number | null; memberId: number | null; proxyIds: number[] }; sourceAddress: string | null; bytes: number; bytesPerSecond: number; error: string | null }[];
   usenet: { articlesRequested: number; delivered: number; missing: number; failed: number; declaredBytes: number; decodedBytes: number; pipelining: boolean; tls: boolean; tlsCipherSuite: string | null } | null;
   /** `connections` is how many the run had open when it ended. */
   bandwidth: { providerId: string | null; server: string | null; url: string; connections: number } | null;

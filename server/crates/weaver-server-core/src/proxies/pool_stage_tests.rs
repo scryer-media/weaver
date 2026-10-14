@@ -425,3 +425,39 @@ async fn connections_that_fail_after_setup_do_not_make_the_pin_suspect() {
     assert!(started.try_recv().is_err(), "no other member was dialled");
     assert_eq!(pool.snapshot().0.races_won, 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_member_carrying_traffic_reports_its_connections_and_rate() {
+    let (pool, members, _started) = fixtures();
+    members[1].gate.add_permits(1);
+    let (_, lease) = pool
+        .lease_members()
+        .into_iter()
+        .find(|(id, _)| *id == 2)
+        .unwrap();
+    let dialed = lease.dial(&target()).await.unwrap();
+    assert_eq!(dialed.path.member, Some(2));
+    let status = pool.snapshot().1;
+    assert_eq!((status[0].open, status[1].open), (0, 1));
+    assert_eq!(
+        (status[0].bytes_per_second, status[1].bytes_per_second),
+        (0, 0)
+    );
+    // Read once a second, the rate spans the last four.
+    for _ in 0..4 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        dialed.outcome.read(1 << 20);
+        pool.snapshot();
+    }
+    let status = pool.snapshot().1;
+    assert_eq!((status[0].open, status[1].open), (0, 1));
+    assert_eq!(
+        (status[0].bytes_per_second, status[1].bytes_per_second),
+        (0, 1 << 20)
+    );
+    // Once the connection closes and the window passes, nothing is carried.
+    drop(dialed);
+    tokio::time::advance(MEMBER_RATE_WINDOW + Duration::from_secs(1)).await;
+    let status = pool.snapshot().1;
+    assert_eq!((status[1].open, status[1].bytes_per_second), (0, 0));
+}
