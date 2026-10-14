@@ -99,10 +99,10 @@ async fn rar_chase_rejects_unacceptable_extension_before_writing_payload() {
             .as_ref()
             .err()
             .expect("chase must reject the blocked member");
-        assert!(crate::pipeline::JobExtractionBudget::is_rejection(error));
+        // A chase reports its failure as text, for its demotion record only.
         assert_eq!(
-            crate::pipeline::JobExtractionBudget::job_failure_reason(error.clone()),
-            "unwanted extension '.bin' in 'zeros_64k.bin'"
+            error,
+            "WEAVER_EXTRACTION_REJECTED[content_policy]: unwanted extension '.bin' in 'zeros_64k.bin'"
         );
         assert!(!outcome.staging_dir.join("zeros_64k.bin").exists());
     }

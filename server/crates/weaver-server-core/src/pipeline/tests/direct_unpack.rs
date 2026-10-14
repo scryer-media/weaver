@@ -2997,8 +2997,9 @@ fn spawn_chase_extraction(
                 std::sync::Arc::clone(&coverage),
             )
             .map(|reader| std::io::BufReader::with_capacity(128 * 1024, reader))
-            .map_err(|error| format!("open: {error}"))
+            .map_err(|error| crate::pipeline::ExtractionError::io(&error))
         })
+        .map_err(String::from)
     })
 }
 

@@ -1534,10 +1534,12 @@ impl Pipeline {
         // verification frontier is settled, before rebuilding missing sets.
         self.group_nameless_rar_volumes(job_id).await;
         for set_name in self.rar_set_names_for_job(job_id) {
-            if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
-                if crate::pipeline::archive::topology::is_incoherent_rar_waiting_state_error(&error)
-                {
-                    return Err(error);
+            if let Err(error) = self
+                .recompute_rar_set_state_classified(job_id, &set_name)
+                .await
+            {
+                if matches!(error, RarRefreshError::IncoherentWaitingState(_)) {
+                    return Err(error.to_string());
                 }
 
                 warn!(

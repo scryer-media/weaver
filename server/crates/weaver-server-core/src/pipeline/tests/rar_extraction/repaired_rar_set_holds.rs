@@ -119,7 +119,11 @@ async fn a_stale_alias_set_with_no_live_claimants_retires_instead_of_failing() {
     pipeline.rar_sets.insert((job_id, alias.to_string()), stale);
 
     let extracted = pipeline.extract_rar_set(job_id, alias).await;
-    assert_eq!(extracted, Ok(0), "retirement is not a failure");
+    assert_eq!(
+        extracted.map_err(String::from),
+        Ok(0),
+        "retirement is not a failure"
+    );
     assert!(
         !pipeline.rar_sets.contains_key(&(job_id, alias.to_string())),
         "the alias set no live file claims is retired"
@@ -234,7 +238,10 @@ async fn a_claimed_alias_set_the_job_already_extracted_is_absorbed_not_reschedul
     );
 
     assert_eq!(
-        pipeline.extract_rar_set(job_id, alias).await,
+        pipeline
+            .extract_rar_set(job_id, alias)
+            .await
+            .map_err(String::from),
         Ok(0),
         "a job whose content is already delivered is not failed over a second name for it"
     );
@@ -306,7 +313,13 @@ async fn a_claimed_alias_set_this_job_never_materialized_is_absorbed() {
         pipeline.classify_unmaterialized_archive_set(job_id, alias),
         UnmaterializedArchiveSet::NeverMaterialized,
     );
-    assert_eq!(pipeline.extract_rar_set(job_id, alias).await, Ok(0));
+    assert_eq!(
+        pipeline
+            .extract_rar_set(job_id, alias)
+            .await
+            .map_err(String::from),
+        Ok(0)
+    );
     assert!(
         pipeline
             .extracted_archives
@@ -357,7 +370,13 @@ async fn a_claimed_alias_set_is_absorbed_on_persisted_facts_after_a_restart() {
         UnmaterializedArchiveSet::NeverMaterialized,
         "facts persisted under another set name must carry the absorption across a restart"
     );
-    assert_eq!(pipeline.extract_rar_set(job_id, alias).await, Ok(0));
+    assert_eq!(
+        pipeline
+            .extract_rar_set(job_id, alias)
+            .await
+            .map_err(String::from),
+        Ok(0)
+    );
     assert!(
         pipeline
             .extracted_archives
@@ -530,7 +549,13 @@ async fn a_claimed_set_with_genuinely_missing_volumes_fails_once_instead_of_loop
     );
 
     // The first visit dispatches the extraction whose failure fails the job.
-    assert_eq!(pipeline.extract_rar_set(job_id, alias).await, Ok(0));
+    assert_eq!(
+        pipeline
+            .extract_rar_set(job_id, alias)
+            .await
+            .map_err(String::from),
+        Ok(0)
+    );
     assert!(
         !pipeline
             .extracted_archives

@@ -398,3 +398,4 @@ mod hex_named_volumes;
 mod no_par2_retry_reclassifies;
 mod par2_metadata_immediately_rebinds;
 mod repaired_rar_set_holds;
+mod typed_error_routes;

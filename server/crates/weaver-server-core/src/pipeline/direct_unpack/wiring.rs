@@ -53,13 +53,13 @@ use super::reader::GatedSplitReader;
 use super::settings::{DirectUnpackGate, DirectUnpackSettings};
 use super::start_header::{SIGNATURE_HEADER_LEN, StartHeader};
 use crate::jobs::ids::JobId;
-use crate::pipeline::FullSetExtractionOutcome;
 use crate::pipeline::Pipeline;
 use crate::pipeline::completion::finalize::extract::{
     SevenZipDecodeMemory, SevenZipExtractionContext, extract_7z_stream,
     extract_zip_stream_candidates,
 };
 use crate::pipeline::extraction::ExtractionRoot;
+use crate::pipeline::{ExtractionError, FullSetExtractionOutcome};
 
 // Buffer between the decoder and the gated reader.
 //
@@ -1749,6 +1749,7 @@ impl Pipeline {
             0,
             Arc::clone(&self.metrics),
         )
+        .map_err(String::from)
     }
 
     // The contiguous, verified prefix the download has committed for a part.
@@ -2105,9 +2106,13 @@ impl Pipeline {
                                 std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader)
                             })
                             .map_err(|error| {
-                                format!("failed to open 7z direct-unpack reader: {error}")
+                                ExtractionError::from_io(
+                                    format!("failed to open 7z direct-unpack reader: {error}"),
+                                    &error,
+                                )
                             })
                     })
+                    .map_err(String::from)
                 })();
                 match &outcome {
                     Ok(members) => info!(

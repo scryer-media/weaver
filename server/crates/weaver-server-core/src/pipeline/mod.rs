@@ -67,6 +67,7 @@ use weaver_nntp::NntpClient;
 use self::archive::rar_state::{RarDerivedPlan, RarSetState};
 use self::download::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};
 pub(crate) use self::extraction::safety::ProcessMemoryPermit;
+pub(crate) use self::extraction::{ExtractionError, ExtractionErrorClass, OrTerminal};
 use self::extraction::{
     ExtractionLimits, ExtractionRoot, JobExtractionBudget, ProcessMemoryBudget,
 };
@@ -804,25 +805,38 @@ impl RarRefreshRequest {
 #[derive(Debug, Clone)]
 pub(super) enum RarRefreshError {
     CapacityPressure(String),
+    // The rebuilt plan waits on members with no volume missing, which no
+    // refresh can resolve.
+    IncoherentWaitingState(String),
     Other(String),
 }
 
-impl RarRefreshError {
-    fn from_message(message: String) -> Self {
-        if capacity::is_fd_capacity_error_message(&message) {
-            Self::CapacityPressure(message)
+impl From<String> for RarRefreshError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<ExtractionError> for RarRefreshError {
+    fn from(error: ExtractionError) -> Self {
+        if error.is(ExtractionErrorClass::CapacityPressure) {
+            Self::CapacityPressure(error.into())
         } else {
-            Self::Other(message)
+            Self::Other(error.into())
         }
     }
+}
 
+impl RarRefreshError {
     fn is_capacity_pressure(&self) -> bool {
         matches!(self, Self::CapacityPressure(_))
     }
 
     fn message(&self) -> &str {
         match self {
-            Self::CapacityPressure(message) | Self::Other(message) => message,
+            Self::CapacityPressure(message)
+            | Self::IncoherentWaitingState(message)
+            | Self::Other(message) => message,
         }
     }
 }
@@ -890,7 +904,7 @@ pub(in crate::pipeline) struct RarCapacityRetry {
 
 pub(crate) enum RarPasswordAttemptError {
     Rar(unrar_rs::RarError),
-    Fatal(String),
+    Fatal(ExtractionError),
 }
 
 pub(crate) struct ArchivePasswordSelection<T> {
@@ -911,7 +925,7 @@ impl std::fmt::Display for RarPasswordAttemptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Rar(error) => write!(f, "{error}"),
-            Self::Fatal(error) => f.write_str(error),
+            Self::Fatal(error) => write!(f, "{error}"),
         }
     }
 }
@@ -925,14 +939,14 @@ impl From<unrar_rs::RarError> for RarPasswordAttemptError {
 // Result of a background extraction task.
 pub(super) struct BatchExtractionOutcome {
     pub(super) extracted: Vec<String>,
-    pub(super) failed: Vec<(String, String)>,
+    pub(super) failed: Vec<(String, ExtractionError)>,
     pub(super) selected_password: Option<String>,
     pub(super) phase_completed_bytes: u64,
 }
 
 pub(super) struct FullSetExtractionOutcome {
     pub(super) extracted: Vec<String>,
-    pub(super) failed: Vec<(String, String)>,
+    pub(super) failed: Vec<(String, ExtractionError)>,
     pub(super) selected_password: Option<String>,
 }
 
@@ -1621,13 +1635,13 @@ pub(super) enum ExtractionDone {
         job_id: JobId,
         set_name: String,
         attempted: Vec<String>,
-        result: Result<BatchExtractionOutcome, String>,
+        result: Result<BatchExtractionOutcome, ExtractionError>,
     },
     // Full set extraction completed (all volumes present).
     FullSet {
         job_id: JobId,
         set_name: String,
-        result: Result<FullSetExtractionOutcome, String>,
+        result: Result<FullSetExtractionOutcome, ExtractionError>,
     },
 }
 
