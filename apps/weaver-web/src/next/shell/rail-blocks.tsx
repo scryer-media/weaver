@@ -2,13 +2,19 @@ import { Fragment, memo, type ReactNode } from "react";
 import { Link, NavLink, useLocation } from "react-router";
 import { useQuery } from "urql";
 import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
-import { useTranslate } from "@/lib/context/translate-context";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { RailBlock, RailMetric } from "./NextShell";
 import { Bar, Square } from "../components/chrome";
 import { Icon, type IconName } from "../components/icons";
 import { UNCATEGORISED, type CategoryEntry } from "../data/categories";
-import { useNextData, type ProviderHealth } from "../data/next-data";
+import {
+  useNextData,
+  useNextDataSelector,
+  type NextData,
+  type ProviderHealth,
+} from "../data/next-data";
+import { sameItems } from "../data/settled";
 import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
 import { useNow } from "../data/clock";
 import { formatClock, formatDayClock, formatLatency, splitUptime } from "../data/format";
@@ -173,14 +179,20 @@ export interface AttentionItem {
  */
 export function useAttentionItems(): AttentionItem[] {
   const t = useTranslate();
-  const { providers, holdoffs, downloadBlock, isPaused } = useNextData(
-    "providers",
-    "holdoffs",
-    "downloadBlock",
-    "isPaused",
+  const counting = useNextDataSelector((data) =>
+    data.providers.some((provider) => provider.activityUntilEpochMs != null),
   );
-  const counting = providers.some((provider) => provider.activityUntilEpochMs != null);
   const now = useNow(1000, counting);
+  // The rows are worked out from each new value and handed back unchanged while
+  // they read the same, so the block draws again only when one of them moves.
+  return useNextDataSelector((data) => attentionItems(data, t, now), sameItems);
+}
+
+function attentionItems(
+  { providers, holdoffs, downloadBlock, isPaused }: NextData,
+  t: Translate,
+  now: number,
+): AttentionItem[] {
   const items: AttentionItem[] = [];
 
   for (const holdoff of holdoffs) {

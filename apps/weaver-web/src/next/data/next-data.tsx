@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  use,
   type ReactNode,
 } from "react";
 import { useQuery, useSubscription } from "urql";
@@ -139,13 +140,6 @@ export interface NextData {
   providersLoaded: boolean;
   holdoffs: ProviderHoldoff[];
   connection: { status: GraphqlConnectionStatus; isDisconnected: boolean; isPolling: boolean };
-  /**
-   * New on every render of the provider. The figures above keep their last
-   * value while equal and this does not, so a reader of the whole value still
-   * renders each time the provider does: the queue's time-left estimate
-   * samples on every render it gets and settles with the time between them.
-   */
-  pulse: object;
 }
 
 const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
@@ -165,7 +159,12 @@ const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
 const EMPTY_PROVIDERS: ProviderHealth[] = [];
 const EMPTY_HOLDOFFS: ProviderHoldoff[] = [];
 
-/** Exported so a fixture can hand a screen the data it reads without the live streams. */
+/**
+ * The whole value, new on every render of the provider, so its reader renders
+ * in the provider's own pass each time: the queue's time-left estimate samples
+ * on every render it gets and settles with the time between them. Exported so
+ * a fixture can hand a screen the data it reads without the live streams.
+ */
 export const NextDataContext = createContext<NextData | null>(null);
 
 /**
@@ -214,10 +213,23 @@ const subscribeNowhere = () => () => {};
 export function useNextData(): NextData;
 export function useNextData<K extends keyof NextData>(...keys: K[]): Pick<NextData, K>;
 export function useNextData<K extends keyof NextData>(...keys: K[]): NextData | Pick<NextData, K> {
-  return useNextDataSelector<NextData | Pick<NextData, K>>(
-    (data) => (keys.length === 0 ? data : pick(data, keys)),
-    keys.length === 0 ? Object.is : shallowEqual,
+  const whole = keys.length === 0;
+  const data = whole ? use(NextDataContext) : null;
+  const picked = useNextDataSelector<Pick<NextData, K> | null>(
+    (next) => (whole ? null : pick(next, keys)),
+    samePick,
   );
+  if (!whole) {
+    return picked!;
+  }
+  if (!data) {
+    throw new Error("useNextData must be used inside NextDataProvider");
+  }
+  return data;
+}
+
+function samePick<T extends object>(left: T | null, right: T | null): boolean {
+  return left === right || (left !== null && right !== null && shallowEqual(left, right));
 }
 
 /**
@@ -229,7 +241,9 @@ export function useNextDataSelector<T>(
   isEqual: (left: T, right: T) => boolean = Object.is,
 ): T {
   const store = useContext(NextDataStoreContext);
-  const fixture = useContext(NextDataContext);
+  // Read only without a provider: under one, this context changes on every
+  // render of it, and a slice reader is not to render with it.
+  const fixture = store === null ? use(NextDataContext) : null;
   // The last answer, handed back while a new one is equal to it, so a reader
   // whose slice did not change sees the same value and does not render.
   const last = useRef<{ value: T } | null>(null);
@@ -384,7 +398,6 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
     }),
     [connectionState.status, isPolling],
   );
-  const pulse = useFreshObject();
 
   const value = useMemo<NextData>(
     () => ({
@@ -404,7 +417,6 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       providersLoaded,
       holdoffs,
       connection,
-      pulse,
     }),
     [
       categories,
@@ -416,7 +428,6 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       peakSpeed,
       providers,
       providersLoaded,
-      pulse,
       queue,
       refreshCategories,
       refreshHistoryCount,
@@ -431,21 +442,24 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   useLayoutEffect(() => {
     store.set(value);
   }, [store, value]);
+  const live = useFreshCopy(value);
 
   return (
     <NextDataStoreContext.Provider value={store}>
-      <LiveJobDownloadRatesProvider rates={snapshot?.jobDownloadRates}>
-        {children}
-      </LiveJobDownloadRatesProvider>
+      <NextDataContext value={live}>
+        <LiveJobDownloadRatesProvider rates={snapshot?.jobDownloadRates}>
+          {children}
+        </LiveJobDownloadRatesProvider>
+      </NextDataContext>
     </NextDataStoreContext.Provider>
   );
 }
 
-/** An object made on every render of its caller. */
-function useFreshObject(): object {
+/** A copy of `value` made on every render of its caller. */
+function useFreshCopy<T extends object>(value: T): T {
   // A new one on every call is the point: compiled, it would be made once.
   "use no memo";
-  return {};
+  return { ...value };
 }
 
 /** How long the tab title holds one speed before it takes the next. */
