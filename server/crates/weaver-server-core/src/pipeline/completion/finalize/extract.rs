@@ -53,6 +53,14 @@ fn buffered_extraction_output<W: Write>(writer: W) -> std::io::BufWriter<W> {
     std::io::BufWriter::with_capacity(EXTRACT_WRITE_BUFFER_BYTES, writer)
 }
 
+// The signature header of one candidate part, when its CRC holds.
+//
+// This CRC is not a second check of what the reader verifies on open. It runs
+// before any reader exists, once per candidate file, and decides which file
+// is part one among duplicates and reposts and which UU padding geometry is
+// real. The reader cannot stand in for it: a start header whose CRC fails is
+// not refused on open, the reader goes looking for the end header instead.
+// It reads 20 bytes per candidate.
 fn read_sevenz_start_header(path: &std::path::Path) -> Option<[u8; 32]> {
     use std::io::Read;
     let mut head = [0u8; 32];
@@ -294,13 +302,24 @@ fn resolve_sevenz_parts(
     selected.ok_or(original_error)
 }
 
-// The sink a 7z member is written on through: it counts and checksums what
-// the decoder hands over, and refuses a byte past the declared size before
-// it reaches the file.
+// The sink a 7z member is written on through: it counts what the decoder
+// hands over, and refuses a byte past the declared size before it reaches the
+// file.
+//
+// It computes no CRC of its own. The reader's checksum verification is on
+// (`decode_7z_streaming` sets it), and with it on the reader compares every
+// member that records a CRC against it on every coder path: on the delivering
+// thread through its verifying reader for Copy, AES, filter, LZMA and
+// single-threaded LZMA2 chains; folded from the workers' per-segment
+// checksums for a parallel LZMA2 block; on the folder worker for the
+// parallel folders of a non-solid archive. A mismatch is the reader's
+// `ChecksumMismatch` block error, and a member that matches is reported
+// through the sub-stream completion hook, which `MemberCommits` uses as the
+// commit signal. The value this sink used to compute fed nothing but that one
+// comparison.
 struct VerifiedMemberSink<'a, W> {
     entry: &'a sevenz_turbo::ArchiveEntry,
     writer: &'a mut W,
-    crc: weaver_yenc::crc::Crc32,
     copied: u64,
 }
 
@@ -322,7 +341,6 @@ impl<W: Write> Write for VerifiedMemberSink<'_, W> {
                 ),
             ));
         }
-        self.crc.update(buffer);
         self.writer.write_all(buffer)?;
         self.copied = copied;
         Ok(buffer.len())
@@ -333,8 +351,9 @@ impl<W: Write> Write for VerifiedMemberSink<'_, W> {
     }
 }
 
-// A decoder can reach EOF before its checksum reader reaches the declared
-// length. Verify both facts before committing the member or its counters.
+// A decoder can reach EOF before the declared length. Check that before the
+// member is handed to `MemberCommits`, which commits it once the reader has
+// also matched its CRC.
 //
 // The entry writes itself on from the decoder's own output, so the bytes are
 // handed over in the pieces the decoder made them in rather than read into a
@@ -347,16 +366,10 @@ fn copy_verified_7z_member(
     let mut sink = VerifiedMemberSink {
         entry,
         writer,
-        crc: weaver_yenc::crc::Crc32::new(),
         copied: 0,
     };
     reader.write_rest(&mut sink)?;
-    let VerifiedMemberSink {
-        crc,
-        copied,
-        writer,
-        ..
-    } = sink;
+    let VerifiedMemberSink { copied, writer, .. } = sink;
     if copied != entry.size() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -367,15 +380,150 @@ fn copy_verified_7z_member(
             ),
         ));
     }
-    if entry.has_crc && u64::from(crc.finalize()) != entry.crc {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("7z member {} CRC mismatch", entry.name()),
-        ));
-    }
     writer.flush()?;
     Ok(copied)
 }
+
+// A member whose bytes are all on disk, waiting for the reader's verdict on
+// its CRC before it counts as extracted.
+struct WrittenMember {
+    file_index: usize,
+    name: String,
+    size: u64,
+    bytes_written: u64,
+    attempt: Arc<PhaseAttemptCounters>,
+    committed: bool,
+}
+
+// The members of one decode pass, committed in the order they were written
+// once the reader has vouched for each.
+//
+// A member that records a CRC is committed when the reader's sub-stream
+// completion hook names it: the hook fires only after the reader matched the
+// CRC, and a mismatch is an error instead. On a sequential chain that is
+// right after the member's callback returns; on a parallel LZMA2 block it can
+// be later, after the next member has started or at the end of the block's
+// stream, because the workers' checksums are folded as they arrive. A member
+// with no CRC has nothing to wait for and is committed when written.
+//
+// A member still waiting when the pass fails has its counters rolled back,
+// and no completion event is sent for it.
+struct MemberCommits<'a> {
+    job_id: JobId,
+    set_name: &'a str,
+    event_tx: &'a broadcast::Sender<PipelineEvent>,
+    verified: Arc<std::sync::Mutex<Vec<usize>>>,
+    members: Vec<WrittenMember>,
+}
+
+impl<'a> MemberCommits<'a> {
+    fn new(
+        job_id: JobId,
+        set_name: &'a str,
+        event_tx: &'a broadcast::Sender<PipelineEvent>,
+    ) -> Self {
+        Self {
+            job_id,
+            set_name,
+            event_tx,
+            verified: Arc::new(std::sync::Mutex::new(Vec::new())),
+            members: Vec::new(),
+        }
+    }
+
+    // The hook the reader reports verified members through.
+    fn hook(&self) -> SubStreamHook {
+        let verified = Arc::clone(&self.verified);
+        Box::new(move |completion: sevenz_turbo::SubStreamCompletion| {
+            verified
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(completion.file_index);
+        })
+    }
+
+    // Record a member whose bytes are all written, committing it now when
+    // the archive records no CRC for it.
+    fn written(&mut self, member: WrittenMember, has_crc: bool) {
+        self.members.push(member);
+        if !has_crc {
+            let last = self.members.len() - 1;
+            self.commit(last);
+        }
+    }
+
+    // Commit every member the reader has vouched for since the last call.
+    fn settle(&mut self) {
+        let verified = std::mem::take(
+            &mut *self
+                .verified
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for file_index in verified {
+            if let Some(index) = self
+                .members
+                .iter()
+                .position(|member| member.file_index == file_index && !member.committed)
+            {
+                self.commit(index);
+            }
+        }
+    }
+
+    fn commit(&mut self, index: usize) {
+        let member = &mut self.members[index];
+        member.attempt.commit();
+        member.committed = true;
+        tracing::info!(
+            job_id = self.job_id.0,
+            member = member.name.as_str(),
+            bytes_written = member.bytes_written,
+            total_bytes = member.size,
+            "member extracted"
+        );
+        let _ = self.event_tx.send(PipelineEvent::ExtractionProgress {
+            job_id: self.job_id,
+            member: member.name.clone(),
+            bytes_written: member.bytes_written,
+            total_bytes: member.size,
+        });
+        let _ = self.event_tx.send(PipelineEvent::ExtractionMemberFinished {
+            job_id: self.job_id,
+            set_name: self.set_name.to_string(),
+            member: member.name.clone(),
+        });
+    }
+
+    // The members extracted, in the order they were written, once the walk
+    // has ended. A member that records a CRC and was never reported verified
+    // fails the set: with verification on the reader either reports it or
+    // fails, so this is a decode that ended without a verdict.
+    fn finish(mut self) -> Result<Vec<String>, String> {
+        self.settle();
+        if let Some(member) = self.members.iter().find(|member| !member.committed) {
+            return Err(format!(
+                "7z extraction failed: member {} ended without a CRC verdict from the reader",
+                member.name
+            ));
+        }
+        Ok(std::mem::take(&mut self.members)
+            .into_iter()
+            .map(|member| member.name)
+            .collect())
+    }
+}
+
+impl Drop for MemberCommits<'_> {
+    fn drop(&mut self) {
+        for member in self.members.iter().filter(|member| !member.committed) {
+            member.attempt.rollback();
+        }
+    }
+}
+
+// What the reader's sub-stream completion hook is installed as.
+type SubStreamHook = Box<dyn FnMut(sevenz_turbo::SubStreamCompletion) + Send>;
 
 struct CountingWriter<W> {
     inner: W,
@@ -1108,9 +1256,14 @@ fn note_adaptive_backlog(_job_id: JobId, _pending_runs: usize) {}
 // The decode pass: the library helper's entry walk, opened under the job's
 // limits and threaded as `threads` says.
 //
-// `extract_fn` receives the output directory where the helper would pass a
-// per-entry destination; the shared extraction body validates every entry
-// path through the extraction root and never reads that argument.
+// `extract_fn` receives each entry with its index in the archive's file
+// table, the coordinate the reader's sub-stream completion hook names a
+// verified member by. The shared extraction body validates every entry path
+// through the extraction root.
+//
+// Checksum verification is set on explicitly: the extraction body computes
+// no member CRC of its own and relies on the reader's, reported through
+// `sub_stream_hook`.
 //
 // An adaptive decode is governed from a thread of its own, because the
 // decoding thread is inside the entry walk — parked on the gated reader, or
@@ -1129,13 +1282,18 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek + Send + 'static>(
     password: sevenz_turbo::Password,
     limits: sevenz_turbo::ArchiveLimits,
     threads: SevenZipDecodeThreads,
+    sub_stream_hook: Option<SubStreamHook>,
     mut extract_fn: impl FnMut(
         &sevenz_turbo::ArchiveEntry,
+        usize,
         &mut dyn sevenz_turbo::EntryRead,
-        &PathBuf,
     ) -> Result<bool, sevenz_turbo::Error>,
 ) -> Result<SevenZipDecodeReport, sevenz_turbo::Error> {
     let mut archive_reader = sevenz_turbo::ArchiveReader::with_limits(reader, password, limits)?;
+    archive_reader.set_verify_checksums(true);
+    if let Some(hook) = sub_stream_hook {
+        archive_reader.set_sub_stream_complete_hook(hook);
+    }
     // A second handle on the same bytes lets the folders of a non-solid
     // archive decode on parallel workers, each reading at its own offset.
     // The reads take turns on the one handle; the decoding does not.
@@ -1145,11 +1303,25 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek + Send + 'static>(
     if !output_dir.exists() {
         std::fs::create_dir_all(output_dir)?;
     }
-    let destination = output_dir.to_path_buf();
+    // Every entry the walk hands over is an element of the reader's own file
+    // table, on every path: sequential, parallel folders and the empty files
+    // walked last. Its index is its offset in that table.
+    let files = archive_reader.archive().files.as_ptr() as usize;
+    let file_count = archive_reader.archive().files.len();
+    let entry_bytes = std::mem::size_of::<sevenz_turbo::ArchiveEntry>().max(1);
     let mut walk =
         |archive_reader: &mut sevenz_turbo::ArchiveReader<R>| -> Result<(), sevenz_turbo::Error> {
-            archive_reader
-                .for_each_entries_direct(|entry, reader| extract_fn(entry, reader, &destination))
+            archive_reader.for_each_entries_direct(|entry, reader| {
+                let offset =
+                    (entry as *const sevenz_turbo::ArchiveEntry as usize).wrapping_sub(files);
+                let file_index = offset / entry_bytes;
+                if offset % entry_bytes != 0 || file_index >= file_count {
+                    return Err(sevenz_turbo::Error::Other(
+                        "7z entry is not in the reader's file table".into(),
+                    ));
+                }
+                extract_fn(entry, file_index, reader)
+            })
         };
 
     let (ceiling, widening, budget) = match threads {
@@ -1449,8 +1621,8 @@ where
     };
     let decode_granted = decode_permit.bytes();
 
-    let mut extracted_members = Vec::new();
-    let extracted_members_ref = &mut extracted_members;
+    let mut commits = MemberCommits::new(job_id, set_name, event_tx);
+    let sub_stream_hook = commits.hook();
     // Directory times are stamped after the decode, once nothing more will
     // be created inside them.
     let mut directory_times: Vec<(PathBuf, SevenZipEntryTimes)> = Vec::new();
@@ -1460,9 +1632,12 @@ where
     let budget_ref = budget;
 
     let extract_fn = |entry: &sevenz_turbo::ArchiveEntry,
-                      reader: &mut dyn sevenz_turbo::EntryRead,
-                      _dest: &PathBuf|
+                      file_index: usize,
+                      reader: &mut dyn sevenz_turbo::EntryRead|
      -> Result<bool, sevenz_turbo::Error> {
+        // Members the reader vouched for since the last entry are committed
+        // before anything is said about this one.
+        commits.settle();
         let safe_path = root_ref
             .validate_relative_path(entry.name())
             .map_err(|error| std::io::Error::other(budget_ref.reject_unsafe_path(error)))?;
@@ -1505,12 +1680,13 @@ where
         let attempt = Arc::new(PhaseAttemptCounters::new(Arc::clone(phase_counters)));
         let mut file = buffered_extraction_output(CountingWriter::new(file, Arc::clone(&attempt)));
         let copied = copy_verified_7z_member(entry, reader, &mut file);
+        // Committed by `commits` once the reader has matched the CRC.
         let bytes_written = match copied {
-            Ok(bytes) => {
-                attempt.commit();
-                bytes
-            }
+            Ok(bytes) => bytes,
             Err(error) => {
+                // What the buffer still holds is dropped unwritten: a buffer
+                // flushed on drop would count its bytes after the rollback.
+                let _ = file.into_parts();
                 attempt.rollback();
                 return Err(error.into());
             }
@@ -1528,26 +1704,17 @@ where
             );
         }
 
-        tracing::info!(
-            job_id = job_id.0,
-            member = entry.name(),
-            bytes_written,
-            total_bytes = entry.size(),
-            "member extracted"
+        commits.written(
+            WrittenMember {
+                file_index,
+                name: entry.name().to_string(),
+                size: entry.size(),
+                bytes_written,
+                attempt,
+                committed: false,
+            },
+            entry.has_crc,
         );
-        let _ = event_tx_ref.send(PipelineEvent::ExtractionProgress {
-            job_id,
-            member: entry.name().to_string(),
-            bytes_written,
-            total_bytes: entry.size(),
-        });
-        let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberFinished {
-            job_id,
-            set_name: set_name.clone(),
-            member: entry.name().to_string(),
-        });
-
-        extracted_members_ref.push(entry.name().to_string());
         Ok(true)
     };
 
@@ -1595,9 +1762,11 @@ where
         password.clone(),
         limits,
         threads,
+        Some(sub_stream_hook),
         extract_fn,
     )
     .map_err(|e| sevenz_extraction_error(&e))?;
+    let extracted_members = commits.finish()?;
 
     // Deepest directories first: a directory's own stamp is the last thing
     // to touch it, and nothing below it is touched afterwards.
