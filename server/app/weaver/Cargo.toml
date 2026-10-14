@@ -29,7 +29,7 @@ weaver-server-api = { path = "../../crates/weaver-server-api", default-features 
 # The tray resolves the running `.app` bundle with the shared classifier, and
 # the Windows upgrade helper runs from a copy of this binary. Pinned to the same
 # signed commit the server core uses, so one version lands in the lock file.
-application-updater = { git = "https://github.com/scryer-media/application-updater", rev = "88af81b8c24c987e93d36d45979034cb50db3d01" }
+application-updater = { git = "https://github.com/scryer-media/application-updater", rev = "4fc9a4bce9e683c812249cb056990f01a823d353" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -94,6 +94,13 @@ windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
+  # `GetExtendedTcpTable`, which finds the process listening on the tray's
+  # port when the tray did not start it.
+  "Win32_NetworkManagement_IpHelper",
+  # The kill-on-close job the tray starts the server in.
+  "Win32_System_JobObjects",
+  # `RegisterApplicationRestart`.
+  "Win32_System_Recovery",
   # `CreateMutexW`, `RegCreateKeyExW` and `CreateFileW` take
   # `SECURITY_ATTRIBUTES`, whose type this feature defines. Another crate in
   # the graph currently enables it too, but this crate must not compile only by

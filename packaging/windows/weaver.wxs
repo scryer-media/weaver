@@ -71,7 +71,19 @@
          msiexec window, so the in-app and MSI upgrades look frozen, and a silent upgrade
          leaves the old binaries running. The old product's own StopTrayBeforeRemoval runs too
          late to help, so locate the installed tray and ask it to shut down before validation.
-         The tray's shutdown command returns success when no tray is running. -->
+         The tray's shutdown command returns success when no tray is running.
+
+         That command is the installed product's code, not this package's, and in releases
+         that predate its stop-by-name sweep it stops only the tray of the session the
+         installer runs in and the server that tray started: an orphaned server, or a tray in
+         another session, survives it.
+         So a second step, which runs no Weaver code, force-stops every weaver.exe and
+         weaver-tray.exe that is still running once the graceful request has had its chance.
+         It names images only, without /T: the upgrade helper that may have started this
+         install is a child of weaver.exe, runs as weaver-upgrade-helper.exe, and must outlive
+         the server. Both steps run before InstallValidate, which precedes InstallInitialize,
+         so they are immediate actions and run at every UI level, /passive and /qn included.
+         taskkill exits nonzero when nothing matched, so its result is ignored. -->
     <Property Id="INSTALLEDTRAYEXE">
       <DirectorySearch Id="InstalledWeaverFolder" Path="[ProgramFiles64Folder]Scryer Media\Weaver">
         <FileSearch Id="InstalledWeaverTrayExe" Name="weaver-tray.exe" />
@@ -88,6 +100,24 @@
       <Custom Action="StopInstalledTrayBeforeValidate"
               Before="InstallValidate"
               Condition="WIX_UPGRADE_DETECTED AND INSTALLEDTRAYEXE" />
+    </InstallExecuteSequence>
+    <SetProperty
+        Id="STOPLEFTOVERWEAVEREXE"
+        Value="[SystemFolder]taskkill.exe"
+        Before="StopLeftoverWeaverProcessesBeforeValidate"
+        Sequence="execute"
+        Condition="WIX_UPGRADE_DETECTED" />
+    <CustomAction
+        Id="StopLeftoverWeaverProcessesBeforeValidate"
+        Property="STOPLEFTOVERWEAVEREXE"
+        ExeCommand="/F /IM weaver.exe /IM weaver-tray.exe"
+        Execute="immediate"
+        Return="ignore"
+        Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="StopLeftoverWeaverProcessesBeforeValidate"
+              After="StopInstalledTrayBeforeValidate"
+              Condition="WIX_UPGRADE_DETECTED" />
     </InstallExecuteSequence>
 
     <!-- These commands affect only the uninstalling user: their HKCU Run entry, the

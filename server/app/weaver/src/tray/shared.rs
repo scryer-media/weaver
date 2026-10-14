@@ -27,17 +27,23 @@ pub(crate) const DEFAULT_PORT: u16 = 9090;
 // wrapper reports the failure to the user.
 pub(crate) const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-// How long a Unix stop waits after `SIGTERM` before escalating to `SIGKILL`.
-// The server's own graceful teardown is what needs the time here; a process
-// that ignores the signal must not be able to strand the wrapper.
+// How long a stop waits after asking the server to exit — `SIGTERM` on Unix,
+// a console Ctrl+C on Windows — before it kills the process. The server's own
+// graceful teardown is what needs the time here; a process that ignores the
+// request must not be able to strand the wrapper.
 #[cfg(unix)]
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+// Shorter on Windows, where the stop also runs inside the installer's
+// shutdown command and while the session ends, and both of those are bounded
+// by someone else.
+#[cfg(windows)]
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 // The names the wrapper and the server are installed under. Both binaries
 // ship in the same directory, which is what lets the wrapper find the server
 // without a configured path.
 #[cfg(windows)]
-const SERVER_EXECUTABLE: &str = "weaver.exe";
+pub(crate) const SERVER_EXECUTABLE: &str = "weaver.exe";
 
 // Size past which the captured stderr log is rotated on the next server
 // start. What lands there is sparse — a setup code, a runtime's last words —
@@ -45,7 +51,7 @@ const SERVER_EXECUTABLE: &str = "weaver.exe";
 const STDERR_LOG_ROTATE_BYTES: u64 = 1 << 20;
 
 #[cfg(windows)]
-const WRAPPER_EXECUTABLE: &str = "weaver-tray.exe";
+pub(crate) const WRAPPER_EXECUTABLE: &str = "weaver-tray.exe";
 #[cfg(not(windows))]
 const SERVER_EXECUTABLE: &str = "weaver";
 #[cfg(not(windows))]
@@ -733,6 +739,11 @@ pub(crate) struct ServerSupervisor {
     // reports it, so a start or readiness wait that happens to reap the exit
     // first cannot turn the relaunch into an ordinary server restart.
     relaunch_pending: bool,
+    // The kill-on-close job every server this wrapper starts runs in, created
+    // with the first one and held until the wrapper exits. Closing it — by
+    // exiting, crashing or being ended — takes the server with it.
+    #[cfg(windows)]
+    job: Option<crate::windows_process::KillOnCloseJob>,
 }
 
 // Reads the server's stderr to its end. Setup codes are kept for the UI;
@@ -786,6 +797,8 @@ impl ServerSupervisor {
             setup_code: Arc::new(Mutex::new(None)),
             log_offset: 0,
             relaunch_pending: false,
+            #[cfg(windows)]
+            job: None,
         }
     }
 
@@ -913,6 +926,8 @@ impl ServerSupervisor {
                 server_executable.display()
             )
         })?;
+        #[cfg(windows)]
+        let contained = self.contain_in_job(&child);
         if let Some(stderr) = child.stderr.take() {
             let setup_code = self.setup_code.clone();
             let mut capture = self.open_stderr_log();
@@ -923,11 +938,31 @@ impl ServerSupervisor {
                     wrapper_timestamp(),
                     child.id()
                 );
+                // The server still runs without the job; it only loses the
+                // guarantee that it stops with the wrapper, so this is a note
+                // in the capture rather than a failed start.
+                #[cfg(windows)]
+                if let Err(error) = &contained {
+                    let _ = writeln!(capture, "{} [wrapper] {error}", wrapper_timestamp());
+                }
             }
             thread::spawn(move || forward_server_stderr(stderr, setup_code, capture));
         }
         self.server = Some(child);
         Ok(())
+    }
+
+    // Put a just-spawned server in the wrapper's kill-on-close job, creating
+    // the job with the first server.
+    #[cfg(windows)]
+    fn contain_in_job(&mut self, child: &Child) -> Result<(), String> {
+        if self.job.is_none() {
+            self.job = Some(crate::windows_process::KillOnCloseJob::create()?);
+        }
+        match self.job.as_ref() {
+            Some(job) => job.assign(child),
+            None => Ok(()),
+        }
     }
 
     // Stop the server this wrapper started. A server it did not start is left
@@ -942,7 +977,7 @@ impl ServerSupervisor {
             .map_err(|error| format!("failed to check Weaver server status: {error}"))?
             .is_none()
         {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             if request_graceful_stop(&mut child)? {
                 return Ok(());
             }
@@ -1216,11 +1251,11 @@ fn configure_server_command(_command: &mut Command) {}
 // The server writes a database on every job; killing it outright is safe but
 // throws away the flush it would otherwise do, so the signal comes first and
 // the caller only escalates when this returns false.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn request_graceful_stop(child: &mut Child) -> Result<bool, String> {
-    // SAFETY: `child` is a live process this wrapper started, so its PID is
-    // still ours to signal and cannot have been recycled.
-    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    if !send_stop_request(child) {
+        return Ok(false);
+    }
 
     let deadline = Instant::now() + GRACEFUL_STOP_TIMEOUT;
     while Instant::now() < deadline {
@@ -1232,6 +1267,29 @@ fn request_graceful_stop(child: &mut Child) -> Result<bool, String> {
         thread::sleep(Duration::from_millis(100));
     }
     Ok(false)
+}
+
+// Ask the server to exit, and report whether the request was delivered.
+#[cfg(unix)]
+fn send_stop_request(child: &Child) -> bool {
+    // SAFETY: `child` is a live process this wrapper started, so its PID is
+    // still ours to signal and cannot have been recycled.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    true
+}
+
+// The server has a console of its own, windowless, and answers Ctrl+C on it
+// with its graceful teardown.
+#[cfg(windows)]
+fn send_stop_request(child: &Child) -> bool {
+    application_updater::windows_process::request_console_interrupt(child.id())
+}
+
+// The port in a `GetExtendedTcpTable` row. The table stores it in network
+// byte order in the low 16 bits of a `u32`, which Windows, always
+// little-endian, reads back byte-swapped.
+pub(crate) fn tcp_table_port(raw: u32) -> u16 {
+    ((raw & 0xFFFF) as u16).swap_bytes()
 }
 
 // A single-page HTTP server used only by `--webview-smoke`.
@@ -1296,9 +1354,20 @@ mod tests {
         http_origin, is_weaver_document, last_logged_error, logged_error_message,
         note_version_change, opens_in_external_browser, parse_http_response, parse_setup_code_line,
         popover_content_from_graphql, remove_desktop_profile, row_detail, set_cookie_value,
+        tcp_table_port,
     };
     #[cfg(unix)]
     use super::{RELAUNCH_PENDING_MESSAGE, ServerSupervisor, SupervisedServer};
+
+    #[test]
+    fn a_tcp_table_port_is_read_out_of_network_byte_order() {
+        // 9090 is 0x2382; the table holds the bytes 0x23 0x82, which a
+        // little-endian `u32` read gives back as 0x8223.
+        assert_eq!(tcp_table_port(0x0000_8223), 9090);
+        // Only the low 16 bits carry the port.
+        assert_eq!(tcp_table_port(0xFFFF_8223), 9090);
+        assert_eq!(tcp_table_port(0x0000_5000), 80);
+    }
 
     #[test]
     fn the_spawn_command_marks_the_server_as_tray_supervised() {

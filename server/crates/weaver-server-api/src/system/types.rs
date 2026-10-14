@@ -951,6 +951,9 @@ pub struct ApplicationUpgradeRunPayload {
     pub error: Option<String>,
     pub started_at_epoch_ms: i64,
     pub completed_at_epoch_ms: Option<i64>,
+    /// Where the Windows installer wrote its verbose log for this run, once it
+    /// has written one.
+    pub installer_log_path: Option<String>,
 }
 
 impl From<weaver_server_core::application_upgrade::ApplicationUpgradeRun>
@@ -969,6 +972,7 @@ impl From<weaver_server_core::application_upgrade::ApplicationUpgradeRun>
             error: value.error,
             started_at_epoch_ms: value.started_at_epoch_ms,
             completed_at_epoch_ms: value.completed_at_epoch_ms,
+            installer_log_path: value.installer_log_path,
         }
     }
 }

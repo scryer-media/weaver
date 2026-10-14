@@ -32,6 +32,11 @@ mod shared;
 #[path = "tray/windows.rs"]
 mod windows;
 
+// The server's kill-on-close job and the lookup of the tray port's owner.
+#[cfg(windows)]
+#[path = "tray/windows_process.rs"]
+mod windows_process;
+
 #[cfg(target_os = "macos")]
 #[path = "tray/macos.rs"]
 mod macos;

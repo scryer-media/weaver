@@ -46,6 +46,9 @@ pub const WEAVER_PRODUCT: ProductDescriptor = ProductDescriptor {
     windows_server_executable: "weaver.exe",
     windows_tray_executable: "weaver-tray.exe",
     windows_helper_executable: "weaver-upgrade-helper.exe",
+    // The server and the tray that supervises it: an orphaned server, or a
+    // tray in another session, holds the installed files just the same.
+    windows_product_process_names: &["weaver.exe", "weaver-tray.exe"],
     staged_replacement_prefix: ".weaver-upgrade-new-",
     disable_self_upgrade_env: "WEAVER_DISABLE_SELF_UPGRADE",
     package_env: "WEAVER_PACKAGE",
@@ -101,6 +104,10 @@ mod tests {
         assert_eq!(
             WEAVER_PRODUCT.windows_helper_executable,
             "weaver-upgrade-helper.exe"
+        );
+        assert_eq!(
+            WEAVER_PRODUCT.windows_product_process_names,
+            ["weaver.exe", "weaver-tray.exe"]
         );
         assert_eq!(
             WEAVER_PRODUCT.staged_replacement_prefix,
