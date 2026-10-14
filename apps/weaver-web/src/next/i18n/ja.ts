@@ -1836,7 +1836,6 @@ export const nextJa: LocaleDictionary = {
   "next.networking.speed.title": "速度テスト",
   "next.networking.speed.routeBlock": "ルート",
   "next.networking.speed.route": "ルート",
-  "next.networking.speed.testBlock": "テスト",
   "next.networking.speed.test": "テスト",
   "next.networking.speed.bandwidth": "帯域",
   "next.networking.speed.usenet": "Usenet",

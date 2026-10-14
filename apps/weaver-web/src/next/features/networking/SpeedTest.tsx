@@ -23,7 +23,7 @@ import { refusalMessage } from "@/lib/refusal";
 import { cn } from "@/lib/utils";
 import { Eyebrow, MetricCell, MetricStrip } from "../../components/chrome";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
-import { NumberField, PrimaryButton, SecondaryButton, Segmented, Select, TextField } from "../../components/controls";
+import { DangerButton, NumberField, PrimaryButton, SecondaryButton, Segmented, Select, TextField } from "../../components/controls";
 import { EM_DASH, splitBytes, splitSpeed } from "../../data/format";
 import { useNextData } from "../../data/next-data";
 import type { Consumer } from "./data";
@@ -561,9 +561,9 @@ export function RunProgress({ run, onCancel }: { run: SpeedTestRun; onCancel: ()
           <Eyebrow tone="rail">{t("next.networking.speed.gate")}</Eyebrow>
           <span className="truncate text-[13px] text-wv-fg">{phaseLabel(t, run.phase)}</span>
         </span>
-        <SecondaryButton icon="close" onClick={onCancel}>
+        <DangerButton icon="close" onClick={onCancel}>
           {t("next.networking.speed.cancel")}
-        </SecondaryButton>
+        </DangerButton>
       </div>
       <div className={cn("grid min-w-0", usenet && "lg:grid-cols-2")}>
         <LiveFigure label={t("next.networking.speed.speed")} points={rateSeries(run)} />

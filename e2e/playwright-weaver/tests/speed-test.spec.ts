@@ -142,19 +142,21 @@ class SpeedPage {
 
   constructor(readonly page: Page) {
     this.route = page.getByRole("region", { name: "Route", exact: true });
-    this.test = page.getByRole("region", { name: "Test", exact: true });
+    this.test = page.getByRole("region", { name: "Speed test", exact: true });
     this.runs = page.getByRole("region", { name: "Runs", exact: true });
   }
 
   async open(server: number, host = PROXIED_HOST): Promise<void> {
     await this.page.goto(weaverRoute(`/settings/networking/speed?consumer=server:${server}`));
-    await expect(this.route.getByRole("button", { name: "Route", exact: true })).toContainText(host);
-    await expect(this.test.getByRole("radio", { name: "Usenet", exact: true })).toHaveAttribute("aria-checked", "true");
+    await expect(this.test.getByRole("button", { name: "Route", exact: true })).toContainText(host);
+    await expect(this.test.getByRole("radio", { name: "Bandwidth", exact: true })).toHaveAttribute("aria-checked", "true");
   }
 
   // A Usenet run of the NZB at `url`, allowed `maxDuration` seconds: by
   // default long enough to drain it.
   async useNzbUrl(url: string, maxDuration = 900): Promise<void> {
+    await this.test.getByRole("radio", { name: "Usenet", exact: true }).click();
+    await expect(this.test.getByRole("radio", { name: "Usenet", exact: true })).toHaveAttribute("aria-checked", "true");
     await this.test.getByRole("button", { name: "NZB", exact: true }).click();
     await this.page.getByRole("menu", { name: "NZB", exact: true }).getByRole("menuitemradio", { name: "URL", exact: true }).click();
     await this.test.getByRole("textbox", { name: "NZB URL", exact: true }).fill(url);

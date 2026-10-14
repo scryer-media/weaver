@@ -1836,7 +1836,6 @@ export const nextEs: LocaleDictionary = {
   "next.networking.speed.title": "Prueba de velocidad",
   "next.networking.speed.routeBlock": "Ruta",
   "next.networking.speed.route": "Ruta",
-  "next.networking.speed.testBlock": "Prueba",
   "next.networking.speed.test": "Prueba",
   "next.networking.speed.bandwidth": "Ancho de banda",
   "next.networking.speed.usenet": "Usenet",

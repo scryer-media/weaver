@@ -253,6 +253,46 @@ test("a feed is tested for bandwidth only, and a custom URL must be HTTPS before
   }
 });
 
+test("picking another route keeps the test as it was set, and a feed takes it as a bandwidth test", async () => {
+  const { page, errors } = await open("", "news.fixture.invalid");
+  try {
+    const route = async (name) => {
+      await page.getByRole("button", { name: "Route", exact: true }).click();
+      await page.getByRole("menuitemradio", { name, exact: true }).click();
+    };
+    const connections = page.getByRole("spinbutton", { name: "Connections", exact: true });
+    const duration = page.getByRole("spinbutton", { name: "Max duration", exact: true });
+    // The route is picked in the Speed test block, above the test it runs.
+    await page.getByRole("region", { name: "Speed test", exact: true }).getByRole("button", { name: "Route", exact: true }).waitFor();
+    assert.equal(await page.getByRole("region", { name: "Route", exact: true }).getByRole("button", { name: "Route", exact: true }).count(), 0);
+    await page.getByRole("button", { name: "Provider", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: "Custom URL", exact: true }).click();
+    await page.getByLabel("URL", { exact: true }).fill("https://files.fixture.invalid/blob");
+    await page.getByRole("radio", { name: "Usenet", exact: true }).click();
+    await page.getByRole("button", { name: "NZB", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: "1 GB", exact: true }).click();
+    await connections.fill("7");
+    await connections.press("Tab");
+    await duration.fill("300");
+    await duration.press("Tab");
+
+    // A feed has no Usenet test: the test turns to bandwidth, as it was set.
+    await route("Feed mirror");
+    await page.getByRole("radio", { name: "Bandwidth", checked: true, exact: true }).waitFor();
+    assert.equal(await page.getByLabel("URL", { exact: true }).inputValue(), "https://files.fixture.invalid/blob");
+
+    // Back on the server, the Usenet test is as it was left.
+    await route("news.fixture.invalid");
+    await page.getByRole("radio", { name: "Usenet", exact: true }).click();
+    assert.match(await page.getByRole("button", { name: "NZB", exact: true }).innerText(), /1 GB/);
+    assert.equal(await connections.inputValue(), "7");
+    assert.equal(await duration.inputValue(), "300");
+    assert.equal(errors.length, 0, errors.join("\n"));
+  } finally {
+    await page.close();
+  }
+});
+
 test("the route editor tests the draft as it stands, unsaved", async () => {
   const { page, errors } = await open("?routes", "news.fixture.invalid");
   try {

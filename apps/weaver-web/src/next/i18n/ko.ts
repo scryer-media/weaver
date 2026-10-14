@@ -1836,7 +1836,6 @@ export const nextKo: LocaleDictionary = {
   "next.networking.speed.title": "속도 테스트",
   "next.networking.speed.routeBlock": "경로",
   "next.networking.speed.route": "경로",
-  "next.networking.speed.testBlock": "테스트",
   "next.networking.speed.test": "테스트",
   "next.networking.speed.bandwidth": "대역폭",
   "next.networking.speed.usenet": "Usenet",

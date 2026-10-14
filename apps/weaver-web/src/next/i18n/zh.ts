@@ -1836,7 +1836,6 @@ export const nextZh: LocaleDictionary = {
   "next.networking.speed.title": "测速",
   "next.networking.speed.routeBlock": "路由",
   "next.networking.speed.route": "路由",
-  "next.networking.speed.testBlock": "测试",
   "next.networking.speed.test": "测试",
   "next.networking.speed.bandwidth": "带宽",
   "next.networking.speed.usenet": "Usenet",

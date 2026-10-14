@@ -428,7 +428,13 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
     setSelected(key);
     setOverrides(noOverrides());
     if (next) {
-      setForm(defaultForm(next));
+      // The test carries over; only what the new route cannot take gives way: a
+      // feed has no Usenet test, and a server takes no more connections than its cap.
+      setForm((current) =>
+        next.kind === "RSS"
+          ? { ...current, kind: "BANDWIDTH" }
+          : { ...current, connections: Math.min(current.connections, Math.max(1, next.cap)) },
+      );
     }
   };
   const route = consumer.route ?? defaultRoute();
@@ -487,7 +493,7 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
       kind: "custom",
       id: "speed-route",
       title: t("next.networking.speed.routeBlock"),
-      searchText: consumers.map((candidate) => candidate.name).join(" "),
+      searchText: consumer.name,
       body: (
         <div className="flex min-w-0 flex-col">
           {measuring ? (
@@ -516,7 +522,22 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
               onToggle={(target) => setOverrides((current) => toggleDown(current, target))}
             />
           )}
-          <div className="flex flex-wrap items-end gap-3 border-t border-wv-hairline px-4 py-4 sm:px-6">
+        </div>
+      ),
+    },
+    {
+      kind: "custom",
+      id: "speed-test",
+      title: t("next.networking.speed.title"),
+      searchText: [
+        ...consumers.map((candidate) => candidate.name),
+        t("next.networking.speed.bandwidth"),
+        t("next.networking.speed.usenet"),
+        ...providers.map((provider) => provider.name),
+      ].join(" "),
+      body: (
+        <>
+          <div className="flex px-4 pt-4 sm:px-6">
             <ControlLabel label={t("next.networking.speed.route")}>
               <Select
                 label={t("next.networking.speed.route")}
@@ -527,16 +548,6 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
               />
             </ControlLabel>
           </div>
-        </div>
-      ),
-    },
-    {
-      kind: "custom",
-      id: "speed-test",
-      title: t("next.networking.speed.testBlock"),
-      searchText: [t("next.networking.speed.bandwidth"), t("next.networking.speed.usenet"), ...providers.map((provider) => provider.name)].join(" "),
-      body: (
-        <>
           <TestControls form={form} onChange={setForm} consumer={consumer} providers={providers} />
           <SpeedTestRunner consumer={consumer} route={null} overrides={overrides} form={form} providers={providers} speedTest={speedTest} />
         </>
