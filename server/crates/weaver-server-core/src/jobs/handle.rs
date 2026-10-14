@@ -745,7 +745,7 @@ pub struct RestoreJobRequest {
     pub working_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AddJobOptions {
     pub initially_paused: bool,
     // SCORE admission generation that must still be authoritative when the
@@ -755,6 +755,10 @@ pub struct AddJobOptions {
     // Unlike admission generations, this must also still hold an unexpired
     // durable promotion lease when the active job row is inserted.
     pub semantic_promotion_generation: Option<i64>,
+    // Archive passwords supplied beside the job's own (`Integration`, then
+    // `DnzbHeader`), persisted with it so a restart still offers them: they are
+    // not in the NZB bytes.
+    pub supplied_password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
 }
 
 // Internal provenance for cancellation. Semantic cancellation is intentionally

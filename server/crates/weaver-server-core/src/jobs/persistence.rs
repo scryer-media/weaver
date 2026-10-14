@@ -35,6 +35,47 @@ pub(super) fn encrypt_archive_password(
         .map_err(StateError::Database)
 }
 
+// A job's supplied archive passwords, sealed as one value the way its
+// password is: a JSON list of `[source label, password]` pairs. An empty list
+// stores nothing.
+pub(super) fn encrypt_supplied_passwords(
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
+    candidates: &[crate::jobs::ArchivePasswordCandidate],
+) -> Result<Option<String>, StateError> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let pairs: Vec<(&str, &str)> = candidates
+        .iter()
+        .map(|candidate| (candidate.source().as_str(), candidate.value()))
+        .collect();
+    let json = serde_json::to_string(&pairs)
+        .map_err(|error| StateError::Database(format!("invalid archive passwords: {error}")))?;
+    encrypt_archive_password(key, Some(&json))
+}
+
+pub(crate) fn decrypt_supplied_passwords(
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
+    stored: Option<String>,
+) -> Result<Vec<crate::jobs::ArchivePasswordCandidate>, StateError> {
+    let json = match decrypt_archive_password(key, stored)? {
+        Some(json) if !json.is_empty() => json,
+        _ => return Ok(Vec::new()),
+    };
+    let pairs: Vec<(String, String)> = serde_json::from_str(&json)
+        .map_err(|error| StateError::Database(format!("invalid archive passwords: {error}")))?;
+    pairs
+        .into_iter()
+        .map(|(label, value)| {
+            crate::jobs::ArchivePasswordSource::from_label(&label)
+                .map(|source| crate::jobs::ArchivePasswordCandidate::new(source, value))
+                .ok_or_else(|| {
+                    StateError::Database(format!("unknown archive password source {label}"))
+                })
+        })
+        .collect()
+}
+
 pub(crate) fn decrypt_archive_password(
     key: Option<&crate::persistence::encryption::EncryptionKey>,
     password: Option<String>,
@@ -548,6 +589,10 @@ impl Database {
                 self.encryption_key(),
                 job.password_override.as_deref(),
             )?),
+            SqlArg::OptText(encrypt_supplied_passwords(
+                self.encryption_key(),
+                &job.supplied_password_candidates,
+            )?),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "create_active_job", |tx| {
@@ -555,8 +600,8 @@ impl Database {
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO active_jobs
-                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password)
-                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                         &args,
                     )
                     .await?;
@@ -596,6 +641,10 @@ impl Database {
                 self.encryption_key(),
                 job.password_override.as_deref(),
             )?),
+            SqlArg::OptText(encrypt_supplied_passwords(
+                self.encryption_key(),
+                &job.supplied_password_candidates,
+            )?),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
@@ -607,8 +656,8 @@ impl Database {
                     Box::pin(async move {
                         tx.execute(
                             "INSERT INTO active_jobs
-                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password)
-                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                             &args,
                         )
                         .await?;
@@ -709,6 +758,10 @@ impl Database {
             SqlArg::OptText(encrypt_archive_password(
                 self.encryption_key(),
                 job.password_override.as_deref(),
+            )?),
+            SqlArg::OptText(encrypt_supplied_passwords(
+                self.encryption_key(),
+                &job.supplied_password_candidates,
             )?),
         ];
         self.run_sql_blocking(async move {
@@ -825,8 +878,8 @@ impl Database {
                         .await?;
                         tx.execute(
                             "INSERT INTO active_jobs
-                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password)
-                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                             &args,
                         )
                         .await?;
@@ -3359,6 +3412,7 @@ mod tests {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             password_override: None,
+            supplied_password_candidates: Vec::new(),
         }
     }
 

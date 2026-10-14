@@ -127,6 +127,7 @@ fn active_backfill_job(job_id: u64, nzb_zstd: Vec<u8>) -> ActiveJob {
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         password_override: None,
+        supplied_password_candidates: Vec::new(),
     }
 }
 

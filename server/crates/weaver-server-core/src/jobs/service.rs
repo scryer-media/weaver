@@ -734,6 +734,7 @@ impl Pipeline {
                 .initially_paused
                 .then_some(crate::jobs::model::PostState::Idle.as_str()),
             password_override: Some(spec.password.clone().unwrap_or_default()),
+            supplied_password_candidates: options.supplied_password_candidates.clone(),
         };
         // Biggest single write on the add-job path: keep it off the
         // orchestrator loop, but never create an in-memory job without durable
@@ -757,7 +758,13 @@ impl Pipeline {
                 &active_job.nzb_path,
                 &active_job.nzb_zstd,
             )
-            .ok();
+            .ok()
+            .map(|nzb| {
+                crate::pipeline::job_carried_password_candidates(
+                    &active_job.supplied_password_candidates,
+                    nzb,
+                )
+            });
             (persisted, nzb_password_candidates)
         })
         .await
@@ -1242,6 +1249,7 @@ impl Pipeline {
                     paused_resume_download_state: None,
                     paused_resume_post_state: None,
                     password_override: Some(spec.password.clone().unwrap_or_default()),
+                    supplied_password_candidates: Vec::new(),
                 })
                 .map_err(crate::SchedulerError::State)?;
 
@@ -2042,16 +2050,23 @@ impl Pipeline {
         let support_facts = self
             .db_blocking(move |db| db.load_job_support_facts(job_id))
             .await?;
-        // One read and parse of the persisted NZB per restored job, off the
-        // pipeline thread, instead of one per archive file. Anything short of
-        // a parsed NZB leaves the harvest to read the row itself, as before.
+        // One read of the row, decrypt of the supplied passwords and parse of
+        // the persisted NZB per restored job, off the pipeline thread, instead
+        // of one per archive file. Anything short of a parsed NZB leaves the
+        // harvest to read the row itself, as before.
         let nzb_password_candidates = self
-            .db_blocking(move |db| match db.load_active_job_persisted_nzb(job_id) {
-                Ok(Some((nzb_path, Some(nzb_zstd)))) => {
-                    crate::pipeline::persisted_nzb_password_candidates(&nzb_path, &nzb_zstd).ok()
-                }
-                _ => None,
-            })
+            .db_blocking(
+                move |db| match db.load_active_job_password_sources(job_id) {
+                    Ok(Some(((nzb_path, Some(nzb_zstd)), supplied))) => {
+                        crate::pipeline::persisted_nzb_password_candidates(&nzb_path, &nzb_zstd)
+                            .ok()
+                            .map(|nzb| {
+                                crate::pipeline::job_carried_password_candidates(&supplied, nzb)
+                            })
+                    }
+                    _ => None,
+                },
+            )
             .await;
 
         let _ = self.event_tx.send(PipelineEvent::JobCreated {

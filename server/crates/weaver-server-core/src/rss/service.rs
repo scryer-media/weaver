@@ -168,6 +168,11 @@ impl RssService {
         if !response.status().is_success() {
             return Err(format!("failed to fetch NZB: HTTP {}", response.status()));
         }
+        let supplied_password_candidates = crate::ingest::header_archive_password_candidates(
+            crate::ingest::dnzb_header_passwords(response.headers())
+                .iter()
+                .map(String::as_str),
+        );
 
         let nzb_bytes = tokio::select! {
             biased;
@@ -221,6 +226,7 @@ impl RssService {
             SubmissionOptions {
                 origin: SubmissionOrigin::Rss,
                 idempotency,
+                supplied_password_candidates,
                 ..SubmissionOptions::default()
             },
         )

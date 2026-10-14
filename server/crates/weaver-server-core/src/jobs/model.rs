@@ -68,6 +68,11 @@ pub struct TerminalDiscard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArchivePasswordSource {
     Explicit,
+    // A password a calling integration handed over beside the job's own one,
+    // such as GraphQL submit's `passwordCandidates` list.
+    Integration,
+    // An `X-DNZB-Password` response header weaver read on its own NZB fetch.
+    DnzbHeader,
     NzbMeta,
     FilenameConvention,
     Settings,
@@ -78,11 +83,27 @@ impl ArchivePasswordSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
+            Self::Integration => "integration",
+            Self::DnzbHeader => "dnzb_header",
             Self::NzbMeta => "nzb_meta",
             Self::FilenameConvention => "filename_convention",
             Self::Settings => "settings",
             Self::PasswordFile => "password_file",
         }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        [
+            Self::Explicit,
+            Self::Integration,
+            Self::DnzbHeader,
+            Self::NzbMeta,
+            Self::FilenameConvention,
+            Self::Settings,
+            Self::PasswordFile,
+        ]
+        .into_iter()
+        .find(|source| source.as_str() == label)
     }
 }
 

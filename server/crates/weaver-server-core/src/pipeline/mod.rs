@@ -127,15 +127,94 @@ pub(crate) fn persisted_nzb_password_candidates(
     Ok(crate::ingest::nzb_password_candidates(&nzb, nzb_path, None))
 }
 
+// The candidates a job carries, as `JobState::nzb_password_candidates` holds
+// them: those supplied with the job (`Integration`, `DnzbHeader`), then its
+// NZB's. The harvest sorts them into buckets by label.
+pub(crate) fn job_carried_password_candidates(
+    supplied: &[ArchivePasswordCandidate],
+    nzb: Vec<ArchivePasswordCandidate>,
+) -> Vec<ArchivePasswordCandidate> {
+    let mut carried = supplied.to_vec();
+    carried.extend(nzb);
+    carried
+}
+
+// Builds the list from the job's carried candidates and the global ones, in
+// four buckets, each capped as
+// `settings::archive_passwords` states: integration (`Explicit` from the spec,
+// then `Integration`), header (`DnzbHeader`), NZB (`NzbMeta`, then
+// `FilenameConvention`), and global (`Settings`, then `PasswordFile`). A value
+// already in the list is skipped without taking a slot, so the earliest
+// source keeps its label.
+pub(crate) fn assemble_archive_password_candidates(
+    spec_password: Option<&str>,
+    carried: &[ArchivePasswordCandidate],
+    global: &[ArchivePasswordCandidate],
+) -> Vec<ArchivePasswordCandidate> {
+    use crate::settings::archive_passwords::{
+        MAX_ARCHIVE_PASSWORDS, MAX_HEADER_ARCHIVE_PASSWORDS, MAX_INTEGRATION_ARCHIVE_PASSWORDS,
+        MAX_NZB_ARCHIVE_PASSWORDS,
+    };
+
+    let spec = crate::ingest::normalize_archive_password_candidate(spec_password)
+        .map(|value| ArchivePasswordCandidate::new(ArchivePasswordSource::Explicit, value));
+    let job = || carried.iter();
+    let with = |sources: &'static [ArchivePasswordSource]| {
+        move |candidate: &&ArchivePasswordCandidate| sources.contains(&candidate.source())
+    };
+    let buckets: [(Vec<&ArchivePasswordCandidate>, usize); 4] = [
+        (
+            spec.iter()
+                .chain(job().filter(with(&[ArchivePasswordSource::Integration])))
+                .collect(),
+            MAX_INTEGRATION_ARCHIVE_PASSWORDS,
+        ),
+        (
+            job()
+                .filter(with(&[ArchivePasswordSource::DnzbHeader]))
+                .collect(),
+            MAX_HEADER_ARCHIVE_PASSWORDS,
+        ),
+        (
+            job()
+                .filter(with(&[ArchivePasswordSource::NzbMeta]))
+                .chain(job().filter(with(&[ArchivePasswordSource::FilenameConvention])))
+                .collect(),
+            MAX_NZB_ARCHIVE_PASSWORDS,
+        ),
+        (global.iter().collect(), MAX_ARCHIVE_PASSWORDS),
+    ];
+
+    let mut candidates: Vec<ArchivePasswordCandidate> = Vec::new();
+    for (bucket, cap) in buckets {
+        let mut kept = 0;
+        for candidate in bucket {
+            if kept >= cap {
+                break;
+            }
+            if candidates
+                .iter()
+                .any(|existing| existing.value() == candidate.value())
+            {
+                continue;
+            }
+            candidates.push(candidate.clone());
+            kept += 1;
+        }
+    }
+    candidates
+}
+
 // A job's archive-password candidates, and whether every source behind them
 // was actually read.
 pub(crate) struct ArchivePasswordHarvest {
-    // In trial order: `Explicit` (the spec's password), then the persisted
-    // NZB's `NzbMeta` and `FilenameConvention`, then the global `Settings`
-    // list and the `PasswordFile`. De-duplicated by value, the earliest source
-    // keeping its label.
+    // In trial order, at most 80: the integration bucket (`Explicit`, the
+    // spec's password, then `Integration`), the header bucket (`DnzbHeader`),
+    // the NZB bucket (`NzbMeta`, then `FilenameConvention`), then the global
+    // bucket (`Settings`, then `PasswordFile`). De-duplicated by value, the
+    // earliest source keeping its label.
     pub(crate) candidates: Vec<ArchivePasswordCandidate>,
-    // `false` when the persisted NZB or the global list could not be read this
+    // `false` when the job's row or the global list could not be read this
     // time. Both of those warn and continue without their half, so an empty or
     // short list is two different facts: "the job carries nothing more", which
     // is permanent, and "a read failed this once", which is not. A caller that
@@ -149,7 +228,8 @@ impl Pipeline {
     // admission, the restart seam, archive probe and topology, finalize and
     // nested extraction.
     //
-    // The NZB half is a database read and a parse, memoized per job in
+    // The job half (the passwords supplied with the job and its NZB's) is a
+    // database read, a decrypt and a parse, memoized per job in
     // `nzb_password_candidates` once it has been read (a missing row or NZB is
     // remembered as empty, a failed read or parse is retried). The global half
     // is read fresh on every call, so a caller on a per-article path must
@@ -161,15 +241,16 @@ impl Pipeline {
     ) -> ArchivePasswordHarvest {
         let state = self.jobs.get(&job_id);
         let spec_password = state.and_then(|state| state.spec.password.as_deref());
-        let (mut candidates, mut complete) =
+        let (carried, mut complete) =
             match state.and_then(|state| state.nzb_password_candidates.get()) {
                 Some(cached) => (cached.clone(), true),
                 None => {
-                    let (candidates, harvested) = self.load_nzb_password_candidates(job_id);
+                    let (candidates, harvested) = self.load_job_password_candidates(job_id);
                     // A job in the pipeline already has its row, and nothing
-                    // adds NZB bytes to a row later, so a missing row or NZB
-                    // stays missing and its empty list is remembered too. A
-                    // failed read or parse is not, so it is retried.
+                    // adds NZB bytes or supplied passwords to a row later, so a
+                    // missing row or NZB stays missing and its list is
+                    // remembered too. A failed read or parse is not, so it is
+                    // retried.
                     if harvested && let Some(state) = state {
                         let _ = state.nzb_password_candidates.set(candidates.clone());
                     }
@@ -177,44 +258,29 @@ impl Pipeline {
                 }
             };
 
-        if let Some(value) = crate::ingest::normalize_archive_password_candidate(spec_password) {
-            candidates.retain(|candidate| candidate.value() != value);
-            candidates.insert(
-                0,
-                ArchivePasswordCandidate::new(ArchivePasswordSource::Explicit, value),
-            );
-        }
-
-        match self.db.global_archive_password_candidates() {
-            Ok(global) => {
-                for candidate in global {
-                    if !candidates
-                        .iter()
-                        .any(|existing| existing.value() == candidate.value())
-                    {
-                        candidates.push(candidate);
-                    }
-                }
-            }
+        let global = match self.db.global_archive_password_candidates() {
+            Ok(global) => global,
             Err(_) => {
                 warn!(job_id = job_id.0, "could not load global archive passwords");
                 complete = false;
+                Vec::new()
             }
-        }
+        };
 
         ArchivePasswordHarvest {
-            candidates,
+            candidates: assemble_archive_password_candidates(spec_password, &carried, &global),
             complete,
         }
     }
 
-    // The NZB half of the harvest, read from the database: the candidates,
-    // and whether the read and parse succeeded (`harvested`).
-    fn load_nzb_password_candidates(&self, job_id: JobId) -> (Vec<ArchivePasswordCandidate>, bool) {
-        match self.db.load_active_job_persisted_nzb(job_id) {
-            Ok(Some((nzb_path, Some(nzb_zstd)))) => {
+    // The job half of the harvest, read from the database: the passwords
+    // supplied with the job, then its persisted NZB's, and whether the read,
+    // decrypt and parse succeeded (`harvested`).
+    fn load_job_password_candidates(&self, job_id: JobId) -> (Vec<ArchivePasswordCandidate>, bool) {
+        match self.db.load_active_job_password_sources(job_id) {
+            Ok(Some(((nzb_path, Some(nzb_zstd)), supplied))) => {
                 match persisted_nzb_password_candidates(&nzb_path, &nzb_zstd) {
-                    Ok(candidates) => (candidates, true),
+                    Ok(nzb) => (job_carried_password_candidates(&supplied, nzb), true),
                     Err(error) => {
                         warn!(
                             job_id = job_id.0,
@@ -225,12 +291,13 @@ impl Pipeline {
                     }
                 }
             }
-            Ok(_) => (Vec::new(), true),
+            Ok(Some(((_, None), supplied))) => (supplied, true),
+            Ok(None) => (Vec::new(), true),
             Err(error) => {
                 warn!(
                     job_id = job_id.0,
                     error = %error,
-                    "failed to load persisted NZB for password candidates"
+                    "failed to load password candidates for job"
                 );
                 (Vec::new(), false)
             }

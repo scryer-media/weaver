@@ -3679,9 +3679,9 @@ impl Pipeline {
     // `Settings` list or the password file, which finalize would try anyway.
     // The harvest is `Pipeline::archive_password_candidates_for_job`, the
     // same list every other archive consumer takes, offered whole: the
-    // settings store bounds the global half at `MAX_ARCHIVE_PASSWORDS`
-    // entries, so the gate's key-derivation work is bounded there, once, for
-    // every consumer alike.
+    // harvest caps it at 80 entries across its four buckets
+    // (`MAX_ARCHIVE_PASSWORDS` and its neighbours), so the gate's
+    // key-derivation work is bounded there, once, for every consumer alike.
     //
     // # Why here rather than in `ensure_direct_sets`
     //
@@ -3805,9 +3805,9 @@ impl Pipeline {
 // Every candidate the gate tries costs a key derivation: a RAR5 PBKDF2 per
 // candidate at the `-hp` check, and for a 7z `-mhe` end header a SHA-256
 // chain of 2^19 rounds per candidate on every parse attempt until the
-// container opens. That work is bounded by the list, not here: the global
-// half is capped at `MAX_ARCHIVE_PASSWORDS` entries by the settings store,
-// and the job half is at most one candidate per source. Offering a prefix
+// container opens. That work is bounded by the list, not here: the harvest
+// caps it at 80 entries across its four buckets (`MAX_ARCHIVE_PASSWORDS` and
+// its neighbours). Offering a prefix
 // instead would send a set whose key sits past the prefix through a demotion
 // and a full redownload to reach the same list at finalize.
 //

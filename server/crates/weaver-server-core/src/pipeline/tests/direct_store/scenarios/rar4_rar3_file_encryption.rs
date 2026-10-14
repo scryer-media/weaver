@@ -1419,6 +1419,142 @@ async fn a_header_encrypted_set_is_offered_the_whole_list_in_priority_order() {
     );
 }
 
+// Passwords supplied at submit (an integration's list and weaver's own
+// `X-DNZB-Password` fetch) reach the `-hp` ring and finalize in bucket order,
+// ahead of the NZB's and the global list, with repeats keeping the earliest
+// label; a restart still offers them, because the job's row carries them.
+#[tokio::test]
+async fn supplied_passwords_reach_the_gate_and_finalize_and_survive_a_restart() {
+    let member_name = "Silver.Horizon.S04E18.mkv";
+    let payload: Vec<u8> = (0..1600u32).map(|index| (index % 179) as u8).collect();
+    let volumes = header_encrypted_store_set(
+        member_name,
+        &payload,
+        2,
+        "moonlit-harbour",
+        HeaderCheck::For("moonlit-harbour"),
+    );
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(45171);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    seed_global_passwords(
+        &pipeline,
+        temp_dir.path(),
+        GlobalPasswords {
+            settings: &["settings-key", "header-key"],
+            file_lines: Some(&["file-key"]),
+        },
+    );
+    let mut supplied =
+        crate::ingest::integration_archive_password_candidates(["given-key", "spec-key"]);
+    supplied.extend(crate::ingest::header_archive_password_candidates([
+        "header-key",
+        "given-key",
+    ]));
+    let mut spec = direct_store_job_spec("Silver Horizon", &volumes);
+    spec.password = Some("spec-key".to_string());
+    pipeline
+        .add_job(
+            job_id,
+            spec.clone(),
+            PathBuf::from("Silver Horizon {{harbour-key}}.nzb"),
+            sample_nzb_zstd_with_password("meta-key"),
+            crate::jobs::AddJobOptions {
+                supplied_password_candidates: supplied,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let expected = [
+        ("explicit", "spec-key"),
+        ("integration", "given-key"),
+        ("dnzb_header", "header-key"),
+        ("nzb_meta", "meta-key"),
+        ("filename_convention", "harbour-key"),
+        ("settings", "settings-key"),
+        ("password_file", "file-key"),
+    ];
+    let labelled = |candidates: &[crate::jobs::ArchivePasswordCandidate]| {
+        candidates
+            .iter()
+            .map(|candidate| (candidate.source().as_str(), candidate.value().to_string()))
+            .collect::<Vec<_>>()
+    };
+    let expected_owned: Vec<(&str, String)> = expected
+        .iter()
+        .map(|(label, value)| (*label, value.to_string()))
+        .collect();
+
+    let harvest = pipeline.archive_password_candidates_for_job(job_id);
+    assert!(harvest.complete);
+    assert_eq!(labelled(&harvest.candidates), expected_owned);
+    // What finalize and nested extraction take for a set with no winner yet.
+    assert_eq!(
+        labelled(&pipeline.archive_password_candidates_for_set(job_id, "Silver.Horizon")),
+        expected_owned
+    );
+
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("the job must carry its direct set");
+    assert!(set.router.wants_header_password());
+    assert_eq!(
+        set.router.header_candidate_sources(),
+        expected.map(|(label, _)| label)
+    );
+
+    pipeline.db.flush_write_queue().await.unwrap();
+    // The restarted server holds the key the row was sealed with.
+    let key = pipeline.db.encryption_key().cloned().unwrap();
+    retire_pipeline_database(pipeline).await;
+    let (mut restored, _, _) = new_direct_pipeline(&temp_dir).await;
+    restored.db.set_encryption_key(key);
+    let saved = restored
+        .db
+        .load_active_jobs()
+        .unwrap()
+        .remove(&job_id)
+        .unwrap();
+    restored
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            complete_files: saved.complete_files,
+            file_progress: saved.file_progress,
+            detected_archives: saved.detected_archives,
+            file_identities: saved.file_identities,
+            extracted_members: saved.extracted_members,
+            status: JobStatus::Paused,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: saved.output_dir,
+        })
+        .await
+        .unwrap();
+    assert!(
+        restored.jobs[&job_id]
+            .nzb_password_candidates
+            .get()
+            .is_some(),
+        "the restore must have read the job's candidates from its row"
+    );
+    let harvest = restored.archive_password_candidates_for_job(job_id);
+    assert!(harvest.complete);
+    assert_eq!(labelled(&harvest.candidates), expected_owned);
+}
+
 // A long global list reaches the ring whole, in priority order: the direct
 // store tries exactly the list finalize would, never a prefix of it.
 #[tokio::test]

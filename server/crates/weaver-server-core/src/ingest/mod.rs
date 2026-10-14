@@ -6,8 +6,9 @@ mod submission;
 mod xz;
 
 pub use import::{
-    ImportError, import_nzb, normalize_archive_password_candidate, nzb_password_candidates,
-    nzb_to_spec,
+    ImportError, dnzb_header_passwords, header_archive_password_candidates, import_nzb,
+    integration_archive_password_candidates, normalize_archive_password_candidate,
+    nzb_password_candidates, nzb_to_spec,
 };
 pub use metadata::{
     ORIGINAL_TITLE_METADATA_KEY, RENAMED_TITLE_METADATA_KEY, append_original_title_metadata,
@@ -20,7 +21,7 @@ pub use persisted_nzb::{
     parse_persisted_nzb_bytes, persist_decoded_nzb_reader_to_zstd,
 };
 pub use submission::{
-    DuplicateBackfillReport, StagedSubmissionPreparation, SubmissionDuplicateOutcome,
+    DuplicateBackfillReport, FetchedNzb, StagedSubmissionPreparation, SubmissionDuplicateOutcome,
     SubmissionOptions, SubmitNzbError, SubmittedJob, SubmittedJobSummary, fetch_nzb_from_url,
     init_job_counter, materialize_semantic_promotion, next_submission_job_id,
     nzb_to_submission_spec, reconcile_duplicate_fingerprint_backfill,

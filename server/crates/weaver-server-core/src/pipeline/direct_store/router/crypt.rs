@@ -244,13 +244,13 @@ impl HeaderCryptRefusal {
 // # Why this is a candidate *list* and not the one password `KeyRing` holds
 //
 // `KeyRing` is fed `spec.password`, which is the job's *first* candidate. The
-// `-hp` gate is offered the job's archive-password list — `Explicit`,
-// `NzbMeta`, `FilenameConvention`, then the global `Settings` list and the
-// password file — because a set whose header key is any of the others but
+// `-hp` gate is offered the job's archive-password list — `Explicit` and
+// `Integration`, `DnzbHeader`, `NzbMeta` and `FilenameConvention`, then the
+// global `Settings` list and the password file — because a set whose header key is any of the others but
 // whose spec carries an operator's guess would otherwise refuse for a password
 // that was sitting right there. The ring does not bound itself: it holds the
-// job's whole list, whose global half the settings store caps at
-// `MAX_ARCHIVE_PASSWORDS` entries, plus the spec's password if it changes
+// job's whole list, which the harvest caps at 80 entries across its four
+// buckets (`MAX_ARCHIVE_PASSWORDS` and its neighbours), plus the spec's password if it changes
 // before the first parse, and the KDF work here is one derivation per held
 // candidate.
 //

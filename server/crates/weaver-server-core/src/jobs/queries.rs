@@ -442,6 +442,50 @@ impl Database {
         })
     }
 
+    // Everything the archive-password harvest reads from an active job's row:
+    // the persisted NZB, and the passwords supplied with the job (decrypted).
+    pub fn load_active_job_password_sources(
+        &self,
+        job_id: JobId,
+    ) -> Result<
+        Option<(
+            PersistedNzbRecord,
+            Vec<crate::jobs::ArchivePasswordCandidate>,
+        )>,
+        StateError,
+    > {
+        let datastore = self.datastore();
+        let row = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT nzb_path, nzb_zstd, password_candidates
+                 FROM active_jobs
+                 WHERE job_id = {}
+                 LIMIT 1",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?
+            .map(|row| {
+                Ok((
+                    (
+                        PathBuf::from(row.text("nzb_path")?),
+                        row.opt_bytes("nzb_zstd")?,
+                    ),
+                    row.opt_text("password_candidates")?,
+                ))
+            })
+            .transpose()
+        })?;
+        row.map(|(nzb, stored)| {
+            let supplied = crate::jobs::persistence::decrypt_supplied_passwords(
+                self.encryption_key(),
+                stored,
+            )?;
+            Ok((nzb, supplied))
+        })
+        .transpose()
+    }
+
     // Load the per-file runtime view for one active job: contiguous bytes
     // written per incomplete file plus the set of fully completed file
     // indices. Used by integration facades that expose per-file listings
