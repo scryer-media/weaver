@@ -43,7 +43,7 @@ export function CategoriesPanel() {
   const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<{ categories: Category[] }>({ query: CATEGORIES_QUERY });
   // The rails and pickers elsewhere read the shared copy, which this panel's own query does not reach.
-  const { refreshCategories } = useNextData();
+  const { refreshCategories } = useNextData("refreshCategories");
   const [{ data: settingsData }] = useQuery<{ settings: { completeDir: string; dataDir: string } }>({
     query: SETTINGS_QUERY,
   });

@@ -1,10 +1,31 @@
-import { useTranslate } from "@/lib/context/translate-context";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { SecondaryButton } from "../components/controls";
 import {
   copySupportReport,
   downloadSupportReportJson,
   useJobSupportReport,
+  type SupportReport,
 } from "../data/support-report";
+
+// Outside the component, so the component itself compiles: what each action reports.
+
+async function copyReport(t: Translate, fetchReport: () => Promise<SupportReport>): Promise<string> {
+  try {
+    const report = await fetchReport();
+    return (await copySupportReport(report)) ? t("next.support.copied") : t("next.support.copyBlocked");
+  } catch {
+    return t("next.support.failed");
+  }
+}
+
+async function downloadReport(t: Translate, fetchReport: () => Promise<SupportReport>, jobId: number): Promise<string> {
+  try {
+    downloadSupportReportJson(await fetchReport(), jobId);
+    return t("next.support.saved");
+  } catch {
+    return t("next.support.failed");
+  }
+}
 
 /**
  * "Copy support report" and "Download JSON" for one job, in any state.
@@ -27,23 +48,11 @@ export function SupportReportActions({
   const { busy, fetchReport } = useJobSupportReport(jobId);
 
   const copy = async () => {
-    try {
-      const report = await fetchReport();
-      onReport(
-        (await copySupportReport(report)) ? t("next.support.copied") : t("next.support.copyBlocked"),
-      );
-    } catch {
-      onReport(t("next.support.failed"));
-    }
+    onReport(await copyReport(t, fetchReport));
   };
 
   const download = async () => {
-    try {
-      downloadSupportReportJson(await fetchReport(), jobId);
-      onReport(t("next.support.saved"));
-    } catch {
-      onReport(t("next.support.failed"));
-    }
+    onReport(await downloadReport(t, fetchReport, jobId));
   };
 
   return (

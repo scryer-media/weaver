@@ -18,7 +18,7 @@ import {
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
 import { authHeaders } from "@/graphql/client";
-import { useTranslate } from "@/lib/context/translate-context";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { openUrlAsDownload, readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
@@ -56,6 +56,7 @@ import { releaseFields, releaseFlags } from "../data/release";
 import { eventTone, useStatusLabel } from "../data/status";
 import { buildTimelineView, downloadingMs, type JobTimelineData } from "../data/timeline";
 import { useNextData } from "../data/next-data";
+import { useSharedStructure } from "../data/share";
 import { countLabel } from "../i18n/labels";
 import { NextShell, RailBlock } from "../shell/NextShell";
 import { SupportReportActions } from "../features/SupportReportActions";
@@ -157,6 +158,27 @@ function sentenceCase(value: string): string {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
+/**
+ * The job's own NZB, fetched rather than linked: the endpoint wants the
+ * session's auth header, which a plain anchor cannot carry. Answers with the
+ * line the status bar reports.
+ */
+async function saveJobNzb(t: Translate, jobId: number, title: string): Promise<string> {
+  try {
+    const response = await fetch(new URL(`api/jobs/${jobId}/nzb`, document.baseURI).href, {
+      headers: authHeaders(),
+      credentials: "same-origin",
+    });
+    if (!response.ok) {
+      throw new Error(await readDownloadErrorMessage(response, t("next.job.nzbFailed")));
+    }
+    await saveResponseAsDownload(response, `${title}.nzb`);
+    return t("next.job.nzbSaved", { name: title });
+  } catch (error) {
+    return error instanceof Error ? error.message : t("next.job.nzbFailed");
+  }
+}
+
 export function JobDetailPage() {
   const { id } = useParams();
   // Reset retained results and destructive confirmations on job navigation.
@@ -174,7 +196,7 @@ function JobDetailContent() {
     return () => { active.current = false; };
   }, []);
   const statusLabel = useStatusLabel();
-  const { connection } = useNextData();
+  const { connection } = useNextData("connection");
   const variables = useMemo(() => ({ id: jobId }), [jobId]);
 
   const [{ data, fetching }, refetch] = useQuery<{ jobDetailSnapshot: JobSnapshot | null }>({
@@ -209,7 +231,9 @@ function JobDetailContent() {
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const snapshot = live?.jobDetailUpdates ?? data?.jobDetailSnapshot ?? null;
+  // Every push carries the whole job again; the parts that did not move keep
+  // their identity, so the blocks drawn from them are left alone.
+  const snapshot = useSharedStructure(live?.jobDetailUpdates ?? data?.jobDetailSnapshot ?? null);
   const inQueue = Boolean(snapshot?.queueItem);
   const raw = snapshot?.queueItem ?? snapshot?.historyItem ?? null;
   const job = useMemo(() => (raw ? normalizeJobData(raw) : null), [raw]);
@@ -350,31 +374,15 @@ function JobDetailContent() {
     void refetch({ requestPolicy: "network-only" });
   };
 
-  /**
-   * The job's own NZB, fetched rather than linked: the endpoint wants the
-   * session's auth header, which a plain anchor cannot carry.
-   */
+  // Only the names it saves under, so a push that moves the job's figures
+  // leaves the header's buttons alone.
+  const { originalTitle, name, displayTitle } = job;
   const downloadNzb = async () => {
-    if (!job) {
-      return;
-    }
-    const title = job.originalTitle.trim() || job.name || job.displayTitle;
+    const title = originalTitle.trim() || name || displayTitle;
     setBusy(true);
-    try {
-      const response = await fetch(new URL(`api/jobs/${job.id}/nzb`, document.baseURI).href, {
-        headers: authHeaders(),
-        credentials: "same-origin",
-      });
-      if (!response.ok) {
-        throw new Error(await readDownloadErrorMessage(response, t("next.job.nzbFailed")));
-      }
-      await saveResponseAsDownload(response, `${title}.nzb`);
-      setReport(t("next.job.nzbSaved", { name: title }));
-    } catch (error) {
-      setReport(error instanceof Error ? error.message : t("next.job.nzbFailed"));
-    } finally {
-      setBusy(false);
-    }
+    const saved = await saveJobNzb(t, job.id, title);
+    setBusy(false);
+    setReport(saved);
   };
 
   /**

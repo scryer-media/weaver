@@ -104,6 +104,22 @@ const QUEUE_PAGE_VARIABLES = {
   input: { pageIndex: 0, pageSize: QUEUE_PAGE_SIZE },
 } as const;
 
+/*
+ * Each item normalized once. An event replaces only the item it carries, so
+ * every other job keeps the object it had, and a row drawn from one can tell
+ * that nothing about it changed.
+ */
+const normalizedJobs = new WeakMap<GraphqlJobData, JobData>();
+
+function normalizeOnce(item: GraphqlJobData): JobData {
+  let job = normalizedJobs.get(item);
+  if (job === undefined) {
+    job = normalizeJobData(item);
+    normalizedJobs.set(item, job);
+  }
+  return job;
+}
+
 export function useLiveQueue(): LiveQueue {
   const client = useClient();
   const connection = useGraphqlConnectionState();
@@ -367,16 +383,24 @@ export function useLiveQueue(): LiveQueue {
       .map((arrival) => arrival.item);
     return [...pageItems, ...arrived]
       .filter((item) => !removedIds.has(item.id))
-      .map((item) => normalizeJobData(overlays[item.id]?.item ?? item));
+      .map((item) => normalizeOnce(overlays[item.id]?.item ?? item));
   }, [arrivals, overlays, pageItems, removedIds, visibleIds]);
 
-  return {
-    jobs,
-    summary: page?.summary ?? EMPTY_SUMMARY,
-    categories: page?.categories ?? EMPTY_CATEGORIES,
-    totalCount: page?.totalCount ?? 0,
-    isLoading: fetching && page === undefined,
-    error: error?.message ?? null,
-    refresh: refreshNow,
-  };
+  const summary = page?.summary ?? EMPTY_SUMMARY;
+  const categories = page?.categories ?? EMPTY_CATEGORIES;
+  const totalCount = page?.totalCount ?? 0;
+  const isLoading = fetching && page === undefined;
+  const errorMessage = error?.message ?? null;
+  return useMemo(
+    () => ({
+      jobs,
+      summary,
+      categories,
+      totalCount,
+      isLoading,
+      error: errorMessage,
+      refresh: refreshNow,
+    }),
+    [categories, errorMessage, isLoading, jobs, refreshNow, summary, totalCount],
+  );
 }

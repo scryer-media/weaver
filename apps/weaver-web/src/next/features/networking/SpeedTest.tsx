@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { useClient, useQuery } from "urql";
+import { useClient, useQuery, type Client } from "urql";
 import {
   BANDWIDTH_PROVIDER_SERVERS_QUERY,
   CANCEL_SPEED_TEST,
@@ -23,7 +23,7 @@ import { Eyebrow, MetricCell, MetricStrip } from "../../components/chrome";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { DangerButton, NumberField, PrimaryButton, SecondaryButton, Segmented, Select, TextField } from "../../components/controls";
 import { EM_DASH, splitBytes, splitSpeed } from "../../data/format";
-import { useNextData } from "../../data/next-data";
+import { useNextDataSelector } from "../../data/next-data";
 import type { Consumer } from "./data";
 import { LiveChart, type RatePoint } from "./LiveChart";
 import { ControlLabel } from "./presentation";
@@ -191,6 +191,28 @@ export function useSpeedTestData() {
 }
 
 /**
+ * Asks the daemon to start a run and hands it to `started`; resolves to why it
+ * would not, or null. Outside the hook, so the hook itself compiles.
+ */
+async function startSpeedTest(
+  client: Client,
+  t: Translate,
+  input: SpeedTestInput,
+  started: (run: SpeedTestRun) => void,
+): Promise<string | null> {
+  try {
+    const result = await client.mutation<{ startSpeedTest: SpeedTestRun }>(START_SPEED_TEST, { input }).toPromise();
+    if (result.error || !result.data) {
+      return result.error ? refusalMessage(t, result.error) : t("next.networking.requestFailed");
+    }
+    started(result.data.startSpeedTest);
+    return null;
+  } catch (caught) {
+    return caught instanceof Error ? caught.message : t("next.networking.requestFailed");
+  }
+}
+
+/**
  * One run as it goes: started here, or picked up while it was running. While it
  * runs it is read again once a second, which is how its progress arrives.
  */
@@ -202,9 +224,11 @@ export function useSpeedTestRun(onFinished: () => void) {
   const [refusal, setRefusal] = useState<string | null>(null);
   /** A run waiting on the operator to agree to pause downloads. */
   const [pending, setPending] = useState<SpeedTestInput | null>(null);
-  const { isPaused, queue } = useNextData();
   // Jobs, not the header gauge: a Usenet run's own bytes drive the gauge, and it can still read them after the run.
-  const downloading = !isPaused && queue.jobs.some((job) => FETCHING.has(job.status.toUpperCase()));
+  // Only the answer is read, so a queue that changes without changing it draws nothing.
+  const downloading = useNextDataSelector(
+    (data) => !data.isPaused && data.queue.jobs.some((job) => FETCHING.has(job.status.toUpperCase())),
+  );
   const runningId = run?.status === "RUNNING" ? run.id : null;
   // The poll outlives renders, so it reads the latest callback rather than restarting for each.
   const finished = useRef(onFinished);
@@ -240,19 +264,14 @@ export function useSpeedTestRun(onFinished: () => void) {
   const begin = async (input: SpeedTestInput) => {
     setBusy(true);
     setRefusal(null);
-    try {
-      const result = await client.mutation<{ startSpeedTest: SpeedTestRun }>(START_SPEED_TEST, { input }).toPromise();
-      if (result.error || !result.data) {
-        setRefusal(result.error ? refusalMessage(t, result.error) : t("next.networking.requestFailed"));
-        return;
-      }
-      setRun(result.data.startSpeedTest);
+    const refused = await startSpeedTest(client, t, input, (started) => {
+      setRun(started);
       finished.current();
-    } catch (caught) {
-      setRefusal(caught instanceof Error ? caught.message : t("next.networking.requestFailed"));
-    } finally {
-      setBusy(false);
+    });
+    if (refused !== null) {
+      setRefusal(refused);
     }
+    setBusy(false);
   };
 
   const cancel = async () => {

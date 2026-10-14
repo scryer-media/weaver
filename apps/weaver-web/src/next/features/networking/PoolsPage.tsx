@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { useClient } from "urql";
+import { useClient, type Client } from "urql";
 import { CREATE_POOL, DELETE_POOL, TEST_POOL, UPDATE_POOL } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { ProxyPool } from "@/lib/networking";
@@ -285,6 +285,22 @@ type ProbeResult = {
   connectMillis: number | null;
 };
 
+/**
+ * Runs a pool's probe: what went wrong (empty when nothing did), and the
+ * members' results once it answered. Outside the component, so the component compiles.
+ */
+async function testPool(
+  client: Client,
+  variables: { id: number; egressId: number; host: string | null; port: number | null },
+): Promise<{ error: string; results?: ProbeResult[] }> {
+  try {
+    const result = await client.mutation(TEST_POOL, variables).toPromise();
+    return { error: result.error?.message ?? "", results: result.data?.testProxyPool ?? [] };
+  } catch (caught) {
+    return { error: String(caught) };
+  }
+}
+
 /** Probe every member in an isolated session; the live selection is left alone. */
 function PoolTest({ pool, data, onClose }: { pool: ProxyPool; data: NetworkingData; onClose: () => void }) {
   const t = useTranslate();
@@ -301,17 +317,17 @@ function PoolTest({ pool, data, onClose }: { pool: ProxyPool; data: NetworkingDa
   const run = async () => {
     setRunning(true);
     setError("");
-    try {
-      const result = await client
-        .mutation(TEST_POOL, { id: pool.id, egressId: egress, host: host.trim() || null, port: host.trim() ? port : null })
-        .toPromise();
-      setError(result.error?.message ?? "");
-      setResults(result.data?.testProxyPool ?? []);
-    } catch (caught) {
-      setError(String(caught));
-    } finally {
-      setRunning(false);
+    const outcome = await testPool(client, {
+      id: pool.id,
+      egressId: egress,
+      host: host.trim() || null,
+      port: host.trim() ? port : null,
+    });
+    setError(outcome.error);
+    if (outcome.results) {
+      setResults(outcome.results);
     }
+    setRunning(false);
   };
 
   return (

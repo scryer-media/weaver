@@ -42,6 +42,7 @@ export function useReconnectPolling<Data, Variables extends AnyVariables = AnyVa
     }
 
     let cancelled = false;
+    const pollVariables = (variables ?? {}) as Variables;
 
     const scheduleNext = (delayMs: number) => {
       if (cancelled) {
@@ -65,7 +66,7 @@ export function useReconnectPolling<Data, Variables extends AnyVariables = AnyVa
 
       try {
         const result = await client
-          .query<Data, Variables>(query, (variables ?? {}) as Variables, {
+          .query<Data, Variables>(query, pollVariables, {
             requestPolicy: "network-only",
           })
           .toPromise();

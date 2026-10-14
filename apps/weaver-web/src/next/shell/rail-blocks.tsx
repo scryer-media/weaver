@@ -1,4 +1,4 @@
-import { Fragment, type ReactNode } from "react";
+import { Fragment, memo, type ReactNode } from "react";
 import { Link, NavLink, useLocation } from "react-router";
 import { useQuery } from "urql";
 import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
@@ -53,9 +53,9 @@ export function providerLoadPercent(provider: ProviderHealth): number {
   return (provider.connectionsActive / max) * 100;
 }
 
-export function ProvidersBlock() {
+export const ProvidersBlock = memo(function ProvidersBlock() {
   const t = useTranslate();
-  const { providers, providersLoaded } = useNextData();
+  const { providers, providersLoaded } = useNextData("providers", "providersLoaded");
   // A holdoff counts down in the rail, so the clock has to be a value React
   // knows about; it ticks only while something is actually counting down.
   const counting = providers.some((provider) => provider.activityUntilEpochMs != null);
@@ -134,7 +134,7 @@ export function ProvidersBlock() {
       )}
     </RailBlock>
   );
-}
+});
 
 /**
  * The rail's one loud control. With no provider nothing can download, so the
@@ -173,7 +173,12 @@ export interface AttentionItem {
  */
 export function useAttentionItems(): AttentionItem[] {
   const t = useTranslate();
-  const { providers, holdoffs, downloadBlock, isPaused } = useNextData();
+  const { providers, holdoffs, downloadBlock, isPaused } = useNextData(
+    "providers",
+    "holdoffs",
+    "downloadBlock",
+    "isPaused",
+  );
   const counting = providers.some((provider) => provider.activityUntilEpochMs != null);
   const now = useNow(1000, counting);
   const items: AttentionItem[] = [];
@@ -244,7 +249,7 @@ export function useAttentionItems(): AttentionItem[] {
   return items;
 }
 
-export function AttentionBlock() {
+export const AttentionBlock = memo(function AttentionBlock() {
   const t = useTranslate();
   const items = useAttentionItems();
 
@@ -268,9 +273,9 @@ export function AttentionBlock() {
       ))}
     </RailBlock>
   );
-}
+});
 
-export function UptimeBlock() {
+export const UptimeBlock = memo(function UptimeBlock() {
   const t = useTranslate();
   const [{ data }] = useQuery<{ systemInfo: { uptimeSeconds: number; version: string } }>({
     query: SYSTEM_INFO_QUERY,
@@ -282,7 +287,7 @@ export function UptimeBlock() {
       <RailMetric value={uptime.value} unit={uptime.unit} note={t("next.rail.sinceRestart")} />
     </RailBlock>
   );
-}
+});
 
 /**
  * The rail's contextual middle block on the list screens: the configured
@@ -415,7 +420,7 @@ function PanelRowContent({
  * lists them indented beneath it, and only a panel's own row is ever the
  * active one.
  */
-export function PanelListBlock({
+export const PanelListBlock = memo(function PanelListBlock({
   eyebrow,
   items,
 }: {
@@ -457,4 +462,4 @@ export function PanelListBlock({
       </nav>
     </RailBlock>
   );
-}
+});

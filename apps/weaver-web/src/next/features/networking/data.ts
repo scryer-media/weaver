@@ -1,8 +1,8 @@
-import { useState } from "react";
-import { useClient, useQuery, useSubscription } from "urql";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { useClient, useQuery, useSubscription, type Client } from "urql";
 import type { DocumentNode } from "graphql";
 import { NETWORK_FLOW_QUERY, NETWORK_FLOW_SUBSCRIPTION, NETWORKING_QUERY } from "@/graphql/networking";
-import { useTranslate } from "@/lib/context/translate-context";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import {
   allocation,
   closedPath,
@@ -53,6 +53,9 @@ export const speedPage = (consumer: string) => `/settings/networking/speed?consu
 export type NetworkingAction = (document: DocumentNode, variables: Record<string, unknown>) => Promise<string | null>;
 
 export const EMPTY_FLOW: NetworkFlow = { legs: [], pools: [] };
+const NO_EGRESSES: Egress[] = [];
+const NO_PROFILES: ProxyProfile[] = [];
+const NO_POOLS: ProxyPool[] = [];
 
 export const defaultRoute = (): NetworkRoute => ({ legs: [directLeg()], failover: "REDISTRIBUTE" });
 
@@ -124,6 +127,35 @@ export function plannedFlow(measured: NetworkFlow, consumers: Consumer[]): Netwo
 }
 
 /**
+ * Runs one mutation. `report` hears how it went as soon as it lands; once it
+ * has, the configuration and the flow are read again before this resolves to
+ * the failure message, or null. Outside the hook, so the hook itself compiles.
+ */
+async function runNetworkingAction(
+  client: Client,
+  t: Translate,
+  document: DocumentNode,
+  variables: Record<string, unknown>,
+  refresh: () => void,
+  report: (failure: string | null) => void,
+): Promise<string | null> {
+  try {
+    const result = await client.mutation(document, variables).toPromise();
+    const failure = result.error ? refusalMessage(t, result.error) : null;
+    report(failure);
+    if (failure === null) {
+      refresh();
+      await client.query(NETWORK_FLOW_QUERY, {}, { requestPolicy: "network-only" }).toPromise();
+    }
+    return failure;
+  } catch (caught) {
+    const failure = caught instanceof Error ? caught.message : t("next.networking.requestFailed");
+    report(failure);
+    return failure;
+  }
+}
+
+/**
  * Everything the networking pages read, and the one way they write.
  *
  * The live flow is only subscribed to on the pages that draw it.
@@ -149,49 +181,63 @@ export function useNetworkingWorkspace(page: string) {
   const [message, setMessage] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
 
-  const action: NetworkingAction = async (document, variables) => {
+  // Kept the same across renders, as is everything derived below, so a page
+  // drawn again for some other reason hands its rows the same props.
+  const action = useCallback<NetworkingAction>(async (document, variables) => {
     setBusy(true);
     setMessage(null);
-    try {
-      const result = await client.mutation(document, variables).toPromise();
-      const failure = result.error ? refusalMessage(t, result.error) : null;
-      setFailed(failure !== null);
-      setMessage(failure ?? t("next.networking.saved"));
-      if (failure === null) {
-        refresh({ requestPolicy: "network-only" });
-        await client.query(NETWORK_FLOW_QUERY, {}, { requestPolicy: "network-only" }).toPromise();
-      }
-      return failure;
-    } catch (caught) {
-      const failure = caught instanceof Error ? caught.message : t("next.networking.requestFailed");
-      setFailed(true);
-      setMessage(failure);
-      return failure;
-    } finally {
-      setBusy(false);
-    }
-  };
+    const failure = await runNetworkingAction(
+      client,
+      t,
+      document,
+      variables,
+      () => refresh({ requestPolicy: "network-only" }),
+      (outcome) => {
+        setFailed(outcome !== null);
+        setMessage(outcome ?? t("next.networking.saved"));
+      },
+    );
+    setBusy(false);
+    return failure;
+  }, [client, refresh, t]);
+  const retry = useCallback(() => refresh({ requestPolicy: "network-only" }), [refresh]);
 
   const measured = subscription.data?.networkFlow ?? initial.data?.networkFlow ?? EMPTY_FLOW;
-  const consumers = flowConsumers(measured, data);
-  const flow = plannedFlow(measured, consumers);
-  const egresses = measured.egresses ?? data?.egressInterfaces ?? [];
+  // Every sample carries the consumers, egresses and proxies afresh, and they
+  // seldom change; what draws them is drawn again only when one of them has.
+  const consumers = useSameWhileUnchanged(flowConsumers(measured, data));
+  const flow = useMemo(() => plannedFlow(measured, consumers), [consumers, measured]);
+  const egresses = useSameWhileUnchanged(measured.egresses ?? data?.egressInterfaces ?? NO_EGRESSES);
+  const profiles = useSameWhileUnchanged(measured.proxies ?? data?.proxyProfiles ?? NO_PROFILES);
+  const pools = useSameWhileUnchanged(measured.proxyPools ?? data?.proxyPools ?? NO_POOLS);
 
   return {
     data,
     error,
     fetching,
-    retry: () => refresh({ requestPolicy: "network-only" }),
+    retry,
     liveError: subscription.error,
     measured,
     consumers,
     flow,
     egresses,
+    profiles,
+    pools,
     action,
     busy,
     message,
     failed,
   };
+}
+
+/** The first of a run of values that serialize the same. */
+export function useSameWhileUnchanged<T>(value: T): T {
+  const key = JSON.stringify(value);
+  const held = useRef({ key, value });
+  if (held.current.key !== key) {
+    held.current = { key, value };
+  }
+  return held.current.value;
 }
 
 /** The addresses an egress is leaving from right now, or would. */

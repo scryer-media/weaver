@@ -1,6 +1,8 @@
-import { useState, type ReactNode } from "react";
+import { createContext, memo, useContext, useMemo, useState, type ReactNode } from "react";
 import { Navigate, useLocation } from "react-router";
 import { useTranslate } from "@/lib/context/translate-context";
+import type { Egress, NetworkFlow as Flow, ProxyPool } from "@/lib/networking";
+import type { ProxyProfile } from "@/lib/proxies";
 import { EmptyState } from "../../components/chrome";
 import { SecondaryButton } from "../../components/controls";
 import {
@@ -8,8 +10,15 @@ import {
   usePanelStatus,
   useSearchReport,
   useSettingsPanelSlug,
+  type SettingsBlock,
 } from "../../pages/settings/framework";
-import { NETWORKING_PAGES, useNetworkingWorkspace, type NetworkingPage } from "./data";
+import {
+  EMPTY_FLOW,
+  NETWORKING_PAGES,
+  useNetworkingWorkspace,
+  type Consumer,
+  type NetworkingPage,
+} from "./data";
 import { EgressPage } from "./EgressPage";
 import { FlowEditor } from "./FlowEditor";
 import { NetworkFlow, type FlowTarget } from "./NetworkFlow";
@@ -25,6 +34,37 @@ function ActionStatus({ message, failed }: { message: string | null; failed: boo
   usePanelStatus(message, failed);
   return null;
 }
+
+/** The live flow, apart, so a sample draws the overview's diagram and not the blocks around it. */
+const LiveFlowContext = createContext<Flow>(EMPTY_FLOW);
+
+/** The overview's diagram, the one part of the page each sample changes. */
+const OverviewFlow = memo(function OverviewFlow({
+  egresses,
+  profiles,
+  pools,
+  consumers,
+  onEdit,
+}: {
+  egresses: Egress[];
+  profiles: ProxyProfile[];
+  pools: ProxyPool[];
+  consumers: Consumer[];
+  onEdit: (target: FlowTarget) => void;
+}) {
+  const flow = useContext(LiveFlowContext);
+  return (
+    <NetworkFlow
+      flow={flow}
+      egresses={egresses}
+      profiles={profiles}
+      pools={pools}
+      consumers={consumers}
+      onEdit={onEdit}
+      trace
+    />
+  );
+});
 
 /**
  * Networking: where connections leave, how each server and feed reaches the
@@ -53,9 +93,24 @@ export function NetworkingWorkspace({
     : (location.pathname.split("/networking/")[1] ?? "overview");
   const workspace = useNetworkingWorkspace(page);
   const [editing, setEditing] = useState<FlowTarget | null>(null);
-  const { data, error, fetching, flow, consumers, egresses, measured, action, busy, message, failed } = workspace;
+  const { data, error, fetching, flow, consumers, egresses, profiles, pools, action, busy, message, failed } = workspace;
   // The pages draw their blocks only once the data is here.
   useSearchReport(0, !data && fetching);
+  // Held while what it names is the same: the diagram reads each sample itself.
+  const overviewBlocks = useMemo<SettingsBlock[]>(
+    () => [
+      {
+        kind: "custom",
+        id: "flow",
+        title: t("next.networking.overview.flow"),
+        searchText: [...consumers.map((consumer) => consumer.name), ...egresses.map((egress) => egress.name)].join(" "),
+        body: (
+          <OverviewFlow egresses={egresses} profiles={profiles} pools={pools} consumers={consumers} onEdit={setEditing} />
+        ),
+      },
+    ],
+    [consumers, egresses, pools, profiles, t],
+  );
 
   if (!NETWORKING_PAGES.includes(page as NetworkingPage)) {
     return <Navigate to="/settings/networking/overview" replace />;
@@ -93,38 +148,23 @@ export function NetworkingWorkspace({
                   {t("next.networking.liveUnavailable")}
                 </NoticeBand>
               ) : null}
-              <SettingsBlocks
-                blocks={[
-                  {
-                    kind: "custom",
-                    id: "flow",
-                    title: t("next.networking.overview.flow"),
-                    searchText: [...consumers.map((consumer) => consumer.name), ...egresses.map((egress) => egress.name)].join(" "),
-                    body: (
-                      <NetworkFlow
-                        flow={flow}
-                        egresses={egresses}
-                        profiles={measured.proxies ?? data.proxyProfiles}
-                        pools={measured.proxyPools ?? data.proxyPools}
-                        consumers={consumers}
-                        onEdit={setEditing}
-                        trace
-                      />
-                    ),
-                  },
-                ]}
-              />
-              <FlowEditor
-                target={editing}
-                onClose={() => setEditing(null)}
-                data={data}
-                egresses={egresses}
-                consumers={consumers}
-                flow={flow}
-                action={action}
-                busy={busy}
-                proxyEditor={(id, onClose) => proxyEditor(id, onClose, workspace.retry)}
-              />
+              <LiveFlowContext.Provider value={flow}>
+                <SettingsBlocks blocks={overviewBlocks} />
+              </LiveFlowContext.Provider>
+              {/* Nothing is drawn until a box is picked, so nothing is drawn again for each sample either. */}
+              {editing ? (
+                <FlowEditor
+                  target={editing}
+                  onClose={() => setEditing(null)}
+                  data={data}
+                  egresses={egresses}
+                  consumers={consumers}
+                  flow={flow}
+                  action={action}
+                  busy={busy}
+                  proxyEditor={(id, onClose) => proxyEditor(id, onClose, workspace.retry)}
+                />
+              ) : null}
             </>
           ) : null}
           {page === "egress" ? (

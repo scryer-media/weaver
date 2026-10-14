@@ -1,12 +1,12 @@
 import type { CSSProperties, ReactNode } from "react";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import { cn } from "@/lib/utils";
 import { WV } from "../data/palette";
 
 /** Uppercase 10.5/600/0.14em label. Rail blocks use `tone="rail"`, headers "header". */
-export function Eyebrow({
+export const Eyebrow = memo(function Eyebrow({
   children,
   tone = "header",
   className,
@@ -26,7 +26,7 @@ export function Eyebrow({
       {children}
     </div>
   );
-}
+});
 
 /**
  * The 30px band that separates every group of rows.
@@ -337,7 +337,7 @@ export function Tag({ children }: { children: ReactNode }) {
 }
 
 /** 7px status/category square — squares, never circles, in this design. */
-export function Square({
+export const Square = memo(function Square({
   color,
   size = 7,
   hollow = false,
@@ -366,7 +366,7 @@ export function Square({
       }}
     />
   );
-}
+});
 
 /** Quarter-cell levels a building cell climbs before it reads as filled. */
 const BAR_LEVELS = 4;

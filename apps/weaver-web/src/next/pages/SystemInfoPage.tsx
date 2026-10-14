@@ -1,14 +1,15 @@
-import { useEffect, useState } from "react";
+import { memo, useContext, useEffect, useState } from "react";
 import { useQuery } from "urql";
 import { authHeaders } from "@/graphql/client";
 import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
+import type { MetricsSnapshot } from "@/lib/metrics";
 import { EmptyState, KeyValueRow, SectionHeader } from "../components/chrome";
 import { PrimaryButton, SecondaryButton } from "../components/controls";
 import { StorageUsage } from "../components/storage";
 import { EM_DASH, formatCount, formatDuration, formatSize } from "../data/format";
-import { useMetricsSnapshot } from "../data/use-metrics-series";
+import { MetricsSnapshotContext, useMetricsSnapshot } from "../data/use-metrics-series";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, UptimeBlock } from "../shell/rail-blocks";
 import { ApplicationUpgradeSection } from "../features/ApplicationUpgradeSection";
@@ -203,197 +204,247 @@ export function SystemInfoPage() {
   }, [copied]);
 
   const info = data?.systemInfo;
-  const cacheBytes = metrics?.decodePendingBytes ?? 0;
-  const cacheLimit = metrics?.decodePressureHardLimitBytes ?? 0;
-  const cacheInUse =
-    cacheLimit > 0
-      ? t("next.system.usedOf", { used: formatSize(cacheBytes), total: formatSize(cacheLimit) })
-      : formatSize(cacheBytes);
 
   // Streamed straight off the endpoint: collection holds the request open for
   // the gap between two metrics samples, so the button stays busy throughout.
   async function downloadDiagnostics() {
     setBusy(true);
     setFailure(null);
-    try {
-      const response = await fetch(new URL("api/system/diagnostics", document.baseURI).href, {
-        headers: authHeaders(),
-        credentials: "same-origin",
-      });
-      if (!response.ok) {
-        throw new Error(await readDownloadErrorMessage(response, t("systemInfo.diagnosticsFailed")));
-      }
-      await saveResponseAsDownload(response, `weaver-diagnostics-${Date.now()}.tar.zst`);
-    } catch (caught) {
-      setFailure(caught instanceof Error ? caught.message : t("systemInfo.diagnosticsFailed"));
-    } finally {
-      setBusy(false);
+    const failed = await saveDiagnostics(() => t("systemInfo.diagnosticsFailed"));
+    if (failed !== null) {
+      setFailure(failed);
     }
+    setBusy(false);
   }
 
   return (
-    <NextShell
-      title={t("next.nav.systemInfo")}
-      note={t("next.system.note")}
-      controls={
-        <>
-          <SecondaryButton
-            icon="copy"
-            disabled={!info}
-            onClick={() => {
-              if (!info) return;
-              void navigator.clipboard
-                ?.writeText(reportText(info, cacheBytes, cacheLimit))
-                .then(() => setCopied(true))
-                .catch(() => setFailure(t("next.system.copyFailed")));
-            }}
-          >
-            {copied ? t("next.system.copied") : t("next.system.copyReport")}
-          </SecondaryButton>
-          <PrimaryButton icon="downloadFile" disabled={busy} onClick={() => void downloadDiagnostics()}>
-            {busy ? t("next.system.collecting") : t("next.system.downloadDiagnostics")}
-          </PrimaryButton>
-        </>
-      }
-      railMiddle={<AttentionBlock />}
-      railFooter={<UptimeBlock />}
-      statusRight={
-        failure ??
-        t("next.system.collectedAt", {
-          time: collectedAt.toLocaleTimeString([], { hour12: false }),
-        })
-      }
-    >
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-        {!info ? (
-          <EmptyState
-            loading={!error}
-            title={error ? t("next.system.unavailable") : t("next.common.loading")}
-            body={error ? error.message : t("next.system.loadingBody")}
-          />
-        ) : (
+    <MetricsSnapshotContext value={metrics}>
+      <NextShell
+        title={t("next.nav.systemInfo")}
+        note={t("next.system.note")}
+        controls={
           <>
-            <SectionHeader
-              label={t("next.system.software")}
-              note={t("next.system.softwareNote", {
-                version: info.version,
-                uptime: formatDuration(info.uptimeSeconds),
-              })}
+            <CopyReportButton
+              info={info}
+              copied={copied}
+              onCopied={() => setCopied(true)}
+              onFailed={() => setFailure(t("next.system.copyFailed"))}
             />
-            <KeyValueRow label={t("next.system.version")} value={info.version} />
-            <KeyValueRow
-              label={t("next.system.deployment")}
-              value={`${enumLabel(info.deployment)} · ${info.architecture}`}
-            />
-            <KeyValueRow label={t("next.system.operatingSystem")} value={enumLabel(info.operatingSystem)} />
-            <KeyValueRow label={t("next.system.database")} value={enumLabel(info.databaseEngine)} />
-            <KeyValueRow label={t("next.rail.uptime")} value={formatDuration(info.uptimeSeconds)} />
-
-            <ApplicationUpgradeSection />
-
-            <SectionHeader label={t("next.system.compute")} note={t("next.system.computeNote")} />
-            <KeyValueRow label={t("next.system.decoderTier")} value={info.compute.decoderTier} />
-            <KeyValueRow
-              label={t("next.system.simd")}
-              value={info.compute.simdFeatures.join(", ") || t("next.system.noneDetected")}
-            />
-            <KeyValueRow
-              label={t("next.system.cores")}
-              value={t("next.system.coresValue", {
-                physical: info.compute.physicalCores,
-                logical: info.compute.logicalCores,
-              })}
-            />
-            <KeyValueRow
-              label={t("next.system.cpuQuota")}
-              value={
-                info.compute.cgroupLimit == null
-                  ? t("next.system.notLimited")
-                  : String(info.compute.cgroupLimit)
-              }
-            />
-
-            {info.compute.kernels.length > 0 ? (
-              <>
-                <SectionHeader label={t("next.system.kernels")} note={t("next.system.kernelsNote")} />
-                {info.compute.kernels.map((entry) => (
-                  <KernelRow key={entry.component} entry={entry} />
-                ))}
-              </>
-            ) : null}
-
-            <SectionHeader label={t("next.system.memory")} note={t("next.system.memoryNote")} />
-            <KeyValueRow label={t("next.system.totalMemory")} value={formatSize(info.memory.totalBytes)} />
-            <KeyValueRow
-              label={t("next.system.availableAtStartup")}
-              value={formatSize(info.memory.availableAtStartupBytes)}
-            />
-            <KeyValueRow
-              label={t("next.system.containerLimit")}
-              value={
-                info.memory.cgroupLimitBytes == null
-                  ? t("next.system.notLimited")
-                  : formatSize(info.memory.cgroupLimitBytes)
-              }
-            />
-            <KeyValueRow
-              label={t("next.system.effectiveLimit")}
-              value={formatSize(info.memory.effectiveLimitBytes)}
-            />
-            <KeyValueRow label={t("next.system.articleCache")} value={cacheInUse} />
-
-            <SectionHeader
-              label={t("next.system.primaryStorage")}
-              note={t("next.system.primaryStorageNote")}
-            />
-            <KeyValueRow label={t("next.system.filesystem")} value={info.primaryStorage.filesystem} />
-            <KeyValueRow label={t("next.system.storageClass")} value={info.primaryStorage.storageClass} />
-            <KeyValueRow
-              label={t("next.system.randomRead")}
-              value={`${formatCount(info.primaryStorage.startupRandomReadIops)} IOPS`}
-            />
-
-            <SectionHeader
-              label={t("next.system.configuredStorage")}
-              note={t("next.system.configuredStorageNote")}
-            />
-            {info.configuredStorage.length === 0 ? (
-              <div className="px-4 sm:px-6 py-5 text-[13px] text-wv-muted">
-                {t("next.system.noStorage")}
-              </div>
-            ) : (
-              info.configuredStorage.map((volume) => (
-                <div
-                  key={volume.path}
-                  className="flex flex-wrap items-center gap-x-5 gap-y-3 border-b border-wv-hairline px-4 sm:px-6 py-[13px] hover:bg-wv-cell-hover"
-                >
-                  <div className="flex min-w-0 flex-[1_1_260px] flex-col gap-1">
-                    <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">
-                      {volume.labels.join(" · ") || t("next.system.storageFallback")}
-                    </span>
-                    <span title={volume.path} className="truncate font-wv-mono text-[11.5px] text-wv-faint">
-                      {volume.path}
-                    </span>
-                  </div>
-                  <StorageUsage
-                    label={
-                      volume.capacity
-                        ? t("next.system.usedOf", {
-                            used: formatSize(volume.capacity.usedBytes),
-                            total: formatSize(volume.capacity.totalBytes),
-                          })
-                        : EM_DASH
-                    }
-                    capacity={volume.capacity}
-                    error={volume.error}
-                    className="ml-auto w-[260px] max-w-full"
-                  />
-                </div>
-              ))
-            )}
+            <PrimaryButton icon="downloadFile" disabled={busy} onClick={() => void downloadDiagnostics()}>
+              {busy ? t("next.system.collecting") : t("next.system.downloadDiagnostics")}
+            </PrimaryButton>
           </>
-        )}
-      </div>
-    </NextShell>
+        }
+        railMiddle={<AttentionBlock />}
+        railFooter={<UptimeBlock />}
+        statusRight={
+          failure ??
+          t("next.system.collectedAt", {
+            time: collectedAt.toLocaleTimeString([], { hour12: false }),
+          })
+        }
+      >
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
+          {!info ? (
+            <EmptyState
+              loading={!error}
+              title={error ? t("next.system.unavailable") : t("next.common.loading")}
+              body={error ? error.message : t("next.system.loadingBody")}
+            />
+          ) : (
+            <>
+              <SectionHeader
+                label={t("next.system.software")}
+                note={t("next.system.softwareNote", {
+                  version: info.version,
+                  uptime: formatDuration(info.uptimeSeconds),
+                })}
+              />
+              <KeyValueRow label={t("next.system.version")} value={info.version} />
+              <KeyValueRow
+                label={t("next.system.deployment")}
+                value={`${enumLabel(info.deployment)} · ${info.architecture}`}
+              />
+              <KeyValueRow label={t("next.system.operatingSystem")} value={enumLabel(info.operatingSystem)} />
+              <KeyValueRow label={t("next.system.database")} value={enumLabel(info.databaseEngine)} />
+              <KeyValueRow label={t("next.rail.uptime")} value={formatDuration(info.uptimeSeconds)} />
+
+              <ApplicationUpgradeSection />
+
+              <SectionHeader label={t("next.system.compute")} note={t("next.system.computeNote")} />
+              <KeyValueRow label={t("next.system.decoderTier")} value={info.compute.decoderTier} />
+              <KeyValueRow
+                label={t("next.system.simd")}
+                value={info.compute.simdFeatures.join(", ") || t("next.system.noneDetected")}
+              />
+              <KeyValueRow
+                label={t("next.system.cores")}
+                value={t("next.system.coresValue", {
+                  physical: info.compute.physicalCores,
+                  logical: info.compute.logicalCores,
+                })}
+              />
+              <KeyValueRow
+                label={t("next.system.cpuQuota")}
+                value={
+                  info.compute.cgroupLimit == null
+                    ? t("next.system.notLimited")
+                    : String(info.compute.cgroupLimit)
+                }
+              />
+
+              {info.compute.kernels.length > 0 ? (
+                <>
+                  <SectionHeader label={t("next.system.kernels")} note={t("next.system.kernelsNote")} />
+                  {info.compute.kernels.map((entry) => (
+                    <KernelRow key={entry.component} entry={entry} />
+                  ))}
+                </>
+              ) : null}
+
+              <SectionHeader label={t("next.system.memory")} note={t("next.system.memoryNote")} />
+              <KeyValueRow label={t("next.system.totalMemory")} value={formatSize(info.memory.totalBytes)} />
+              <KeyValueRow
+                label={t("next.system.availableAtStartup")}
+                value={formatSize(info.memory.availableAtStartupBytes)}
+              />
+              <KeyValueRow
+                label={t("next.system.containerLimit")}
+                value={
+                  info.memory.cgroupLimitBytes == null
+                    ? t("next.system.notLimited")
+                    : formatSize(info.memory.cgroupLimitBytes)
+                }
+              />
+              <KeyValueRow
+                label={t("next.system.effectiveLimit")}
+                value={formatSize(info.memory.effectiveLimitBytes)}
+              />
+              <ArticleCacheRow />
+
+              <SectionHeader
+                label={t("next.system.primaryStorage")}
+                note={t("next.system.primaryStorageNote")}
+              />
+              <KeyValueRow label={t("next.system.filesystem")} value={info.primaryStorage.filesystem} />
+              <KeyValueRow label={t("next.system.storageClass")} value={info.primaryStorage.storageClass} />
+              <KeyValueRow
+                label={t("next.system.randomRead")}
+                value={`${formatCount(info.primaryStorage.startupRandomReadIops)} IOPS`}
+              />
+
+              <SectionHeader
+                label={t("next.system.configuredStorage")}
+                note={t("next.system.configuredStorageNote")}
+              />
+              {info.configuredStorage.length === 0 ? (
+                <div className="px-4 sm:px-6 py-5 text-[13px] text-wv-muted">
+                  {t("next.system.noStorage")}
+                </div>
+              ) : (
+                info.configuredStorage.map((volume) => (
+                  <div
+                    key={volume.path}
+                    className="flex flex-wrap items-center gap-x-5 gap-y-3 border-b border-wv-hairline px-4 sm:px-6 py-[13px] hover:bg-wv-cell-hover"
+                  >
+                    <div className="flex min-w-0 flex-[1_1_260px] flex-col gap-1">
+                      <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">
+                        {volume.labels.join(" · ") || t("next.system.storageFallback")}
+                      </span>
+                      <span title={volume.path} className="truncate font-wv-mono text-[11.5px] text-wv-faint">
+                        {volume.path}
+                      </span>
+                    </div>
+                    <StorageUsage
+                      label={
+                        volume.capacity
+                          ? t("next.system.usedOf", {
+                              used: formatSize(volume.capacity.usedBytes),
+                              total: formatSize(volume.capacity.totalBytes),
+                            })
+                          : EM_DASH
+                      }
+                      capacity={volume.capacity}
+                      error={volume.error}
+                      className="ml-auto w-[260px] max-w-full"
+                    />
+                  </div>
+                ))
+              )}
+            </>
+          )}
+        </div>
+      </NextShell>
+    </MetricsSnapshotContext>
   );
 }
+
+/** The article cache's bytes in use and its hard limit, from the latest sample. */
+function articleCache(metrics: MetricsSnapshot | null): { bytes: number; limit: number } {
+  return {
+    bytes: metrics?.decodePendingBytes ?? 0,
+    limit: metrics?.decodePressureHardLimitBytes ?? 0,
+  };
+}
+
+/**
+ * Fetches the diagnostics bundle and saves it. The message to show when that
+ * fails, or null once it is saved.
+ */
+async function saveDiagnostics(failed: () => string): Promise<string | null> {
+  try {
+    const response = await fetch(new URL("api/system/diagnostics", document.baseURI).href, {
+      headers: authHeaders(),
+      credentials: "same-origin",
+    });
+    if (!response.ok) {
+      throw new Error(await readDownloadErrorMessage(response, failed()));
+    }
+    await saveResponseAsDownload(response, `weaver-diagnostics-${Date.now()}.tar.zst`);
+    return null;
+  } catch (caught) {
+    return caught instanceof Error ? caught.message : failed();
+  }
+}
+
+/** Copies the report, with the article cache as the latest sample has it. */
+const CopyReportButton = memo(function CopyReportButton({
+  info,
+  copied,
+  onCopied,
+  onFailed,
+}: {
+  info: SystemInfo | undefined;
+  copied: boolean;
+  onCopied: () => void;
+  onFailed: () => void;
+}) {
+  const t = useTranslate();
+  const cache = articleCache(useContext(MetricsSnapshotContext));
+  return (
+    <SecondaryButton
+      icon="copy"
+      disabled={!info}
+      onClick={() => {
+        if (!info) return;
+        void navigator.clipboard
+          ?.writeText(reportText(info, cache.bytes, cache.limit))
+          .then(() => onCopied())
+          .catch(() => onFailed());
+      }}
+    >
+      {copied ? t("next.system.copied") : t("next.system.copyReport")}
+    </SecondaryButton>
+  );
+});
+
+/** The article cache row; it follows the metrics sample on its own. */
+const ArticleCacheRow = memo(function ArticleCacheRow() {
+  const t = useTranslate();
+  const cache = articleCache(useContext(MetricsSnapshotContext));
+  const cacheInUse =
+    cache.limit > 0
+      ? t("next.system.usedOf", { used: formatSize(cache.bytes), total: formatSize(cache.limit) })
+      : formatSize(cache.bytes);
+  return <KeyValueRow label={t("next.system.articleCache")} value={cacheInUse} />;
+});

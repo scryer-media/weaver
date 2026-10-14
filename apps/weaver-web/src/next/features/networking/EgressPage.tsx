@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
-import { useClient, useMutation, useQuery } from "urql";
+import { memo, useEffect, useMemo, useState } from "react";
+import { useClient, useMutation, useQuery, type Client } from "urql";
 import { CREATE_EGRESS, DELETE_EGRESS, RESET_EGRESS_USAGE, TEST_EGRESS, UPDATE_EGRESS } from "@/graphql/networking";
 import { SETTINGS_QUERY, UPDATE_SETTINGS_MUTATION } from "@/graphql/queries";
-import { useTranslate } from "@/lib/context/translate-context";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import type { Egress } from "@/lib/networking";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Dialog } from "../../components/Dialog";
@@ -127,7 +127,7 @@ function useDownloadCeiling(busy: boolean, message: string | null, failed: boole
   return { block, loading: fetching && !data };
 }
 
-export function EgressPage({
+export const EgressPage = memo(function EgressPage({
   data,
   egresses,
   action,
@@ -242,7 +242,7 @@ export function EgressPage({
       ) : null}
     </>
   );
-}
+});
 
 /**
  * One egress in its editor, mounted while it is open. The egress table opens
@@ -483,6 +483,33 @@ export function EgressEditor({
   );
 }
 
+type EgressTestResult = { ok: boolean; text: string };
+
+/** Connects out through one egress and reports what came back. Outside the component, so the component compiles. */
+async function testEgress(
+  client: Client,
+  t: Translate,
+  variables: { id: number; host: string; port: number },
+  report: (result: EgressTestResult) => void,
+): Promise<void> {
+  const response = await client.mutation(TEST_EGRESS, variables).toPromise();
+  const outcome = response.data?.testEgressInterface as
+    | { success: boolean; message: string; sourceAddress: string | null; connectMillis: number | null }
+    | undefined;
+  if (response.error || !outcome) {
+    report({ ok: false, text: response.error?.message ?? t("next.networking.egress.testFailed") });
+  } else {
+    report({
+      ok: outcome.success,
+      text: [
+        outcome.message,
+        ...(outcome.sourceAddress ? [t("next.networking.egress.source", { address: outcome.sourceAddress })] : []),
+        ...(outcome.connectMillis != null ? [`${outcome.connectMillis} ms`] : []),
+      ].join(" · "),
+    });
+  }
+}
+
 /** Connect out through one egress and report the source address the far end saw. */
 function EgressTest({ egress, onClose }: { egress: Egress; onClose: () => void }) {
   const t = useTranslate();
@@ -490,30 +517,11 @@ function EgressTest({ egress, onClose }: { egress: Egress; onClose: () => void }
   const [host, setHost] = useState("");
   const [port, setPort] = useState(443);
   const [running, setRunning] = useState(false);
-  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const [result, setResult] = useState<EgressTestResult | null>(null);
 
   const run = async () => {
     setRunning(true);
-    try {
-      const response = await client.mutation(TEST_EGRESS, { id: egress.id, host: host.trim(), port }).toPromise();
-      const outcome = response.data?.testEgressInterface as
-        | { success: boolean; message: string; sourceAddress: string | null; connectMillis: number | null }
-        | undefined;
-      if (response.error || !outcome) {
-        setResult({ ok: false, text: response.error?.message ?? t("next.networking.egress.testFailed") });
-      } else {
-        setResult({
-          ok: outcome.success,
-          text: [
-            outcome.message,
-            ...(outcome.sourceAddress ? [t("next.networking.egress.source", { address: outcome.sourceAddress })] : []),
-            ...(outcome.connectMillis != null ? [`${outcome.connectMillis} ms`] : []),
-          ].join(" · "),
-        });
-      }
-    } finally {
-      setRunning(false);
-    }
+    await testEgress(client, t, { id: egress.id, host: host.trim(), port }, setResult).finally(() => setRunning(false));
   };
 
   return (

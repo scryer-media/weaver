@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, type CombinedError } from "urql";
 import {
   ARCHIVE_PASSWORD_SETTINGS_QUERY,
@@ -119,7 +119,9 @@ function useAnswered<T>(read: T | undefined): [T | undefined, (answer: T) => voi
   const [answered, setAnswered] = useState<{ read: T | undefined; value: T } | null>(null);
   // The read an answer lands on, which may be newer than the one it was asked under.
   const readRef = useRef(read);
-  readRef.current = read;
+  useLayoutEffect(() => {
+    readRef.current = read;
+  }, [read]);
   return [
     answered !== null && answered.read === read ? answered.value : read,
     (value: T) => setAnswered({ read: readRef.current, value }),
@@ -193,7 +195,9 @@ export function GeneralPanel() {
   // or refused. A refused value stays in its field beside the daemon's reason.
   const [edits, setEdits] = useState<Partial<Form>>({});
   const editsRef = useRef(edits);
-  editsRef.current = edits;
+  useLayoutEffect(() => {
+    editsRef.current = edits;
+  }, [edits]);
   // What each field holds once the saves still on their way land.
   const pending = useRef<Partial<Form>>({});
   // Saves run one at a time in the order they were made, so the last change

@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
+import { useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
 import { useMutation, useQuery, type CombinedError } from "urql";
 import { eventScriptDefaults, eventScriptOptions, eventScriptSection, type EventScriptOptions } from "@/next/components/EventScriptSettings";
 import {
@@ -457,7 +457,9 @@ export function ScriptListPanel() {
   const fetched = data?.scriptInstances;
   // The list as last read, for an answer that lands after a newer read than the one it was asked under.
   const fetchedRef = useRef(fetched);
-  fetchedRef.current = fetched;
+  useLayoutEffect(() => {
+    fetchedRef.current = fetched;
+  }, [fetched]);
   const instances = reordered && reordered.base === fetched ? reordered.value : (fetched ?? NO_INSTANCES);
   const scripts = discovered?.discoveredScripts.scripts ?? NO_SCRIPTS;
   const problems = discovered?.discoveredScripts.problems ?? [];

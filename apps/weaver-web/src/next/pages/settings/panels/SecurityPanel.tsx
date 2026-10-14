@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import { useClient, useMutation, useQuery } from "urql";
 import {
   ACCESS_POLICY_QUERY,
@@ -157,6 +157,24 @@ export function SecurityPanel() {
       refetchNetwork={() => refetchNetwork({ requestPolicy: "network-only" })}
     />
   );
+}
+
+/**
+ * Ends every session, this browser's too: "password" when the server wants a
+ * recent password check first. Outside the panel, so the panel itself compiles.
+ */
+async function signOutEverywhere(): Promise<"signedOut" | "password" | "failed"> {
+  try {
+    const response = await fetch(new URL("api/auth/signout-all", document.baseURI), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      credentials: "include",
+    });
+    if (response.status === 428) return "password";
+    return response.ok ? "signedOut" : "failed";
+  } catch {
+    return "failed";
+  }
 }
 
 function SecurityPanelBody({
@@ -529,7 +547,8 @@ function SecurityPanelBody({
   // consumed first: a reload must not quietly mint a second key. An install
   // that wants a recent password check asks for it here, then mints the key.
   const keyLinkSpent = useRef(false);
-  useEffect(() => {
+  // The link is read once on arrival, with whatever the panel holds then.
+  const takeKeyLink = useEffectEvent(() => {
     if (keyLinkSpent.current) return;
     const { link, search } = takeApiKeyLink(window.location.search);
     if (!link) return;
@@ -552,8 +571,9 @@ function SecurityPanelBody({
       }
       return outcome === "password" ? "password" : "done";
     });
-    // The link is read once on arrival; nothing it depends on changes after that.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  });
+  useEffect(() => {
+    takeKeyLink();
   }, []);
 
   const submitRemoveKey = async (key: ApiKey): Promise<"done" | "password"> => {
@@ -579,23 +599,13 @@ function SecurityPanelBody({
   const submitSignOutAll = async (): Promise<"done" | "password"> => {
     setBusy(true);
     setSignOutAllError(null);
-    try {
-      const response = await fetch(new URL("api/auth/signout-all", document.baseURI), {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        credentials: "include",
-      });
-      if (response.status === 428) return "password";
-      if (!response.ok) {
-        setSignOutAllError(t("next.security.signOutEverywhereFailed"));
-        return "done";
-      }
-    } catch {
+    const outcome = await signOutEverywhere();
+    if (outcome === "failed") {
       setSignOutAllError(t("next.security.signOutEverywhereFailed"));
-      return "done";
-    } finally {
-      setBusy(false);
     }
+    setBusy(false);
+    if (outcome === "password") return "password";
+    if (outcome === "failed") return "done";
     // This browser's session went with the rest; the entry page asks it to sign in.
     window.location.assign(new URL(".", document.baseURI));
     return "done";

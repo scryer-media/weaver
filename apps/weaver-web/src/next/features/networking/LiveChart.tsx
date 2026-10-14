@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 
 /** One closed bin: when it closed, in ms since measuring began, and the rate over it. */
@@ -27,33 +27,49 @@ function niceCeiling(value: number): number {
 /** How long the chart takes to move on to a newly closed bin; the polls arrive about a second apart. */
 const GLIDE_MS = 1000;
 
+/** Sets one attribute the glide moves; one that already reads so is left alone. */
+function place(element: Element | null, name: string, value: string) {
+  if (element && element.getAttribute(name) !== value) {
+    element.setAttribute(name, value);
+  }
+}
+
 /**
- * The point on the run's clock the chart shows, gliding on to each newly closed
- * bin over a second rather than jumping. A clock that goes back is a new run, and
- * jumps there.
+ * Moves the chart to the point on the run's clock it shows, gliding on to each
+ * newly closed bin over a second rather than jumping. A clock that goes back is a
+ * new run, and jumps there.
+ *
+ * The glide is drawn by `paint`, frame by frame, straight onto the chart: the
+ * chart renders once per poll, not once per frame. Each render repaints where the
+ * glide stands, so what it drew new is in place before it is seen.
  */
-function useGlide(target: number): number {
-  const [shown, setShown] = useState(target);
+function useGlide(target: number, paint: (shown: number) => void) {
   const current = useRef(target);
+  const painter = useRef(paint);
+  useLayoutEffect(() => {
+    painter.current = paint;
+    paint(current.current);
+  });
   useEffect(() => {
     const from = current.current;
     if (target <= from || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
       current.current = target;
-      setShown(target);
+      painter.current(target);
       return;
     }
     const since = performance.now();
-    let frame = requestAnimationFrame(function step(now: number) {
+    let frame: number;
+    const step = (now: number) => {
       const progress = Math.min(1, Math.max(0, (now - since) / GLIDE_MS));
       current.current = from + (target - from) * progress;
-      setShown(current.current);
+      painter.current(current.current);
       if (progress < 1) {
         frame = requestAnimationFrame(step);
       }
-    });
+    };
+    frame = requestAnimationFrame(step);
     return () => cancelAnimationFrame(frame);
   }, [target]);
-  return shown;
 }
 
 /**
@@ -90,27 +106,38 @@ export function LiveChart({
 
   const latest = points.at(-1);
   const end = latest?.at ?? 0;
-  const shown = useGlide(end);
   const ceiling = niceCeiling(Math.max(0, ...points.filter((point) => point.at > end - WINDOW_MS * 1.5).map((point) => point.rate)));
   const scale = width / WINDOW_MS;
   const y = (rate: number) => HEIGHT - (Math.min(rate, ceiling) / ceiling) * (HEIGHT - HEAD);
-  // The line is laid out on the run's own clock from 0; the window is moved over it.
-  const shift = Math.min(0, width - shown * scale);
-  const reach = shown * scale + shift;
-  const vertices = [{ at: 0, rate: points[0]?.rate ?? 0 }, ...points]
-    .filter((point, index, all) => (all[index + 1]?.at ?? Infinity) >= shown - WINDOW_MS - 2000)
-    .map((point) => ({ x: point.at * scale, y: y(point.rate) }));
-  const line = vertices.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`);
-  const first = line[0]?.split(",")[0] ?? "0";
-  // Where the line stands at the shown moment, between the two corners either side of it.
-  const at = shown * scale;
-  const after = vertices.findIndex((point) => point.x >= at);
-  const before = vertices[after - 1];
-  const next = vertices[after] ?? vertices.at(-1);
-  const dot =
-    before && next && next.x > before.x
-      ? before.y + ((next.y - before.y) * (at - before.x)) / (next.x - before.x)
-      : (next?.y ?? HEIGHT);
+  const reveal = useRef<SVGRectElement>(null);
+  const slide = useRef<SVGGElement>(null);
+  const area = useRef<SVGPolygonElement>(null);
+  const trace = useRef<SVGPolylineElement>(null);
+  const lead = useRef<SVGGElement>(null);
+  useGlide(end, (shown) => {
+    // The line is laid out on the run's own clock from 0; the window is moved over it.
+    const shift = Math.min(0, width - shown * scale);
+    const reach = shown * scale + shift;
+    const vertices = [{ at: 0, rate: points[0]?.rate ?? 0 }, ...points]
+      .filter((point, index, all) => (all[index + 1]?.at ?? Infinity) >= shown - WINDOW_MS - 2000)
+      .map((point) => ({ x: point.at * scale, y: y(point.rate) }));
+    const line = vertices.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`);
+    const first = line[0]?.split(",")[0] ?? "0";
+    // Where the line stands at the shown moment, between the two corners either side of it.
+    const at = shown * scale;
+    const after = vertices.findIndex((point) => point.x >= at);
+    const before = vertices[after - 1];
+    const next = vertices[after] ?? vertices.at(-1);
+    const dot =
+      before && next && next.x > before.x
+        ? before.y + ((next.y - before.y) * (at - before.x)) / (next.x - before.x)
+        : (next?.y ?? HEIGHT);
+    place(reveal.current, "x", String(reach - width));
+    place(slide.current, "transform", `translate(${shift.toFixed(1)} 0)`);
+    place(area.current, "points", `${first},${HEIGHT} ${line.join(" ")} ${(end * scale).toFixed(1)},${HEIGHT}`);
+    place(trace.current, "points", line.join(" "));
+    place(lead.current, "transform", `translate(${reach.toFixed(1)} ${dot.toFixed(1)})`);
+  });
 
   return (
     <div ref={box} className="relative h-[132px] w-full min-w-0" role="img" aria-label={label}>
@@ -123,7 +150,7 @@ export function LiveChart({
             </linearGradient>
             <clipPath id={clip}>
               {/* What has arrived so far, revealed as it arrives. */}
-              <rect x={reach - width} y={-HEAD} width={width} height={HEIGHT + 2 * HEAD} />
+              <rect ref={reveal} y={-HEAD} width={width} height={HEIGHT + 2 * HEAD} />
             </clipPath>
           </defs>
           <line x1={0} x2={width} y1={HEIGHT - 0.5} y2={HEIGHT - 0.5} className="stroke-wv-hairline" />
@@ -133,13 +160,13 @@ export function LiveChart({
           </text>
           {points.length ? (
             <g clipPath={`url(#${clip})`}>
-              <g transform={`translate(${shift.toFixed(1)} 0)`}>
-                <polygon points={`${first},${HEIGHT} ${line.join(" ")} ${(end * scale).toFixed(1)},${HEIGHT}`} fill={`url(#${fill})`} />
-                <polyline points={line.join(" ")} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+              <g ref={slide}>
+                <polygon ref={area} fill={`url(#${fill})`} />
+                <polyline ref={trace} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
               </g>
             </g>
           ) : null}
-          <g className={cn(!latest && "opacity-0")} transform={`translate(${reach.toFixed(1)} ${dot.toFixed(1)})`}>
+          <g ref={lead} className={cn(!latest && "opacity-0")}>
             <circle r={8} fill={color} opacity={0.25} className="origin-center [transform-box:fill-box] motion-safe:animate-ping" />
             <circle r={3.5} fill={color} />
           </g>

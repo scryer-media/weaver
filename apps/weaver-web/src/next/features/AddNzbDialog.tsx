@@ -48,7 +48,7 @@ export function AddNzbDialog({
 }) {
   const t = useTranslate();
   const upload = useUploadNzb({ open, resetOnOpen: true, onSubmitted: onClose });
-  const { addFiles } = upload;
+  const { addFiles, fileInputRef } = upload;
   const blocked = upload.entries.filter(isBlocked);
   // Set once a submit has answered, so its verdict is read from the entries it updated.
   const [awaitingVerdict, setAwaitingVerdict] = useState(false);
@@ -142,7 +142,7 @@ export function AddNzbDialog({
           )}
         >
           <input
-            ref={upload.fileInputRef}
+            ref={fileInputRef}
             type="file"
             accept={NZB_UPLOAD_ACCEPT}
             multiple

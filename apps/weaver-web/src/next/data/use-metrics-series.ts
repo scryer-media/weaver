@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { createContext, useEffect, useMemo, useState } from "react";
 import { useQuery, useSubscription } from "urql";
 import {
   METRICS_HISTORY_QUERY,
@@ -117,6 +117,12 @@ interface MetricsPageResponse {
   metrics: MetricsSnapshot;
   globalState: { isPaused: boolean; downloadBlock: DownloadBlockState };
 }
+
+/**
+ * The snapshot a screen holds, for the parts of it that show a figure from
+ * it: a new sample redraws those, not the screen around them.
+ */
+export const MetricsSnapshotContext = createContext<MetricsSnapshot | null>(null);
 
 /** The full live metrics snapshot — the stat strip reads every field of it. */
 export function useMetricsSnapshot(): MetricsSnapshot | null {

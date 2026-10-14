@@ -193,16 +193,18 @@ export function useLiveSpeed(): number {
 
 /**
  * The job's download rate from the same push, and the same server tick, as
- * `useLiveSpeed`. Re-renders only when this job's figure changes.
+ * `useLiveSpeed`; `fallback` while the push in hand carries no rates, and 0
+ * when it carries none for this job. Re-renders only when the figure changes.
  */
-export function useLiveJobDownloadRate(jobId: number | null | undefined): LiveJobDownloadRate {
+export function useLiveJobDownloadRate(jobId: number | null | undefined, fallback: number): number {
   const ratesStore = useContext(LiveJobDownloadRatesStoreContext);
+  const read = () => resolveRate(ratesStore.getRate(jobId), fallback);
 
-  return useSyncExternalStore(
-    ratesStore.subscribe,
-    () => ratesStore.getRate(jobId),
-    () => undefined,
-  );
+  return useSyncExternalStore(ratesStore.subscribe, read, () => fallback);
+}
+
+function resolveRate(live: LiveJobDownloadRate, fallback: number): number {
+  return live === undefined ? fallback : (live ?? 0);
 }
 
 export function useLivePaused(): boolean {

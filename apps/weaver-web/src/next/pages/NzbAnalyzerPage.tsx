@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { useMutation } from "urql";
+import { useMutation, type UseMutationExecute } from "urql";
 import { ANALYZE_NZB_MUTATION } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
@@ -28,6 +28,24 @@ function toBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.subarray(start, start + SLICE));
   }
   return btoa(binary);
+}
+
+/** The report for one NZB, or the message to show in its place. */
+async function analyzeFile(
+  file: File,
+  analyzeNzb: UseMutationExecute<AnalyzeNzbResponse>,
+  failed: () => string,
+): Promise<{ report: SupportReport } | { error: string }> {
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const result = await analyzeNzb({ input: { nzbBase64: toBase64(bytes) } });
+    if (result.error || !result.data?.analyzeNzb) {
+      return { error: result.error?.graphQLErrors[0]?.message ?? failed() };
+    }
+    return { report: result.data.analyzeNzb };
+  } catch {
+    return { error: failed() };
+  }
 }
 
 /**
@@ -62,21 +80,14 @@ export function NzbAnalyzerPage() {
       setBusy(false);
       return;
     }
-    try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const result = await analyzeNzb({ input: { nzbBase64: toBase64(bytes) } });
-      if (result.error || !result.data?.analyzeNzb) {
-        setReport(null);
-        setError(result.error?.graphQLErrors[0]?.message ?? t("next.analyzer.failed"));
-        return;
-      }
-      setReport(result.data.analyzeNzb);
-    } catch {
+    const outcome = await analyzeFile(file, analyzeNzb, () => t("next.analyzer.failed"));
+    if ("report" in outcome) {
+      setReport(outcome.report);
+    } else {
       setReport(null);
-      setError(t("next.analyzer.failed"));
-    } finally {
-      setBusy(false);
+      setError(outcome.error);
     }
+    setBusy(false);
   };
 
   return (

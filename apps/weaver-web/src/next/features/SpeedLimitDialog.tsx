@@ -22,7 +22,7 @@ const MIB = 1024 * 1024;
  */
 export function useSpeedLimitDialog() {
   const t = useTranslate();
-  const { speedLimit: ceiling, downloadBlock } = useNextData();
+  const { speedLimit: ceiling, downloadBlock } = useNextData("speedLimit", "downloadBlock");
   const [saveState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
   const [open, setOpen] = useState(false);
   const [megabytes, setMegabytes] = useState(0);
@@ -92,7 +92,7 @@ export function useSpeedLimitDialog() {
  * the configured ceiling. Zero is unlimited.
  */
 export function useSpeedLimitInForce() {
-  const { speedLimit, downloadBlock } = useNextData();
+  const { speedLimit, downloadBlock } = useNextData("speedLimit", "downloadBlock");
   const scheduled = downloadBlock.scheduledSpeedLimit;
   return { inForce: scheduled > 0 ? scheduled : speedLimit, bySchedule: scheduled > 0 };
 }

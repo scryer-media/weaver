@@ -14,7 +14,15 @@ import {
   type ProxyPool,
 } from "@/lib/networking";
 import type { ProxyProfile } from "@/lib/proxies";
-import { EMPTY_FLOW, flowConsumers, plannedFlow, speedPage, type Consumer, type NetworkingData } from "./data";
+import {
+  EMPTY_FLOW,
+  flowConsumers,
+  plannedFlow,
+  speedPage,
+  useSameWhileUnchanged,
+  type Consumer,
+  type NetworkingData,
+} from "./data";
 import { NetworkFlow, type FlowEndpoint } from "./NetworkFlow";
 
 /** One leg while a test measures: its connections, the rung they went by (null for direct), and its rate now. */
@@ -43,6 +51,14 @@ export function RouteView({
   const [{ data, error }] = useQuery<NetworkingData>({ query: NETWORKING_QUERY, pause: !consumer });
   const [initial] = useQuery<{ networkFlow: Flow }>({ query: NETWORK_FLOW_QUERY, pause: !consumer });
   const [live] = useSubscription<{ networkFlow: Flow }>({ query: NETWORK_FLOW_SUBSCRIPTION, pause: !consumer });
+  const measured = live.data?.networkFlow ?? initial.data?.networkFlow ?? EMPTY_FLOW;
+  const find = (consumers: Consumer[]) => consumers.find((candidate) => candidate.key === consumer);
+  // The flow names the consumers it has sampled; one it has not is still in the configuration.
+  // Each sample carries them, the egresses and the proxies afresh; the same ones are held.
+  const own = useSameWhileUnchanged(find(flowConsumers(measured, data)) ?? find(flowConsumers(EMPTY_FLOW, data)));
+  const egresses = useSameWhileUnchanged(measured.egresses ?? data?.egressInterfaces ?? []);
+  const profiles = useSameWhileUnchanged(measured.proxies ?? data?.proxyProfiles ?? []);
+  const pools = useSameWhileUnchanged(measured.proxyPools ?? data?.proxyPools ?? []);
   if (!consumer) {
     return (
       <p className="px-4 py-4 text-[12.5px] leading-[1.5] text-wv-muted sm:px-6">
@@ -51,10 +67,6 @@ export function RouteView({
     );
   }
 
-  const measured = live.data?.networkFlow ?? initial.data?.networkFlow ?? EMPTY_FLOW;
-  const find = (consumers: Consumer[]) => consumers.find((candidate) => candidate.key === consumer);
-  // The flow names the consumers it has sampled; one it has not is still in the configuration.
-  const own = find(flowConsumers(measured, data)) ?? find(flowConsumers(EMPTY_FLOW, data));
   return (
     <div className="flex min-w-0 flex-col">
       {error ? (
@@ -66,9 +78,9 @@ export function RouteView({
         <NetworkFlow
           compact
           flow={plannedFlow(measured, [own])}
-          egresses={measured.egresses ?? data?.egressInterfaces ?? []}
-          profiles={measured.proxies ?? data?.proxyProfiles ?? []}
-          pools={measured.proxyPools ?? data?.proxyPools ?? []}
+          egresses={egresses}
+          profiles={profiles}
+          pools={pools}
           consumers={[own]}
         />
       ) : error ? null : (

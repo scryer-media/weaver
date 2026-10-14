@@ -184,6 +184,9 @@ function buildQueueEtaById(jobs: EtaJobInput[], speed: number): Map<number, stri
 }
 
 export function useStableEtaSpeed(jobs: EtaJobInput[], instantaneousSpeed: number): number {
+  // Every render is a sample, the same jobs and speed included: the estimate
+  // settles with the time between them, so it must not be cached by its inputs.
+  "use no memo";
   const [state] = useState<EtaEstimatorState>(() => ({
     signature: "",
     samples: [],

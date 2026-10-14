@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useClient } from "urql";
 import {
   CANCEL_SCRIPT_TEST_MUTATION,
@@ -72,7 +72,9 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
   const started = useRef(false);
   const closed = useRef(false);
   const latest = useRef<ScriptTestRun | null>(null);
-  latest.current = run;
+  useLayoutEffect(() => {
+    latest.current = run;
+  }, [run]);
 
   const cancel = useCallback(
     (id: string) => client.mutation<{ cancelScriptTest: boolean }>(CANCEL_SCRIPT_TEST_MUTATION, { id }).toPromise(),

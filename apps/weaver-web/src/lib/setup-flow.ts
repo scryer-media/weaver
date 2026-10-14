@@ -116,17 +116,8 @@ export function useRestartAction() {
       if (cancelled) {
         return;
       }
-      try {
-        const response = await fetch(statusUrl(), {
-          credentials: "include",
-          cache: "no-store",
-        });
-        if (!cancelled && response.ok) {
-          window.location.reload();
-          return;
-        }
-      } catch {
-        // Expected for as long as Weaver is down.
+      if (await reloadOnceAnswering(() => cancelled)) {
+        return;
       }
       if (cancelled) {
         return;
@@ -149,27 +140,90 @@ export function useRestartAction() {
 
   const restart = async () => {
     setError(null);
-    try {
-      // The session cookie alone is refused: a browser request that changes
-      // state also has to carry the CSRF value loaded with the session.
-      const response = await fetch(restartUrl(), {
-        method: "POST",
-        credentials: "include",
-        headers: authHeaders(),
-      });
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => ({}))) as { error?: string };
-        setError(payload.error ?? `restart failed (${response.status})`);
-        return;
-      }
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+    const failure = await requestRestart();
+    if (failure !== null) {
+      setError(failure);
       return;
     }
     setPhase("restarting");
   };
 
   return { phase, error, restart };
+}
+
+/** Reloads the page if Weaver answers its status check and the wait still stands; whether it did. */
+async function reloadOnceAnswering(cancelled: () => boolean): Promise<boolean> {
+  try {
+    const response = await fetch(statusUrl(), {
+      credentials: "include",
+      cache: "no-store",
+    });
+    if (!cancelled() && response.ok) {
+      window.location.reload();
+      return true;
+    }
+  } catch {
+    // Expected for as long as Weaver is down.
+  }
+  return false;
+}
+
+/** Asks Weaver to restart; why it refused, or null once it accepted. */
+async function requestRestart(): Promise<string | null> {
+  try {
+    // The session cookie alone is refused: a browser request that changes
+    // state also has to carry the CSRF value loaded with the session.
+    const response = await fetch(restartUrl(), {
+      method: "POST",
+      credentials: "include",
+      headers: authHeaders(),
+    });
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => ({}))) as { error?: string };
+      return payload.error ?? `restart failed (${response.status})`;
+    }
+  } catch (cause) {
+    return cause instanceof Error ? cause.message : String(cause);
+  }
+  return null;
+}
+
+type SetupOutcome =
+  | { kind: "failed"; error: string }
+  | { kind: "restart"; supported: boolean; unsupportedReason: string | null }
+  | { kind: "reloading" };
+
+/** Sends the finished form, and reloads the page once setup is done and no restart is needed. */
+async function requestSetup(
+  body: Record<string, unknown>,
+  authenticatedAccess: boolean,
+): Promise<SetupOutcome> {
+  try {
+    const response = await fetch(setupUrl(), {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const payload = (await response.json().catch(() => ({}))) as SetupResponse;
+    if (!response.ok) {
+      return { kind: "failed", error: payload.error ?? `setup failed (${response.status})` };
+    }
+    if (authenticatedAccess) {
+      await refreshSessionCookie();
+    }
+    if (payload.restartRequiredForBind) {
+      return {
+        kind: "restart",
+        supported: Boolean(payload.restartSupported),
+        unsupportedReason: payload.restartUnsupportedReason ?? null,
+      };
+    }
+    window.location.reload();
+    return { kind: "reloading" };
+  } catch (cause) {
+    return { kind: "failed", error: cause instanceof Error ? cause.message : String(cause) };
+  }
 }
 
 /// The fresh-install form: its state, what the deployment lets it ask, and
@@ -217,44 +271,25 @@ export function useSetupForm(environment?: SetupEnvironment | null) {
     }
     setError(null);
     setSubmitting(true);
-    try {
-      const body: Record<string, unknown> = { mode: selectedMode };
-      if (needsCredentials) {
-        body.username = username.trim();
-        body.password = password;
-      }
-      if (codeRequired) {
-        body.setupCode = setupCode.trim();
-      }
-      if (bindWide && bindQuestionApplies) {
-        body.bindAddress = "0.0.0.0";
-      }
-      const response = await fetch(setupUrl(), {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const payload = (await response.json().catch(() => ({}))) as SetupResponse;
-      if (!response.ok) {
-        setError(payload.error ?? `setup failed (${response.status})`);
-        setSubmitting(false);
-        return;
-      }
-      if (authenticatedAccess) {
-        await refreshSessionCookie();
-      }
-      if (payload.restartRequiredForBind) {
-        setRestart({
-          supported: Boolean(payload.restartSupported),
-          unsupportedReason: payload.restartUnsupportedReason ?? null,
-        });
-        return;
-      }
-      window.location.reload();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+    const body: Record<string, unknown> = { mode: selectedMode };
+    if (needsCredentials) {
+      body.username = username.trim();
+      body.password = password;
+    }
+    if (codeRequired) {
+      body.setupCode = setupCode.trim();
+    }
+    if (bindWide && bindQuestionApplies) {
+      body.bindAddress = "0.0.0.0";
+    }
+    const outcome = await requestSetup(body, authenticatedAccess);
+    if (outcome.kind === "failed") {
+      setError(outcome.error);
       setSubmitting(false);
+      return;
+    }
+    if (outcome.kind === "restart") {
+      setRestart({ supported: outcome.supported, unsupportedReason: outcome.unsupportedReason });
     }
   };
 

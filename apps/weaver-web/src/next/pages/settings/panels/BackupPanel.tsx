@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 import { useQuery } from "urql";
 import { StoredBackups } from "./StoredBackups";
 import { createStoredBackup, useBackupAdminAction } from "./useBackupAdminAction";
@@ -95,6 +95,139 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+// The requests, outside the panel so the panel itself compiles. Each resolves to
+// what the panel shows next, or to what went wrong; none throws.
+
+type Outcome<T> = { done: T } | { failure: string };
+
+async function readStatus(t: Translate): Promise<Outcome<BackupStatus>> {
+  try {
+    return {
+      done: (await readJsonOrThrow(t, await fetch(endpoint("api/backup/status"), {
+        headers: authHeaders(),
+      }))) as BackupStatus,
+    };
+  } catch (failure) {
+    return { failure: message(failure) };
+  }
+}
+
+/** Builds an archive and saves it; resolves to the note naming the file. */
+async function exportBackup(t: Translate, password: string): Promise<Outcome<string>> {
+  try {
+    const response = await fetch(endpoint("api/backup/export"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ password: password.trim() ? password : null }),
+    });
+    if (!response.ok) {
+      await throwJsonError(t, response);
+    }
+    const filename = await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.enc`);
+    return { done: t("next.backup.savedFile", { name: filename }) };
+  } catch (failure) {
+    return { failure: message(failure) };
+  }
+}
+
+/** Reads an archive's manifest; resolves to it, the remaps it asks for, and the note saying so. */
+async function inspectBackup(
+  t: Translate,
+  file: File,
+  password: string,
+  dataDir: string,
+): Promise<Outcome<{ result: InspectResult; remaps: Record<string, string>; note: string }>> {
+  try {
+    const form = new FormData();
+    form.append("file", file);
+    if (password.trim()) {
+      form.append("password", password);
+    }
+    if (dataDir.trim()) {
+      form.append("data_dir", dataDir.trim());
+    }
+    const result = (await readJsonOrThrow(
+      t,
+      await fetch(endpoint("api/backup/inspect"), {
+        method: "POST",
+        headers: authHeaders(),
+        body: form,
+      }),
+    )) as InspectResult;
+    return {
+      done: {
+        result,
+        remaps: Object.fromEntries(result.required_category_remaps.map((entry) => [entry.category_name, ""])),
+        note:
+          result.required_category_remaps.length > 0
+            ? t("next.backup.readNeedsRemaps")
+            : t("next.backup.readDone"),
+      },
+    };
+  } catch (failure) {
+    return { failure: message(failure) };
+  }
+}
+
+/** Stages an archive to restore; resolves to the note saying what it holds. */
+async function restoreBackup(
+  t: Translate,
+  request: {
+    file: File;
+    password: string;
+    dataDir: string;
+    intermediateDir: string;
+    completeDir: string;
+    inspected: InspectResult | null;
+    remaps: Record<string, string>;
+  },
+): Promise<Outcome<string>> {
+  const { file, password, dataDir, intermediateDir, completeDir, inspected, remaps } = request;
+  try {
+    const form = new FormData();
+    form.append("file", file);
+    if (password.trim()) {
+      form.append("password", password);
+    }
+    form.append("data_dir", dataDir.trim());
+    if (intermediateDir.trim()) {
+      form.append("intermediate_dir", intermediateDir.trim());
+    }
+    if (completeDir.trim()) {
+      form.append("complete_dir", completeDir.trim());
+    }
+    const required = inspected?.required_category_remaps ?? [];
+    if (required.length > 0) {
+      form.append(
+        "category_remaps",
+        JSON.stringify(
+          required
+            .map((entry) => ({
+              category_name: entry.category_name,
+              new_dest_dir: remaps[entry.category_name]?.trim() ?? "",
+            }))
+            .filter((entry) => entry.new_dest_dir.length > 0),
+        ),
+      );
+    }
+    const report = (await readJsonOrThrow(
+      t,
+      await fetch(endpoint("api/backup/restore"), {
+        method: "POST",
+        headers: authHeaders(),
+        body: form,
+      }),
+    )) as RestoreReport;
+    return {
+      done: report.restart_required
+        ? countLabel(t, "next.backup.staged", report.history_jobs)
+        : countLabel(t, "next.backup.restored", report.history_jobs),
+    };
+  } catch (failure) {
+    return { failure: message(failure) };
+  }
+}
+
 export function BackupPanel() {
   const t = useTranslate();
   const [{ data, fetching }] = useQuery<{ settings: { dataDir: string } }>({ query: SETTINGS_QUERY });
@@ -127,21 +260,22 @@ export function BackupPanel() {
   }, [currentDataDir]);
 
   const loadStatus = async () => {
-    try {
-      setStatus((await readJsonOrThrow(t, await fetch(endpoint("api/backup/status"), {
-        headers: authHeaders(),
-      }))) as BackupStatus);
-    } catch (failure) {
+    const read = await readStatus(t);
+    if ("done" in read) {
+      setStatus(read.done);
+    } else {
       setStatus(null);
-      setError(message(failure));
+      setError(read.failure);
     }
   };
 
-  useEffect(() => {
+  // The status is read once when the panel opens; every action that can
+  // change it reads it again itself. A language change must not re-read it.
+  const loadStatusOnOpen = useEffectEvent(() => {
     void loadStatus();
-    // The status is read once when the panel opens; every action that can
-    // change it reads it again itself.
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- a language change must not re-read the status
+  });
+  useEffect(() => {
+    loadStatusOnOpen();
   }, []);
 
   const mismatch = passwordConfirm !== "" && passwordConfirm !== password;
@@ -150,24 +284,15 @@ export function BackupPanel() {
     setBusy(true);
     setError(null);
     setNote(t("next.backup.building"));
-    try {
-      const response = await fetch(endpoint("api/backup/export"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ password: password.trim() ? password : null }),
-      });
-      if (!response.ok) {
-        await throwJsonError(t, response);
-      }
-      const filename = await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.enc`);
-      setNote(t("next.backup.savedFile", { name: filename }));
+    const saved = await exportBackup(t, password);
+    if ("done" in saved) {
+      setNote(saved.done);
       setBackupGeneration((value) => value + 1);
-    } catch (failure) {
+    } else {
       setNote(null);
-      setError(message(failure));
-    } finally {
-      setBusy(false);
+      setError(saved.failure);
     }
+    setBusy(false);
   };
 
   const create = () => {
@@ -186,39 +311,17 @@ export function BackupPanel() {
     setBusy(true);
     setError(null);
     setNote(t("next.backup.reading"));
-    try {
-      const form = new FormData();
-      form.append("file", file);
-      if (restorePassword.trim()) {
-        form.append("password", restorePassword);
-      }
-      if (dataDir.trim()) {
-        form.append("data_dir", dataDir.trim());
-      }
-      const result = (await readJsonOrThrow(
-        t,
-        await fetch(endpoint("api/backup/inspect"), {
-          method: "POST",
-          headers: authHeaders(),
-          body: form,
-        }),
-      )) as InspectResult;
-      setInspected(result);
-      setRemaps(
-        Object.fromEntries(result.required_category_remaps.map((entry) => [entry.category_name, ""])),
-      );
-      setNote(
-        result.required_category_remaps.length > 0
-          ? t("next.backup.readNeedsRemaps")
-          : t("next.backup.readDone"),
-      );
-    } catch (failure) {
+    const read = await inspectBackup(t, file, restorePassword, dataDir);
+    if ("done" in read) {
+      setInspected(read.done.result);
+      setRemaps(read.done.remaps);
+      setNote(read.done.note);
+    } else {
       setInspected(null);
       setNote(null);
-      setError(message(failure));
-    } finally {
-      setBusy(false);
+      setError(read.failure);
     }
+    setBusy(false);
   };
 
   const restore = async () => {
@@ -229,53 +332,23 @@ export function BackupPanel() {
     setBusy(true);
     setError(null);
     setNote(t("next.backup.staging"));
-    try {
-      const form = new FormData();
-      form.append("file", file);
-      if (restorePassword.trim()) {
-        form.append("password", restorePassword);
-      }
-      form.append("data_dir", dataDir.trim());
-      if (intermediateDir.trim()) {
-        form.append("intermediate_dir", intermediateDir.trim());
-      }
-      if (completeDir.trim()) {
-        form.append("complete_dir", completeDir.trim());
-      }
-      const required = inspected?.required_category_remaps ?? [];
-      if (required.length > 0) {
-        form.append(
-          "category_remaps",
-          JSON.stringify(
-            required
-              .map((entry) => ({
-                category_name: entry.category_name,
-                new_dest_dir: remaps[entry.category_name]?.trim() ?? "",
-              }))
-              .filter((entry) => entry.new_dest_dir.length > 0),
-          ),
-        );
-      }
-      const report = (await readJsonOrThrow(
-        t,
-        await fetch(endpoint("api/backup/restore"), {
-          method: "POST",
-          headers: authHeaders(),
-          body: form,
-        }),
-      )) as RestoreReport;
-      setNote(
-        report.restart_required
-          ? countLabel(t, "next.backup.staged", report.history_jobs)
-          : countLabel(t, "next.backup.restored", report.history_jobs),
-      );
+    const staged = await restoreBackup(t, {
+      file,
+      password: restorePassword,
+      dataDir,
+      intermediateDir,
+      completeDir,
+      inspected,
+      remaps,
+    });
+    if ("done" in staged) {
+      setNote(staged.done);
       await loadStatus();
-    } catch (failure) {
+    } else {
       setNote(null);
-      setError(message(failure));
-    } finally {
-      setBusy(false);
+      setError(staged.failure);
     }
+    setBusy(false);
   };
 
   const missingRemaps = (inspected?.required_category_remaps ?? []).filter(

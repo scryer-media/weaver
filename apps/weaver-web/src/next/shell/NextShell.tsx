@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useState, type ReactNode } from "react";
 import { NavLink, useLocation } from "react-router";
 import { BrandLockup } from "@/lib/brand";
 import { useTranslate } from "@/lib/context/translate-context";
@@ -8,7 +8,7 @@ import { signOut } from "@/lib/logout";
 import { cn } from "@/lib/utils";
 import { upgradesInApp } from "@/next/features/updates/application-upgrade";
 import { useApplicationUpgradeStatus } from "@/next/features/updates/use-application-upgrade";
-import { useNextData } from "../data/next-data";
+import { useNextData, useNextDataSelector } from "../data/next-data";
 import { splitSpeed } from "../data/format";
 import { Eyebrow } from "../components/chrome";
 import { Icon, type IconName } from "../components/icons";
@@ -84,9 +84,16 @@ export function NextShell({
   children: ReactNode;
 }) {
   const t = useTranslate();
-  const { version, update, queue, historyCount, connection } = useNextData();
+  const { version, update, historyCount, connection } = useNextData(
+    "version",
+    "update",
+    "historyCount",
+    "connection",
+  );
+  const downloadCount = useNextDataSelector((data) => data.queue.summary.totalItems);
   const upgradeInApp = upgradesInApp(useApplicationUpgradeStatus());
   const [navOpen, setNavOpen] = useState(false);
+  const closeNav = useCallback(() => setNavOpen(false), []);
   const { pathname } = useLocation();
   const loginEnabled = useLoginEnabled();
 
@@ -108,74 +115,17 @@ export function NextShell({
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [navOpen]);
 
-  // The prototypes each wire up only their own screens, so their rails show
-  // different subsets. In the product the list is always whole — otherwise
-  // Monitoring is unreachable from Downloads.
-  const nav: NavEntry[] = [
-    { to: "/", label: t("next.nav.downloads"), icon: "downloads", count: queue.summary.totalItems, end: false },
-    { to: "/history", label: t("next.nav.history"), icon: "history", count: historyCount },
-    { to: "/monitoring", label: t("next.nav.monitoring"), icon: "monitoring" },
-    { to: "/system-info", label: t("next.nav.systemInfo"), icon: "systemInfo" },
-    { to: "/logs", label: t("next.nav.logs"), icon: "logs" },
-    { to: "/tools/nzb-analyzer", label: t("next.nav.nzbAnalyzer"), icon: "inspectFile" },
-    { to: "/settings", label: t("nav.settings"), icon: "settings" },
-  ];
-
   // Not a component: the aside and the drawer must render the same blocks, and
   // splitting it into one would put the rail's props back in a second signature.
   const renderRail = (onDismiss?: () => void) => (
     <>
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-        <div className="flex h-14 flex-none items-center gap-[9px] border-b border-wv-line-strong px-[18px]">
-          <BrandLockup className="h-[16px] w-auto flex-none" />
-          <span className="ml-auto font-wv-mono text-[10px] text-wv-faint">{version || "—"}</span>
-          {onDismiss === undefined ? null : (
-            <button
-              type="button"
-              onClick={onDismiss}
-              aria-label={t("next.shell.closeNavigation")}
-              className="-mr-[7px] flex size-7 flex-none cursor-pointer items-center justify-center text-[15px] text-wv-muted hover:text-wv-fg"
-            >
-              <Icon name="close" size={16} />
-            </button>
-          )}
-        </div>
-
-        <nav className="flex flex-col gap-0.5 px-[10px] py-[14px]">
-          {nav.map((entry) => (
-            <NavLink
-              key={entry.to}
-              to={entry.to}
-              end={entry.to === "/"}
-              className={({ isActive }) =>
-                cn(
-                  "flex h-8 items-center gap-[10px] px-[10px] text-[13.5px] hover:bg-wv-nav-hover",
-                  isActive ? "bg-wv-nav-active font-medium text-wv-strong" : "text-wv-fg",
-                )
-              }
-            >
-              {({ isActive }) => (
-                <>
-                  <span
-                    aria-hidden="true"
-                    className={cn("h-[14px] w-[3px] flex-none", isActive && "bg-wv-accent")}
-                  />
-                  <Icon
-                    name={entry.icon}
-                    size={16}
-                    className={cn("-ml-[1px] flex-none", isActive ? "text-wv-accent" : "text-wv-faint")}
-                  />
-                  <span className="truncate">{entry.label}</span>
-                  {entry.count === undefined ? null : (
-                    <span className="ml-auto font-wv-mono text-[11px] text-wv-faint">
-                      {entry.count}
-                    </span>
-                  )}
-                </>
-              )}
-            </NavLink>
-          ))}
-        </nav>
+        <RailHead
+          version={version}
+          downloadCount={downloadCount}
+          historyCount={historyCount}
+          onDismiss={onDismiss}
+        />
 
         {railMiddle}
         <div className="mt-auto flex flex-none flex-col">{railFooter}</div>
@@ -206,7 +156,7 @@ export function NextShell({
             onPointerDown={() => setNavOpen(false)}
           />
           <aside className="absolute inset-y-0 left-0 flex w-[264px] max-w-[86vw] flex-col border-r border-wv-line-strong bg-wv-rail">
-            {renderRail(() => setNavOpen(false))}
+            {renderRail(closeNav)}
           </aside>
         </div>
       ) : null}
@@ -299,6 +249,93 @@ export function NextShell({
 }
 
 /**
+ * The brand row and the screen links, the part of the rail every screen shares.
+ * A screen renders its shell again each time its own figures move, several
+ * times a second on Downloads; these change only with a count or the version.
+ */
+const RailHead = memo(function RailHead({
+  version,
+  downloadCount,
+  historyCount,
+  onDismiss,
+}: {
+  version: string;
+  downloadCount: number;
+  historyCount: number;
+  onDismiss?: () => void;
+}) {
+  const t = useTranslate();
+
+  // The prototypes each wire up only their own screens, so their rails show
+  // different subsets. In the product the list is always whole — otherwise
+  // Monitoring is unreachable from Downloads.
+  const nav: NavEntry[] = [
+    { to: "/", label: t("next.nav.downloads"), icon: "downloads", count: downloadCount, end: false },
+    { to: "/history", label: t("next.nav.history"), icon: "history", count: historyCount },
+    { to: "/monitoring", label: t("next.nav.monitoring"), icon: "monitoring" },
+    { to: "/system-info", label: t("next.nav.systemInfo"), icon: "systemInfo" },
+    { to: "/logs", label: t("next.nav.logs"), icon: "logs" },
+    { to: "/tools/nzb-analyzer", label: t("next.nav.nzbAnalyzer"), icon: "inspectFile" },
+    { to: "/settings", label: t("nav.settings"), icon: "settings" },
+  ];
+
+  return (
+    <>
+      <div className="flex h-14 flex-none items-center gap-[9px] border-b border-wv-line-strong px-[18px]">
+        <BrandLockup className="h-[16px] w-auto flex-none" />
+        <span className="ml-auto font-wv-mono text-[10px] text-wv-faint">{version || "—"}</span>
+        {onDismiss === undefined ? null : (
+          <button
+            type="button"
+            onClick={onDismiss}
+            aria-label={t("next.shell.closeNavigation")}
+            className="-mr-[7px] flex size-7 flex-none cursor-pointer items-center justify-center text-[15px] text-wv-muted hover:text-wv-fg"
+          >
+            <Icon name="close" size={16} />
+          </button>
+        )}
+      </div>
+
+      <nav className="flex flex-col gap-0.5 px-[10px] py-[14px]">
+        {nav.map((entry) => (
+          <NavLink
+            key={entry.to}
+            to={entry.to}
+            end={entry.to === "/"}
+            className={({ isActive }) =>
+              cn(
+                "flex h-8 items-center gap-[10px] px-[10px] text-[13.5px] hover:bg-wv-nav-hover",
+                isActive ? "bg-wv-nav-active font-medium text-wv-strong" : "text-wv-fg",
+              )
+            }
+          >
+            {({ isActive }) => (
+              <>
+                <span
+                  aria-hidden="true"
+                  className={cn("h-[14px] w-[3px] flex-none", isActive && "bg-wv-accent")}
+                />
+                <Icon
+                  name={entry.icon}
+                  size={16}
+                  className={cn("-ml-[1px] flex-none", isActive ? "text-wv-accent" : "text-wv-faint")}
+                />
+                <span className="truncate">{entry.label}</span>
+                {entry.count === undefined ? null : (
+                  <span className="ml-auto font-wv-mono text-[11px] text-wv-faint">
+                    {entry.count}
+                  </span>
+                )}
+              </>
+            )}
+          </NavLink>
+        ))}
+      </nav>
+    </>
+  );
+});
+
+/**
  * Sign out, beside the title bar rather than inside it, so a screen that draws
  * its own header keeps it too. It stretches to the header's height to carry the
  * same bottom rule, and centres on the header's first row once the header's
@@ -360,7 +397,7 @@ function SignOutControl() {
  * one something else manages (a container, a package manager) gets the release
  * page on GitHub, since the upgrade has to happen there.
  */
-function UpdateBlock({
+const UpdateBlock = memo(function UpdateBlock({
   version,
   url,
   inApp,
@@ -412,16 +449,16 @@ function UpdateBlock({
       )}
     </div>
   );
-}
+});
 
 /**
  * The download speed, with the speed limit a click away. A limit in force turns
  * the button amber and adds a line under the peak, so a slow queue that is only
  * doing as it was told says so.
  */
-function ThroughputBlock() {
+const ThroughputBlock = memo(function ThroughputBlock() {
   const t = useTranslate();
-  const { speed, peakSpeed } = useNextData();
+  const { speed, peakSpeed } = useNextData("speed", "peakSpeed");
   const { inForce, bySchedule } = useSpeedLimitInForce();
   const { openDialog, dialog } = useSpeedLimitDialog();
   const now = splitSpeed(speed);
@@ -469,10 +506,10 @@ function ThroughputBlock() {
       {dialog}
     </RailBlock>
   );
-}
+});
 
 /** The rail's last block: the sponsor link. */
-function SponsorBlock() {
+const SponsorBlock = memo(function SponsorBlock() {
   const t = useTranslate();
   return (
     <div className="flex flex-none flex-col gap-[10px] border-t border-wv-line-strong px-5 py-[12px]">
@@ -487,7 +524,7 @@ function SponsorBlock() {
       </a>
     </div>
   );
-}
+});
 
 /**
  * A rail block: the bordered, padded unit the rail is built from.

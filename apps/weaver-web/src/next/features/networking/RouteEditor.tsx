@@ -342,9 +342,11 @@ export function RouteEditor({
                               onChange={(next) =>
                                 setRungs(
                                   path.rungs.map((current, n) =>
-                                    n === rungIndex
-                                      ? { ...current, [current.kind === "PROXY" ? "proxyId" : "poolId"]: next ? Number(next) : null }
-                                      : current,
+                                    n !== rungIndex
+                                      ? current
+                                      : current.kind === "PROXY"
+                                        ? { ...current, proxyId: next ? Number(next) : null }
+                                        : { ...current, poolId: next ? Number(next) : null },
                                   ),
                                 )
                               }

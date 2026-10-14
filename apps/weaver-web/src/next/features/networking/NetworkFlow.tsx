@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import {
   closedPath,
@@ -119,6 +119,18 @@ type Block = {
   note: string[];
   pinned: number | null;
   members: Member[];
+};
+/** One leg's row: where it stands, how tall it is, and its ladder. */
+type Row = {
+  leg: LegFlow;
+  y: number;
+  height: number;
+  cardHeight: number;
+  note: string[];
+  blocks: Block[];
+  /** Where the line with no tunnel crosses, or null when the leg has none. */
+  bypass: number | null;
+  closed: boolean;
 };
 
 /**
@@ -293,7 +305,10 @@ function hopState(position: number, failingAt: number, status: string, enabled: 
   return position < failingAt ? "UP" : "UNREACHED";
 }
 
-/** Animate measurements only: configuration and card positions change once per sample. */
+/**
+ * Animate measurements only: configuration and card positions change once per sample.
+ * A flow that arrives with the same legs, each count where it already stands, draws nothing more.
+ */
 function useMeasurements(legs: LegFlow[]) {
   const [counts, setCounts] = useState<Record<string, number>>({});
   const current = useRef<Record<string, number>>({});
@@ -303,10 +318,19 @@ function useMeasurements(legs: LegFlow[]) {
       from: current.current[legKey(leg)] ?? leg.open,
       to: leg.open,
     }));
+    // Every frame would set the counts already held, key for key.
+    if (
+      Object.keys(current.current).length === new Set(values.map((value) => value.key)).size &&
+      values.every((value) => Object.hasOwn(current.current, value.key) && value.from === value.to)
+    ) {
+      return;
+    }
     let start: number | undefined;
     let frame: number;
     const step = (now: number) => {
-      start ??= now;
+      if (start === undefined) {
+        start = now;
+      }
       const progress = Math.min(1, (now - start) / 300);
       const next = Object.fromEntries(values.map((value) => [value.key, value.from + (value.to - value.from) * progress]));
       current.current = next;
@@ -322,7 +346,19 @@ function useMeasurements(legs: LegFlow[]) {
 }
 
 /** A state in the diagram: the square, then the word, in the state's colour. */
-function StateText({ x, y, state, label, size = 10.5 }: { x: number; y: number; state: string; label: string; size?: number }) {
+const StateText = memo(function StateText({
+  x,
+  y,
+  state,
+  label,
+  size = 10.5,
+}: {
+  x: number;
+  y: number;
+  state: string;
+  label: string;
+  size?: number;
+}) {
   const color = stateColor(state);
   return (
     <g>
@@ -332,25 +368,33 @@ function StateText({ x, y, state, label, size = 10.5 }: { x: number; y: number; 
       </text>
     </g>
   );
-}
+});
 
 /** The bar down a box's left edge, in the colour of the state the box is in. */
-function StateBar({ x, y, height, state }: { x: number; y: number; height: number; state: string }) {
+const StateBar = memo(function StateBar({ x, y, height, state }: { x: number; y: number; height: number; state: string }) {
   return <rect x={x} y={y} width="3" height={height} fill={stateColor(state)} />;
-}
+});
 
 /** Lines written under a box's state: what went wrong with what the box stands for. */
-function Note({ x, y, lines }: { x: number; y: number; lines: string[] }) {
-  return (
-    <>
-      {lines.map((line, index) => (
-        <text key={index} x={x} y={y + index * NOTE_LINE} fill={INK.muted} fontSize="9.5">
-          {line}
-        </text>
-      ))}
-    </>
-  );
-}
+const Note = memo(
+  function Note({ x, y, lines }: { x: number; y: number; lines: string[] }) {
+    return (
+      <>
+        {lines.map((line, index) => (
+          <text key={index} x={x} y={y + index * NOTE_LINE} fill={INK.muted} fontSize="9.5">
+            {line}
+          </text>
+        ))}
+      </>
+    );
+  },
+  // The lines are worked out afresh on every sample; the same words draw nothing more.
+  (before, after) =>
+    before.x === after.x &&
+    before.y === after.y &&
+    before.lines.length === after.lines.length &&
+    before.lines.every((line, index) => line === after.lines[index]),
+);
 
 /** A proxy in the lane: its name, then its state, then what is wrong with it, behind its state bar. */
 function HopBox({
@@ -543,7 +587,7 @@ function Traffic({ points, width, still }: { points: Point[]; width: number; sti
  * lights moving the same way, each in its ribbon, along the way each leg takes
  * (or the one way pointed at); a line that is down, failing or blocked stays still.
  */
-export function NetworkFlow({
+export const NetworkFlow = memo(function NetworkFlow({
   flow,
   egresses,
   profiles,
@@ -593,14 +637,16 @@ export function NetworkFlow({
   );
   // Each egress card in the lane, from the top; one with a speed limit is a row taller.
   const egressCards = useMemo(() => {
+    const placed: { egress: Egress; y: number; shift: number; height: number }[] = [];
     let top = 58;
-    return used.map((egress) => {
+    for (const egress of used) {
       // Everything below the addresses moves down by the ones stacked after the first.
       const shift = Math.max(0, (egress.addresses?.length ?? 0) - 1) * ADDRESS_LINE;
       const card = { egress, y: top, shift, height: EGRESS_HEIGHT + shift + heldTo(egress).length * EGRESS_LIMIT_ROW };
+      placed.push(card);
       top += card.height + EGRESS_GAP;
-      return card;
-    });
+    }
+    return placed;
   }, [used]);
   const egressBottom = egressCards.reduce((bottom, card) => Math.max(bottom, card.y + card.height), 38);
   const grouped = !compact && (used.length > 6 || flow.legs.length > 40);
@@ -612,9 +658,12 @@ export function NetworkFlow({
       .filter((leg) => (!filter || leg.consumer === filter) && (!grouped || group === leg.egressId))
       .sort((a, b) => a.egressId - b.egressId || a.consumer.localeCompare(b.consumer) || a.position - b.position);
     let offset = 58;
-    const rows = legs.map((leg) => {
+    const rows: Row[] = [];
+    for (const leg of legs) {
       let bottom = 0;
-      const blocks: Block[] = (leg.path.kind === "DIRECT" ? [] : leg.path.rungs).map((rung, rungIndex) => {
+      const blocks: Block[] = [];
+      const rungs: Rung[] = leg.path.kind === "DIRECT" ? [] : leg.path.rungs;
+      for (const [rungIndex, rung] of rungs.entries()) {
         const live =
           rung.kind === "POOL"
             ? flow.pools.find((candidate) => candidate.poolId === rung.poolId && candidate.egressId === leg.egressId)
@@ -660,8 +709,8 @@ export function NetworkFlow({
           (members.length ? 2 * MEMBER_GAP : 0);
         const top = bottom;
         bottom = top + height + 8;
-        return { rung, rungIndex, top, height, failing, note, pinned: live?.pinnedMember ?? null, members };
-      });
+        blocks.push({ rung, rungIndex, top, height, failing, note, pinned: live?.pinnedMember ?? null, members });
+      }
       // Direct has no box: its line crosses level with the leg, or beneath the ladder it backs up.
       const bypass = leg.path.kind === "DIRECT" ? LEG_HEIGHT / 2 : leg.path.directFallback ? bottom + 26 : null;
       // A kill switch stands where the ladder's first rung would.
@@ -671,8 +720,8 @@ export function NetworkFlow({
       const y = offset;
       const height = Math.max(cardHeight, closed ? BOX_HEIGHT : bypass == null ? bottom - 8 : bypass + 16);
       offset += height + 18;
-      return { leg, y, height, cardHeight, note, blocks, bypass, closed };
-    });
+      rows.push({ leg, y, height, cardHeight, note, blocks, bypass, closed });
+    }
     // The one endpoint stands level with the middle of everything that leads to it.
     const middle = (58 + Math.max(offset - 18, egressBottom)) / 2;
     const endpointY = Math.max(58, Math.round(middle - ENDPOINT_BOX_HEIGHT / 2));
@@ -816,7 +865,12 @@ export function NetworkFlow({
       const held = members.reduce((sum, member) => sum + (member.live?.open ?? 0), 0);
       const head = BOX_HEIGHT + noteHeight(block.note.length);
       // An active head and a carrying member share a tint, so the rows start a gap below the head.
+      const memberTops: number[] = [];
       let memberY = y + head + MEMBER_GAP;
+      for (const member of members) {
+        memberTops.push(memberY);
+        memberY += member.height;
+      }
       return (
         <g key={rungIndex} {...way}>
           {failing ? <title>{failing.reason}</title> : null}
@@ -844,9 +898,8 @@ export function NetworkFlow({
           )}
           <StateBar x={PROXY.x} y={y} height={block.height} state={state} />
           <g role="group" aria-label={t("next.networking.flow.poolMembers", { name: poolName(rung.poolId) })}>
-            {members.map((member) => {
-              const top = memberY;
-              memberY += member.height;
+            {members.map((member, index) => {
+              const top = memberTops[index]!;
               // Only what the pool has measured: a figure it has not taken is left out, not dashed.
               const timing = member.measured
                 ? [
@@ -1385,4 +1438,4 @@ export function NetworkFlow({
       </div>
     </div>
   );
-}
+});
