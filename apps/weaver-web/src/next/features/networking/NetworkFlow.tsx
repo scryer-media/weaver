@@ -3,6 +3,7 @@ import { useTranslate } from "@/lib/context/translate-context";
 import {
   closedPath,
   isDown,
+  OUTBOUND_CONSUMER,
   type DownTarget,
   type Egress,
   type FailingHop,
@@ -215,10 +216,18 @@ const CELL_HEIGHT = 10;
 const MAX_CELLS = 100;
 const ENDPOINT_HEIGHT = 124;
 const ENDPOINT_GAP = 20;
+// Only a server's card counts its connections. A feed's card is its name over
+// what it is; Default outbound's is its name alone.
+const FEED_HEIGHT = 56;
+const OUTBOUND_HEIGHT = 38;
 
-type EndpointCard = { cap: number; cells: number; rows: number; y: number; height: number };
+type EndpointCard = { cap: number; cells: number; rows: number; y: number; height: number; anchor: number };
 
-/** Where each route card sits, each as tall as its rows of connection boxes need. */
+/**
+ * Where each route card sits, and where its legs meet it: halfway down, or on
+ * a server's card halfway down its first row of connection boxes. A server's
+ * card is as tall as those rows need.
+ */
 function endpointCards(consumers: FlowConsumer[], legs: LegFlow[]): Map<string, EndpointCard> {
   const cards = new Map<string, EndpointCard>();
   let y = 58;
@@ -227,8 +236,13 @@ function endpointCards(consumers: FlowConsumer[], legs: LegFlow[]): Map<string, 
     const cap = consumer.cap ?? own.reduce((sum, leg) => sum + leg.target, 0);
     const cells = Math.min(cap, MAX_CELLS);
     const rows = Math.max(1, Math.ceil(cells / CELLS_PER_ROW));
-    const height = ENDPOINT_HEIGHT + (rows - 1) * CELL_ROW_PITCH;
-    cards.set(consumer.key, { cap, cells, rows, y, height });
+    const height =
+      consumer.key === OUTBOUND_CONSUMER
+        ? OUTBOUND_HEIGHT
+        : consumer.key.startsWith("rss:")
+          ? FEED_HEIGHT
+          : ENDPOINT_HEIGHT + (rows - 1) * CELL_ROW_PITCH;
+    cards.set(consumer.key, { cap, cells, rows, y, height, anchor: y + Math.min(height, ENDPOINT_HEIGHT) / 2 });
     y += height + ENDPOINT_GAP;
   }
   return cards;
@@ -630,10 +644,20 @@ export const NetworkFlow = memo(function NetworkFlow({
   const half = switchHalf(switchWords);
   const toggleWidth = onToggle ? 2 * half : 0;
   const { EGRESS, LEGS, PROXY, ENDPOINTS, WIDTH, HOP_GAP } = lanes;
+  // With one route picked, the flow is that route alone: its legs, the
+  // egresses they leave through and its own card.
+  const shownLegs = useMemo(
+    () => (filter ? flow.legs.filter((leg) => leg.consumer === filter) : flow.legs),
+    [flow.legs, filter],
+  );
+  const shown = useMemo(
+    () => (filter ? consumers.filter((consumer) => consumer.key === filter) : consumers),
+    [consumers, filter],
+  );
   // An egress no route leaves through is not part of the flow, so it has no card.
   const used = useMemo(
-    () => egresses.filter((egress) => flow.legs.some((leg) => leg.egressId === egress.id)),
-    [egresses, flow.legs],
+    () => egresses.filter((egress) => shownLegs.some((leg) => leg.egressId === egress.id)),
+    [egresses, shownLegs],
   );
   // Each egress card in the lane, from the top; one with a speed limit is a row taller.
   const egressCards = useMemo(() => {
@@ -649,13 +673,13 @@ export const NetworkFlow = memo(function NetworkFlow({
     return placed;
   }, [used]);
   const egressBottom = egressCards.reduce((bottom, card) => Math.max(bottom, card.y + card.height), 38);
-  const grouped = !compact && (used.length > 6 || flow.legs.length > 40);
-  const cards = useMemo(() => endpointCards(consumers, flow.legs), [consumers, flow.legs]);
+  const grouped = !compact && (used.length > 6 || shownLegs.length > 40);
+  const cards = useMemo(() => endpointCards(shown, flow.legs), [shown, flow.legs]);
   const cardsBottom = [...cards.values()].reduce((bottom, card) => Math.max(bottom, card.y + card.height), 0);
 
   const layout = useMemo(() => {
-    const legs = flow.legs
-      .filter((leg) => (!filter || leg.consumer === filter) && (!grouped || group === leg.egressId))
+    const legs = shownLegs
+      .filter((leg) => !grouped || group === leg.egressId)
       .sort((a, b) => a.egressId - b.egressId || a.consumer.localeCompare(b.consumer) || a.position - b.position);
     let offset = 58;
     const rows: Row[] = [];
@@ -732,7 +756,7 @@ export const NetworkFlow = memo(function NetworkFlow({
       lanes === COMPACT_ENDPOINT ? endpointY + ENDPOINT_BOX_HEIGHT : 0,
     );
     return { rows, endpointY, height: compact ? bottom + 12 : Math.max(bottom + 52, 260) };
-  }, [flow.legs, flow.pools, filter, grouped, group, pools, profiles, egressBottom, cardsBottom, lanes, compact, toggleWidth, overrides]);
+  }, [shownLegs, flow.pools, grouped, group, pools, profiles, egressBottom, cardsBottom, lanes, compact, toggleWidth, overrides]);
 
   const width = scale(Math.max(1, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
   const profile = (id: number | null) => profiles.find((candidate) => candidate.id === id);
@@ -1026,7 +1050,7 @@ export const NetworkFlow = memo(function NetworkFlow({
               onClick={() => setGroup(group === egress.id ? null : egress.id)}
               className={group === egress.id ? "!border-wv-accent" : undefined}
             >
-              {egress.name} · {countLabel(t, "next.networking.legCount", flow.legs.filter((leg) => leg.egressId === egress.id).length)}
+              {egress.name} · {countLabel(t, "next.networking.legCount", shownLegs.filter((leg) => leg.egressId === egress.id).length)}
             </SecondaryButton>
           ))}
         </div>
@@ -1060,7 +1084,7 @@ export const NetworkFlow = memo(function NetworkFlow({
             const egressY = egressCard ? egressCard.y + EGRESS_HEIGHT / 2 : 112;
             const consumerY = endpoint
               ? layout.endpointY + ENDPOINT_BOX_HEIGHT / 2
-              : (cards.get(leg.consumer)?.y ?? 58) + 62;
+              : (cards.get(leg.consumer)?.anchor ?? 58 + ENDPOINT_HEIGHT / 2);
             const legY = y + LEG_HEIGHT / 2;
             const count = counts[legKey(leg)] ?? leg.open;
             const flowing = traffic && leg.open > 0;
@@ -1358,7 +1382,7 @@ export const NetworkFlow = memo(function NetworkFlow({
               />
             </g>
           ) : ENDPOINTS
-            ? consumers.map((consumer) => {
+            ? shown.map((consumer) => {
                 const legs = flow.legs.filter((leg) => leg.consumer === consumer.key);
                 const { cap, cells, y, height } = cards.get(consumer.key)!;
                 const open = legs.reduce((sum, leg) => sum + (counts[legKey(leg)] ?? leg.open), 0);
@@ -1368,6 +1392,10 @@ export const NetworkFlow = memo(function NetworkFlow({
                 // One row stretches across the card; past a full row the boxes keep their size and wrap.
                 const cellX = scale(Math.max(1, Math.min(cells, CELLS_PER_ROW)), 188);
                 const rss = consumer.key.startsWith("rss:");
+                // Default outbound's name already says what it is.
+                const outbound = consumer.key === OUTBOUND_CONSUMER;
+                // Only a server's card counts its connections.
+                const server = !rss && !outbound;
                 const x = ENDPOINTS.x + 14;
                 return (
                   <g
@@ -1384,39 +1412,45 @@ export const NetworkFlow = memo(function NetworkFlow({
                         <text x={x} y={y + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
                           {consumer.name.slice(0, 24)}
                         </text>
-                        <text x={x} y={y + 41} fill={INK.muted} fontSize="9.5">
-                          {rss
-                            ? t("next.networking.flow.rssKind")
-                            : t("next.networking.flow.serverKind", {
-                                failover:
-                                  consumer.route?.failover === "HOLD"
-                                    ? t("next.networking.failover.hold")
-                                    : t("next.networking.failover.redistribute"),
-                              })}
-                        </text>
-                        <text x={x} y={y + 67} fill={INK.fg} fontSize="20">
-                          {`${Math.round(open)} / ${cap}`}
-                        </text>
-                        <text x={x} y={y + 85} fill={INK.muted} fontSize="10">
-                          {formatRate(legs.reduce((sum, leg) => sum + (leg.bytesPerSecond ?? 0), 0))}
-                          {parked ? ` · ${t("next.networking.flow.parked", { count: parked })}` : ""}
-                        </text>
-                        {Array.from({ length: cells }, (_, cell) => {
-                          const boundary = (cell * cap) / cells;
-                          const reserved = boundary >= cap - parked;
-                          return (
-                            <rect
-                              key={cell}
-                              x={x + cellX(cell % CELLS_PER_ROW)}
-                              y={y + 98 + Math.floor(cell / CELLS_PER_ROW) * CELL_ROW_PITCH}
-                              width={Math.max(1, cellX(1) - 2)}
-                              height={CELL_HEIGHT}
-                              fill={boundary < open ? INK.accent : "none"}
-                              stroke={reserved ? INK.warn : INK.track}
-                              strokeDasharray={reserved ? "2 2" : undefined}
-                            />
-                          );
-                        })}
+                        {outbound ? null : (
+                          <text x={x} y={y + 41} fill={INK.muted} fontSize="9.5">
+                            {rss
+                              ? t("next.networking.routes.rssFeed")
+                              : t("next.networking.flow.serverKind", {
+                                  failover:
+                                    consumer.route?.failover === "HOLD"
+                                      ? t("next.networking.failover.hold")
+                                      : t("next.networking.failover.redistribute"),
+                                })}
+                          </text>
+                        )}
+                        {server ? (
+                          <>
+                            <text x={x} y={y + 67} fill={INK.fg} fontSize="20">
+                              {`${Math.round(open)} / ${cap}`}
+                            </text>
+                            <text x={x} y={y + 85} fill={INK.muted} fontSize="10">
+                              {formatRate(legs.reduce((sum, leg) => sum + (leg.bytesPerSecond ?? 0), 0))}
+                              {parked ? ` · ${t("next.networking.flow.parked", { count: parked })}` : ""}
+                            </text>
+                            {Array.from({ length: cells }, (_, cell) => {
+                              const boundary = (cell * cap) / cells;
+                              const reserved = boundary >= cap - parked;
+                              return (
+                                <rect
+                                  key={cell}
+                                  x={x + cellX(cell % CELLS_PER_ROW)}
+                                  y={y + 98 + Math.floor(cell / CELLS_PER_ROW) * CELL_ROW_PITCH}
+                                  width={Math.max(1, cellX(1) - 2)}
+                                  height={CELL_HEIGHT}
+                                  fill={boundary < open ? INK.accent : "none"}
+                                  stroke={reserved ? INK.warn : INK.track}
+                                  strokeDasharray={reserved ? "2 2" : undefined}
+                                />
+                              );
+                            })}
+                          </>
+                        ) : null}
                       </>,
                     )}
                   </g>

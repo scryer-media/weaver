@@ -55,7 +55,7 @@ export function RouteView({
   const find = (consumers: Consumer[]) => consumers.find((candidate) => candidate.key === consumer);
   // The flow names the consumers it has sampled; one it has not is still in the configuration.
   // Each sample carries them, the egresses and the proxies afresh; the same ones are held.
-  const own = useSameWhileUnchanged(find(flowConsumers(measured, data)) ?? find(flowConsumers(EMPTY_FLOW, data)));
+  const own = useSameWhileUnchanged(find(flowConsumers(measured, data, t)) ?? find(flowConsumers(EMPTY_FLOW, data, t)));
   const egresses = useSameWhileUnchanged(measured.egresses ?? data?.egressInterfaces ?? []);
   const profiles = useSameWhileUnchanged(measured.proxies ?? data?.proxyProfiles ?? []);
   const pools = useSameWhileUnchanged(measured.proxyPools ?? data?.proxyPools ?? []);

@@ -12,12 +12,20 @@ import { defaultRoute, speedPage, type Consumer, type NetworkingAction, type Net
 import { RouteEditor } from "./RouteEditor";
 import { stateLabel, StatusMark } from "./presentation";
 
-/** "20 NNTP connections · 2 legs": what a consumer is, and how its route splits it. */
+/**
+ * "20 NNTP connections · 2 legs": what a consumer is, and how its route splits
+ * it. Default outbound's name already says what it is.
+ */
 export function consumerSummary(t: Translate, consumer: Consumer): string {
   const legs = countLabel(t, "next.networking.legCount", consumer.route?.legs.length ?? 1);
-  return consumer.kind === "SERVER"
-    ? `${countLabel(t, "next.networking.routes.connections", consumer.cap)} · ${legs}`
-    : `${t("next.networking.routes.rssFeed")} · ${legs}`;
+  switch (consumer.kind) {
+    case "SERVER":
+      return `${countLabel(t, "next.networking.routes.connections", consumer.cap)} · ${legs}`;
+    case "RSS":
+      return `${t("next.networking.routes.rssFeed")} · ${legs}`;
+    case "OUTBOUND":
+      return legs;
+  }
 }
 
 /** The state a consumer's legs add up to: carrying, broken, or waiting. */
@@ -125,7 +133,7 @@ export function RoutesPage({
 }
 
 /**
- * One server's or feed's route in its editor, mounted while it is open. The
+ * One consumer's route in its editor, mounted while it is open. The
  * routes table opens it, and so does a route leg or an endpoint picked in the
  * network flow.
  */
@@ -183,7 +191,7 @@ export function RouteDialog({
           profiles={data.proxyProfiles}
           pools={data.proxyPools}
           cap={consumer.cap}
-          rss={consumer.kind === "RSS"}
+          kind={consumer.kind}
           status={flow.legs.filter((leg) => leg.consumer === consumer.key)}
         />
       </div>

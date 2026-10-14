@@ -127,7 +127,7 @@ export function formProblem(
   form: TestForm,
   consumer: Pick<Consumer, "kind">,
 ): string | null {
-  if (form.kind === "USENET" && consumer.kind === "RSS") {
+  if (form.kind === "USENET" && consumer.kind !== "SERVER") {
     return t("next.networking.speed.usenetNeedsServer");
   }
   if (form.kind === "BANDWIDTH" && !form.providerId && !/^https:\/\/\S+$/i.test(form.customUrl.trim())) {
@@ -353,7 +353,7 @@ export function TestControls({
           className="self-start"
           options={[
             { value: "BANDWIDTH", label: t("next.networking.speed.bandwidth") },
-            { value: "USENET", label: t("next.networking.speed.usenet"), disabled: consumer.kind === "RSS" },
+            { value: "USENET", label: t("next.networking.speed.usenet"), disabled: consumer.kind !== "SERVER" },
           ]}
         />
       </ControlLabel>

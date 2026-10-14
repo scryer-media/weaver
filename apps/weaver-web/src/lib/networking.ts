@@ -15,9 +15,13 @@ export type LegFlow = Leg & { rungStates?:string[]; consumer: string; position: 
 /** The first proxy hop on a ladder rung known to be failing, and what its last attempt came to. */
 export type FailingHop = { rung: number; proxyId: number; reason: string };
 export type PoolMemberFlow = { state?:string; id: number; open: number; opening: number; warmed: boolean; blocked: string | null; connectMs: number | null; bytesPerSecond: number | null; liveBytesPerSecond: number; samples: number; failures: number };
-export type NetworkFlow = { consumers?:{key:string;id:number;name:string;kind:"SERVER"|"RSS";cap:number;route:NetworkRoute}[]; proxies?:import("./proxies").ProxyProfile[]; proxyPools?:ProxyPool[]; egresses?:Egress[]; sampledAt?:number;legs: LegFlow[]; pools: PoolFlow[] };
+export type NetworkFlow = { consumers?:{key:string;id:number;name:string;kind:ConsumerKind;cap:number;route:NetworkRoute}[]; proxies?:import("./proxies").ProxyProfile[]; proxyPools?:ProxyPool[]; egresses?:Egress[]; sampledAt?:number;legs: LegFlow[]; pools: PoolFlow[] };
 /** A pool on one egress as it runs: `liveBytesPerSecond` on a member is what it carries now, `bytesPerSecond` what the pool judges it by. */
 export type PoolFlow = { poolId: number; egressId: number; pinnedMember: number | null; members: PoolMemberFlow[] };
+/** What owns a route: a server, a feed, or Default outbound, which carries every other fetch. */
+export type ConsumerKind = "SERVER" | "RSS" | "OUTBOUND";
+/** Default outbound's key: there is one, and it is never made or removed. */
+export const OUTBOUND_CONSUMER = "outbound";
 export const directLeg = (): Leg => ({ egressId: 0, weight: 100, path: { kind: "DIRECT", rungs: [], directFallback: false } });
 /** A path nothing can take: a ladder with no rung on it and no going direct. It is how a kill switch is stored. */
 export const closedPath = (path: Leg["path"]) => path.kind === "LADDER" && !path.rungs.length && !path.directFallback;
@@ -142,7 +146,7 @@ export type BandwidthProviderServer = { id: string; name: string; location: stri
  * held run's uploaded file again.
  */
 export type SpeedTestInput = {
-  kind: "SERVER" | "RSS"; id: number; route?: ReturnType<typeof routeInput> | null; overrides?: PathOverride | null;
+  kind: ConsumerKind; id: number; route?: ReturnType<typeof routeInput> | null; overrides?: PathOverride | null;
   bandwidth?: { providerId?: string | null; server?: string | null; customUrl?: string | null } | null;
   usenet?: {
     sabSize?: SabTestSize | null; nzbUrl?: string | null; nzbUpload?: File | null; nzbRunId?: number | null;

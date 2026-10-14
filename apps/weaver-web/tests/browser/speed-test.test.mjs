@@ -302,13 +302,63 @@ test("picking another route keeps the test as it was set, and a feed takes it as
 test("the route editor has no speed test of its own: the speed test page runs every test", async () => {
   const { page, errors } = await open("?routes", "news.fixture.invalid");
   try {
-    await page.getByRole("button", { name: "Edit route", exact: true }).first().click();
+    await page.locator('main [data-row-id="server:1"]').getByRole("button", { name: "Edit route", exact: true }).click();
     const editor = page.getByRole("dialog", { name: "Route for news.fixture.invalid", exact: true });
     await editor.waitFor();
+    // A server's route splits its connections, and says so above the legs and on each one.
+    await editor.getByText(/^Split up to 20 connections/).waitFor();
+    await editor.getByText(/^Target: /).first().waitFor();
     assert.equal(await editor.getByRole("button", { name: "Speed test", exact: true }).count(), 0);
     assert.equal(await editor.getByRole("button", { name: "Run", exact: true }).count(), 0);
     assert.equal(await editor.getByRole("region", { name: "Speed test", exact: true }).count(), 0);
     await shot(page, "speed-dialog");
+    assert.equal(errors.length, 0, errors.join("\n"));
+  } finally {
+    await page.close();
+  }
+});
+
+test("Default outbound's route comes first and is edited with nothing said about connections", async () => {
+  const { page, errors } = await open("?routes", "Default outbound");
+  try {
+    // Its name says what it is, so its summary is only its legs.
+    assert.equal(await page.locator("main [data-row-id]").first().getAttribute("data-row-id"), "outbound");
+    const row = page.locator('main [data-row-id="outbound"]');
+    await row.getByText("1 leg", { exact: true }).waitFor();
+    await row.getByRole("button", { name: "Edit route", exact: true }).click();
+    const editor = page.getByRole("dialog", { name: "Route for Default outbound", exact: true });
+    await editor.getByRole("group", { name: "Leg 1", exact: true }).waitFor();
+    // It splits nothing: no word above the legs, and no target on one.
+    assert.equal(await editor.getByText(/^Split up to|^Feeds try/).count(), 0);
+    assert.equal(await editor.getByText(/^Target: /).count(), 0);
+    await shot(page, "speed-outbound-dialog");
+    await editor.getByRole("button", { name: "Save route", exact: true }).click();
+    await editor.waitFor({ state: "detached" });
+    const [saved] = await sent(page, "SaveNetworkRoute");
+    assert.equal(saved.kind, "OUTBOUND");
+    assert.equal(saved.id, 0);
+    assert.equal(errors.length, 0, errors.join("\n"));
+  } finally {
+    await page.close();
+  }
+});
+
+test("Default outbound is tested for bandwidth only, and its run is named for it", async () => {
+  const { page, errors } = await open("", "news.fixture.invalid");
+  try {
+    await page.getByRole("button", { name: "Route", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: "Default outbound", exact: true }).click();
+    await page.getByRole("radio", { name: "Bandwidth", checked: true, exact: true }).waitFor();
+    assert.equal(await page.getByRole("radio", { name: "Usenet", exact: true }).isDisabled(), true);
+    await page.getByRole("button", { name: "Run", exact: true }).and(page.locator(":enabled")).click();
+    await page.getByRole("region", { name: "Progress", exact: true }).waitFor();
+    const [start] = await sent(page, "StartSpeedTest");
+    assert.deepEqual(start.input, {
+      kind: "OUTBOUND", id: 0,
+      overrides: { downLegs: [], downRungs: [], downProxies: [], downEgresses: [] },
+      bandwidth: { providerId: "cloudflare" },
+    });
+    await page.locator('main [data-row-id="2"]').filter({ hasText: "Default outbound" }).waitFor();
     assert.equal(errors.length, 0, errors.join("\n"));
   } finally {
     await page.close();

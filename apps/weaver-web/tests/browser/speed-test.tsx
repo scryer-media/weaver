@@ -2,12 +2,12 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router";
 import { Client, Provider, fetchExchange } from "urql";
-import { TranslateContext } from "@/lib/context/translate-context";
+import { TranslateContext, type Translate } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import { directLeg, type Egress, type NetworkRoute, type SpeedTestInput, type SpeedTestRun } from "@/lib/networking";
 import type { ProxyKind, ProxyProfile } from "@/lib/proxies";
 import { NextDataContext, type NextData } from "@/next/data/next-data";
-import type { Consumer, NetworkingData } from "@/next/features/networking/data";
+import { flowConsumers, type Consumer, type NetworkingAction, type NetworkingData } from "@/next/features/networking/data";
 import { RoutesPage } from "@/next/features/networking/RoutesPage";
 import { SpeedPage } from "@/next/features/networking/SpeedPage";
 import { nextEn } from "@/next/i18n/en";
@@ -15,7 +15,11 @@ import { SettingsShellProvider } from "@/next/pages/settings/framework";
 import "@/next/fonts.css";
 import "@/next/theme.css";
 
-/* The fixture's daemon: two egresses, a pool of two proxies, a server and a feed, and the runs it holds. */
+/* The fixture's daemon: two egresses, a pool of two proxies, Default outbound, a server and a feed, and the runs it holds. */
+
+const dictionary: Record<string, string> = { ...en, ...nextEn };
+const t: Translate = (key, values) =>
+  Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key);
 
 const egresses: Egress[] = [
   { id: 0, name: "System", bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled: true, maxDownloadSpeed: 0, health: "UP", reason: null },
@@ -37,6 +41,12 @@ const route: NetworkRoute = {
   ],
 };
 const consumers: Consumer[] = [
+  // Default outbound comes as the flow brings it, first, and is named in the reader's language.
+  ...flowConsumers(
+    { legs: [], pools: [], consumers: [{ key: "outbound", id: 0, name: "Default outbound", kind: "OUTBOUND", cap: 1, route: { failover: "REDISTRIBUTE", legs: [directLeg()] } }] },
+    undefined,
+    t,
+  ),
   { key: "server:1", id: 1, name: "news.fixture.invalid", kind: "SERVER", cap: 20, route },
   { key: "rss:1", id: 1, name: "Feed mirror", kind: "RSS", cap: 1, route: null },
 ];
@@ -211,6 +221,11 @@ function graphql(name: string, variables: Record<string, unknown>) {
   if (name === "BandwidthProviderServers") return { data: { bandwidthProviderServers: [] } };
   return { data: { bandwidthProviders: providers, speedTestRuns: runs.map(report) } };
 }
+/** A route saved from the routes table's editor, kept as the request it would have sent. */
+const action: NetworkingAction = async (_document, variables) => {
+  requests.push({ name: "SaveNetworkRoute", variables: structuredClone(variables) });
+  return null;
+};
 const fixture = {
   requests, uploads, finish: (id: number) => finished.add(id), measure,
   fail: (id: number, failure: NonNullable<SpeedTestRun["failure"]>) => failures.set(id, failure),
@@ -245,7 +260,7 @@ window.fetch = async (request, init) => {
 /* With `?routes` it is the routes table and its editor; otherwise the speed test page, opened on the server. */
 const query = new URLSearchParams(window.location.search);
 const screen = query.has("routes")
-  ? <RoutesPage data={data} consumers={consumers} flow={{ legs: [], pools: [] }} action={async () => null} busy={false} />
+  ? <RoutesPage data={data} consumers={consumers} flow={{ legs: [], pools: [] }} action={action} busy={false} />
   : <SpeedPage data={data} consumers={consumers} />;
 /*
  * With `?downloading` a job is downloading, so a run asks before it pauses downloads; otherwise the queue is idle.
@@ -256,6 +271,5 @@ const live = {
   speed: query.has("gauge") ? 12 * 1024 * 1024 : 0,
   queue: { jobs: query.has("downloading") ? [{ id: 7, status: "DOWNLOADING" }] : [] } as unknown as NextData["queue"],
 } as NextData;
-const dictionary: Record<string, string> = { ...en, ...nextEn };
 const shell = { search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls") };
-createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t: (key, values) => Object.entries(values ?? {}).reduce((text, [name, value]) => text.replaceAll(`{{${name}}}`, String(value)), dictionary[key] ?? key), uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter initialEntries={[query.has("routes") ? "/settings/networking/routes" : "/settings/networking/speed?consumer=server:1"]}><SettingsShellProvider {...shell}><NextDataContext.Provider value={live}><main className="mx-auto flex max-w-[1400px] flex-col p-8">{screen}</main></NextDataContext.Provider></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);
+createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t, uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter initialEntries={[query.has("routes") ? "/settings/networking/routes" : "/settings/networking/speed?consumer=server:1"]}><SettingsShellProvider {...shell}><NextDataContext.Provider value={live}><main className="mx-auto flex max-w-[1400px] flex-col p-8">{screen}</main></NextDataContext.Provider></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);

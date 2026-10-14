@@ -24,7 +24,7 @@ import { Cell } from "../../components/rows";
 import { Eyebrow } from "../../components/chrome";
 import { splitBytes, splitSpeed } from "../../data/format";
 import { SettingsBlocks, type SettingsBlock } from "../../pages/settings/framework";
-import { defaultRoute, type Consumer, type NetworkingData } from "./data";
+import { consumerName, defaultRoute, type Consumer, type NetworkingData } from "./data";
 import type { FlowEndpoint } from "./NetworkFlow";
 import { CheckRow, ControlLabel, StatusMark, stateLabel } from "./presentation";
 import { RoutePlanView, type LiveLeg } from "./RouteView";
@@ -118,7 +118,10 @@ function kindSummary(t: Translate, run: SpeedTestRun, providers: BandwidthProvid
 function runEndpoint(t: Translate, run: SpeedTestRun, providers: BandwidthProvider[]): { title: string; detail: string } {
   const { bandwidth, usenet } = run.request;
   if (usenet) {
-    return { title: run.consumerName, detail: `${t("next.networking.speed.usenet")} · ${nzbLabel(t, usenet)}` };
+    return {
+      title: consumerName(t, run.consumer, run.consumerName),
+      detail: `${t("next.networking.speed.usenet")} · ${nzbLabel(t, usenet)}`,
+    };
   }
   const id = bandwidth?.providerId;
   return {
@@ -286,7 +289,11 @@ function RunDetail({
   const parts: ReactNode[] = [
     <RoutePlanView
       key="flow"
-      consumer={{ key: run.consumer, name: run.consumerName, cap: run.tested.legs.reduce((sum, leg) => sum + leg.target, 0) }}
+      consumer={{
+        key: run.consumer,
+        name: consumerName(t, run.consumer, run.consumerName),
+        cap: run.tested.legs.reduce((sum, leg) => sum + leg.target, 0),
+      }}
       route={route}
       targets={run.tested.legs.map((leg) => leg.target)}
       legDown={run.tested.legs.map((leg) => leg.down)}
@@ -464,10 +471,10 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
     setSelected(key);
     setOverrides(noOverrides());
     if (next) {
-      // The test carries over; only what the new route cannot take gives way: a
-      // feed has no Usenet test, and a server takes no more connections than its cap.
+      // The test carries over; only what the new route cannot take gives way: only
+      // a server has a Usenet test, and it takes no more connections than its cap.
       setForm((current) =>
-        next.kind === "RSS"
+        next.kind !== "SERVER"
           ? { ...current, kind: "BANDWIDTH" }
           : { ...current, connections: Math.min(current.connections, Math.max(1, next.cap)) },
       );
@@ -624,9 +631,10 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
       rows: shown.map((run) => {
         const result = run.result;
         const startedAt = new Date(run.startedAt);
+        const owner = consumerName(t, run.consumer, run.consumerName);
         return {
           id: String(run.id),
-          searchText: `${run.consumerName} ${run.kind}`,
+          searchText: `${owner} ${run.kind}`,
           expanded: comparing ? undefined : open.has(run.id),
           detail: !comparing && open.has(run.id) ? detail(run) : undefined,
           cells: [
@@ -644,8 +652,8 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
             <Cell key="started" mono title={startedAt.toLocaleString()}>
               {startedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
             </Cell>,
-            <Cell key="route" title={run.consumerName}>
-              {run.consumerName}
+            <Cell key="route" title={owner}>
+              {owner}
             </Cell>,
             <Cell key="kind" mono className="text-wv-secondary">
               {kindSummary(t, run, providers)}

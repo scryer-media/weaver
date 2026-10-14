@@ -7,6 +7,7 @@ import {
   routeProblem,
   routeTargets,
   rungProxyIds,
+  type ConsumerKind,
   type Egress,
   type Leg,
   type LegFlow,
@@ -68,7 +69,7 @@ export function RouteEditor({
   profiles,
   pools,
   cap = 1,
-  rss = false,
+  kind = "SERVER",
   status = [],
 }: {
   value: NetworkRoute;
@@ -77,7 +78,8 @@ export function RouteEditor({
   profiles: ProxyProfile[];
   pools: ProxyPool[];
   cap?: number;
-  rss?: boolean;
+  /** What owns the route. Only a server's connections are split; anything else takes the first healthy leg. */
+  kind?: ConsumerKind;
   status?: LegFlow[];
 }) {
   const t = useTranslate();
@@ -137,9 +139,11 @@ export function RouteEditor({
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
-      <p className="text-[12.5px] leading-[1.5] text-pretty text-wv-muted">
-        {rss ? t("next.networking.route.introRss") : t("next.networking.route.intro", { count: cap })}
-      </p>
+      {kind === "OUTBOUND" ? null : (
+        <p className="text-[12.5px] leading-[1.5] text-pretty text-wv-muted">
+          {kind === "SERVER" ? t("next.networking.route.intro", { count: cap }) : t("next.networking.route.introRss")}
+        </p>
+      )}
 
       <div
         aria-label={t("next.networking.route.distribution")}
@@ -387,11 +391,11 @@ export function RouteEditor({
             ) : null}
 
             <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-wv-hairline pt-3">
-              {rss ? null : (
+              {kind === "SERVER" ? (
                 <span className="font-wv-mono text-[11.5px] text-wv-muted">
                   {t("next.networking.route.target", { count: targets[index] ?? 0 })}
                 </span>
-              )}
+              ) : null}
               <CheckRow
                 checked={down.has(index)}
                 label={t("next.networking.route.simulateDown")}

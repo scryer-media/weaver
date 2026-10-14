@@ -7,6 +7,8 @@ import {
   allocation,
   closedPath,
   directLeg,
+  OUTBOUND_CONSUMER,
+  type ConsumerKind,
   type Egress,
   type NetworkFlow,
   type NetworkRoute,
@@ -33,12 +35,12 @@ export type NetworkingData = {
   rssFeeds: { id: number; name: string; enabled: boolean; routing: NetworkRoute | null }[];
 };
 
-/** A server or feed: something that owns a route. */
+/** A server, a feed, or Default outbound: something that owns a route. */
 export type Consumer = {
   key: string;
   id: number;
   name: string;
-  kind: "SERVER" | "RSS";
+  kind: ConsumerKind;
   cap: number;
   route: NetworkRoute | null;
 };
@@ -46,7 +48,7 @@ export type Consumer = {
 export const NETWORKING_PAGES = ["overview", "egress", "proxies", "routes", "speed"] as const;
 export type NetworkingPage = (typeof NETWORKING_PAGES)[number];
 
-/** The speed test page with a server or feed selected. */
+/** The speed test page with a route selected. */
 export const speedPage = (consumer: string) => `/settings/networking/speed?consumer=${encodeURIComponent(consumer)}`;
 
 /** Run a mutation; resolves to the failure message, or null once it has landed. */
@@ -59,13 +61,20 @@ const NO_POOLS: ProxyPool[] = [];
 
 export const defaultRoute = (): NetworkRoute => ({ legs: [directLeg()], failover: "REDISTRIBUTE" });
 
+/** A consumer's name. Default outbound is named here, in the reader's language, not by the daemon. */
+export const consumerName = (t: Translate, key: string, name: string) =>
+  key === OUTBOUND_CONSUMER ? t("next.networking.defaultOutbound") : name;
+
 /**
  * Everything that owns a route. The flow names them once the daemon has
  * sampled one; before that they are the servers and feeds as configured.
+ * Default outbound has no configuration read here, so only the flow brings
+ * it: with no route to start from, its editor could only start on the
+ * default one and save over what is there.
  */
-export function flowConsumers(measured: NetworkFlow, data: NetworkingData | undefined): Consumer[] {
+export function flowConsumers(measured: NetworkFlow, data: NetworkingData | undefined, t: Translate): Consumer[] {
   return (
-    measured.consumers ??
+    measured.consumers?.map((consumer) => ({ ...consumer, name: consumerName(t, consumer.key, consumer.name) })) ??
     (data
       ? [
           ...data.servers.map((server) => ({
@@ -205,7 +214,7 @@ export function useNetworkingWorkspace(page: string) {
   const measured = subscription.data?.networkFlow ?? initial.data?.networkFlow ?? EMPTY_FLOW;
   // Every sample carries the consumers, egresses and proxies afresh, and they
   // seldom change; what draws them is drawn again only when one of them has.
-  const consumers = useSameWhileUnchanged(flowConsumers(measured, data));
+  const consumers = useSameWhileUnchanged(flowConsumers(measured, data, t));
   const flow = useMemo(() => plannedFlow(measured, consumers), [consumers, measured]);
   const egresses = useSameWhileUnchanged(measured.egresses ?? data?.egressInterfaces ?? NO_EGRESSES);
   const profiles = useSameWhileUnchanged(measured.proxies ?? data?.proxyProfiles ?? NO_PROFILES);

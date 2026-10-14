@@ -76,7 +76,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
  const killSwitch=diagram.getByRole("link",{name:"Set a route for News archive",exact:true});
  assert.deepEqual(await killSwitch.locator("text").allTextContents(),["Kill switch","Blocked · no proxy, and direct is off"]);
  // Every box wears its state down its left edge: egresses, legs, endpoints, chain hops, lone proxies, the pool's heading and card, and the kill switch.
- assert.equal(await diagram.locator("rect[width='3']").count(),3+6+4+3+2+2+1);
+ assert.equal(await diagram.locator("rect[width='3']").count(),3+7+5+3+2+2+1);
  const legCards=diagram.locator("a[aria-label^='Edit the route for']");
  assert.deepEqual(await legCards.filter({hasText:"leg 3"}).locator("text").allTextContents(),["News primary · leg 3 · 10%","Down · 0/0 open · 0.00 MiB/s","parked · hold","Interface is down"]);
  // An egress says each limit it is held to under its load, speed then quota, a row each on a card that grows to fit.
@@ -95,14 +95,22 @@ test("flow displays route evidence, opens editors, and edits weights without los
  assert.notEqual(await lte.locator("g:has(> title) > text").getAttribute("fill"),await fiber.locator("g:has(> title) > text").last().getAttribute("fill"));
  // The daemon knows only that its egress is up; the leg is blocked all the same.
  assert.deepEqual(await legCards.filter({hasText:"News archive"}).locator("text").allTextContents(),["News archive · leg 1 · 100%","Blocked · 0/0 open · 0.00 MiB/s","0 planned"]);
- await diagram.locator("path[stroke-dasharray]").nth(8).waitFor({state:"attached"});
- assert.equal(await diagram.locator("path[stroke-dasharray]").count(),9);
+ await diagram.locator("path[stroke-dasharray]").nth(10).waitFor({state:"attached"});
+ assert.equal(await diagram.locator("path[stroke-dasharray]").count(),11);
  const faded=diagram.locator("[opacity='0.2']");
  const fadedLegs=diagram.locator("g[opacity='0.2'] > a[aria-label^='Edit the route for']");
  const fadedEgresses=diagram.locator("g[opacity='0.2'] > a[href='/settings/networking/egress']");
  const endpoints=diagram.locator("a[href^='/settings/networking/routes']:not([aria-label])");
  const fadedEndpoints=diagram.locator("g[opacity='0.2'] > a[href^='/settings/networking/routes']:not([aria-label])");
  assert.equal(await faded.count(),0);
+ // Only a server's card counts its connections: a feed's is its name over what it is, Default outbound's its name alone.
+ for(const [name,texts] of [["Feed mirror",["Feed mirror","RSS feed"]],["Default outbound",["Default outbound"]]]){
+  const card=endpoints.filter({hasText:name});
+  assert.deepEqual(await card.locator("text").allTextContents(),texts);
+  assert.equal(await card.locator("rect").count(),2);
+ }
+ // A server's card keeps a box for each of its 50 connections.
+ assert.equal(await endpoints.filter({hasText:"News primary"}).locator("rect").count(),2+50);
  // Nothing moves until a box is pointed at; then only what it lights does.
  const snakes=diagram.locator("animate");
  const fadedSnakes=diagram.locator("g[opacity='0.2'] animate");
@@ -112,7 +120,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
  assert.equal(await snakes.count(),0);
  await chain.hover();
  await fadedEndpoints.filter({hasText:"News primary"}).waitFor({state:"attached"});
- assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for News primary, leg 2","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1","Edit the route for News primary, leg 1","Edit the route for News primary, leg 3"]);
+ assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Default outbound, leg 1","Edit the route for News primary, leg 2","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1","Edit the route for News primary, leg 1","Edit the route for News primary, leg 3"]);
  assert.equal(await chain.getAttribute("opacity"),null);
  assert.equal(await fadedSnakes.count(),0);
  assert.ok(await snakes.count()>0);
@@ -121,39 +129,40 @@ test("flow displays route evidence, opens editors, and edits weights without los
  assert.equal(await proxy.locator("xpath=..").getAttribute("opacity"),"0.2");
  assert.equal(await killSwitch.locator("xpath=..").getAttribute("opacity"),"0.2");
  assert.equal(await fadedEgresses.count(),2);
- assert.equal(await fadedEndpoints.count(),2);
+ assert.equal(await fadedEndpoints.count(),3);
  // An endpoint nothing reaches is already dimmed, and fades further.
  const archive=endpoints.filter({hasText:"News archive"}).locator("xpath=..");
  assert.ok(Number(await archive.getAttribute("opacity"))<0.2);
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-focus-chain.png"),fullPage:true});
  await diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"WAN Fiber"}).hover();
  await fadedEndpoints.filter({hasText:"Feed mirror"}).waitFor({state:"attached"});
- assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Feed mirror, leg 1","Edit the route for News primary, leg 2","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1","Edit the route for News primary, leg 3"]);
+ assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Default outbound, leg 1","Edit the route for Feed mirror, leg 1","Edit the route for News primary, leg 2","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1","Edit the route for News primary, leg 3"]);
  assert.ok(await snakes.count()>0);
  assert.equal(await fadedSnakes.count(),0);
  assert.equal(await ribbons.count(),await snakes.count());
  assert.equal(await ribbons.evaluateAll(paths=>paths.filter(path=>path.getAttribute("fill")!==path.parentElement.querySelector(":scope > g > path").getAttribute("stroke")).length),0);
  assert.equal(await fadedEgresses.count(),2);
- assert.equal(await fadedEndpoints.count(),2);
+ assert.equal(await fadedEndpoints.count(),3);
  assert.ok(Number(await archive.getAttribute("opacity"))<0.2);
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-focus-egress.png"),fullPage:true});
  // The highlight follows the pointer and nothing else: it is gone once the pointer is.
  await page.mouse.move(0,0);
  await faded.first().waitFor({state:"detached"});
  assert.equal(await snakes.count(),0);
- assert.equal(await dashed.count(),9);
+ assert.equal(await dashed.count(),11);
  // A route behind a kill switch lights up but does not move: nothing can go that way.
  await killSwitch.hover();
  await fadedEndpoints.filter({hasText:"News primary"}).waitFor({state:"attached"});
  assert.equal(await killSwitch.locator("xpath=..").getAttribute("opacity"),null);
  assert.equal(await snakes.count(),0);
- assert.equal(await dashed.count(),9);
+ assert.equal(await dashed.count(),11);
  await page.mouse.move(0,0);
  await faded.first().waitFor({state:"detached"});
  // Picking a box opens the editor for what the box stands for, and holds no highlight.
  const edits=[
   [diagram.getByRole("link",{name:"Edit the route for Feed mirror, leg 1",exact:true}),"Route for Feed mirror"],
   [endpoints.filter({hasText:"News backup"}),"Route for News backup"],
+  [endpoints.filter({hasText:"Default outbound"}),"Route for Default outbound"],
   [killSwitch,"Route for News archive"],
   [diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"WAN Fiber"}),"WAN Fiber"],
   [pool,"Europe"],
@@ -209,8 +218,23 @@ test("flow displays route evidence, opens editors, and edits weights without los
  await page.getByRole("menu",{name:"Leg 1 rung 1",exact:true}).waitFor({state:"detached"});
  await page.getByRole("button",{name:"Toggle all down"}).click();
  await page.getByText("0 / 50",{exact:true}).first().waitFor();
- await diagram.locator("path[stroke-dasharray]").nth(13).waitFor({state:"attached"});
- assert.equal(await diagram.locator("path[stroke-dasharray]").count(),14);
+ await diagram.locator("path[stroke-dasharray]").nth(15).waitFor({state:"attached"});
+ assert.equal(await diagram.locator("path[stroke-dasharray]").count(),16);
+ // With one route picked, only what it reaches is drawn: its legs, the egress they leave through and its own card.
+ const egressCards=diagram.locator("a[href='/settings/networking/egress']");
+ await page.getByRole("button",{name:"Endpoint",exact:true}).click();
+ await page.getByRole("menuitemradio",{name:"Feed mirror",exact:true}).click();
+ await egressCards.filter({hasText:"WAN Fiber"}).waitFor({state:"detached"});
+ assert.equal(await egressCards.count(),1);
+ await egressCards.filter({hasText:"System"}).waitFor();
+ assert.deepEqual(await endpoints.allTextContents(),["Feed mirrorRSS feed"]);
+ assert.deepEqual(await legCards.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Feed mirror, leg 1"]);
+ assert.equal(await diagram.locator("a").filter({hasText:"Europe · pool"}).count(),0);
+ if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-one-route.png"),fullPage:true});
+ await page.getByRole("button",{name:"Endpoint",exact:true}).click();
+ await page.getByRole("menuitemradio",{name:"All endpoints",exact:true}).click();
+ await egressCards.filter({hasText:"WAN Fiber"}).waitFor();
+ assert.equal(await endpoints.count(),5);
  assert.equal(errors.length,0,errors.join("\n"));
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT,fullPage:true});
  await page.close();
