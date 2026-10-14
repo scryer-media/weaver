@@ -70,6 +70,14 @@ fn main() {
             std::process::exit(1);
         }
     }
+    // A server started by a process that interrupted another console server
+    // inherits the ignore-Ctrl+C flag, and must clear it to stay stoppable.
+    // The helper above keeps it: it sends those interrupts itself.
+    #[cfg(windows)]
+    {
+        // SAFETY: A null handler with FALSE only clears this process's flag.
+        unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) };
+    }
     if let Some(code) =
         weaver_server_core::post_processing::runner::maybe_run_supervisor_from_process_args()
     {

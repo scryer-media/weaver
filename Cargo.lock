@@ -206,7 +206,7 @@ dependencies = [
 [[package]]
 name = "application-updater"
 version = "0.1.0"
-source = "git+https://github.com/scryer-media/application-updater?rev=4fc9a4bce9e683c812249cb056990f01a823d353#4fc9a4bce9e683c812249cb056990f01a823d353"
+source = "git+https://github.com/scryer-media/application-updater?rev=e55801ce7f66c744667d4fe27dd12432a4697f33#e55801ce7f66c744667d4fe27dd12432a4697f33"
 dependencies = [
  "artifact-trust",
  "blake3",

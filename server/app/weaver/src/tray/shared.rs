@@ -1245,6 +1245,10 @@ fn configure_server_command(command: &mut Command) {
     use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
     command.creation_flags(CREATE_NO_WINDOW);
+    // A tray relaunched by the upgrade helper inherits its ignore-Ctrl+C flag;
+    // clear it so the server does not inherit it and ignore its stop request.
+    // SAFETY: A null handler with FALSE only clears this process's flag.
+    unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) };
 }
 
 #[cfg(not(windows))]

@@ -77,13 +77,18 @@
          that predate its stop-by-name sweep it stops only the tray of the session the
          installer runs in and the server that tray started: an orphaned server, or a tray in
          another session, survives it.
-         So a second step, which runs no Weaver code, force-stops every weaver.exe and
-         weaver-tray.exe that is still running once the graceful request has had its chance.
-         It names images only, without /T: the upgrade helper that may have started this
-         install is a child of weaver.exe, runs as weaver-upgrade-helper.exe, and must outlive
-         the server. Both steps run before InstallValidate, which precedes InstallInitialize,
-         so they are immediate actions and run at every UI level, /passive and /qn included.
-         taskkill exits nonzero when nothing matched, so its result is ignored. -->
+         So a second step, which runs no Weaver code, force-stops the weaver.exe and
+         weaver-tray.exe processes that are still running once the graceful request has had
+         its chance. It is scoped to executables inside the installed folder (the folder of
+         INSTALLEDTRAYEXE), so a portable or development copy running elsewhere survives; a
+         process whose path cannot be read (another user's) is skipped and left to Restart
+         Manager. The folder is read into a variable outside the script block because MSI
+         formatting strips braces around a resolved property. There is no tree kill: the
+         upgrade helper that may have started this install is a child of weaver.exe, runs as
+         weaver-upgrade-helper.exe, which is not in the name list, and must outlive the server.
+         Both steps run before InstallValidate, which precedes InstallInitialize, so they are
+         immediate actions and run at every UI level, /passive and /qn included. The stop's
+         result is ignored. -->
     <Property Id="INSTALLEDTRAYEXE">
       <DirectorySearch Id="InstalledWeaverFolder" Path="[ProgramFiles64Folder]Scryer Media\Weaver">
         <FileSearch Id="InstalledWeaverTrayExe" Name="weaver-tray.exe" />
@@ -102,22 +107,22 @@
               Condition="WIX_UPGRADE_DETECTED AND INSTALLEDTRAYEXE" />
     </InstallExecuteSequence>
     <SetProperty
-        Id="STOPLEFTOVERWEAVEREXE"
-        Value="[SystemFolder]taskkill.exe"
+        Id="STOPLEFTOVERWEAVERPOWERSHELLEXE"
+        Value="[System64Folder]WindowsPowerShell\v1.0\powershell.exe"
         Before="StopLeftoverWeaverProcessesBeforeValidate"
         Sequence="execute"
-        Condition="WIX_UPGRADE_DETECTED" />
+        Condition="WIX_UPGRADE_DETECTED AND INSTALLEDTRAYEXE" />
     <CustomAction
         Id="StopLeftoverWeaverProcessesBeforeValidate"
-        Property="STOPLEFTOVERWEAVEREXE"
-        ExeCommand="/F /IM weaver.exe /IM weaver-tray.exe"
+        Property="STOPLEFTOVERWEAVERPOWERSHELLEXE"
+        ExeCommand="-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command &quot;$folder = (Split-Path -Parent '[INSTALLEDTRAYEXE]') + '\'; Get-Process weaver,weaver-tray -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($folder, 'OrdinalIgnoreCase') } | Stop-Process -Force&quot;"
         Execute="immediate"
         Return="ignore"
         Impersonate="yes" />
     <InstallExecuteSequence>
       <Custom Action="StopLeftoverWeaverProcessesBeforeValidate"
               After="StopInstalledTrayBeforeValidate"
-              Condition="WIX_UPGRADE_DETECTED" />
+              Condition="WIX_UPGRADE_DETECTED AND INSTALLEDTRAYEXE AND STOPLEFTOVERWEAVERPOWERSHELLEXE" />
     </InstallExecuteSequence>
 
     <!-- These commands affect only the uninstalling user: their HKCU Run entry, the
