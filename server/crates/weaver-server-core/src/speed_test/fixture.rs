@@ -298,7 +298,6 @@ async fn serve_http(
 
 // A TLS acceptor for the loopback certificate, and the certificate's DER
 // and PEM to trust.
-#[cfg(test)]
 pub fn loopback_tls() -> (tokio_rustls::TlsAcceptor, Vec<u8>, String) {
     use tokio_rustls::rustls;
     let cert = weaver_tunnel::test_support::tls::loopback_certificate();

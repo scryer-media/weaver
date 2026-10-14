@@ -4,8 +4,10 @@ use common::{TestHarness, assert_no_errors, response_data};
 use std::sync::atomic::Ordering;
 use weaver_server_api::auth::{CallerIdentity, CallerScope};
 use weaver_server_core::proxies::ProxyRuntime;
-use weaver_server_core::speed_test::SpeedTestStatus;
-use weaver_server_core::speed_test::fixture::{FixtureArticle, HttpFixture, NntpFixture, nzb};
+use weaver_server_core::speed_test::fixture::{
+    FixtureArticle, HttpFixture, NntpFixture, loopback_tls, nzb,
+};
+use weaver_server_core::speed_test::{SpeedTestService, SpeedTestStatus};
 
 async fn harness() -> TestHarness {
     let h = TestHarness::new().await;
@@ -509,6 +511,75 @@ async fn a_bandwidth_run_starts_on_its_source_alone_and_reports_it() {
     let connections = done["result"]["connections"].as_array().unwrap();
     assert_eq!(connections.len(), 1, "{done}");
     assert!(connections[0]["error"].is_string(), "{done}");
+}
+
+// Give egress 0 a download quota of `limit` bytes.
+fn egress_quota(h: &TestHarness, limit: u64) {
+    use weaver_nntp::transfer::{QuotaRuntimeConfig, ServerTransferConfig, StableServerId};
+
+    h.handle
+        .proxy_runtime()
+        .unwrap()
+        .network
+        .egress_controls
+        .configure(
+            StableServerId(0),
+            ServerTransferConfig {
+                rate_bytes_per_sec: 0,
+                quota: Some(QuotaRuntimeConfig {
+                    limit_bytes: limit,
+                    generation: 1,
+                    retry_at: None,
+                }),
+            },
+        );
+}
+
+#[tokio::test]
+async fn a_bandwidth_run_over_https_completes_with_its_result() {
+    let h = harness().await;
+    let (acceptor, cert_der, _) = loopback_tls();
+    let http = HttpFixture::start(String::new(), 200_000, Some(acceptor)).await;
+    let service = SpeedTestService::for_handle(&h.handle, h.config.clone(), h.db.clone(), true);
+    service.trust_roots_for_tests(vec![cert_der]);
+    service.measure_until_stopped_for_tests();
+    // Two GETs fit the quota and a third does not, so every connection ends
+    // on it and the run ends with them.
+    egress_quota(&h, 500_000);
+    let url = format!("https://127.0.0.1:{}/blob", http.addr.port());
+
+    let started = start(
+        &h,
+        &format!(r#"{{kind:RSS,id:1,route:{DIRECT},bandwidth:{{customUrl:"{url}"}}}}"#),
+    )
+    .await;
+    assert_eq!(started["kind"], "BANDWIDTH");
+    let done = finished(&h, started["id"].as_u64().unwrap()).await;
+
+    assert_eq!(done["status"], "COMPLETED", "{done}");
+    assert_eq!(done["error"], serde_json::Value::Null);
+    let result = &done["result"];
+    assert_eq!(result["bytes"], 400_000.0);
+    assert!(result["averageBps"].as_f64().unwrap() > 0.0, "{done}");
+    assert_eq!(result["bandwidth"]["url"], url);
+    assert_eq!(result["bandwidth"]["providerId"], serde_json::Value::Null);
+    let connections = result["connections"].as_array().unwrap();
+    assert!(!connections.is_empty());
+    assert_eq!(result["bandwidth"]["connections"], connections.len());
+    let moved: f64 = connections
+        .iter()
+        .map(|connection| connection["bytes"].as_f64().unwrap())
+        .sum();
+    assert_eq!(moved, 400_000.0);
+    for connection in connections {
+        assert_eq!(connection["leg"], 0, "{connection}");
+        assert_eq!(connection["path"]["egressId"], 0, "{connection}");
+        assert_eq!(
+            connection["error"], "egress 0 has used its download quota",
+            "{connection}"
+        );
+    }
+    assert_eq!(result["legs"][0]["bytes"], 400_000.0);
 }
 
 #[tokio::test]

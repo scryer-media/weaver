@@ -234,10 +234,13 @@ const query = new URLSearchParams(window.location.search);
 const screen = query.has("routes")
   ? <RoutesPage data={data} consumers={consumers} flow={{ legs: [], pools: [] }} action={async () => null} busy={false} />
   : <SpeedPage data={data} consumers={consumers} />;
-/* With `?downloading` a job is downloading, so a run asks before it pauses downloads; otherwise the queue is idle. */
+/*
+ * With `?downloading` a job is downloading, so a run asks before it pauses downloads; otherwise the queue is idle.
+ * With `?gauge` the header gauge reads a rate, as it can just after a Usenet run.
+ */
 const live = {
   isPaused: false,
-  speed: 0,
+  speed: query.has("gauge") ? 12 * 1024 * 1024 : 0,
   queue: { jobs: query.has("downloading") ? [{ id: 7, status: "DOWNLOADING" }] : [] } as unknown as NextData["queue"],
 } as NextData;
 const dictionary: Record<string, string> = { ...en, ...nextEn };

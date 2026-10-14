@@ -208,8 +208,9 @@ export function useSpeedTestRun(onFinished: () => void) {
   const [refusal, setRefusal] = useState<string | null>(null);
   /** A run waiting on the operator to agree to pause downloads. */
   const [pending, setPending] = useState<SpeedTestInput | null>(null);
-  const { isPaused, speed, queue } = useNextData();
-  const downloading = !isPaused && (speed > 0 || queue.jobs.some((job) => FETCHING.has(job.status.toUpperCase())));
+  const { isPaused, queue } = useNextData();
+  // Jobs, not the header gauge: a Usenet run's own bytes drive the gauge, and it can still read them after the run.
+  const downloading = !isPaused && queue.jobs.some((job) => FETCHING.has(job.status.toUpperCase()));
   const runningId = run?.status === "RUNNING" ? run.id : null;
   // The poll outlives renders, so it reads the latest callback rather than restarting for each.
   const finished = useRef(onFinished);
