@@ -319,6 +319,8 @@ test("a chain's hops open in order and offer only the proxies that can still fol
     const editor = page.getByRole("dialog", { name: "Route for news.fixture.invalid", exact: true });
     // A ladder starts with its first rung.
     await option(editor, "Proxy ladder").click();
+    // A new ladder falls back to direct until that is turned off.
+    assert.equal(await editor.getByRole("checkbox", { name: "Allow direct fallback on this egress", exact: true }).isChecked(), true);
     // A proxy's or a pool's select sits under the rung's type, where a chain's hops do.
     const type = editor.getByRole("radiogroup", { name: "Leg 1 rung 1 type", exact: true });
     for (const [kind, placeholder] of [["Proxy", "Select proxy"], ["Pool", "Select pool"]]) {

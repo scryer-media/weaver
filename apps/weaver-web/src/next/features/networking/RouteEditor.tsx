@@ -207,7 +207,8 @@ export function RouteEditor({
                 label={t("next.networking.route.path")}
                 value={path.kind}
                 onChange={(kind) =>
-                  update(index, { ...leg, path: { kind, rungs: kind === "LADDER" ? [emptyRung()] : [], directFallback: false } })
+                  // A new ladder falls back to direct until that is turned off.
+                  update(index, { ...leg, path: { kind, rungs: kind === "LADDER" ? [emptyRung()] : [], directFallback: kind === "LADDER" } })
                 }
                 className="self-start"
                 options={[
