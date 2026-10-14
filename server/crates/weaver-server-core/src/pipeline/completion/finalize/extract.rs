@@ -1341,7 +1341,7 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek + Send + 'static>(
                 let offset =
                     (entry as *const sevenz_turbo::ArchiveEntry as usize).wrapping_sub(files);
                 let file_index = offset / entry_bytes;
-                if offset % entry_bytes != 0 || file_index >= file_count {
+                if !offset.is_multiple_of(entry_bytes) || file_index >= file_count {
                     return Err(sevenz_turbo::Error::Other(
                         "7z entry is not in the reader's file table".into(),
                     ));

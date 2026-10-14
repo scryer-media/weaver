@@ -143,8 +143,7 @@ fn zip_with_bad_unicode_path_field() -> Vec<u8> {
 #[test]
 fn zip_8_6_unicode_extra_field_mismatch_is_recognised() {
     let error = zip::ZipArchive::new(Cursor::new(zip_with_bad_unicode_path_field()))
-        .err()
-        .expect("the Unicode path field fails its CRC");
+        .expect_err("the Unicode path field fails its CRC");
     let zip::result::ZipError::InvalidArchive(detail) = &error else {
         panic!("an invalid archive: {error:?}");
     };
