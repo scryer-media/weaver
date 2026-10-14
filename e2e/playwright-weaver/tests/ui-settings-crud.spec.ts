@@ -94,22 +94,49 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
   await expect(editor).toBeHidden();
 });
 
+test("the unacceptable extension list saves under General downloads, normalized", async ({ cleanPage: page }) => {
+  test.skip(afterRestart, "the list is put back before restart");
+  await page.goto("/settings/general");
+  const extensions = page
+    .getByRole("region", { name: "Downloads", exact: true })
+    .getByRole("textbox", { name: "Unacceptable extensions", exact: true });
+  await expect(extensions).toBeVisible();
+  const original = await extensions.inputValue();
+  try {
+    await extensions.fill("EXE, r??");
+    await saveSettings(page);
+    await page.reload();
+    await expect(extensions).toHaveValue("exe, r??");
+  } finally {
+    await extensions.fill(original);
+    await saveSettings(page);
+    await page.reload();
+    await expect(extensions).toHaveValue(original);
+  }
+});
+
 test("archive passwords and the password file save, clear and persist without echoing the list", async ({ cleanPage: page }) => {
   await page.goto("/settings/general");
   const section = page.getByRole("region", { name: "Archive passwords", exact: true });
   const list = section.getByRole("textbox", { name: "Passwords (one per line)", exact: true });
   const file = section.getByRole("textbox", { name: "Password file", exact: true });
   const clear = section.getByRole("button", { name: "Clear", exact: true });
+  // The list stays behind Edit passwords until asked for, so a shared screen never shows it.
+  const edit = section.getByRole("button", { name: "Edit passwords", exact: true });
   const passwordFile = "/data/e2e-archive-passwords.txt";
   if (afterRestart) {
     // The daemon reports only that a list is stored; the list never comes back.
     await expect(clear).toBeVisible();
+    await expect(list).toHaveCount(0);
+    await edit.click();
     await expect(list).toHaveValue("");
     await expect(file).toHaveValue(passwordFile);
     return;
   }
 
   await expect(clear).toHaveCount(0);
+  await expect(list).toHaveCount(0);
+  await edit.click();
   writeFileSync("/weaver-data/e2e-archive-passwords.txt", "fixture-password\n", { mode: 0o644 });
   await list.fill("first-secret\nsecond-secret");
   await file.click();
@@ -122,6 +149,8 @@ test("archive passwords and the password file save, clear and persist without ec
   await saveSettings(page);
   await page.reload();
   await expect(clear).toBeVisible();
+  await expect(list).toHaveCount(0);
+  await edit.click();
   await expect(list).toHaveValue("");
   await expect(file).toHaveValue(passwordFile);
 
@@ -134,6 +163,7 @@ test("archive passwords and the password file save, clear and persist without ec
   await expect(file).toHaveValue(passwordFile);
 
   // Leave a list stored for the restart stage.
+  await edit.click();
   await list.fill("third-secret");
   await saveSettings(page);
   await page.reload();
@@ -366,7 +396,7 @@ test("the performance profile saves the moment one is picked and keeps it", asyn
   expect(recommendedName, `unknown profile ${offered.recommended}`).toBeTruthy();
   const profile = page
     .getByRole("region", { name: "Performance", exact: true })
-    .getByRole("button", { name: "Profile", exact: true });
+    .getByRole("button", { name: "Hardware profile", exact: true });
   const unconfirmed = page.getByText("Running the recommended profile, not yet confirmed.", { exact: true });
   if (afterRestart) {
     await expect(profile).toHaveText(recommendedName);
@@ -382,7 +412,7 @@ test("the performance profile saves the moment one is picked and keeps it", asyn
   );
   await profile.click();
   await page
-    .getByRole("menu", { name: "Profile", exact: true })
+    .getByRole("menu", { name: "Hardware profile", exact: true })
     .getByRole("menuitemradio", { name: recommendedName, exact: true })
     .click();
   const response = await saved;

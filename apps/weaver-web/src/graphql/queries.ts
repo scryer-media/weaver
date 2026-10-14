@@ -2341,6 +2341,21 @@ export const UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION = gql`
   }
 `;
 
+/** The unwanted extension list, which General edits apart from the script settings it is stored with. */
+export const UNACCEPTABLE_EXTENSIONS_QUERY = gql`
+  query UnacceptableExtensions {
+    postProcessingSettings {
+      unacceptableExtensions
+    }
+  }
+`;
+
+export const SET_UNACCEPTABLE_EXTENSIONS_MUTATION = gql`
+  mutation SetUnacceptableExtensions($extensions: [String!]!) {
+    setUnacceptableExtensions(extensions: $extensions)
+  }
+`;
+
 export const VALIDATED_ARCHIVE_PASSWORD_QUERY = gql`
   query ValidatedArchivePassword($id: Int!) {
     validatedArchivePassword(id: $id)

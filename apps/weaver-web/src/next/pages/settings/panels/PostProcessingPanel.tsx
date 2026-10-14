@@ -82,7 +82,6 @@ interface ExecutionForm extends EventScriptOptions {
   powershellInterpreter: string;
   batchInterpreter: string;
   goInterpreter: string;
-  unacceptableExtensions: string;
 }
 
 /** The daemon runs between 1 and 128 scripts at once. */
@@ -98,15 +97,7 @@ const DEFAULTS: ExecutionForm = {
   powershellInterpreter: "",
   batchInterpreter: "",
   goInterpreter: "",
-  unacceptableExtensions: "",
 };
-
-function splitExtensions(value: string): string[] {
-  return value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-}
 
 function errorText(error: CombinedError): string {
   return error.graphQLErrors[0]?.message ?? error.message;
@@ -146,7 +137,6 @@ export function ScriptConfigurationPanel() {
             powershellInterpreter: settings.powershellInterpreter ?? "",
             batchInterpreter: settings.batchInterpreter ?? "",
             goInterpreter: settings.goInterpreter ?? "",
-            unacceptableExtensions: settings.unacceptableExtensions.join(", "),
           }
         : DEFAULTS,
     [settings],
@@ -181,7 +171,6 @@ export function ScriptConfigurationPanel() {
           powershellInterpreter: values.powershellInterpreter.trim() || null,
           batchInterpreter: values.batchInterpreter.trim() || null,
           goInterpreter: values.goInterpreter.trim() || null,
-          unacceptableExtensions: splitExtensions(values.unacceptableExtensions),
         },
       }).then((result) => {
         if (result.error) {
@@ -269,18 +258,6 @@ export function ScriptConfigurationPanel() {
             max: 600,
             suffix: t("next.general.seconds"),
             onChange: (next) => patch({ terminationGraceSeconds: next }),
-          },
-        },
-        {
-          id: "unacceptableExtensions",
-          label: t("next.postProcessing.extensions"),
-          help: t("next.postProcessing.extensionsHelp"),
-          keywords: values.unacceptableExtensions,
-          control: {
-            kind: "text",
-            value: values.unacceptableExtensions,
-            placeholder: "exe, bat, scr",
-            onChange: (next) => patch({ unacceptableExtensions: next }),
           },
         },
         {

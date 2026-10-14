@@ -4,7 +4,9 @@ import {
   ARCHIVE_PASSWORD_SETTINGS_QUERY,
   HARDWARE_PROFILE_QUERY,
   SET_HARDWARE_PROFILE_MUTATION,
+  SET_UNACCEPTABLE_EXTENSIONS_MUTATION,
   SETTINGS_QUERY,
+  UNACCEPTABLE_EXTENSIONS_QUERY,
   UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION,
   UPDATE_SETTINGS_MUTATION,
 } from "@/graphql/queries";
@@ -57,11 +59,20 @@ interface GeneralSettings {
   /** A replacement list, blank to keep what is stored, null to remove it on save. */
   archivePasswords: string | null;
   archivePasswordFile: string;
+  /** The unwanted extension list as typed, comma-separated; saved on its own. */
+  unacceptableExtensions: string;
 }
 
 interface ArchivePasswordSettings {
   hasPasswords: boolean;
   passwordFile: string | null;
+}
+
+function splitExtensions(value: string): string[] {
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 const DUPLICATE_ACTION_LABEL: Record<DuplicateAction, string> = {
@@ -116,24 +127,32 @@ export function GeneralPanel() {
   const [{ data: archiveData }, reexecuteArchive] = useQuery<{
     archivePasswordSettings: ArchivePasswordSettings;
   }>({ query: ARCHIVE_PASSWORD_SETTINGS_QUERY });
+  const [{ data: extensionsData }, reexecuteExtensions] = useQuery<{
+    postProcessingSettings: { unacceptableExtensions: string[] };
+  }>({ query: UNACCEPTABLE_EXTENSIONS_QUERY });
   const [updateState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
   const [archiveState, updateArchivePasswords] = useMutation(UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION);
+  const [extensionsState, setExtensions] = useMutation(SET_UNACCEPTABLE_EXTENSIONS_MUTATION);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The password box stays shut until asked for, so clicking through settings on a shared screen shows none.
+  const [editingPasswords, setEditingPasswords] = useState(false);
 
   const source = useMemo<GeneralSettings | null>(() => {
     const settings = data?.settings;
     const archive = archiveData?.archivePasswordSettings;
-    return settings && archive
+    const extensions = extensionsData?.postProcessingSettings.unacceptableExtensions;
+    return settings && archive && extensions
       ? {
           ...settings,
           duplicatePolicy: normalizeDuplicatePolicy(settings.duplicatePolicy),
           hasArchivePasswords: archive.hasPasswords,
           archivePasswords: "",
           archivePasswordFile: archive.passwordFile ?? "",
+          unacceptableExtensions: extensions.join(", "),
         }
       : null;
-  }, [data?.settings, archiveData?.archivePasswordSettings]);
+  }, [data?.settings, archiveData?.archivePasswordSettings, extensionsData?.postProcessingSettings]);
 
   const draft = useDraft(source, () => {
     setStatus(null);
@@ -143,11 +162,12 @@ export function GeneralPanel() {
 
   usePanelState({
     dirty: draft.dirty,
-    busy: updateState.fetching || archiveState.fetching,
+    busy: updateState.fetching || archiveState.fetching || extensionsState.fetching,
     status: error ?? status,
     failed: error !== null,
     revert: () => {
       setError(null);
+      setEditingPasswords(false);
       draft.revert();
     },
     save: () => {
@@ -160,6 +180,7 @@ export function GeneralPanel() {
       const archiveChanged =
         values.archivePasswords !== "" ||
         values.archivePasswordFile.trim() !== source.archivePasswordFile;
+      const extensionsChanged = values.unacceptableExtensions !== source.unacceptableExtensions;
       void Promise.all([
         updateSettings({
           input: {
@@ -180,7 +201,8 @@ export function GeneralPanel() {
               passwordFile: values.archivePasswordFile.trim() || null,
             })
           : null,
-      ]).then(([general, archive]) => {
+        extensionsChanged ? setExtensions({ extensions: splitExtensions(values.unacceptableExtensions) }) : null,
+      ]).then(([general, archive, extensions]) => {
         if (general.error || !general.data?.updateSettings) {
           setError(general.error?.message ?? t("next.settings.saveFailed"));
           return;
@@ -189,11 +211,19 @@ export function GeneralPanel() {
           setError(archive.error?.message ?? t("next.settings.saveFailed"));
           return;
         }
+        if (extensions && (extensions.error || !extensions.data?.setUnacceptableExtensions)) {
+          setError(extensions.error?.message ?? t("next.settings.saveFailed"));
+          return;
+        }
         draft.markSaved();
+        setEditingPasswords(false);
         setStatus(t("next.settings.saved"));
         void reexecute({ requestPolicy: "network-only" });
         if (archive) {
           void reexecuteArchive({ requestPolicy: "network-only" });
+        }
+        if (extensions) {
+          void reexecuteExtensions({ requestPolicy: "network-only" });
         }
       });
     },
@@ -277,6 +307,19 @@ export function GeneralPanel() {
                 onChange: (next) => draft.set({ enableSrrdbLookup: next }),
               },
             },
+            {
+              id: "unacceptableExtensions",
+              label: t("next.general.unacceptableExtensions"),
+              help: t("next.general.unacceptableExtensionsHelp"),
+              keywords: values.unacceptableExtensions,
+              control: {
+                kind: "text",
+                value: values.unacceptableExtensions,
+                placeholder: "exe, bat, scr",
+                className: "w-[420px] max-w-full",
+                onChange: (next) => draft.set({ unacceptableExtensions: next }),
+              },
+            },
           ],
         }
       : null,
@@ -294,21 +337,27 @@ export function GeneralPanel() {
                 kind: "custom",
                 control: (
                   <div className="flex items-start justify-end gap-2">
-                    <TextArea
-                      label={t("next.archivePasswords.list")}
-                      value={values.archivePasswords ?? ""}
-                      rows={3}
-                      secret
-                      placeholder={
-                        values.archivePasswords === null
-                          ? t("next.archivePasswords.cleared")
-                          : values.hasArchivePasswords
-                            ? "••••••••"
-                            : undefined
-                      }
-                      className="w-[190px] max-w-full"
-                      onChange={(next) => draft.set({ archivePasswords: next })}
-                    />
+                    {editingPasswords || values.archivePasswords === null ? (
+                      <TextArea
+                        label={t("next.archivePasswords.list")}
+                        value={values.archivePasswords ?? ""}
+                        rows={3}
+                        secret
+                        placeholder={
+                          values.archivePasswords === null
+                            ? t("next.archivePasswords.cleared")
+                            : values.hasArchivePasswords
+                              ? "••••••••"
+                              : undefined
+                        }
+                        className="w-[190px] max-w-full"
+                        onChange={(next) => draft.set({ archivePasswords: next })}
+                      />
+                    ) : (
+                      <SecondaryButton icon="password" onClick={() => setEditingPasswords(true)}>
+                        {t("next.archivePasswords.edit")}
+                      </SecondaryButton>
+                    )}
                     {values.hasArchivePasswords ? (
                       <SecondaryButton
                         onClick={() =>
@@ -340,12 +389,18 @@ export function GeneralPanel() {
       : null,
     profileSettings && offersProfileChoice(profileSettings)
       ? {
-          kind: "custom",
+          kind: "section",
           id: "performance",
           title: t("next.performance.title"),
-          note: t("next.performance.body"),
-          searchText: "performance profile hardware memory threads efficient balanced",
-          body: <PerformanceProfile settings={profileSettings} />,
+          fields: [
+            {
+              id: "hardwareProfile",
+              label: t("next.performance.profile"),
+              help: t("next.performance.timing"),
+              keywords: "performance profile hardware memory threads efficient balanced",
+              control: { kind: "custom", control: <PerformanceProfile settings={profileSettings} /> },
+            },
+          ],
         }
       : null,
     values
@@ -465,9 +520,7 @@ function PerformanceProfile({ settings }: { settings: HardwareProfileSettings })
   };
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-6">
-      <span className="text-[13px] font-semibold text-wv-fg">{t("next.performance.profile")}</span>
-      <div className="ml-auto flex min-w-0 flex-col items-end gap-2">
+    <div className="flex min-w-0 flex-col items-end gap-2">
       <Select
         label={t("next.performance.profile")}
         options={saved.options.map((option) => {
@@ -486,13 +539,11 @@ function PerformanceProfile({ settings }: { settings: HardwareProfileSettings })
         <p className="text-[11.5px] text-wv-dim">{t("next.performance.notConfirmed")}</p>
       ) : null}
       {scheduledNotice ? <p className="text-[11.5px] text-wv-dim">{scheduledNotice}</p> : null}
-      <p className="text-[11.5px] text-wv-dim">{t("next.performance.timing")}</p>
       {error ? (
         <p role="alert" className="text-[12.5px] text-wv-error-text">
           {error}
         </p>
       ) : null}
-      </div>
     </div>
   );
 }

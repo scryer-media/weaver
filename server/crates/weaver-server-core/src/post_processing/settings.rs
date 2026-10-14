@@ -202,15 +202,53 @@ impl Database {
         settings: PostProcessingSettings,
         preserve_extensions: bool,
     ) -> Result<PostProcessingSettings, StateError> {
+        self.merge_post_processing_settings(
+            "save_post_processing_settings_preserving_extensions",
+            move |stored| {
+                let mut settings = settings.clone();
+                if preserve_extensions {
+                    settings.unacceptable_extensions = stored.unacceptable_extensions.clone();
+                }
+                settings
+            },
+        )
+    }
+
+    // Replace the unwanted extension list and keep every other setting as
+    // stored, in the same transaction as the read so a concurrent save of the
+    // other settings is not undone.
+    pub fn save_unacceptable_extensions(
+        &self,
+        extensions: Vec<String>,
+    ) -> Result<PostProcessingSettings, StateError> {
+        self.merge_post_processing_settings("save_unacceptable_extensions", move |stored| {
+            PostProcessingSettings {
+                unacceptable_extensions: extensions.clone(),
+                ..stored.clone()
+            }
+        })
+    }
+
+    // Read the stored settings, merge an update into them, normalize, and
+    // write the result back, all in one transaction.
+    fn merge_post_processing_settings<M>(
+        &self,
+        op_name: &'static str,
+        merge: M,
+    ) -> Result<PostProcessingSettings, StateError>
+    where
+        M: Fn(&PostProcessingSettings) -> PostProcessingSettings + Send + Sync + 'static,
+    {
         let datastore = self.datastore();
         let default_settings = to_json(&PostProcessingSettings::default())?;
+        let merge = std::sync::Arc::new(merge);
         let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
                 &datastore,
-                "save_post_processing_settings_preserving_extensions",
+                op_name,
                 |tx| {
                     let default_settings = default_settings.clone();
-                    let settings = settings.clone();
+                    let merge = std::sync::Arc::clone(&merge);
                     Box::pin(async move {
                         tx.execute(
                             "INSERT INTO settings (key, value) VALUES ({}, {})\n                             ON CONFLICT(key) DO NOTHING",
@@ -236,11 +274,7 @@ impl Database {
                             })?
                             .text("value")?;
                         let stored = from_json::<PostProcessingSettings>(&stored)?;
-                        let mut settings = settings;
-                        if preserve_extensions {
-                            settings.unacceptable_extensions = stored.unacceptable_extensions.clone();
-                        }
-                        let settings = settings.normalized().map_err(state_err)?;
+                        let settings = merge(&stored).normalized().map_err(state_err)?;
                         let lowered = retention_lowered(&stored, &settings);
                         tx.execute(
                             "INSERT INTO settings (key, value) VALUES ({}, {})\n                             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -601,5 +635,45 @@ mod tests {
         assert!(!stored.contains("eventScriptConcurrency"));
         assert!(stored.contains(r#""concurrency":4"#));
         assert!(stored.contains(r#""scriptOutputFailedRunsPerJob":8"#));
+    }
+
+    #[test]
+    fn saving_the_extension_list_keeps_every_other_setting() {
+        let db = Database::open_in_memory().unwrap();
+        let mut settings = PostProcessingSettings {
+            concurrency: 3,
+            python_interpreter: Some("/usr/bin/python3".into()),
+            ..PostProcessingSettings::default()
+        };
+        settings.event_scripts.script_output_runs_per_job = 7;
+        db.save_post_processing_settings(&settings).unwrap();
+
+        let saved = db
+            .save_unacceptable_extensions(vec![" ISO ".into(), "exe".into(), "iso".into()])
+            .unwrap();
+        assert_eq!(saved.unacceptable_extensions, vec!["exe", "iso"]);
+        let stored = db.post_processing_settings().unwrap();
+        assert_eq!(stored.unacceptable_extensions, vec!["exe", "iso"]);
+        assert_eq!(stored.concurrency, 3);
+        assert_eq!(
+            stored.python_interpreter.as_deref(),
+            Some("/usr/bin/python3")
+        );
+        assert_eq!(stored.event_scripts.script_output_runs_per_job, 7);
+
+        // An empty list turns the check off; a pattern it cannot read is refused.
+        assert!(
+            db.save_unacceptable_extensions(Vec::new())
+                .unwrap()
+                .unacceptable_extensions
+                .is_empty()
+        );
+        assert!(db.save_unacceptable_extensions(vec!["a/b".into()]).is_err());
+        assert!(
+            db.post_processing_settings()
+                .unwrap()
+                .unacceptable_extensions
+                .is_empty()
+        );
     }
 }

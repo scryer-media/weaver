@@ -156,6 +156,23 @@ impl PostProcessingMutation {
         ))
     }
 
+    /// Replace the unwanted extension list and nothing else. An empty list
+    /// turns the check off. Returns the list as saved, normalized.
+    #[graphql(guard = "AdminGuard")]
+    async fn set_unacceptable_extensions(
+        &self,
+        ctx: &Context<'_>,
+        extensions: Vec<String>,
+    ) -> Result<Vec<String>> {
+        let db = ctx.data::<Database>()?.clone();
+        let settings =
+            tokio::task::spawn_blocking(move || db.save_unacceptable_extensions(extensions))
+                .await
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?
+                .map_err(|error| async_graphql::Error::new(error.to_string()))?;
+        Ok(settings.unacceptable_extensions)
+    }
+
     /// Select the sole live source of scripts. Changing it turns every
     /// script job off, because a name in the new directory is not the script
     /// that was wired up. What was saved in them is kept, and script files
