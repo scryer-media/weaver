@@ -81,7 +81,12 @@ test("flow displays route evidence, opens editors, exports a frozen SVG, and edi
  assert.deepEqual(await fiber.locator("text").allTextContents(),["WAN Fiber","Up","192.0.2.10","24 open · 22.89 MiB/s","50.00 MiB/s","120 GB / 500 GB"]);
  assert.deepEqual(await fiber.locator("g:has(> title) svg").evaluateAll(icons=>icons.map(icon=>icon.getAttribute("class").split(" ").find(name=>name!=="lucide"))),["lucide-gauge","lucide-chart-pie"]);
  assert.deepEqual(await fiber.locator("g:has(> title) > title").allTextContents(),["Download limit","Download quota"]);
- assert.deepEqual(await diagram.locator("a[href='/settings/networking/egress'] > rect:first-child").evaluateAll(rects=>rects.map(rect=>rect.getAttribute("height"))),["108","148","128"]);
+ // An egress leaving from more than one address stacks them, one to a line, and its card grows to hold them.
+ const system=diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"System"});
+ const systemTexts=await system.locator("text").evaluateAll(texts=>texts.map(text=>[text.textContent,Number(text.getAttribute("y"))]));
+ assert.deepEqual(systemTexts.map(([text])=>text).slice(0,4),["System","Up","192.0.2.21","2001:db8::21"]);
+ assert.deepEqual(systemTexts.slice(2,5).map(([,y],index,all)=>index?y-all[index-1][1]:0),[0,14,20]);
+ assert.deepEqual(await diagram.locator("a[href='/settings/networking/egress'] > rect:first-child").evaluateAll(rects=>rects.map(rect=>rect.getAttribute("height"))),["122","148","128"]);
  const lte=diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"LTE standby"});
  assert.deepEqual(await lte.locator("text").allTextContents(),["LTE standby","Down","198.51.100.10","Interface is down","20.0 GB / 20.0 GB · Blocked"]);
  assert.notEqual(await lte.locator("g:has(> title) > text").getAttribute("fill"),await fiber.locator("g:has(> title) > text").last().getAttribute("fill"));
@@ -178,7 +183,7 @@ test("flow displays route evidence, opens editors, exports a frozen SVG, and edi
  assert.equal(await unsaved.getByRole("link").count(),0);
  // A server saved behind a kill switch shows it in its own editor, and one about to be says what it will get.
  const heldRoute=page.getByRole("region",{name:"Held server route",exact:true});
- assert.deepEqual(await heldRoute.locator("svg text").allTextContents(),["EGRESS INTERFACES","ROUTE LEGS","PROXIES","System","Up","System routing","0 open · 0.00 MiB/s","Leg 1 · 100%","Blocked · 0/0 open · 0.00 MiB/s","0 planned","Kill switch","Blocked · no proxy, and direct is off"]);
+ assert.deepEqual(await heldRoute.locator("svg text").allTextContents(),["EGRESS INTERFACES","ROUTE LEGS","PROXIES","System","Up","192.0.2.21","2001:db8::21","0 open · 0.00 MiB/s","Leg 1 · 100%","Blocked · 0/0 open · 0.00 MiB/s","0 planned","Kill switch","Blocked · no proxy, and direct is off"]);
  assert.equal(await heldRoute.locator("svg a").count(),0);
  assert.equal(await heldRoute.locator("svg path[stroke-dasharray]").count(),2);
  assert.equal(await heldRoute.getByRole("link",{name:"Edit in Networking",exact:true}).getAttribute("href"),"/settings/networking/routes?consumer=server%3A3");

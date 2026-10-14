@@ -168,9 +168,11 @@ class SpeedPage {
     return this.test.getByRole("button", { name: "Run", exact: true });
   }
 
-  // The switch that takes leg `position` (1-based) down for the next run.
+  // The Up/Down switch that takes leg `position` (1-based) down for the next run.
   async takeLegDown(position: number): Promise<void> {
-    const down = this.route.getByRole("switch", { name: `Leg ${position} down`, exact: true });
+    const down = this.route
+      .getByRole("radiogroup", { name: `Leg ${position}`, exact: true })
+      .getByRole("radio", { name: "Down", exact: true });
     await down.click();
     await expect(down).toHaveAttribute("aria-checked", "true");
   }
@@ -282,7 +284,9 @@ test("ST01 a Usenet run measures through the proxy rung, the same run with that 
   const afterRun1 = await expectBooked(request, before, result1.bytes, "run 1");
 
   // Run 2: the same test with the proxy rung taken down.
-  const down = speed.route.getByRole("switch", { name: "Leg 1 rung 1 down", exact: true });
+  const down = speed.route
+    .getByRole("radiogroup", { name: "Leg 1 rung 1", exact: true })
+    .getByRole("radio", { name: "Down", exact: true });
   await down.click();
   await expect(down).toHaveAttribute("aria-checked", "true");
   const mark2 = await fixtureMark(request);
