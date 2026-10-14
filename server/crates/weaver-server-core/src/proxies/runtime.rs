@@ -18,6 +18,15 @@ use weaver_tunnel::{
     transport::{TransportKind, TransportProxy},
 };
 
+// A host and port as a person types them: an IPv6 address goes in brackets.
+fn endpoint(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 fn bridge_credentials() -> Result<(String, String), String> {
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).map_err(|_| "could not generate bridge credentials")?;
@@ -313,7 +322,11 @@ impl TunnelProvider for DirectProvider {
         weaver_tunnel::resolution::connect_host(host, port)
             .await
             .map(|s| Box::new(s) as Box<dyn TunnelStream>)
-            .map_err(|_| TunnelError::Engine("direct connection failed".into()))
+            .map_err(|error| TunnelError::Dial {
+                host: host.into(),
+                port,
+                detail: error.to_string(),
+            })
     }
     fn describe(&self) -> String {
         "direct host access".into()
@@ -351,14 +364,17 @@ impl TunnelProvider for Ladder {
                     });
                     return Ok(stream);
                 }
-                Ok(Err(TunnelError::HostKeyMismatch { .. })) => {
-                    attempt.fail("SSH host key changed; verify and reset trust");
+                Ok(Err(error @ TunnelError::HostKeyMismatch { .. })) => {
+                    attempt.fail(&error.to_string());
                     route.blocked();
-                    return Err(TunnelError::Engine(
-                        "SSH host key verification failed".into(),
-                    ));
+                    return Err(error);
                 }
-                _ => attempt.fail("proxy connection failed"),
+                Ok(Err(error)) => attempt.fail(&error.to_string()),
+                Err(_) => attempt.fail(&format!(
+                    "{} did not answer within {} seconds",
+                    endpoint(&hop.profile.host, hop.profile.port),
+                    route.timeout.as_secs()
+                )),
             }
         }
         #[expect(clippy::disallowed_methods, reason = "a route's direct fallback")]
@@ -686,7 +702,23 @@ impl ProxyRuntime {
         }
     }
     pub async fn test_profile(&self, profile: &ProxyProfile) -> Result<String, String> {
+        let outcome = self.test_profile_once(profile).await;
+        if let Err(error) = &outcome {
+            tracing::warn!(proxy_id = profile.id, kind = ?profile.kind, error = %error, "proxy test failed");
+        }
+        outcome
+    }
+    // The test's answer names what failed and where, as the tunnel reported it,
+    // so the person reading it knows what to fix.
+    async fn test_profile_once(&self, profile: &ProxyProfile) -> Result<String, String> {
         profile.validate().map_err(|e| e.to_string())?;
+        let endpoint = endpoint(&profile.host, profile.port);
+        let timed_out = || {
+            format!(
+                "{endpoint} did not answer within {} seconds",
+                profile.timeout().as_secs()
+            )
+        };
         if profile.kind == ProxyKind::Http3Connect {
             let dns = profile.proxy_dns_servers().first().ok_or(
                 "Testing HTTP/3 forwarding needs DNS servers the proxy resolves with; test an assigned NNTP server instead",
@@ -700,7 +732,9 @@ impl ProxyRuntime {
             hop.provider.shutdown().await;
             return match result {
                 Ok(Ok(())) => Ok("HTTP/3 proxy TLS, authentication and forwarding succeeded".into()),
-                _ => Err("HTTP/3 proxy connection failed; check UDP reachability, TLS certificate, credentials and the proxy's DNS servers".into()),
+                Ok(Err(error)) => Err(error.to_string()),
+                // QUIC rides UDP, which a network can drop without a word.
+                Err(_) => Err(format!("{} over UDP", timed_out())),
             };
         }
         let observer = Arc::new(Observer {
@@ -711,16 +745,24 @@ impl ProxyRuntime {
         let result = tokio::time::timeout(profile.timeout(), async {
             match profile.kind {
                 ProxyKind::Ssh => {
-                    SshTunnelProvider::handshake(profile.ssh_spec(), observer).await?;
+                    SshTunnelProvider::handshake(profile.ssh_spec(), observer)
+                        .await
+                        .map_err(|error| error.to_string())?;
                 }
                 ProxyKind::WireGuard => {
-                    WireGuardTunnelProvider::handshake(profile.wireguard_spec()?, observer).await?;
+                    let spec = profile.wireguard_spec().map_err(|error| error.to_string())?;
+                    WireGuardTunnelProvider::handshake(spec, observer)
+                        .await
+                        .map_err(|error| error.to_string())?;
                 }
                 _ => {
-                    let hop = ProxyHop::new(profile.clone(), &self.db)
-                        .map_err(TunnelError::Configuration)?;
+                    let hop = ProxyHop::new(profile.clone(), &self.db)?;
                     if let Some(dns) = profile.proxy_dns_servers().first() {
-                        let _stream = hop.provider.dial(&dns.to_string(), 53).await?;
+                        let _stream = hop
+                            .provider
+                            .dial(&dns.to_string(), 53)
+                            .await
+                            .map_err(|error| error.to_string())?;
                     } else {
                         #[expect(
                             clippy::disallowed_methods,
@@ -728,9 +770,7 @@ impl ProxyRuntime {
                         )]
                         weaver_tunnel::resolution::connect_host(&profile.host, profile.port)
                             .await
-                            .map_err(|_| {
-                                TunnelError::Engine("proxy endpoint unreachable".into())
-                            })?;
+                            .map_err(|error| format!("could not connect to {endpoint}: {error}"))?;
                         return Ok(
                             "Endpoint reachable; test an assigned consumer to verify forwarding"
                                 .to_string(),
@@ -738,15 +778,9 @@ impl ProxyRuntime {
                     }
                 }
             }
-            Ok::<_, TunnelError>("Proxy connection succeeded".to_string())
+            Ok("Proxy connection succeeded".to_string())
         })
         .await;
-        match result {
-            Ok(Ok(message)) => Ok(message),
-            Ok(Err(TunnelError::HostKeyMismatch { .. })) => {
-                Err("SSH host key changed; verify the server before resetting trust".into())
-            }
-            _ => Err("Proxy connection failed; check endpoint and credentials".into()),
-        }
+        result.unwrap_or_else(|_| Err(timed_out()))
     }
 }
