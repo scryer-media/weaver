@@ -260,17 +260,6 @@ export function ScriptConfigurationPanel() {
             onChange: (next) => patch({ terminationGraceSeconds: next }),
           },
         },
-        {
-          id: "strictSecurity",
-          label: t("next.postProcessing.strictSecurity"),
-          help: t("next.postProcessing.strictSecurityHelp"),
-          control: {
-            kind: "static",
-            value: settings?.strictSecurityRefusesExecution
-              ? t("next.postProcessing.refuses")
-              : t("next.postProcessing.permissive"),
-          },
-        },
       ],
     },
     eventScriptSection(t, values, patch, source),
