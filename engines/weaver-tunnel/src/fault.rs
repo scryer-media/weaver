@@ -310,7 +310,7 @@ impl fmt::Display for ProxyFault {
                 f.write_str("The connection through the proxy failed after it opened.")
             }
             Self::TestNeedsDns => f.write_str(
-                "Testing an HTTP/3 proxy needs DNS servers it resolves with. Test an assigned server instead.",
+                "Testing an HTTP/3 proxy needs a host and port, or DNS servers it resolves with.",
             ),
             Self::Other { detail } => f.write_str(detail),
         }

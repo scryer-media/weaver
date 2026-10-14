@@ -46,7 +46,7 @@ impl fmt::Display for ProxyTestPass {
         f.write_str(match self {
             Self::Connected => "Connected.",
             Self::Forwarded => "Connected and forwarded through the proxy.",
-            Self::Reachable => "Reachable. Test an assigned server to check forwarding.",
+            Self::Reachable => "Reachable. Give a host and port to check forwarding.",
         })
     }
 }
