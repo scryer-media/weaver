@@ -42,7 +42,7 @@ export const DELETE_POOL = gql`mutation DeletePool($id:Int!) { deleteProxyPool(i
 export const SAVE_ROUTE = gql`mutation SaveNetworkRoute($kind:NetworkConsumerKind!,$id:Int!,$input:RouteInput!) { saveNetworkRoute(kind:$kind,id:$id,input:$input) { consumer } }`;
 const PATH_FIELDS = "kind directFallback rungs { kind proxyId poolId chainIds }";
 /** A speed test run as every speed test screen reads it: the route it took and what it measured. */
-const SPEED_TEST_RUN_FIELDS = `id consumer consumerName kind status phase startedAt finishedAt error
+const SPEED_TEST_RUN_FIELDS = `id consumer consumerName kind status phase startedAt finishedAt failure { code message params }
   request { bandwidth { providerId server customUrl } usenet { sabSize nzbUrl nzbFilename nzbRunId connections maxDurationSeconds } }
   tested { legs { position egressId weight down downReason target path { ${PATH_FIELDS} } } failover
     overrides { downLegs downRungs { leg rung } downProxies downEgresses } names { kind id name } }

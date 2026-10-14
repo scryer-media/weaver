@@ -209,7 +209,8 @@ async fn serve_nntp(stream: Box<dyn Io>, shared: Arc<NntpShared>) -> std::io::Re
 }
 
 // An HTTP/1.1 source: `/blob` answers `blob_len` bytes, each page its own
-// body, and anything else 404. With `tls`, HTTPS.
+// body, `/limited` answers HTTP 429 as a rate-limiting provider does, and
+// anything else 404. With `tls`, HTTPS.
 pub struct HttpFixture {
     pub addr: SocketAddr,
     requests: watch::Sender<usize>,
@@ -351,6 +352,14 @@ async fn serve_http(
     let body: Vec<u8> = match (path, pages.get(path)) {
         (_, Some(body)) => body.clone(),
         ("/blob", None) => (0..blob_len).map(|i| (i % 253) as u8).collect(),
+        ("/limited", None) => {
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await?;
+            return stream.flush().await;
+        }
         _ => {
             stream
                 .write_all(

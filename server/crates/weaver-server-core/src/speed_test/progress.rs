@@ -9,6 +9,7 @@ use weaver_tunnel::pipe::{
 };
 use weaver_tunnel::{TunnelError, TunnelProvider, TunnelStream};
 
+use super::failure::SpeedTestFailure;
 use super::model::{
     ConnectionResult, LegResult, Sample, SpeedTestDialPath, SpeedTestResult, UsenetResult,
 };
@@ -20,7 +21,7 @@ pub(crate) struct ConnectionRecord {
     path: SpeedTestDialPath,
     source: Option<SocketAddr>,
     bytes: AtomicU64,
-    error: Mutex<Option<String>>,
+    error: Mutex<Option<SpeedTestFailure>>,
 }
 
 impl ConnectionRecord {
@@ -28,7 +29,7 @@ impl ConnectionRecord {
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
     // The first error ends the connection; later ones are its consequence.
-    pub(crate) fn fail(&self, error: impl Into<String>) {
+    pub(crate) fn fail(&self, error: impl Into<SpeedTestFailure>) {
         let mut slot = self.error.lock().expect("connection error");
         if slot.is_none() {
             *slot = Some(error.into());
@@ -37,6 +38,9 @@ impl ConnectionRecord {
     fn has_error(&self) -> bool {
         self.error.lock().expect("connection error").is_some()
     }
+    fn failure(&self) -> Option<SpeedTestFailure> {
+        self.error.lock().expect("connection error").clone()
+    }
     fn result(&self) -> ConnectionResult {
         ConnectionResult {
             leg: self.leg,
@@ -44,7 +48,7 @@ impl ConnectionRecord {
             path: self.path.clone(),
             source_address: self.source.map(|source| source.to_string()),
             bytes: self.bytes.load(Ordering::Relaxed),
-            error: self.error.lock().expect("connection error").clone(),
+            error: self.failure().map(|error| error.to_string()),
         }
     }
 }
@@ -202,7 +206,7 @@ impl Progress {
         connect: Duration,
         path: SpeedTestDialPath,
         source: Option<SocketAddr>,
-        error: Option<String>,
+        error: Option<SpeedTestFailure>,
     ) -> Arc<ConnectionRecord> {
         let record = Arc::new(ConnectionRecord {
             leg,
@@ -221,7 +225,12 @@ impl Progress {
 
     // Attach the error that ended a leg's work to the leg's newest
     // connection still without one, or record it on its own.
-    pub(crate) fn end_leg_connection(&self, leg: usize, egress: u32, error: String) {
+    pub(crate) fn end_leg_connection(
+        &self,
+        leg: usize,
+        egress: u32,
+        error: impl Into<SpeedTestFailure>,
+    ) {
         let connections = self.connections.lock().expect("speed test connections");
         if let Some(record) = connections
             .iter()
@@ -240,8 +249,21 @@ impl Progress {
                 ..Default::default()
             },
             None,
-            Some(error),
+            Some(error.into()),
         );
+    }
+
+    // What ended the first connection that ended on an error, once the run
+    // has measured.
+    pub(crate) fn first_failure(&self) -> Option<SpeedTestFailure> {
+        if !self.measuring() {
+            return None;
+        }
+        self.connections
+            .lock()
+            .expect("speed test connections")
+            .iter()
+            .find_map(|record| record.failure())
     }
 
     // Connections recorded on each leg.
@@ -452,12 +474,12 @@ impl LegRecorder {
                 ..Default::default()
             },
             None,
-            Some(error.to_string()),
+            Some(error.to_string().into()),
         )
     }
 
     // A connection that ended before it dialed anything.
-    pub(crate) fn error_row(&self, error: String) -> Arc<ConnectionRecord> {
+    pub(crate) fn error_row(&self, error: SpeedTestFailure) -> Arc<ConnectionRecord> {
         self.progress.record(
             self.leg,
             Duration::ZERO,
@@ -562,7 +584,8 @@ impl StreamProvider {
     }
     // Record the error that ended the connection on its row, opening the
     // row when nothing was dialed yet.
-    pub(crate) fn fail(&self, error: String) {
+    pub(crate) fn fail(&self, error: impl Into<SpeedTestFailure>) {
+        let error = error.into();
         let Some(recorder) = &self.recorder else {
             return;
         };

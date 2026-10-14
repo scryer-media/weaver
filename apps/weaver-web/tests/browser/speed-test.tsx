@@ -59,7 +59,7 @@ const runs: SpeedTestRun[] = [
   {
     id: 1, consumer: "rss:1", consumerName: "Feed mirror", kind: "BANDWIDTH",
     request: { bandwidth: { providerId: "cloudflare", server: null, customUrl: null }, usenet: null },
-    status: "COMPLETED", phase: null, startedAt: 1790640000000, finishedAt: 1790640010000, error: null,
+    status: "COMPLETED", phase: null, startedAt: 1790640000000, finishedAt: 1790640010000, failure: null,
     tested: { legs: [{ position: 0, egressId: 0, weight: 100, down: false, downReason: null, path: { kind: "DIRECT" }, target: 4 }], failover: "REDISTRIBUTE", overrides: noOverrides(), names: [{ kind: "egress", id: 0, name: "System" }] },
     result: {
       bytes: 100 * MIB, elapsedMs: 10000, averageBps: 10 * MIB, peakBps: 12 * MIB,
@@ -71,9 +71,16 @@ const runs: SpeedTestRun[] = [
 ];
 const requests: { name: string; variables: Record<string, unknown> }[] = [];
 const finished = new Set<number>();
+/** Runs the test has failed, with why: each reports FAILED with nothing measured. */
+const failures = new Map<number, NonNullable<SpeedTestRun["failure"]>>();
 
 /** What a run reports: still measuring, or done once the test has said so. */
 function report(run: SpeedTestRun): SpeedTestRun {
+  const failure = run.status === "RUNNING" ? failures.get(run.id) : undefined;
+  if (failure) {
+    Object.assign(run, { status: "FAILED", phase: null, finishedAt: run.startedAt + 1000, failure, result: null });
+    return run;
+  }
   if (run.status !== "RUNNING" || !finished.has(run.id)) return run;
   const live = run.tested.legs.filter((leg) => !leg.down);
   const usenet = run.kind === "USENET";
@@ -177,7 +184,7 @@ function graphql(name: string, variables: Record<string, unknown>) {
             }
           : null,
       }, status: "RUNNING", phase: "draining 3",
-      startedAt: 1790640100000, finishedAt: null, error: null,
+      startedAt: 1790640100000, finishedAt: null, failure: null,
       tested: {
         legs: tested.legs.map((leg, position) => ({ position, egressId: leg.egressId, weight: leg.weight, down: overrides.downLegs.includes(position), downReason: overrides.downLegs.includes(position) ? "taken down for this test" : null, path: leg.path, target: overrides.downLegs.includes(position) ? 0 : 10 })),
         failover: tested.failover, overrides, names: [],
@@ -201,7 +208,10 @@ function graphql(name: string, variables: Record<string, unknown>) {
   if (name === "BandwidthProviderServers") return { data: { bandwidthProviderServers: [] } };
   return { data: { bandwidthProviders: providers, speedTestRuns: runs.map(report) } };
 }
-const fixture = { requests, uploads, finish: (id: number) => finished.add(id), measure };
+const fixture = {
+  requests, uploads, finish: (id: number) => finished.add(id), measure,
+  fail: (id: number, failure: NonNullable<SpeedTestRun["failure"]>) => failures.set(id, failure),
+};
 Object.assign(window, { speedFixture: fixture });
 
 const client = new Client({ url: "/graphql", exchanges: [fetchExchange], preferGetMethod: false });

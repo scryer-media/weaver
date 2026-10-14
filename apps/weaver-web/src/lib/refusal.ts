@@ -22,13 +22,18 @@ export function refusalMessage(t: Translate, error: FailedRequest): string {
   }
   const code = refusal.extensions?.code;
   if (typeof code === "string") {
-    const key = refusalKey(code);
-    const sentence = t(key, namedValues(refusal.extensions?.params));
-    if (sentence !== key) {
-      return sentence;
-    }
+    return codedSentence(t, refusalKey(code), refusal.extensions?.params, refusal.message);
   }
   return refusal.message;
+}
+
+/**
+ * The sentence at `key`, naming what `params` holds, or the daemon's own
+ * `message` when this build has no sentence there.
+ */
+export function codedSentence(t: Translate, key: string, params: unknown, message: string): string {
+  const sentence = t(key, namedValues(params));
+  return sentence === key ? message : sentence;
 }
 
 /** The numbers and words a refusal names, for a sentence that repeats them. */

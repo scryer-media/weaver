@@ -447,3 +447,29 @@ test("with no job downloading, a rate on the header gauge does not make Run or R
     await page.close();
   }
 });
+
+test("a bandwidth run the provider rate limits says so in our words, with the daemon's own on hover", async () => {
+  const { page, errors } = await open("", "news.fixture.invalid");
+  try {
+    await page.getByRole("button", { name: "Route", exact: true }).click();
+    await page.getByRole("menuitemradio", { name: "Feed mirror", exact: true }).click();
+    await page.getByRole("radio", { name: "Bandwidth", checked: true, exact: true }).waitFor();
+    await page.getByRole("button", { name: "Run", exact: true }).and(page.locator(":enabled")).click();
+    await page.getByRole("region", { name: "Progress", exact: true }).waitFor();
+    const message = "GET https://speed.cloudflare.com/__down?bytes=99999999 answered HTTP 429 Too Many Requests";
+    await page.evaluate(
+      (message) => window.speedFixture.fail(2, { code: "RATE_LIMITED", message, params: { url: "https://speed.cloudflare.com/__down?bytes=99999999" } }),
+      message,
+    );
+    // The line is our sentence alone; the URL and status the daemon gave are its title.
+    const sentence = "Failed · The provider is rate limiting your IP right now; choose another provider.";
+    const failed = page.getByRole("region", { name: "Result", exact: true }).getByRole("alert").filter({ hasText: sentence }).first();
+    await failed.waitFor();
+    assert.equal(await failed.textContent(), sentence);
+    assert.equal(await failed.getAttribute("title"), message);
+    await shot(page, "speed-rate-limited");
+    assert.equal(errors.length, 0, errors.join("\n"));
+  } finally {
+    await page.close();
+  }
+});

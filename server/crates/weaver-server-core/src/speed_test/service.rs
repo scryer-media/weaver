@@ -10,6 +10,7 @@ use weaver_nntp::socket_budget::ConnectionLoan;
 use weaver_nntp::transfer::{ServerTransferControl, StableServerId};
 
 use super::bandwidth::{self, BandwidthLeg, BandwidthPlan};
+use super::failure::SpeedTestFailure;
 use super::http::{HttpLeg, HttpOptions, fetch_test_nzb, read_capped, routed_get};
 use super::model::*;
 use super::nearest::{Nearest, nearest};
@@ -101,7 +102,7 @@ struct RunCell {
 struct Life {
     status: SpeedTestStatus,
     phase: Option<SpeedTestPhase>,
-    error: Option<String>,
+    error: Option<SpeedTestFailure>,
     finished_at_ms: Option<i64>,
     result: Option<SpeedTestResult>,
     bandwidth: Option<BandwidthResult>,
@@ -757,7 +758,9 @@ struct RunPlan {
 enum Outcome {
     Completed,
     Cancelled,
+    // A cause with no variant of its own, in the daemon's words.
     Failed(String),
+    FailedWith(SpeedTestFailure),
 }
 
 impl ServiceInner {
@@ -944,9 +947,9 @@ async fn drive(inner: Arc<ServiceInner>, cell: Arc<RunCell>, plan: RunPlan) {
     let outcome = match work.await {
         Ok(outcome) => outcome,
         Err(error) if error.is_panic() => {
-            Outcome::Failed("the speed test stopped unexpectedly".into())
+            Outcome::FailedWith(SpeedTestFailure::StoppedUnexpectedly)
         }
-        Err(_) => Outcome::Failed("the speed test was stopped".into()),
+        Err(_) => Outcome::FailedWith(SpeedTestFailure::Stopped),
     };
     cell.progress.finish();
     inner.set_phase(&cell, SpeedTestPhase::Releasing);
@@ -955,7 +958,8 @@ async fn drive(inner: Arc<ServiceInner>, cell: Arc<RunCell>, plan: RunPlan) {
     let (status, error) = match outcome {
         Outcome::Completed => (SpeedTestStatus::Completed, None),
         Outcome::Cancelled => (SpeedTestStatus::Cancelled, None),
-        Outcome::Failed(error) => (SpeedTestStatus::Failed, Some(error)),
+        Outcome::Failed(error) => (SpeedTestStatus::Failed, Some(error.into())),
+        Outcome::FailedWith(failure) => (SpeedTestStatus::Failed, Some(failure)),
     };
     let result = {
         let mut life = cell.life.lock().expect("speed test run");
@@ -987,7 +991,7 @@ async fn drive(inner: Arc<ServiceInner>, cell: Arc<RunCell>, plan: RunPlan) {
         bytes = result.as_ref().map_or(0, |r| r.bytes),
         average_bps = result.as_ref().map_or(0.0, |r| r.average_bps),
         peak_bps = result.as_ref().map_or(0.0, |r| r.peak_bps),
-        error = error.as_deref().unwrap_or(""),
+        error = %error.as_ref().map_or_else(String::new, ToString::to_string),
         "speed test finished"
     );
     record_metrics(&cell, status, result.as_ref());
@@ -1016,7 +1020,7 @@ async fn execute(
         })
     };
     let Some(first) = plan.legs.first() else {
-        return Outcome::Failed("no leg is up".into());
+        return Outcome::FailedWith(SpeedTestFailure::NoLegUp);
     };
 
     // Preparing: everything that can fail before the queue is touched.
@@ -1152,19 +1156,16 @@ async fn execute(
                 && let Some(index) = pool.server_for_stable_id(StableServerId(server.id))
             {
                 if let Some(reason) = inner.lease_refusal(server.id).await {
-                    return Outcome::Failed(
-                        NetworkRefusal::SpeedTestLeaseRefused {
-                            server: server.id,
-                            name: cell.consumer_name.clone(),
-                            reason,
-                        }
-                        .to_string(),
-                    );
+                    return Outcome::FailedWith(SpeedTestFailure::LeaseRefused {
+                        server: server.id,
+                        name: cell.consumer_name.clone(),
+                        reason,
+                    });
                 }
                 let configured = pool.configured_connections(index).unwrap_or(0);
                 let lent = usize::from(connections).min(configured);
                 let Some(loan) = pool.lend_connections(index, lent) else {
-                    return Outcome::Failed("the server left the live pool".into());
+                    return Outcome::FailedWith(SpeedTestFailure::ServerLeftPool);
                 };
                 let loan = Arc::new(loan);
                 *gate.loan.lock().expect("speed test loan") = Some(loan.clone());
@@ -1291,13 +1292,14 @@ async fn execute(
         return Outcome::Cancelled;
     }
     if cell.progress.bytes() == 0 {
-        let first_error = cell
-            .progress
-            .result(cell.usenet(), None)
-            .and_then(|result| result.connections.into_iter().find_map(|c| c.error));
-        return Outcome::Failed(match first_error {
-            Some(error) => format!("no bytes were received: {error}"),
-            None => "no bytes were received".into(),
+        // What ended the first connection is why nothing came; a cause of its
+        // own stands as the run's, any other is told as the empty run's.
+        return Outcome::FailedWith(match cell.progress.first_failure() {
+            Some(SpeedTestFailure::Other(error)) => {
+                SpeedTestFailure::Other(format!("no bytes were received: {error}"))
+            }
+            Some(failure) => failure,
+            None => SpeedTestFailure::NoBytes,
         });
     }
     Outcome::Completed
