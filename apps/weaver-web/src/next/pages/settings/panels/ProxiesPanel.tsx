@@ -5,13 +5,12 @@ import {
   PROXY_PROFILES_QUERY,
   RESET_PROXY_TRUST_MUTATION,
   SAVE_PROXY_MUTATION,
-  TEST_PROXY_MUTATION,
 } from "@/graphql/proxies";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { proxyLabels, type ProxyKind, type ProxyProfile, type ProxyResolver } from "@/lib/proxies";
 import { cn } from "@/lib/utils";
-import { proxyTestSentence } from "@/lib/proxy-fault";
 import { refusalMessage } from "@/lib/refusal";
+import { TestViaDialog } from "../../../features/networking/TestViaDialog";
 import {
   WIREGUARD_KEY,
   parseWireguardConfig,
@@ -237,9 +236,9 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
   const [{ data, fetching }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({
     query: PROXY_PROFILES_QUERY,
   });
-  const [, testProxy] = useMutation(TEST_PROXY_MUTATION);
-
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
+  const [testingId, setTestingId] = useState<number | null>(null);
+  // Each proxy's last test in this session, in one sentence.
   const [health, setHealth] = useState<Record<number, string>>({});
 
   const profiles = data?.proxyProfiles ?? [];
@@ -247,30 +246,13 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
     ? (profiles.find((profile) => profile.id === editingId) ?? null)
     : null;
 
-  const runTest = async (profile: ProxyProfile) => {
-    setHealth((current) => ({ ...current, [profile.id]: t("next.proxies.testing") }));
-    const result = await testProxy({ id: profile.id });
-    const outcome = result.data?.testProxyProfile;
-    setHealth((current) => ({
-      ...current,
-      [profile.id]: outcome
-        ? proxyTestSentence(t, {
-            ...outcome,
-            message: outcome.message || (outcome.success ? t("next.proxies.reachable") : t("next.proxies.failed")),
-          })
-        : result.error
-          ? refusalMessage(t, result.error)
-          : t("next.proxies.failed"),
-    }));
-  };
-
   const blocks: SettingsBlock[] = [
     {
       kind: "table",
       id: "proxies",
       title: t("next.settings.panel.proxies"),
       note: t("next.proxies.tableNote"),
-      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 180px",
+      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 204px",
       headers: [
         t("next.proxies.name"),
         t("next.proxies.type"),
@@ -304,8 +286,8 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
             {health[profile.id] ?? "—"}
           </Cell>,
           <span key="actions" className="ml-auto flex items-center gap-2" onClick={(event) => event.stopPropagation()}>
-            <SecondaryButton icon="test" className="h-7 px-2" onClick={() => void runTest(profile)}>
-              {t("next.proxies.test")}
+            <SecondaryButton icon="test" className="h-7 px-2" onClick={() => setTestingId(profile.id)}>
+              {t("next.proxies.testVia")}
             </SecondaryButton>
             <SecondaryButton className="h-7 px-2" onClick={() => setEditingId(profile.id)}>
               {t("next.proxies.edit")}
@@ -330,6 +312,15 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
             void reexecute({ requestPolicy: "network-only" });
             onChanged?.();
           }}
+        />
+      )}
+
+      {testingId === null ? null : (
+        <TestViaDialog
+          key={testingId}
+          subject={{ proxy: testingId }}
+          onTested={(summary) => setHealth((current) => ({ ...current, [testingId]: summary }))}
+          onClose={() => setTestingId(null)}
         />
       )}
     </>
