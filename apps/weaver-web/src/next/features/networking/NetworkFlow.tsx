@@ -94,6 +94,8 @@ const ADDRESS_LINE = 14;
 const LEG_HEIGHT = 64;
 const BOX_HEIGHT = 44;
 const NOTE_LINE = 12;
+/** The space a pool box keeps between its member rows and its head above, and its edge below. */
+const MEMBER_GAP = 8;
 const EGRESS_PAGE = "/settings/networking/egress";
 const PROXIES_PAGE = "/settings/networking/proxies";
 const routePage = (consumer: string) => `/settings/networking/routes?consumer=${encodeURIComponent(consumer)}`;
@@ -661,7 +663,7 @@ export function NetworkFlow({
           BOX_HEIGHT +
           noteHeight(note.length) +
           members.reduce((sum, member) => sum + member.height, 0) +
-          (members.length ? 8 : 0);
+          (members.length ? 2 * MEMBER_GAP : 0);
         const top = bottom;
         bottom = top + height + 8;
         return { rung, rungIndex, top, height, failing, note, pinned: live?.pinnedMember ?? null, members };
@@ -835,7 +837,8 @@ export function NetworkFlow({
       const state = configured?.enabled === false ? "DISABLED" : status;
       const held = members.reduce((sum, member) => sum + (member.live?.open ?? 0), 0);
       const head = BOX_HEIGHT + noteHeight(block.note.length);
-      let memberY = y + head;
+      // An active head and a carrying member share a tint, so the rows start a gap below the head.
+      let memberY = y + head + MEMBER_GAP;
       return (
         <g key={rungIndex} {...way}>
           {failing ? <title>{failing.reason}</title> : null}
