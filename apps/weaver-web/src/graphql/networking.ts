@@ -34,12 +34,12 @@ export const CREATE_EGRESS = gql`mutation CreateEgress($input:EgressInterfaceInp
 export const UPDATE_EGRESS = gql`mutation UpdateEgress($id:Int!,$input:EgressInterfaceInput!) { updateEgressInterface(id:$id,input:$input) { id } }`;
 export const DELETE_EGRESS = gql`mutation DeleteEgress($id:Int!) { deleteEgressInterface(id:$id) }`;
 export const RESET_EGRESS_USAGE = gql`mutation ResetEgressUsage($id:Int!) { resetEgressDownloadQuotaUsage(id:$id) { id } }`;
-export const TEST_EGRESS = gql`mutation TestEgress($id:Int!,$proxyId:Int,$host:String!,$port:Int!) { testEgressInterface(id:$id,proxyId:$proxyId,host:$host,port:$port) { success message sourceAddress connectMillis } }`;
-export const TEST_POOL = gql`mutation TestPool($id:Int!,$egressId:Int!,$host:String,$port:Int) { testProxyPool(id:$id,egressId:$egressId,host:$host,port:$port) { proxyId success message sourceAddress connectMillis } }`;
 export const CREATE_POOL = gql`mutation CreatePool($input:ProxyPoolInput!) { createProxyPool(input:$input) { id } }`;
 export const UPDATE_POOL = gql`mutation UpdatePool($id:Int!,$input:ProxyPoolInput!) { updateProxyPool(id:$id,input:$input) { id } }`;
 export const DELETE_POOL = gql`mutation DeletePool($id:Int!) { deleteProxyPool(id:$id) }`;
 export const SAVE_ROUTE = gql`mutation SaveNetworkRoute($kind:NetworkConsumerKind!,$id:Int!,$input:RouteInput!) { saveNetworkRoute(kind:$kind,id:$id,input:$input) { consumer } }`;
+/** Every path through a drafted route, with a proxy or each member of a pool on top. Nothing is saved. */
+export const TEST_VIA = gql`mutation TestVia($route:RouteInput!,$subject:TestSubjectInput,$target:TestTargetInput) { testVia(route:$route,subject:$subject,target:$target) { leg egressId carrierIds proxyId success code message params failingProxyId sourceAddress connectMillis } }`;
 const PATH_FIELDS = "kind directFallback rungs { kind proxyId poolId chainIds }";
 /** A speed test run as every speed test screen reads it: the route it took and what it measured. */
 const SPEED_TEST_RUN_FIELDS = `id consumer consumerName kind status phase startedAt finishedAt failure { code message params }

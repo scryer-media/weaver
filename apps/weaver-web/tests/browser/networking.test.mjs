@@ -238,3 +238,51 @@ test("flow displays route evidence, opens editors, and edits weights without los
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT,fullPage:true});
  await page.close();
 });
+test("an egress is tested alone and a pool member by member, each through a route drafted for it",async()=>{
+ const page=await browser.newPage({viewport:{width:1440,height:2700}});page.setDefaultTimeout(0);const errors=[];page.on("pageerror",error=>errors.push(error.message));
+ await page.goto(`${baseUrl}/tests/browser/networking.html`);
+ const diagram=page.locator("svg[aria-label^='Egress interfaces']").first();
+ const button=(scope,name)=>scope.getByRole("button",{name,exact:true});
+ const tests=()=>page.evaluate(()=>window.networkingFixture.tests);
+ const dialog=page.getByRole("dialog",{name:"Test via",exact:true});
+ const rows=dialog.getByRole("list",{name:"Paths",exact:true}).getByRole("listitem");
+ /** Each row as it reads: its hops, and the hop it failed at. */
+ const paths=async count=>{await rows.nth(count-1).waitFor();assert.equal(await rows.count(),count);return Promise.all(Array.from({length:count},async(_,index)=>[await rows.nth(index).locator("span").first().textContent(),await rows.nth(index).locator("span.text-wv-error-text").allTextContents()]));};
+ // An egress tested alone starts its draft on itself, and needs somewhere to connect to.
+ await diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"WAN Fiber"}).click();
+ const egress=page.getByRole("dialog",{name:"WAN Fiber",exact:true});
+ await button(egress,"Test").click();
+ await button(dialog,"Egress").waitFor();
+ assert.equal(await button(dialog,"Egress").textContent(),"WAN Fiber");
+ const run=button(dialog,"Test");
+ assert.equal(await run.isDisabled(),true);
+ await dialog.getByLabel("Host",{exact:true}).fill("news.fixture.invalid");
+ await dialog.getByLabel("Port",{exact:true}).fill("563");
+ await run.click();
+ assert.deepEqual(await paths(1),[["WAN Fiber",[]]]);
+ await rows.first().getByText("8.4 ms · source 192.0.2.10:40000",{exact:true}).waitFor();
+ await rows.first().getByText("Connected.",{exact:true}).waitFor();
+ assert.deepEqual((await tests()).at(-1),{route:{failover:"REDISTRIBUTE",legs:[{egressId:1,weight:100,path:{direct:true}}]},subject:null,target:{host:"news.fixture.invalid",port:563}});
+ if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-test-egress.png")});
+ await button(dialog,"Close").click();
+ await dialog.waitFor({state:"detached"});
+ await page.keyboard.press("Escape");
+ await egress.waitFor({state:"detached"});
+ // A pool is tried member by member down the draft's one leg; a disabled member fails where it stands.
+ await diagram.locator("a").filter({hasText:"Europe · pool"}).click();
+ await button(page.getByRole("dialog",{name:"Europe",exact:true}),"Test pool").click();
+ await dialog.getByText("Europe · WireGuard",{exact:true}).waitFor();
+ assert.equal(await button(dialog,"Egress").textContent(),"System");
+ assert.equal(await button(dialog,"Add leg").count(),0);
+ await button(dialog,"Egress").click();
+ await page.getByRole("menuitemradio",{name:"WAN Fiber",exact:true}).click();
+ await run.click();
+ assert.deepEqual(await paths(3),[["WAN Fiber > Frankfurt",[]],["WAN Fiber > Lisbon",["Lisbon"]],["WAN Fiber > Amsterdam",[]]]);
+ await rows.nth(1).getByText("Failed at Lisbon",{exact:true}).waitFor();
+ await rows.nth(1).getByText("The proxy is disabled or could not be set up.",{exact:true}).waitFor();
+ const sent=(await tests()).at(-1);
+ assert.deepEqual([sent.subject,sent.target,sent.route.legs.map(leg=>leg.egressId)],[{pool:1},null,[1]]);
+ assert.equal(errors.length,0,errors.join("\n"));
+ if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-test-pool.png")});
+ await page.close();
+});

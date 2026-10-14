@@ -38,12 +38,31 @@ const outboundLeg={...outbound.legs[0]!,consumer:"outbound",position:0,target:1,
 const consumersFor=(route:NetworkRoute):Consumer[]=>[{key:"outbound",id:0,name:"Default outbound",kind:"OUTBOUND",cap:1,route:outbound},{key:"server:1",id:1,name:"News primary",kind:"SERVER",cap:50,route},{key:"server:2",id:2,name:"News backup",kind:"SERVER",cap:20,route:backup},{key:"server:3",id:3,name:"News archive",kind:"SERVER",cap:10,route:held},{key:"rss:1",id:1,name:"Feed mirror",kind:"RSS",cap:1,route:feed}];
 const flowFor=(route:NetworkRoute,down:boolean):Flow=>({sampledAt:1790640000,legs:[...route.legs.map((leg,position)=>({...leg,consumer:"server:1",position,target:position===2||down?0:[30,15][position]??0,open:position===2||down?0:[24,12][position]??0,opening:0,state:position===2||down?"DOWN":"UP",reason:position===2?"Interface is down":null,pinnedAddress:null,sourceAddress:position===0?"192.0.2.10:45123":"127.0.0.1:45124",bytesPerSecond:position===0?24_000_000:0,selectedRung:position===0?0:null,selectedProxyId:position===0?1:null})),backupLeg,heldLeg,feedLeg,outboundLeg],pools:[{poolId:1,egressId:1,pinnedMember:1,members:[{id:1,open:24,opening:0,warmed:true,blocked:null,connectMs:20,bytesPerSecond:1_000_000,liveBytesPerSecond:24_000_000,samples:40,failures:0},{id:2,open:0,opening:0,warmed:true,blocked:null,connectMs:25,bytesPerSecond:800_000,liveBytesPerSecond:0,samples:20,failures:0},{id:3,state:"DISABLED",open:0,opening:0,warmed:false,blocked:null,connectMs:null,bytesPerSecond:null,liveBytesPerSecond:0,samples:0,failures:0}]}]});
 const data:NetworkingData={egressInterfaces:egresses,proxyProfiles:profiles,proxyPools:pools,discoverNetworkInterfaces:[],platformNetworking:{platform:"fixture",egressBindingKinds:["SYSTEM","INTERFACE","SOURCE_ADDRESS"],sourceAddressHint:null,container:false,bridgeNetworkSuspected:false,maxWireguardInstances:4,notes:[]},servers:[],rssFeeds:[]};
+// A test through a drafted route, as the daemon runs one: every path once, with each proxy under test on top. A disabled proxy fails where it stands.
+type TestVariables={route:{legs:{egressId:number;path:{direct?:boolean;ladder?:{directFallback:boolean;rungs:{proxy?:number;pool?:number;chain?:number[]}[]}}}[]};subject:{proxy?:number;pool?:number}|null;target:{host:string;port:number}|null};
+const tests:TestVariables[]=[];
+Object.assign(window,{networkingFixture:{tests}});
+const members=(pool:number)=>pools.find(candidate=>candidate.id===pool)?.memberIds??[];
+function testVia(variables:TestVariables){
+ tests.push(structuredClone(variables));
+ const {subject,target}=variables;const seen=new Set<string>();
+ const paths=variables.route.legs.flatMap((leg,index)=>{const ladder=leg.path.ladder;const carriers=ladder?[...ladder.rungs.flatMap(rung=>rung.proxy!==undefined?[[rung.proxy]]:rung.pool!==undefined?members(rung.pool).map(id=>[id]):[rung.chain??[]]),...(ladder.directFallback?[[]]:[])]:[[]];
+  return carriers.flatMap(carrierIds=>{const key=`${leg.egressId}:${carrierIds.join(",")}`;if(seen.has(key))return [];seen.add(key);return [{leg:index,egressId:leg.egressId,carrierIds}];});});
+ const onTop:(number|null)[]=subject?.proxy!==undefined?[subject.proxy]:subject?.pool!==undefined?members(subject.pool):[null];
+ return paths.flatMap(path=>onTop.map(proxyId=>{
+  const off=[...path.carrierIds,...(proxyId===null?[]:[proxyId])].find(id=>profiles.find(entry=>entry.id===id)?.enabled===false);
+  const shown={...path,proxyId,params:{},message:"",sourceAddress:null,connectMillis:0,failingProxyId:null};
+  if(off!==undefined)return {...shown,success:false,code:"PROXY_UNAVAILABLE",message:"The proxy is disabled.",failingProxyId:off};
+  const address=egresses.find(egress=>egress.id===path.egressId)?.sourceAddress??"192.0.2.21";
+  return {...shown,success:true,code:proxyId===null?"CONNECTED":target?"FORWARDED":["WIRE_GUARD","SSH"].includes(profiles.find(entry=>entry.id===proxyId)?.kind??"")?"CONNECTED":"REACHABLE",sourceAddress:`${address}:40000`,connectMillis:8.4};
+ }));
+}
 // Whatever the editors ask for, answered at once from the fixture.
 const client=new Client({url:"http://fixture.invalid/graphql",exchanges:[()=>operations=>pipe(operations,mergeMap(operation=>{
  const definition=operation.query.definitions.find(entry=>entry.kind==="OperationDefinition");
  const name=definition?.kind==="OperationDefinition"?definition.name?.value??"":"";
  const flow={...flowFor(initial,false),consumers:consumersFor(initial),proxies:profiles,proxyPools:pools,egresses};
- return fromValue({operation,data:name==="ProxyProfiles"?{proxyProfiles:profiles}:name==="Networking"?data:name==="NetworkFlow"||name==="NetworkFlowUpdates"?{networkFlow:flow}:{}});
+ return fromValue({operation,data:name==="ProxyProfiles"?{proxyProfiles:profiles}:name==="Networking"?data:name==="NetworkFlow"||name==="NetworkFlowUpdates"?{networkFlow:flow}:name==="TestVia"?{testVia:testVia(operation.variables as TestVariables)}:{}});
 }))]});
 const action:NetworkingAction=async()=>null;
 const width=Number(new URLSearchParams(location.search).get("width")??1400);

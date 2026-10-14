@@ -76,7 +76,66 @@ function graphql(name: string, variables: Record<string, unknown>) {
     else profiles.push(saved);
     return { data: { saveProxyProfile: { id: saved.id } } };
   }
-  return { data: { proxyProfiles: profiles.map(view), testProxyProfile: { success: true, code: "REACHABLE", message: "", params: {} } } };
+  if (name === "Networking") return { data: { ...pools, egressInterfaces: egresses, proxyProfiles: profiles.map(view) } };
+  if (name === "TestVia") return testVia(variables);
+  return { data: { proxyProfiles: profiles.map(view) } };
+}
+
+/*
+ * A test through a drafted route, as the daemon runs one: every path the route
+ * has, once each, with every proxy under test on top. Seedbox never answers,
+ * so whatever it carries or is fails at it.
+ */
+const egress = (id: number, name: string, enabled: boolean) => ({
+  id, name, bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled, maxDownloadSpeed: 0, health: "UP", reason: null,
+});
+const egresses = [egress(4, "Backup", false), egress(0, "System", true), egress(5, "Fiber", true)];
+const SILENT = 2;
+/* The daemon allows 64 results; this one allows three, or `?limit`, so a test can reach the limit. */
+const resultLimit = () => Number(query.get("limit") ?? 3);
+type RungInput = { proxy?: number; pool?: number; chain?: number[] };
+type LegInput = { egressId: number; path: { direct?: boolean; ladder?: { directFallback: boolean; rungs: RungInput[] } } };
+const members = (pool: number) => pools.proxyPools.find((candidate) => candidate.id === pool)?.memberIds ?? [];
+const refusal = (code: string, params: Record<string, unknown> = {}) => ({ errors: [{ message: code, extensions: { code, params } }] });
+function testVia(variables: Record<string, unknown>) {
+  const legs = (variables.route as { legs: LegInput[] }).legs;
+  const subject = variables.subject as { proxy?: number; pool?: number } | null;
+  const target = variables.target as { host: string; port: number } | null;
+  if (!subject && !target) return refusal("TEST_TARGET_REQUIRED");
+  const tested = subject?.proxy !== undefined ? [subject.proxy] : subject?.pool !== undefined ? members(subject.pool) : [];
+  const seen = new Set<string>();
+  const paths = legs.flatMap((leg, index) => {
+    const ladder = leg.path.ladder;
+    const carriers = ladder
+      ? [
+          ...ladder.rungs.flatMap((rung) =>
+            rung.proxy !== undefined ? [[rung.proxy]] : rung.pool !== undefined ? members(rung.pool).map((id) => [id]) : [rung.chain ?? []]),
+          ...(ladder.directFallback ? [[]] : []),
+        ]
+      : [[]];
+    return carriers.flatMap((carrierIds) => {
+      const key = `${leg.egressId}:${carrierIds.join(",")}`;
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [{ leg: index, egressId: leg.egressId, carrierIds }];
+    });
+  });
+  if (paths.some((path) => path.carrierIds.some((id) => tested.includes(id)))) return refusal("TEST_SUBJECT_IN_ROUTE");
+  const onTop: (number | null)[] = subject ? tested : [null];
+  if (paths.length * onTop.length > resultLimit()) return refusal("TEST_PATH_COUNT", { limit: resultLimit() });
+  return {
+    data: {
+      testVia: paths.flatMap((path) => onTop.map((proxyId) => {
+        const shown = { ...path, proxyId, failingProxyId: null, sourceAddress: null, connectMillis: 0, params: {}, message: "" };
+        if (path.carrierIds.includes(SILENT) || proxyId === SILENT) {
+          return { ...shown, success: false, code: "TIMED_OUT", params: { seconds: 10 }, message: "No answer within 10 seconds.", failingProxyId: SILENT };
+        }
+        const kind = profiles.find((profile) => profile.id === proxyId)?.kind;
+        const code = target ? (proxyId === null ? "CONNECTED" : "FORWARDED") : kind === "SSH" || kind === "WIRE_GUARD" ? "CONNECTED" : "REACHABLE";
+        return { ...shown, success: true, code, sourceAddress: "192.0.2.10:40000", connectMillis: 12.5 };
+      })),
+    },
+  };
 }
 /* Every pool save the pools page sends, as it sends it. */
 const poolSaves: Record<string, unknown>[] = [];

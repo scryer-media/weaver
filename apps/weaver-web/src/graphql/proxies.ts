@@ -9,4 +9,3 @@ export const PROXY_PROFILES_QUERY = gql`
 export const SAVE_PROXY_MUTATION = gql`mutation SaveProxyProfile($id: Int, $input: ProxyProfileInput!) { saveProxyProfile(id: $id, input: $input) { id } }`;
 export const DELETE_PROXY_MUTATION = gql`mutation DeleteProxyProfile($id: Int!) { deleteProxyProfile(id: $id) }`;
 export const RESET_PROXY_TRUST_MUTATION = gql`mutation ResetProxyHostKey($id: Int!) { resetProxyHostKey(id: $id) { id hostKeyFingerprint } }`;
-export const TEST_PROXY_MUTATION = gql`mutation TestProxyProfile($id: Int!) { testProxyProfile(id: $id) { success code message params } }`;

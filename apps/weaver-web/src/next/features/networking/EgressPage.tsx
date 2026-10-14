@@ -1,16 +1,14 @@
 import { memo, useEffect, useMemo, useState } from "react";
-import { useClient, useMutation, useQuery, type Client } from "urql";
-import { CREATE_EGRESS, DELETE_EGRESS, RESET_EGRESS_USAGE, TEST_EGRESS, UPDATE_EGRESS } from "@/graphql/networking";
+import { useMutation, useQuery } from "urql";
+import { CREATE_EGRESS, DELETE_EGRESS, RESET_EGRESS_USAGE, UPDATE_EGRESS } from "@/graphql/networking";
 import { SETTINGS_QUERY, UPDATE_SETTINGS_MUTATION } from "@/graphql/queries";
-import { useTranslate, type Translate } from "@/lib/context/translate-context";
+import { useTranslate } from "@/lib/context/translate-context";
 import type { Egress } from "@/lib/networking";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
-import { Dialog } from "../../components/Dialog";
 import { RecordEditor } from "../../components/RecordEditor";
-import { PrimaryButton, SecondaryButton, TextField } from "../../components/controls";
+import { SecondaryButton, TextField } from "../../components/controls";
 import { Cell } from "../../components/rows";
 import {
-  FieldRows,
   SettingsBlocks,
   useDraft,
   usePanelState,
@@ -22,6 +20,7 @@ import { quotaDraft, quotaFields, quotaInput, quotaProblem } from "../../pages/s
 import { egressInput, liveAddresses, type NetworkingAction, type NetworkingData } from "./data";
 import { QuotaCell, quotaSearchText } from "./egress-quota";
 import { bindingLabel, formatLimit, Hint, MIB, stateLabel, StatusMark } from "./presentation";
+import { TestViaDialog } from "./TestViaDialog";
 
 const NEW_EGRESS: Egress = {
   id: -1,
@@ -478,91 +477,9 @@ export function EgressEditor({
         onDismiss={() => setDeleting(null)}
       />
 
-      {testing ? <EgressTest key={testing.id} egress={testing} onClose={() => setTesting(null)} /> : null}
-    </>
-  );
-}
-
-type EgressTestResult = { ok: boolean; text: string };
-
-/** Connects out through one egress and reports what came back. Outside the component, so the component compiles. */
-async function testEgress(
-  client: Client,
-  t: Translate,
-  variables: { id: number; host: string; port: number },
-  report: (result: EgressTestResult) => void,
-): Promise<void> {
-  const response = await client.mutation(TEST_EGRESS, variables).toPromise();
-  const outcome = response.data?.testEgressInterface as
-    | { success: boolean; message: string; sourceAddress: string | null; connectMillis: number | null }
-    | undefined;
-  if (response.error || !outcome) {
-    report({ ok: false, text: response.error?.message ?? t("next.networking.egress.testFailed") });
-  } else {
-    report({
-      ok: outcome.success,
-      text: [
-        outcome.message,
-        ...(outcome.sourceAddress ? [t("next.networking.egress.source", { address: outcome.sourceAddress })] : []),
-        ...(outcome.connectMillis != null ? [`${outcome.connectMillis} ms`] : []),
-      ].join(" · "),
-    });
-  }
-}
-
-/** Connect out through one egress and report the source address the far end saw. */
-function EgressTest({ egress, onClose }: { egress: Egress; onClose: () => void }) {
-  const t = useTranslate();
-  const client = useClient();
-  const [host, setHost] = useState("");
-  const [port, setPort] = useState(443);
-  const [running, setRunning] = useState(false);
-  const [result, setResult] = useState<EgressTestResult | null>(null);
-
-  const run = async () => {
-    setRunning(true);
-    await testEgress(client, t, { id: egress.id, host: host.trim(), port }, setResult).finally(() => setRunning(false));
-  };
-
-  return (
-    <Dialog
-      open
-      title={t("next.networking.egress.testTitle", { name: egress.name })}
-      onDismiss={onClose}
-      footer={
-        <>
-          <SecondaryButton onClick={onClose}>{t("next.networking.close")}</SecondaryButton>
-          <PrimaryButton icon="test" disabled={running || !host.trim()} onClick={() => void run()}>
-            {running ? t("next.networking.egress.connecting") : t("next.networking.egress.connect")}
-          </PrimaryButton>
-        </>
-      }
-    >
-      <Hint>{t("next.networking.egress.testNote")}</Hint>
-      <FieldRows
-        fields={[
-          {
-            id: "host",
-            label: t("next.networking.test.host"),
-            control: { kind: "text", value: host, onChange: setHost, placeholder: "news.example.invalid" },
-          },
-          {
-            id: "port",
-            label: t("next.networking.test.port"),
-            control: { kind: "number", value: port, min: 1, max: 65535, onChange: setPort },
-          },
-        ]}
-      />
-      {result ? (
-        <div role="status" className="px-4 py-4 sm:px-6">
-          <StatusMark
-            state={result.ok ? "UP" : "DOWN"}
-            label={result.ok ? t("next.networking.test.passed") : t("next.networking.test.failed")}
-            detail={result.text}
-            wrap
-          />
-        </div>
+      {testing ? (
+        <TestViaDialog key={testing.id} subject={null} egressId={testing.id} onClose={() => setTesting(null)} />
       ) : null}
-    </Dialog>
+    </>
   );
 }

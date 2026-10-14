@@ -1,18 +1,17 @@
 import { useState, type ReactNode } from "react";
-import { useClient, type Client } from "urql";
-import { CREATE_POOL, DELETE_POOL, TEST_POOL, UPDATE_POOL } from "@/graphql/networking";
+import { CREATE_POOL, DELETE_POOL, UPDATE_POOL } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
 import type { ProxyPool } from "@/lib/networking";
 import { proxyLabels, type ProxyKind } from "@/lib/proxies";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
-import { Dialog } from "../../components/Dialog";
 import { RecordEditor } from "../../components/RecordEditor";
-import { PrimaryButton, SecondaryButton } from "../../components/controls";
+import { SecondaryButton } from "../../components/controls";
 import { Cell } from "../../components/rows";
 import { countLabel } from "../../i18n/labels";
-import { FieldRows, SettingsBlocks, type SettingsBlock } from "../../pages/settings/framework";
+import { SettingsBlocks, type SettingsBlock } from "../../pages/settings/framework";
 import type { NetworkingAction, NetworkingData } from "./data";
 import { CheckRow, Hint, StatusMark } from "./presentation";
+import { TestViaDialog } from "./TestViaDialog";
 
 /** The daemon pools up to sixteen proxies. */
 const MAX_POOL_MEMBERS = 16;
@@ -272,130 +271,9 @@ export function PoolEditor({
         onDismiss={() => setDeleting(null)}
       />
 
-      {testing ? <PoolTest key={testing.id} pool={testing} data={data} onClose={() => setTesting(null)} /> : null}
-    </>
-  );
-}
-
-type ProbeResult = {
-  proxyId: number;
-  success: boolean;
-  message: string;
-  sourceAddress: string | null;
-  connectMillis: number | null;
-};
-
-/**
- * Runs a pool's probe: what went wrong (empty when nothing did), and the
- * members' results once it answered. Outside the component, so the component compiles.
- */
-async function testPool(
-  client: Client,
-  variables: { id: number; egressId: number; host: string | null; port: number | null },
-): Promise<{ error: string; results?: ProbeResult[] }> {
-  try {
-    const result = await client.mutation(TEST_POOL, variables).toPromise();
-    return { error: result.error?.message ?? "", results: result.data?.testProxyPool ?? [] };
-  } catch (caught) {
-    return { error: String(caught) };
-  }
-}
-
-/** Probe every member in an isolated session; the live selection is left alone. */
-function PoolTest({ pool, data, onClose }: { pool: ProxyPool; data: NetworkingData; onClose: () => void }) {
-  const t = useTranslate();
-  const client = useClient();
-  const usable = data.egressInterfaces.filter((egress) => egress.enabled);
-  const [egress, setEgress] = useState(usable[0]?.id ?? 0);
-  const [host, setHost] = useState("");
-  const [port, setPort] = useState(443);
-  const [running, setRunning] = useState(false);
-  const [results, setResults] = useState<ProbeResult[]>([]);
-  const [error, setError] = useState("");
-  const destinationRequired = pool.kind === "SOCKS5" || pool.kind === "HTTP_CONNECT";
-
-  const run = async () => {
-    setRunning(true);
-    setError("");
-    const outcome = await testPool(client, {
-      id: pool.id,
-      egressId: egress,
-      host: host.trim() || null,
-      port: host.trim() ? port : null,
-    });
-    setError(outcome.error);
-    if (outcome.results) {
-      setResults(outcome.results);
-    }
-    setRunning(false);
-  };
-
-  return (
-    <Dialog
-      open
-      title={t("next.networking.pools.testTitle", { name: pool.name })}
-      note={proxyLabels[pool.kind]}
-      onDismiss={onClose}
-      footer={
-        <>
-          <SecondaryButton onClick={onClose}>{t("next.networking.close")}</SecondaryButton>
-          <PrimaryButton
-            icon="test"
-            disabled={running || (destinationRequired && !host.trim())}
-            onClick={() => void run()}
-          >
-            {running ? t("next.networking.pools.testing") : t("next.networking.pools.testMembers")}
-          </PrimaryButton>
-        </>
-      }
-    >
-      <Hint>{t("next.networking.pools.testNote")}</Hint>
-      <FieldRows
-        fields={[
-          {
-            id: "egress",
-            label: t("next.networking.route.egress"),
-            control: {
-              kind: "select",
-              value: String(egress),
-              options: usable.map((candidate) => ({ value: String(candidate.id), label: candidate.name })),
-              onChange: (next) => setEgress(Number(next)),
-            },
-          },
-          {
-            id: "host",
-            label: t("next.networking.test.host"),
-            help: destinationRequired ? undefined : t("next.networking.pools.hostOptional"),
-            control: { kind: "text", value: host, onChange: setHost, placeholder: "news.example.invalid" },
-          },
-          {
-            id: "port",
-            label: t("next.networking.test.port"),
-            control: { kind: "number", value: port, min: 1, max: 65535, onChange: setPort },
-          },
-        ]}
-      />
-      {error ? (
-        <div role="alert" className="px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">
-          {error}
-        </div>
+      {testing ? (
+        <TestViaDialog key={testing.id} subject={{ pool: testing.id }} onClose={() => setTesting(null)} />
       ) : null}
-      <div role="status" className="flex flex-col">
-        {results.map((result) => (
-          <div key={result.proxyId} className="border-b border-wv-hairline px-4 py-3 sm:px-6">
-            <StatusMark
-              state={result.success ? "UP" : "DOWN"}
-              label={data.proxyProfiles.find((profile) => profile.id === result.proxyId)?.name ?? t("next.networking.proxyNumber", { id: result.proxyId })}
-              detail={[
-                result.message,
-                ...(result.sourceAddress ? [t("next.networking.egress.source", { address: result.sourceAddress })] : []),
-                ...(result.connectMillis != null ? [`${result.connectMillis} ms`] : []),
-              ].join(" · ")}
-              wrap
-            />
-          </div>
-        ))}
-      </div>
-    </Dialog>
+    </>
   );
 }

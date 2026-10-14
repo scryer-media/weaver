@@ -490,3 +490,128 @@ test("a proxy's names are resolved by Weaver or the proxy, with the host's DNS o
     assert.deepEqual(input.dnsServers, []);
   } finally { await page.close(); }
 });
+
+/** Opens Test via from the proxy's own line. */
+async function testingVia(page, name) {
+  await action(line(page, name), "Test via").click();
+  const dialog = page.getByRole("dialog", { name: "Test via", exact: true });
+  await action(dialog, "Egress").waitFor();
+  return dialog;
+}
+/** Each path a run tried, as its row reads: the hops, how it went, and what was said of it. */
+async function paths(dialog, count) {
+  const rows = dialog.getByRole("list", { name: "Paths", exact: true }).getByRole("listitem");
+  await rows.nth(count - 1).waitFor();
+  assert.equal(await rows.count(), count);
+  return Promise.all(Array.from({ length: count }, async (_, index) => {
+    const row = rows.nth(index);
+    return {
+      hops: await row.locator("span").first().textContent(),
+      failing: await row.locator("span.text-wv-error-text").allTextContents(),
+      sentence: await row.locator("p").textContent(),
+    };
+  }));
+}
+const runs = async (page) => (await daemon(page)).requests.filter((request) => request.name === "TestVia");
+
+test("a proxy is tested through a route drafted for it, which cannot use the proxy, and each path is a row", async () => {
+  const page = await open();
+  try {
+    const dialog = await testingVia(page, "Relay");
+    await dialog.getByText("Relay · SOCKS5", { exact: true }).waitFor();
+    // The draft starts direct on the first egress that is turned on.
+    assert.equal(await action(dialog, "Egress").textContent(), "System");
+    assert.equal(await option(dialog, "Direct").getAttribute("aria-checked"), "true");
+    // A test tries every path, so the draft has no weights or share to hold.
+    assert.equal(await dialog.getByRole("slider").count(), 0);
+    assert.equal(await dialog.getByText("Simulate leg down", { exact: true }).count(), 0);
+    assert.equal(await dialog.getByText("When a leg goes down", { exact: true }).count(), 0);
+
+    await option(dialog, "Proxy ladder").click();
+    // The proxy under test cannot carry itself, so it is not offered.
+    await action(dialog, "Leg 1 rung 1").click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Amsterdam", "Seedbox"]);
+    await page.getByRole("menuitemradio", { name: "Amsterdam", exact: true }).click();
+    await action(dialog, "Add rung").click();
+    assert.equal(await action(dialog, "Leg 1 rung 2").textContent(), "Seedbox");
+
+    await action(dialog, "Test").click();
+    const reachable = "Reachable. Give a host and port to check forwarding.";
+    const silent = "No answer within 10 seconds. Check the address, the port and any firewall.";
+    assert.deepEqual(await paths(dialog, 3), [
+      { hops: "System > Amsterdam > Relay", failing: [], sentence: reachable },
+      { hops: "System > Seedbox > Relay", failing: ["Seedbox"], sentence: silent },
+      { hops: "System > Relay", failing: [], sentence: reachable },
+    ]);
+    const rows = dialog.getByRole("list", { name: "Paths", exact: true }).getByRole("listitem");
+    await rows.nth(1).getByText("Failed at Seedbox", { exact: true }).waitFor();
+    await rows.nth(0).getByText("Passed", { exact: true }).waitFor();
+    await rows.nth(0).getByText("13 ms · source 192.0.2.10:40000", { exact: true }).waitFor();
+    assert.deepEqual((await runs(page)).at(-1).variables, {
+      route: {
+        failover: "REDISTRIBUTE",
+        legs: [{ egressId: 0, weight: 100, path: { ladder: { directFallback: true, rungs: [{ proxy: 1 }, { proxy: 2 }] } } }],
+      },
+      subject: { proxy: 3 },
+      target: null,
+    });
+    await shot(page, "test-via-proxy");
+
+    // With somewhere to go, the proxy is asked to forward there.
+    await field(dialog, "Host").fill("news.fixture.invalid");
+    await field(dialog, "Port").fill("563");
+    await action(dialog, "Test").click();
+    await rows.first().getByText("Connected and forwarded through the proxy.", { exact: true }).waitFor();
+    assert.deepEqual((await runs(page)).at(-1).variables.target, { host: "news.fixture.invalid", port: 563 });
+
+    // The proxy's line keeps the last run: the first path that failed.
+    await action(dialog, "Close").click();
+    await dialog.waitFor({ state: "detached" });
+    await line(page, "Relay").getByText(silent, { exact: true }).waitFor();
+    assert.equal(await line(page, "Amsterdam").getByText("—", { exact: true }).count(), 1);
+  } finally { await page.close(); }
+});
+
+test("a test the daemon refuses says why in our words, and leaves no rows", async () => {
+  const page = await open("?limit=2");
+  try {
+    const dialog = await testingVia(page, "Relay");
+    // A draft has one leg: nothing to add.
+    assert.equal(await action(dialog, "Add leg").count(), 0);
+    await option(dialog, "Proxy ladder").click();
+    await action(dialog, "Add rung").click();
+    await action(dialog, "Test").click();
+    await dialog.getByRole("alert").getByText("A test can try at most 2 paths. Use fewer rungs or pool members.", { exact: true }).waitFor();
+    assert.equal(await dialog.getByRole("list", { name: "Paths", exact: true }).count(), 0);
+    await shot(page, "test-via-refused");
+    await action(dialog, "Close").click();
+    await line(page, "Relay").getByText("A test can try at most 2 paths. Use fewer rungs or pool members.", { exact: true }).waitFor();
+  } finally { await page.close(); }
+});
+
+test("a pool is tested member by member through a route drafted for it", async () => {
+  const page = await open("?pools");
+  try {
+    await page.getByText("Exits", { exact: true }).click();
+    const editor = page.getByRole("dialog", { name: "Exits", exact: true });
+    await action(editor, "Test pool").click();
+    const dialog = page.getByRole("dialog", { name: "Test via", exact: true });
+    await dialog.getByText("Exits · SOCKS5", { exact: true }).waitFor();
+    // The draft may not use the pool's own members.
+    await option(dialog, "Proxy ladder").click();
+    await action(dialog, "Leg 1 rung 1").click();
+    assert.deepEqual(await page.getByRole("menuitemradio").allTextContents(), ["Amsterdam", "Seedbox"]);
+    await page.getByRole("menuitemradio", { name: "Amsterdam", exact: true }).click();
+    await option(dialog, "Direct").click();
+    await action(dialog, "Test").click();
+    assert.deepEqual(await paths(dialog, 1), [
+      { hops: "System > Relay", failing: [], sentence: "Reachable. Give a host and port to check forwarding." },
+    ]);
+    assert.deepEqual((await runs(page)).at(-1).variables, {
+      route: { failover: "REDISTRIBUTE", legs: [{ egressId: 0, weight: 100, path: { direct: true } }] },
+      subject: { pool: 1 },
+      target: null,
+    });
+    await shot(page, "test-via-pool");
+  } finally { await page.close(); }
+});
