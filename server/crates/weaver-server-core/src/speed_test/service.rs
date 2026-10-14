@@ -307,7 +307,7 @@ impl SpeedTestService {
                         SpeedTestError::Invalid(format!("server {id} does not exist"))
                     })?,
             ),
-            Consumer::Rss(_) => None,
+            Consumer::Rss(_) | Consumer::Outbound => None,
         };
         let consumer_name = runtime
             .network
@@ -319,6 +319,7 @@ impl SpeedTestService {
             .unwrap_or_else(|| match consumer {
                 Consumer::Server(id) => format!("server {id}"),
                 Consumer::Rss(id) => format!("feed {id}"),
+                Consumer::Outbound => "Default outbound".into(),
             });
 
         let policy = match &request.route {
@@ -539,7 +540,7 @@ impl SpeedTestService {
 
 fn validate_request(request: &SpeedTestRequest) -> Result<(), SpeedTestError> {
     match (&request.kind, request.consumer) {
-        (SpeedTestKind::Usenet { .. }, Consumer::Rss(_)) => {
+        (SpeedTestKind::Usenet { .. }, Consumer::Rss(_) | Consumer::Outbound) => {
             Err(NetworkRefusal::SpeedTestUsenetNeedsServer.into())
         }
         (SpeedTestKind::Bandwidth { provider }, _) => match provider {

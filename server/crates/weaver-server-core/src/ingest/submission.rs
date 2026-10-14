@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,7 +8,7 @@ use tracing::{info, warn};
 use crate::Database;
 use crate::jobs::JobSpec;
 use crate::jobs::ids::JobId;
-use crate::security::{ResolvedFetchTarget, RuntimeSecurityConfig, resolve_fetch_target};
+use crate::security::RuntimeSecurityConfig;
 use crate::settings::SharedConfig;
 use crate::{SchedulerError, SchedulerHandle};
 use weaver_nzb::Nzb;
@@ -918,121 +917,51 @@ impl std::fmt::Debug for FetchedNzb {
     }
 }
 
+// Fetches an NZB on the Default outbound route, or directly without a
+// runtime.
 pub async fn fetch_nzb_from_url(
-    _client: &reqwest::Client,
+    runtime: Option<&crate::proxies::ProxyRuntime>,
     url: &str,
+    allow_private_network: bool,
 ) -> Result<FetchedNzb, SubmitNzbError> {
-    fetch_nzb_from_url_with_resolver(url, |current_url| async move {
-        resolve_fetch_target(&current_url, false).await
-    })
-    .await
-}
-
-async fn fetch_nzb_from_url_with_resolver<R, Fut>(
-    url: &str,
-    mut resolve_target: R,
-) -> Result<FetchedNzb, SubmitNzbError>
-where
-    R: FnMut(reqwest::Url) -> Fut,
-    Fut: Future<Output = Result<ResolvedFetchTarget, String>>,
-{
     let limits = RuntimeSecurityConfig::from_env_or_default_for_tests();
-    let mut current_url =
-        reqwest::Url::parse(url).map_err(|error| SubmitNzbError::Fetch(error.to_string()))?;
-
-    for redirect_count in 0..=MAX_FETCH_REDIRECTS {
-        let target = resolve_target(current_url.clone())
-            .await
-            .map_err(SubmitNzbError::Fetch)?;
-        let client = target
-            .apply_dns_override(
-                reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .timeout(std::time::Duration::from_secs(60))
-                    .user_agent("weaver/0.1")
-                    .gzip(true)
-                    .brotli(true)
-                    .deflate(true)
-                    .zstd(true),
-            )
-            .build()
-            .map_err(|error| SubmitNzbError::Fetch(format!("client build failed: {error}")))?;
-
-        let response = client
-            .get(target.url.clone())
-            .send()
-            .await
-            .map_err(|error| SubmitNzbError::Fetch(format!("request failed: {error}")))?;
-
-        if response.status().is_redirection() {
-            if redirect_count == MAX_FETCH_REDIRECTS {
-                return Err(SubmitNzbError::Fetch("too many redirects".to_string()));
-            }
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| SubmitNzbError::Fetch("redirect missing Location".to_string()))?;
-            current_url = current_url
-                .join(location)
-                .map_err(|error| SubmitNzbError::Fetch(format!("invalid redirect: {error}")))?;
-            continue;
-        }
-
-        if !response.status().is_success() {
-            return Err(SubmitNzbError::Fetch(format!("HTTP {}", response.status())));
-        }
-
-        let filename = extract_filename_from_response(&response, current_url.as_str());
-        // Only the response that carries the NZB speaks for its passwords; a
-        // redirect's headers are not read.
-        let header_passwords = crate::ingest::dnzb_header_passwords(response.headers());
-        let nzb_bytes =
-            read_response_with_limit(response, limits.nzb_decompressed_limit_bytes).await?;
-
-        if nzb_bytes.is_empty() {
-            return Err(SubmitNzbError::Fetch("empty response body".into()));
-        }
-
-        // Submission runs Scan scripts before parsing these fetched bytes.
-        return Ok(FetchedNzb {
-            bytes: nzb_bytes,
-            filename,
-            header_passwords,
-        });
+    let url = reqwest::Url::parse(url).map_err(|error| SubmitNzbError::Fetch(error.to_string()))?;
+    let options = crate::proxies::FetchOptions {
+        label: "NZB",
+        timeout: std::time::Duration::from_secs(60),
+        redirects: MAX_FETCH_REDIRECTS,
+        user_agent: "weaver/0.1",
+        https_only: false,
+        allow_private_network,
+    };
+    let response = crate::proxies::routed_fetch(
+        runtime,
+        crate::proxies::Consumer::Outbound,
+        &url,
+        &options,
+        |request, _, _| request,
+    )
+    .await
+    .map_err(SubmitNzbError::Fetch)?;
+    if !response.status().is_success() {
+        return Err(SubmitNzbError::Fetch(format!("HTTP {}", response.status())));
     }
-
-    Err(SubmitNzbError::Fetch("too many redirects".to_string()))
-}
-
-async fn read_response_with_limit(
-    mut response: reqwest::Response,
-    limit: u64,
-) -> Result<Vec<u8>, SubmitNzbError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit)
-    {
-        return Err(SubmitNzbError::Fetch(format!(
-            "response exceeds {limit} bytes"
-        )));
-    }
-
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
+    let filename = extract_filename_from_response(&response, response.url().as_str());
+    // Only the response that carries the NZB speaks for its passwords; a
+    // redirect's headers are not read.
+    let header_passwords = crate::ingest::dnzb_header_passwords(response.headers());
+    let bytes = crate::proxies::read_body(response, limits.nzb_decompressed_limit_bytes)
         .await
-        .map_err(|error| SubmitNzbError::Fetch(format!("body read failed: {error}")))?
-    {
-        let next_len = body.len().saturating_add(chunk.len());
-        if next_len as u64 > limit {
-            return Err(SubmitNzbError::Fetch(format!(
-                "response exceeds {limit} bytes"
-            )));
-        }
-        body.extend_from_slice(&chunk);
+        .map_err(SubmitNzbError::Fetch)?;
+    if bytes.is_empty() {
+        return Err(SubmitNzbError::Fetch("empty response body".into()));
     }
-    Ok(body)
+    // Submission runs Scan scripts before parsing these fetched bytes.
+    Ok(FetchedNzb {
+        bytes,
+        filename,
+        header_passwords,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1408,8 +1337,6 @@ fn parse_content_disposition_filename(header: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn minimal_nzb(name: &str) -> String {
@@ -1440,17 +1367,8 @@ mod tests {
         String::from_utf8_lossy(&request).into_owned()
     }
 
-    fn pinned_target(url: reqwest::Url, addr: SocketAddr) -> ResolvedFetchTarget {
-        let host = url.host_str().unwrap().to_string();
-        ResolvedFetchTarget {
-            url,
-            host,
-            addrs: vec![addr],
-        }
-    }
-
     #[tokio::test]
-    async fn fetch_nzb_uses_pinned_hostname_resolution() {
+    async fn fetch_nzb_reads_the_named_file() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let xml = minimal_nzb("Pinned.Release");
@@ -1472,23 +1390,19 @@ mod tests {
             request
         });
 
-        let url = format!("http://public.test:{}/download.nzb", addr.port());
+        let url = format!("http://{addr}/download.nzb");
         let FetchedNzb {
             bytes,
             filename,
             header_passwords,
-        } = fetch_nzb_from_url_with_resolver(&url, move |url| async move {
-            Ok(pinned_target(url, addr))
-        })
-        .await
-        .unwrap();
+        } = fetch_nzb_from_url(None, &url, true).await.unwrap();
         let request = server.await.unwrap();
         assert!(header_passwords.is_empty());
 
         assert_eq!(filename.as_deref(), Some("Pinned.Release.nzb"));
         assert!(!bytes.is_empty());
         assert!(request.starts_with("GET /download.nzb HTTP/1.1"));
-        assert!(request.contains(&format!("host: public.test:{}", addr.port())));
+        assert!(request.contains(&format!("host: {addr}")));
     }
 
     fn numbered(prefix: &str, count: usize) -> Vec<String> {
@@ -1716,12 +1630,8 @@ mod tests {
             stream.write_all(response.as_bytes()).await.unwrap();
         });
 
-        let url = format!("http://public.test:{}/download.nzb", addr.port());
-        let fetched = fetch_nzb_from_url_with_resolver(&url, move |url| async move {
-            Ok(pinned_target(url, addr))
-        })
-        .await
-        .unwrap();
+        let url = format!("http://{addr}/download.nzb");
+        let fetched = fetch_nzb_from_url(None, &url, true).await.unwrap();
         server.await.unwrap();
 
         assert_eq!(
@@ -1760,67 +1670,26 @@ mod tests {
             stream.write_all(headers.as_bytes()).await.unwrap();
             stream.write_all(payload).await.unwrap();
         });
-        let url = format!("http://public.test:{}/repairable.nzb", addr.port());
-        let bytes = fetch_nzb_from_url_with_resolver(&url, move |url| async move {
-            Ok(pinned_target(url, addr))
-        })
-        .await
-        .unwrap()
-        .bytes;
+        let url = format!("http://{addr}/repairable.nzb");
+        let bytes = fetch_nzb_from_url(None, &url, true).await.unwrap().bytes;
         server.await.unwrap();
         assert_eq!(bytes, payload);
         assert!(weaver_nzb::parse_nzb(&bytes).is_err());
     }
 
     #[tokio::test]
-    async fn fetch_nzb_rejects_redirect_to_private_before_request() {
-        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let redirect_addr = redirect_listener.local_addr().unwrap();
-        let private_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let private_addr = private_listener.local_addr().unwrap();
-        let redirect_server = tokio::spawn(async move {
-            let (mut stream, _) = redirect_listener.accept().await.unwrap();
-            let _request = read_http_request(&mut stream).await;
-            let response = format!(
-                "HTTP/1.1 302 Found\r\n\
-                 Location: http://127.0.0.1:{}/private.nzb\r\n\
-                 Content-Length: 0\r\n\
-                 Connection: close\r\n\
-                 \r\n",
-                private_addr.port()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
-        let private_accept = tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_millis(200), private_listener.accept())
-                .await
-                .is_ok()
-        });
+    async fn fetch_nzb_refuses_a_private_destination_before_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/private.nzb", listener.local_addr().unwrap());
 
-        let url = format!("http://public.test:{}/redirect.nzb", redirect_addr.port());
-        let error = fetch_nzb_from_url_with_resolver(&url, move |url| async move {
-            if url.host_str() == Some("public.test") {
-                Ok(pinned_target(url, redirect_addr))
-            } else {
-                resolve_fetch_target(&url, false).await
-            }
-        })
-        .await
-        .unwrap_err();
-        redirect_server.await.unwrap();
-        let private_was_hit = private_accept.await.unwrap();
+        let error = fetch_nzb_from_url(None, &url, false).await.unwrap_err();
 
-        assert!(error.to_string().contains("not allowed"));
-        assert!(!private_was_hit);
-    }
-
-    #[test]
-    fn pinned_target_preserves_original_host_for_dns_override() {
-        let url = reqwest::Url::parse("http://public.test:8080/file.nzb").unwrap();
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-        let target = pinned_target(url, addr);
-
-        assert_eq!(target.host, "public.test");
-        assert_eq!(target.addrs, vec![addr]);
+        assert!(error.to_string().contains("not allowed"), "{error}");
+        // Nothing connected: the refusal came before any request.
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 }

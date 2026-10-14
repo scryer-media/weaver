@@ -38,6 +38,8 @@ pub enum Purpose {
     NntpProbe { server: u32, leg: usize },
     ProxyEndpoint { proxy: u32 },
     Feed { feed: u32 },
+    // Any other fetch Weaver makes over HTTP.
+    Outbound,
     Probe,
     // A DNS query a hop asks to resolve a name dialled through it.
     Dns,

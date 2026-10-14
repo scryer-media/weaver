@@ -500,7 +500,7 @@ impl From<core::SpeedTestFailure> for SpeedTestFailureGql {
 #[derive(Clone, Debug, SimpleObject)]
 pub struct SpeedTestRun {
     pub id: u32,
-    // "server:N" or "rss:N".
+    // "server:N", "rss:N" or "outbound".
     pub consumer: String,
     pub consumer_name: String,
     pub kind: SpeedTestKind,

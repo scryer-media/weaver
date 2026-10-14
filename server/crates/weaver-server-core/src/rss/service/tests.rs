@@ -278,6 +278,8 @@ async fn run_sync_uses_conditional_get_and_basic_auth() {
     assert_eq!(first.items_submitted, 1);
     let second = service.run_all_sync().await.unwrap();
     assert_eq!(second.items_fetched, 0);
+    // A 304 is the feed unchanged, not a redirect.
+    assert!(second.errors.is_empty(), "{:?}", second.errors);
     assert_eq!(state.conditional_hits.load(Ordering::SeqCst), 1);
     assert_eq!(state.auth_failures.load(Ordering::SeqCst), 0);
     server_task.abort();

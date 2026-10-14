@@ -598,9 +598,6 @@ impl StreamProvider {
             current: Mutex::new(None),
         })
     }
-    pub(crate) fn pin(&self, host: &str, addresses: Vec<IpAddr>) {
-        *self.pins.lock().expect("stream pins") = Some((host.to_owned(), addresses));
-    }
     pub(crate) fn add_bytes(&self, bytes: u64) {
         if let Some(record) = &*self.current.lock().expect("stream connection") {
             record.add_bytes(bytes);
@@ -618,6 +615,19 @@ impl StreamProvider {
             Some(record) => record.fail(error),
             None => *current = Some(recorder.error_row(error)),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::proxies::FetchPath for StreamProvider {
+    async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        self.stage.resolve(host).await
+    }
+    fn pin(&self, host: &str, addresses: Vec<IpAddr>) {
+        *self.pins.lock().expect("stream pins") = Some((host.to_owned(), addresses));
+    }
+    fn budget(&self) -> Duration {
+        self.stage.budget()
     }
 }
 

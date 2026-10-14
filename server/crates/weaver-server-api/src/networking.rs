@@ -457,12 +457,15 @@ impl From<core::ProxyPool> for ProxyPoolGql {
 pub enum NetworkConsumerKind {
     Server,
     Rss,
+    // Default outbound. There is one, so its id is ignored.
+    Outbound,
 }
 impl NetworkConsumerKind {
     pub(crate) fn consumer(self, id: u32) -> core::Consumer {
         match self {
             Self::Server => core::Consumer::Server(id),
             Self::Rss => core::Consumer::Rss(id),
+            Self::Outbound => core::Consumer::Outbound,
         }
     }
 }
@@ -725,6 +728,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
             let (kind, id) = match consumer {
                 core::Consumer::Server(id) => (NetworkConsumerKind::Server, id),
                 core::Consumer::Rss(id) => (NetworkConsumerKind::Rss, id),
+                core::Consumer::Outbound => (NetworkConsumerKind::Outbound, 0),
             };
             NetworkConsumerFlow {
                 key: consumer.key(),
@@ -1041,6 +1045,7 @@ impl NetworkingMutation {
                     db.list_servers()?.iter().any(|server| server.id == id)
                 }
                 core::Consumer::Rss(id) => db.get_rss_feed(id)?.is_some(),
+                core::Consumer::Outbound => true,
             };
             if !exists {
                 return Err(NetworkRefusal::RouteConsumerGone.into());

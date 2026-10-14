@@ -232,7 +232,7 @@ async fn routed_http(kind: ProxyKind) {
         .await
         .unwrap();
     assert_eq!(
-        read_response_with_limit(response, 1024).await.unwrap(),
+        read_body(response, 1024).await.unwrap(),
         b"through selected route"
     );
     let requests = captured.lock().unwrap().clone();
@@ -316,7 +316,7 @@ async fn a_proxy_resolving_with_its_host_is_handed_the_feeds_name() {
             .await
             .unwrap();
         assert_eq!(
-            read_response_with_limit(response, 1024).await.unwrap(),
+            read_body(response, 1024).await.unwrap(),
             b"through selected route"
         );
         assert_eq!(
@@ -485,9 +485,7 @@ async fn inherit_feed_routing(kind: ProxyKind) {
         .await
         .unwrap();
     assert_eq!(
-        read_response_with_limit(direct_download, 1024 * 1024)
-            .await
-            .unwrap(),
+        read_body(direct_download, 1024 * 1024).await.unwrap(),
         sample_nzb_bytes()
     );
     runtime.stop_all().await;

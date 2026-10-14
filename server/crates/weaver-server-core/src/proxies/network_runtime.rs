@@ -17,9 +17,9 @@ use weaver_tunnel::{
 use super::*;
 use crate::Database;
 
-#[path = "network_feed.rs"]
-mod feed;
-pub use feed::FeedAttempt;
+#[path = "network_fetch.rs"]
+mod fetch;
+pub use fetch::FetchAttempt;
 #[path = "network_draft.rs"]
 mod draft;
 pub use draft::DraftNetworkRoute;
@@ -52,6 +52,11 @@ impl Configuration {
                         .into_iter()
                         .map(|feed| (Consumer::Rss(feed.id), feed.name, 1)),
                 )
+                .chain(std::iter::once((
+                    Consumer::Outbound,
+                    "Default outbound".to_owned(),
+                    1,
+                )))
                 .collect(),
             consumers: ProxyRuntime::load_consumers(db).map_err(|e| e.to_string())?,
             egresses: db

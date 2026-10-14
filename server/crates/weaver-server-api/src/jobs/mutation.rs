@@ -1144,8 +1144,8 @@ async fn submit_from_facade_input(
             (Some(bytes), None, input.filename)
         }
         (None, Some(url), None) => {
-            let client = ctx.data::<reqwest::Client>()?;
-            let fetched = fetch_nzb_from_url(client, &url).await;
+            let runtime = handle.proxy_runtime();
+            let fetched = fetch_nzb_from_url(runtime.as_deref(), &url, false).await;
             if fetched.is_err() {
                 raise_url_completed(db, &url, input.category.as_deref(), UrlStatus::Failure).await;
             }

@@ -1,5 +1,4 @@
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use async_graphql::{Schema, SchemaBuilder};
 use weaver_nntp::pool::NntpPool;
@@ -123,16 +122,6 @@ pub fn build_schema_with_backup(
         history_delete_manager.spawn_worker();
     }
 
-    let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .user_agent("weaver/0.1")
-        .gzip(true)
-        .brotli(true)
-        .deflate(true)
-        .zstd(true)
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .expect("http client build should succeed");
     let staged_upload_manager = StagedUploadManager::new();
     staged_upload_manager.spawn_cleanup_worker();
     let post_processing_executor = context.post_processing_executor.clone().unwrap_or_else(|| {
@@ -177,7 +166,6 @@ pub fn build_schema_with_backup(
     .data(context.update_check)
     .data(context.application_upgrade)
     .data(context.schedules)
-    .data(http_client)
     .data(context.log_buffer)
     .data(context.system_runtime)
     .data(context.nntp_pool)

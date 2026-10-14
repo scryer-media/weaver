@@ -344,12 +344,16 @@ impl RoutingPolicy {
 pub enum Consumer {
     Server(u32),
     Rss(u32),
+    // Default outbound: everything Weaver fetches over HTTP that is not a
+    // server, a feed or a speed test. It always exists and has cap 1.
+    Outbound,
 }
 impl Consumer {
     pub fn key(self) -> String {
         match self {
             Self::Server(id) => format!("server:{id}"),
             Self::Rss(id) => format!("rss:{id}"),
+            Self::Outbound => "outbound".into(),
         }
     }
 }

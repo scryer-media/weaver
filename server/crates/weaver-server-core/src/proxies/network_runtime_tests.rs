@@ -280,7 +280,9 @@ async fn a_feed_leg_holds_its_health_until_its_last_rung_and_fallback_have_faile
     let unreachable = || DialError::Egress(std::io::Error::other("no route to host"));
 
     // Both proxy rungs fail; the direct fallback has not run yet.
-    let attempts = runtime.feed_attempts(1, legacy.clone()).unwrap();
+    let attempts = runtime
+        .fetch_attempts(Consumer::Rss(1), legacy.clone())
+        .unwrap();
     assert_eq!(attempts.len(), 3, "two rungs and the direct fallback");
     attempts[0].report(Some(&refused(1)));
     attempts[1].report(Some(&refused(2)));
@@ -296,7 +298,7 @@ async fn a_feed_leg_holds_its_health_until_its_last_rung_and_fallback_have_faile
     // Once the rungs' own cooldowns lapse, the next sync fails the same way;
     // two whole failed syncs cool the leg.
     tokio::time::advance(Duration::from_secs(31)).await;
-    let attempts = runtime.feed_attempts(1, legacy).unwrap();
+    let attempts = runtime.fetch_attempts(Consumer::Rss(1), legacy).unwrap();
     assert_eq!(attempts.len(), 3);
     attempts[0].report(Some(&refused(1)));
     attempts[1].report(Some(&refused(2)));

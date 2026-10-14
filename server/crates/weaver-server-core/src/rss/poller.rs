@@ -1,12 +1,13 @@
 use tracing::{info, warn};
 
+use crate::proxies::read_body;
 use crate::rss::model::{
     RSS_SEEN_RETENTION_SECS, RSS_SYNC_TICK_SECS, compile_rules, evaluate_item, is_due,
     parse_feed_items,
 };
 use crate::rss::service::{
     DueSyncOutcome, MAX_RSS_FEED_BODY_BYTES, RssFeedSyncReport, RssService, RssServiceError,
-    RssSyncReport, read_response_with_limit,
+    RssSyncReport,
 };
 use crate::{RssFeedRow, RssRuleAction};
 
@@ -40,7 +41,7 @@ impl RssService {
                 response.status()
             )));
         }
-        let body = read_response_with_limit(response, MAX_RSS_FEED_BODY_BYTES)
+        let body = read_body(response, MAX_RSS_FEED_BODY_BYTES)
             .await
             .map_err(RssServiceError::Http)?;
         let body = crate::post_processing::feed::transform_feed(
@@ -408,7 +409,7 @@ impl RssService {
         let body = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Ok(RssFeedSyncReport::default()),
-            result = read_response_with_limit(response, MAX_RSS_FEED_BODY_BYTES) => result.map_err(RssServiceError::Http)?,
+            result = read_body(response, MAX_RSS_FEED_BODY_BYTES) => result.map_err(RssServiceError::Http)?,
         };
         let body = crate::post_processing::feed::transform_feed(
             &self.inner.db,

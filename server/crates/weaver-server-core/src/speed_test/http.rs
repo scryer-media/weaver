@@ -1,13 +1,12 @@
-use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use weaver_tunnel::bridge::Bridge;
-use weaver_tunnel::pipe::{DialError, Dialer, Resolution};
+use weaver_tunnel::pipe::{DialError, Dialer};
 
 use super::failure::SpeedTestFailure;
 use super::progress::{LegRecorder, StreamProvider};
-use crate::security::{ResolvedFetchTarget, is_blocked_egress_ip};
+use crate::proxies::{AdmitError, Admitted, admit, pinned, start_bridge, through_bridge};
 
 // The test NZB may be no larger than this.
 pub(crate) const NZB_LIMIT: usize = 16 * 1024 * 1024;
@@ -71,7 +70,7 @@ pub(crate) struct RoutedClient {
 }
 
 impl RoutedClient {
-    // Set up the way the RSS routed GET does: resolve on the leg, apply the
+    // Set up the way every routed fetch is: resolve on the leg, apply the
     // egress block rules unless private destinations are allowed, pin the
     // checked addresses, and point reqwest at the leg's bridge.
     pub(crate) async fn connect(
@@ -80,64 +79,36 @@ impl RoutedClient {
         options: &HttpOptions,
         recorder: Option<LegRecorder>,
     ) -> Result<Self, (Option<Arc<StreamProvider>>, SpeedTestFailure)> {
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err((None, "URL must use http or https".into()));
-        }
-        let host = url
-            .host_str()
-            .ok_or((None, "URL must include a host".into()))?
-            .trim_matches(['[', ']'])
-            .to_owned();
-        let port = url
-            .port_or_known_default()
-            .ok_or((None, "URL has no port".into()))?;
-        // `None` when the proxy the leg exits through resolves the name:
-        // nothing here to check or pin.
-        let addresses = match leg.stage.resolve(&host).await.map_err(|error| {
-            let failure = match error {
-                // The local resolver found nothing for the host.
-                DialError::Destination(error) => SpeedTestFailure::Unresolved {
-                    host: host.clone(),
-                    reason: Some(error.to_string()),
-                },
-                error => error.to_string().into(),
-            };
-            (None, failure)
-        })? {
-            Resolution::Addresses(addresses) => Some(addresses),
-            Resolution::Unresolved => None,
-        };
-        if addresses.as_ref().is_some_and(Vec::is_empty) {
-            return Err((None, SpeedTestFailure::Unresolved { host, reason: None }));
-        }
-        if !options.allow_private_network
-            && addresses
-                .iter()
-                .flatten()
-                .any(|ip| is_blocked_egress_ip(*ip))
-        {
-            return Err((None, SpeedTestFailure::AddressNotAllowed { host }));
-        }
         let provider = StreamProvider::new(leg.stage.clone(), recorder);
-        if let Some(addresses) = &addresses {
-            provider.pin(&host, addresses.clone());
-        }
-        let addresses = addresses.unwrap_or_default();
-        let mut secret = [0u8; 32];
-        getrandom::fill(&mut secret)
-            .map_err(|_| (None, "could not generate bridge credentials".into()))?;
-        let bridge = Bridge::start(
-            &tokio::runtime::Handle::current(),
-            provider.clone(),
-            leg.stage.budget(),
-            ("weaver".into(), hex::encode(secret)),
-        )
-        .map_err(|e| (Some(provider.clone()), e.to_string().into()))?;
-        let built = Self::build(&bridge, &host, port, url, &addresses, options);
-        match built {
+        let admitted = admit(provider.as_ref(), url, options.allow_private_network)
+            .await
+            .map_err(|error| {
+                let host = url
+                    .host_str()
+                    .unwrap_or_default()
+                    .trim_matches(['[', ']'])
+                    .to_owned();
+                let failure = match error {
+                    AdmitError::Url(message) => message.into(),
+                    // The local resolver found nothing for the host.
+                    AdmitError::Resolve(DialError::Destination(error)) => {
+                        SpeedTestFailure::Unresolved {
+                            host,
+                            reason: Some(error.to_string()),
+                        }
+                    }
+                    AdmitError::Resolve(error) => error.to_string().into(),
+                    AdmitError::Empty => SpeedTestFailure::Unresolved { host, reason: None },
+                    AdmitError::Private => SpeedTestFailure::AddressNotAllowed { host },
+                };
+                (None, failure)
+            })?;
+        let bridge = start_bridge(provider.clone())
+            .map_err(|error| (Some(provider.clone()), error.into()))?;
+        match Self::build(&bridge, &admitted, url, options) {
             Ok(client) => Ok(Self {
                 client,
-                host,
+                host: admitted.host,
                 bridge,
                 provider,
             }),
@@ -150,16 +121,12 @@ impl RoutedClient {
 
     fn build(
         bridge: &Bridge,
-        host: &str,
-        port: u16,
+        admitted: &Admitted,
         url: &reqwest::Url,
-        addresses: &[IpAddr],
         options: &HttpOptions,
     ) -> Result<reqwest::Client, String> {
-        let addr = bridge.addr().map_err(|e| e.to_string())?;
-        let same_host = host.to_owned();
+        let same_host = admitted.host.clone();
         let mut builder = reqwest::Client::builder()
-            .no_proxy()
             .user_agent(concat!("weaver/", env!("CARGO_PKG_VERSION")))
             .read_timeout(Duration::from_secs(30))
             // Ask for the body as stored: a compressed transfer would count
@@ -181,12 +148,8 @@ impl RoutedClient {
                 } else {
                     attempt.stop()
                 }
-            }))
-            .proxy(
-                reqwest::Proxy::all(format!("socks5h://{addr}"))
-                    .map_err(|e| e.to_string())?
-                    .basic_auth(bridge.credentials().0, bridge.credentials().1),
-            );
+            }));
+        builder = through_bridge(builder, bridge)?;
         if !options.roots.is_empty() {
             let roots = options
                 .roots
@@ -196,18 +159,15 @@ impl RoutedClient {
                 .map_err(|e| e.to_string())?;
             builder = builder.tls_certs_only(roots);
         }
-        let target = ResolvedFetchTarget {
-            url: url.clone(),
-            host: host.to_owned(),
-            addrs: addresses
-                .iter()
-                .map(|ip| SocketAddr::new(*ip, port))
-                .collect(),
-        };
-        target
-            .apply_dns_override(builder)
-            .build()
-            .map_err(|e| e.to_string())
+        pinned(
+            builder,
+            url,
+            &admitted.host,
+            admitted.port,
+            &admitted.addresses,
+        )
+        .build()
+        .map_err(|e| e.to_string())
     }
 
     // One GET, refused unless it answers with a success status.

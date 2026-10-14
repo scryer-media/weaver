@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::Extension;
@@ -36,7 +36,6 @@ pub(super) struct NzbgetFacadeContext {
     api_key_cache: ApiKeyCache,
     session_token: super::SessionToken,
     security: RuntimeSecurityConfig,
-    http_client: reqwest::Client,
     started_at: Instant,
     scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
     rss: weaver_server_api::RssService,
@@ -73,12 +72,6 @@ impl NzbgetFacadeContext {
         scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
         complete_capacity: weaver_server_core::operations::CapacityReader,
     ) -> Self {
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
         Self {
             db,
             handle,
@@ -87,7 +80,6 @@ impl NzbgetFacadeContext {
             api_key_cache,
             session_token,
             security,
-            http_client,
             started_at: Instant::now(),
             scheduled_resume,
             rss,
@@ -966,7 +958,8 @@ async fn append(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Valu
     let request = parse_append_params(params).map_err(|error| append_refused("", error))?;
     let requested_name = request.filename.clone().unwrap_or_default();
     let (nzb_bytes, fetched_filename, header_passwords) = if is_http_url(&request.content_or_url) {
-        match fetch_nzb_from_url(&ctx.http_client, &request.content_or_url).await {
+        let runtime = ctx.handle.proxy_runtime();
+        match fetch_nzb_from_url(runtime.as_deref(), &request.content_or_url, false).await {
             Ok(fetched) => (fetched.bytes, fetched.filename, fetched.header_passwords),
             Err(error) => {
                 raise_url_completed(

@@ -474,6 +474,7 @@ impl ProxyRuntime {
                     .into_iter()
                     .map(|f| Consumer::Rss(f.id).key()),
             )
+            .chain(std::iter::once(Consumer::Outbound.key()))
             .collect())
     }
     // Whether the runtime knows this consumer, so a route for it can be
