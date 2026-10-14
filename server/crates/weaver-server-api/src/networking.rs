@@ -536,9 +536,12 @@ pub struct NetworkPoolMemberFlow {
     pub blocked: Option<String>,
     pub handshake_ms: Option<f64>,
     pub connect_ms: Option<f64>,
+    // The delivery rate the pool judges the member by, per connection.
     pub bytes_per_second: Option<f64>,
     pub samples: u32,
     pub failures: u32,
+    // What the member's open connections carry now, all together.
+    pub live_bytes_per_second: u64,
 }
 pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
     let mut legs = Vec::new();
@@ -673,6 +676,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                         bytes_per_second: evidence.and_then(|c| c.bytes_per_second),
                         samples: evidence.map_or(0, |c| c.samples),
                         failures: evidence.map_or(0, |c| c.failures),
+                        live_bytes_per_second: m.bytes_per_second,
                     }
                 })
                 .collect(),
@@ -705,6 +709,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                         bytes_per_second: None,
                         samples: 0,
                         failures: 0,
+                        live_bytes_per_second: 0,
                     });
                 }
             }

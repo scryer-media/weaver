@@ -302,6 +302,8 @@ pub struct ConnectionResult {
     pub path: DialPathGql,
     pub source_address: Option<String>,
     pub bytes: f64,
+    // The connection's rate over the newest sample bin.
+    pub bytes_per_second: f64,
     pub error: Option<String>,
 }
 
@@ -500,6 +502,7 @@ impl From<core::SpeedTestResult> for SpeedTestResult {
                     },
                     source_address: c.source_address,
                     bytes: c.bytes as f64,
+                    bytes_per_second: c.bytes_per_second as f64,
                     error: c.error,
                 })
                 .collect(),

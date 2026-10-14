@@ -82,7 +82,7 @@ function report(run: SpeedTestRun): SpeedTestRun {
     result: {
       bytes: 240 * MIB, elapsedMs: 12000, averageBps: 20 * MIB, peakBps: 30 * MIB,
       legs: live.map((leg) => ({ position: leg.position, bytes: 240 * MIB / live.length, averageBps: 20 * MIB / live.length, peakBps: 30 * MIB / live.length, connections: leg.target, sourceAddresses: ["192.0.2.10"] })),
-      connections: live.map((leg) => ({ leg: leg.position, connectMs: 18, path: { egressId: leg.egressId, rung: null, poolId: null, memberId: null, proxyIds: [] }, sourceAddress: "192.0.2.10:45123", bytes: 240 * MIB / live.length, error: null })),
+      connections: live.map((leg) => ({ leg: leg.position, connectMs: 18, path: { egressId: leg.egressId, rung: null, poolId: null, memberId: null, proxyIds: [] }, sourceAddress: "192.0.2.10:45123", bytes: 240 * MIB / live.length, bytesPerSecond: 0, error: null })),
       usenet: usenet ? { articlesRequested: 320, delivered: 318, missing: 2, failed: 0, declaredBytes: 100_000_000, decodedBytes: 230 * MIB, pipelining: true, tls: true, tlsCipherSuite: "TLS13_AES_256_GCM_SHA384" } : null,
       bandwidth: usenet ? null : { providerId: "cloudflare", server: null, url: "https://speed.fixture.invalid/__down", connections: 4 },
       samples: live.flatMap((leg) => [1000, 2000].map((atMs) => ({ atMs, leg: leg.position, bytes: 10 * MIB, decodedBytes: usenet ? 9 * MIB : 0 }))),
@@ -118,8 +118,8 @@ function reported(route: NonNullable<SpeedTestInput["route"]>): NetworkRoute {
 
 /**
  * Moves a running test on to measuring, `seconds` in: one connection held on each leg still up, through its
- * first rung, each second's bin a little different and the newest one 12 MiB on each leg. A Usenet run's
- * bins say what they decoded to as well.
+ * first rung (a pool's by its second member), each second's bin a little different and the newest one 12 MiB
+ * on each leg. A Usenet run's bins say what they decoded to as well.
  */
 function measure(id: number, seconds = 1) {
   const run = runs.find((entry) => entry.id === id);
@@ -132,7 +132,10 @@ function measure(id: number, seconds = 1) {
     result: {
       bytes: total * live.length, elapsedMs: seconds * 1000, averageBps: total / seconds, peakBps: 12 * MIB,
       legs: live.map((leg) => ({ position: leg.position, bytes: total, averageBps: total / seconds, peakBps: 12 * MIB, connections: 1, sourceAddresses: [] })),
-      connections: live.map((leg) => ({ leg: leg.position, connectMs: 18, path: { egressId: leg.egressId, rung: leg.path.kind === "LADDER" ? 0 : null, poolId: null, memberId: null, proxyIds: [] }, sourceAddress: null, bytes: total, error: null })),
+      connections: live.map((leg) => {
+        const pool = leg.path.kind === "LADDER" && leg.path.rungs[0]?.kind === "POOL" ? pools.find((entry) => entry.id === leg.path.rungs[0]!.poolId) : undefined;
+        return { leg: leg.position, connectMs: 18, path: { egressId: leg.egressId, rung: leg.path.kind === "LADDER" ? 0 : null, poolId: pool?.id ?? null, memberId: pool?.memberIds[1] ?? null, proxyIds: [] }, sourceAddress: null, bytes: total, bytesPerSecond: binBytes(seconds), error: null };
+      }),
       usenet: run.kind === "USENET" ? { articlesRequested: 320, delivered: 120, missing: 0, failed: 0, declaredBytes: 100_000_000, decodedBytes: Math.round(total * live.length * 0.97), pipelining: true, tls: true, tlsCipherSuite: "TLS13_AES_256_GCM_SHA384" } : null,
       bandwidth: null,
       samples: Array.from({ length: seconds }, (_, index) => index + 1).flatMap((second) => live.map((leg) => ({

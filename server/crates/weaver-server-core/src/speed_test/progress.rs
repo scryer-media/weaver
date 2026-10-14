@@ -20,6 +20,10 @@ pub(crate) struct ConnectionRecord {
     path: SpeedTestDialPath,
     source: Option<SocketAddr>,
     bytes: AtomicU64,
+    // The bytes counted when the last sample bin closed, and the rate the
+    // connection moved them at over that bin.
+    sampled: AtomicU64,
+    rate: AtomicU64,
     error: Mutex<Option<String>>,
 }
 
@@ -44,6 +48,7 @@ impl ConnectionRecord {
             path: self.path.clone(),
             source_address: self.source.map(|source| source.to_string()),
             bytes: self.bytes.load(Ordering::Relaxed),
+            bytes_per_second: self.rate.load(Ordering::Relaxed),
             error: self.error.lock().expect("connection error").clone(),
         }
     }
@@ -171,7 +176,8 @@ impl Progress {
     }
 
     // Close one sample bin per leg: the bytes each leg moved, and decoded,
-    // since the last.
+    // since the last. Each connection keeps its own rate over the bin, so a
+    // reader can tell which path carries what.
     pub(crate) fn sample(&self) {
         if !self.measuring() {
             return;
@@ -181,7 +187,23 @@ impl Progress {
         if at <= samples.0 && !samples.1.is_empty() {
             return;
         }
+        let width = at.saturating_sub(samples.0).as_secs_f64();
         samples.0 = at;
+        for record in self
+            .connections
+            .lock()
+            .expect("speed test connections")
+            .iter()
+        {
+            let total = record.bytes.load(Ordering::Relaxed);
+            let moved = total.saturating_sub(record.sampled.swap(total, Ordering::Relaxed));
+            let rate = if width > 0.0 {
+                (moved as f64 / width) as u64
+            } else {
+                0
+            };
+            record.rate.store(rate, Ordering::Relaxed);
+        }
         for (leg, counters) in self.legs.iter().enumerate() {
             let total = counters.bytes.load(Ordering::Relaxed);
             let previous = counters.sampled.swap(total, Ordering::Relaxed);
@@ -210,6 +232,8 @@ impl Progress {
             path,
             source,
             bytes: AtomicU64::new(0),
+            sampled: AtomicU64::new(0),
+            rate: AtomicU64::new(0),
             error: Mutex::new(error),
         });
         self.connections

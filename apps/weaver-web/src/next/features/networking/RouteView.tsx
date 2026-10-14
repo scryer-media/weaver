@@ -10,6 +10,7 @@ import {
   type NetworkFlow as Flow,
   type NetworkRoute,
   type PathOverride,
+  type PoolFlow,
   type ProxyPool,
 } from "@/lib/networking";
 import type { ProxyProfile } from "@/lib/proxies";
@@ -96,7 +97,7 @@ export function RouteView({
  * kept), with what is down drawn down and each leg's share as the test gives it.
  * With `onToggle` every box carries the Down switch that changes it. While a
  * test measures, `live` has each leg's connections and rate, and the lines
- * that carry them move.
+ * that carry them move; `livePools` has the pool members those connections hold.
  */
 export function RoutePlanView({
   consumer,
@@ -108,6 +109,7 @@ export function RoutePlanView({
   pools,
   legDown,
   live,
+  livePools,
   endpoint,
   onToggle,
 }: {
@@ -122,6 +124,7 @@ export function RoutePlanView({
   /** Which legs were down, when the daemon has said; otherwise worked out from `overrides`. */
   legDown?: boolean[];
   live?: LiveLeg[];
+  livePools?: PoolFlow[];
   /** What the test measures against, drawn as the box the flow ends at. */
   endpoint?: FlowEndpoint;
   onToggle?: (target: DownTarget) => void;
@@ -129,7 +132,7 @@ export function RoutePlanView({
   const plan = testedPlan(route, overrides, pools);
   const down = legDown ?? plan.legDown;
   const flow: Flow = {
-    pools: [],
+    pools: livePools ?? [],
     legs: route.legs.map((leg, position) => {
       const rungs = leg.path.kind === "DIRECT" ? [] : leg.path.rungs;
       const now = down[position] ? undefined : live?.[position];

@@ -58,8 +58,11 @@ test("flow displays route evidence, opens editors, exports a frozen SVG, and edi
  assert.equal(await diagram.locator("a[href='/settings/networking/egress']").count(),3);
  assert.equal(await diagram.getByText("Spare uplink",{exact:true}).count(),0);
  const members=diagram.getByRole("group",{name:"Europe pool members",exact:true});
- await members.getByText("Amsterdam · Pinned",{exact:true}).waitFor();
- assert.deepEqual(await members.locator("text").allTextContents(),["Amsterdam · Pinned","Session 30 ms · open 20 ms · 0.95 MiB/s","Frankfurt · Ready","Session 40 ms · open 25 ms · 0.76 MiB/s","Lisbon · Disabled"]);
+ // The member carrying the pool's traffic says so, with what it carries now; the one idle beside it stands by on its timings.
+ await members.getByText("Amsterdam · Active",{exact:true}).waitFor();
+ assert.deepEqual(await members.locator("text").allTextContents(),["Amsterdam · Active","24 open · 22.89 MiB/s","Frankfurt · Standby","Session 40 ms · open 25 ms · 0.76 MiB/s","Lisbon · Disabled"]);
+ assert.equal(await members.locator("a").filter({hasText:"Amsterdam · Active"}).locator("title").textContent(),"Session 30 ms · open 20 ms · 0.95 MiB/s");
+ assert.equal(await members.locator("rect[fill='#1f2b29']").count(),1);
  const pool=diagram.locator("a").filter({hasText:"Europe · pool"});
  assert.deepEqual(await pool.locator("text").allTextContents(),["Europe · pool","24 connections","Active · pinned to Amsterdam"]);
  const chain=diagram.getByRole("group",{name:"Relay one > Relay two > Exit",exact:true});
@@ -154,7 +157,7 @@ test("flow displays route evidence, opens editors, exports a frozen SVG, and edi
   [killSwitch,"Route for News archive"],
   [diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"WAN Fiber"}),"WAN Fiber"],
   [pool,"Europe"],
-  [members.locator("a").filter({hasText:"Frankfurt · Ready"}),"Frankfurt"],
+  [members.locator("a").filter({hasText:"Frankfurt · Standby"}),"Frankfurt"],
   [chain.locator("a").filter({hasText:"Relay two"}),"Relay two"],
  ];
  for(const [box,title] of edits){
