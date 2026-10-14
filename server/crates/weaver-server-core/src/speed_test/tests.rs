@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use tokio::sync::{RwLock, mpsc};
 
-use super::fixture::{FixtureArticle, HttpFixture, NntpFixture, loopback_tls, nzb};
+use super::fixture::{
+    FixtureArticle, HttpFixture, NntpFixture, SilentFixture, librespeed_list, loopback_tls, nzb,
+};
 use super::*;
 use crate::proxies::{Consumer, Failover, LegPath, ProxyRuntime, Route, RouteLeg};
 use crate::settings::Config;
@@ -548,6 +550,181 @@ async fn an_uploaded_nzb_is_measured_and_held_with_its_run() {
         std::fs::read_dir(rig._dir.path()).unwrap().next().is_none(),
         "the upload is never written"
     );
+}
+
+// A LibreSpeed run on `server`, or on the nearest server without one.
+fn librespeed_request(server: Option<&str>) -> SpeedTestRequest {
+    SpeedTestRequest {
+        consumer: Consumer::Rss(1),
+        route: Some(direct_route()),
+        overrides: PathOverride::default(),
+        kind: SpeedTestKind::Bandwidth {
+            provider: BandwidthProvider::Builtin {
+                id: "librespeed".into(),
+                server: server.map(Into::into),
+            },
+        },
+    }
+}
+
+// Serve `list` as the LibreSpeed server list the rig's runs fetch.
+async fn serve_librespeed_list(
+    rig: &Rig,
+    list: Vec<u8>,
+    tls: tokio_rustls::TlsAcceptor,
+) -> HttpFixture {
+    let fixture = HttpFixture::serve(vec![("/servers.php", list)], 0, Some(tls)).await;
+    rig.service.server_list_url_for_tests(
+        format!("https://127.0.0.1:{}/servers.php", fixture.addr.port())
+            .parse()
+            .unwrap(),
+    );
+    fixture
+}
+
+#[tokio::test]
+async fn nearest_takes_the_server_that_answers_its_ping_over_one_that_never_does() {
+    let rig = rig().await;
+    let (acceptor, cert_der, _) = loopback_tls();
+    rig.service.trust_roots_for_tests(vec![cert_der]);
+    rig.service.measure_until_stopped_for_tests();
+    let silent = SilentFixture::start().await;
+    let answering =
+        HttpFixture::serve(vec![("/ping", Vec::new())], 200_000, Some(acceptor.clone())).await;
+    let _list = serve_librespeed_list(
+        &rig,
+        librespeed_list(&[
+            ("1", silent.addr, Some("ping")),
+            ("2", answering.addr, Some("ping")),
+        ]),
+        acceptor,
+    )
+    .await;
+
+    // No server is named: the run is not refused, it takes the nearest.
+    let started = rig.service.start(librespeed_request(None)).await.unwrap();
+    assert_eq!(started.status, SpeedTestStatus::Running);
+    let mut revision = rig.service.subscribe();
+    loop {
+        let run = rig.service.run(started.id).unwrap();
+        assert_eq!(run.status, SpeedTestStatus::Running, "{:?}", run.error);
+        if run.result.is_some_and(|result| result.bytes > 0) {
+            break;
+        }
+        revision.changed().await.unwrap();
+    }
+    assert!(rig.service.cancel(started.id));
+    let run = finished(&rig, started.id).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Cancelled);
+    let bandwidth = run.result.unwrap().bandwidth.unwrap();
+    assert_eq!(bandwidth.provider_id.as_deref(), Some("librespeed"));
+    assert_eq!(bandwidth.server.as_deref(), Some("2"));
+    assert_eq!(
+        bandwidth.url,
+        format!(
+            "https://127.0.0.1:{}/blob?ckSize=1024",
+            answering.addr.port()
+        )
+    );
+    // The silent server's probe let go of its bridge: every connection it
+    // took has been closed.
+    silent
+        .counts()
+        .wait_for(|counts| counts.closed == counts.accepted)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn nearest_fails_the_run_when_no_server_answers() {
+    let rig = rig().await;
+    let (acceptor, cert_der, _) = loopback_tls();
+    rig.service.trust_roots_for_tests(vec![cert_der]);
+    // Its ping endpoint answers 404.
+    let refusing = HttpFixture::serve(Vec::new(), 200_000, Some(acceptor.clone())).await;
+    // Listed without a ping endpoint, so never pinged.
+    let unpinged =
+        HttpFixture::serve(vec![("/ping", Vec::new())], 200_000, Some(acceptor.clone())).await;
+    let _list = serve_librespeed_list(
+        &rig,
+        librespeed_list(&[
+            ("1", refusing.addr, Some("ping")),
+            ("2", unpinged.addr, None),
+        ]),
+        acceptor,
+    )
+    .await;
+
+    let started = rig.service.start(librespeed_request(None)).await.unwrap();
+    let run = finished(&rig, started.id).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Failed);
+    assert_eq!(run.error.as_deref(), Some("no LibreSpeed server answered"));
+    assert!(run.result.is_none());
+    assert_eq!(*refusing.requests().borrow(), 1, "the ping was asked once");
+    assert_eq!(*unpinged.requests().borrow(), 0, "nothing was asked of it");
+    assert!(
+        !rig.handle.is_globally_paused(),
+        "the queue was never paused"
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_while_pinging_ends_the_run_and_closes_every_probe() {
+    let rig = rig().await;
+    let (acceptor, cert_der, _) = loopback_tls();
+    rig.service.trust_roots_for_tests(vec![cert_der]);
+    let silent = SilentFixture::start().await;
+    let _list = serve_librespeed_list(
+        &rig,
+        librespeed_list(&[("1", silent.addr, Some("ping"))]),
+        acceptor,
+    )
+    .await;
+
+    let started = rig.service.start(librespeed_request(None)).await.unwrap();
+    silent
+        .counts()
+        .wait_for(|counts| counts.accepted >= 1)
+        .await
+        .unwrap();
+    assert!(rig.service.cancel(started.id));
+    let run = finished(&rig, started.id).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Cancelled, "{:?}", run.error);
+    assert!(run.result.is_none());
+    silent
+        .counts()
+        .wait_for(|counts| counts.closed == counts.accepted)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_named_server_the_list_lacks_fails_the_run_without_a_ping() {
+    let rig = rig().await;
+    let (acceptor, cert_der, _) = loopback_tls();
+    rig.service.trust_roots_for_tests(vec![cert_der]);
+    let listed =
+        HttpFixture::serve(vec![("/ping", Vec::new())], 200_000, Some(acceptor.clone())).await;
+    let _list = serve_librespeed_list(
+        &rig,
+        librespeed_list(&[("1", listed.addr, Some("ping"))]),
+        acceptor,
+    )
+    .await;
+
+    let started = rig
+        .service
+        .start(librespeed_request(Some("9")))
+        .await
+        .unwrap();
+    let run = finished(&rig, started.id).await;
+
+    assert_eq!(run.status, SpeedTestStatus::Failed);
+    assert_eq!(run.error.as_deref(), Some("librespeed lists no server 9"));
+    assert_eq!(*listed.requests().borrow(), 0);
 }
 
 #[tokio::test]

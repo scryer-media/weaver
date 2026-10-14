@@ -1,12 +1,12 @@
 // Loopback sources for speed test tests: an NNTP server that serves yEnc
-// articles and can hold its answers, and an HTTP(S) server that serves a
-// test NZB and fixed-size blobs.
+// articles and can hold its answers, an HTTP(S) server that serves a test
+// NZB, other pages and fixed-size blobs, and a server that never answers.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -208,16 +208,26 @@ async fn serve_nntp(stream: Box<dyn Io>, shared: Arc<NntpShared>) -> std::io::Re
     }
 }
 
-// An HTTP/1.1 source: `/test.nzb` answers the NZB, `/blob` answers
-// `blob_len` bytes. With `tls`, HTTPS.
+// An HTTP/1.1 source: `/blob` answers `blob_len` bytes, each page its own
+// body, and anything else 404. With `tls`, HTTPS.
 pub struct HttpFixture {
     pub addr: SocketAddr,
     requests: watch::Sender<usize>,
 }
 
 impl HttpFixture {
+    // `/test.nzb` answers the NZB.
     pub async fn start(
         nzb: String,
+        blob_len: usize,
+        tls: Option<tokio_rustls::TlsAcceptor>,
+    ) -> Self {
+        Self::serve(vec![("/test.nzb", nzb.into_bytes())], blob_len, tls).await
+    }
+
+    // Each `(path, body)` page answers its body.
+    pub async fn serve(
+        pages: Vec<(&str, Vec<u8>)>,
         blob_len: usize,
         tls: Option<tokio_rustls::TlsAcceptor>,
     ) -> Self {
@@ -225,11 +235,16 @@ impl HttpFixture {
         let addr = listener.local_addr().unwrap();
         let requests = watch::channel(0).0;
         let counter = requests.clone();
-        let nzb = Arc::new(nzb);
+        let pages: Arc<HashMap<String, Vec<u8>>> = Arc::new(
+            pages
+                .into_iter()
+                .map(|(path, body)| (path.to_owned(), body))
+                .collect(),
+        );
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let tls = tls.clone();
-                let nzb = nzb.clone();
+                let pages = pages.clone();
                 let counter = counter.clone();
                 tokio::spawn(async move {
                     let stream: Box<dyn Io> = match tls {
@@ -239,7 +254,7 @@ impl HttpFixture {
                         },
                         None => Box::new(stream),
                     };
-                    let _ = serve_http(stream, &nzb, blob_len, &counter).await;
+                    let _ = serve_http(stream, &pages, blob_len, &counter).await;
                 });
             }
         });
@@ -251,9 +266,72 @@ impl HttpFixture {
     }
 }
 
+// A LibreSpeed server list naming each `(id, address, ping path)` server
+// over HTTPS, with `/blob` as its download endpoint.
+pub fn librespeed_list(servers: &[(&str, SocketAddr, Option<&str>)]) -> Vec<u8> {
+    let entries: Vec<serde_json::Value> = servers
+        .iter()
+        .map(|(id, addr, ping)| {
+            let mut entry = serde_json::json!({
+                "id": id,
+                "name": format!("fixture {id}"),
+                "server": format!("https://{addr}/"),
+                "dlURL": "blob",
+                "ulURL": "",
+                "getIpURL": "",
+                "sponsorName": "",
+            });
+            if let Some(ping) = ping {
+                entry["pingURL"] = serde_json::Value::from(*ping);
+            }
+            entry
+        })
+        .collect();
+    serde_json::to_vec(&entries).unwrap()
+}
+
+// Connections a silent server has taken, and those its peer has closed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SilentCounts {
+    pub accepted: usize,
+    pub closed: usize,
+}
+
+// A TCP server that never answers: it takes every connection and reads and
+// drops what it is sent until the peer closes it.
+pub struct SilentFixture {
+    pub addr: SocketAddr,
+    counts: watch::Sender<SilentCounts>,
+}
+
+impl SilentFixture {
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counts = watch::channel(SilentCounts::default()).0;
+        let accept = counts.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                accept.send_modify(|counts| counts.accepted += 1);
+                let counts = accept.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    while let Ok(1..) = stream.read(&mut buffer).await {}
+                    counts.send_modify(|counts| counts.closed += 1);
+                });
+            }
+        });
+        Self { addr, counts }
+    }
+
+    pub fn counts(&self) -> watch::Receiver<SilentCounts> {
+        self.counts.subscribe()
+    }
+}
+
 async fn serve_http(
     stream: Box<dyn Io>,
-    nzb: &str,
+    pages: &HashMap<String, Vec<u8>>,
     blob_len: usize,
     counter: &watch::Sender<usize>,
 ) -> std::io::Result<()> {
@@ -270,9 +348,9 @@ async fn serve_http(
     counter.send_modify(|count| *count += 1);
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
     let path = path.split('?').next().unwrap_or(path);
-    let body: Vec<u8> = match path {
-        "/test.nzb" => nzb.as_bytes().to_vec(),
-        "/blob" => (0..blob_len).map(|i| (i % 253) as u8).collect(),
+    let body: Vec<u8> = match (path, pages.get(path)) {
+        (_, Some(body)) => body.clone(),
+        ("/blob", None) => (0..blob_len).map(|i| (i % 253) as u8).collect(),
         _ => {
             stream
                 .write_all(

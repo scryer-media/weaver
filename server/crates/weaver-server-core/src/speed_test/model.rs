@@ -57,7 +57,8 @@ impl SpeedTestKindLabel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BandwidthProvider {
     // A provider from the built-in table; `server` picks one entry of a list
-    // provider's server list.
+    // provider's server list. Without one, a list provider run takes the
+    // nearest: the first listed server to answer a ping through the route.
     Builtin { id: String, server: Option<String> },
     // Any HTTPS URL. The egress block rules apply to it.
     Custom { url: reqwest::Url },
@@ -302,6 +303,7 @@ pub struct UsenetResult {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BandwidthResult {
     pub provider_id: Option<String>,
+    // The list server the run pulled from, asked for or picked as nearest.
     pub server: Option<String>,
     pub url: String,
     // Parallel connections the run ended with.
