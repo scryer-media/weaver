@@ -316,7 +316,7 @@ test("a route opens from anywhere on its line and from its Edit button", async (
   }
 });
 
-test("a chain's hops open in order and offer only the proxies that can still follow", async () => {
+test("a rung starts on the first target it offers, and a chain's hops offer only the proxies that can still follow", async () => {
   const page = await open("?routes", "news.fixture.invalid");
   try {
     await action(page, "Edit route").click();
@@ -325,12 +325,12 @@ test("a chain's hops open in order and offer only the proxies that can still fol
     await option(editor, "Proxy ladder").click();
     // A new ladder falls back to direct until that is turned off.
     assert.equal(await editor.getByRole("checkbox", { name: "Allow direct fallback on this egress", exact: true }).isChecked(), true);
-    // A proxy's or a pool's select sits under the rung's type, where a chain's hops do.
+    // A proxy's or a pool's select sits under the rung's type, where a chain's hops do, and starts on the first it offers.
     const type = editor.getByRole("radiogroup", { name: "Leg 1 rung 1 type", exact: true });
-    for (const [kind, placeholder] of [["Proxy", "Select proxy"], ["Pool", "Select pool"]]) {
+    for (const [kind, first] of [["Proxy", "Amsterdam"], ["Pool", "Exits"]]) {
       await option(editor, kind).click();
       const target = action(editor, "Leg 1 rung 1");
-      assert.equal(await target.textContent(), placeholder);
+      assert.equal(await target.textContent(), first);
       const [select, group] = [await target.boundingBox(), await type.boundingBox()];
       assert.ok(select.y >= group.y + group.height, `${kind} select is under the type`);
       assert.ok(select.x < group.x, `${kind} select starts at the rung's left edge`);
@@ -338,6 +338,7 @@ test("a chain's hops open in order and offer only the proxies that can still fol
     await shot(page, "route-rung-pool");
     await option(editor, "Chain").click();
     const hop = (position) => action(editor, `Chain hop ${position}`);
+    const hops = () => Promise.all([1, 2, 3].map((position) => hop(position).textContent()));
     /** What the hop's menu lists, read with the menu open and closed again by picking `choice`. */
     const offered = async (position, choice) => {
       await hop(position).click();
@@ -346,32 +347,31 @@ test("a chain's hops open in order and offer only the proxies that can still fol
       await items.filter({ hasText: choice }).click();
       return names;
     };
-    // Each hop waits for the one beneath it, and all three read alike.
-    assert.deepEqual(await Promise.all([1, 2, 3].map((position) => hop(position).textContent())), Array(3).fill("Select proxy"));
-    assert.deepEqual(await Promise.all([1, 2, 3].map((position) => hop(position).isDisabled())), [false, true, true]);
+    // A new chain takes the first two proxies that can ride one another, and no third.
+    assert.deepEqual(await hops(), ["Amsterdam · WireGuard", "Seedbox · SSH", "None"]);
+    assert.deepEqual(await Promise.all([1, 2, 3].map((position) => hop(position).isDisabled())), [false, false, false]);
     // Under each hop, whether the chain needs it: the first two, and not the third.
     const notes = editor.locator("span").filter({ hasText: /^(\* Required|Optional)$/ });
     assert.deepEqual(await notes.allTextContents(), ["* Required", "* Required", "Optional"]);
-    await shot(page, "route-chain-empty");
+    await shot(page, "route-chain-new");
 
-    assert.deepEqual(
-      await offered(1, "Amsterdam"),
-      ["Select proxy", "Amsterdam · WireGuard", "Seedbox · SSH", "Relay · SOCKS5", "Paris · WireGuard"],
-    );
-    assert.deepEqual(await Promise.all([2, 3].map((position) => hop(position).isDisabled())), [false, true]);
     // The proxy beneath is gone from the list, and WireGuard still rides WireGuard.
-    assert.deepEqual(await offered(2, "Seedbox"), ["Select proxy", "Seedbox · SSH", "Relay · SOCKS5", "Paris · WireGuard"]);
+    assert.deepEqual(await offered(2, "Seedbox"), ["Seedbox · SSH", "Relay · SOCKS5", "Paris · WireGuard"]);
     // Nothing that needs UDP rides SSH.
-    assert.deepEqual(await offered(3, "Relay"), ["Select proxy", "Relay · SOCKS5"]);
+    assert.deepEqual(await offered(3, "Relay"), ["None", "Relay · SOCKS5"]);
     await shot(page, "route-chain");
+    // The third hop comes off again.
+    await offered(3, "None");
+    assert.deepEqual(await hops(), ["Amsterdam · WireGuard", "Seedbox · SSH", "None"]);
 
-    // With the first hop taken out the two above it move down, and the third opens again.
-    await offered(1, "Select proxy");
-    assert.deepEqual(
-      await Promise.all([1, 2, 3].map((position) => hop(position).textContent())),
-      ["Seedbox · SSH", "Relay · SOCKS5", "Select proxy"],
-    );
-    assert.equal(await hop(3).isDisabled(), false);
+    // A second hop that cannot ride the new first gives way to the first that can.
+    await offered(2, "Paris");
+    assert.deepEqual(await offered(1, "Seedbox"), ["Amsterdam · WireGuard", "Seedbox · SSH", "Relay · SOCKS5"]);
+    assert.deepEqual(await hops(), ["Seedbox · SSH", "Relay · SOCKS5", "None"]);
+
+    // An added rung starts on the first proxy the ladder has not used.
+    await action(editor, "Add rung").click();
+    assert.equal(await action(editor, "Leg 1 rung 2").textContent(), "Amsterdam");
   } finally {
     await page.close();
   }

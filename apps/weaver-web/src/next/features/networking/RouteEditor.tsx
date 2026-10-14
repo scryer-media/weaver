@@ -99,6 +99,35 @@ export function RouteEditor({
       ? profiles.filter((profile) => profile.id === rung.proxyId || usable([profile.id]))
       : pools.filter((pool) => pool.id === rung.poolId || usable(pool.memberIds));
   };
+  /** The first choice that is turned on, else the first: a new pick starts on something that carries traffic. */
+  const firstOf = (options: { id: number; enabled: boolean }[]) => options.find((option) => option.enabled) ?? options[0];
+  /** A chain with its two required hops filled, each with the first proxy that still leaves the hop above it a choice. */
+  const fillChain = (chainIds: number[], limits: ChainLimits): number[] => {
+    let ids = chainIds;
+    for (let hop = ids.length; hop < 2; hop += 1) {
+      const options = chainHopProfiles(profiles, ids, hop, limits);
+      const carrying = hop === 0
+        ? options.filter((profile) => chainHopProfiles(profiles, [profile.id], 1, limits).length > 0)
+        : options;
+      const first = firstOf(carrying.length ? carrying : options);
+      if (!first) break;
+      ids = withChainHop(profiles, ids, hop, first.id, limits);
+    }
+    return ids;
+  };
+  /** The ladder with rung `own` made a `kind` rung on the first target the other rungs leave it. */
+  const seedRung = (rungs: Rung[], own: number, kind: Rung["kind"]): Rung[] => {
+    const next = rungs.map((current, n) => (n === own ? { ...emptyRung(), kind } : current));
+    const blank = next[own]!;
+    const target = kind === "CHAIN" ? null : firstOf(rungTargets(next, own))?.id ?? null;
+    const seeded: Rung =
+      kind === "CHAIN"
+        ? { ...blank, chainIds: fillChain([], chainLimits(next, own)) }
+        : kind === "PROXY"
+          ? { ...blank, proxyId: target }
+          : { ...blank, poolId: target };
+    return next.map((current, n) => (n === own ? seeded : current));
+  };
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
@@ -208,7 +237,10 @@ export function RouteEditor({
                 value={path.kind}
                 onChange={(kind) =>
                   // A new ladder falls back to direct until that is turned off.
-                  update(index, { ...leg, path: { kind, rungs: kind === "LADDER" ? [emptyRung()] : [], directFallback: kind === "LADDER" } })
+                  update(index, {
+                    ...leg,
+                    path: { kind, rungs: kind === "LADDER" ? seedRung([emptyRung()], 0, "PROXY") : [], directFallback: kind === "LADDER" },
+                  })
                 }
                 className="self-start"
                 options={[
@@ -236,9 +268,7 @@ export function RouteEditor({
                           size="compact"
                           label={t("next.networking.route.rungType", { leg: index + 1, rung: rungIndex + 1 })}
                           value={rung.kind}
-                          onChange={(kind) =>
-                            setRungs(path.rungs.map((current, n) => (n === rungIndex ? { ...emptyRung(), kind } : current)))
-                          }
+                          onChange={(kind) => setRungs(seedRung(path.rungs, rungIndex, kind))}
                           options={[
                             { value: "PROXY", label: t("next.networking.route.proxy") },
                             { value: "POOL", label: t("next.networking.route.pool") },
@@ -275,17 +305,16 @@ export function RouteEditor({
                                   className="w-full min-w-0"
                                   disabled={hop > rung.chainIds.length}
                                   onChange={(next) => {
-                                    const chainIds = withChainHop(
-                                      profiles,
-                                      rung.chainIds,
-                                      hop,
-                                      next ? Number(next) : null,
-                                      chainLimits(path.rungs, rungIndex),
+                                    const limits = chainLimits(path.rungs, rungIndex);
+                                    // A required hop the change cut is filled again from the top of its list.
+                                    const chainIds = fillChain(
+                                      withChainHop(profiles, rung.chainIds, hop, next ? Number(next) : null, limits),
+                                      limits,
                                     );
                                     setRungs(path.rungs.map((current, n) => (n === rungIndex ? { ...current, chainIds } : current)));
                                   }}
                                   options={[
-                                    { value: "", label: t("next.networking.route.chooseProxy") },
+                                    ...(hop < 2 ? [] : [{ value: "", label: t("next.networking.route.noHop") }]),
                                     ...chainHopProfiles(profiles, rung.chainIds, hop, chainLimits(path.rungs, rungIndex))
                                       .map((profile) => ({
                                         value: String(profile.id),
@@ -314,16 +343,10 @@ export function RouteEditor({
                                   ),
                                 )
                               }
-                              options={[
-                                {
-                                  value: "",
-                                  label: rung.kind === "PROXY" ? t("next.networking.route.chooseProxy") : t("next.networking.route.choosePool"),
-                                },
-                                ...rungTargets(path.rungs, rungIndex).map((target) => ({
-                                  value: String(target.id),
-                                  label: target.enabled ? target.name : `${target.name} · ${t("next.networking.disabled")}`,
-                                })),
-                              ]}
+                              options={rungTargets(path.rungs, rungIndex).map((target) => ({
+                                value: String(target.id),
+                                label: target.enabled ? target.name : `${target.name} · ${t("next.networking.disabled")}`,
+                              }))}
                             />
                           </div>
                         )}
@@ -349,7 +372,7 @@ export function RouteEditor({
                   icon="add"
                   className="mt-3 self-start"
                   disabled={path.rungs.length >= MAX_RUNGS}
-                  onClick={() => setRungs([...path.rungs, emptyRung()])}
+                  onClick={() => setRungs(seedRung([...path.rungs, emptyRung()], path.rungs.length, "PROXY"))}
                 >
                   {t("next.networking.route.addRung")}
                 </SecondaryButton>
