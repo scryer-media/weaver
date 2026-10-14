@@ -309,7 +309,7 @@ struct DirectProvider;
 #[async_trait::async_trait]
 impl TunnelProvider for DirectProvider {
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        tokio::net::TcpStream::connect((host, port))
+        weaver_tunnel::resolution::connect_host(host, port)
             .await
             .map(|s| Box::new(s) as Box<dyn TunnelStream>)
             .map_err(|_| TunnelError::Engine("direct connection failed".into()))
@@ -362,9 +362,11 @@ impl TunnelProvider for Ladder {
         }
         if route.policy.allow_direct
             && !route.is_revoked()
-            && let Ok(Ok(stream)) =
-                tokio::time::timeout(route.timeout, tokio::net::TcpStream::connect((host, port)))
-                    .await
+            && let Ok(Ok(stream)) = tokio::time::timeout(
+                route.timeout,
+                weaver_tunnel::resolution::connect_host(host, port),
+            )
+            .await
         {
             route.success(None);
             return Ok(Box::new(stream));
@@ -706,7 +708,7 @@ impl ProxyRuntime {
                     if let Some(dns) = profile.proxy_dns_servers().first() {
                         let _stream = hop.provider.dial(&dns.to_string(), 53).await?;
                     } else {
-                        tokio::net::TcpStream::connect((profile.host.as_str(), profile.port))
+                        weaver_tunnel::resolution::connect_host(&profile.host, profile.port)
                             .await
                             .map_err(|_| {
                                 TunnelError::Engine("proxy endpoint unreachable".into())
