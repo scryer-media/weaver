@@ -22,7 +22,7 @@ const egresses: Egress[] = [
   { id: 1, name: "WAN Fiber", bindingKind: "SOURCE_ADDRESS", interfaceName: null, sourceAddress: "192.0.2.10", enabled: true, maxDownloadSpeed: 0, health: "UP", reason: null },
 ];
 const profile = (id: number, name: string, kind: ProxyKind): ProxyProfile => ({
-  id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port: 51820, dnsServers: [],
+  id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port: 51820, resolver: "WEAVER", dnsServers: [],
   tunnelAddresses: [`10.0.0.${id}/32`], peerPublicKey: null, tunnelPublicKey: null, mtu: 1420, keepaliveSeconds: null,
   timeoutSeconds: 10, hostKeyFingerprint: null, hasUsername: false, hasPassword: false, hasPrivateKey: true,
   hasPassphrase: false, hasPresharedKey: false,

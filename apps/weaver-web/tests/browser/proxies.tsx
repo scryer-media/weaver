@@ -5,7 +5,7 @@ import { Client, Provider, fetchExchange } from "urql";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import { PasswordManagersKeptOut } from "@/lib/password-manager";
-import type { ProxyKind } from "@/lib/proxies";
+import type { ProxyKind, ProxyResolver } from "@/lib/proxies";
 import type { NetworkingData } from "@/next/features/networking/data";
 import { PoolsPage } from "@/next/features/networking/PoolsPage";
 import { RoutesPage } from "@/next/features/networking/RoutesPage";
@@ -20,13 +20,13 @@ import "@/next/theme.css";
 const SECRETS = ["username", "password", "privateKey", "passphrase", "presharedKey"] as const;
 type Stored = {
   id: number; name: string; kind: ProxyKind; enabled: boolean; host: string; port: number;
-  dnsServers: string[]; tunnelAddresses: string[]; peerPublicKey: string | null; mtu: number;
+  resolver: ProxyResolver; dnsServers: string[]; tunnelAddresses: string[]; peerPublicKey: string | null; mtu: number;
   keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null;
   secrets: Partial<Record<(typeof SECRETS)[number], string>>;
 };
 const stored = (id: number, name: string, kind: ProxyKind, port: number, extra: Partial<Stored> = {}): Stored => ({
-  id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port, dnsServers: [],
-  tunnelAddresses: [], peerPublicKey: null, mtu: 1280, keepaliveSeconds: 25, timeoutSeconds: 30,
+  id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port,
+  resolver: kind === "WIRE_GUARD" ? "WEAVER" : "PROXY", dnsServers: [], tunnelAddresses: [], peerPublicKey: null, mtu: 1280, keepaliveSeconds: 25, timeoutSeconds: 30,
   hostKeyFingerprint: null, secrets: {}, ...extra,
 });
 const profiles: Stored[] = [
@@ -66,7 +66,8 @@ function graphql(name: string, variables: Record<string, unknown>) {
     const saved: Stored = {
       id: existing?.id ?? Math.max(0, ...profiles.map((profile) => profile.id)) + 1,
       name: input.name as string, kind: input.kind as ProxyKind, enabled: input.enabled as boolean,
-      host: input.host as string, port: input.port as number, dnsServers: input.dnsServers as string[],
+      host: input.host as string, port: input.port as number, resolver: input.resolver as ProxyResolver,
+      dnsServers: input.dnsServers as string[],
       tunnelAddresses: input.tunnelAddresses as string[], peerPublicKey: input.peerPublicKey as string | null,
       mtu: input.mtu as number, keepaliveSeconds: input.keepaliveSeconds as number,
       timeoutSeconds: input.timeoutSeconds as number, hostKeyFingerprint: existing?.hostKeyFingerprint ?? null, secrets,

@@ -88,10 +88,10 @@ AllowedIPs = 0.0.0.0/0
 Endpoint = vpn.fixture.invalid:51999
 PersistentKeepalive = off
 `;
-const DETAILS = ["Endpoint", "Port", "Private key", "Peer public key", "Preshared key", "Interface addresses", "DNS servers", "MTU", "Keepalive"];
+const DETAILS = ["Endpoint", "Port", "Private key", "Peer public key", "Preshared key", "Interface addresses", "MTU", "Keepalive"];
 /** What the configuration above fills the form with, as the daemon is sent it. */
 const FILLED = {
-  kind: "WIRE_GUARD", enabled: true, host: "vpn.fixture.invalid", port: 51999, dnsServers: ["10.6.0.1"],
+  kind: "WIRE_GUARD", enabled: true, host: "vpn.fixture.invalid", port: 51999, resolver: "PROXY", dnsServers: ["10.6.0.1"],
   tunnelAddresses: ["10.6.0.2/32", "fd00::2/128"], peerPublicKey: KEY("b"), mtu: 1380, keepaliveSeconds: 0,
   timeoutSeconds: 30, privateKey: KEY("a"), presharedKey: KEY("c"),
 };
@@ -109,6 +109,9 @@ async function filled(editor) {
   assert.equal(await field(editor, "Peer public key").inputValue(), KEY("b"));
   assert.equal(await field(editor, "Preshared key").inputValue(), KEY("c"));
   assert.equal(await field(editor, "Interface addresses").inputValue(), "10.6.0.2/32\nfd00::2/128");
+  // The tunnel's DNS servers answer inside it, so the proxy resolves, and only with servers.
+  assert.equal(await option(editor, "Proxy").getAttribute("aria-checked"), "true");
+  assert.equal(await editor.getByRole("radiogroup", { name: "Using", exact: true }).count(), 0);
   assert.equal(await field(editor, "DNS servers").inputValue(), "10.6.0.1");
   assert.equal(await field(editor, "MTU").inputValue(), "1380");
   assert.equal(await field(editor, "Keepalive").inputValue(), "0");
@@ -133,9 +136,13 @@ test("a new WireGuard proxy has three ways in and opens on the file, and enterin
 
     await option(editor, "Enter details manually").click();
     for (const name of DETAILS) await field(editor, name).waitFor();
-    for (const name of ["Endpoint", "Private key", "Peer public key", "Preshared key", "Interface addresses", "DNS servers", "MTU", "Keepalive"]) {
+    for (const name of ["Endpoint", "Private key", "Peer public key", "Preshared key", "Interface addresses", "MTU", "Keepalive"]) {
       assert.equal(await field(editor, name).inputValue(), "", name);
     }
+    // Weaver resolves with the host's own DNS until told otherwise.
+    assert.equal(await option(editor, "Weaver").getAttribute("aria-checked"), "true");
+    assert.equal(await option(editor, "Host").getAttribute("aria-checked"), "true");
+    assert.equal(await field(editor, "DNS servers").count(), 0);
     assert.equal(await field(editor, "Port").inputValue(), "51820");
     assert.equal(await action(editor, "Save").isDisabled(), false);
     await shot(page, "proxy-wireguard-manual");
@@ -409,7 +416,7 @@ test("SSH signs in with an Ed25519 key and has no password", async () => {
     await field(editor, "Password").fill("fixture-password");
     await pick(page, editor, "Type", "SSH");
     assert.equal(await field(editor, "Password").count(), 0);
-    assert.equal(await editor.getByRole("radiogroup").count(), 0);
+    assert.equal(await editor.getByRole("radiogroup", { name: "Set up from", exact: true }).count(), 0);
     assert.equal(await field(editor, "Port").inputValue(), "22");
     await editor.getByText("Ed25519 keys only.", { exact: true }).waitFor();
     // None of it is the Weaver login, so no field is left to a password manager.
@@ -437,5 +444,49 @@ test("SSH signs in with an Ed25519 key and has no password", async () => {
     // The types that do take a password still have one.
     const relay = await editing(page, "Relay");
     await field(relay, "Password").waitFor();
+  } finally { await page.close(); }
+});
+
+test("a proxy's names are resolved by Weaver or the proxy, with the host's DNS or servers asked in order", async () => {
+  const page = await open();
+  try {
+    const seedbox = await editing(page, "Seedbox");
+    assert.equal(await option(seedbox, "Proxy").getAttribute("aria-checked"), "true");
+    assert.equal(await option(seedbox, "Host").getAttribute("aria-checked"), "true");
+    assert.equal(await field(seedbox, "DNS servers").count(), 0);
+    await option(seedbox, "DNS servers").click();
+    // Servers chosen and none named is not the host's DNS by another name.
+    await action(seedbox, "Save").click();
+    await seedbox.getByText("Add at least one DNS server.", { exact: true }).waitFor();
+    await field(seedbox, "DNS servers").fill("192.0.2.53\n192.0.2.54");
+    await shot(page, "proxy-resolution-servers");
+    await action(seedbox, "Save").click();
+    await seedbox.waitFor({ state: "detached" });
+    let input = (await daemon(page)).requests.at(-1).variables.input;
+    assert.equal(input.resolver, "PROXY");
+    assert.deepEqual(input.dnsServers, ["192.0.2.53", "192.0.2.54"]);
+
+    // WireGuard hands its peer no name, so a WireGuard proxy resolves only with servers.
+    const amsterdam = await editing(page, "Amsterdam");
+    assert.equal(await option(amsterdam, "Weaver").getAttribute("aria-checked"), "true");
+    await option(amsterdam, "Proxy").click();
+    assert.equal(await amsterdam.getByRole("radiogroup", { name: "Using", exact: true }).count(), 0);
+    await field(amsterdam, "DNS servers").waitFor();
+    await option(amsterdam, "Weaver").click();
+    assert.equal(await option(amsterdam, "Host").getAttribute("aria-checked"), "true");
+    assert.equal(await field(amsterdam, "DNS servers").count(), 0);
+    await action(amsterdam, "Cancel").click();
+
+    // The host's DNS sends no servers, whatever was typed before it was chosen.
+    const relay = await editing(page, "Relay");
+    await option(relay, "Weaver").click();
+    await option(relay, "DNS servers").click();
+    await field(relay, "DNS servers").fill("192.0.2.53");
+    await option(relay, "Host").click();
+    await action(relay, "Save").click();
+    await relay.waitFor({ state: "detached" });
+    input = (await daemon(page)).requests.at(-1).variables.input;
+    assert.equal(input.resolver, "WEAVER");
+    assert.deepEqual(input.dnsServers, []);
   } finally { await page.close(); }
 });

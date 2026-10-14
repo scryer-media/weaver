@@ -173,7 +173,7 @@ export type SpeedTestRequest = {
 };
 /** Why a run failed: the web words each code; OTHER, or a code it does not know, shows `message`. */
 export type SpeedTestFailureCode =
-  | "RATE_LIMITED" | "HTTP_STATUS" | "TLS_VERIFICATION" | "UNRESOLVED" | "NO_DNS_SERVERS" | "ADDRESS_NOT_ALLOWED"
+  | "RATE_LIMITED" | "HTTP_STATUS" | "TLS_VERIFICATION" | "UNRESOLVED" | "ADDRESS_NOT_ALLOWED"
   | "EGRESS_QUOTA_USED" | "NO_LEG_UP" | "LEASE_REFUSED" | "SERVER_LEFT_POOL" | "STOPPED" | "STOPPED_UNEXPECTEDLY"
   | "NO_BYTES" | "OTHER";
 /** `message` is the daemon's own account, naming the URL, host or status; `params` holds what the sentence names. */

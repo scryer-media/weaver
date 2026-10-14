@@ -94,16 +94,13 @@ export function RouteEditor({
   };
   /** What the ladder's other rungs leave a chain on rung `own`: a ladder uses a proxy once. */
   const chainLimits = (rungs: Rung[], own: number): ChainLimits => ({
-    needsDns: rss,
     taken: new Set(rungs.flatMap((rung, position) => (position === own ? [] : rungProxyIds(rung, pools)))),
   });
-  /** A feed resolves names through its proxies, so each one it uses needs DNS servers. */
-  const resolves = (id: number) => !rss || !!profiles.find((profile) => profile.id === id)?.dnsServers?.length;
-  /** What rung `own` may target besides its current choice: the daemon refuses a repeat, an empty pool or, for a feed, a proxy without DNS. */
+  /** What rung `own` may target besides its current choice: the daemon refuses a repeat or an empty pool. */
   const rungTargets = (rungs: Rung[], own: number) => {
     const rung = rungs[own]!;
     const { taken } = chainLimits(rungs, own);
-    const usable = (ids: number[]) => ids.every((id) => !taken?.has(id) && resolves(id));
+    const usable = (ids: number[]) => ids.every((id) => !taken?.has(id));
     return rung.kind === "PROXY"
       ? profiles.filter((profile) => profile.id === rung.proxyId || usable([profile.id]))
       : pools.filter((pool) => pool.id === rung.poolId || (pool.memberIds.length > 0 && usable(pool.memberIds)));
