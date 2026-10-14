@@ -112,9 +112,11 @@ pub(crate) fn extract(
                     ));
                 }
                 if !info.is_directory && policy.unacceptable_extension_match(&name).is_some() {
-                    return Err(budget.reject_content_policy(
-                        crate::post_processing::model::unwanted_extension_reason(&name),
-                    ));
+                    return Err(budget
+                        .reject_content_policy(
+                            crate::post_processing::model::unwanted_extension_reason(&name),
+                        )
+                        .into());
                 }
                 if !should_extract(&name)? {
                     if archive.is_solid() {

@@ -506,7 +506,9 @@ impl Pipeline {
             let budget = self.extraction_budget(job_id, &scan_root)?;
             let root_for_scan = scan_root.clone();
             tokio::task::spawn_blocking(move || {
-                ExtractionRoot::open(&root_for_scan)?.scan_no_links(&budget)
+                ExtractionRoot::open(&root_for_scan)?
+                    .scan_no_links(&budget)
+                    .map_err(String::from)
             })
             .await
             .map_err(|error| format!("extraction root link scan task failed: {error}"))??;

@@ -137,10 +137,10 @@ fn a_member_failing_the_readers_crc_check_is_never_committed() {
             panic!("{label}: a member that fails its CRC fails the set");
         };
 
-        assert!(
-            error.starts_with(SEVENZ_BLOCK_DATA_ERROR_PREFIX)
-                && error.to_ascii_lowercase().contains("checksum"),
-            "{label}: the reader's CRC verdict fails the set as block data: {error}"
+        assert_eq!(
+            error.class(),
+            ExtractionErrorClass::Recoverable,
+            "{label}: the reader's CRC verdict keeps the set for repair: {error}"
         );
         assert_eq!(
             finished_members(&mut events),
@@ -456,6 +456,7 @@ fn extract_with_weaver_zip_result(
         None,
     )
     .map(|(members, _)| members)
+    .map_err(String::from)
 }
 
 fn extract_with_weaver_zip_result_with_phase(
@@ -484,7 +485,8 @@ fn extract_with_weaver_zip_result_with_phase(
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
         Some(Arc::clone(&phase_counters)),
     )
-    .map(|(members, _)| members);
+    .map(|(members, _)| members)
+    .map_err(String::from);
     (result, phase_counters)
 }
 
@@ -580,6 +582,7 @@ fn extract_with_weaver_tar_result(
         JobId(1),
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
     )
+    .map_err(String::from)
 }
 
 fn extract_with_weaver_xz_result(
@@ -598,6 +601,7 @@ fn extract_with_weaver_xz_result(
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
         2,
     )
+    .map_err(String::from)
 }
 
 fn extract_with_weaver_tar_xz_result(
@@ -614,6 +618,7 @@ fn extract_with_weaver_tar_xz_result(
         JobId(1),
         archive_path.file_name().unwrap().to_string_lossy().as_ref(),
     )
+    .map_err(String::from)
 }
 
 fn assert_zip_method_matches_7z(extra_args: &[&str], password: Option<&str>) {
@@ -1194,7 +1199,7 @@ fn sevenzip_extraction_restores_entry_times_and_skips_anti_items() {
         decode_threads: 1,
     };
     let outcome = extract_7z_stream(&context, || {
-        fs::File::open(&archive_path).map_err(|error| error.to_string())
+        fs::File::open(&archive_path).map_err(|error| ExtractionError::io(&error))
     })
     .expect("7z extraction");
 
@@ -1392,7 +1397,7 @@ fn conventional_7z_metadata_pass_reserves_what_its_reader_is_limited_to() {
             .lock()
             .unwrap()
             .push(budget.memory_reserved_bytes());
-        fs::File::open(&archive_path).map_err(|error| error.to_string())
+        fs::File::open(&archive_path).map_err(|error| ExtractionError::io(&error))
     })
     .expect("7z extraction");
 
@@ -1730,14 +1735,14 @@ fn conventional_7z_extraction_refuses_a_dictionary_the_memory_ceiling_cannot_hol
     let (root, budget) = test_extraction_security_with_memory(&out_dir, 8 * 1024 * 1024);
     let context = conventional_7z_context(&out_dir, root, budget, &archive, 1);
     let error = match extract_7z_stream(&context, || {
-        fs::File::open(&archive_path).map_err(|error| error.to_string())
+        fs::File::open(&archive_path).map_err(|error| ExtractionError::io(&error))
     }) {
         Ok(_) => panic!("a 16 MiB dictionary was decoded under an 8 MiB ceiling"),
         Err(error) => error,
     };
 
     assert!(
-        error.contains("MemoryLimited"),
+        error.message().contains("MemoryLimited"),
         "the refusal names the memory limit: {error}"
     );
     assert!(
@@ -1769,7 +1774,7 @@ fn conventional_7z_extraction_decodes_with_the_threads_it_is_given() {
     let (root, budget) = test_extraction_security(&out_dir);
     let context = conventional_7z_context(&out_dir, root, Arc::clone(&budget), &archive, 4);
     let outcome = extract_7z_stream(&context, || {
-        fs::File::open(&archive_path).map_err(|error| error.to_string())
+        fs::File::open(&archive_path).map_err(|error| ExtractionError::io(&error))
     })
     .expect("7z extraction");
 
@@ -1846,7 +1851,7 @@ fn conventional_7z_extraction_admits_beside_a_peer_job_retained_state() {
 
     let context = conventional_7z_context(&out_dir, root, Arc::clone(&budget), &archive, 4);
     let outcome = extract_7z_stream(&context, || {
-        fs::File::open(&archive_path).map_err(|error| error.to_string())
+        fs::File::open(&archive_path).map_err(|error| ExtractionError::io(&error))
     })
     .expect("the decode is admitted while the peer's state is still held");
 
@@ -1927,11 +1932,11 @@ fn conventional_7z_decode_reservation_is_sized_from_the_archive_and_its_threads(
     );
 }
 
-// A 7z block whose bytes are wrong is worded for the scheduler to keep for
+// A 7z block whose bytes are wrong is classed for the scheduler to keep for
 // the recovery data; a method this build cannot decode, a password problem,
-// and a read that failed for any reason but malformed or short bytes keep the
-// ordinary wording, which ends the job. The I/O cases are rendered the way
-// the decoder renders them, from the reader's own error.
+// and a read that failed for any reason but malformed or short bytes are
+// terminal. The I/O cases are rendered the way the decoder renders them, from
+// the reader's own error.
 #[test]
 fn sevenz_extraction_error_marks_only_data_errors() {
     use sevenz_turbo::BlockErrorKind;
@@ -1962,10 +1967,11 @@ fn sevenz_extraction_error_marks_only_data_errors() {
         )),
     ];
     for error in &data_errors {
-        let worded = sevenz_extraction_error(error);
-        assert!(
-            worded.starts_with(SEVENZ_BLOCK_DATA_ERROR_PREFIX),
-            "{worded}"
+        let classed = sevenz_extraction_error(error);
+        assert_eq!(
+            classed.class(),
+            ExtractionErrorClass::Recoverable,
+            "{classed}"
         );
     }
     let terminal = [
@@ -1980,9 +1986,13 @@ fn sevenz_extraction_error_marks_only_data_errors() {
         )),
     ];
     for error in &terminal {
-        let worded = sevenz_extraction_error(error);
-        assert!(worded.starts_with("7z extraction failed: "), "{worded}");
+        let classed = sevenz_extraction_error(error);
+        assert_eq!(classed.class(), ExtractionErrorClass::Terminal, "{classed}");
     }
+    assert!(
+        sevenz_extraction_error(&sevenz_turbo::Error::PasswordRequired)
+            .is(ExtractionErrorClass::PasswordRequired)
+    );
 }
 
 // `bytes` of word salad: compressible enough that decoding it takes real
@@ -2318,7 +2328,7 @@ fn chase_7z_extraction_decodes_a_multi_run_block_adaptively() {
         decode_threads: 4,
     };
     let outcome = extract_7z_stream(&context, || {
-        fs::File::open(&archive_path).map_err(|error| error.to_string())
+        fs::File::open(&archive_path).map_err(|error| ExtractionError::io(&error))
     })
     .expect("7z chase extraction");
 

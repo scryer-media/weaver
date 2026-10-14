@@ -242,7 +242,7 @@ impl Pipeline {
                             error = %error,
                             "failed to join a RAR chase armed at completion"
                         );
-                        self.fail_job(job_id, error);
+                        self.fail_job_on_extraction_error(job_id, error);
                         return;
                     }
                 }
@@ -257,7 +257,7 @@ impl Pipeline {
                         error = %error,
                         "failed to start RAR full-set extraction"
                     );
-                    self.fail_job(job_id, error);
+                    self.fail_job_on_extraction_error(job_id, error);
                     return;
                 }
             }

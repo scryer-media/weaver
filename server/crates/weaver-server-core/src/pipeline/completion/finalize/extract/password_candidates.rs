@@ -1,27 +1,21 @@
 use super::*;
 
+// Integrity and decoder failures cannot distinguish a wrong password from
+// damaged encrypted bytes. Only a refusal the reader classes as a missing or
+// wrong password advances to the next candidate.
 fn sevenz_password_error(error: &sevenz_turbo::Error) -> bool {
-    match error {
-        sevenz_turbo::Error::PasswordRequired => true,
-        // Integrity and decoder failures cannot distinguish a wrong password
-        // from damaged encrypted bytes. Never advance candidates for them.
-        sevenz_turbo::Error::BlockDecode {
-            kind: sevenz_turbo::BlockErrorKind::Password,
-            message,
-            ..
-        } => message == "PasswordRequired",
-        _ => false,
-    }
+    crate::pipeline::extraction::error::sevenz_error_class(error)
+        == ExtractionErrorClass::PasswordRequired
 }
 
 pub(super) fn extract_7z_with_password_candidates<R, F>(
     mut context: SevenZipExtractionContext,
     passwords: &[crate::jobs::ArchivePasswordCandidate],
     mut open_reader: F,
-) -> Result<FullSetExtractionOutcome, String>
+) -> Result<FullSetExtractionOutcome, ExtractionError>
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
-    F: FnMut() -> Result<R, String>,
+    F: FnMut() -> Result<R, ExtractionError>,
 {
     let budget = Arc::clone(&context.budget);
     let end_header_bytes = match context.decode_memory {
@@ -58,7 +52,7 @@ where
                 return extract_7z_stream(&context, open_reader);
             }
         }
-        Err(error) if error.starts_with("WEAVER_PASSWORD_REQUIRED:") => {}
+        Err(error) if error.is(ExtractionErrorClass::PasswordRequired) => {}
         Err(error) => return Err(error),
     }
     let mut seen = HashSet::new();
@@ -68,12 +62,12 @@ where
     {
         budget
             .check_active_io()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ExtractionError::io(&error))?;
         let password = sevenz_turbo::Password::new(candidate.value());
         let listed = list(&password, &mut open_reader);
         let (archive, header_permit) = match listed {
             Ok(archive) => archive,
-            Err(error) if error.starts_with("WEAVER_PASSWORD_REQUIRED:") => continue,
+            Err(error) if error.is(ExtractionErrorClass::PasswordRequired) => continue,
             Err(error) => return Err(error),
         };
         let entries = archive.files.len() as u64;
@@ -133,7 +127,7 @@ where
         // a decoder wraps the underlying read error as a password failure.
         budget
             .check_active_io()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ExtractionError::io(&error))?;
         match probe {
             Ok(_) => {
                 context.password = password;
@@ -145,5 +139,7 @@ where
             Err(error) => return Err(sevenz_extraction_error(&error)),
         }
     }
-    Err("WEAVER_PASSWORD_REQUIRED: no supplied password could decrypt the 7z archive".into())
+    Err(ExtractionError::password_required(
+        "no supplied password could decrypt the 7z archive",
+    ))
 }

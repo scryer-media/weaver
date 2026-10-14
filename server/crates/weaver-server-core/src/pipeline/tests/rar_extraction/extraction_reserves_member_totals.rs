@@ -262,10 +262,11 @@ async fn extraction_refreshes_stale_cached_headers_for_touched_volumes() {
     )
     .unwrap_err();
     assert!(
-        error.contains("CRC mismatch")
-            || error.to_ascii_lowercase().contains("checksum")
-            || error.contains("not registered")
-            || error.contains("unavailable"),
+        matches!(
+            error.class(),
+            crate::pipeline::ExtractionErrorClass::Recoverable
+                | crate::pipeline::ExtractionErrorClass::StaleTopology
+        ),
         "unexpected stale-header extraction error: {error}"
     );
 
@@ -780,7 +781,7 @@ fn rar_password_candidate_helper_stops_on_non_password_error() {
         |_password| {
             attempts += 1;
             Err(RarPasswordAttemptError::Fatal(
-                "cache decode failed".to_string(),
+                crate::pipeline::ExtractionError::terminal("cache decode failed"),
             ))
         },
     ) {
@@ -789,7 +790,8 @@ fn rar_password_candidate_helper_stops_on_non_password_error() {
     };
 
     assert_eq!(attempts, 1);
-    assert_eq!(error, "candidate helper: cache decode failed");
+    assert!(error.is(crate::pipeline::ExtractionErrorClass::Terminal));
+    assert_eq!(error.message(), "candidate helper: cache decode failed");
 }
 
 #[test]
@@ -821,9 +823,11 @@ fn rar_password_candidate_helper_redacts_exhausted_candidates() {
     };
 
     assert_eq!(attempts, 2);
-    assert!(error.contains("after 2 candidate(s) from explicit,nzb_meta"));
-    assert!(!error.contains("first-secret"));
-    assert!(!error.contains("second-secret"));
+    assert!(error.is(crate::pipeline::ExtractionErrorClass::PasswordRequired));
+    let message = error.message();
+    assert!(message.contains("after 2 candidate(s) from explicit,nzb_meta"));
+    assert!(!message.contains("first-secret"));
+    assert!(!message.contains("second-secret"));
 }
 
 #[tokio::test]
@@ -1865,10 +1869,9 @@ async fn stale_rar_batch_failure_for_extracted_member_is_ignored() {
             job_id,
             set_name: "show".to_string(),
             attempted: vec!["E01.mkv".to_string()],
-            result: Err(
-                "failed to finalize output work/sample.mkv.partial: No such file or directory (os error 2)"
-                    .to_string(),
-            ),
+            result: Err(crate::pipeline::ExtractionError::terminal(
+                "failed to finalize output work/sample.mkv.partial: No such file or directory (os error 2)",
+            )),
         })
         .await;
 
@@ -2573,7 +2576,11 @@ async fn nested_scan_rejects_a_link_in_the_staging_tree() {
         Ok(_) => panic!("a link in the staging tree must stop the nested scan"),
     };
     assert!(
-        JobExtractionBudget::is_rejection(&error),
+        pipeline
+            .extraction_budgets
+            .get(&job_id)
+            .and_then(|budget| budget.rejection())
+            .is_some(),
         "the link is refused as unsafe output, not reported as an I/O failure: {error}"
     );
 }

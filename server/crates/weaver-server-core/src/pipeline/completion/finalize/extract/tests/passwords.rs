@@ -56,7 +56,7 @@ fn sevenzip(password: Option<&str>, encrypt_header: bool) -> Vec<u8> {
 fn extract_zip_bytes(
     bytes: Vec<u8>,
     values: &[&str],
-) -> Result<(Vec<String>, Option<String>), String> {
+) -> Result<(Vec<String>, Option<String>), ExtractionError> {
     let output = TempDir::new().unwrap();
     let (root, budget) = test_extraction_security(output.path());
     let (events, _) = tokio::sync::broadcast::channel(32);
@@ -109,20 +109,20 @@ fn zip_integrity_failure_does_not_select_a_later_password() {
     bytes[offset] ^= 1;
     let error =
         extract_zip_bytes(bytes, &["synthetic-right", "unused-after-corruption"]).unwrap_err();
-    assert!(!error.starts_with("WEAVER_PASSWORD_REQUIRED:"));
+    assert!(!error.is(ExtractionErrorClass::PasswordRequired), "{error}");
 }
 
 #[test]
 fn zip_exhaustion_has_password_classification() {
     let error =
         extract_zip_bytes(archive(&[("secret.mkv", Some("right"))]), &["wrong"]).unwrap_err();
-    assert!(error.starts_with("WEAVER_PASSWORD_REQUIRED:"));
+    assert!(error.is(ExtractionErrorClass::PasswordRequired), "{error}");
 }
 
 #[test]
 fn zip_without_candidates_requires_a_password() {
     let error = extract_zip_bytes(archive(&[("secret.mkv", Some("right"))]), &[]).unwrap_err();
-    assert!(error.starts_with("WEAVER_PASSWORD_REQUIRED:"));
+    assert!(error.is(ExtractionErrorClass::PasswordRequired), "{error}");
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn zip_members_can_have_distinct_passwords() {
 #[test]
 fn malformed_zip_is_not_a_password_failure() {
     let error = extract_zip_bytes(vec![0; 50], &["unused"]).unwrap_err();
-    assert!(!error.starts_with("WEAVER_PASSWORD_REQUIRED:"));
+    assert!(!error.is(ExtractionErrorClass::PasswordRequired), "{error}");
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn zip_output_io_failure_is_not_a_password_failure() {
         None,
     )
     .unwrap_err();
-    assert!(!error.starts_with("WEAVER_PASSWORD_REQUIRED:"));
+    assert!(!error.is(ExtractionErrorClass::PasswordRequired), "{error}");
 }
 
 fn check_sevenzip(password: Option<&str>, header: bool) {
@@ -251,7 +251,7 @@ fn sevenzip_missing_password_is_classified() {
         extract_7z_with_password_candidates(context, &[], || Ok(Cursor::new(bytes.clone())))
             .err()
             .unwrap();
-    assert!(error.starts_with("WEAVER_PASSWORD_REQUIRED:"), "{error}");
+    assert!(error.is(ExtractionErrorClass::PasswordRequired), "{error}");
 }
 
 #[test]
@@ -265,11 +265,11 @@ fn sevenzip_io_failure_stops_at_first_open() {
         &candidates(["first".into(), "second".into()]),
         || {
             opens += 1;
-            Err::<Cursor<Vec<u8>>, _>("synthetic I/O failure".into())
+            Err::<Cursor<Vec<u8>>, _>(ExtractionError::terminal("synthetic I/O failure"))
         },
     )
     .err()
     .unwrap();
-    assert_eq!(error, "synthetic I/O failure");
+    assert!(error.is(ExtractionErrorClass::Terminal), "{error}");
     assert_eq!(opens, 1);
 }
