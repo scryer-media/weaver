@@ -88,6 +88,9 @@ export function RouteEditor({
   const t = useTranslate();
   // Only a server's connections are shared out across legs by weight.
   const split = kind === "SERVER";
+  // A lone leg is the whole route, so it is not boxed and numbered as one of several.
+  const framed = value.legs.length > 1;
+  const Frame = framed ? "fieldset" : "div";
   const [down, setDown] = useState<Set<number>>(new Set());
   const update = (index: number, leg: Leg) =>
     onChange({ ...value, legs: value.legs.map((current, position) => (position === index ? leg : current)) });
@@ -205,11 +208,19 @@ export function RouteEditor({
         const setRungs = (rungs: Rung[]) => update(index, { ...leg, path: { ...path, rungs } });
         const live = status.find((sample) => sample.position === index);
         return (
-          <fieldset key={index} className="flex min-w-0 flex-col gap-3 border border-wv-control bg-wv-chrome px-3 pt-1 pb-3 sm:px-4">
-            <legend className="flex items-center gap-2 px-1 font-wv-title text-[12.5px] font-semibold text-wv-fg">
-              {split ? <Square color={legColor(index)} /> : null}
-              {t("next.networking.route.leg", { position: index + 1 })}
-            </legend>
+          <Frame
+            key={index}
+            className={cn(
+              "flex min-w-0 flex-col gap-3",
+              framed && "border border-wv-control bg-wv-chrome px-3 pt-1 pb-3 sm:px-4",
+            )}
+          >
+            {framed ? (
+              <legend className="flex items-center gap-2 px-1 font-wv-title text-[12.5px] font-semibold text-wv-fg">
+                {split ? <Square color={legColor(index)} /> : null}
+                {t("next.networking.route.leg", { position: index + 1 })}
+              </legend>
+            ) : null}
             {live ? (
               <StatusMark
                 state={live.state}
@@ -403,7 +414,7 @@ export function RouteEditor({
               </div>
             ) : null}
 
-            {split || value.legs.length > 1 ? (
+            {split || framed ? (
               <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-wv-hairline pt-3">
                 {split ? (
                   <>
@@ -427,29 +438,30 @@ export function RouteEditor({
                     />
                   </>
                 ) : null}
-                <div className="ml-auto flex flex-none items-center gap-1">
-                  <IconButton
-                    icon="moveUp"
-                    label={t("next.networking.route.legUp")}
-                    disabled={index === 0}
-                    onClick={() => reorder(move(value.legs, index, -1))}
-                  />
-                  <IconButton
-                    icon="moveDown"
-                    label={t("next.networking.route.legDown")}
-                    disabled={index === value.legs.length - 1}
-                    onClick={() => reorder(move(value.legs, index, 1))}
-                  />
-                  <IconButton
-                    icon="remove"
-                    label={t("next.networking.route.removeLeg")}
-                    disabled={value.legs.length === 1}
-                    onClick={() => reorder(removeLeg(value.legs, index))}
-                  />
-                </div>
+                {framed ? (
+                  <div className="ml-auto flex flex-none items-center gap-1">
+                    <IconButton
+                      icon="moveUp"
+                      label={t("next.networking.route.legUp")}
+                      disabled={index === 0}
+                      onClick={() => reorder(move(value.legs, index, -1))}
+                    />
+                    <IconButton
+                      icon="moveDown"
+                      label={t("next.networking.route.legDown")}
+                      disabled={index === value.legs.length - 1}
+                      onClick={() => reorder(move(value.legs, index, 1))}
+                    />
+                    <IconButton
+                      icon="remove"
+                      label={t("next.networking.route.removeLeg")}
+                      onClick={() => reorder(removeLeg(value.legs, index))}
+                    />
+                  </div>
+                ) : null}
               </div>
             ) : null}
-          </fieldset>
+          </Frame>
         );
       })}
 

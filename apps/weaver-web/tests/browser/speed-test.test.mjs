@@ -321,15 +321,18 @@ test("the route editor has no speed test of its own: the speed test page runs ev
 test("Default outbound's route comes first and is edited with nothing said about connections", async () => {
   const { page, errors } = await open("?routes", "Default outbound");
   try {
-    // Its name says what it is, so its summary is only its legs.
+    // Its name says what it is, and one leg splits nothing, so its summary is empty.
     assert.equal(await page.locator("main [data-row-id]").first().getAttribute("data-row-id"), "outbound");
     const row = page.locator('main [data-row-id="outbound"]');
-    await row.getByText("1 leg", { exact: true }).waitFor();
     await row.getByRole("button", { name: "Edit route", exact: true }).click();
+    assert.equal(await row.getByText(/\bleg/).count(), 0);
     const editor = page.getByRole("dialog", { name: "Route for Default outbound", exact: true });
-    await editor.getByRole("group", { name: "Leg 1", exact: true }).waitFor();
-    // It splits nothing, so it has one leg: no word above it, no target, no
-    // weight, preview or share to hold, and no leg to add, move or remove.
+    await editor.getByRole("button", { name: "Egress", exact: true }).waitFor();
+    // It splits nothing, so it has one leg, shown as the route itself: no leg
+    // box or number, no word above it, no target, no weight, preview or share
+    // to hold, and no leg to add, move or remove.
+    assert.equal(await editor.getByRole("group", { name: /^Leg / }).count(), 0);
+    assert.equal(await editor.getByText(/^Leg \d|\bleg\b/).count(), 0);
     assert.equal(await editor.getByText(/^Split up to|^Feeds try/).count(), 0);
     assert.equal(await editor.getByText(/^Target: /).count(), 0);
     assert.equal(await editor.getByRole("slider").count(), 0);

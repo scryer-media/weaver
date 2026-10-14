@@ -14,17 +14,19 @@ import { stateLabel, StatusMark } from "./presentation";
 
 /**
  * "20 NNTP connections · 2 legs": what a consumer is, and how its route splits
- * it. Default outbound's name already says what it is.
+ * it. A route of one leg splits nothing, so says nothing about legs, and
+ * Default outbound's name already says what it is.
  */
 export function consumerSummary(t: Translate, consumer: Consumer): string {
-  const legs = countLabel(t, "next.networking.legCount", consumer.route?.legs.length ?? 1);
+  const count = consumer.route?.legs.length ?? 1;
+  const legs = count > 1 ? [countLabel(t, "next.networking.legCount", count)] : [];
   switch (consumer.kind) {
     case "SERVER":
-      return `${countLabel(t, "next.networking.routes.connections", consumer.cap)} · ${legs}`;
+      return [countLabel(t, "next.networking.routes.connections", consumer.cap), ...legs].join(" · ");
     case "RSS":
-      return `${t("next.networking.routes.rssFeed")} · ${legs}`;
+      return [t("next.networking.routes.rssFeed"), ...legs].join(" · ");
     case "OUTBOUND":
-      return legs;
+      return legs.join(" · ");
   }
 }
 
@@ -171,7 +173,7 @@ export function RouteDialog({
     <Dialog
       open
       title={t("next.networking.routes.editorTitle", { name: consumer.name })}
-      note={consumerSummary(t, { ...consumer, route })}
+      note={consumerSummary(t, { ...consumer, route }) || undefined}
       width={720}
       onDismiss={onClose}
       footer={
