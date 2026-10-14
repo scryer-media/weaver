@@ -1,12 +1,12 @@
-// Bounded DNS-over-TCP through a selected proxy or egress. Never uses the
-// host resolver.
+// Bounded DNS-over-TCP to listed servers, asked through a pipe stage: the
+// leg's egress or a proxy hop.
 use crate::{
-    TunnelError, TunnelProvider, TunnelStream,
+    TunnelError, TunnelStream,
     pipe::{DialError, Dialer, Purpose, Target},
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn invalid() -> TunnelError {
@@ -23,20 +23,18 @@ trait Carrier: Send + Sync {
     async fn open(&self, server: IpAddr) -> Result<Box<dyn TunnelStream>, TunnelError>;
 }
 
-struct Provider<'a>(&'a dyn TunnelProvider);
-
-#[async_trait::async_trait]
-impl Carrier for Provider<'_> {
-    async fn open(&self, server: IpAddr) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        self.0.dial(&server.to_string(), 53).await
-    }
+// Why no server gave an answer. `reached` says whether any server could be
+// dialled at all.
+#[derive(Debug)]
+struct Unanswered {
+    error: TunnelError,
+    reached: bool,
 }
 
 // A pipe stage carrying the queries. It keeps why it could not reach a
 // server, so a lookup that reached none fails as the stage failed.
 struct Stage<'a> {
     dialer: &'a dyn Dialer,
-    reached: AtomicBool,
     failure: Mutex<Option<DialError>>,
 }
 
@@ -50,10 +48,7 @@ impl Carrier for Stage<'_> {
             addresses: vec![server],
         };
         match self.dialer.dial(&target).await {
-            Ok(dialed) => {
-                self.reached.store(true, Ordering::Relaxed);
-                Ok(dialed.into_observed_stream())
-            }
+            Ok(dialed) => Ok(dialed.into_observed_stream()),
             Err(error) => {
                 let said = TunnelError::Engine(error.to_string());
                 *self.failure.lock().expect("dns stage failure") = Some(error);
@@ -61,19 +56,6 @@ impl Carrier for Stage<'_> {
             }
         }
     }
-}
-
-pub async fn resolve(
-    provider: &dyn TunnelProvider,
-    servers: &[IpAddr],
-    host: &str,
-) -> Result<Vec<IpAddr>, TunnelError> {
-    if let Ok(ip) = host.parse() {
-        return Ok(vec![ip]);
-    }
-    let resolved = resolve_name(&Provider(provider), servers, host).await;
-    crate::metrics::record_resolution(crate::metrics::Resolver::Routed, resolved.is_ok());
-    resolved
 }
 
 // Resolves `host` by asking `servers` in order through `dialer`. When no
@@ -89,16 +71,15 @@ pub async fn resolve_through(
     }
     let stage = Stage {
         dialer,
-        reached: AtomicBool::new(false),
         failure: Mutex::new(None),
     };
     let resolved = resolve_name(&stage, servers, host).await;
     crate::metrics::record_resolution(crate::metrics::Resolver::Routed, resolved.is_ok());
-    resolved.map_err(|error| {
+    resolved.map_err(|unanswered| {
         let failure = stage.failure.into_inner().expect("dns stage failure");
         match failure {
-            Some(failure) if !stage.reached.into_inner() => failure,
-            _ => DialError::Destination(std::io::Error::other(error)),
+            Some(failure) if !unanswered.reached => failure,
+            _ => DialError::Destination(std::io::Error::other(unanswered.error)),
         }
     })
 }
@@ -107,12 +88,14 @@ async fn resolve_name(
     provider: &dyn Carrier,
     servers: &[IpAddr],
     host: &str,
-) -> Result<Vec<IpAddr>, TunnelError> {
+) -> Result<Vec<IpAddr>, Unanswered> {
     if servers.is_empty() {
-        return Err(TunnelError::Configuration(
-            "this proxy needs a routed DNS server for hostname resolution".into(),
-        ));
+        return Err(Unanswered {
+            error: TunnelError::Configuration("no DNS servers to ask".into()),
+            reached: false,
+        });
     }
+    let mut reached_any = false;
     for server in servers {
         let mut addresses = Vec::new();
         for qtype in [1u16, 28] {
@@ -124,13 +107,16 @@ async fn resolve_name(
             // A route that cannot reach the server at all is different: the
             // other family would only dial the same dead route again, and the
             // caller's ladder moves on sooner for being told once.
+            // `query` marks `reached` as soon as the server answers the
+            // dial, so a query cut off by the ceiling still says so.
             let mut reached = false;
-            match tokio::time::timeout(
+            let answered = tokio::time::timeout(
                 FAMILY_QUERY_TIMEOUT,
                 query(provider, *server, host, qtype, &mut reached),
             )
-            .await
-            {
+            .await;
+            reached_any |= reached;
+            match answered {
                 Ok(Ok(found)) => addresses.extend(found),
                 _ if !reached => break,
                 _ => {}
@@ -142,9 +128,10 @@ async fn resolve_name(
             return Ok(addresses);
         }
     }
-    Err(TunnelError::Engine(
-        "routed DNS could not resolve the destination".into(),
-    ))
+    Err(Unanswered {
+        error: TunnelError::Engine("routed DNS could not resolve the destination".into()),
+        reached: reached_any,
+    })
 }
 
 async fn query(

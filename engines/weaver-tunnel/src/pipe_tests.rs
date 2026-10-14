@@ -1446,3 +1446,116 @@ async fn servers_asked_through_an_unreachable_hop_fail_as_the_path() {
     assert!(error.is_path_evidence(), "{error:?}");
     assert!(!matches!(error, DialError::Destination(_)), "{error:?}");
 }
+
+// An egress whose DNS server answers each query only after `delay`: `PUBLIC`
+// for an A query, nothing for any other.
+struct SlowDns {
+    delay: Duration,
+}
+#[async_trait::async_trait]
+impl Dialer for SlowDns {
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        let (near, mut far) = tokio::io::duplex(1024);
+        let delay = self.delay;
+        tokio::spawn(async move {
+            let size = far.read_u16().await.unwrap() as usize;
+            let mut reply = vec![0; size];
+            far.read_exact(&mut reply).await.unwrap();
+            tokio::time::sleep(delay).await;
+            let qtype = u16::from_be_bytes([reply[size - 4], reply[size - 3]]);
+            reply[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+            if qtype == 1 {
+                reply[6..8].copy_from_slice(&1u16.to_be_bytes());
+                reply.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4]);
+                reply.extend_from_slice(&PUBLIC.parse::<std::net::Ipv4Addr>().unwrap().octets());
+            }
+            far.write_u16(reply.len() as u16).await.unwrap();
+            far.write_all(&reply).await.unwrap();
+        });
+        Ok(Dialed {
+            stream: DialedStream::Tunnel(Box::new(near)),
+            outcome: Default::default(),
+            path: DialPath::default(),
+            peer: None,
+            source: None,
+            setup: None,
+        })
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "slow dns".into()
+    }
+}
+
+// A stage whose proxy answers the request for the next hop only after
+// `delay`.
+struct Late {
+    delay: Duration,
+}
+#[async_trait::async_trait]
+impl Dialer for Late {
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        let (near, mut far) = tokio::io::duplex(1024);
+        let delay = self.delay;
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            far.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            // The far end stays open for the stream the hop hands back.
+            std::future::pending::<()>().await;
+        });
+        Ok(Dialed {
+            stream: DialedStream::Tunnel(Box::new(near)),
+            outcome: Default::default(),
+            path: DialPath::default(),
+            peer: None,
+            source: None,
+            setup: None,
+        })
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "late".into()
+    }
+}
+
+// A lookup has a window of its own: one that takes 8 s of a hop's 30 still
+// leaves the proxy the whole 30 s to answer, and the hop's budget counts
+// both windows. A hop that hands the name on has no lookup to wait for.
+#[tokio::test(start_paused = true)]
+async fn a_slow_lookup_leaves_the_hop_its_whole_connect_window() {
+    let resolving = named_hop(
+        7,
+        "192.0.2.1",
+        8080,
+        Naming::Servers {
+            servers: vec![ROUTED_DNS.parse().unwrap()],
+            egress: Arc::new(SlowDns {
+                delay: Duration::from_secs(4),
+            }),
+        },
+        Arc::new(Late {
+            delay: Duration::from_secs(25),
+        }),
+    );
+
+    let dialed = resolving.dial(&named("news.invalid", 119)).await;
+
+    assert!(dialed.is_ok(), "{:?}", dialed.err());
+    assert_eq!(resolving.budget(), Duration::from_secs(61));
+    let handing_on = named_hop(
+        8,
+        "192.0.2.1",
+        8080,
+        Naming::Proxy,
+        Arc::new(Late {
+            delay: Duration::ZERO,
+        }),
+    );
+    assert_eq!(handing_on.budget(), Duration::from_secs(31));
+}

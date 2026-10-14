@@ -180,7 +180,9 @@ pub struct ProxyProfileInput {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
-    pub resolver: ProxyResolver,
+    // Omitted by a client written before a proxy named its resolver: a saved
+    // proxy keeps its own, and a new one resolves as every proxy did then.
+    pub resolver: Option<ProxyResolver>,
     #[graphql(default)]
     pub dns_servers: Vec<String>,
     #[graphql(default)]
@@ -220,6 +222,23 @@ impl ProxyProfileInput {
         secret_update(&mut secrets.private_key, self.private_key);
         secret_update(&mut secrets.passphrase, self.passphrase);
         secret_update(&mut secrets.preshared_key, self.preshared_key);
+        let dns_servers: Vec<std::net::IpAddr> = self
+            .dns_servers
+            .iter()
+            .map(|s| s.trim().parse())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|_| refusal_error(NetworkRefusal::ProxyDnsServerInvalid))?;
+        let resolver = match (self.resolver, existing) {
+            (Some(resolver), _) => resolver.into(),
+            (None, Some(existing)) => existing.resolver,
+            // A WireGuard tunnel cannot take a name, so without servers of
+            // its own Weaver resolved for it; every other proxy resolved for
+            // itself, through its servers when it had them.
+            (None, None) if self.kind == ProxyKind::WireGuard && dns_servers.is_empty() => {
+                proxies::Resolver::Weaver
+            }
+            (None, None) => proxies::Resolver::Proxy,
+        };
         let profile = ProxyProfile {
             id,
             name: self.name.trim().into(),
@@ -227,13 +246,8 @@ impl ProxyProfileInput {
             enabled: self.enabled,
             host: self.host.trim().trim_matches(['[', ']']).into(),
             port: self.port,
-            resolver: self.resolver.into(),
-            dns_servers: self
-                .dns_servers
-                .iter()
-                .map(|s| s.trim().parse())
-                .collect::<std::result::Result<_, _>>()
-                .map_err(|_| refusal_error(NetworkRefusal::ProxyDnsServerInvalid))?,
+            resolver,
+            dns_servers,
             tunnel_addresses: self.tunnel_addresses,
             peer_public_key: self.peer_public_key,
             mtu: self.mtu,

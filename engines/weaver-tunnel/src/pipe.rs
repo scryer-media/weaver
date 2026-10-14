@@ -70,6 +70,14 @@ pub enum Naming {
 }
 
 impl Naming {
+    // How long a lookup may take on top of a hop's connect: the same bound
+    // `resolve` is given, and nothing when the proxy is handed the name.
+    fn window(&self, timeout: Duration) -> Duration {
+        match self {
+            Self::Proxy => Duration::ZERO,
+            Self::Host | Self::Servers { .. } | Self::ProxyServers(_) => timeout,
+        }
+    }
     // What `host` resolves to for a dial through `hop`, or `Unresolved` when
     // the proxy is handed the name.
     async fn resolve(
@@ -631,8 +639,10 @@ impl Dialer for TransportHop {
             purpose: Purpose::ProxyEndpoint { proxy: self.id },
             addresses: Vec::new(),
         };
-        let started = tokio::time::Instant::now();
+        // The lookup has a window of its own in `budget`, so a slow one
+        // leaves the connect its whole timeout.
         let destinations = hop_destinations(self, target).await?;
+        let started = tokio::time::Instant::now();
         let mut last = None;
         for (index, destination) in destinations.iter().enumerate() {
             let mut dialed = self
@@ -692,7 +702,10 @@ impl Dialer for TransportHop {
             .or_else(|| self.failure.of(self.id))
     }
     fn budget(&self) -> Duration {
-        self.inner.budget().saturating_add(self.timeout)
+        self.inner
+            .budget()
+            .saturating_add(self.timeout)
+            .saturating_add(self.naming.window(self.timeout))
     }
     // No shutdown: a stream proxy hop holds nothing of its own, and the
     // stage beneath belongs to whoever built it.
@@ -924,15 +937,22 @@ impl Dialer for SessionHop {
         let started = tokio::time::Instant::now();
         self.prepare_carrier().await?;
         // Resolving through the proxy dials it, so the name is resolved
-        // before this dial holds the session.
+        // before this dial holds the session. The lookup has a window of its
+        // own in `budget`, so a slow one does not shorten the connect.
+        let resolving = tokio::time::Instant::now();
         let destinations = hop_destinations(self, target).await?;
+        let resolved = resolving.elapsed();
         let activity = self.activity.clone().read_owned().await;
         let capacity = self.capacity.acquire()?;
         let outcome = Arc::new(ConnectionOutcome::default());
         let mut connected = Err(DialError::Skipped("no destination".into()));
         for (index, destination) in destinations.iter().enumerate() {
             // Reserve part of the remaining budget for every other address.
-            let remaining = self.budget().saturating_sub(started.elapsed());
+            let remaining = self
+                .inner
+                .budget()
+                .saturating_add(self.timeout)
+                .saturating_sub(started.elapsed().saturating_sub(resolved));
             connected = tokio::time::timeout(
                 remaining / (destinations.len() - index) as u32,
                 self.provider
@@ -993,7 +1013,9 @@ impl Dialer for SessionHop {
         })
     }
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
-        // A WireGuard tunnel asks its DNS servers from inside the tunnel.
+        // A WireGuard tunnel asks its DNS servers from inside the tunnel. It
+        // was built with the same servers this naming lists, so it asks
+        // them itself.
         let (Naming::ProxyServers(_), Some(provider)) = (&self.naming, &self.resolver) else {
             return self.naming.resolve(self, host, self.timeout).await;
         };
@@ -1027,7 +1049,10 @@ impl Dialer for SessionHop {
             .then(|| Arc::new(datagram::SessionDatagrams::new(self)) as Arc<dyn DatagramTransport>)
     }
     fn budget(&self) -> Duration {
-        self.inner.budget().saturating_add(self.timeout)
+        self.inner
+            .budget()
+            .saturating_add(self.timeout)
+            .saturating_add(self.naming.window(self.timeout))
     }
     // Stops this hop's own session only. The stage beneath may be another
     // session shared with other routes, or one a probe runtime borrowed;

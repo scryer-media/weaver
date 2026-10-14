@@ -673,7 +673,7 @@ impl ProxyRuntime {
         profile.validate().map_err(|e| e.to_string())?;
         if profile.kind == ProxyKind::Http3Connect {
             let dns = profile.proxy_dns_servers().first().ok_or(
-                "Configure a routed DNS server IP to test HTTP/3 forwarding, or test an assigned NNTP server",
+                "Testing HTTP/3 forwarding needs DNS servers the proxy resolves with; test an assigned NNTP server instead",
             )?;
             let hop = ProxyHop::new(profile.clone(), &self.db)?;
             let result = tokio::time::timeout(profile.timeout(), async {
@@ -684,7 +684,7 @@ impl ProxyRuntime {
             hop.provider.shutdown().await;
             return match result {
                 Ok(Ok(())) => Ok("HTTP/3 proxy TLS, authentication and forwarding succeeded".into()),
-                _ => Err("HTTP/3 proxy connection failed; check UDP reachability, TLS certificate, credentials and routed DNS".into()),
+                _ => Err("HTTP/3 proxy connection failed; check UDP reachability, TLS certificate, credentials and the proxy's DNS servers".into()),
             };
         }
         let observer = Arc::new(Observer {
@@ -694,16 +694,33 @@ impl ProxyRuntime {
         });
         let result = tokio::time::timeout(profile.timeout(), async {
             match profile.kind {
-                ProxyKind::Ssh => { SshTunnelProvider::handshake(profile.ssh_spec(), observer).await?; }
-                ProxyKind::WireGuard => { WireGuardTunnelProvider::handshake(profile.wireguard_spec()?, observer).await?; }
+                ProxyKind::Ssh => {
+                    SshTunnelProvider::handshake(profile.ssh_spec(), observer).await?;
+                }
+                ProxyKind::WireGuard => {
+                    WireGuardTunnelProvider::handshake(profile.wireguard_spec()?, observer).await?;
+                }
                 _ => {
-                    let hop = ProxyHop::new(profile.clone(), &self.db).map_err(TunnelError::Configuration)?;
-                    if let Some(dns) = profile.proxy_dns_servers().first() { let _stream = hop.provider.dial(&dns.to_string(), 53).await?; }
-                    else { tokio::net::TcpStream::connect((profile.host.as_str(), profile.port)).await.map_err(|_| TunnelError::Engine("proxy endpoint unreachable".into()))?; return Ok("Endpoint reachable; configure routed DNS or test an assigned consumer to verify forwarding".to_string()); }
+                    let hop = ProxyHop::new(profile.clone(), &self.db)
+                        .map_err(TunnelError::Configuration)?;
+                    if let Some(dns) = profile.proxy_dns_servers().first() {
+                        let _stream = hop.provider.dial(&dns.to_string(), 53).await?;
+                    } else {
+                        tokio::net::TcpStream::connect((profile.host.as_str(), profile.port))
+                            .await
+                            .map_err(|_| {
+                                TunnelError::Engine("proxy endpoint unreachable".into())
+                            })?;
+                        return Ok(
+                            "Endpoint reachable; test an assigned consumer to verify forwarding"
+                                .to_string(),
+                        );
+                    }
                 }
             }
             Ok::<_, TunnelError>("Proxy connection succeeded".to_string())
-        }).await;
+        })
+        .await;
         match result {
             Ok(Ok(message)) => Ok(message),
             Ok(Err(TunnelError::HostKeyMismatch { .. })) => {

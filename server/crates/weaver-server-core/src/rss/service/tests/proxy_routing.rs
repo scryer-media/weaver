@@ -300,7 +300,8 @@ async fn wireguard_rss_uses_tunnel_dns_and_preserves_host() {
 }
 
 // A proxy set to resolve with its own host is handed the feed's name, and no
-// DNS server is asked for it.
+// DNS server is asked for it. The private-network block is on, but Weaver
+// never sees the address the proxy resolves, so there is nothing to check.
 #[tokio::test]
 async fn a_proxy_resolving_with_its_host_is_handed_the_feeds_name() {
     for kind in [ProxyKind::Ssh, ProxyKind::Socks5] {
@@ -342,6 +343,29 @@ async fn a_proxy_resolving_with_its_host_is_handed_the_feeds_name() {
         runtime.stop_all().await;
         task.abort();
     }
+}
+
+// An address the URL names itself is still checked through a proxy that
+// resolves with its own host: a private one is refused before the proxy is
+// asked for anything.
+#[tokio::test]
+async fn a_proxy_resolving_with_its_host_is_never_handed_a_private_address() {
+    let temp = TempDir::new().unwrap();
+    let (addr, captured, task) = origin().await;
+    let mut fixture = Fixture::start(ProxyKind::Socks5, addr).await;
+    fixture.profile.dns_servers.clear();
+    let (service, runtime, feed, _) =
+        service(&temp, &fixture, &format!("http://{addr}/feed"), false);
+    assert!(
+        service
+            .send_rss_request(&feed, &feed.url, false)
+            .await
+            .is_err()
+    );
+    assert!(captured.lock().unwrap().is_empty());
+    assert!(fixture.targets.as_ref().unwrap().lock().unwrap().is_empty());
+    runtime.stop_all().await;
+    task.abort();
 }
 
 #[tokio::test]

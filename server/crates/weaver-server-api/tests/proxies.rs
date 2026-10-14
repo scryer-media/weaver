@@ -69,6 +69,55 @@ async fn profile_crud_redacts_secrets_and_preserves_omitted_credentials() {
 }
 
 #[tokio::test]
+async fn a_save_without_a_resolver_keeps_how_the_proxy_resolved() {
+    let h = harness().await;
+    let save = |id: Option<u64>, kind: &str, extra: &str| {
+        let id = id.map_or("null".into(), |id| id.to_string());
+        format!(
+            r#"mutation {{ saveProxyProfile(id: {id}, input: {{
+        name: "older-client-{kind}", kind: {kind}, enabled: true, host: "127.0.0.1", port: 1080{extra}
+    }}) {{ id resolver }} }}"#
+        )
+    };
+    let saved = |result: &async_graphql::Response| {
+        assert_no_errors(result);
+        let data = response_data(result);
+        (
+            data["saveProxyProfile"]["id"].as_u64().unwrap(),
+            data["saveProxyProfile"]["resolver"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+    };
+    let (socks, resolver) = saved(&h.execute(&save(None, "SOCKS5", "")).await);
+    assert_eq!(resolver, "PROXY");
+    let wireguard = r#", tunnelAddresses: ["10.0.0.2/32"],
+        peerPublicKey: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+        privateKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=""#;
+    let (_, resolver) = saved(&h.execute(&save(None, "WIRE_GUARD", wireguard)).await);
+    assert_eq!(resolver, "WEAVER");
+    let with_dns = format!(r#"{wireguard}, dnsServers: ["10.0.0.1"]"#);
+    let (_, resolver) = saved(&h.execute(&save(None, "WIRE_GUARD", &with_dns)).await);
+    assert_eq!(resolver, "PROXY");
+
+    let named = h
+        .execute(&format!(
+            r#"mutation {{ saveProxyProfile(id: {socks}, input: {{
+        name: "older-client-SOCKS5", kind: SOCKS5, resolver: WEAVER, enabled: true, host: "127.0.0.1", port: 1080
+    }}) {{ resolver }} }}"#
+        ))
+        .await;
+    assert_no_errors(&named);
+    let (_, resolver) = saved(&h.execute(&save(Some(socks), "SOCKS5", "")).await);
+    assert_eq!(
+        resolver, "WEAVER",
+        "an update without a resolver keeps the saved one"
+    );
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
+#[tokio::test]
 async fn an_ssh_profile_is_refused_a_password() {
     let h = harness().await;
     let result = h

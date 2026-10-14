@@ -186,9 +186,10 @@ impl RssService {
             .map_err(|_| AttemptError::Route)?;
         if let Some(bridge) = &bridge {
             let addr = bridge.addr().map_err(|_| AttemptError::Route)?;
-            // The local bridge receives the hostname for Host/SNI, but both
-            // direct and proxy hops connect only to the checked addresses
-            // pinned on the attempt; the remote proxy cannot resolve it again.
+            // The local bridge receives the hostname for Host/SNI. When the
+            // leg resolved it, every hop connects only to the checked
+            // addresses pinned on the attempt; when the exit proxy resolves
+            // names itself, it is handed the name.
             builder = builder.proxy(
                 reqwest::Proxy::all(format!("socks5h://{addr}"))
                     .map_err(|_| AttemptError::Route)?

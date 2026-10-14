@@ -14,7 +14,7 @@ async fn http3_profile_test_never_falls_back_to_tcp_when_dns_is_missing() {
             .test_profile(&p)
             .await
             .unwrap_err()
-            .contains("routed DNS")
+            .contains("DNS servers the proxy resolves with")
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(50), listener.accept())
