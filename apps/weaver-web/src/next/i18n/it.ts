@@ -1744,6 +1744,7 @@ export const nextIt: LocaleDictionary = {
   "next.networking.testVia.title": "Prova tramite percorso",
   "next.networking.testVia.route": "Percorso",
   "next.networking.testVia.destination": "Destinazione",
+  "next.networking.testVia.optional": "Facoltativo",
   "next.networking.testVia.host": "Host",
   "next.networking.testVia.port": "Porta",
   "next.networking.testVia.run": "Prova",

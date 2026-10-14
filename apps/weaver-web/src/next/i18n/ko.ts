@@ -1744,6 +1744,7 @@ export const nextKo: LocaleDictionary = {
   "next.networking.testVia.title": "경로 경유 테스트",
   "next.networking.testVia.route": "경로",
   "next.networking.testVia.destination": "대상",
+  "next.networking.testVia.optional": "선택 사항",
   "next.networking.testVia.host": "호스트",
   "next.networking.testVia.port": "포트",
   "next.networking.testVia.run": "테스트",

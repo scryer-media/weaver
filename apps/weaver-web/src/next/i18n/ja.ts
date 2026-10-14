@@ -1744,6 +1744,7 @@ export const nextJa: LocaleDictionary = {
   "next.networking.testVia.title": "ルート経由でテスト",
   "next.networking.testVia.route": "ルート",
   "next.networking.testVia.destination": "宛先",
+  "next.networking.testVia.optional": "オプション",
   "next.networking.testVia.host": "ホスト",
   "next.networking.testVia.port": "ポート",
   "next.networking.testVia.run": "テスト",

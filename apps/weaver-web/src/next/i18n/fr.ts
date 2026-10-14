@@ -1744,6 +1744,7 @@ export const nextFr: LocaleDictionary = {
   "next.networking.testVia.title": "Tester via une route",
   "next.networking.testVia.route": "Route",
   "next.networking.testVia.destination": "Destination",
+  "next.networking.testVia.optional": "Facultatif",
   "next.networking.testVia.host": "Hôte",
   "next.networking.testVia.port": "Port",
   "next.networking.testVia.run": "Tester",

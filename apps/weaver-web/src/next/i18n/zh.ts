@@ -1744,6 +1744,7 @@ export const nextZh: LocaleDictionary = {
   "next.networking.testVia.title": "经路由测试",
   "next.networking.testVia.route": "路由",
   "next.networking.testVia.destination": "目标",
+  "next.networking.testVia.optional": "可选",
   "next.networking.testVia.host": "主机",
   "next.networking.testVia.port": "端口",
   "next.networking.testVia.run": "测试",

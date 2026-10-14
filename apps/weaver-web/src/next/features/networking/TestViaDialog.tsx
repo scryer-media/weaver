@@ -6,10 +6,12 @@ import { routeInput, routeProblem, type NetworkRoute } from "@/lib/networking";
 import { proxyLabels } from "@/lib/proxies";
 import { proxyTestSentence } from "@/lib/proxy-fault";
 import { refusalMessage } from "@/lib/refusal";
+import { cn } from "@/lib/utils";
 import { draftRoute, routeChoices, testSummary, type PathTestResult, type TestSubject } from "@/lib/test-via";
 import { SectionHeader } from "../../components/chrome";
 import { Dialog } from "../../components/Dialog";
 import { PrimaryButton, SecondaryButton } from "../../components/controls";
+import { Icon } from "../../components/icons";
 import { FieldRows } from "../../pages/settings/framework";
 import type { NetworkingData } from "./data";
 import { RouteEditor } from "./RouteEditor";
@@ -52,6 +54,7 @@ export function TestViaDialog({
   const [edited, setEdited] = useState<NetworkRoute | null>(null);
   const [host, setHost] = useState("");
   const [port, setPort] = useState(DEFAULT_PORT);
+  const [destinationOpen, setDestinationOpen] = useState(false);
   const [results, setResults] = useState<PathTestResult[] | null>(null);
   const [refusal, setRefusal] = useState<string | null>(null);
   const outcomeRef = useRef<HTMLDivElement>(null);
@@ -66,7 +69,8 @@ export function TestViaDialog({
   const route = edited ?? (data ? draftRoute(data.egressInterfaces, egressId) : null);
   const problem = data && route ? routeProblem(route, { egresses: data.egressInterfaces, pools: data.proxyPools }) : null;
   const choices = data ? routeChoices(data.proxyProfiles, data.proxyPools, subject) : null;
-  const target = host.trim() ? { host: host.trim(), port } : null;
+  // A destination folded away is not tested, whatever was typed into it.
+  const target = (subject === null || destinationOpen) && host.trim() ? { host: host.trim(), port } : null;
 
   const egressName = (id: number) => data?.egressInterfaces.find((egress) => egress.id === id)?.name ?? String(id);
   const proxyName = (id: number) =>
@@ -147,21 +151,36 @@ export function TestViaDialog({
               kind="OUTBOUND"
             />
           </div>
-          <SectionHeader label={t("next.networking.testVia.destination")} sticky={false} />
-          <FieldRows
-            fields={[
-              {
-                id: "host",
-                label: t("next.networking.testVia.host"),
-                control: { kind: "text", value: host, onChange: setHost },
-              },
-              {
-                id: "port",
-                label: t("next.networking.testVia.port"),
-                control: { kind: "number", value: port, min: 1, max: 65535, onChange: setPort },
-              },
-            ]}
-          />
+          {/* A route alone needs somewhere to connect; a proxy or pool is tested without one. */}
+          {subject === null ? (
+            <SectionHeader label={t("next.networking.testVia.destination")} sticky={false} />
+          ) : (
+            <button
+              type="button"
+              aria-expanded={destinationOpen}
+              onClick={() => setDestinationOpen((open) => !open)}
+              className="flex h-8 flex-none items-center gap-2 border-b border-wv-hairline px-4 text-left font-wv-mono text-[11px] text-wv-muted hover:text-wv-fg sm:px-6"
+            >
+              <Icon name="expand" size={12} className={cn("flex-none transition-transform", destinationOpen && "rotate-90")} />
+              {t("next.networking.testVia.optional")}
+            </button>
+          )}
+          {subject === null || destinationOpen ? (
+            <FieldRows
+              fields={[
+                {
+                  id: "host",
+                  label: t("next.networking.testVia.host"),
+                  control: { kind: "text", value: host, onChange: setHost },
+                },
+                {
+                  id: "port",
+                  label: t("next.networking.testVia.port"),
+                  control: { kind: "number", value: port, min: 1, max: 65535, onChange: setPort },
+                },
+              ]}
+            />
+          ) : null}
           <div ref={outcomeRef} className="flex flex-none flex-col">
             {refusal === null ? null : (
               <p role="alert" className="px-4 py-4 text-[12.5px] leading-[1.5] text-wv-error-text sm:px-6">

@@ -557,12 +557,28 @@ test("a proxy is tested through a route drafted for it, which cannot use the pro
     });
     await shot(page, "test-via-proxy");
 
+    // The destination starts folded away under Optional.
+    const optional = action(dialog, "Optional");
+    assert.equal(await optional.getAttribute("aria-expanded"), "false");
+    assert.equal(await field(dialog, "Host").count(), 0);
+
     // With somewhere to go, the proxy is asked to forward there.
+    await optional.click();
     await field(dialog, "Host").fill("news.fixture.invalid");
     await field(dialog, "Port").fill("563");
     await action(dialog, "Test").click();
     await rows.first().getByText("Connected and forwarded through the proxy.", { exact: true }).waitFor();
     assert.deepEqual((await runs(page)).at(-1).variables.target, { host: "news.fixture.invalid", port: 563 });
+
+    // Folded away again, what was typed is not sent.
+    await optional.click();
+    assert.equal(await field(dialog, "Host").count(), 0);
+    const sent = (await runs(page)).length;
+    await action(dialog, "Test").click();
+    await rows.first().getByText(reachable, { exact: true }).waitFor();
+    const last = await runs(page);
+    assert.equal(last.length, sent + 1);
+    assert.equal(last.at(-1).variables.target, null);
 
     // The proxy's line keeps the last run: the first path that failed.
     await action(dialog, "Close").click();
