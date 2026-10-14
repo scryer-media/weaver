@@ -105,6 +105,7 @@ type Member = {
   id: number;
   state: string;
   live: PoolMemberFlow | undefined;
+  /** The pool has timed the member's connections or measured what they deliver. */
   measured: boolean;
   /** The member holds connections for the pool right now. */
   carrying: boolean;
@@ -628,8 +629,7 @@ export function NetworkFlow({
         const failing = leg.failingHops?.find((hop) => hop.rung === rungIndex);
         const members: Member[] = (configured?.memberIds ?? live?.members.map((member) => member.id) ?? []).map((id) => {
           const member = live?.members.find((candidate) => candidate.id === id);
-          const measured =
-            member != null && (member.handshakeMs != null || member.connectMs != null || member.bytesPerSecond != null);
+          const measured = member != null && (member.connectMs != null || member.bytesPerSecond != null);
           const carrying = (member?.open ?? 0) > 0;
           const said = member?.blocked ?? (failing?.proxyId === id ? failing.reason : null);
           const note = said ? wrap(said, lanes.PROXY.width - 45 - toggleWidth, 9.5, 2) : [];
@@ -869,15 +869,18 @@ export function NetworkFlow({
             {members.map((member) => {
               const top = memberY;
               memberY += member.height;
+              // Only what the pool has measured: a figure it has not taken is left out, not dashed.
               const timing = member.measured
-                ? t("next.networking.flow.memberTiming", {
-                    session: member.live?.handshakeMs?.toFixed(0) ?? "—",
-                    open: member.live?.connectMs?.toFixed(0) ?? "—",
-                    rate:
-                      member.live?.bytesPerSecond == null
-                        ? t("next.networking.flow.noEvidence")
-                        : formatRate(member.live.bytesPerSecond),
-                  })
+                ? [
+                    member.live?.connectMs == null
+                      ? null
+                      : t("next.networking.flow.memberConnect", { ms: member.live.connectMs.toFixed(0) }),
+                    member.live?.bytesPerSecond == null
+                      ? null
+                      : t("next.networking.flow.memberSpeed", { rate: formatRate(member.live.bytesPerSecond) }),
+                  ]
+                    .filter((part) => part !== null)
+                    .join(" · ")
                 : null;
               // A member carrying traffic shows what it carries now; its timings move to the hover.
               const detail = member.carrying

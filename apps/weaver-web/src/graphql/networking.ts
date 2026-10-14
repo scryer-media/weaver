@@ -27,7 +27,7 @@ export const NETWORKING_QUERY = gql`
   }
 `;
 const FLOW_FIELDS = `sampledAt consumers { key id name kind cap route { legs { egressId weight path { kind directFallback rungs { kind proxyId poolId chainIds } } } failover } } proxies { id name kind enabled host port } proxyPools { id name kind memberIds enabled } egresses { ${EGRESS_FIELDS} } legs { consumer position egressId weight target open opening state reason pinnedAddress sourceAddress bytesPerSecond selectedRung selectedProxyId rungStates failingHops { rung proxyId reason } path { kind directFallback rungs { kind proxyId poolId chainIds } } }
-  pools { poolId egressId pinnedMember members { id state open opening warmed blocked handshakeMs connectMs bytesPerSecond liveBytesPerSecond samples failures } }`;
+  pools { poolId egressId pinnedMember members { id state open opening warmed blocked connectMs bytesPerSecond liveBytesPerSecond samples failures } }`;
 export const NETWORK_FLOW_QUERY = gql`query NetworkFlow { networkFlow { ${FLOW_FIELDS} } }`;
 export const NETWORK_FLOW_SUBSCRIPTION = gql`subscription NetworkFlowUpdates { networkFlow { ${FLOW_FIELDS} } }`;
 export const CREATE_EGRESS = gql`mutation CreateEgress($input:EgressInterfaceInput!) { createEgressInterface(input:$input) { id } }`;

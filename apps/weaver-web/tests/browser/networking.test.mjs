@@ -60,8 +60,8 @@ test("flow displays route evidence, opens editors, exports a frozen SVG, and edi
  const members=diagram.getByRole("group",{name:"Europe pool members",exact:true});
  // The member carrying the pool's traffic says so, with what it carries now; the one idle beside it stands by on its timings.
  await members.getByText("Amsterdam · Active",{exact:true}).waitFor();
- assert.deepEqual(await members.locator("text").allTextContents(),["Amsterdam · Active","24 open · 22.89 MiB/s","Frankfurt · Standby","Session 40 ms · open 25 ms · 0.76 MiB/s","Lisbon · Disabled"]);
- assert.equal(await members.locator("a").filter({hasText:"Amsterdam · Active"}).locator("title").textContent(),"Session 30 ms · open 20 ms · 0.95 MiB/s");
+ assert.deepEqual(await members.locator("text").allTextContents(),["Amsterdam · Active","24 open · 22.89 MiB/s","Frankfurt · Standby","Connects in 25 ms · 0.76 MiB/s each","Lisbon · Disabled"]);
+ assert.equal(await members.locator("a").filter({hasText:"Amsterdam · Active"}).locator("title").textContent(),"Connects in 20 ms · 0.95 MiB/s each");
  assert.equal(await members.locator("rect[fill='#1f2b29']").count(),1);
  const pool=diagram.locator("a").filter({hasText:"Europe · pool"});
  assert.deepEqual(await pool.locator("text").allTextContents(),["Europe · pool","24 connections","Active · pinned to Amsterdam"]);

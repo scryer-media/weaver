@@ -165,7 +165,6 @@ function livePools(run: SpeedTestRun): PoolFlow[] {
         opening: 0,
         warmed: true,
         blocked: null,
-        handshakeMs: null,
         connectMs: null,
         bytesPerSecond: null,
         liveBytesPerSecond: 0,
