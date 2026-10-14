@@ -77,7 +77,9 @@ function graphql(name: string, variables: Record<string, unknown>) {
   }
   return { data: { proxyProfiles: profiles.map(view), testProxyProfile: { success: true, message: "" } } };
 }
-const fixture = { profiles, requests, changes: 0 };
+/* Every pool save the pools page sends, as it sends it. */
+const poolSaves: Record<string, unknown>[] = [];
+const fixture = { profiles, requests, poolSaves, changes: 0 };
 const panel = <ProxiesPanel onChanged={() => { fixture.changes += 1; }} />;
 /* With `?pools` the table sits where the app shows it, under the pools that group its proxies. */
 const pools = {
@@ -89,7 +91,7 @@ const pools = {
 const consumers = [{ key: "server:1", id: 1, name: "news.fixture.invalid", kind: "SERVER" as const, cap: 20, route: null }];
 const query = new URLSearchParams(window.location.search);
 const screen = query.has("pools")
-  ? <PoolsPage data={pools} action={async () => null} busy={false} proxies={panel} />
+  ? <PoolsPage data={pools} action={async (_document, variables) => { poolSaves.push(structuredClone(variables)); return null; }} busy={false} proxies={panel} />
   : query.has("routes")
     ? <RoutesPage data={{ ...pools, proxyProfiles: [...pools.proxyProfiles, view(stored(4, "Paris", "WIRE_GUARD", 51820)) as NetworkingData["proxyProfiles"][number]] }} consumers={consumers} flow={{ legs: [], pools: [] }} action={async () => null} busy={false} />
     : panel;

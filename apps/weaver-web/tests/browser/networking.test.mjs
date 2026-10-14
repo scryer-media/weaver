@@ -198,6 +198,13 @@ test("flow displays route evidence, opens editors, exports a frozen SVG, and edi
  assert.match(exported,/192\.0\.2\.10/);assert.match(exported,/2026-/);assert.match(exported,/<path/);assert.match(exported,/Relay two/);assert.match(exported,/ENDPOINTS/);assert.doesNotMatch(exported,/password|privateKey|credentials/);
  const slider=page.getByRole("slider").first();await slider.focus();await page.keyboard.press("ArrowRight");
  await page.getByLabel("Route weights").filter({hasText:"61,29,10"}).waitFor();
+ // A rung may only name a pool with a member in it: the empty one is not offered.
+ await page.getByRole("button",{name:"Leg 1 rung 1",exact:true}).click();
+ const offered=await page.getByRole("menu",{name:"Leg 1 rung 1",exact:true}).getByRole("menuitemradio").allTextContents();
+ assert.ok(offered.includes("Europe")&&offered.includes("Relays"),offered.join(","));
+ assert.ok(!offered.includes("Empty"),offered.join(","));
+ await page.keyboard.press("Escape");
+ await page.getByRole("menu",{name:"Leg 1 rung 1",exact:true}).waitFor({state:"detached"});
  await page.getByRole("button",{name:"Toggle all down"}).click();
  await page.getByText("0 / 50",{exact:true}).first().waitFor();
  await diagram.locator("path[stroke-dasharray]").nth(13).waitFor({state:"attached"});

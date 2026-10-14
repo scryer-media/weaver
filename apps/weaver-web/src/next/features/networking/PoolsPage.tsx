@@ -14,7 +14,7 @@ import { FieldRows, SettingsBlocks, type SettingsBlock } from "../../pages/setti
 import type { NetworkingAction, NetworkingData } from "./data";
 import { CheckRow, Hint, StatusMark } from "./presentation";
 
-/** The daemon pools two to sixteen proxies. */
+/** The daemon pools up to sixteen proxies. */
 const MAX_POOL_MEMBERS = 16;
 
 const NEW_POOL: ProxyPool = { id: -1, name: "", kind: "WIRE_GUARD", memberIds: [], enabled: true };
@@ -185,7 +185,7 @@ export function PoolEditor({
         error={error}
         busy={busy}
         saveLabel={t("next.networking.pools.save")}
-        saveDisabled={editing.memberIds.length < 2 || editing.memberIds.length > MAX_POOL_MEMBERS}
+        saveDisabled={editing.memberIds.length > MAX_POOL_MEMBERS}
         onSave={() => void save()}
         onDismiss={onClose}
         onDelete={editing.id >= 0 ? () => setDeleting(editing) : undefined}
@@ -221,7 +221,6 @@ export function PoolEditor({
               {
                 id: "members",
                 label: t("next.networking.pools.members"),
-                help: t("next.networking.pools.membersHelp"),
                 control: {
                   kind: "custom",
                   control: candidates.length ? (

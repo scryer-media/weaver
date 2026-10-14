@@ -282,6 +282,26 @@ test("pools and proxies are each added from the middle under their own table, an
   }
 });
 
+test("a pool can be saved before it has a member, and saves with one", async () => {
+  const page = await open("?pools");
+  try {
+    await action(page.locator("main"), "Add pool").click();
+    const editor = page.getByRole("dialog", { name: "Add pool", exact: true });
+    await field(editor, "Name").fill("Solo");
+    // A pool can be made before any proxy is put in it.
+    assert.equal(await action(editor, "Save pool").isEnabled(), true);
+    await editor.getByRole("checkbox", { name: "Amsterdam", exact: true }).click();
+    await editor.getByRole("checkbox", { name: "Amsterdam", checked: true, exact: true }).waitFor();
+    assert.equal(await action(editor, "Save pool").isEnabled(), true);
+    await action(editor, "Save pool").click();
+    await editor.waitFor({ state: "detached" });
+    const { poolSaves } = await daemon(page);
+    assert.deepEqual(poolSaves.map(({ input }) => input), [{ name: "Solo", kind: "WIRE_GUARD", memberIds: [1], enabled: true }]);
+  } finally {
+    await page.close();
+  }
+});
+
 /** The line of a table that holds `text`, which is a button itself and holds its own Edit button. */
 const line = (page, text) => page.locator("main").getByRole("button").filter({ hasText: text });
 /** Opens `title` from the line's own body, then from its Edit button, and closes it each time. */
