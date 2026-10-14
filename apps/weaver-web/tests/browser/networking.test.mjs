@@ -60,11 +60,15 @@ test("flow displays route evidence, opens editors, and edits weights without los
  const members=diagram.getByRole("group",{name:"Europe pool members",exact:true});
  // The member carrying the pool's traffic says so, with what it carries now; the one idle beside it stands by on its timings.
  await members.getByText("Amsterdam · Active",{exact:true}).waitFor();
- assert.deepEqual(await members.locator("text").allTextContents(),["Amsterdam · Active","24 open · 22.89 MiB/s","Frankfurt · Standby","Connects in 25 ms · 0.76 MiB/s each","Lisbon · Disabled"]);
+ // The pool lists Frankfurt, Lisbon, Amsterdam; it is drawn by what carries traffic, then by the quickest to connect.
+ assert.deepEqual(await members.locator("text").allTextContents(),["Amsterdam · Active","24 open · 22.89 MiB/s","Frankfurt · Standby","25 ms · 0.76 MiB/s each","Lisbon · Disabled"]);
+ // A connect time wears the signal mark instead of words; the hover, which has no room for it, says what it is.
+ assert.equal(await members.locator("a").filter({hasText:"Frankfurt · Standby"}).locator("svg.lucide-signal").count(),1);
+ assert.equal(await members.locator("svg.lucide-signal").count(),1);
  assert.equal(await members.locator("a").filter({hasText:"Amsterdam · Active"}).locator("title").textContent(),"Connects in 20 ms · 0.95 MiB/s each");
  assert.equal(await members.locator("rect[fill='#1f2b29']").count(),1);
  const pool=diagram.locator("a").filter({hasText:"Europe · pool"});
- assert.deepEqual(await pool.locator("text").allTextContents(),["Europe · pool","24 connections","Active · pinned to Amsterdam"]);
+ assert.deepEqual(await pool.locator("text").allTextContents(),["Europe · pool","24 connections","Active"]);
  const chain=diagram.getByRole("group",{name:"Relay one > Relay two > Exit",exact:true});
  assert.deepEqual(await chain.locator("text").allTextContents(),["Relay one","Up",">","Relay two","Failing","endpoint","unreachable:","connection refused",">","Exit","Unreached"]);
  await diagram.getByText("Direct · Active",{exact:true}).first().waitFor();
@@ -95,8 +99,8 @@ test("flow displays route evidence, opens editors, and edits weights without los
  assert.notEqual(await lte.locator("g:has(> title) > text").getAttribute("fill"),await fiber.locator("g:has(> title) > text").last().getAttribute("fill"));
  // The daemon knows only that its egress is up; the leg is blocked all the same.
  assert.deepEqual(await legCards.filter({hasText:"News archive"}).locator("text").allTextContents(),["News archive · leg 1 · 100%","Blocked · 0/0 open · 0.00 MiB/s","0 planned"]);
- await diagram.locator("path[stroke-dasharray]").nth(10).waitFor({state:"attached"});
- assert.equal(await diagram.locator("path[stroke-dasharray]").count(),11);
+ await diagram.locator("path[stroke-dasharray]:not([stroke-dasharray='18 30'])").nth(10).waitFor({state:"attached"});
+ assert.equal(await diagram.locator("path[stroke-dasharray]:not([stroke-dasharray='18 30'])").count(),11);
  const faded=diagram.locator("[opacity='0.2']");
  const fadedLegs=diagram.locator("g[opacity='0.2'] > a[aria-label^='Edit the route for']");
  const fadedEgresses=diagram.locator("g[opacity='0.2'] > a[href='/settings/networking/egress']");
@@ -109,15 +113,28 @@ test("flow displays route evidence, opens editors, and edits weights without los
   assert.deepEqual(await card.locator("text").allTextContents(),texts);
   assert.equal(await card.locator("rect").count(),2);
  }
+ // A feed's card carries the RSS mark; no other card does.
+ assert.equal(await endpoints.filter({hasText:"Feed mirror"}).locator("svg.lucide-rss").count(),1);
+ assert.equal(await diagram.locator("svg.lucide-rss").count(),1);
  // A server's card keeps a box for each of its 50 connections.
  assert.equal(await endpoints.filter({hasText:"News primary"}).locator("rect").count(),2+50);
- // Nothing moves until a box is pointed at; then only what it lights does.
+ // At rest only the legs moving bytes move: News primary's first and News backup's, three lines each.
+ // Pointed at a box, only what it lights does.
  const snakes=diagram.locator("animate");
  const fadedSnakes=diagram.locator("g[opacity='0.2'] animate");
  // Every snake runs in a ribbon of its own green; a dashed thread never carries one.
- const dashed=diagram.locator("path[stroke-dasharray]");
- const ribbons=diagram.locator("g:has(> g > path > animate) > path:not([fill='none'])");
- assert.equal(await snakes.count(),0);
+ // The snakes are dashed too; these are the threads.
+ const dashed=diagram.locator("path[stroke-dasharray]:not([stroke-dasharray='18 30'])");
+ const ribbons=diagram.locator("g:has(> path > animate) > path:not([fill='none'])");
+ await snakes.nth(5).waitFor({state:"attached"});
+ assert.equal(await snakes.count(),6);
+ assert.equal(await ribbons.count(),6);
+ // The pool's traffic goes in and out at the member carrying it, not at the pool's head.
+ const carrier=members.locator("rect[fill='#1f2b29']");
+ const carrierMiddle=Number(await carrier.getAttribute("y"))+Number(await carrier.getAttribute("height"))/2;
+ const snakePaths=await snakes.evaluateAll(nodes=>nodes.map(node=>node.parentElement.getAttribute("d").trim().split(/\s+/).map(Number)));
+ assert.ok(snakePaths.some(d=>Math.abs(d.at(-1)-carrierMiddle)<0.01),"a snake ends at the carrying member");
+ assert.ok(snakePaths.some(d=>Math.abs(d[2]-carrierMiddle)<0.01),"a snake starts at the carrying member");
  await chain.hover();
  await fadedEndpoints.filter({hasText:"News primary"}).waitFor({state:"attached"});
  assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Default outbound, leg 1","Edit the route for News primary, leg 2","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1","Edit the route for News primary, leg 1","Edit the route for News primary, leg 3"]);
@@ -125,7 +142,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
  assert.equal(await fadedSnakes.count(),0);
  assert.ok(await snakes.count()>0);
  assert.equal(await ribbons.count(),await snakes.count());
- assert.equal(await ribbons.evaluateAll(paths=>paths.filter(path=>path.getAttribute("fill")!==path.parentElement.querySelector(":scope > g > path").getAttribute("stroke")).length),0);
+ assert.equal(await ribbons.evaluateAll(paths=>paths.filter(path=>path.getAttribute("fill")!==path.parentElement.querySelector(":scope > path:has(> animate)").getAttribute("stroke")).length),0);
  assert.equal(await proxy.locator("xpath=..").getAttribute("opacity"),"0.2");
  assert.equal(await killSwitch.locator("xpath=..").getAttribute("opacity"),"0.2");
  assert.equal(await fadedEgresses.count(),2);
@@ -140,7 +157,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
  assert.ok(await snakes.count()>0);
  assert.equal(await fadedSnakes.count(),0);
  assert.equal(await ribbons.count(),await snakes.count());
- assert.equal(await ribbons.evaluateAll(paths=>paths.filter(path=>path.getAttribute("fill")!==path.parentElement.querySelector(":scope > g > path").getAttribute("stroke")).length),0);
+ assert.equal(await ribbons.evaluateAll(paths=>paths.filter(path=>path.getAttribute("fill")!==path.parentElement.querySelector(":scope > path:has(> animate)").getAttribute("stroke")).length),0);
  assert.equal(await fadedEgresses.count(),2);
  assert.equal(await fadedEndpoints.count(),3);
  assert.ok(Number(await archive.getAttribute("opacity"))<0.2);
@@ -148,7 +165,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
  // The highlight follows the pointer and nothing else: it is gone once the pointer is.
  await page.mouse.move(0,0);
  await faded.first().waitFor({state:"detached"});
- assert.equal(await snakes.count(),0);
+ assert.equal(await snakes.count(),6);
  assert.equal(await dashed.count(),11);
  // A route behind a kill switch lights up but does not move: nothing can go that way.
  await killSwitch.hover();
@@ -158,6 +175,12 @@ test("flow displays route evidence, opens editors, and edits weights without los
  assert.equal(await dashed.count(),11);
  await page.mouse.move(0,0);
  await faded.first().waitFor({state:"detached"});
+ // A reader who asks for less motion gets none, from the moment they ask: the traffic stands still in its ribbons.
+ await page.emulateMedia({reducedMotion:"reduce"});
+ await snakes.first().waitFor({state:"detached"});
+ assert.equal(await diagram.locator("path[stroke-dasharray='18 30']").count(),6);
+ await page.emulateMedia({reducedMotion:"no-preference"});
+ await snakes.nth(5).waitFor({state:"attached"});
  // Picking a box opens the editor for what the box stands for, and holds no highlight.
  const edits=[
   [diagram.getByRole("link",{name:"Edit the route for Feed mirror, leg 1",exact:true}),"Route for Feed mirror"],
@@ -180,30 +203,6 @@ test("flow displays route evidence, opens editors, and edits weights without los
   await page.mouse.move(0,0);
   await faded.first().waitFor({state:"detached"});
  }
- // A server's own editor shows its route and does not edit it: three lanes, no links, no controls.
- const own=page.getByRole("region",{name:"Server editor route",exact:true});
- for(const lane of lanes.slice(0,3))await own.getByText(lane,{exact:true}).waitFor();
- assert.equal(await own.getByText("ENDPOINTS",{exact:true}).count(),0);
- for(const leg of ["Leg 1 · 60%","Leg 2 · 30%","Leg 3 · 10%"])await own.getByText(leg,{exact:true}).waitFor();
- await own.getByText("Europe · pool",{exact:true}).waitFor();
- assert.equal(await own.locator("svg a").count(),0);
- assert.equal(await own.getByRole("button").count(),0);
- assert.equal(await own.getByRole("link",{name:"Edit in Networking",exact:true}).getAttribute("href"),"/settings/networking/routes?consumer=server%3A1");
- const unsaved=page.getByRole("region",{name:"New server route",exact:true});
- await unsaved.getByText(/^Starts on the direct route/).waitFor();
- assert.equal(await unsaved.locator("svg").count(),0);
- assert.equal(await unsaved.getByRole("link").count(),0);
- // A server saved behind a kill switch shows it in its own editor, and one about to be says what it will get.
- const heldRoute=page.getByRole("region",{name:"Held server route",exact:true});
- assert.deepEqual(await heldRoute.locator("svg text").allTextContents(),["EGRESS INTERFACES","ROUTE LEGS","PROXIES","System","Up","192.0.2.21","2001:db8::21","0 open · 0.00 MiB/s","Leg 1 · 100%","Blocked · 0/0 open · 0.00 MiB/s","0 planned","Kill switch","Blocked · no proxy, and direct is off"]);
- assert.equal(await heldRoute.locator("svg a").count(),0);
- assert.equal(await heldRoute.locator("svg path[stroke-dasharray]").count(),2);
- assert.equal(await heldRoute.getByRole("link",{name:"Edit in Networking",exact:true}).getAttribute("href"),"/settings/networking/routes?consumer=server%3A3");
- const unsavedHeld=page.getByRole("region",{name:"New held server route",exact:true});
- await unsavedHeld.getByText(/^Starts with nothing allowed out/).waitFor();
- assert.equal(await unsavedHeld.locator("svg").count(),0);
- if(process.env.NETWORKING_SCREENSHOT)await heldRoute.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-held-route.png")});
- if(process.env.NETWORKING_SCREENSHOT)await own.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-server-route.png")});
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-live.png"),fullPage:true});
  // The flow is not offered as a file.
  assert.equal(await page.getByRole("button",{name:"Download SVG"}).count(),0);
@@ -218,8 +217,8 @@ test("flow displays route evidence, opens editors, and edits weights without los
  await page.getByRole("menu",{name:"Leg 1 rung 1",exact:true}).waitFor({state:"detached"});
  await page.getByRole("button",{name:"Toggle all down"}).click();
  await page.getByText("0 / 50",{exact:true}).first().waitFor();
- await diagram.locator("path[stroke-dasharray]").nth(15).waitFor({state:"attached"});
- assert.equal(await diagram.locator("path[stroke-dasharray]").count(),16);
+ await dashed.nth(15).waitFor({state:"attached"});
+ assert.equal(await dashed.count(),16);
  // With one route picked, only what it reaches is drawn: its legs, the egress they leave through and its own card.
  const egressCards=diagram.locator("a[href='/settings/networking/egress']");
  await page.getByRole("button",{name:"Endpoint",exact:true}).click();

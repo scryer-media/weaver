@@ -61,6 +61,7 @@ const OverviewFlow = memo(function OverviewFlow({
       pools={pools}
       consumers={consumers}
       onEdit={onEdit}
+      traffic
       trace
     />
   );

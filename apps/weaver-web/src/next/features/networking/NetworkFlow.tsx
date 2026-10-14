@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import {
   closedPath,
@@ -92,6 +92,8 @@ const BOX_HEIGHT = 44;
 const NOTE_LINE = 12;
 /** The space a pool box keeps between its member rows and its head above, and its edge below. */
 const MEMBER_GAP = 8;
+/** The connections that fill the widest ribbon, unless a cap is larger: twenty is not many. */
+const RIBBON_FULL = 100;
 const EGRESS_PAGE = "/settings/networking/egress";
 const PROXIES_PAGE = "/settings/networking/proxies";
 const routePage = (consumer: string) => `/settings/networking/routes?consumer=${encodeURIComponent(consumer)}`;
@@ -118,8 +120,11 @@ type Block = {
   failing: FailingHop | undefined;
   /** The failing hop's reason, broken to fit the box that hop is drawn in. */
   note: string[];
-  pinned: number | null;
   members: Member[];
+  /** Where each member's row starts, below the block's top. */
+  memberTops: number[];
+  /** Where a line carrying the rung meets it, below the block's top: the member carrying the pool, or the head. */
+  anchor: number;
 };
 /** One leg's row: where it stands, how tall it is, and its ladder. */
 type Row = {
@@ -560,8 +565,16 @@ function UpDownSwitch({
   );
 }
 
-/** Whether the reader has asked for less motion; traffic then stands still. */
-const lessMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+const LESS_MOTION = "(prefers-reduced-motion: reduce)";
+const lessMotion = () => window.matchMedia?.(LESS_MOTION).matches === true;
+const onMotionChange = (changed: () => void) => {
+  const query = window.matchMedia?.(LESS_MOTION);
+  query?.addEventListener("change", changed);
+  return () => query?.removeEventListener("change", changed);
+};
+
+/** Whether the reader asks for less motion, followed while the flow is shown; traffic then stands still. */
+const useLessMotion = () => useSyncExternalStore(onMotionChange, lessMotion, () => false);
 
 /** Traffic on a line: dashes that crawl from the egress out toward the endpoint. */
 function Traffic({ points, width, still }: { points: Point[]; width: number; still: boolean }) {
@@ -596,10 +609,12 @@ function Traffic({ points, width, still }: { points: Point[]; width: number; sti
  * `compact` draws one endpoint's flow for that endpoint's own editor: no
  * controls, and no endpoint lane, since the editor is the endpoint. With
  * `endpoint` it ends at that one box instead, the far end a speed test
- * measures against. With `traffic` the lines carrying a leg that has
- * connections open move. With `trace`, pointing at a box sets the routes it
- * lights moving the same way, each in its ribbon, along the way each leg takes
- * (or the one way pointed at); a line that is down, failing or blocked stays still.
+ * measures against. With `traffic` the lines carrying a leg that is moving
+ * bytes move, except those a pointed-at box fades. With `trace`, pointing at
+ * a box sets the routes it lights moving the same way, each in its ribbon,
+ * along the way each leg takes (or the one way pointed at); a line that is
+ * down, failing or blocked stays still. Nothing moves for a reader who asks
+ * for less motion.
  */
 export const NetworkFlow = memo(function NetworkFlow({
   flow,
@@ -636,7 +651,7 @@ export const NetworkFlow = memo(function NetworkFlow({
   const [filter, setFilter] = useState("");
   const [group, setGroup] = useState<number | null>(null);
   const counts = useMeasurements(flow.legs);
-  const [still] = useState(lessMotion);
+  const still = useLessMotion();
   const lanes = compact ? (endpoint ? COMPACT_ENDPOINT : COMPACT) : FULL;
   const onToggle = toggles?.onToggle;
   const overrides = toggles?.overrides;
@@ -726,6 +741,20 @@ export const NetworkFlow = memo(function NetworkFlow({
           failing && !members.some((member) => member.id === failing.proxyId)
             ? wrap(failing.reason, boxWidth - 26, 9.5, rung.kind === "CHAIN" ? 4 : 2)
             : [];
+        // What carries the pool's traffic first, then the quickest to connect; the unmeasured last.
+        const latency = (member: Member) => member.live?.connectMs ?? Number.POSITIVE_INFINITY;
+        members.sort(
+          (a, b) => Number(b.state === "ACTIVE") - Number(a.state === "ACTIVE") || latency(a) - latency(b) || 0,
+        );
+        // An active head and a carrying member share a tint, so the rows start a gap below the head.
+        const memberTops: number[] = [];
+        let memberTop = BOX_HEIGHT + noteHeight(note.length) + MEMBER_GAP;
+        for (const member of members) {
+          memberTops.push(memberTop);
+          memberTop += member.height;
+        }
+        const carrier = members.findIndex((member) => member.carrying);
+        const anchor = carrier >= 0 ? memberTops[carrier]! + (members[carrier]!.height - 2) / 2 : BOX_HEIGHT / 2;
         const height =
           BOX_HEIGHT +
           noteHeight(note.length) +
@@ -733,7 +762,7 @@ export const NetworkFlow = memo(function NetworkFlow({
           (members.length ? 2 * MEMBER_GAP : 0);
         const top = bottom;
         bottom = top + height + 8;
-        blocks.push({ rung, rungIndex, top, height, failing, note, pinned: live?.pinnedMember ?? null, members });
+        blocks.push({ rung, rungIndex, top, height, failing, note, members, memberTops, anchor });
       }
       // Direct has no box: its line crosses level with the leg, or beneath the ladder it backs up.
       const bypass = leg.path.kind === "DIRECT" ? LEG_HEIGHT / 2 : leg.path.directFallback ? bottom + 26 : null;
@@ -758,7 +787,7 @@ export const NetworkFlow = memo(function NetworkFlow({
     return { rows, endpointY, height: compact ? bottom + 12 : Math.max(bottom + 52, 260) };
   }, [shownLegs, flow.pools, grouped, group, pools, profiles, egressBottom, cardsBottom, lanes, compact, toggleWidth, overrides]);
 
-  const width = scale(Math.max(1, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
+  const width = scale(Math.max(RIBBON_FULL, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
   const profile = (id: number | null) => profiles.find((candidate) => candidate.id === id);
   const name = (id: number) => profile(id)?.name ?? t("next.networking.proxyNumber", { id });
   const poolName = (id: number | null) =>
@@ -888,13 +917,6 @@ export const NetworkFlow = memo(function NetworkFlow({
       const state = configured?.enabled === false ? "DISABLED" : status;
       const held = members.reduce((sum, member) => sum + (member.live?.open ?? 0), 0);
       const head = BOX_HEIGHT + noteHeight(block.note.length);
-      // An active head and a carrying member share a tint, so the rows start a gap below the head.
-      const memberTops: number[] = [];
-      let memberY = y + head + MEMBER_GAP;
-      for (const member of members) {
-        memberTops.push(memberY);
-        memberY += member.height;
-      }
       return (
         <g key={rungIndex} {...way}>
           {failing ? <title>{failing.reason}</title> : null}
@@ -910,7 +932,7 @@ export const NetworkFlow = memo(function NetworkFlow({
               title={t("next.networking.flow.poolRung", { name: poolName(rung.poolId) })}
               aside={held > 0 ? countLabel(t, "next.networking.flow.holding", held) : undefined}
               state={state}
-              label={`${stateLabel(t, state)}${block.pinned != null ? ` · ${t("next.networking.flow.pinnedTo", { name: name(block.pinned) })}` : ""}`}
+              label={stateLabel(t, state)}
               note={block.note}
               active={isActive}
               toggleWidth={toggleWidth}
@@ -923,27 +945,26 @@ export const NetworkFlow = memo(function NetworkFlow({
           <StateBar x={PROXY.x} y={y} height={block.height} state={state} />
           <g role="group" aria-label={t("next.networking.flow.poolMembers", { name: poolName(rung.poolId) })}>
             {members.map((member, index) => {
-              const top = memberTops[index]!;
+              const top = y + block.memberTops[index]!;
               // Only what the pool has measured: a figure it has not taken is left out, not dashed.
-              const timing = member.measured
-                ? [
-                    member.live?.connectMs == null
-                      ? null
-                      : t("next.networking.flow.memberConnect", { ms: member.live.connectMs.toFixed(0) }),
-                    member.live?.bytesPerSecond == null
-                      ? null
-                      : t("next.networking.flow.memberSpeed", { rate: formatRate(member.live.bytesPerSecond) }),
-                  ]
-                    .filter((part) => part !== null)
-                    .join(" · ")
-                : null;
+              const ms = member.measured ? member.live?.connectMs : null;
+              const speed =
+                member.measured && member.live?.bytesPerSecond != null
+                  ? t("next.networking.flow.memberSpeed", { rate: formatRate(member.live.bytesPerSecond) })
+                  : null;
+              const timings = (latency: string | null) =>
+                member.measured ? [latency, speed].filter((part) => part !== null).join(" · ") : null;
+              // The hover has no room for the signal mark, so it says what the figure is.
+              const timing = timings(ms == null ? null : t("next.networking.flow.memberConnect", { ms: ms.toFixed(0) }));
               // A member carrying traffic shows what it carries now; its timings move to the hover.
+              const signal = !member.carrying && ms != null;
               const detail = member.carrying
                 ? t("next.networking.flow.egressLoad", {
                     open: member.live?.open ?? 0,
                     rate: formatRate(member.live?.liveBytesPerSecond ?? 0),
                   })
-                : timing;
+                : timings(ms == null ? null : t("next.networking.flow.memberLatency", { ms: ms.toFixed(0) }));
+              const detailX = PROXY.x + 29 + (signal ? 14 : 0);
               return card(
                 proxyTarget(member.id),
                 PROXIES_PAGE,
@@ -960,9 +981,14 @@ export const NetworkFlow = memo(function NetworkFlow({
                   <text x={PROXY.x + 29} y={top + 13} fill={INK.secondary} fontSize="10">
                     {`${fit(name(member.id), PROXY.width / 2 - 20, 10)} · ${stateLabel(t, member.state)}`}
                   </text>
+                  {signal ? (
+                    <g transform={`translate(${PROXY.x + 29} ${top + 17})`} color={INK.muted}>
+                      <Icon name="signal" size={10} />
+                    </g>
+                  ) : null}
                   {detail ? (
-                    <text x={PROXY.x + 29} y={top + 25} fill={INK.muted} fontSize="9.5">
-                      {fit(detail, PROXY.width - 45, 9.5)}
+                    <text x={detailX} y={top + 25} fill={INK.muted} fontSize="9.5">
+                      {fit(detail, PROXY.end - 16 - detailX, 9.5)}
                     </text>
                   ) : null}
                   <Note x={PROXY.x + 29} y={top + (detail ? 37 : 25)} lines={member.note} />
@@ -1087,7 +1113,7 @@ export const NetworkFlow = memo(function NetworkFlow({
               : (cards.get(leg.consumer)?.anchor ?? 58 + ENDPOINT_HEIGHT / 2);
             const legY = y + LEG_HEIGHT / 2;
             const count = counts[legKey(leg)] ?? leg.open;
-            const flowing = traffic && leg.open > 0;
+            const flowing = traffic && leg.open > 0 && (leg.bytesPerSecond ?? 0) > 0;
             const color = stateColor(leg.state);
             const tip = [
               t("next.networking.flow.connections", { open: leg.open, target: leg.target }),
@@ -1098,11 +1124,11 @@ export const NetworkFlow = memo(function NetworkFlow({
             // Every way the leg can take is drawn: a line stops at a rung's box and resumes past it, and
             // the way with no tunnel runs straight across. The one carrying the leg is the ribbon.
             const ways = [
-              ...blocks.map((block) => ({
-                at: y + block.top + BOX_HEIGHT / 2,
-                boxed: true,
-                status: rungStatus(leg, block.rungIndex, false),
-              })),
+              ...blocks.map((block) => {
+                const status = rungStatus(leg, block.rungIndex, false);
+                // The rung carrying the leg is met where its traffic goes: a pool's at the member carrying it.
+                return { at: y + block.top + (status === "ACTIVE" ? block.anchor : BOX_HEIGHT / 2), boxed: true, status };
+              }),
               ...(bypass == null ? [] : [{ at: y + bypass, boxed: false, status: rungStatus(leg, blocks.length, true) }]),
               ...(closed ? [{ at: y + BOX_HEIGHT / 2, boxed: true, status: "BLOCKED" }] : []),
             ];
@@ -1149,6 +1175,8 @@ export const NetworkFlow = memo(function NetworkFlow({
                 <title>{tip}</title>
                 {lines.map((line, index) => {
                   const traced = trace && focus !== null && line.lit && line.moves;
+                  // What a pointed-at box fades stands still, so only what it lights moves.
+                  const moving = traced || (flowing && line.lit);
                   const open = line.carries && count > 0;
                   // A traced line with nothing open is drawn as the live ribbon its leg's connections would fill.
                   const carried = open ? count : traced ? Math.max(1, leg.target) : 0;
@@ -1160,10 +1188,8 @@ export const NetworkFlow = memo(function NetworkFlow({
                         fill={open ? line.color : stateColor("ACTIVE")}
                         opacity={line.lit ? (focus ? 0.5 : 0.28) : 0.28 * FADE}
                       />
-                      {flowing || traced ? (
-                        <g opacity={line.lit ? undefined : FADE}>
-                          <Traffic points={line.points} width={Math.min(4, Math.max(2, thickness / 2))} still={still} />
-                        </g>
+                      {moving ? (
+                        <Traffic points={line.points} width={Math.min(4, Math.max(2, thickness / 2))} still={still} />
                       ) : null}
                     </g>
                   ) : (
@@ -1410,8 +1436,13 @@ export const NetworkFlow = memo(function NetworkFlow({
                         <rect x={ENDPOINTS.x} y={y} width={ENDPOINTS.width} height={height} fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} />
                         <StateBar x={ENDPOINTS.x} y={y} height={height} state={down ? "DOWN" : open > 0 ? "UP" : "IDLE"} />
                         <text x={x} y={y + 23} fill={INK.fg} fontSize="12.5" fontFamily={TITLE_FONT} fontWeight="600">
-                          {consumer.name.slice(0, 24)}
+                          {rss ? fit(consumer.name, ENDPOINTS.width - 50, 12.5) : consumer.name.slice(0, 24)}
                         </text>
+                        {rss ? (
+                          <g transform={`translate(${ENDPOINTS.end - 26} ${y + 12})`} color={INK.muted}>
+                            <Icon name="rss" size={12} />
+                          </g>
+                        ) : null}
                         {outbound ? null : (
                           <text x={x} y={y + 41} fill={INK.muted} fontSize="9.5">
                             {rss

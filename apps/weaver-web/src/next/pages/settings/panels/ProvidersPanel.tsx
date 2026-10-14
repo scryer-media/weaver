@@ -20,7 +20,6 @@ import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Icon } from "../../../components/icons";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { speedPage } from "../../../features/networking/data";
-import { RouteView } from "../../../features/networking/RouteView";
 import { SecondaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WorkingOverlay } from "../../../components/WorkingOverlay";
@@ -657,32 +656,27 @@ export function ProvidersPanel() {
             }),
           ],
         },
-        {
-          id: "routing",
-          title: t("next.providers.networkRoute"),
-          fields:
-            editingId === "new"
-              ? [
+        // A server's route is drawn and edited under Networking; only a new server sets something here.
+        ...(editingId === "new"
+          ? [
+              {
+                id: "routing",
+                title: t("next.providers.networkRoute"),
+                fields: [
                   {
                     id: "killSwitch",
                     label: t("next.networking.killSwitch"),
                     help: t("next.providers.killSwitchHelp"),
                     control: {
-                      kind: "toggle",
+                      kind: "toggle" as const,
                       value: values.killSwitch,
-                      onChange: (next) => patch({ killSwitch: next }),
+                      onChange: (next: boolean) => patch({ killSwitch: next }),
                     },
                   },
-                ]
-              : [],
-          body: (
-            <RouteView
-              consumer={typeof editingId === "number" ? `server:${editingId}` : undefined}
-              killSwitch={values.killSwitch}
-              speedLink
-            />
-          ),
-        },
+                ],
+              },
+            ]
+          : []),
       ]
     : [];
 

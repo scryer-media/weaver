@@ -1,7 +1,3 @@
-import { Link } from "react-router";
-import { useQuery, useSubscription } from "urql";
-import { NETWORK_FLOW_QUERY, NETWORK_FLOW_SUBSCRIPTION, NETWORKING_QUERY } from "@/graphql/networking";
-import { useTranslate } from "@/lib/context/translate-context";
 import {
   closedPath,
   testedPlan,
@@ -14,94 +10,11 @@ import {
   type ProxyPool,
 } from "@/lib/networking";
 import type { ProxyProfile } from "@/lib/proxies";
-import {
-  EMPTY_FLOW,
-  flowConsumers,
-  plannedFlow,
-  speedPage,
-  useSameWhileUnchanged,
-  type Consumer,
-  type NetworkingData,
-} from "./data";
+import type { Consumer } from "./data";
 import { NetworkFlow, type FlowEndpoint } from "./NetworkFlow";
 
 /** One leg while a test measures: its connections, the rung they went by (null for direct), and its rate now. */
 export type LiveLeg = { connections: number; rung: number | null | undefined; bytesPerSecond: number };
-
-/**
- * A server's or a feed's route, shown inside its own editor.
- *
- * Routes are made and changed under Networking, so this only shows the one
- * this consumer has: the egress each leg leaves through and the proxies it
- * tunnels through, with what each is doing now. A consumer that has not been
- * saved has no route to show; it starts on the default one, or behind a kill
- * switch if it is being made with one.
- */
-export function RouteView({
-  consumer,
-  killSwitch = false,
-  speedLink = false,
-}: {
-  consumer?: string;
-  killSwitch?: boolean;
-  /** Also link to the speed test with this consumer selected. */
-  speedLink?: boolean;
-}) {
-  const t = useTranslate();
-  const [{ data, error }] = useQuery<NetworkingData>({ query: NETWORKING_QUERY, pause: !consumer });
-  const [initial] = useQuery<{ networkFlow: Flow }>({ query: NETWORK_FLOW_QUERY, pause: !consumer });
-  const [live] = useSubscription<{ networkFlow: Flow }>({ query: NETWORK_FLOW_SUBSCRIPTION, pause: !consumer });
-  const measured = live.data?.networkFlow ?? initial.data?.networkFlow ?? EMPTY_FLOW;
-  const find = (consumers: Consumer[]) => consumers.find((candidate) => candidate.key === consumer);
-  // The flow names the consumers it has sampled; one it has not is still in the configuration.
-  // Each sample carries them, the egresses and the proxies afresh; the same ones are held.
-  const own = useSameWhileUnchanged(find(flowConsumers(measured, data, t)) ?? find(flowConsumers(EMPTY_FLOW, data, t)));
-  const egresses = useSameWhileUnchanged(measured.egresses ?? data?.egressInterfaces ?? []);
-  const profiles = useSameWhileUnchanged(measured.proxies ?? data?.proxyProfiles ?? []);
-  const pools = useSameWhileUnchanged(measured.proxyPools ?? data?.proxyPools ?? []);
-  if (!consumer) {
-    return (
-      <p className="px-4 py-4 text-[12.5px] leading-[1.5] text-wv-muted sm:px-6">
-        {t(killSwitch ? "next.networking.policy.unsavedBlocked" : "next.networking.policy.unsaved")}
-      </p>
-    );
-  }
-
-  return (
-    <div className="flex min-w-0 flex-col">
-      {error ? (
-        <p role="alert" className="px-4 py-4 text-[12.5px] leading-[1.5] text-wv-error-text sm:px-6">
-          {t("next.networking.policy.loadFailed")}
-        </p>
-      ) : null}
-      {own ? (
-        <NetworkFlow
-          compact
-          flow={plannedFlow(measured, [own])}
-          egresses={egresses}
-          profiles={profiles}
-          pools={pools}
-          consumers={[own]}
-        />
-      ) : error ? null : (
-        <p className="px-4 py-4 text-[12.5px] leading-[1.5] text-wv-muted sm:px-6">{t("next.networking.policy.loading")}</p>
-      )}
-      <div className="flex flex-wrap items-center">
-        <Link
-          to={`/settings/networking/routes?consumer=${encodeURIComponent(consumer)}`}
-          className="self-start px-4 py-3 text-[12.5px] text-wv-accent hover:underline sm:px-6"
-        >
-          {t("next.networking.policy.editInNetworking")}
-        </Link>
-        {speedLink ? (
-          <Link to={speedPage(consumer)} className="self-start px-4 py-3 text-[12.5px] text-wv-accent hover:underline sm:px-6">
-            {t("next.networking.speed.title")}
-          </Link>
-        ) : null}
-      </div>
-    </div>
-  );
-}
 
 /**
  * A route as a speed test takes it: the compact flow of one consumer, drawn

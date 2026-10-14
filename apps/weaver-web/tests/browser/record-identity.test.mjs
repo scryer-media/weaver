@@ -97,18 +97,17 @@ test("a kill switch saves a new provider switched off behind a blocked route, un
     const testConnection = page.getByRole("button", { name: "Test connection", exact: true });
     assert.equal(await enabled.getAttribute("aria-checked"), "true");
     assert.equal(await killSwitch.getAttribute("aria-checked"), "false");
-    await page.getByText(/^Starts on the direct route/).waitFor();
 
     await killSwitch.click();
-    await page.getByText(/^Starts with nothing allowed out/).waitFor();
-    assert.equal(await enabled.getAttribute("aria-checked"), "false");
+    await enabled.and(page.locator("[aria-checked='false']")).waitFor();
+    // The provider editor draws no route: that is Networking's.
+    assert.equal(await page.getByRole("link", { name: "Edit in Networking", exact: true }).count(), 0);
     assert.equal(await enabled.isDisabled(), true);
     assert.equal(await testConnection.isDisabled(), true);
 
     // Taking the kill switch back off gives the provider back as it was filled in.
     await killSwitch.click();
-    await page.getByText(/^Starts on the direct route/).waitFor();
-    assert.equal(await enabled.getAttribute("aria-checked"), "true");
+    await enabled.and(page.locator("[aria-checked='true']")).waitFor();
     assert.equal(await enabled.isDisabled(), false);
     assert.equal(await testConnection.isDisabled(), false);
 
@@ -173,10 +172,10 @@ test("a kill switch saves a new feed switched off behind a blocked route", RUNNE
     const enabled = toggle(page, "Enabled");
     const killSwitch = toggle(page, "Kill switch");
     assert.equal(await enabled.getAttribute("aria-checked"), "true");
-    await page.getByText(/^Starts on the direct route/).waitFor();
     await killSwitch.click();
-    await page.getByText(/^Starts with nothing allowed out/).waitFor();
-    assert.equal(await enabled.getAttribute("aria-checked"), "false");
+    await enabled.and(page.locator("[aria-checked='false']")).waitFor();
+    // The feed editor draws no route: that is Networking's.
+    assert.equal(await page.getByRole("link", { name: "Edit in Networking", exact: true }).count(), 0);
     assert.equal(await enabled.isDisabled(), true);
     await shot(page, "feed-kill-switch");
     await page.getByRole("button", { name: SAVE }).click();

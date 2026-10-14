@@ -21,7 +21,6 @@ import { RecordEditor, type EditorSection } from "../../../components/RecordEdit
 import { SecondaryButton, Select } from "../../../components/controls";
 import { Icon } from "../../../components/icons";
 import { RoutingState } from "../../../components/RoutingState";
-import { RouteView } from "../../../features/networking/RouteView";
 import { Cell } from "../../../components/rows";
 import { formatDate, formatSize } from "../../../data/format";
 import { WV } from "../../../data/palette";
@@ -815,28 +814,27 @@ export function RssPanel() {
           : []),
       ],
     },
-    {
-      id: "routing",
-      title: t("next.providers.networkRoute"),
-      fields:
-        feedId === "new"
-          ? [
+    // A feed's route is drawn and edited under Networking; only a new feed sets something here.
+    ...(feedId === "new"
+      ? [
+          {
+            id: "routing",
+            title: t("next.providers.networkRoute"),
+            fields: [
               {
                 id: "killSwitch",
                 label: t("next.networking.killSwitch"),
                 help: t("next.rss.killSwitchHelp"),
                 control: {
-                  kind: "toggle",
+                  kind: "toggle" as const,
                   value: feedForm.killSwitch,
-                  onChange: (next) => patchFeed({ killSwitch: next }),
+                  onChange: (next: boolean) => patchFeed({ killSwitch: next }),
                 },
               },
-            ]
-          : [],
-      body: (
-        <RouteView consumer={editingFeed ? `rss:${editingFeed.id}` : undefined} killSwitch={feedForm.killSwitch} />
-      ),
-    },
+            ],
+          },
+        ]
+      : []),
   ];
 
   const ruleFields: FieldSpec[] = [
