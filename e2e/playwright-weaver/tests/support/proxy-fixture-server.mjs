@@ -101,6 +101,9 @@ export async function startProxyFixture(options = {}) {
   let sequence = 0;
   let feedToken = "initial";
   let nzb = "";
+  // The TTL on every address answered locally. 0 unless a flow sets it, so
+  // Weaver holds no answer between lookups.
+  let dnsTtl = 0;
   // Article bytes arrive in many chunks per connection; consecutive chunks on
   // one route fold into the last event so a long download cannot push the
   // events a test asserts (connections, DNS, held bodies) out of the log. The
@@ -309,7 +312,8 @@ export async function startProxyFixture(options = {}) {
     header.writeUInt16BE(known ? 0x8180 : 0x8183, 2);
     header.writeUInt16BE(1, 4);
     if (known && type === 1) {
-      const answers = (local ?? addresses).map(address => Buffer.from([0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, ...address.split(".").map(Number)]));
+      const ttl = [dnsTtl >>> 24, (dnsTtl >>> 16) & 255, (dnsTtl >>> 8) & 255, dnsTtl & 255];
+      const answers = (local ?? addresses).map(address => Buffer.from([0xc0, 0x0c, 0, 1, 0, 1, ...ttl, 0, 4, ...address.split(".").map(Number)]));
       header.writeUInt16BE(answers.length, 6);
       return Buffer.concat([header, question, ...answers]);
     }
@@ -382,6 +386,10 @@ export async function startProxyFixture(options = {}) {
           route.socksReply = command.socksReply;
         }
         if (command.cut) for (const socket of route.sockets) socket.destroy();
+      }
+      if ("dnsTtl" in command) {
+        if (!(Number.isInteger(command.dnsTtl) && command.dnsTtl >= 0 && command.dnsTtl <= 86400)) throw new Error("dnsTtl must be whole seconds from 0 to 86400");
+        dnsTtl = command.dnsTtl;
       }
       if (typeof command.nzb === "string") nzb = command.nzb;
       if (typeof command.feedToken === "string" && /^[a-z0-9-]+$/.test(command.feedToken)) feedToken = command.feedToken;

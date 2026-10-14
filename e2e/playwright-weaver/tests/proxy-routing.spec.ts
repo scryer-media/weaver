@@ -271,6 +271,74 @@ test("a proxy Weaver resolves for is handed the address and carries a download",
   }
 });
 
+// A hop holds what its DNS servers answered for as long as the answer's TTL
+// says. A connection test borrows the hop a live server built, so it asks
+// the servers again while their answers are for no time at all, and not once
+// they are held.
+test("a proxy hop holds its DNS servers' answer for its TTL", async ({ request }) => {
+  test.setTimeout(4 * 60_000);
+  const events = async (after: number) => {
+    const response = await request.get(`${controlUrl}/events?after=${after}`);
+    expect(response.ok()).toBeTruthy();
+    return await response.json() as { sequence: number; events: Event[] };
+  };
+  const mark = async () => (await events(Number.MAX_SAFE_INTEGER)).sequence;
+  const control = async (data: Record<string, unknown>) => {
+    const response = await request.post(controlUrl, { data });
+    expect(response.ok(), await response.text()).toBeTruthy();
+  };
+  const response = await request.get(controlUrl);
+  expect(response.ok()).toBeTruthy();
+  const fixture: Evidence = await response.json();
+  await control({ route: "primary", up: true, hold: false, connectStatus: null });
+  await control({ dnsTtl: 0 });
+  await updateConfiguredServer(request, "nntp", { active: false });
+  await updateConfiguredServer(request, "nntp2", { active: false });
+  const saved = await graphql<{ saveProxyProfile: { id: number } }>(request,
+    `mutation($input: ProxyProfileInput!) { saveProxyProfile(input: $input) { id } }`,
+    { input: {
+      name: "e2e-held-answers", kind: "HTTP_CONNECT", resolver: "PROXY", enabled: true,
+      host: fixture.ip, port: fixture.ports.primary, username: "fixture", password: "fixture", dnsServers: [fixture.ip], timeoutSeconds: 2,
+    } });
+  const name = "held-answers.proxy.test";
+  const input = {
+    host: name, port: fixture.ports.nntp, tls: false, username: "e2e-user", password: "e2e-pass", connections: 1,
+    routing: { proxyIds: [saved.saveProxyProfile.id], allowDirect: false },
+  };
+  const added = await graphql<{ addServer: { id: number } }>(request,
+    `mutation($input: ServerInput!) { addServer(input: $input) { id } }`, { input: { ...input, active: true } });
+  const probe = async () => {
+    const result = (await graphql<{ testConfiguredServerConnection: { success: boolean; message: string } }>(request,
+      `mutation($id: Int!) { testConfiguredServerConnection(id: $id) { success message } }`, { id: added.addServer.id })).testConfiguredServerConnection;
+    expect(result).toMatchObject({ success: true });
+  };
+  const lookups = (seen: Event[]) => seen.filter(event => event.kind === "routed-dns" && event.name === name);
+  try {
+    const jobId = await startDownload(request, "proxy-held-answers");
+    await expect.poll(async () => await jobState(request, jobId), { timeout: 60_000 }).toBe("COMPLETED");
+
+    let start = await mark();
+    await probe();
+    expect(lookups((await events(start)).events).length, "an answer for no time at all is asked for again").toBeGreaterThan(0);
+
+    await control({ dnsTtl: 3600 });
+    start = await mark();
+    await probe();
+    expect(lookups((await events(start)).events).length, "nothing was held, so the servers are asked").toBeGreaterThan(0);
+
+    start = await mark();
+    await probe();
+    const seen = (await events(start)).events;
+    expect(lookups(seen), "a held answer asks the servers nothing").toEqual([]);
+    expect(seen.filter(event => event.kind === "attempt" && event.port === fixture.ports.dns), "no lookup is dialled through the proxy").toEqual([]);
+    expect(seen.filter(event => event.kind === "attempt" && event.route === "primary" && event.port === fixture.ports.nntp).length).toBeGreaterThan(0);
+  } finally {
+    await control({ dnsTtl: 0 });
+    await graphql(request, `mutation($id: Int!, $input: ServerInput!) { updateServer(id: $id, input: $input) { id } }`,
+      { id: added.addServer.id, input: { ...input, active: false } });
+  }
+});
+
 async function startDownload(request: APIRequestContext, name: string): Promise<number> {
   const count = 32;
   const size = 64 * 1024;

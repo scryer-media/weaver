@@ -730,6 +730,11 @@
       "oracle": "api-metrics"
     },
     {
+      "name": "proxy-hop-holds-dns-answers-for-their-ttl",
+      "owner": "proxy-routing",
+      "oracle": "api-metrics"
+    },
+    {
       "name": "encrypted-backup-restore-matrix",
       "owner": "ui-backup-restore-sqlite-to-sqlite",
       "oracle": "browser"
