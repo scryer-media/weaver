@@ -664,7 +664,8 @@ export function Slider({
  * A number box, whole unless `precision` asks for decimal places.
  *
  * Kept as text while focused so a field can be cleared and retyped — a number
- * input that snaps an empty string back to 0 is unusable — and clamped on blur.
+ * input that snaps an empty string back to 0 is unusable — and clamped on blur
+ * or Enter.
  *
  * A unit ("days", "seconds") is set inside the box at its right edge. The
  * border belongs to the label wrapping both, so a click on the unit still
@@ -731,6 +732,11 @@ export function NumberField({
         value={draft ?? String(value)}
         onChange={(event) => setDraft(event.target.value)}
         onBlur={(event) => commit(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            commit(event.currentTarget.value);
+          }
+        }}
         className={cn(
           "h-full min-w-0 bg-transparent pl-3 font-wv-mono text-[12px] text-wv-fg outline-none",
           suffix === undefined ? "flex-1 pr-3" : "w-[86px] flex-none",
@@ -757,6 +763,7 @@ export function TextArea({
   rows = 3,
   className,
   secret,
+  onBlur,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -766,6 +773,7 @@ export function TextArea({
   className?: string;
   /** Keep password managers out, for key material. */
   secret?: boolean;
+  onBlur?: () => void;
 }) {
   const ignore = usePasswordManagerIgnore({ secret, type: "textarea" });
   return (
@@ -776,6 +784,7 @@ export function TextArea({
       rows={rows}
       value={value}
       onChange={(event) => onChange(event.target.value)}
+      onBlur={onBlur}
       className={cn(
         "w-[268px] max-w-full resize-y border border-wv-control bg-wv-input px-3 py-2 font-wv-mono text-[12px] leading-[1.5] text-wv-fg outline-none focus:border-wv-control-focus",
         className,

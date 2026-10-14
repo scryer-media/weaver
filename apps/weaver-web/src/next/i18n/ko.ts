@@ -677,8 +677,6 @@ export const nextKo: LocaleDictionary = {
   "next.archivePasswords.title": "압축 파일 비밀번호",
   "next.archivePasswords.list": "비밀번호 (한 줄에 하나)",
   "next.archivePasswords.edit": "비밀번호 편집",
-  "next.archivePasswords.cleared": "저장 시 삭제됨",
-  "next.archivePasswords.keep": "유지",
   "next.archivePasswords.file": "비밀번호 파일",
   "next.archivePasswords.password": "압축 파일 비밀번호",
   "next.archivePasswords.show": "표시",

@@ -677,8 +677,6 @@ export const nextZh: LocaleDictionary = {
   "next.archivePasswords.title": "压缩包密码",
   "next.archivePasswords.list": "密码（每行一个）",
   "next.archivePasswords.edit": "编辑密码",
-  "next.archivePasswords.cleared": "保存时移除",
-  "next.archivePasswords.keep": "保留",
   "next.archivePasswords.file": "密码文件",
   "next.archivePasswords.password": "压缩包密码",
   "next.archivePasswords.show": "显示",

@@ -677,8 +677,6 @@ export const nextFr: LocaleDictionary = {
   "next.archivePasswords.title": "Mots de passe des archives",
   "next.archivePasswords.list": "Mots de passe (un par ligne)",
   "next.archivePasswords.edit": "Modifier les mots de passe",
-  "next.archivePasswords.cleared": "Supprimé à l’enregistrement",
-  "next.archivePasswords.keep": "Conserver",
   "next.archivePasswords.file": "Fichier de mots de passe",
   "next.archivePasswords.password": "Mot de passe de l’archive",
   "next.archivePasswords.show": "Afficher",

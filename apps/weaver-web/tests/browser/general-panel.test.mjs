@@ -28,44 +28,141 @@ async function shot(part, name) {
   }
 }
 const sent = (page, name) => page.evaluate((name) => window.generalPanelFixture.sent.filter((entry) => entry.name === name).map((entry) => entry.variables), name);
+/** Wait until the panel has sent `count` mutations named `name`. */
+const sentCount = (page, name, count) =>
+  page.waitForFunction(([name, count]) => window.generalPanelFixture.sent.filter((entry) => entry.name === name).length >= count, [name, count]);
+/** The panel never offered the top bar anything to save or revert. */
+async function assertNeverDirty(page) {
+  const { dirty, actions } = await page.evaluate(() => ({
+    dirty: window.generalPanelFixture.flags.filter((flags) => flags.dirty).length,
+    actions: window.generalPanelFixture.actions.current,
+  }));
+  assert.equal(dirty, 0);
+  assert.equal(actions, null);
+}
 
-test("the password list stays shut until Edit passwords opens it, and shuts again on save and on revert", async () => {
+test("a toggle, a select and a committed number each save on their own, and the top bar never turns dirty", async () => {
+  const { page, errors } = await open();
+  try {
+    const downloads = page.getByRole("region", { name: "Downloads", exact: true });
+    const srrdb = downloads.getByRole("switch", { name: "SRRDB release lookup", exact: true });
+    const retries = downloads.getByRole("spinbutton", { name: "Article retries", exact: true });
+    const delay = downloads.getByRole("spinbutton", { name: "Propagation delay", exact: true });
+    await srrdb.waitFor();
+
+    // A toggle saves as it changes, and only its own field.
+    await srrdb.click();
+    await sentCount(page, "UpdateSettings", 1);
+    assert.deepEqual(await sent(page, "UpdateSettings"), [{ input: { enableSrrdbLookup: true } }]);
+    await downloads.locator('[role="switch"][aria-checked="true"]').waitFor();
+
+    // A number saves when Enter commits it, not while it is typed.
+    await retries.fill("5");
+    assert.equal((await sent(page, "UpdateSettings")).length, 1);
+    await retries.press("Enter");
+    await sentCount(page, "UpdateSettings", 2);
+    assert.deepEqual((await sent(page, "UpdateSettings"))[1], { input: { maxRetries: 5 } });
+
+    // Committing what is already stored sends nothing: the next save is the delay's.
+    await retries.press("Enter");
+    await retries.blur();
+    await delay.fill("120");
+    await delay.blur();
+    await sentCount(page, "UpdateSettings", 3);
+    assert.deepEqual((await sent(page, "UpdateSettings")).slice(2), [{ input: { propagationDelaySecs: 120 } }]);
+
+    // A duplicate rule saves alone, as its one field of the policy.
+    const duplicates = page.getByRole("region", { name: "Duplicates", exact: true });
+    await duplicates.getByRole("button", { name: "Overlapping article set", exact: true }).click();
+    await page.getByRole("menu", { name: "Overlapping article set", exact: true }).getByRole("menuitemradio", { name: "Block", exact: true }).click();
+    await sentCount(page, "UpdateSettings", 4);
+    assert.deepEqual((await sent(page, "UpdateSettings"))[3], { input: { duplicatePolicy: { articleSet: "BLOCK" } } });
+    await duplicates.getByRole("button", { name: "Overlapping article set", exact: true }).filter({ hasText: "Block" }).waitFor();
+
+    // Each save went alone through its own mutation.
+    assert.equal((await sent(page, "UpdateArchivePasswordSettings")).length, 0);
+    assert.equal((await sent(page, "SetUnacceptableExtensions")).length, 0);
+    await page.locator("#status").filter({ hasText: /^clean$/ }).waitFor();
+    await assertNeverDirty(page);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test("a refused save keeps what was typed or chosen and shows the daemon's reason", async () => {
+  const { page, errors } = await open();
+  try {
+    const downloads = page.getByRole("region", { name: "Downloads", exact: true });
+    const extensions = downloads.getByRole("textbox", { name: "Unacceptable extensions", exact: true });
+    const status = page.locator("#status");
+    await extensions.waitFor();
+
+    await page.evaluate(() => { window.generalPanelFixture.refuse.SetUnacceptableExtensions = "the extension list was refused"; });
+    await extensions.fill("bat, iso");
+    await extensions.press("Enter");
+    await status.filter({ hasText: /^clean the extension list was refused$/ }).waitFor();
+    assert.equal(await extensions.inputValue(), "bat, iso");
+    assert.equal(await page.evaluate(() => window.generalPanelFixture.flags.at(-1).failed), true);
+
+    // Committed again once the daemon takes it, it is stored and the reason goes.
+    await page.evaluate(() => { delete window.generalPanelFixture.refuse.SetUnacceptableExtensions; });
+    await extensions.press("Enter");
+    await sentCount(page, "SetUnacceptableExtensions", 2);
+    await status.filter({ hasText: /^clean$/ }).waitFor();
+    assert.deepEqual(await sent(page, "SetUnacceptableExtensions"), [{ extensions: ["bat", "iso"] }, { extensions: ["bat", "iso"] }]);
+
+    // A refused toggle keeps the choice in view beside the reason.
+    const storage = page.getByRole("region", { name: "Storage", exact: true });
+    const cleanup = storage.getByRole("switch", { name: "Clean up after unpacking", exact: true });
+    await page.evaluate(() => { window.generalPanelFixture.refuse.UpdateSettings = "settings were refused"; });
+    await cleanup.click();
+    await status.filter({ hasText: /^clean settings were refused$/ }).waitFor();
+    assert.equal(await cleanup.getAttribute("aria-checked"), "false");
+    assert.deepEqual(await sent(page, "UpdateSettings"), [{ input: { cleanupAfterExtract: false } }]);
+    await assertNeverDirty(page);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
+test("the password list stays shut until Edit passwords opens it, saves when left, and Clear removes the stored one", async () => {
   const { page, errors } = await open();
   try {
     const section = page.getByRole("region", { name: "Archive passwords", exact: true });
     const edit = section.getByRole("button", { name: "Edit passwords", exact: true });
     const list = section.getByRole("textbox", { name: "Passwords (one per line)", exact: true });
-    const status = page.locator("#status");
+    const clear = section.getByRole("button", { name: "Clear", exact: true });
     await edit.waitFor();
     assert.equal(await list.count(), 0);
-    await section.getByRole("button", { name: "Clear", exact: true }).waitFor();
+    await clear.waitFor();
     await shot(section, "archive-passwords");
 
-    // Opened, a new list is typed and saved; saving shuts the box again.
+    // Opened and left blank, it shuts again and keeps what is stored.
+    await edit.click();
+    await list.focus();
+    await list.blur();
+    await edit.waitFor();
+    assert.equal(await list.count(), 0);
+
+    // A typed list saves when the box is left, and the box shuts.
     await edit.click();
     await list.fill("first-secret\nsecond-secret");
-    assert.equal(await edit.count(), 0);
-    await page.evaluate(() => window.generalPanelFixture.actions.current.save());
-    await status.filter({ hasText: /^clean Saved/ }).waitFor();
+    await list.blur();
     await edit.waitFor();
     assert.equal(await list.count(), 0);
-    assert.deepEqual((await sent(page, "UpdateArchivePasswordSettings"))[0], { passwords: ["first-secret", "second-secret"], passwordFile: null });
-    // The extension list was not touched, so it was not sent.
+    assert.deepEqual(await sent(page, "UpdateArchivePasswordSettings"), [{ passwords: ["first-secret", "second-secret"] }]);
+
+    // Clear removes the stored list at once.
+    await clear.click();
+    await clear.waitFor({ state: "detached" });
+    assert.deepEqual(await sent(page, "UpdateArchivePasswordSettings"), [{ passwords: ["first-secret", "second-secret"] }, { passwords: [] }]);
+    assert.equal(await list.count(), 0);
+    // Nothing else was touched, so nothing else was sent.
     assert.equal((await sent(page, "SetUnacceptableExtensions")).length, 0);
-
-    // Opened and reverted, it shuts with nothing typed kept.
-    await edit.click();
-    await list.fill("third-secret");
-    await status.filter({ hasText: /^dirty/ }).waitFor();
-    await page.evaluate(() => window.generalPanelFixture.actions.current.revert());
-    await edit.waitFor();
-    assert.equal(await list.count(), 0);
-    await status.filter({ hasText: /^clean/ }).waitFor();
-
-    // Clearing shows the box only to say the list goes on save; there is nothing in it to see.
-    await section.getByRole("button", { name: "Clear", exact: true }).click();
-    assert.equal(await list.inputValue(), "");
-    assert.equal(await list.getAttribute("placeholder"), "Removed on save");
+    assert.equal((await sent(page, "UpdateSettings")).length, 0);
+    await assertNeverDirty(page);
     assert.deepEqual(errors, []);
   } finally {
     await page.close();
@@ -84,11 +181,11 @@ test("the unacceptable extension list is a Downloads row, and saves on its own a
     await shot(section, "downloads");
 
     await extensions.fill("bat, cmd, EXE, iso");
-    await page.locator("#status").filter({ hasText: /^dirty/ }).waitFor();
-    await page.evaluate(() => window.generalPanelFixture.actions.current.save());
-    await page.locator("#status").filter({ hasText: /^clean Saved/ }).waitFor();
-    assert.deepEqual(await sent(page, "SetUnacceptableExtensions"), [{ extensions: ["bat", "cmd", "EXE", "iso"] }]);
+    await extensions.blur();
     await section.getByRole("textbox", { name: "Unacceptable extensions", exact: true }).and(page.locator('[value="bat, cmd, exe, iso"]')).waitFor();
+    assert.deepEqual(await sent(page, "SetUnacceptableExtensions"), [{ extensions: ["bat", "cmd", "EXE", "iso"] }]);
+    assert.equal((await sent(page, "UpdateSettings")).length, 0);
+    await assertNeverDirty(page);
     assert.deepEqual(errors, []);
   } finally {
     await page.close();

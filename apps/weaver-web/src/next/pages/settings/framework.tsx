@@ -92,12 +92,16 @@ export type FieldControl =
       autoComplete?: string;
       /** Keep password managers out. Defaults to on for a password that is not the Weaver login. */
       secret?: boolean;
+      /** The value as typed, when the field is left or Enter is pressed in it. */
+      onCommit?: (value: string) => void;
     }
   /** A folder on the daemon's filesystem, or a file: typed, or picked with Browse. */
   | {
       kind: "path";
       value: string;
       onChange: (next: string) => void;
+      /** The path, when the field is left, Enter is pressed in it, or Browse picks one. */
+      onCommit?: (value: string) => void;
       placeholder?: string;
       pick?: "folder" | "file";
       /** The folder Browse opens in while the field is empty. */
@@ -194,11 +198,22 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           label={spec.label}
         />
       );
-    case "text":
+    case "text": {
+      const commit = control.onCommit;
       return (
         <TextField
           value={control.value}
           onChange={control.onChange}
+          onBlur={commit ? () => commit(control.value) : undefined}
+          onKeyDown={
+            commit
+              ? (event) => {
+                  if (event.key === "Enter") {
+                    commit(event.currentTarget.value);
+                  }
+                }
+              : undefined
+          }
           label={spec.label}
           placeholder={control.placeholder}
           mono={control.mono ?? true}
@@ -208,11 +223,13 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           className={control.className ?? "w-[268px] max-w-full"}
         />
       );
+    }
     case "path":
       return (
         <PathField
           value={control.value}
           onChange={control.onChange}
+          onCommit={control.onCommit}
           label={spec.label}
           placeholder={control.placeholder}
           pick={control.pick}

@@ -428,6 +428,7 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
 export function PathField({
   value,
   onChange,
+  onCommit,
   label,
   placeholder,
   pick,
@@ -437,6 +438,8 @@ export function PathField({
 }: {
   value: string;
   onChange: (next: string) => void;
+  /** The path, when the field is left, Enter is pressed in it, or the picker chooses one. */
+  onCommit?: (value: string) => void;
   label: string;
   placeholder?: string;
   pick?: "folder" | "file";
@@ -485,6 +488,16 @@ export function PathField({
         value={value}
         placeholder={placeholder}
         onChange={onChange}
+        onBlur={onCommit ? () => onCommit(value) : undefined}
+        onKeyDown={
+          onCommit
+            ? (event) => {
+                if (event.key === "Enter") {
+                  onCommit(event.currentTarget.value);
+                }
+              }
+            : undefined
+        }
         onFocus={() => {
           if (quietFocus.current) {
             quietFocus.current = false;
@@ -510,6 +523,7 @@ export function PathField({
         onClose={closePicker}
         onChoose={(path) => {
           onChange(path);
+          onCommit?.(path);
           closePicker();
         }}
       />
