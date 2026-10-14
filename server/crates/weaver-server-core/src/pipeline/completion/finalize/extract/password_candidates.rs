@@ -106,7 +106,8 @@ where
             password.clone(),
             limits,
             SevenZipDecodeThreads::Fixed(context.decode_threads),
-            |entry, reader, _| {
+            None,
+            |entry, _, reader| {
                 let mut member = 0u64;
                 let mut buffer = [0u8; 8192];
                 loop {

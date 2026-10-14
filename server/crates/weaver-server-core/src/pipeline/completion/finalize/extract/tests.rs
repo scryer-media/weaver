@@ -18,36 +18,202 @@ use lzma_turbo::{LzmaEncProps, XzWriter};
 
 static XZ_MT_DECODER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+// The sink holds a member to its declared length. Its CRC is the reader's to
+// check; see `a_member_failing_the_readers_crc_check_is_never_committed`.
 #[test]
-fn sevenz_member_requires_declared_length_and_crc() {
+fn sevenz_member_requires_declared_length() {
     let payload = b"verified member";
-    let mut crc = weaver_yenc::crc::Crc32::new();
-    crc.update(payload);
-    let checksum = u64::from(crc.finalize());
-    for has_crc in [false, true] {
-        for size in [payload.len() - 1, payload.len(), payload.len() + 1] {
-            for stored_crc in [checksum, checksum ^ 1] {
-                let entry = sevenz_turbo::ArchiveEntry {
-                    name: "member.bin".into(),
-                    size: size as u64,
-                    has_crc,
-                    crc: stored_crc,
-                    ..Default::default()
-                };
-                let mut output = Vec::new();
-                let result = copy_verified_7z_member(&entry, &mut &payload[..], &mut output);
-                let valid = size == payload.len() && (!has_crc || stored_crc == checksum);
-                assert_eq!(
-                    result.is_ok(),
-                    valid,
-                    "size={size}, crc={stored_crc}, has_crc={has_crc}"
-                );
-                if valid {
-                    assert_eq!(result.unwrap(), payload.len() as u64);
-                    assert_eq!(output, payload);
-                }
-            }
+    for size in [payload.len() - 1, payload.len(), payload.len() + 1] {
+        let entry = sevenz_turbo::ArchiveEntry {
+            name: "member.bin".into(),
+            size: size as u64,
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        let result = copy_verified_7z_member(&entry, &mut &payload[..], &mut output);
+        let valid = size == payload.len();
+        assert_eq!(result.is_ok(), valid, "size={size}");
+        if valid {
+            assert_eq!(result.unwrap(), payload.len() as u64);
+            assert_eq!(output, payload);
         }
+    }
+}
+
+// Bytes no coder can shrink, so an LZMA2 encoder stores them in uncompressed
+// chunks and a flipped byte decodes as a flipped byte: a CRC mismatch, not a
+// decoder failure.
+fn incompressible(bytes: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..bytes)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+// A 7z archive of `members` in one block coded with `method`.
+fn sevenz_archive_with_method(
+    method: sevenz_turbo::EncoderConfiguration,
+    members: &[(&str, &[u8])],
+) -> Vec<u8> {
+    use sevenz_turbo::{ArchiveEntry, ArchiveWriter};
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+    writer.set_content_methods(vec![method]);
+    for (name, bytes) in members {
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file(name),
+                Some(Cursor::new(bytes.to_vec())),
+            )
+            .expect("entry");
+    }
+    writer.finish().expect("finish").into_inner()
+}
+
+// The member names the decode announced as finished, in order.
+fn finished_members(events: &mut tokio::sync::broadcast::Receiver<PipelineEvent>) -> Vec<String> {
+    let mut finished = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let PipelineEvent::ExtractionMemberFinished { member, .. } = event {
+            finished.push(member);
+        }
+    }
+    finished
+}
+
+// Weaver computes no member CRC of its own: the reader's verdict is the
+// commit signal. A member whose bytes do not match its CRC fails the set as a
+// block data error, which keeps the set for the recovery data to rule on, and
+// it is never announced as extracted nor counted as completed. The member
+// before it, which matched, is committed.
+//
+// Every place the reader checks a CRC: Copy, by its verifying reader on the
+// delivering thread; and a multi-run LZMA2 archive on four threads, whose
+// small first block decodes on a folder worker and whose second, too large to
+// stage, decodes alone in parallel with its checksums folded from the
+// workers, so its verdict can arrive after its callback has returned.
+#[test]
+fn a_member_failing_the_readers_crc_check_is_never_committed() {
+    let good = incompressible(3 * 1024 * 1024, 7);
+    let bad = incompressible(9 * 1024 * 1024, 11);
+    let members: [(&str, &[u8]); 2] = [
+        ("Silver.Horizon/good.bin", &good),
+        ("Silver.Horizon/bad.bin", &bad),
+    ];
+    let cases = [
+        (
+            "copy",
+            sevenz_archive_with_method(
+                sevenz_turbo::EncoderConfiguration::new(sevenz_turbo::EncoderMethod::COPY),
+                &members,
+            ),
+            1,
+        ),
+        (
+            "parallel lzma2",
+            sevenz_multi_run_archive(1024 * 1024, &members),
+            4,
+        ),
+    ];
+    for (label, mut archive, threads) in cases {
+        // Packed bytes of the block start right after the signature header,
+        // the two members in order; the middle of the second member's
+        // stretch is its own payload, whatever chunk framing surrounds it.
+        let flip = 32 + good.len() + bad.len() / 2;
+        archive[flip] ^= 0x40;
+
+        let temp = TempDir::new().unwrap();
+        let out_dir = temp.path().join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let (root, budget) = test_extraction_security_with_memory(&out_dir, 1024 * 1024 * 1024);
+        let mut context = conventional_7z_context(&out_dir, root, budget, &archive, threads);
+        let (event_tx, mut events) = tokio::sync::broadcast::channel(64);
+        context.event_tx = event_tx;
+        let Err(error) = extract_7z_stream(&context, || Ok(Cursor::new(archive.clone()))) else {
+            panic!("{label}: a member that fails its CRC fails the set");
+        };
+
+        assert!(
+            error.starts_with(SEVENZ_BLOCK_DATA_ERROR_PREFIX)
+                && error.to_ascii_lowercase().contains("checksum"),
+            "{label}: the reader's CRC verdict fails the set as block data: {error}"
+        );
+        assert_eq!(
+            finished_members(&mut events),
+            vec!["Silver.Horizon/good.bin".to_string()],
+            "{label}: only the member that matched its CRC is announced"
+        );
+        assert_eq!(
+            context
+                .phase_counters
+                .completed_bytes
+                .load(Ordering::Relaxed),
+            good.len() as u64,
+            "{label}: the failed member's bytes are rolled back"
+        );
+    }
+}
+
+// Every member that records a CRC is committed only on the reader's report,
+// and every one is reported: an intact archive extracts in full, in order, on
+// both coder paths.
+#[test]
+fn members_are_committed_on_the_readers_crc_report() {
+    let first = incompressible(3 * 1024 * 1024, 5);
+    let second = incompressible(9 * 1024 * 1024, 9);
+    let members: [(&str, &[u8]); 2] = [
+        ("Silver.Horizon/first.bin", &first),
+        ("Silver.Horizon/second.bin", &second),
+    ];
+    let cases = [
+        (
+            "copy",
+            sevenz_archive_with_method(
+                sevenz_turbo::EncoderConfiguration::new(sevenz_turbo::EncoderMethod::COPY),
+                &members,
+            ),
+            1,
+        ),
+        (
+            "parallel lzma2",
+            sevenz_multi_run_archive(1024 * 1024, &members),
+            4,
+        ),
+    ];
+    for (label, archive, threads) in cases {
+        let temp = TempDir::new().unwrap();
+        let out_dir = temp.path().join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let (root, budget) = test_extraction_security_with_memory(&out_dir, 1024 * 1024 * 1024);
+        let mut context = conventional_7z_context(&out_dir, root, budget, &archive, threads);
+        let (event_tx, mut events) = tokio::sync::broadcast::channel(64);
+        context.event_tx = event_tx;
+        let outcome =
+            extract_7z_stream(&context, || Ok(Cursor::new(archive.clone()))).expect(label);
+        let names = vec![
+            "Silver.Horizon/first.bin".to_string(),
+            "Silver.Horizon/second.bin".to_string(),
+        ];
+        assert_eq!(outcome.extracted, names, "{label}");
+        assert_eq!(finished_members(&mut events), names, "{label}");
+        assert_eq!(
+            context
+                .phase_counters
+                .completed_bytes
+                .load(Ordering::Relaxed),
+            (first.len() + second.len()) as u64,
+            "{label}"
+        );
+        assert_eq!(fs::read(out_dir.join(&names[0])).unwrap(), first, "{label}");
+        assert_eq!(
+            fs::read(out_dir.join(&names[1])).unwrap(),
+            second,
+            "{label}"
+        );
     }
 }
 
@@ -2074,7 +2240,8 @@ fn chase_decode_widens_on_a_backlog_of_complete_runs() {
             },
             budget: Arc::clone(&budget),
         },
-        |entry, reader, _dest| {
+        None,
+        |entry, _file_index, reader| {
             assert_eq!(entry.name(), "Silver.Horizon/reel.txt");
             let mut chunk = vec![0u8; 64 * 1024];
             loop {
