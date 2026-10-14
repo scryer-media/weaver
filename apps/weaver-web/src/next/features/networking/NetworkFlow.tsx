@@ -17,6 +17,7 @@ import {
 import { proxyLabels, type ProxyProfile } from "@/lib/proxies";
 import { EmptyState } from "../../components/chrome";
 import { SecondaryButton, Select } from "../../components/controls";
+import { Icon } from "../../components/icons";
 import { countLabel } from "../../i18n/labels";
 import { formatRate, stateColor, stateLabel, stateTone } from "./presentation";
 
@@ -83,6 +84,10 @@ const COMPACT: Lanes = {
 /** A compact flow that ends at the one endpoint a speed test measures against. */
 const COMPACT_ENDPOINT: Lanes = { ...COMPACT, ENDPOINTS: lane(782, 170), WIDTH: 960 };
 const ENDPOINT_BOX_HEIGHT = 76;
+const EGRESS_HEIGHT = 108;
+/** The row an egress card adds at its bottom for its speed limit. */
+const EGRESS_LIMIT_ROW = 20;
+const EGRESS_GAP = 20;
 const LEG_HEIGHT = 64;
 const BOX_HEIGHT = 44;
 const NOTE_LINE = 12;
@@ -519,6 +524,16 @@ export function NetworkFlow({
     () => egresses.filter((egress) => flow.legs.some((leg) => leg.egressId === egress.id)),
     [egresses, flow.legs],
   );
+  // Each egress card in the lane, from the top; one with a speed limit is a row taller.
+  const egressCards = useMemo(() => {
+    let top = 58;
+    return used.map((egress) => {
+      const card = { egress, y: top, height: EGRESS_HEIGHT + (egress.maxDownloadSpeed > 0 ? EGRESS_LIMIT_ROW : 0) };
+      top += card.height + EGRESS_GAP;
+      return card;
+    });
+  }, [used]);
+  const egressBottom = egressCards.reduce((bottom, card) => Math.max(bottom, card.y + card.height), 38);
   const grouped = !compact && (used.length > 6 || flow.legs.length > 40);
   const cards = useMemo(() => endpointCards(consumers, flow.legs), [consumers, flow.legs]);
   const cardsBottom = [...cards.values()].reduce((bottom, card) => Math.max(bottom, card.y + card.height), 0);
@@ -590,16 +605,16 @@ export function NetworkFlow({
       return { leg, y, height, cardHeight, note, blocks, bypass, closed };
     });
     // The one endpoint stands level with the middle of everything that leads to it.
-    const middle = (58 + Math.max(offset - 18, used.length * 128 + 38)) / 2;
+    const middle = (58 + Math.max(offset - 18, egressBottom)) / 2;
     const endpointY = Math.max(58, Math.round(middle - ENDPOINT_BOX_HEIGHT / 2));
     const bottom = Math.max(
       offset - 16,
-      used.length * 128 + 38,
+      egressBottom,
       compact ? 0 : cardsBottom,
       lanes === COMPACT_ENDPOINT ? endpointY + ENDPOINT_BOX_HEIGHT : 0,
     );
     return { rows, endpointY, height: compact ? bottom + 12 : Math.max(bottom + 52, 260) };
-  }, [flow.legs, flow.pools, filter, grouped, group, pools, profiles, used.length, cardsBottom, lanes, compact, toggleRow, overrides]);
+  }, [flow.legs, flow.pools, filter, grouped, group, pools, profiles, egressBottom, cardsBottom, lanes, compact, toggleRow, overrides]);
 
   const width = scale(Math.max(1, ...consumers.map((consumer) => consumer.cap ?? 1)), 28);
   const profile = (id: number | null) => profiles.find((candidate) => candidate.id === id);
@@ -926,7 +941,8 @@ export function NetworkFlow({
           ))}
 
           {layout.rows.map(({ leg, y, blocks, bypass, closed }) => {
-            const egressY = 112 + Math.max(0, used.findIndex((egress) => egress.id === leg.egressId)) * 128;
+            const egressCard = egressCards.find((card) => card.egress.id === leg.egressId) ?? egressCards[0];
+            const egressY = egressCard ? egressCard.y + EGRESS_HEIGHT / 2 : 112;
             const consumerY = endpoint
               ? layout.endpointY + ENDPOINT_BOX_HEIGHT / 2
               : (cards.get(leg.consumer)?.y ?? 58) + 62;
@@ -1027,9 +1043,8 @@ export function NetworkFlow({
             );
           })}
 
-          {used.map((egress, index) => {
+          {egressCards.map(({ egress, y, height }) => {
             const legs = flow.legs.filter((leg) => leg.egressId === egress.id);
-            const y = 58 + index * 128;
             const down = egress.health === "DOWN";
             const open = Math.round(legs.reduce((sum, leg) => sum + (counts[legKey(leg)] ?? leg.open), 0));
             const x = EGRESS.x + 14;
@@ -1041,8 +1056,8 @@ export function NetworkFlow({
                   { kind: "egress", id: egress.id },
                   EGRESS_PAGE,
                   <>
-                    <rect x={EGRESS.x} y={y} width={EGRESS.width} height="108" fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} strokeDasharray={down ? "4 4" : undefined} />
-                    <StateBar x={EGRESS.x} y={y} height={108} state={egress.health} />
+                    <rect x={EGRESS.x} y={y} width={EGRESS.width} height={height} fill={INK.card} stroke={down ? stateColor("DOWN") : INK.line} strokeDasharray={down ? "4 4" : undefined} />
+                    <StateBar x={EGRESS.x} y={y} height={height} state={egress.health} />
                     <text x={x} y={y + 24} fill={INK.fg} fontSize="13" fontFamily={TITLE_FONT} fontWeight="600">
                       {fit(egress.name, room - (onToggle ? TOGGLE_WIDTH + 6 : 0), 13)}
                     </text>
@@ -1070,6 +1085,17 @@ export function NetworkFlow({
                             })}
                       </text>
                     )}
+                    {egress.maxDownloadSpeed > 0 ? (
+                      <g color={INK.muted}>
+                        <title>{t("next.networking.egress.downloadLimit")}</title>
+                        <g transform={`translate(${x} ${y + height - 23})`}>
+                          <Icon name="bandwidth" size={12} />
+                        </g>
+                        <text x={x + 18} y={y + height - 13} fill={INK.muted} fontSize="10">
+                          {formatRate(egress.maxDownloadSpeed)}
+                        </text>
+                      </g>
+                    ) : null}
                   </>,
                 )}
               </g>

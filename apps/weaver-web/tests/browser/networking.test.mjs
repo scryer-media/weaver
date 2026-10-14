@@ -76,6 +76,12 @@ test("flow displays route evidence, opens editors, exports a frozen SVG, and edi
  assert.equal(await diagram.locator("rect[width='3']").count(),3+6+4+3+2+2+1);
  const legCards=diagram.locator("a[aria-label^='Edit the route for']");
  assert.deepEqual(await legCards.filter({hasText:"leg 3"}).locator("text").allTextContents(),["News primary · leg 3 · 10%","Down · 0/0 open · 0.00 MiB/s","parked · hold","Interface is down"]);
+ // An egress with a speed limit says it under its load, behind the gauge, on a card a row taller.
+ const fiber=diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"WAN Fiber"});
+ assert.deepEqual(await fiber.locator("text").allTextContents(),["WAN Fiber","Up","192.0.2.10","24 open · 22.89 MiB/s","50.00 MiB/s"]);
+ assert.equal(await fiber.locator("g:has(> title) svg.lucide-gauge").count(),1);
+ assert.equal(await fiber.locator("g:has(> title) > title").textContent(),"Download limit");
+ assert.deepEqual(await diagram.locator("a[href='/settings/networking/egress'] > rect:first-child").evaluateAll(rects=>rects.map(rect=>rect.getAttribute("height"))),["108","128","108"]);
  assert.deepEqual(await diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"LTE standby"}).locator("text").allTextContents(),["LTE standby","Down","198.51.100.10","Interface is down"]);
  // The daemon knows only that its egress is up; the leg is blocked all the same.
  assert.deepEqual(await legCards.filter({hasText:"News archive"}).locator("text").allTextContents(),["News archive · leg 1 · 100%","Blocked · 0/0 open · 0.00 MiB/s","0 planned"]);
