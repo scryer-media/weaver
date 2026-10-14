@@ -393,6 +393,26 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "SPEED_TEST_LEASE_REFUSED",
             "server Primary cannot lend its connections: its health tracker has it out of service",
         ),
+        (
+            R::TestNeedsRoute,
+            "TEST_NEEDS_ROUTE",
+            "a test goes through a route drafted for it",
+        ),
+        (
+            R::TestTargetRequired,
+            "TEST_TARGET_REQUIRED",
+            "a test of the route alone needs a host and port to reach",
+        ),
+        (
+            R::TestSubjectInRoute,
+            "TEST_SUBJECT_IN_ROUTE",
+            "the route a proxy is tested through cannot carry that proxy",
+        ),
+        (
+            R::TestPathCount { limit: 64 },
+            "TEST_PATH_COUNT",
+            "a test tries every path through the route, and at most 64; draft a smaller route",
+        ),
     ]
 }
 
@@ -478,9 +498,13 @@ fn slot(refusal: &R) -> usize {
         R::SpeedTestLegDownAll => 75,
         R::SpeedTestQuotaBlocked { .. } => 76,
         R::SpeedTestLeaseRefused { .. } => 77,
+        R::TestTargetRequired => 78,
+        R::TestSubjectInRoute => 79,
+        R::TestPathCount { .. } => 80,
+        R::TestNeedsRoute => 81,
     }
 }
-const SLOTS: usize = 78;
+const SLOTS: usize = 82;
 
 #[test]
 fn every_refusal_keeps_its_code_and_its_sentence() {
@@ -577,6 +601,7 @@ fn only_the_sentences_that_name_values_carry_them() {
                     "reason": "its health tracker has it out of service",
                 })
             ),
+            "TEST_PATH_COUNT" => assert_eq!(params, serde_json::json!({ "limit": 64 })),
             _ => assert_eq!(params, serde_json::json!({}), "{code}"),
         }
     }

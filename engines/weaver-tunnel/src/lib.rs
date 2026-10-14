@@ -47,10 +47,9 @@ pub use provider::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use registry::TunnelRegistry;
-pub use ssh::{SshTunnelProvider, TunnelHandshake, validate_private_key};
+pub use ssh::{SshTunnelProvider, validate_private_key};
 pub use wireguard::{
     DEFAULT_WIREGUARD_KEEPALIVE, DEFAULT_WIREGUARD_MTU, IpCidr, MAX_WIREGUARD_MTU,
-    MIN_WIREGUARD_MTU, WIREGUARD_KEY_MESSAGE, WgStack, WgTcpStream, WgUdpSocket,
-    WireGuardHandshake, WireGuardSpec, WireGuardTunnelProvider, parse_key, public_key_of,
-    validate_wireguard_keys,
+    MIN_WIREGUARD_MTU, WIREGUARD_KEY_MESSAGE, WgStack, WgTcpStream, WgUdpSocket, WireGuardSpec,
+    WireGuardTunnelProvider, parse_key, public_key_of, validate_wireguard_keys,
 };

@@ -2,7 +2,7 @@ import { expect, metricValue, metrics, test } from "./helpers";
 import { waitTerminal } from "./support/downloads";
 import {
   FlowSubscription, type LegFlow, type NetworkFlow, type RouteInput, extended, flowAfter, flowMark, graphqlErrors,
-  ladderLeg, directLeg, legOn, networkHosts, platformNetworking, proxyProfiles, rung, serverKey, testEgress, testProxyProfile,
+  ladderLeg, directLeg, legOn, networkHosts, platformNetworking, proxyProfiles, rung, serverKey, testEgress, testVia,
 } from "./support/network-flow";
 import { NetworkWorld, PROXIED_HOST, expectNoFailureEvents, jobEvents, saveEvidence, serverHealth, verifyOutput } from "./support/network-scenario";
 import { type FixtureEvent, attemptsOn, controlRoute, directEvents, fixtureEvents, fixtureMark, waitFixtureEvents } from "./support/proxy-fixture";
@@ -154,15 +154,16 @@ test("F06 a 503 from rung 0 is hop evidence and the leg recovers once it clears"
   expect(await download.release()).toBe("COMPLETED");
 });
 
-test("F07 a rejected proxy password cools rung 0 and the profile test reports it", async ({ request }) => {
+test("F07 a rejected proxy password cools rung 0 and a test via its egress reports it", async ({ request }) => {
   test.setTimeout(0);
-  const { leg, connect1 } = await twoRungLadder({ connect1Password: "wrong" });
+  const { a, leg, connect1 } = await twoRungLadder({ connect1Password: "wrong" });
   const download = await world.pacedDownload("f07-auth", { parts: 64, slowMs: 500 });
   const flow = await onRung(request, leg, 1, "leg on rung 1 after the 407");
   expect(leg(flow)?.rungStates[0]).toBe("COOLDOWN");
-  const result = await testProxyProfile(request, connect1.id);
-  expect(result.success).toBe(false);
-  expect(result.message.trim()).not.toBe("");
+  const results = await testVia(request, { legs: [directLeg(a.id, 100)] }, { proxy: connect1.id }, { host: PROXIED_HOST, port: 119 });
+  expect(results).toHaveLength(1);
+  expect(results[0]).toMatchObject({ egressId: a.id, carrierIds: [], proxyId: connect1.id, success: false });
+  expect(results[0]!.message.trim()).not.toBe("");
   expect(await download.release()).toBe("COMPLETED");
 });
 

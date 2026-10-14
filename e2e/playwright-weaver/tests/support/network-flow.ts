@@ -272,9 +272,21 @@ export async function resetProxyHostKey(request: APIRequestContext, id: number):
   return (await graphql<{ resetProxyHostKey: ProxyProfile }>(request,
     `mutation($id: Int!) { resetProxyHostKey(id: $id) { ${PROFILE} } }`, { id })).resetProxyHostKey;
 }
-export async function testProxyProfile(request: APIRequestContext, id: number): Promise<{ success: boolean; message: string }> {
-  return (await graphql<{ testProxyProfile: { success: boolean; message: string } }>(request,
-    "mutation($id: Int!) { testProxyProfile(id: $id) { success message } }", { id })).testProxyProfile;
+export type PathTest = {
+  leg: number; egressId: number; carrierIds: number[]; proxyId: number | null;
+  success: boolean; code: string; message: string; failingProxyId: number | null;
+  sourceAddress: string | null; connectMillis: number;
+};
+export type TestSubject = { proxy: number } | { pool: number };
+/** Test every path through a drafted route, with `subject` on top of it. */
+export async function testVia(request: APIRequestContext, route: RouteInput, subject?: TestSubject, target?: { host: string; port: number }): Promise<PathTest[]> {
+  return (await graphql<{ testVia: PathTest[] }>(request,
+    `mutation($route: RouteInput!, $subject: TestSubjectInput, $target: TestTargetInput) {
+      testVia(route: $route, subject: $subject, target: $target) {
+        leg egressId carrierIds proxyId success code message failingProxyId sourceAddress connectMillis
+      }
+    }`,
+    { route, subject: subject ?? null, target: target ?? null })).testVia;
 }
 export async function proxyProfiles(request: APIRequestContext): Promise<ProxyProfile[]> {
   return (await graphql<{ proxyProfiles: ProxyProfile[] }>(request, `query { proxyProfiles { ${PROFILE} } }`)).proxyProfiles;

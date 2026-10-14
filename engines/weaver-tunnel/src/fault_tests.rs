@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    NoopTunnelObserver, SshTunnelProvider, parse_key, public_key_of,
+    NoopTunnelObserver, SshTunnelProvider, TunnelProvider, parse_key, public_key_of,
     test_support::{CLIENT_ED25519_PEM_WITH_PASSPHRASE, ECDSA_P256_PEM, spec_for},
     transport::{TransportKind, TransportProxy, hop_before},
     validate_private_key, validate_wireguard_keys,
@@ -370,7 +370,8 @@ fn a_key_of_another_algorithm_is_named() {
 async fn an_ssh_tunnel_without_a_key_says_it_needs_one() {
     let mut spec = spec_for("proxy-nokey", "192.0.2.1", 22);
     spec.private_key_pem.clear();
-    let error = SshTunnelProvider::handshake(spec, Arc::new(NoopTunnelObserver))
+    let error = SshTunnelProvider::new(spec, Arc::new(NoopTunnelObserver))
+        .prepare()
         .await
         .unwrap_err();
     assert_eq!(classify(&error, WAIT), ProxyFault::SshKeyMissing);

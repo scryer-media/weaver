@@ -68,7 +68,7 @@ const LIFTED: &[(&str, usize)] = &[
         "server/crates/weaver-server-core/src/proxies/routed_http.rs",
         2,
     ),
-    ("server/crates/weaver-server-core/src/proxies/runtime.rs", 3),
+    ("server/crates/weaver-server-core/src/proxies/runtime.rs", 2),
     ("server/crates/weaver-server-core/src/speed_test/http.rs", 1),
     ("xtask/src/main.rs", 1),
 ];

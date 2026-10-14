@@ -353,24 +353,6 @@ pub struct ProxyTestResult {
     // The values the client's sentence for the code may name.
     pub params: async_graphql::Json<serde_json::Map<String, serde_json::Value>>,
 }
-impl ProxyTestResult {
-    fn passed(pass: proxies::ProxyTestPass) -> Self {
-        Self {
-            success: true,
-            code: pass.code().into(),
-            message: pass.to_string(),
-            params: async_graphql::Json(serde_json::Map::new()),
-        }
-    }
-    fn failed(fault: &proxies::ProxyFault) -> Self {
-        Self {
-            success: false,
-            code: fault.code().into(),
-            message: fault.to_string(),
-            params: async_graphql::Json(proxies::fault_params(fault)),
-        }
-    }
-}
 
 #[derive(Default)]
 pub(crate) struct ProxiesMutation;
@@ -452,26 +434,15 @@ impl ProxiesMutation {
         refresh_nntp(ctx).await?;
         Ok(profile.into())
     }
-    #[graphql(guard = "AdminGuard")]
-    async fn test_proxy_profile(&self, ctx: &Context<'_>, id: u32) -> Result<ProxyTestResult> {
-        let runtime = runtime(ctx)?;
-        let _guard = runtime.mutations.lock().await;
-        let db = ctx.data::<Database>()?.clone();
-        let profile = spawn_blocking_db("proxies.load", move || db.list_proxy_profiles())
-            .await?
-            .into_iter()
-            .find(|p| p.id == id)
-            .ok_or_else(|| refusal_error(NetworkRefusal::ProxyNotFound))?;
-        type Tested = std::result::Result<
-            std::result::Result<proxies::ProxyTestPass, proxies::ProxyFault>,
-            NetworkRefusal,
-        >;
-        let test: std::pin::Pin<Box<dyn std::future::Future<Output = Tested> + Send + '_>> =
-            Box::pin(runtime.test_profile(&profile));
-        Ok(match test.await.map_err(refusal_error)? {
-            Ok(pass) => ProxyTestResult::passed(pass),
-            Err(fault) => ProxyTestResult::failed(&fault),
-        })
+    // A test names the route it goes through; this one names none, so it is
+    // refused.
+    #[graphql(
+        guard = "AdminGuard",
+        deprecation = "Use testVia with the route the proxy is tested through."
+    )]
+    async fn test_proxy_profile(&self, id: u32) -> Result<ProxyTestResult> {
+        let _ = id;
+        Err(refusal_error(NetworkRefusal::TestNeedsRoute))
     }
 }
 

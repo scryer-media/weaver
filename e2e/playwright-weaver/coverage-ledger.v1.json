@@ -174,7 +174,7 @@
       "name": "testProxyProfile",
       "owner": "proxy-routing",
       "oracle": "unit-only",
-      "rationale": "The flow exercises configured-server connection tests and actual consumer traffic rather than profile-level diagnostics."
+      "rationale": "Deprecated: it names no route, so it refuses every call with TEST_NEEDS_ROUTE; proxies are tested through testVia."
     },
     {
       "name": "resetServerDownloadQuotaUsage",
@@ -705,6 +705,11 @@
     {
       "name": "testProxyPool",
       "owner": "advanced-networking-pools",
+      "oracle": "api-metrics"
+    },
+    {
+      "name": "testVia",
+      "owner": "advanced-networking-routes",
       "oracle": "api-metrics"
     },
     {

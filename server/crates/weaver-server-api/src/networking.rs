@@ -391,28 +391,107 @@ pub struct EgressTestResult {
     pub connect_millis: Option<f64>,
     pub proxy_id: Option<u32>,
 }
-impl EgressTestResult {
-    fn from_probe(
-        proxy_id: Option<u32>,
-        result: std::result::Result<core::NetworkProbe, String>,
-    ) -> Self {
-        match result {
-            Ok(probe) => Self {
+impl From<core::PathTest> for EgressTestResult {
+    fn from(test: core::PathTest) -> Self {
+        match test.outcome {
+            Ok(_) => Self {
                 success: true,
                 message: "Connection succeeded".into(),
-                source_address: probe.source_address.map(|s| s.to_string()),
-                connect_millis: Some(probe.elapsed.as_secs_f64() * 1000.0),
-                proxy_id,
+                source_address: test.source_address.map(|s| s.to_string()),
+                connect_millis: Some(test.elapsed.as_secs_f64() * 1000.0),
+                proxy_id: test.proxy_id,
             },
-            Err(message) => Self {
+            Err(fault) => Self {
                 success: false,
-                message,
+                message: fault.to_string(),
                 source_address: None,
                 connect_millis: None,
-                proxy_id,
+                proxy_id: test.proxy_id,
             },
         }
     }
+}
+// What a test through a drafted route stacks on top of it.
+#[derive(Clone, Copy, Debug, OneofObject)]
+pub enum TestSubjectInput {
+    Proxy(u32),
+    Pool(u32),
+}
+#[derive(Clone, Debug, InputObject)]
+pub struct TestTargetInput {
+    pub host: String,
+    pub port: u16,
+}
+// One path through a drafted route, and the proxy tested on top of it.
+#[derive(SimpleObject)]
+pub struct PathTestResult {
+    pub leg: u32,
+    pub egress_id: u32,
+    pub carrier_ids: Vec<u32>,
+    pub proxy_id: Option<u32>,
+    pub success: bool,
+    pub code: String,
+    // The outcome in English, for a client with no sentence for its code.
+    pub message: String,
+    // The values the client's sentence for the code may name.
+    pub params: async_graphql::Json<serde_json::Map<String, serde_json::Value>>,
+    pub failing_proxy_id: Option<u32>,
+    pub source_address: Option<String>,
+    pub connect_millis: f64,
+}
+impl From<core::PathTest> for PathTestResult {
+    fn from(test: core::PathTest) -> Self {
+        let (success, code, message, params) = match &test.outcome {
+            Ok(pass) => (true, pass.code(), pass.to_string(), serde_json::Map::new()),
+            Err(fault) => (
+                false,
+                fault.code(),
+                fault.to_string(),
+                core::fault_params(fault),
+            ),
+        };
+        Self {
+            leg: u32::try_from(test.leg).unwrap_or(u32::MAX),
+            egress_id: test.egress_id,
+            carrier_ids: test.carriers,
+            proxy_id: test.proxy_id,
+            success,
+            code: code.into(),
+            message,
+            params: async_graphql::Json(params),
+            failing_proxy_id: test.failing_proxy,
+            source_address: test.source_address.map(|s| s.to_string()),
+            connect_millis: test.elapsed.as_secs_f64() * 1000.0,
+        }
+    }
+}
+// A route of one direct leg on an egress, for the tests that name only it.
+fn direct_on(egress_id: u32) -> core::Route {
+    core::Route {
+        legs: vec![core::RouteLeg {
+            egress_id,
+            weight: 100,
+            path: core::LegPath::Direct,
+        }],
+        failover: core::Failover::default(),
+    }
+}
+async fn test_via(
+    runtime: &ProxyRuntime,
+    route: &core::Route,
+    subject: core::TestSubject,
+    target: Option<(String, u16)>,
+) -> Result<Vec<core::PathTest>> {
+    let _guard = runtime.mutations.lock().await;
+    let test: std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<Vec<core::PathTest>, NetworkRefusal>,
+                > + Send
+                + '_,
+        >,
+    > = Box::pin(runtime.network.test_via(route, subject, target));
+    test.await.map_err(refusal_error)
 }
 #[derive(Clone, Debug, InputObject)]
 pub struct ProxyPoolInput {
@@ -1066,7 +1145,34 @@ impl NetworkingMutation {
             failover: route.failover.into(),
         })
     }
+    // Tests every path through a drafted route, with a proxy or each member
+    // of a pool on top of it. Nothing is dialled outside the route.
     #[graphql(guard = "AdminGuard")]
+    async fn test_via(
+        &self,
+        ctx: &Context<'_>,
+        route: RouteInput,
+        subject: Option<TestSubjectInput>,
+        target: Option<TestTargetInput>,
+    ) -> Result<Vec<PathTestResult>> {
+        let runtime = runtime(ctx)?;
+        let route = route.route()?;
+        let subject = match subject {
+            None => core::TestSubject::Route,
+            Some(TestSubjectInput::Proxy(id)) => core::TestSubject::Proxy(id),
+            Some(TestSubjectInput::Pool(id)) => core::TestSubject::Pool(id),
+        };
+        let target = target.map(|target| (target.host, target.port));
+        Ok(test_via(&runtime, &route, subject, target)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+    #[graphql(
+        guard = "AdminGuard",
+        deprecation = "Use testVia with a direct route on the egress."
+    )]
     async fn test_egress_interface(
         &self,
         ctx: &Context<'_>,
@@ -1076,15 +1182,18 @@ impl NetworkingMutation {
         port: u16,
     ) -> Result<EgressTestResult> {
         let runtime = runtime(ctx)?;
-        Ok(EgressTestResult::from_probe(
-            proxy_id,
-            runtime
-                .network
-                .test_path(id, proxy_id, Some(&host), Some(port))
-                .await,
-        ))
+        let subject = proxy_id.map_or(core::TestSubject::Route, core::TestSubject::Proxy);
+        test_via(&runtime, &direct_on(id), subject, Some((host, port)))
+            .await?
+            .into_iter()
+            .next()
+            .map(Into::into)
+            .ok_or_else(|| "the test tried no path".into())
     }
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(
+        guard = "AdminGuard",
+        deprecation = "Use testVia with a direct route on the egress."
+    )]
     async fn test_proxy_pool(
         &self,
         ctx: &Context<'_>,
@@ -1107,27 +1216,17 @@ impl NetworkingMutation {
         {
             return Err("host and port are required for a SOCKS5 or HTTP CONNECT pool test".into());
         }
-        use async_graphql::futures_util::StreamExt;
-        let concurrency = if pool.kind == core::ProxyKind::WireGuard {
-            core::max_wireguard_instances().min(4)
-        } else {
-            4
-        };
-        let results = async_graphql::futures_util::stream::iter(pool.member_ids)
-            .map(|member| {
-                let network = &runtime.network;
-                let host = host.as_deref();
-                async move {
-                    EgressTestResult::from_probe(
-                        Some(member),
-                        network.test_path(egress_id, Some(member), host, port).await,
-                    )
-                }
-            })
-            .buffered(concurrency)
-            .collect()
-            .await;
-        Ok(results)
+        let target = host.zip(port);
+        Ok(test_via(
+            &runtime,
+            &direct_on(egress_id),
+            core::TestSubject::Pool(id),
+            target,
+        )
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect())
     }
 }
 

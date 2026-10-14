@@ -23,6 +23,9 @@ pub use fetch::FetchAttempt;
 #[path = "network_draft.rs"]
 mod draft;
 pub use draft::DraftNetworkRoute;
+#[path = "network_test_via.rs"]
+mod test_via;
+pub use test_via::{MAX_TEST_PATHS, PathTest, TestSubject};
 
 // The health reason of an egress whose download quota is used up.
 pub const QUOTA_REACHED: &str = "Quota reached";
@@ -174,11 +177,6 @@ pub struct LiveNetworkRoute {
     pub legs: RwLock<Vec<LiveLeg>>,
     cap: std::sync::atomic::AtomicU16,
     timeout: Duration,
-}
-
-pub struct NetworkProbe {
-    pub source_address: Option<std::net::SocketAddr>,
-    pub elapsed: Duration,
 }
 
 type StagedPoolMembers = HashMap<(u32, u32), Vec<(u32, Arc<dyn Dialer>)>>;
@@ -1127,60 +1125,6 @@ impl NetworkRuntime {
             }
         }
     }
-    pub async fn test_path(
-        &self,
-        id: u32,
-        proxy: Option<u32>,
-        host: Option<&str>,
-        port: Option<u16>,
-    ) -> Result<NetworkProbe, String> {
-        let isolated = self.isolated_probe_runtime();
-        let stage = {
-            let config = isolated
-                .configuration
-                .read()
-                .expect("network configuration");
-            let egress = config.egresses.get(&id).ok_or("egress does not exist")?;
-            if !egress.enabled {
-                return Err("egress is disabled".into());
-            }
-            let bottom = Self::bottom(&config, id, Duration::from_secs(15))?;
-            match proxy {
-                Some(proxy) => isolated.hop(&config, proxy, bottom.clone(), bottom, &[])?,
-                None => bottom as Arc<dyn Dialer>,
-            }
-        };
-        let started = tokio::time::Instant::now();
-        let result = async {
-            let source_address = match (host, port) {
-                (Some(host), Some(port)) => {
-                    let dialed = stage
-                        .dial(&Target {
-                            host: host.into(),
-                            port,
-                            purpose: weaver_tunnel::pipe::Purpose::Probe,
-                            addresses: Vec::new(),
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    dialed.source
-                }
-                (None, None) if proxy.is_some() => {
-                    stage.prepare().await.map_err(|e| e.to_string())?;
-                    None
-                }
-                _ => return Err("host and port must be provided together".into()),
-            };
-            Ok(NetworkProbe {
-                source_address,
-                elapsed: started.elapsed(),
-            })
-        }
-        .await;
-        isolated.shutdown().await;
-        result
-    }
-
     pub async fn shutdown(&self) {
         if let Some(task) = self.poll.lock().expect("network health task").take() {
             task.abort();

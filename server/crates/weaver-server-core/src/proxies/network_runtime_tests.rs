@@ -1188,3 +1188,6 @@ fn a_held_share_on_an_out_of_quota_leg_leaves_no_leg_in_quota() {
         &HashSet::from([1, 2])
     ));
 }
+
+#[path = "network_test_via_tests.rs"]
+mod via;

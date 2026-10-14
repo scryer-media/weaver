@@ -112,6 +112,14 @@ pub enum NetworkRefusal {
         name: String,
         reason: String,
     },
+
+    // Tests through a drafted route.
+    TestNeedsRoute,
+    TestTargetRequired,
+    TestSubjectInRoute,
+    TestPathCount {
+        limit: usize,
+    },
 }
 
 // Whose download quota keeps a speed test from starting.
@@ -207,6 +215,10 @@ impl NetworkRefusal {
             Self::SpeedTestLegDownAll => "SPEED_TEST_LEG_DOWN_ALL",
             Self::SpeedTestQuotaBlocked { .. } => "SPEED_TEST_QUOTA_BLOCKED",
             Self::SpeedTestLeaseRefused { .. } => "SPEED_TEST_LEASE_REFUSED",
+            Self::TestNeedsRoute => "TEST_NEEDS_ROUTE",
+            Self::TestTargetRequired => "TEST_TARGET_REQUIRED",
+            Self::TestSubjectInRoute => "TEST_SUBJECT_IN_ROUTE",
+            Self::TestPathCount { .. } => "TEST_PATH_COUNT",
         }
     }
 
@@ -237,6 +249,7 @@ impl NetworkRefusal {
                 name,
                 reason,
             } => serde_json::json!({ "serverId": server, "name": name, "reason": reason }),
+            Self::TestPathCount { limit } => serde_json::json!({ "limit": limit }),
             _ => return serde_json::Map::new(),
         };
         match value {
@@ -395,6 +408,18 @@ impl std::fmt::Display for NetworkRefusal {
             }
             Self::SpeedTestLeaseRefused { name, reason, .. } => {
                 return write!(f, "server {name} cannot lend its connections: {reason}");
+            }
+
+            Self::TestNeedsRoute => "a test goes through a route drafted for it",
+            Self::TestTargetRequired => "a test of the route alone needs a host and port to reach",
+            Self::TestSubjectInRoute => {
+                "the route a proxy is tested through cannot carry that proxy"
+            }
+            Self::TestPathCount { limit } => {
+                return write!(
+                    f,
+                    "a test tries every path through the route, and at most {limit}; draft a smaller route"
+                );
             }
         };
         f.write_str(sentence)

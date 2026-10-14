@@ -196,8 +196,9 @@ async fn http3_profiles_round_trip_and_feed_routes_keep_credentials_private() {
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
-// A test answers with a code the client words, and dials nothing it cannot
-// use: an HTTP/3 proxy is tested through a DNS server it resolves with.
+// A test goes through a route drafted for it, answers each path with a code
+// the client words, and dials nothing it cannot use: an HTTP/3 proxy is
+// tested through a DNS server it resolves with.
 #[tokio::test]
 async fn a_proxy_test_answers_with_a_code() {
     let h = harness().await;
@@ -213,23 +214,53 @@ async fn a_proxy_test_answers_with_a_code() {
     let id = response_data(&result)["saveProxyProfile"]["id"]
         .as_u64()
         .unwrap();
-    let result = h
-        .execute(&format!(
-            "mutation {{ testProxyProfile(id: {id}) {{ success code message params }} }}"
-        ))
-        .await;
+    let test_via = |subject: &str| {
+        format!(
+            r#"mutation {{ testVia(
+        route: {{ legs: [{{ egressId: 0, weight: 100, path: {{ direct: true }} }}] }}{subject}
+    ) {{ leg egressId carrierIds proxyId success code message params failingProxyId }} }}"#
+        )
+    };
+    let refused = |result: &async_graphql::Response| {
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        serde_json::to_value(&result.errors[0]).unwrap()["extensions"]["code"].clone()
+    };
+    let subject = format!(", subject: {{ proxy: {id} }}");
+    assert_has_errors(
+        &h.execute_as(&test_via(&subject), CallerScope::Control)
+            .await,
+    );
+    let result = h.execute(&test_via(&subject)).await;
     assert_no_errors(&result);
-    let test = &response_data(&result)["testProxyProfile"];
+    let tests = response_data(&result)["testVia"].as_array().unwrap().clone();
+    assert_eq!(tests.len(), 1);
+    let test = &tests[0];
+    assert_eq!(test["leg"], 0);
+    assert_eq!(test["egressId"], 0);
+    assert_eq!(test["carrierIds"], serde_json::json!([]));
+    assert_eq!(test["proxyId"], id);
     assert_eq!(test["success"], false);
     assert_eq!(test["code"], "TEST_NEEDS_DNS");
     assert_eq!(test["params"], serde_json::json!({}));
     assert!(!test["message"].as_str().unwrap().is_empty());
-    let missing = h
-        .execute("mutation { testProxyProfile(id: 999) { success } }")
-        .await;
-    assert_eq!(missing.errors.len(), 1, "{:?}", missing.errors);
-    let error = serde_json::to_value(&missing.errors[0]).unwrap();
-    assert_eq!(error["extensions"]["code"], "PROXY_NOT_FOUND");
+    assert_eq!(
+        refused(&h.execute(&test_via(", subject: { proxy: 999 }")).await),
+        "PROXY_NOT_FOUND"
+    );
+    assert_eq!(
+        refused(&h.execute(&test_via("")).await),
+        "TEST_TARGET_REQUIRED"
+    );
+    // A test that names no route is refused.
+    assert_eq!(
+        refused(
+            &h.execute(&format!(
+                "mutation {{ testProxyProfile(id: {id}) {{ success }} }}"
+            ))
+            .await
+        ),
+        "TEST_NEEDS_ROUTE"
+    );
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
