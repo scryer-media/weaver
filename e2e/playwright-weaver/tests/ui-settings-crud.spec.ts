@@ -22,6 +22,21 @@ async function saveSettings(page: Page) {
   await expect(page.getByRole("button", { name: "Saved", exact: true })).toBeDisabled();
 }
 
+/** A General field saves itself: do `action` and wait for its own mutation to answer without errors. */
+async function savedBy(page: Page, mutation: string, action: () => Promise<void>) {
+  const saved = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname.endsWith("/graphql")
+      && response.request().method() === "POST"
+      && response.request().postData()?.includes(`mutation ${mutation}`) === true,
+  );
+  await action();
+  const response = await saved;
+  expect(response.ok()).toBeTruthy();
+  const payload = await response.json();
+  expect(payload.errors ?? [], JSON.stringify(payload.errors ?? [])).toEqual([]);
+}
+
 async function confirmRemoval(page: Page, label: string) {
   const confirm = page.getByRole("dialog", { name: label, exact: true });
   await confirm.getByRole("button", { name: label, exact: true }).click();
@@ -54,9 +69,9 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
   }
 
   await expect(srrdbLookup).not.toBeChecked();
-  await srrdbLookup.click();
-  await expect(page.getByText("Unsaved changes", { exact: true })).toBeVisible();
-  await saveSettings(page);
+  // The switch saves as it changes; the top bar has nothing to save.
+  await savedBy(page, "UpdateSettings", () => srrdbLookup.click());
+  await expect(page.getByRole("button", { name: "Saved", exact: true })).toBeDisabled();
   await page.reload();
   await expect(srrdbLookup).toBeChecked();
 
@@ -103,14 +118,19 @@ test("the unacceptable extension list saves under General downloads, normalized"
   await expect(extensions).toBeVisible();
   const original = await extensions.inputValue();
   try {
+    // The list saves when Enter commits it.
     await extensions.fill("EXE, r??");
-    await saveSettings(page);
+    await savedBy(page, "SetUnacceptableExtensions", () => extensions.press("Enter"));
     await page.reload();
     await expect(extensions).toHaveValue("exe, r??");
   } finally {
-    await extensions.fill(original);
-    await saveSettings(page);
+    // A commit that changes nothing sends nothing, so only a changed list is put back.
     await page.reload();
+    if ((await extensions.inputValue()) !== original) {
+      await extensions.fill(original);
+      await savedBy(page, "SetUnacceptableExtensions", () => extensions.press("Enter"));
+      await page.reload();
+    }
     await expect(extensions).toHaveValue(original);
   }
 });
@@ -139,14 +159,20 @@ test("archive passwords and the password file save, clear and persist without ec
   await edit.click();
   writeFileSync("/weaver-data/e2e-archive-passwords.txt", "fixture-password\n", { mode: 0o644 });
   await list.fill("first-secret\nsecond-secret");
+  // Leaving the box stores the list, and the box shuts.
+  await savedBy(page, "UpdateArchivePasswordSettings", () => list.blur());
+  await expect(list).toHaveCount(0);
+  await expect(clear).toBeVisible();
+  // A file picked through Browse is stored as it is picked.
   await file.click();
   const picker = page.getByRole("dialog", { name: "Password file", exact: true });
   await expect(picker).toBeVisible();
   await picker.getByRole("button", { name: "e2e-archive-passwords.txt", exact: true }).click();
-  await picker.getByRole("button", { name: "Use this file", exact: true }).click();
+  await savedBy(page, "UpdateArchivePasswordSettings", () =>
+    picker.getByRole("button", { name: "Use this file", exact: true }).click(),
+  );
   await expect(picker).toBeHidden();
   await expect(file).toHaveValue(passwordFile);
-  await saveSettings(page);
   await page.reload();
   await expect(clear).toBeVisible();
   await expect(list).toHaveCount(0);
@@ -154,10 +180,9 @@ test("archive passwords and the password file save, clear and persist without ec
   await expect(list).toHaveValue("");
   await expect(file).toHaveValue(passwordFile);
 
-  // Clearing removes the stored list on save and keeps the file.
-  await clear.click();
-  await expect(section.getByRole("button", { name: "Keep", exact: true })).toBeVisible();
-  await saveSettings(page);
+  // Clearing removes the stored list at once and keeps the file.
+  await savedBy(page, "UpdateArchivePasswordSettings", () => clear.click());
+  await expect(clear).toHaveCount(0);
   await page.reload();
   await expect(clear).toHaveCount(0);
   await expect(file).toHaveValue(passwordFile);
@@ -165,7 +190,7 @@ test("archive passwords and the password file save, clear and persist without ec
   // Leave a list stored for the restart stage.
   await edit.click();
   await list.fill("third-secret");
-  await saveSettings(page);
+  await savedBy(page, "UpdateArchivePasswordSettings", () => list.blur());
   await page.reload();
   await expect(clear).toBeVisible();
 });
