@@ -17,7 +17,7 @@ import { CheckRow, Hint, StatusMark } from "./presentation";
 /** The daemon pools two to sixteen proxies. */
 const MAX_POOL_MEMBERS = 16;
 
-const NEW_POOL: ProxyPool = { id: -1, name: "", kind: "SOCKS5", memberIds: [], enabled: true };
+const NEW_POOL: ProxyPool = { id: -1, name: "", kind: "WIRE_GUARD", memberIds: [], enabled: true };
 
 /** WireGuard keeps a tunnel per member per egress, and each reserves this much memory. */
 const WIREGUARD_BUDGET_MIB = 516;

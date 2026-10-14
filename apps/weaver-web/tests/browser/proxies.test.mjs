@@ -268,6 +268,10 @@ test("pools and proxies are each added from the middle under their own table, an
       await under.click();
       const editor = page.getByRole("dialog", { name, exact: true });
       await editor.waitFor();
+      // A new pool, like a new proxy, starts as WireGuard.
+      if (name === "Add pool") {
+        assert.match(await action(editor, "Proxy type").innerText(), /WireGuard/);
+      }
       await action(editor, "Cancel").click();
       await editor.waitFor({ state: "detached" });
     }
