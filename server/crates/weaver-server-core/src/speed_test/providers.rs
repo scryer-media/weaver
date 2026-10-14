@@ -76,7 +76,7 @@ pub fn provider(id: &str) -> Option<&'static ProviderInfo> {
 // resolve through `list_server_url`.
 pub fn provider_url(provider: &ProviderInfo) -> Result<reqwest::Url, String> {
     let Some(host) = provider.host else {
-        return Err(format!("{} needs a server from its list", provider.name));
+        return Err(format!("{} takes its server from a list", provider.name));
     };
     reqwest::Url::parse(&format!("https://{host}{}", provider.path))
         .map_err(|error| error.to_string())
@@ -91,6 +91,9 @@ pub struct ProviderServer {
     pub host: String,
     // Where the server's download endpoint lives.
     pub download_url: String,
+    // Where the server's ping endpoint lives; `None` for a server that names
+    // none, which is never pinged.
+    pub ping_url: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -100,6 +103,8 @@ struct LibreSpeedEntry {
     server: String,
     #[serde(rename = "dlURL")]
     dl_url: String,
+    #[serde(default, rename = "pingURL")]
+    ping_url: Option<String>,
     #[serde(default, rename = "sponsorName")]
     sponsor_name: Option<String>,
 }
@@ -129,6 +134,16 @@ pub fn parse_librespeed_servers(body: &[u8]) -> Result<Vec<ProviderServer>, Stri
                 return None;
             }
             let download = base.join(entry.dl_url.trim_start_matches('/')).ok()?;
+            // The ping endpoint sits beside the download one, on the same
+            // base; a server that names none, or one that does not resolve,
+            // is listed but never pinged.
+            let ping = entry
+                .ping_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|ping| !ping.is_empty())
+                .and_then(|ping| base.join(ping.trim_start_matches('/')).ok())
+                .map(|ping| ping.to_string());
             let id = match entry.id {
                 serde_json::Value::String(id) => id,
                 other => other.to_string(),
@@ -139,6 +154,7 @@ pub fn parse_librespeed_servers(body: &[u8]) -> Result<Vec<ProviderServer>, Stri
                 location: entry.sponsor_name.filter(|name| !name.is_empty()),
                 host: base.host_str()?.to_owned(),
                 download_url: download.to_string(),
+                ping_url: ping,
             })
         })
         .collect())
@@ -205,6 +221,7 @@ mod tests {
                     location: Some("Example".into()),
                     host: "speed.example.test".into(),
                     download_url: "https://speed.example.test/backend/garbage.php".into(),
+                    ping_url: None,
                 },
                 ProviderServer {
                     id: "5".into(),
@@ -212,12 +229,50 @@ mod tests {
                     location: None,
                     host: "nested.example.test".into(),
                     download_url: "https://nested.example.test/backend/garbage.php".into(),
+                    ping_url: None,
                 }
             ]
         );
         assert_eq!(
             list_server_url(&servers[0]).unwrap().as_str(),
             "https://speed.example.test/backend/garbage.php?ckSize=1024"
+        );
+    }
+
+    #[test]
+    fn librespeed_ping_urls_resolve_against_the_server_base() {
+        let body = br#"[
+            {"id":1,"name":"Root","server":"//root.example.test/","dlURL":"garbage.php","pingURL":"empty.php"},
+            {"id":2,"name":"Backend","server":"https://backend.example.test/speed","dlURL":"backend/garbage.php","pingURL":"backend/empty.php"},
+            {"id":3,"name":"Rooted","server":"https://rooted.example.test/speed/","dlURL":"garbage.php","pingURL":"/empty.php"},
+            {"id":4,"name":"Blank","server":"https://blank.example.test/","dlURL":"garbage.php","pingURL":"  "},
+            {"id":5,"name":"Absent","server":"https://absent.example.test/","dlURL":"garbage.php"},
+            {"id":6,"name":"Null","server":"https://null.example.test/","dlURL":"garbage.php","pingURL":null}
+        ]"#;
+        let pings: Vec<(String, Option<String>)> = parse_librespeed_servers(body)
+            .unwrap()
+            .into_iter()
+            .map(|server| (server.id, server.ping_url))
+            .collect();
+        assert_eq!(
+            pings,
+            vec![
+                (
+                    "1".into(),
+                    Some("https://root.example.test/empty.php".into())
+                ),
+                (
+                    "2".into(),
+                    Some("https://backend.example.test/speed/backend/empty.php".into())
+                ),
+                (
+                    "3".into(),
+                    Some("https://rooted.example.test/speed/empty.php".into())
+                ),
+                ("4".into(), None),
+                ("5".into(), None),
+                ("6".into(), None),
+            ]
         );
     }
 }

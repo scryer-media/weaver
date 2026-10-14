@@ -8,6 +8,7 @@ mod bandwidth;
 pub mod fixture;
 mod http;
 mod model;
+mod nearest;
 mod overrides;
 mod progress;
 pub mod providers;
