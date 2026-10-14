@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { memo, type ReactNode } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { LoadingMark } from "@/lib/loading-mark";
 import { SectionHeader, Square, useSettledFlag } from "./chrome";
@@ -56,7 +56,7 @@ function pointsFor(values: readonly number[], ceiling: number): string {
  * so it resizes with the column without re-projecting any points; the stroke is
  * kept at a true 1.6px by `vector-effect: non-scaling-stroke`.
  */
-export function Chart({
+export const Chart = memo(function Chart({
   title,
   note,
   series,
@@ -162,4 +162,4 @@ export function Chart({
       </div>
     </section>
   );
-}
+});

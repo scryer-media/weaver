@@ -1,4 +1,4 @@
-import { memo, useContext, useState } from "react";
+import { createContext, memo, useContext, useMemo, useState } from "react";
 import { Link } from "react-router";
 import { useQuery } from "urql";
 import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
@@ -9,6 +9,7 @@ import { Segmented } from "../components/controls";
 import { Chart, type ChartSeries } from "../components/Chart";
 import { columnStyle } from "../components/columns";
 import { useNextData, useNextDataSelector, type ProviderHealth } from "../data/next-data";
+import { shallowEqual, useSettled } from "../data/settled";
 import {
   EM_DASH,
   formatClock,
@@ -67,8 +68,25 @@ function axisLabels(timestamps: readonly number[]): string[] {
   ];
 }
 
+/** The four failure counters the failures list shows beside each rate. */
+interface FailureTotals {
+  articlesNotFound: number;
+  decodeErrors: number;
+  crcErrors: number;
+  segmentsFailedPermanent: number;
+}
+
+function sameTotals(left: FailureTotals | null, right: FailureTotals | null): boolean {
+  return left === right || (left !== null && right !== null && shallowEqual(left, right));
+}
+
+/**
+ * The failure counters alone, kept while they read the same: a live sample
+ * almost never moves them, and the list need not redraw for one that did not.
+ */
+const FailureTotalsContext = createContext<FailureTotals | null>(null);
+
 export function MonitoringPage() {
-  const t = useTranslate();
   const [rangeId, setRangeId] = useState<RangeId>("1h");
   const range = RANGES.find((entry) => entry.value === rangeId)!.range;
 
@@ -76,144 +94,179 @@ export function MonitoringPage() {
   const metrics = useMetricsSnapshot();
   const [{ data: systemInfo }] = useQuery<SystemInfoResponse>({ query: SYSTEM_INFO_QUERY });
 
-  const labels = axisLabels(series.timestamps);
   const compute = systemInfo?.systemInfo?.compute ?? null;
+  const failureTotals = useSettled<FailureTotals | null>(
+    metrics
+      ? {
+          articlesNotFound: metrics.articlesNotFound,
+          decodeErrors: metrics.decodeErrors,
+          crcErrors: metrics.crcErrors,
+          segmentsFailedPermanent: metrics.segmentsFailedPermanent,
+        }
+      : null,
+    sameTotals,
+  );
 
+  // A live sample reaches the figures that read it through context; the
+  // screen around them takes none of its props from it and is left alone.
+  return (
+    <MetricsSnapshotContext value={metrics}>
+      <FailureTotalsContext value={failureTotals}>
+        <MonitoringScreen
+          rangeId={rangeId}
+          onRangeChange={setRangeId}
+          series={series}
+          compute={compute}
+        />
+      </FailureTotalsContext>
+    </MetricsSnapshotContext>
+  );
+}
+
+const MonitoringScreen = memo(function MonitoringScreen({
+  rangeId,
+  onRangeChange,
+  series,
+  compute,
+}: {
+  rangeId: RangeId;
+  onRangeChange: (rangeId: RangeId) => void;
+  series: MetricsSeries;
+  compute: { decoderTier: string; logicalCores: number } | null;
+}) {
+  const t = useTranslate();
+  const labels = useMemo(() => axisLabels(series.timestamps), [series.timestamps]);
+  const { throughput, segments, depths } = useMemo(() => chartSeries(t, series), [t, series]);
+
+  return (
+    <NextShell
+      title={t("next.nav.monitoring")}
+      note={t("next.monitoring.note")}
+      controls={
+        <Segmented
+          label={t("next.monitoring.range")}
+          value={rangeId}
+          onChange={onRangeChange}
+          options={RANGES}
+          className="font-wv-mono text-[11.5px]"
+        />
+      }
+      railMiddle={<AttentionBlock />}
+      railFooter={<UptimeBlock />}
+      beforeContent={<MonitoringStrip compute={compute} />}
+      statusRight={
+        series.error
+          ? series.error
+          : t("next.monitoring.sampled", {
+              window: RANGES.find((entry) => entry.value === rangeId)!.label,
+            })
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
+        <Chart
+          title={t("next.shell.throughput")}
+          note={t("next.monitoring.throughputNote")}
+          series={throughput}
+          xLabels={labels}
+          loading={series.isLoading}
+          formatValue={formatRate}
+        />
+        <Chart
+          title={t("next.monitoring.segments")}
+          note={t("next.monitoring.segmentsNote")}
+          series={segments}
+          xLabels={labels}
+          loading={series.isLoading}
+          formatValue={formatPerSecond}
+        />
+        <Chart
+          title={t("next.monitoring.depths")}
+          note={t("next.monitoring.depthsNote")}
+          series={depths}
+          xLabels={labels}
+          loading={series.isLoading}
+          formatValue={formatCompactCount}
+        />
+
+        <EgressQuotaSection />
+
+        <ProvidersSection />
+
+        <FailuresSection series={series} />
+      </div>
+    </NextShell>
+  );
+});
+
+/** One chart line: the series and the newest sample, formatted, for its legend. */
+function line(
+  values: number[],
+  format: (value: number) => string,
+  entry: Omit<ChartSeries, "values" | "value">,
+): ChartSeries {
+  return { ...entry, values, value: format(last(values)) };
+}
+
+/** The three charts' lines, worked out once per history rather than per sample. */
+function chartSeries(t: Translate, series: MetricsSeries) {
   const throughput: ChartSeries[] = [
-    {
+    line(series.rate("weaver_pipeline_bytes_downloaded_total"), formatRate, {
       key: "downloaded",
       label: t("next.monitoring.series.downloaded"),
       color: WV.accent,
       fill: WV_FILL.accent,
-      values: series.rate("weaver_pipeline_bytes_downloaded_total"),
-      value: formatRate(last(series.rate("weaver_pipeline_bytes_downloaded_total"))),
-    },
-    {
+    }),
+    line(series.rate("weaver_pipeline_bytes_committed_total"), formatRate, {
       key: "committed",
       label: t("next.monitoring.series.committed"),
       color: WV.info,
-      values: series.rate("weaver_pipeline_bytes_committed_total"),
-      value: formatRate(last(series.rate("weaver_pipeline_bytes_committed_total"))),
-    },
-    {
+    }),
+    line(series.rate("weaver_pipeline_bytes_decoded_total"), formatRate, {
       key: "decoded",
       label: t("next.monitoring.series.decoded"),
       color: WV.slate,
-      values: series.rate("weaver_pipeline_bytes_decoded_total"),
-      value: formatRate(last(series.rate("weaver_pipeline_bytes_decoded_total"))),
-    },
+    }),
   ];
 
   const segments: ChartSeries[] = [
-    {
+    line(series.rate("weaver_pipeline_segments_downloaded_total"), formatPerSecond, {
       key: "downloaded",
       label: t("next.monitoring.series.downloaded"),
       color: WV.info,
       fill: WV_FILL.info,
-      values: series.rate("weaver_pipeline_segments_downloaded_total"),
-      value: formatPerSecond(last(series.rate("weaver_pipeline_segments_downloaded_total"))),
-    },
-    {
+    }),
+    line(series.rate("weaver_pipeline_segments_decoded_total"), formatPerSecond, {
       key: "decoded",
       label: t("next.monitoring.series.decoded"),
       color: WV.accent,
-      values: series.rate("weaver_pipeline_segments_decoded_total"),
-      value: formatPerSecond(last(series.rate("weaver_pipeline_segments_decoded_total"))),
-    },
-    {
+    }),
+    line(series.rate("weaver_pipeline_segments_retried_total"), formatPerSecond, {
       key: "retried",
       label: t("next.monitoring.series.retried"),
       color: WV.warn,
-      values: series.rate("weaver_pipeline_segments_retried_total"),
-      value: formatPerSecond(last(series.rate("weaver_pipeline_segments_retried_total"))),
-    },
+    }),
   ];
 
   const depths: ChartSeries[] = [
-    {
+    line(series.gauge("weaver_pipeline_download_queue_depth"), formatCount, {
       key: "download",
       label: t("next.monitoring.series.download"),
       color: WV.violet,
       fill: WV_FILL.violet,
-      values: series.gauge("weaver_pipeline_download_queue_depth"),
-      value: formatCount(last(series.gauge("weaver_pipeline_download_queue_depth"))),
-    },
-    {
+    }),
+    line(series.gauge("weaver_pipeline_decode_pending"), formatCount, {
       key: "decode",
       label: t("next.monitoring.series.decodePending"),
       color: WV.accent,
-      values: series.gauge("weaver_pipeline_decode_pending"),
-      value: formatCount(last(series.gauge("weaver_pipeline_decode_pending"))),
-    },
-    {
+    }),
+    line(series.gauge("weaver_pipeline_commit_pending"), formatCount, {
       key: "commit",
       label: t("next.monitoring.series.commitPending"),
       color: WV.info,
-      values: series.gauge("weaver_pipeline_commit_pending"),
-      value: formatCount(last(series.gauge("weaver_pipeline_commit_pending"))),
-    },
+    }),
   ];
 
-  return (
-    <MetricsSnapshotContext value={metrics}>
-      <NextShell
-        title={t("next.nav.monitoring")}
-        note={t("next.monitoring.note")}
-        controls={
-          <Segmented
-            label={t("next.monitoring.range")}
-            value={rangeId}
-            onChange={setRangeId}
-            options={RANGES}
-            className="font-wv-mono text-[11.5px]"
-          />
-        }
-        railMiddle={<AttentionBlock />}
-        railFooter={<UptimeBlock />}
-        beforeContent={<MonitoringStrip compute={compute} />}
-        statusRight={
-          series.error
-            ? series.error
-            : t("next.monitoring.sampled", {
-                window: RANGES.find((entry) => entry.value === rangeId)!.label,
-              })
-        }
-      >
-        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-          <Chart
-            title={t("next.shell.throughput")}
-            note={t("next.monitoring.throughputNote")}
-            series={throughput}
-            xLabels={labels}
-            loading={series.isLoading}
-            formatValue={(value) => formatRate(value)}
-          />
-          <Chart
-            title={t("next.monitoring.segments")}
-            note={t("next.monitoring.segmentsNote")}
-            series={segments}
-            xLabels={labels}
-            loading={series.isLoading}
-            formatValue={(value) => formatPerSecond(value)}
-          />
-          <Chart
-            title={t("next.monitoring.depths")}
-            note={t("next.monitoring.depthsNote")}
-            series={depths}
-            xLabels={labels}
-            loading={series.isLoading}
-            formatValue={(value) => formatCompactCount(value)}
-          />
-
-          <EgressQuotaSection />
-
-          <ProvidersSection />
-
-          <FailuresSection series={series} />
-        </div>
-      </NextShell>
-    </MetricsSnapshotContext>
-  );
+  return { throughput, segments, depths };
 }
 
 /** Every provider's open connections, against what each may open. */
@@ -401,7 +454,7 @@ const ProvidersSection = memo(function ProvidersSection() {
 /** Each kind of failure: its rate now and its total since the start. */
 const FailuresSection = memo(function FailuresSection({ series }: { series: MetricsSeries }) {
   const t = useTranslate();
-  const metrics = useContext(MetricsSnapshotContext);
+  const totals = useContext(FailureTotalsContext);
 
   const failures = [
     {
@@ -409,28 +462,28 @@ const FailuresSection = memo(function FailuresSection({ series }: { series: Metr
       label: t("next.monitoring.failure.notFound"),
       color: WV.warn,
       rate: last(series.rate("weaver_pipeline_articles_not_found_total")),
-      total: metrics?.articlesNotFound ?? 0,
+      total: totals?.articlesNotFound ?? 0,
     },
     {
       key: "decode-errors",
       label: t("next.monitoring.failure.decode"),
       color: WV.error,
       rate: last(series.rate("weaver_pipeline_decode_errors_total")),
-      total: metrics?.decodeErrors ?? 0,
+      total: totals?.decodeErrors ?? 0,
     },
     {
       key: "crc",
       label: t("next.monitoring.failure.crc"),
       color: WV.violet,
       rate: last(series.rate("weaver_pipeline_crc_errors_total")),
-      total: metrics?.crcErrors ?? 0,
+      total: totals?.crcErrors ?? 0,
     },
     {
       key: "permanent",
       label: t("next.monitoring.failure.permanent"),
       color: WV.error,
       rate: last(series.rate("weaver_pipeline_segments_failed_permanent_total")),
-      total: metrics?.segmentsFailedPermanent ?? 0,
+      total: totals?.segmentsFailedPermanent ?? 0,
     },
   ];
 

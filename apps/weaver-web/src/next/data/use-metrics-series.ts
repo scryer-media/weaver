@@ -1,4 +1,4 @@
-import { createContext, useEffect, useMemo, useState } from "react";
+import { createContext, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useSubscription } from "urql";
 import {
   METRICS_HISTORY_QUERY,
@@ -135,14 +135,25 @@ export function useMetricsSnapshot(): MetricsSnapshot | null {
   }>({ query: METRICS_PAGE_SUBSCRIPTION });
 
   const [polled, setPolled] = useState<MetricsPageResponse>();
+  // Whether a polled answer is held. A live sample clears one only when there
+  // is one: clearing nothing still costs the screen a render on every sample.
+  const holdingPolled = useRef(false);
   useReconnectPolling<MetricsPageResponse>({
     enabled: connection.status === "disconnected",
     query: METRICS_PAGE_QUERY,
-    onData: setPolled,
+    onData: (data) => {
+      holdingPolled.current = true;
+      setPolled(data);
+    },
   });
 
   useEffect(() => {
-    if (connection.status === "connected" && subscriptionData?.systemMetricsUpdates) {
+    if (
+      holdingPolled.current &&
+      connection.status === "connected" &&
+      subscriptionData?.systemMetricsUpdates
+    ) {
+      holdingPolled.current = false;
       setPolled(undefined);
     }
   }, [connection.status, subscriptionData]);
