@@ -834,7 +834,6 @@ export const nextKo: LocaleDictionary = {
   "next.proxies.tunnel": "터널",
   "next.proxies.credentials": "자격 증명",
   "next.proxies.secretsNote": "비밀 정보는 쓰기 전용으로 저장됩니다",
-  "next.proxies.tableNote": "공급자와 피드에는 각 패널에서 지정합니다",
   "next.proxies.lastTest": "마지막 테스트",
   "next.proxies.empty": "프록시가 없습니다. 공급자는 직접 연결합니다.",
   "next.proxies.add": "프록시 추가",

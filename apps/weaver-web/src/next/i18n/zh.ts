@@ -834,7 +834,6 @@ export const nextZh: LocaleDictionary = {
   "next.proxies.tunnel": "隧道",
   "next.proxies.credentials": "凭据",
   "next.proxies.secretsNote": "机密信息仅可写入,不可读取",
-  "next.proxies.tableNote": "在服务商和订阅源各自的面板中分配",
   "next.proxies.lastTest": "上次测试",
   "next.proxies.empty": "没有代理。服务商直接连接。",
   "next.proxies.add": "添加代理",

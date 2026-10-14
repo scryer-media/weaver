@@ -78,6 +78,13 @@ function graphql(name: string, variables: Record<string, unknown>) {
   }
   if (name === "Networking") return { data: { ...pools, egressInterfaces: egresses, proxyProfiles: profiles.map(view) } };
   if (name === "TestVia") return testVia(variables);
+  if (name === "DeleteProxyProfile") {
+    const id = variables.id as number;
+    // As the daemon does: a pool's member stays until it leaves the pool.
+    if (members(1).includes(id)) return refusal("PROXY_IN_POOL");
+    profiles.splice(profiles.findIndex((profile) => profile.id === id), 1);
+    return { data: { deleteProxyProfile: true } };
+  }
   return { data: { proxyProfiles: profiles.map(view) } };
 }
 

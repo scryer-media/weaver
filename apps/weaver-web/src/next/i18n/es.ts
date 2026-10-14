@@ -834,7 +834,6 @@ export const nextEs: LocaleDictionary = {
   "next.proxies.tunnel": "Túnel",
   "next.proxies.credentials": "Credenciales",
   "next.proxies.secretsNote": "los secretos se guardan solo en escritura",
-  "next.proxies.tableNote": "se asignan a proveedores y feeds en sus propios paneles",
   "next.proxies.lastTest": "Última prueba",
   "next.proxies.empty": "No hay proxies. Los proveedores se conectan directamente.",
   "next.proxies.add": "Añadir proxy",

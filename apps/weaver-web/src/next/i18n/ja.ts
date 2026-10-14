@@ -834,7 +834,6 @@ export const nextJa: LocaleDictionary = {
   "next.proxies.tunnel": "トンネル",
   "next.proxies.credentials": "認証情報",
   "next.proxies.secretsNote": "シークレットは書き込み専用で保存されます",
-  "next.proxies.tableNote": "プロバイダーとフィードにはそれぞれのパネルで割り当てます",
   "next.proxies.lastTest": "前回のテスト",
   "next.proxies.empty": "プロキシはありません。プロバイダーは直接接続します。",
   "next.proxies.add": "プロキシを追加",

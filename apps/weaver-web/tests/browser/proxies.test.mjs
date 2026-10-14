@@ -333,6 +333,35 @@ test("a pool and a proxy open from anywhere on their line and from its Edit butt
   }
 });
 
+test("a proxy is removed from its own line once confirmed, and a refusal says why", async () => {
+  const page = await open();
+  try {
+    const proxies = page.locator("main");
+    assert.equal(await proxies.getByText("assigned to providers and feeds on their own panels").count(), 0);
+    const confirm = page.getByRole("dialog", { name: "Remove proxy", exact: true });
+
+    // A pool's member is refused, and the dialog stays open to say so.
+    await action(line(page, "Relay"), "Remove").click();
+    await action(confirm, "Remove proxy").click();
+    await confirm.getByRole("alert").getByText("This proxy is in a pool. Remove it from the pool first.", { exact: true }).waitFor();
+    await action(confirm, "Cancel").click();
+    await confirm.waitFor({ state: "detached" });
+    assert.equal(await line(page, "Relay").count(), 1);
+
+    // Anything else goes once confirmed.
+    await action(line(page, "Seedbox"), "Remove").click();
+    assert.equal(await confirm.getByRole("alert").count(), 0);
+    await shot(page, "proxy-remove");
+    await action(confirm, "Remove proxy").click();
+    await confirm.waitFor({ state: "detached" });
+    await line(page, "Seedbox").waitFor({ state: "detached" });
+    const removes = (await daemon(page)).requests.filter((request) => request.name === "DeleteProxyProfile");
+    assert.deepEqual(removes.map((request) => request.variables.id), [3, 2]);
+  } finally {
+    await page.close();
+  }
+});
+
 test("a route opens from anywhere on its line and from its Edit button", async () => {
   const page = await open("?routes", "news.fixture.invalid");
   try {

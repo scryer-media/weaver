@@ -21,7 +21,7 @@ import {
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { SecondaryButton, Segmented, TextArea, TextField } from "../../../components/controls";
+import { DangerButton, SecondaryButton, Segmented, TextArea, TextField } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WV } from "../../../data/palette";
 import {
@@ -238,6 +238,9 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
   });
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
   const [testingId, setTestingId] = useState<number | null>(null);
+  const [removing, setRemoving] = useState<ProxyProfile | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const [{ fetching: removeBusy }, deleteProxy] = useMutation(DELETE_PROXY_MUTATION);
   // Each proxy's last test in this session, in one sentence.
   const [health, setHealth] = useState<Record<number, string>>({});
 
@@ -251,8 +254,7 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
       kind: "table",
       id: "proxies",
       title: t("next.settings.panel.proxies"),
-      note: t("next.proxies.tableNote"),
-      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 204px",
+      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 284px",
       headers: [
         t("next.proxies.name"),
         t("next.proxies.type"),
@@ -296,6 +298,9 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
             <SecondaryButton className="h-7 px-2" onClick={() => setEditingId(profile.id)}>
               {t("next.proxies.edit")}
             </SecondaryButton>
+            <DangerButton className="h-7 px-2" onClick={() => setRemoving(profile)}>
+              {t("next.common.remove")}
+            </DangerButton>
           </span>,
         ],
       })),
@@ -327,6 +332,42 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
           onClose={() => setTestingId(null)}
         />
       )}
+
+      <ConfirmDialog
+        open={removing !== null}
+        title={t("next.proxies.remove")}
+        note={removing?.name}
+        busy={removeBusy}
+        confirmLabel={t("next.proxies.remove")}
+        body={
+          <>
+            {t("next.proxies.removeBody")}
+            {removeError === null ? null : (
+              <span role="alert" className="mt-3 block text-[12.5px] text-wv-error-text">
+                {removeError}
+              </span>
+            )}
+          </>
+        }
+        onConfirm={() => {
+          if (removing) {
+            void deleteProxy({ id: removing.id }).then((result) => {
+              if (result.error) {
+                setRemoveError(refusalMessage(t, result.error));
+                return;
+              }
+              setRemoving(null);
+              setRemoveError(null);
+              void reexecute({ requestPolicy: "network-only" });
+              onChanged?.();
+            });
+          }
+        }}
+        onDismiss={() => {
+          setRemoving(null);
+          setRemoveError(null);
+        }}
+      />
     </>
   );
 }
