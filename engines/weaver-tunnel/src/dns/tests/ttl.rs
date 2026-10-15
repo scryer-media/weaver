@@ -1,4 +1,5 @@
 use super::*;
+use crate::resolution::record::{LookupError, Recording};
 use std::sync::Arc;
 
 type Answer = dyn Fn(IpAddr, u16, &[u8]) -> Vec<u8> + Send + Sync;
@@ -200,4 +201,93 @@ fn a_ttl_with_the_top_bit_set_is_read_as_zero() {
     );
     let parsed = parse_response(&reply, 9, "fixture.test", 1).unwrap();
     assert_eq!(parsed.ttl, 0);
+}
+
+// What a test recording says of a lookup through `carrier` that found
+// nothing.
+async fn why(carrier: &dyn Carrier, servers: &[IpAddr], host: &str) -> LookupError {
+    let recording = Arc::new(Recording::default());
+    recording
+        .scope(async {
+            record::asking(host, || record::Asker::servers(servers));
+            let _ = resolve_name(carrier, servers, host).await;
+        })
+        .await;
+    recording
+        .finish(host, 80, None)
+        .and_then(|resolution| resolution.error)
+        .expect("a failed lookup")
+}
+
+fn failure(failure: LookupFailure, detail: &str) -> LookupError {
+    LookupError {
+        failure,
+        detail: detail.into(),
+    }
+}
+
+#[tokio::test]
+async fn a_lookup_says_which_answer_told_it_most() {
+    let zone = Zone::new(|_, _, query| respond(query, 2, &[], &[]));
+    assert_eq!(
+        why(&zone, &[server()], "fixture.test").await,
+        failure(LookupFailure::ServerFailure, "192.0.2.53: SERVFAIL")
+    );
+    // A name no server knows says so, with or without how long that holds.
+    let zone = Zone::new(|_, _, query| respond(query, 3, &[], &[]));
+    assert_eq!(
+        why(&zone, &[server()], "missing.test").await,
+        failure(LookupFailure::NoSuchName, "192.0.2.53: NXDOMAIN")
+    );
+    let zone = Zone::new(|_, _, query| respond(query, 0, &[], &[soa(900, 120)]));
+    assert_eq!(
+        why(&zone, &[server()], "fixture.test").await,
+        failure(LookupFailure::NoAddress, "192.0.2.53: NODATA")
+    );
+    // A server that refuses tells less than one that says the name is gone.
+    let other: IpAddr = "192.0.2.54".parse().unwrap();
+    let zone = Zone::new(move |asked, _, query| {
+        respond(query, if asked == other { 3 } else { 5 }, &[], &[])
+    });
+    assert_eq!(
+        why(&zone, &[server(), other], "missing.test").await,
+        failure(LookupFailure::NoSuchName, "192.0.2.54: NXDOMAIN")
+    );
+}
+
+// Servers that can be dialled and never answer.
+#[derive(Default)]
+struct Silent(std::sync::Mutex<Vec<tokio::io::DuplexStream>>);
+
+#[async_trait::async_trait]
+impl Carrier for Silent {
+    async fn open(&self, _: IpAddr) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+        let (client, server) = tokio::io::duplex(4096);
+        self.0.lock().unwrap().push(server);
+        Ok(Box::new(client))
+    }
+}
+
+// Servers that cannot be dialled.
+struct Unreachable;
+
+#[async_trait::async_trait]
+impl Carrier for Unreachable {
+    async fn open(&self, _: IpAddr) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+        Err(TunnelError::Engine(
+            "egress connection failed: no route".into(),
+        ))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_server_that_never_answers_runs_out_of_time_and_one_never_reached_gives_no_reply() {
+    assert_eq!(
+        why(&Silent::default(), &[server()], "fixture.test").await,
+        failure(LookupFailure::TimedOut, "192.0.2.53: no answer within 5s")
+    );
+    assert_eq!(
+        why(&Unreachable, &[server()], "fixture.test").await,
+        failure(LookupFailure::NoReply, "egress connection failed: no route")
+    );
 }

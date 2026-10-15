@@ -25,7 +25,9 @@ mod draft;
 pub use draft::DraftNetworkRoute;
 #[path = "network_test_via.rs"]
 mod test_via;
-pub use test_via::{MAX_TEST_PATHS, PathTest, TestSubject};
+pub use test_via::{
+    HostResolution, LookupError, LookupFailure, MAX_TEST_PATHS, PathTest, ResolvedBy, TestSubject,
+};
 
 // The health reason of an egress whose download quota is used up.
 pub const QUOTA_REACHED: &str = "Quota reached";

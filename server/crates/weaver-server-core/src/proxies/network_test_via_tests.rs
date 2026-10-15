@@ -1,5 +1,9 @@
 use super::*;
-use weaver_tunnel::test_support::{TEST_PEER_ADDRESS, TEST_PEER_HTTP_PORT};
+use std::net::IpAddr;
+use weaver_tunnel::test_support::{
+    CLIENT_ED25519_PEM, HOST_KEY_FINGERPRINT, SshServerDouble, SshServerOptions, TEST_PEER_ADDRESS,
+    TEST_PEER_HTTP_PORT, dns::DnsServerDouble, proxy::ProxyServerDouble,
+};
 
 fn socks(id: u32, port: u16) -> ProxyProfile {
     ProxyProfile {
@@ -52,6 +56,30 @@ fn runtime_with(
     }
     runtime.apply_configuration(config).unwrap();
     runtime
+}
+
+fn ip(text: &str) -> IpAddr {
+    text.parse().unwrap()
+}
+
+// How the one path of a test through `route` resolved `host`.
+async fn resolved(
+    runtime: &NetworkRuntime,
+    route: &Route,
+    subject: TestSubject,
+    target: Option<(&str, u16)>,
+) -> (Result<ProxyTestPass, ProxyFault>, HostResolution) {
+    let mut tests = runtime
+        .test_via(
+            route,
+            subject,
+            target.map(|(host, port)| (host.to_owned(), port)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tests.len(), 1);
+    let test = tests.remove(0);
+    (test.outcome, test.resolution.expect("a resolution"))
 }
 
 async fn refusal(runtime: &NetworkRuntime, path: LegPath, subject: TestSubject) -> NetworkRefusal {
@@ -208,6 +236,14 @@ async fn a_proxy_reachable_only_through_a_tunnel_is_tested_through_that_tunnel()
             .iter()
             .any(|query| query == "far.vpn.test")
     );
+    let resolution = tests[0].resolution.clone().unwrap();
+    assert_eq!(resolution.host, "far.vpn.test");
+    assert_eq!(resolution.by, ResolvedBy::ProxyServers);
+    assert_eq!(resolution.proxy, Some(1));
+    assert_eq!(resolution.servers, near.client_spec("route").dns_servers);
+    assert_eq!(resolution.addresses, [IpAddr::V4(TEST_PEER_ADDRESS)]);
+    assert_eq!(resolution.connected, Some(IpAddr::V4(TEST_PEER_ADDRESS)));
+    assert_eq!(resolution.error, None);
 
     // Given a target, the far tunnel carries a connection to it.
     let tests = runtime
@@ -219,8 +255,242 @@ async fn a_proxy_reachable_only_through_a_tunnel_is_tested_through_that_tunnel()
         .await
         .unwrap();
     assert_eq!(tests[0].outcome, Ok(ProxyTestPass::Forwarded));
+    let resolution = tests[0].resolution.clone().unwrap();
+    assert_eq!(resolution.by, ResolvedBy::Literal);
+    assert_eq!(resolution.connected, Some(IpAddr::V4(TEST_PEER_ADDRESS)));
+    // A name the far tunnel's DNS server does not know fails the lookup.
+    let (outcome, resolution) = resolved(
+        &runtime,
+        &route,
+        TestSubject::Proxy(2),
+        Some(("missing.vpn.test", TEST_PEER_HTTP_PORT)),
+    )
+    .await;
+    assert!(outcome.is_err());
+    assert_eq!(resolution.by, ResolvedBy::ProxyServers);
+    assert_eq!(resolution.proxy, Some(2));
+    assert!(resolution.addresses.is_empty());
+    assert_eq!(
+        resolution.error.map(|error| error.failure),
+        Some(LookupFailure::NoSuchName)
+    );
     // The test's sessions ended with it.
     assert!(runtime.sessions.lock().unwrap().is_empty());
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_direct_path_says_how_its_target_was_resolved() {
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = target.local_addr().unwrap().port();
+    let runtime = runtime_with(vec![], vec![], vec![]);
+    let route = draft(LegPath::Direct);
+    // An address is its own answer.
+    let (outcome, resolution) = resolved(
+        &runtime,
+        &route,
+        TestSubject::Route,
+        Some(("127.0.0.1", port)),
+    )
+    .await;
+    assert_eq!(outcome, Ok(ProxyTestPass::Connected));
+    assert_eq!(resolution.by, ResolvedBy::Literal);
+    assert_eq!(resolution.addresses, [ip("127.0.0.1")]);
+    assert_eq!(resolution.connected, Some(ip("127.0.0.1")));
+    let _accepted = target.accept().await.unwrap();
+    // A name is looked up with this machine's DNS, and the answer is held
+    // for the next dial.
+    for held in [false, true] {
+        let (outcome, resolution) = resolved(
+            &runtime,
+            &route,
+            TestSubject::Route,
+            Some(("localhost", port)),
+        )
+        .await;
+        assert_eq!(outcome, Ok(ProxyTestPass::Connected));
+        assert_eq!(resolution.host, "localhost");
+        assert_eq!(resolution.by, ResolvedBy::Host);
+        assert_eq!(resolution.proxy, None);
+        assert!(resolution.addresses.contains(&ip("127.0.0.1")));
+        assert_eq!(resolution.connected, Some(ip("127.0.0.1")));
+        assert_eq!(resolution.cached, held);
+        assert_eq!(resolution.error, None);
+        let _accepted = target.accept().await.unwrap();
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_connect_that_fails_after_a_lookup_still_says_what_the_name_resolved_to() {
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let runtime = runtime_with(vec![], vec![], vec![]);
+    let (outcome, resolution) = resolved(
+        &runtime,
+        &draft(LegPath::Direct),
+        TestSubject::Route,
+        Some(("localhost", port)),
+    )
+    .await;
+    assert_eq!(outcome, Err(ProxyFault::ConnectionRefused));
+    assert_eq!(resolution.by, ResolvedBy::Host);
+    assert!(resolution.addresses.contains(&ip("127.0.0.1")));
+    assert_eq!(resolution.connected, None);
+    assert_eq!(resolution.error, None);
+    runtime.shutdown().await;
+}
+
+// The DNS server a stream proxy asks through itself.
+const ROUTED_DNS: &str = "192.0.2.53";
+// What that server resolves `named.invalid` to.
+const NAMED: &str = "198.51.100.7";
+
+// A SOCKS5 proxy at `double`, resolving as `resolver` and `dns` say.
+fn socks_at(
+    id: u32,
+    double: &ProxyServerDouble,
+    resolver: crate::proxies::Resolver,
+    dns: &[&str],
+) -> ProxyProfile {
+    ProxyProfile {
+        id,
+        port: double.addr.port(),
+        resolver,
+        dns_servers: dns.iter().map(|server| ip(server)).collect(),
+        // Hop timeouts are not under test here.
+        timeout_seconds: 300,
+        ..socks(id, 0)
+    }
+}
+
+#[tokio::test]
+async fn a_proxy_test_with_a_target_says_who_resolved_it() {
+    use crate::proxies::Resolver as Naming;
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let to = target.local_addr().unwrap();
+    let dns = DnsServerDouble::start(HashMap::from([(
+        "named.invalid".into(),
+        NAMED.parse().unwrap(),
+    )]))
+    .await;
+    let double = ProxyServerDouble::start(
+        weaver_tunnel::transport::TransportKind::Socks5,
+        None,
+        HashMap::from([
+            ((ROUTED_DNS.into(), 53), dns.addr),
+            ((NAMED.into(), to.port()), to),
+            (("named.invalid".into(), to.port()), to),
+            (("127.0.0.1".into(), to.port()), to),
+        ]),
+    )
+    .await;
+    let runtime = runtime_with(
+        vec![
+            socks_at(1, &double, Naming::Proxy, &[ROUTED_DNS]),
+            socks_at(2, &double, Naming::Proxy, &[]),
+            socks_at(3, &double, Naming::Weaver, &[]),
+        ],
+        vec![],
+        vec![],
+    );
+    let route = draft(LegPath::Direct);
+    let named = Some(("named.invalid", to.port()));
+
+    // DNS servers asked through the proxy.
+    let (outcome, resolution) = resolved(&runtime, &route, TestSubject::Proxy(1), named).await;
+    assert_eq!(outcome, Ok(ProxyTestPass::Forwarded));
+    assert_eq!(
+        resolution,
+        HostResolution {
+            host: "named.invalid".into(),
+            by: ResolvedBy::ProxyServers,
+            proxy: Some(1),
+            servers: vec![ip(ROUTED_DNS)],
+            addresses: vec![ip(NAMED)],
+            cached: false,
+            connected: Some(ip(NAMED)),
+            error: None,
+        }
+    );
+    let _accepted = target.accept().await.unwrap();
+
+    // The proxy handed the name.
+    let (outcome, resolution) = resolved(&runtime, &route, TestSubject::Proxy(2), named).await;
+    assert_eq!(outcome, Ok(ProxyTestPass::Forwarded));
+    assert_eq!(resolution.by, ResolvedBy::Proxy);
+    assert_eq!(resolution.proxy, Some(2));
+    assert!(resolution.addresses.is_empty());
+    assert_eq!(resolution.connected, None);
+    let _accepted = target.accept().await.unwrap();
+
+    // This machine's DNS, with the proxy handed the address.
+    let (outcome, resolution) = resolved(
+        &runtime,
+        &route,
+        TestSubject::Proxy(3),
+        Some(("localhost", to.port())),
+    )
+    .await;
+    assert_eq!(outcome, Ok(ProxyTestPass::Forwarded));
+    assert_eq!(resolution.by, ResolvedBy::Host);
+    assert_eq!(resolution.proxy, None);
+    assert!(resolution.addresses.contains(&ip("127.0.0.1")));
+    assert_eq!(resolution.connected, Some(ip("127.0.0.1")));
+    let _accepted = target.accept().await.unwrap();
+
+    // A name the servers do not know fails the lookup, in their words.
+    let (outcome, resolution) = resolved(
+        &runtime,
+        &route,
+        TestSubject::Proxy(1),
+        Some(("missing.invalid", to.port())),
+    )
+    .await;
+    assert_eq!(outcome, Err(ProxyFault::NameNotResolved));
+    assert_eq!(resolution.by, ResolvedBy::ProxyServers);
+    assert!(resolution.addresses.is_empty());
+    assert_eq!(
+        resolution.error,
+        Some(LookupError {
+            failure: LookupFailure::NoSuchName,
+            detail: format!("{ROUTED_DNS}: NXDOMAIN"),
+        })
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_ssh_test_without_a_target_says_how_its_endpoint_was_resolved() {
+    let ssh = SshServerDouble::start(SshServerOptions::default()).await;
+    let mut profile = ProxyProfile {
+        id: 1,
+        kind: ProxyKind::Ssh,
+        host: "localhost".into(),
+        port: ssh.port(),
+        timeout_seconds: 300,
+        host_key_fingerprint: Some(HOST_KEY_FINGERPRINT.into()),
+        ..proxy()
+    };
+    profile.secrets.username = Some("operator".into());
+    profile.secrets.private_key = Some(CLIENT_ED25519_PEM.into());
+    // An SSH test pins the host key it met, so the profile is saved.
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&profile).unwrap();
+    let runtime = NetworkRuntime::new(db, tokio::runtime::Handle::current()).unwrap();
+    let (outcome, resolution) = resolved(
+        &runtime,
+        &draft(LegPath::Direct),
+        TestSubject::Proxy(1),
+        None,
+    )
+    .await;
+    assert_eq!(outcome, Ok(ProxyTestPass::Connected));
+    assert_eq!(resolution.host, "localhost");
+    assert_eq!(resolution.by, ResolvedBy::Host);
+    assert!(resolution.addresses.contains(&ip("127.0.0.1")));
+    assert_eq!(resolution.connected, Some(ip("127.0.0.1")));
     runtime.shutdown().await;
 }
 

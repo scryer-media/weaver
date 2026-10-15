@@ -598,6 +598,12 @@ test("a proxy is tested through a route drafted for it, which cannot use the pro
     await action(dialog, "Test").click();
     await rows.first().getByText("Connected and forwarded through the proxy.", { exact: true }).waitFor();
     assert.deepEqual((await runs(page)).at(-1).variables.target, { host: "news.fixture.invalid", port: 563 });
+    // Each path says how the host was resolved, the address it reached marked among several.
+    const resolved = rows.first().locator("p").nth(1);
+    assert.equal(await resolved.textContent(), "news.fixture.invalid → 192.0.2.80, 192.0.2.81 · DNS 192.0.2.53 via Relay");
+    assert.equal(await resolved.locator("strong").textContent(), "192.0.2.81");
+    // A path that failed before its lookup says nothing of one.
+    assert.equal(await rows.nth(1).locator("p").count(), 1);
 
     // Folded away again, what was typed is not sent.
     await optional.click();
@@ -605,6 +611,7 @@ test("a proxy is tested through a route drafted for it, which cannot use the pro
     const sent = (await runs(page)).length;
     await action(dialog, "Test").click();
     await rows.first().getByText(reachable, { exact: true }).waitFor();
+    assert.equal(await rows.first().locator("p").count(), 1);
     const last = await runs(page);
     assert.equal(last.length, sent + 1);
     assert.equal(last.at(-1).variables.target, null);

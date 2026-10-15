@@ -3,7 +3,10 @@
 use crate::{
     TunnelError, TunnelStream,
     pipe::{DialError, Dialer, Purpose, Target},
-    resolution::{Lookup, Ttl},
+    resolution::{
+        Lookup, Ttl,
+        record::{self, LookupFailure},
+    },
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
@@ -84,6 +87,7 @@ pub async fn resolve_through(
         return Ok(Lookup {
             addresses: vec![ip],
             ttl: Ttl::Unknown,
+            nonexistent: false,
         });
     }
     let stage = Stage {
@@ -112,6 +116,92 @@ pub async fn resolve_through(
 struct Found {
     addresses: Vec<IpAddr>,
     ttl: Option<u32>,
+    // The server said the name does not exist.
+    nonexistent: bool,
+}
+
+// Why one query got no answer.
+enum Failed {
+    // The server could not be reached.
+    Unreached(TunnelError),
+    // The connection closed before a whole reply came.
+    Closed,
+    // The server answered with this error code instead of an answer.
+    Rcode(u16),
+    Invalid,
+}
+
+// Why a lookup found nothing, from what each server it asked said: the
+// most telling answer any server gave.
+#[derive(Default)]
+struct Why(Option<(LookupFailure, String)>);
+
+impl Why {
+    fn rank(failure: LookupFailure) -> u8 {
+        match failure {
+            LookupFailure::NoSuchName => 5,
+            LookupFailure::NoAddress => 4,
+            LookupFailure::ServerFailure => 3,
+            LookupFailure::TimedOut => 2,
+            LookupFailure::Other => 1,
+            LookupFailure::NoReply => 0,
+        }
+    }
+    fn consider(&mut self, failure: LookupFailure, detail: impl FnOnce() -> String) {
+        if self
+            .0
+            .as_ref()
+            .is_none_or(|(held, _)| Self::rank(failure) > Self::rank(*held))
+        {
+            self.0 = Some((failure, detail()));
+        }
+    }
+    // What one family's query came to at `server`.
+    fn query(&mut self, server: IpAddr, answered: &Result<Result<Found, Failed>, impl Sized>) {
+        match answered {
+            Ok(Ok(found)) if found.addresses.is_empty() && found.nonexistent => {
+                self.consider(LookupFailure::NoSuchName, || format!("{server}: NXDOMAIN"))
+            }
+            Ok(Ok(found)) if found.addresses.is_empty() => {
+                self.consider(LookupFailure::NoAddress, || format!("{server}: NODATA"))
+            }
+            Ok(Ok(_)) => {}
+            // The stage's own words, as it failed to dial the server.
+            Ok(Err(Failed::Unreached(error))) => {
+                self.consider(LookupFailure::NoReply, || match error {
+                    TunnelError::Engine(said) => said.clone(),
+                    error => error.to_string(),
+                })
+            }
+            Ok(Err(Failed::Closed)) => self.consider(LookupFailure::NoReply, || {
+                format!("{server}: the connection closed without a reply")
+            }),
+            Ok(Err(Failed::Rcode(rcode))) => self.consider(LookupFailure::ServerFailure, || {
+                let said = match rcode {
+                    2 => "SERVFAIL".to_owned(),
+                    5 => "REFUSED".to_owned(),
+                    rcode => format!("RCODE {rcode}"),
+                };
+                format!("{server}: {said}")
+            }),
+            Ok(Err(Failed::Invalid)) => {
+                self.consider(LookupFailure::Other, || format!("{server}: {INVALID}"))
+            }
+            Err(_) => self.consider(LookupFailure::TimedOut, || {
+                format!(
+                    "{server}: no answer within {}s",
+                    FAMILY_QUERY_TIMEOUT.as_secs()
+                )
+            }),
+        }
+    }
+    // Notes why `host` found nothing in the test recording this lookup runs
+    // in, if any.
+    fn note(self, host: &str) {
+        if let Some((failure, detail)) = self.0 {
+            record::failed(host, failure, || detail);
+        }
+    }
 }
 
 async fn resolve_name(
@@ -120,11 +210,15 @@ async fn resolve_name(
     host: &str,
 ) -> Result<Lookup, Unanswered> {
     if servers.is_empty() {
+        record::failed(host, LookupFailure::Other, || {
+            "no DNS servers to ask".into()
+        });
         return Err(Unanswered {
             error: TunnelError::Configuration("no DNS servers to ask".into()),
             reached: false,
         });
     }
+    let mut why = Why::default();
     let mut reached_any = false;
     // How long the name's having no address holds, while every server
     // asked has said so for both families.
@@ -152,6 +246,7 @@ async fn resolve_name(
             )
             .await;
             reached_any |= reached;
+            why.query(*server, &answered);
             match answered {
                 Ok(Ok(found)) => {
                     if let Some(held) = found.ttl {
@@ -170,6 +265,7 @@ async fn resolve_name(
             return Ok(Lookup {
                 addresses,
                 ttl: ttl.map_or(Ttl::Unknown, Ttl::Seconds),
+                nonexistent: false,
             });
         }
         negative = negative
@@ -177,10 +273,13 @@ async fn resolve_name(
             .filter(|_| said_none == 2)
             .map(|(negative, ttl)| negative.min(ttl));
     }
+    let nonexistent = matches!(why.0, Some((LookupFailure::NoSuchName, _)));
+    why.note(host);
     match negative {
         Some(ttl) => Ok(Lookup {
             addresses: Vec::new(),
             ttl: Ttl::Seconds(ttl),
+            nonexistent,
         }),
         None => Err(Unanswered {
             error: TunnelError::Engine(UNRESOLVED.into()),
@@ -195,7 +294,7 @@ async fn query(
     host: &str,
     qtype: u16,
     reached: &mut bool,
-) -> Result<Found, TunnelError> {
+) -> Result<Found, Failed> {
     let mut name = host.trim_end_matches('.').to_ascii_lowercase();
     // The shortest TTL of the aliases followed so far.
     let mut ttl = u32::MAX;
@@ -204,11 +303,11 @@ async fn query(
         let mut packet = Vec::from(id.to_be_bytes());
         packet.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
         if name.is_empty() || name.len() > 253 {
-            return Err(invalid());
+            return Err(Failed::Invalid);
         }
         for label in name.split('.') {
             if label.is_empty() || label.len() > 63 || !label.is_ascii() {
-                return Err(invalid());
+                return Err(Failed::Invalid);
             }
             packet.push(label.len() as u8);
             packet.extend_from_slice(label.as_bytes());
@@ -216,25 +315,33 @@ async fn query(
         packet.push(0);
         packet.extend_from_slice(&qtype.to_be_bytes());
         packet.extend_from_slice(&[0, 1]);
-        let mut stream = provider.open(server).await?;
+        let mut stream = provider.open(server).await.map_err(Failed::Unreached)?;
         *reached = true;
         stream
             .write_u16(packet.len() as u16)
             .await
-            .map_err(|_| invalid())?;
-        stream.write_all(&packet).await.map_err(|_| invalid())?;
-        let size = stream.read_u16().await.map_err(|_| invalid())? as usize;
+            .map_err(|_| Failed::Closed)?;
+        stream
+            .write_all(&packet)
+            .await
+            .map_err(|_| Failed::Closed)?;
+        let size = stream.read_u16().await.map_err(|_| Failed::Closed)? as usize;
         if !(12..=16384).contains(&size) {
-            return Err(invalid());
+            return Err(Failed::Invalid);
         }
-        let mut reply = vec![0; size];
-        stream.read_exact(&mut reply).await.map_err(|_| invalid())?;
-        let reply = parse_response(&reply, id, &name, qtype)?;
+        let mut bytes = vec![0; size];
+        stream
+            .read_exact(&mut bytes)
+            .await
+            .map_err(|_| Failed::Closed)?;
+        let reply = parse_response(&bytes, id, &name, qtype)
+            .map_err(|_| refusal(&bytes, id).map_or(Failed::Invalid, Failed::Rcode))?;
         ttl = ttl.min(reply.ttl);
         if !reply.addresses.is_empty() {
             return Ok(Found {
                 addresses: reply.addresses,
                 ttl: Some(ttl),
+                nonexistent: false,
             });
         }
         match reply.alias {
@@ -243,11 +350,21 @@ async fn query(
                 return Ok(Found {
                     addresses: Vec::new(),
                     ttl: reply.negative.map(|negative| negative.min(ttl)),
+                    nonexistent: reply.nonexistent,
                 });
             }
         }
     }
-    Err(invalid())
+    Err(Failed::Invalid)
+}
+
+// The error code a reply to query `id` carries in place of an answer, when
+// it is one: the server could not, or would not, resolve the name.
+fn refusal(bytes: &[u8], id: u16) -> Option<u16> {
+    let flags = u16_at(bytes, 2).ok()?;
+    let rcode = flags & 0x000f;
+    (u16_at(bytes, 0).ok()? == id && flags & 0x8000 != 0 && !matches!(rcode, 0 | 3))
+        .then_some(rcode)
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> Result<u16, TunnelError> {
@@ -361,6 +478,8 @@ struct Reply {
     // For no address, how long that holds: the zone's negative TTL, from
     // the SOA in the authority section, when there is one.
     negative: Option<u32>,
+    // The server said the name does not exist.
+    nonexistent: bool,
 }
 
 fn parse_response(bytes: &[u8], id: u16, host: &str, qtype: u16) -> Result<Reply, TunnelError> {
@@ -453,6 +572,7 @@ fn parse_response(bytes: &[u8], id: u16, host: &str, qtype: u16) -> Result<Reply
         alias,
         ttl,
         negative,
+        nonexistent: rcode == 3,
     })
 }
 
