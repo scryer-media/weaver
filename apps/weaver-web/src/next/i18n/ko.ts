@@ -1684,7 +1684,7 @@ export const nextKo: LocaleDictionary = {
   "next.networking.flow.poolMembers": "{{name}} 풀 구성원",
   "next.networking.flow.memberConnect": "연결 {{ms}} ms",
   "next.networking.flow.memberLatency": "{{ms}} ms",
-  "next.networking.flow.memberSpeed": "각 {{rate}}",
+  "next.networking.flow.memberSpeed": "연결당 {{rate}}",
   "next.networking.flow.holding.one": "연결 {{count}}개",
   "next.networking.flow.holding.other": "연결 {{count}}개",
   "next.networking.flow.serverKind": "서버 · {{failover}}",

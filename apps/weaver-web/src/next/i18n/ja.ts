@@ -1684,7 +1684,7 @@ export const nextJa: LocaleDictionary = {
   "next.networking.flow.poolMembers": "プール {{name}} のメンバー",
   "next.networking.flow.memberConnect": "接続 {{ms}} ms",
   "next.networking.flow.memberLatency": "{{ms}} ms",
-  "next.networking.flow.memberSpeed": "各 {{rate}}",
+  "next.networking.flow.memberSpeed": "接続あたり {{rate}}",
   "next.networking.flow.holding.one": "{{count}} 接続",
   "next.networking.flow.holding.other": "{{count}} 接続",
   "next.networking.flow.serverKind": "サーバー · {{failover}}",

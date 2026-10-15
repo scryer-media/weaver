@@ -29,7 +29,7 @@ test("create an egress and two-leg route, then disable the egress through GraphQ
  await page.getByRole("link",{name:"Overview",exact:true}).click();
  await page.getByRole("link",{name:"Edit the route for news.fixture.invalid, leg 2",exact:true}).waitFor();
  assert.equal(await page.locator("svg").getByRole("link",{name:/Edit the route for .* leg/}).count(),2);
- assert.equal(await page.locator("svg path[stroke-dasharray]").count(),4);
+ assert.equal(await page.locator("svg path[stroke-dasharray]").count(),6);
  const gql=async(query,variables={})=>{const r=await page.request.post(`${baseUrl}/graphql`,{data:{query,variables}});const body=await r.json();assert.equal(body.errors,undefined,JSON.stringify(body.errors));return body.data;};
  const data=await gql("{egressInterfaces{id name} networkFlow{legs{position target state}}}");
  assert.deepEqual(data.networkFlow.legs.map(l=>l.target),[10,10]);
@@ -61,11 +61,11 @@ test("flow displays route evidence, opens editors, and edits weights without los
  // The member carrying the pool's traffic says so, with what it carries now; the one idle beside it stands by on its timings.
  await members.getByText("Amsterdam · Active",{exact:true}).waitFor();
  // The pool lists Frankfurt, Lisbon, Amsterdam; it is drawn by what carries traffic, then by the quickest to connect.
- assert.deepEqual(await members.locator("text").allTextContents(),["Amsterdam · Active","24 open · 22.89 MiB/s","Frankfurt · Standby","25 ms · 0.76 MiB/s each","Lisbon · Disabled"]);
+ assert.deepEqual(await members.locator("text").allTextContents(),["Amsterdam · Active","24 open · 22.89 MiB/s","Frankfurt · Standby","25 ms · 0.76 MiB/s per connection","Lisbon · Disabled"]);
  // A connect time wears the signal mark instead of words; the hover, which has no room for it, says what it is.
  assert.equal(await members.locator("a").filter({hasText:"Frankfurt · Standby"}).locator("svg.lucide-signal").count(),1);
  assert.equal(await members.locator("svg.lucide-signal").count(),1);
- assert.equal(await members.locator("a").filter({hasText:"Amsterdam · Active"}).locator("title").textContent(),"Connects in 20 ms · 0.95 MiB/s each");
+ assert.equal(await members.locator("a").filter({hasText:"Amsterdam · Active"}).locator("title").textContent(),"Connects in 20 ms · 0.95 MiB/s per connection");
  assert.equal(await members.locator("rect[fill='#1f2b29']").count(),1);
  const pool=diagram.locator("a").filter({hasText:"Europe · pool"});
  assert.deepEqual(await pool.locator("text").allTextContents(),["Europe · pool","24 connections","Active"]);
@@ -99,8 +99,11 @@ test("flow displays route evidence, opens editors, and edits weights without los
  assert.notEqual(await lte.locator("g:has(> title) > text").getAttribute("fill"),await fiber.locator("g:has(> title) > text").last().getAttribute("fill"));
  // The daemon knows only that its egress is up; the leg is blocked all the same.
  assert.deepEqual(await legCards.filter({hasText:"News archive"}).locator("text").allTextContents(),["News archive · leg 1 · 100%","Blocked · 0/0 open · 0.00 MiB/s","0 planned"]);
- await diagram.locator("path[stroke-dasharray]:not([stroke-dasharray='18 30'])").nth(10).waitFor({state:"attached"});
- assert.equal(await diagram.locator("path[stroke-dasharray]:not([stroke-dasharray='18 30'])").count(),11);
+ // A feed or Default outbound opens a connection only for a moment, over its one leg: the leg is its name, its state, and where it leaves from while open.
+ assert.deepEqual(await legCards.filter({hasText:"Default outbound"}).locator("text").allTextContents(),["Default outbound","Up"]);
+ assert.deepEqual(await legCards.filter({hasText:"Feed mirror"}).locator("text").allTextContents(),["Feed mirror","Up","127.0.0.1:45130"]);
+ await diagram.locator("path[stroke-dasharray]:not([stroke-dasharray='18 30'])").nth(12).waitFor({state:"attached"});
+ assert.equal(await diagram.locator("path[stroke-dasharray]:not([stroke-dasharray='18 30'])").count(),13);
  const faded=diagram.locator("[opacity='0.2']");
  const fadedLegs=diagram.locator("g[opacity='0.2'] > a[aria-label^='Edit the route for']");
  const fadedEgresses=diagram.locator("g[opacity='0.2'] > a[href='/settings/networking/egress']");
@@ -166,13 +169,13 @@ test("flow displays route evidence, opens editors, and edits weights without los
  await page.mouse.move(0,0);
  await faded.first().waitFor({state:"detached"});
  assert.equal(await snakes.count(),6);
- assert.equal(await dashed.count(),11);
+ assert.equal(await dashed.count(),13);
  // A route behind a kill switch lights up but does not move: nothing can go that way.
  await killSwitch.hover();
  await fadedEndpoints.filter({hasText:"News primary"}).waitFor({state:"attached"});
  assert.equal(await killSwitch.locator("xpath=..").getAttribute("opacity"),null);
  assert.equal(await snakes.count(),0);
- assert.equal(await dashed.count(),11);
+ assert.equal(await dashed.count(),13);
  await page.mouse.move(0,0);
  await faded.first().waitFor({state:"detached"});
  // A reader who asks for less motion gets none, from the moment they ask: the traffic stands still in its ribbons.
@@ -217,8 +220,8 @@ test("flow displays route evidence, opens editors, and edits weights without los
  await page.getByRole("menu",{name:"Leg 1 rung 1",exact:true}).waitFor({state:"detached"});
  await page.getByRole("button",{name:"Toggle all down"}).click();
  await page.getByText("0 / 50",{exact:true}).first().waitFor();
- await dashed.nth(15).waitFor({state:"attached"});
- assert.equal(await dashed.count(),16);
+ await dashed.nth(18).waitFor({state:"attached"});
+ assert.equal(await dashed.count(),19);
  // With one route picked, only what it reaches is drawn: its legs, the egress they leave through and its own card.
  const egressCards=diagram.locator("a[href='/settings/networking/egress']");
  await page.getByRole("button",{name:"Endpoint",exact:true}).click();
@@ -236,6 +239,53 @@ test("flow displays route evidence, opens editors, and edits weights without los
  assert.equal(await endpoints.count(),5);
  assert.equal(errors.length,0,errors.join("\n"));
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT,fullPage:true});
+ await page.close();
+});
+/** Every point a path's outline passes through, as [x, y]. */
+const outline=d=>[...d.matchAll(/(-?[\d.]+) (-?[\d.]+)/g)].map(([,x,y])=>[Number(x),Number(y)]);
+test("a pool carried by two members splits its ribbon between them, each part into its member's row",async()=>{
+ const page=await browser.newPage({viewport:{width:1440,height:2700}});page.setDefaultTimeout(0);const errors=[];page.on("pageerror",error=>errors.push(error.message));
+ await page.goto(`${baseUrl}/tests/browser/networking.html?split`);
+ const diagram=page.locator("svg[aria-label^='Egress interfaces']").first();
+ const members=diagram.getByRole("group",{name:"Europe pool members",exact:true});
+ await members.getByText("Frankfurt · Active",{exact:true}).waitFor();
+ const row=name=>members.locator("a").filter({hasText:`${name} · Active`}).locator("rect").first().evaluate(rect=>{const x=Number(rect.getAttribute("x")),y=Number(rect.getAttribute("y"));return {left:x,right:x+Number(rect.getAttribute("width")),middle:y+Number(rect.getAttribute("height"))/2};});
+ const ribbons=(await diagram.locator("path[fill][opacity]:not([stroke])").evaluateAll(paths=>paths.map(path=>path.getAttribute("d")))).map(outline);
+ /** The ribbon reaching `x`: how far down it reaches there, its middle and its thickness. */
+ const at=x=>ribbons.flatMap(points=>{const ys=points.filter(([px])=>Math.abs(px-x)<0.01).map(([,y])=>y);return ys.length?[{points,middle:(Math.min(...ys)+Math.max(...ys))/2,thickness:Math.max(...ys)-Math.min(...ys)}]:[];});
+ const amsterdam=await row("Amsterdam"),frankfurt=await row("Frankfurt");
+ assert.equal(amsterdam.left,frankfurt.left);
+ const box=await members.evaluate(group=>{const {y,height}=group.getBBox();return {top:y,bottom:y+height};});
+ const inPool=parts=>parts.filter(part=>part.middle>box.top&&part.middle<box.bottom);
+ // A part runs in to each member's row and another out of it, level with its middle.
+ const into=inPool(at(amsterdam.left)),out=inPool(at(amsterdam.right));
+ assert.deepEqual(into.map(part=>part.middle),[amsterdam.middle,frankfurt.middle]);
+ assert.deepEqual(out.map(part=>part.middle),[amsterdam.middle,frankfurt.middle]);
+ // Amsterdam holds 18 of the 24 connections and Frankfurt 6, so its part is the thicker.
+ assert.ok(into[0].thickness>into[1].thickness);
+ // Where the parts leave the leg they lie side by side, as the one ribbon they make there.
+ const start=([first])=>first;
+ const [legX]=start(into[0].points);
+ const edges=into.map(part=>part.points.filter(([x])=>x===legX).map(([,y])=>y).sort((a,b)=>a-b));
+ assert.equal(edges[0][1],edges[1][0]);
+ assert.equal(errors.length,0,errors.join("\n"));
+ await page.close();
+});
+test("a direct way is broken where it says it goes direct",async()=>{
+ const page=await browser.newPage({viewport:{width:1440,height:2700}});page.setDefaultTimeout(0);const errors=[];page.on("pageerror",error=>errors.push(error.message));
+ await page.goto(`${baseUrl}/tests/browser/networking.html`);
+ const diagram=page.locator("svg[aria-label^='Egress interfaces']").first();
+ const label=diagram.getByText("Direct · Failing",{exact:true});
+ await label.waitFor();
+ const square=await label.evaluate(text=>{const rect=text.previousElementSibling;return {x:Number(rect.getAttribute("x")),middle:Number(rect.getAttribute("y"))+Number(rect.getAttribute("height"))/2};});
+ const words=await label.evaluate(text=>{const box=text.getBBox();return box.x+box.width;});
+ const lines=(await diagram.locator("path[stroke-dasharray='4 5']").evaluateAll(paths=>paths.map(path=>path.getAttribute("d")))).map(outline);
+ // The line stops short of the words, level with them, and picks up again past them.
+ const level=lines.filter(points=>points.some(([,y])=>y===square.middle));
+ assert.ok(level.some(points=>{const [x,y]=points.at(-1);return x<square.x&&x>square.x-10&&y===square.middle;}));
+ assert.ok(level.some(points=>{const [x,y]=points[0];return x>words&&x<words+10&&y===square.middle;}));
+ assert.equal(level.flat().filter(([x])=>x>square.x&&x<words).length,0);
+ assert.equal(errors.length,0,errors.join("\n"));
  await page.close();
 });
 test("an egress is tested alone and a pool member by member, each through a route drafted for it",async()=>{

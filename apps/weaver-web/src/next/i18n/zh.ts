@@ -1684,7 +1684,7 @@ export const nextZh: LocaleDictionary = {
   "next.networking.flow.poolMembers": "代理池 {{name}} 的成员",
   "next.networking.flow.memberConnect": "连接 {{ms}} ms",
   "next.networking.flow.memberLatency": "{{ms}} ms",
-  "next.networking.flow.memberSpeed": "每条 {{rate}}",
+  "next.networking.flow.memberSpeed": "每连接 {{rate}}",
   "next.networking.flow.holding.one": "{{count}} 个连接",
   "next.networking.flow.holding.other": "{{count}} 个连接",
   "next.networking.flow.serverKind": "服务器 · {{failover}}",

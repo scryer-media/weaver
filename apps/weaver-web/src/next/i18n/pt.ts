@@ -1684,7 +1684,7 @@ export const nextPt: LocaleDictionary = {
   "next.networking.flow.poolMembers": "Membros do pool {{name}}",
   "next.networking.flow.memberConnect": "Conecta em {{ms}} ms",
   "next.networking.flow.memberLatency": "{{ms}} ms",
-  "next.networking.flow.memberSpeed": "{{rate}} cada",
+  "next.networking.flow.memberSpeed": "{{rate}} por conexão",
   "next.networking.flow.holding.one": "{{count}} conexão",
   "next.networking.flow.holding.other": "{{count}} conexões",
   "next.networking.flow.serverKind": "Servidor · {{failover}}",
