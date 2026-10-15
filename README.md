@@ -72,7 +72,7 @@ Weaver has an incredibly powerful networking sub system. It enables you to compo
 | gzip   | ⭐️     | ❌      | ❌      |
 | bzip2  | ⭐️     | ❌      | ❌      |
 | par2   | ⭐️     | ⭐️      | ⭐️      |
-| par3   | ⭐️***  | ❌      | ❌      |
+| par3***| ⭐️     | ❌      | ❌      |
 
 _*Weaver supports "store mode" optimizations that directly materialize the binary file through a streaming decoder rather than download => decode_
 
