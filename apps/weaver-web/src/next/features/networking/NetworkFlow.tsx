@@ -64,6 +64,14 @@ const PROXY = lane(642, 440);
 const ENDPOINTS = lane(1138, 214);
 const WIDTH = 1368;
 const HOP_GAP = 26;
+/** How wide each hop of a chain of `hops` is, side by side across the proxy lane. */
+const hopWidth = (hops: number) => (PROXY.width - (hops - 1) * HOP_GAP) / hops;
+/** Where each gap between a chain's hops starts and ends across the proxy lane. */
+const chainGaps = (hops: number): [number, number][] =>
+  Array.from({ length: hops - 1 }, (_, gap) => {
+    const from = PROXY.x + (gap + 1) * hopWidth(hops) + gap * HOP_GAP;
+    return [from, from + HOP_GAP];
+  });
 const ENDPOINT_BOX_HEIGHT = 76;
 const EGRESS_HEIGHT = 108;
 /** The row an egress card adds at its bottom for each limit it is held to. */
@@ -215,7 +223,7 @@ const CELLS_PER_ROW = 20;
 const CELL_ROW_PITCH = 13;
 const CELL_HEIGHT = 10;
 const MAX_CELLS = 100;
-const ENDPOINT_HEIGHT = 124;
+const ENDPOINT_HEIGHT = 106;
 const ENDPOINT_GAP = 20;
 // Only a server's card counts its connections. A feed's card is its name over
 // what it is; Default outbound's is its name alone.
@@ -597,12 +605,13 @@ function Traffic({ points, width, still }: { points: Point[]; width: number; sti
  * has no card.
  *
  * The proxy lane draws a leg's ladder top to bottom. A proxy is one box, a
- * chain is its hops in order with a `>` between them, and a pool lists its
- * members. Every rung has a line in from its leg and out to the endpoint,
- * whether or not it is the one carrying the leg; the line carrying a pool
- * runs inside its box to the member carrying it. Going direct has no box:
- * the line crosses the lane, broken where it says it goes direct. A leg behind a kill switch has no rung
- * and may not go direct, so the kill switch is the box its line stops at.
+ * chain is its hops in order with its line running on between them, and a
+ * pool lists its members. Every rung has a line in from its leg and out to
+ * the endpoint, whether or not it is the one carrying the leg; the line
+ * carrying a pool runs inside its box to the members carrying it, split
+ * between them. Going direct has no box: the line crosses the lane, broken
+ * where it says it goes direct. A leg behind a kill switch has no rung and
+ * may not go direct, so the kill switch is the box its line stops at.
  *
  * Every box wears its state as a bar down its left edge, and says what is
  * wrong with it inside itself. Pointing at a box lights the routes through
@@ -737,7 +746,7 @@ export const NetworkFlow = memo(function NetworkFlow({
         // A failing hop says why inside its own box: the hop's in a chain, the member's row in a pool.
         const boxWidth =
           rung.kind === "CHAIN"
-            ? (PROXY.width - (rung.chainIds.length - 1) * HOP_GAP) / rung.chainIds.length
+            ? hopWidth(rung.chainIds.length)
             : PROXY.width;
         const note =
           failing && !members.some((member) => member.id === failing.proxyId)
@@ -877,13 +886,13 @@ export const NetworkFlow = memo(function NetworkFlow({
     const ground = <rect x={PROXY.x} y={y} width={PROXY.width} height={block.height} fill="transparent" />;
 
     if (rung.kind === "CHAIN") {
-      const hopWidth = (PROXY.width - (rung.chainIds.length - 1) * HOP_GAP) / rung.chainIds.length;
+      const boxWidth = hopWidth(rung.chainIds.length);
       const failingAt = failing ? rung.chainIds.indexOf(failing.proxyId) : -1;
       return (
         <g key={rungIndex} role="group" aria-label={rung.chainIds.map(name).join(" > ")} {...way}>
           {ground}
           {rung.chainIds.map((id, position) => {
-            const x = PROXY.x + position * (hopWidth + HOP_GAP);
+            const x = PROXY.x + position * (boxWidth + HOP_GAP);
             const state = proxyDown(id) ? "DOWN" : hopState(position, failingAt, status, profile(id)?.enabled !== false);
             return (
               <g key={id}>
@@ -894,7 +903,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                   <HopBox
                     x={x}
                     y={y}
-                    width={hopWidth}
+                    width={boxWidth}
                     height={block.height}
                     title={name(id)}
                     state={state}
@@ -905,11 +914,6 @@ export const NetworkFlow = memo(function NetworkFlow({
                     toggleWidth={toggleWidth}
                   />,
                 )}
-                {position + 1 < rung.chainIds.length ? (
-                  <text x={x + hopWidth + HOP_GAP / 2} y={y + 27} fill={INK.muted} fontSize="15" textAnchor="middle">
-                    {">"}
-                  </text>
-                ) : null}
               </g>
             );
           })}
@@ -1158,6 +1162,8 @@ export const NetworkFlow = memo(function NetworkFlow({
                     : [{ at: y + block.top + BOX_HEIGHT / 2, share: 1 }],
                   stop: PROXY.x + (carriers.length ? MEMBER_INSET : 0),
                   resume: PROXY.end - (carriers.length ? MEMBER_INSET : 0),
+                  // A chain's line runs on through the gap between each hop and the next.
+                  gaps: block.rung.kind === "CHAIN" ? chainGaps(block.rung.chainIds.length) : [],
                   status,
                 };
               }),
@@ -1170,11 +1176,20 @@ export const NetworkFlow = memo(function NetworkFlow({
                       // The words are monospaced, after their state's square.
                       resume:
                         PROXY.x + DIRECT_X + 13 + directLabel(leg, blocks.length).length * DIRECT_SIZE * 0.6 + DIRECT_GAP,
+                      gaps: [],
                       status: rungStatus(leg, blocks.length, true),
                     },
                   ]),
               ...(closed
-                ? [{ branches: [{ at: y + BOX_HEIGHT / 2, share: 1 }], stop: PROXY.x, resume: PROXY.end, status: "BLOCKED" }]
+                ? [
+                    {
+                      branches: [{ at: y + BOX_HEIGHT / 2, share: 1 }],
+                      stop: PROXY.x,
+                      resume: PROXY.end,
+                      gaps: [],
+                      status: "BLOCKED",
+                    },
+                  ]
                 : []),
             ];
             const taken = ways.find((way) => way.status === "ACTIVE") ?? ways[leg.selectedRung ?? 0] ?? ways[0];
@@ -1228,8 +1243,20 @@ export const NetworkFlow = memo(function NetworkFlow({
                   ] satisfies Point[],
                   share,
                 }));
+                const across = way.gaps.map(([from, to]) => ({
+                  ...line,
+                  branches: way.branches.map(({ at, share }) => ({
+                    points: [
+                      [from, at],
+                      [to, at],
+                    ] satisfies Point[],
+                    share,
+                  })),
+                  fan: "start" as const,
+                }));
                 return [
                   { ...line, branches: enter, fan: "start" as const },
+                  ...across,
                   { ...line, branches: leave, fan: "end" as const },
                 ];
               }),
@@ -1530,24 +1557,17 @@ export const NetworkFlow = memo(function NetworkFlow({
                             <Icon name="rss" size={12} />
                           </g>
                         ) : null}
-                        {outbound ? null : (
+                        {rss ? (
                           <text x={x} y={y + 41} fill={INK.muted} fontSize="9.5">
-                            {rss
-                              ? t("next.networking.routes.rssFeed")
-                              : t("next.networking.flow.serverKind", {
-                                  failover:
-                                    consumer.route?.failover === "HOLD"
-                                      ? t("next.networking.failover.hold")
-                                      : t("next.networking.failover.redistribute"),
-                                })}
+                            {t("next.networking.routes.rssFeed")}
                           </text>
-                        )}
+                        ) : null}
                         {server ? (
                           <>
-                            <text x={x} y={y + 67} fill={INK.fg} fontSize="20">
+                            <text x={x} y={y + 49} fill={INK.fg} fontSize="20">
                               {`${Math.round(open)} / ${cap}`}
                             </text>
-                            <text x={x} y={y + 85} fill={INK.muted} fontSize="10">
+                            <text x={x} y={y + 67} fill={INK.muted} fontSize="10">
                               {formatRate(legs.reduce((sum, leg) => sum + (leg.bytesPerSecond ?? 0), 0))}
                               {parked ? ` · ${t("next.networking.flow.parked", { count: parked })}` : ""}
                             </text>
@@ -1558,7 +1578,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                                 <rect
                                   key={cell}
                                   x={x + cellX(cell % CELLS_PER_ROW)}
-                                  y={y + 98 + Math.floor(cell / CELLS_PER_ROW) * CELL_ROW_PITCH}
+                                  y={y + 80 + Math.floor(cell / CELLS_PER_ROW) * CELL_ROW_PITCH}
                                   width={Math.max(1, cellX(1) - 2)}
                                   height={CELL_HEIGHT}
                                   fill={boundary < open ? INK.accent : "none"}

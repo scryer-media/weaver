@@ -91,6 +91,8 @@ export function RouteEditor({
   // A lone leg is the whole route, so it is not boxed and numbered as one of several.
   const framed = value.legs.length > 1;
   const Frame = framed ? "fieldset" : "div";
+  // Weights, the split they make and what a dropped leg does to its share matter once a second leg is added.
+  const shared = split && framed;
   const [down, setDown] = useState<Set<number>>(new Set());
   const update = (index: number, leg: Leg) =>
     onChange({ ...value, legs: value.legs.map((current, position) => (position === index ? leg : current)) });
@@ -147,13 +149,13 @@ export function RouteEditor({
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
-      {split ? (
+      {shared ? (
         <p className="text-[12.5px] leading-[1.5] text-pretty text-wv-muted">
           {t("next.networking.route.intro", { count: cap })}
         </p>
       ) : null}
 
-      {split ? (
+      {shared ? (
         <div
           aria-label={t("next.networking.route.distribution")}
           className="flex h-8 min-w-0 border border-wv-control"
@@ -251,7 +253,7 @@ export function RouteEditor({
                     }))}
                 />
               </ControlLabel>
-              {split ? (
+              {shared ? (
                 <ControlLabel label={t("next.networking.route.weight")}>
                   <NumberField
                     label={t("next.networking.route.weight")}
@@ -259,7 +261,6 @@ export function RouteEditor({
                     min={1}
                     max={100}
                     suffix="%"
-                    disabled={value.legs.length === 1}
                     onChange={(next) => weight(index, next)}
                   />
                 </ControlLabel>
@@ -414,9 +415,9 @@ export function RouteEditor({
               </div>
             ) : null}
 
-            {split || framed ? (
+            {framed ? (
               <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-wv-hairline pt-3">
-                {split ? (
+                {shared ? (
                   <>
                     <span className="font-wv-mono text-[11.5px] text-wv-muted">
                       {t("next.networking.route.target", { count: targets[index] ?? 0 })}
@@ -438,27 +439,25 @@ export function RouteEditor({
                     />
                   </>
                 ) : null}
-                {framed ? (
-                  <div className="ml-auto flex flex-none items-center gap-1">
-                    <IconButton
-                      icon="moveUp"
-                      label={t("next.networking.route.legUp")}
-                      disabled={index === 0}
-                      onClick={() => reorder(move(value.legs, index, -1))}
-                    />
-                    <IconButton
-                      icon="moveDown"
-                      label={t("next.networking.route.legDown")}
-                      disabled={index === value.legs.length - 1}
-                      onClick={() => reorder(move(value.legs, index, 1))}
-                    />
-                    <IconButton
-                      icon="remove"
-                      label={t("next.networking.route.removeLeg")}
-                      onClick={() => reorder(removeLeg(value.legs, index))}
-                    />
-                  </div>
-                ) : null}
+                <div className="ml-auto flex flex-none items-center gap-1">
+                  <IconButton
+                    icon="moveUp"
+                    label={t("next.networking.route.legUp")}
+                    disabled={index === 0}
+                    onClick={() => reorder(move(value.legs, index, -1))}
+                  />
+                  <IconButton
+                    icon="moveDown"
+                    label={t("next.networking.route.legDown")}
+                    disabled={index === value.legs.length - 1}
+                    onClick={() => reorder(move(value.legs, index, 1))}
+                  />
+                  <IconButton
+                    icon="remove"
+                    label={t("next.networking.route.removeLeg")}
+                    onClick={() => reorder(removeLeg(value.legs, index))}
+                  />
+                </div>
               </div>
             ) : null}
           </Frame>
@@ -474,17 +473,19 @@ export function RouteEditor({
           >
             {t("next.networking.route.addLeg")}
           </SecondaryButton>
-          <ControlLabel label={t("next.networking.route.failover")}>
-            <Segmented
-              label={t("next.networking.route.failover")}
-              value={value.failover}
-              onChange={(failover) => onChange({ ...value, failover })}
-              options={[
-                { value: "REDISTRIBUTE", label: t("next.networking.route.redistribute") },
-                { value: "HOLD", label: t("next.networking.route.hold") },
-              ]}
-            />
-          </ControlLabel>
+          {shared ? (
+            <ControlLabel label={t("next.networking.route.failover")}>
+              <Segmented
+                label={t("next.networking.route.failover")}
+                value={value.failover}
+                onChange={(failover) => onChange({ ...value, failover })}
+                options={[
+                  { value: "REDISTRIBUTE", label: t("next.networking.route.redistribute") },
+                  { value: "HOLD", label: t("next.networking.route.hold") },
+                ]}
+              />
+            </ControlLabel>
+          ) : null}
         </div>
       ) : null}
 

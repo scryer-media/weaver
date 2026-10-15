@@ -3,6 +3,8 @@ import { after, before, test } from "node:test";
 import { createServer } from "vite";
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE_PATH ?? "playwright");
 let server, browser, baseUrl;
+/** Every point a path's outline passes through, as [x, y]. */
+const outline=d=>[...d.matchAll(/(-?[\d.]+) (-?[\d.]+)/g)].map(([,x,y])=>[Number(x),Number(y)]);
 before(async()=>{server=await createServer({cacheDir:"node_modules/.vite/browser-networking",server:{host:"127.0.0.1",port:0,...(process.env.NETWORKING_FIXTURE_API?{proxy:{"/graphql":{target:process.env.NETWORKING_FIXTURE_API,ws:true}}}:{})}});await server.listen();baseUrl=`http://127.0.0.1:${server.httpServer.address().port}`;browser=await chromium.launch({headless:true});});
 after(async()=>{await browser?.close();await server?.close();});
 test("create an egress and two-leg route, then disable the egress through GraphQL",{skip:!process.env.NETWORKING_FIXTURE_API},async()=>{
@@ -70,7 +72,10 @@ test("flow displays route evidence, opens editors, and edits weights without los
  const pool=diagram.locator("a").filter({hasText:"Europe · pool"});
  assert.deepEqual(await pool.locator("text").allTextContents(),["Europe · pool","24 connections","Active"]);
  const chain=diagram.getByRole("group",{name:"Relay one > Relay two > Exit",exact:true});
- assert.deepEqual(await chain.locator("text").allTextContents(),["Relay one","Up",">","Relay two","Failing","The connection was","refused. Check the","port and that the","proxy is running.",">","Exit","Unreached"]);
+ assert.deepEqual(await chain.locator("text").allTextContents(),["Relay one","Up","Relay two","Failing","The connection was","refused. Check the","port and that the","proxy is running.","Exit","Unreached"]);
+ // The chain's line runs on between its hops, level across each gap from one box to the next.
+ const gaps=(await diagram.locator("path[stroke-dasharray='4 5']").evaluateAll(paths=>paths.map(path=>path.getAttribute("d")))).map(outline).filter(points=>points.length===2&&points[0][1]===points[1][1]&&points[1][0]-points[0][0]===26);
+ assert.equal(gaps.length,2);
  await diagram.getByText("Direct · Active",{exact:true}).first().waitFor();
  const proxy=diagram.locator("a").filter({hasText:"Frankfurt · WireGuard"});
  assert.deepEqual(await proxy.locator("text").allTextContents(),["Frankfurt · WireGuard","Failing","No handshake within 12 seconds. Check the endpoint, and that the","server's peer list has public key Fixture+peer+key=."]);
@@ -102,8 +107,8 @@ test("flow displays route evidence, opens editors, and edits weights without los
  // A feed or Default outbound opens a connection only for a moment, over its one leg: the leg is its name, its state, and where it leaves from while open.
  assert.deepEqual(await legCards.filter({hasText:"Default outbound"}).locator("text").allTextContents(),["Default outbound","Up"]);
  assert.deepEqual(await legCards.filter({hasText:"Feed mirror"}).locator("text").allTextContents(),["Feed mirror","Up","127.0.0.1:45130"]);
- await diagram.locator("path[stroke-dasharray]:not([stroke-dasharray='18 30'])").nth(12).waitFor({state:"attached"});
- assert.equal(await diagram.locator("path[stroke-dasharray]:not([stroke-dasharray='18 30'])").count(),13);
+ await diagram.locator("path[stroke-dasharray]:not([stroke-dasharray='18 30'])").nth(14).waitFor({state:"attached"});
+ assert.equal(await diagram.locator("path[stroke-dasharray]:not([stroke-dasharray='18 30'])").count(),15);
  const faded=diagram.locator("[opacity='0.2']");
  const fadedLegs=diagram.locator("g[opacity='0.2'] > a[aria-label^='Edit the route for']");
  const fadedEgresses=diagram.locator("g[opacity='0.2'] > a[href='/settings/networking/egress']");
@@ -169,13 +174,13 @@ test("flow displays route evidence, opens editors, and edits weights without los
  await page.mouse.move(0,0);
  await faded.first().waitFor({state:"detached"});
  assert.equal(await snakes.count(),6);
- assert.equal(await dashed.count(),13);
+ assert.equal(await dashed.count(),15);
  // A route behind a kill switch lights up but does not move: nothing can go that way.
  await killSwitch.hover();
  await fadedEndpoints.filter({hasText:"News primary"}).waitFor({state:"attached"});
  assert.equal(await killSwitch.locator("xpath=..").getAttribute("opacity"),null);
  assert.equal(await snakes.count(),0);
- assert.equal(await dashed.count(),13);
+ assert.equal(await dashed.count(),15);
  await page.mouse.move(0,0);
  await faded.first().waitFor({state:"detached"});
  // A reader who asks for less motion gets none, from the moment they ask: the traffic stands still in its ribbons.
@@ -220,8 +225,8 @@ test("flow displays route evidence, opens editors, and edits weights without los
  await page.getByRole("menu",{name:"Leg 1 rung 1",exact:true}).waitFor({state:"detached"});
  await page.getByRole("button",{name:"Toggle all down"}).click();
  await page.getByText("0 / 50",{exact:true}).first().waitFor();
- await dashed.nth(18).waitFor({state:"attached"});
- assert.equal(await dashed.count(),19);
+ await dashed.nth(20).waitFor({state:"attached"});
+ assert.equal(await dashed.count(),21);
  // With one route picked, only what it reaches is drawn: its legs, the egress they leave through and its own card.
  const egressCards=diagram.locator("a[href='/settings/networking/egress']");
  await page.getByRole("button",{name:"Endpoint",exact:true}).click();
@@ -241,8 +246,24 @@ test("flow displays route evidence, opens editors, and edits weights without los
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT,fullPage:true});
  await page.close();
 });
-/** Every point a path's outline passes through, as [x, y]. */
-const outline=d=>[...d.matchAll(/(-?[\d.]+) (-?[\d.]+)/g)].map(([,x,y])=>[Number(x),Number(y)]);
+test("a server's route with one leg offers Add leg alone, and the split and its controls come with a second leg",async()=>{
+ const page=await browser.newPage({viewport:{width:1440,height:2700}});page.setDefaultTimeout(0);const errors=[];page.on("pageerror",error=>errors.push(error.message));
+ await page.goto(`${baseUrl}/tests/browser/networking.html`);
+ const multi=[page.getByLabel("Leg weight distribution",{exact:true}),page.getByText(/^Split up to/),page.getByText("Weight",{exact:true}),page.getByText("Simulate leg down",{exact:true}),page.getByText("When a leg goes down",{exact:true})];
+ const remove=page.getByRole("button",{name:"Remove leg",exact:true});
+ await remove.nth(2).waitFor();
+ await remove.last().click();
+ await page.getByLabel("Route weights").filter({hasText:/^\d+,\d+$/}).waitFor();
+ await remove.last().click();
+ await page.getByLabel("Route weights").filter({hasText:/^100$/}).waitFor();
+ assert.deepEqual(await Promise.all(multi.map(control=>control.count())),[0,0,0,0,0]);
+ assert.equal(await remove.count(),0);
+ await page.getByRole("button",{name:"Add leg",exact:true}).click();
+ await page.getByLabel("Leg weight distribution",{exact:true}).waitFor();
+ assert.deepEqual(await Promise.all(multi.map(control=>control.count())),[1,1,2,2,1]);
+ assert.equal(errors.length,0,errors.join("\n"));
+ await page.close();
+});
 test("a pool carried by two members splits its ribbon between them, each part into its member's row",async()=>{
  const page=await browser.newPage({viewport:{width:1440,height:2700}});page.setDefaultTimeout(0);const errors=[];page.on("pageerror",error=>errors.push(error.message));
  await page.goto(`${baseUrl}/tests/browser/networking.html?split`);
