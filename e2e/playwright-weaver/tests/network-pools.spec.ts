@@ -45,8 +45,12 @@ test("P01 a pool pins its fastest member and prewarms the rest", async ({ reques
   const download = await world.pacedDownload("p01-fastest", { parts: 64, slowMs: 500 });
   const flow = await flowAfter(request, await flowMark(request), sample => {
     const pool = view(sample);
-    return pool?.pinnedMember === connect1.id && [connect1, connect2, connect3].every(profile => member(pool, profile.id)?.warmed && member(pool, profile.id)?.connectMs !== null);
-  }, "connect1 pinned, every member warmed and measured");
+    // A selected member is still PROBING while its connections are opening.
+    // Wait for the displayed pin state that the assertion below checks.
+    return pool?.pinnedMember === connect1.id
+      && PINNED_STATES.includes(member(pool, connect1.id)?.state ?? "")
+      && [connect1, connect2, connect3].every(profile => member(pool, profile.id)?.warmed && member(pool, profile.id)?.connectMs !== null);
+  }, "connect1 pinned with connections settled, every member warmed and measured");
   const pool = view(flow)!;
   await saveEvidence(info, "P01", pool);
   const ms = [connect1, connect2, connect3].map(profile => member(pool, profile.id)!.connectMs!);
