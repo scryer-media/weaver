@@ -330,7 +330,9 @@ test("PP02 a failed download runs its scripts with SAB_PP_STATUS -1 and FAILURE/
       note("observed", `${script}: SAB_FAIL_MSG=${JSON.stringify(record!.env.SAB_FAIL_MSG)}, history error=${JSON.stringify(item.error)}`);
     }
     const facade = await facadeHistory(request, jobId);
-    expect(facade).toMatchObject({ Status: "FAILURE/HEALTH", ParStatus: "NONE", UnpackStatus: "NONE", DeleteStatus: "HEALTH", ScriptStatus: "SUCCESS" });
+    // NZBGet history calls a health-aborted download deleted; the script
+    // environment above still reports FAILURE/HEALTH.
+    expect(facade).toMatchObject({ Status: "DELETED/HEALTH", ParStatus: "NONE", UnpackStatus: "NONE", DeleteStatus: "HEALTH", ScriptStatus: "SUCCESS" });
   } finally {
     await restore();
     removeFixtureScripts([sab, nzb]);
@@ -353,7 +355,7 @@ test("PP03 an unpacked and an unpack-failed job report PAR/UNPACK status, with a
     const cases = [
       { name: `${tag}-good`, data: zlib.gzipSync(Buffer.from(`pp03 payload ${tag}\n`.repeat(256))), state: "COMPLETED",
         sabStatus: "0", nzbStatus: "SUCCESS/ALL", unpack: "2", facade: "SUCCESS/ALL" },
-      { name: `${tag}-bad`, data: corruptGzip(), state: "FAILED", sabStatus: "2", nzbStatus: "FAILURE/UNPACK", unpack: "1", facade: "FAILURE/HEALTH" },
+      { name: `${tag}-bad`, data: corruptGzip(), state: "FAILED", sabStatus: "2", nzbStatus: "FAILURE/UNPACK", unpack: "1", facade: "FAILURE/UNPACK" },
     ];
     for (const testCase of cases) {
       const jobId = await fileJob(request, testCase.name, `${testCase.name}.gz`, testCase.data, { password });

@@ -171,12 +171,6 @@
       "rationale": "SSH host-key trust uses the Rust SSH fixtures; this application flow uses HTTP CONNECT and SOCKS5."
     },
     {
-      "name": "testProxyProfile",
-      "owner": "proxy-routing",
-      "oracle": "unit-only",
-      "rationale": "Deprecated: it names no route, so it refuses every call with TEST_NEEDS_ROUTE; proxies are tested through testVia."
-    },
-    {
       "name": "resetServerDownloadQuotaUsage",
       "owner": "bandwidth-and-server-quotas",
       "oracle": "api-metrics"
@@ -700,16 +694,6 @@
     {
       "name": "saveNetworkRoute",
       "owner": "advanced-networking-routes",
-      "oracle": "api-metrics"
-    },
-    {
-      "name": "testEgressInterface",
-      "owner": "advanced-networking-egress",
-      "oracle": "api-metrics"
-    },
-    {
-      "name": "testProxyPool",
-      "owner": "advanced-networking-pools",
       "oracle": "api-metrics"
     },
     {
