@@ -938,7 +938,6 @@ export const nextKo: LocaleDictionary = {
   "next.security.checkFailed": "비밀번호가 올바르지 않습니다.",
   "next.security.checkUnreachable": "비밀번호를 확인하기 위해 Weaver에 연결할 수 없습니다.",
   "next.security.passwordHelp": "모든 브라우저가 이 계정으로 로그인합니다. 비밀번호를 바꾸면 모든 세션이 로그아웃됩니다.",
-  "next.security.changePasswordNote": "이 브라우저를 포함해 로그인한 모든 브라우저가 다시 로그인해야 합니다",
   "next.security.signOutEverywhere": "모든 곳에서 로그아웃",
   "next.security.signOutEverywhereTitle": "모든 브라우저 로그아웃",
   "next.security.signOutEverywhereBody": "이 브라우저를 포함해 weaver에 로그인한 모든 브라우저가 로그아웃되며 다시 로그인해야 합니다. API 키는 계속 작동합니다.",

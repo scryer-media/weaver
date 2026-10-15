@@ -938,7 +938,6 @@ export const nextIt: LocaleDictionary = {
   "next.security.checkFailed": "La password non è corretta.",
   "next.security.checkUnreachable": "Impossibile raggiungere Weaver per verificare la password.",
   "next.security.passwordHelp": "Ogni browser accede con questo account. Cambiare la password disconnette tutte le sessioni.",
-  "next.security.changePasswordNote": "ogni browser connesso, compreso questo, dovrà accedere di nuovo",
   "next.security.signOutEverywhere": "Esci ovunque",
   "next.security.signOutEverywhereTitle": "Disconnetti tutti i browser",
   "next.security.signOutEverywhereBody": "Ogni browser connesso a weaver, compreso questo, viene disconnesso e deve accedere di nuovo. Le chiavi API continuano a funzionare.",

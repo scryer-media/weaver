@@ -967,7 +967,6 @@ function SecurityPanelBody({
       <RecordEditor
         open={passwordOpen}
         title={t("next.security.changePassword")}
-        note={authenticated ? t("next.security.changePasswordNote") : undefined}
         error={passwordError}
         busy={busy}
         saveLabel={t("next.security.changePassword")}

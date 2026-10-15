@@ -938,7 +938,6 @@ export const nextFr: LocaleDictionary = {
   "next.security.checkFailed": "Ce mot de passe est incorrect.",
   "next.security.checkUnreachable": "Impossible de joindre Weaver pour vérifier le mot de passe.",
   "next.security.passwordHelp": "Chaque navigateur se connecte avec ce compte. Changer le mot de passe déconnecte toutes les sessions.",
-  "next.security.changePasswordNote": "chaque navigateur connecté, celui-ci compris, devra se reconnecter",
   "next.security.signOutEverywhere": "Se déconnecter partout",
   "next.security.signOutEverywhereTitle": "Déconnecter tous les navigateurs",
   "next.security.signOutEverywhereBody": "Chaque navigateur connecté à weaver, y compris celui-ci, est déconnecté et doit se reconnecter. Les clés API continuent de fonctionner.",

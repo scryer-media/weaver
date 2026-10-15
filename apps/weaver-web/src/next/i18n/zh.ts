@@ -938,7 +938,6 @@ export const nextZh: LocaleDictionary = {
   "next.security.checkFailed": "密码不正确。",
   "next.security.checkUnreachable": "无法连接 Weaver 来验证密码。",
   "next.security.passwordHelp": "所有浏览器都使用此账户登录。更改密码会注销所有会话。",
-  "next.security.changePasswordNote": "所有已登录的浏览器（包括当前浏览器）都需要重新登录",
   "next.security.signOutEverywhere": "在所有位置注销",
   "next.security.signOutEverywhereTitle": "注销所有浏览器",
   "next.security.signOutEverywhereBody": "所有登录到 weaver 的浏览器（包括当前浏览器）都会被注销，需要重新登录。API 密钥仍可继续使用。",

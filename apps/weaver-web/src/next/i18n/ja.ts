@@ -938,7 +938,6 @@ export const nextJa: LocaleDictionary = {
   "next.security.checkFailed": "パスワードが正しくありません。",
   "next.security.checkUnreachable": "パスワードを確認するためにWeaverに接続できませんでした。",
   "next.security.passwordHelp": "すべてのブラウザがこのアカウントでサインインします。パスワードを変更するとすべてのセッションがサインアウトされます。",
-  "next.security.changePasswordNote": "このブラウザを含む、サインイン中のすべてのブラウザで再サインインが必要になります",
   "next.security.signOutEverywhere": "すべての場所でサインアウト",
   "next.security.signOutEverywhereTitle": "すべてのブラウザをサインアウト",
   "next.security.signOutEverywhereBody": "このブラウザを含め、weaverにサインインしているすべてのブラウザがサインアウトされ、再度サインインが必要になります。APIキーは引き続き使えます。",

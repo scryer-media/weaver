@@ -938,7 +938,6 @@ export const nextEs: LocaleDictionary = {
   "next.security.checkFailed": "La contraseña no es correcta.",
   "next.security.checkUnreachable": "No se pudo contactar con Weaver para comprobar la contraseña.",
   "next.security.passwordHelp": "Todos los navegadores inician sesión con esta cuenta. Cambiar la contraseña cierra todas las sesiones.",
-  "next.security.changePasswordNote": "todos los navegadores con sesión, este incluido, tendrán que volver a iniciarla",
   "next.security.signOutEverywhere": "Cerrar sesión en todas partes",
   "next.security.signOutEverywhereTitle": "Cerrar sesión en todos los navegadores",
   "next.security.signOutEverywhereBody": "Todos los navegadores con sesión en weaver, incluido este, se desconectan y deben volver a iniciar sesión. Las claves API siguen funcionando.",

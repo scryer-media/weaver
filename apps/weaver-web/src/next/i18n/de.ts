@@ -938,7 +938,6 @@ export const nextDe: LocaleDictionary = {
   "next.security.checkFailed": "Dieses Passwort ist nicht korrekt.",
   "next.security.checkUnreachable": "Weaver war zur Passwortprüfung nicht erreichbar.",
   "next.security.passwordHelp": "Jeder Browser meldet sich mit diesem Konto an. Eine Passwortänderung meldet alle Sitzungen ab.",
-  "next.security.changePasswordNote": "jeder angemeldete Browser, auch dieser, muss sich neu anmelden",
   "next.security.signOutEverywhere": "Überall abmelden",
   "next.security.signOutEverywhereTitle": "Alle Browser abmelden",
   "next.security.signOutEverywhereBody": "Jeder bei weaver angemeldete Browser, auch dieser, wird abgemeldet und muss sich neu anmelden. API-Schlüssel funktionieren weiter.",

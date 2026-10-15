@@ -945,7 +945,6 @@ export const nextEn: LocaleDictionary = {
   "next.security.checkFailed": "That password is not correct.",
   "next.security.checkUnreachable": "Weaver could not be reached to check the password.",
   "next.security.passwordHelp": "Every browser signs in with this account. Changing the password signs out every session.",
-  "next.security.changePasswordNote": "every signed-in browser, this one included, has to sign in again",
   "next.security.signOutEverywhere": "Sign out everywhere",
   "next.security.signOutEverywhereTitle": "Sign out every browser",
   "next.security.signOutEverywhereBody": "Every browser signed in to weaver, including this one, is signed out and must sign in again. API keys keep working.",
