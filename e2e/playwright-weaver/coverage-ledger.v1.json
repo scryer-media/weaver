@@ -628,6 +628,11 @@
       "oracle": "browser"
     },
     {
+      "name": "setUnacceptableExtensions",
+      "owner": "ui-settings-crud",
+      "oracle": "browser"
+    },
+    {
       "name": "toggleSchedule",
       "owner": "ui-settings-crud",
       "oracle": "browser"

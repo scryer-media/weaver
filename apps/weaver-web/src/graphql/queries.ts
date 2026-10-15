@@ -2332,6 +2332,17 @@ export const ARCHIVE_PASSWORD_SETTINGS_QUERY = gql`
   }
 `;
 
+// Omit the file argument entirely when changing only the list. An absent
+// variable referenced by that argument is resolved as null by the server.
+export const UPDATE_ARCHIVE_PASSWORD_LIST_MUTATION = gql`
+  mutation UpdateArchivePasswordSettings($passwords: [String!]!) {
+    updateArchivePasswordSettings(passwords: $passwords) {
+      hasPasswords
+      passwordFile
+    }
+  }
+`;
+
 export const UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION = gql`
   mutation UpdateArchivePasswordSettings($passwords: [String!], $passwordFile: String) {
     updateArchivePasswordSettings(passwords: $passwords, passwordFile: $passwordFile) {

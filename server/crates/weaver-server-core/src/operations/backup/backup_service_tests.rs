@@ -953,6 +953,36 @@ fn logical_table_rows_may_exceed_sixteen_mib_within_the_backup_limit() {
 }
 
 #[test]
+fn background_egress_usage_keeps_a_restore_target_pristine() {
+    let db = open_temp_db();
+    db.save_config(&Config {
+        servers: vec![sample_server(1)],
+        ..sample_config()
+    })
+    .unwrap();
+    let usage = crate::servers::ServerDownloadUsage {
+        server_id: 0,
+        lifetime_bytes: 45_890,
+        quota_baseline_bytes: 0,
+        window_start: None,
+        window_end: None,
+        updated_at: chrono::Utc::now(),
+    };
+    db.upsert_egress_download_usage(&usage).unwrap();
+    assert!(db.restore_target_is_pristine().unwrap());
+
+    // NNTP download usage must still prevent replacing a used instance,
+    // even if its quota was reset and no job rows remain.
+    db.upsert_server_download_usage(&crate::servers::ServerDownloadUsage {
+        server_id: 1,
+        quota_baseline_bytes: usage.lifetime_bytes,
+        ..usage
+    })
+    .unwrap();
+    assert!(!db.restore_target_is_pristine().unwrap());
+}
+
+#[test]
 fn durable_duplicate_identity_makes_a_restore_target_non_pristine() {
     let db = open_temp_db();
     assert!(db.restore_target_is_pristine().unwrap());
