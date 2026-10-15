@@ -7,7 +7,15 @@ import { proxyLabels } from "@/lib/proxies";
 import { proxyTestSentence } from "@/lib/proxy-fault";
 import { refusalMessage } from "@/lib/refusal";
 import { cn } from "@/lib/utils";
-import { draftRoute, routeChoices, testSummary, type PathTestResult, type TestSubject } from "@/lib/test-via";
+import {
+  draftRoute,
+  resolutionParts,
+  routeChoices,
+  testSummary,
+  type PathTestResult,
+  type ResolutionParts,
+  type TestSubject,
+} from "@/lib/test-via";
 import { SectionHeader } from "../../components/chrome";
 import { Dialog } from "../../components/Dialog";
 import { PrimaryButton, SecondaryButton } from "../../components/controls";
@@ -249,6 +257,31 @@ function PathRow({
         <StatusMark state={result.success ? "UP" : "DOWN"} label={label} detail={detail || undefined} />
       </div>
       <p className="text-[12.5px] leading-[1.5] text-pretty text-wv-secondary">{proxyTestSentence(t, result)}</p>
+      {result.resolution ? (
+        <ResolutionLine
+          parts={resolutionParts(t, result.resolution, { egress: egressName(result.egressId), proxy: proxyName })}
+        />
+      ) : null}
     </li>
+  );
+}
+
+/** How the path's host was resolved, the connected address marked among several. */
+function ResolutionLine({ parts }: { parts: ResolutionParts }) {
+  return (
+    <p
+      title={parts.detail ?? undefined}
+      className="font-wv-mono text-[11px] leading-[1.5] break-words text-wv-muted"
+    >
+      {parts.host}
+      {parts.addresses.length > 0 ? " → " : null}
+      {parts.addresses.map((part, index) => (
+        <Fragment key={part.address}>
+          {index > 0 ? ", " : null}
+          {part.connected ? <strong className="font-medium text-wv-fg">{part.address}</strong> : part.address}
+        </Fragment>
+      ))}
+      {parts.said ? ` · ${parts.said}` : null}
+    </p>
   );
 }

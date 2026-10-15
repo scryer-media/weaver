@@ -264,6 +264,82 @@ async fn a_proxy_test_answers_with_a_code() {
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
+// Each path says how the host it dialled was resolved, what the name
+// resolved to even when the connect then failed, and the codes a failed
+// lookup is reported with.
+#[tokio::test]
+async fn a_test_says_how_its_host_was_resolved() {
+    let h = harness().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let test_via = |host: &str| {
+        format!(
+            r#"mutation {{ testVia(
+        route: {{ legs: [{{ egressId: 0, weight: 100, path: {{ direct: true }} }}] }},
+        target: {{ host: "{host}", port: {port} }}
+    ) {{ success resolution {{
+        host resolvedBy proxyId dnsServers addresses cached connectedAddress error {{ code detail }}
+    }} }} }}"#
+        )
+    };
+    let result = h.execute(&test_via("127.0.0.1")).await;
+    assert_no_errors(&result);
+    assert_eq!(
+        response_data(&result)["testVia"],
+        serde_json::json!([{
+            "success": true,
+            "resolution": {
+                "host": "127.0.0.1",
+                "resolvedBy": "LITERAL",
+                "proxyId": null,
+                "dnsServers": [],
+                "addresses": ["127.0.0.1"],
+                "cached": false,
+                "connectedAddress": "127.0.0.1",
+                "error": null,
+            },
+        }])
+    );
+    let _accepted = listener.accept().await.unwrap();
+    drop(listener);
+    let result = h.execute(&test_via("localhost")).await;
+    assert_no_errors(&result);
+    let test = &response_data(&result)["testVia"][0];
+    assert_eq!(test["success"], false);
+    let resolution = &test["resolution"];
+    assert_eq!(resolution["host"], "localhost");
+    assert_eq!(resolution["resolvedBy"], "HOST");
+    assert!(
+        resolution["addresses"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("127.0.0.1")),
+        "{resolution}"
+    );
+    assert_eq!(resolution["connectedAddress"], serde_json::Value::Null);
+    assert_eq!(resolution["error"], serde_json::Value::Null);
+    let sdl = weaver_server_api::export_schema_sdl();
+    let codes = sdl
+        .split("enum LookupErrorCode {")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        codes,
+        [
+            "NO_SUCH_NAME",
+            "NO_ADDRESS",
+            "TIMED_OUT",
+            "SERVER_FAILURE",
+            "NO_REPLY",
+            "OTHER"
+        ]
+    );
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
 #[tokio::test]
 async fn feed_policy_is_atomic_preserved_and_blocks_referenced_profile_deletion() {
     let h = harness().await;

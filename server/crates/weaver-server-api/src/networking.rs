@@ -438,6 +438,90 @@ pub struct PathTestResult {
     pub failing_proxy_id: Option<u32>,
     pub source_address: Option<String>,
     pub connect_millis: f64,
+    // How the host the path's final dial named was resolved.
+    pub resolution: Option<HostResolution>,
+}
+// Who turned a test's host into addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+pub enum ResolvedBy {
+    // The host is an address.
+    Literal,
+    // The operating system's resolver.
+    Host,
+    // Weaver asked DNS servers from the route's egress.
+    Servers,
+    // The proxy was handed the name.
+    Proxy,
+    // Weaver asked DNS servers through the proxy.
+    ProxyServers,
+}
+impl From<core::ResolvedBy> for ResolvedBy {
+    fn from(value: core::ResolvedBy) -> Self {
+        match value {
+            core::ResolvedBy::Literal => Self::Literal,
+            core::ResolvedBy::Host => Self::Host,
+            core::ResolvedBy::Servers => Self::Servers,
+            core::ResolvedBy::Proxy => Self::Proxy,
+            core::ResolvedBy::ProxyServers => Self::ProxyServers,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+pub enum LookupErrorCode {
+    NoSuchName,
+    NoAddress,
+    TimedOut,
+    ServerFailure,
+    NoReply,
+    Other,
+}
+impl From<core::LookupFailure> for LookupErrorCode {
+    fn from(value: core::LookupFailure) -> Self {
+        match value {
+            core::LookupFailure::NoSuchName => Self::NoSuchName,
+            core::LookupFailure::NoAddress => Self::NoAddress,
+            core::LookupFailure::TimedOut => Self::TimedOut,
+            core::LookupFailure::ServerFailure => Self::ServerFailure,
+            core::LookupFailure::NoReply => Self::NoReply,
+            core::LookupFailure::Other => Self::Other,
+        }
+    }
+}
+#[derive(SimpleObject)]
+pub struct LookupError {
+    pub code: LookupErrorCode,
+    // The resolver's own words.
+    pub detail: String,
+}
+#[derive(SimpleObject)]
+pub struct HostResolution {
+    pub host: String,
+    pub resolved_by: ResolvedBy,
+    // The proxy that resolved it, or that Weaver asked through.
+    pub proxy_id: Option<u32>,
+    pub dns_servers: Vec<String>,
+    pub addresses: Vec<String>,
+    // The answer was held from an earlier lookup.
+    pub cached: bool,
+    pub connected_address: Option<String>,
+    pub error: Option<LookupError>,
+}
+impl From<core::HostResolution> for HostResolution {
+    fn from(value: core::HostResolution) -> Self {
+        Self {
+            host: value.host,
+            resolved_by: value.by.into(),
+            proxy_id: value.proxy,
+            dns_servers: value.servers.iter().map(ToString::to_string).collect(),
+            addresses: value.addresses.iter().map(ToString::to_string).collect(),
+            cached: value.cached,
+            connected_address: value.connected.map(|ip| ip.to_string()),
+            error: value.error.map(|error| LookupError {
+                code: error.failure.into(),
+                detail: error.detail,
+            }),
+        }
+    }
 }
 impl From<core::PathTest> for PathTestResult {
     fn from(test: core::PathTest) -> Self {
@@ -462,6 +546,7 @@ impl From<core::PathTest> for PathTestResult {
             failing_proxy_id: test.failing_proxy,
             source_address: test.source_address.map(|s| s.to_string()),
             connect_millis: test.elapsed.as_secs_f64() * 1000.0,
+            resolution: test.resolution.map(Into::into),
         }
     }
 }

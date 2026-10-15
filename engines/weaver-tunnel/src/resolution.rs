@@ -26,6 +26,9 @@ use crate::{
 #[path = "resolution_tests.rs"]
 mod tests;
 
+#[path = "resolution_record.rs"]
+pub mod record;
+
 // How long a lookup's answer holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ttl {
@@ -42,6 +45,9 @@ pub enum Ttl {
 pub struct Lookup {
     pub addresses: Vec<IpAddr>,
     pub ttl: Ttl,
+    // For a negative answer, whether it said the name does not exist
+    // rather than that it has no address.
+    pub nonexistent: bool,
 }
 
 // How long answers are held.
@@ -102,13 +108,42 @@ impl Replicate for io::Error {
     }
 }
 
-type Answer = Arc<[IpAddr]>;
+// An answer as the cache holds it.
+#[derive(Clone)]
+struct Answer {
+    addresses: Arc<[IpAddr]>,
+    nonexistent: bool,
+}
+
+impl Answer {
+    fn of(lookup: &Lookup) -> Self {
+        Self {
+            addresses: lookup.addresses.as_slice().into(),
+            nonexistent: lookup.nonexistent,
+        }
+    }
+    // The addresses, after noting the answer in the test recording the
+    // caller runs in, if any. `held` says it was held from before.
+    fn noted(&self, name: &str, held: bool) -> Vec<IpAddr> {
+        record::cached(name, held);
+        if self.addresses.is_empty() {
+            let (failure, said) = if self.nonexistent {
+                (record::LookupFailure::NoSuchName, "NXDOMAIN")
+            } else {
+                (record::LookupFailure::NoAddress, "NODATA")
+            };
+            record::failed(name, failure, || said.to_owned());
+        }
+        self.addresses.to_vec()
+    }
+}
+
 // What a lookup came to, once it lands.
 type Landed<E> = Option<Result<Answer, Arc<E>>>;
 
 enum Slot<E> {
     Held {
-        addresses: Answer,
+        answer: Answer,
         until: Instant,
     },
     Asking {
@@ -201,9 +236,9 @@ impl<E: Replicate> ResolutionCache<E> {
                 let mut slots = self.slots.lock().expect("resolution cache");
                 let slots = &mut *slots;
                 match slots.names.get_mut(&key) {
-                    Some(Slot::Held { addresses, until }) if *until > Instant::now() => {
+                    Some(Slot::Held { answer, until }) if *until > Instant::now() => {
                         metrics::record_cache(resolver, CacheOutcome::Hit);
-                        return Ok(addresses.to_vec());
+                        return Ok(answer.noted(name, true));
                     }
                     Some(Slot::Asking {
                         landed, waiting, ..
@@ -236,8 +271,11 @@ impl<E: Replicate> ResolutionCache<E> {
                     };
                     metrics::record_cache(resolver, CacheOutcome::Joined);
                     return match answer.as_ref().expect("a landed lookup") {
-                        Ok(addresses) => Ok(addresses.to_vec()),
-                        Err(error) => Err(error.replicate()),
+                        Ok(answer) => Ok(answer.noted(name, false)),
+                        Err(error) => {
+                            record::cached(name, false);
+                            Err(error.replicate())
+                        }
                     };
                 }
                 Turn::Ask(flight, sender) => {
@@ -250,7 +288,8 @@ impl<E: Replicate> ResolutionCache<E> {
                         landed: false,
                     };
                     let lookup = lookup.take().expect("a caller asks at most once");
-                    return flight.land(lookup().await);
+                    record::cached(name, false);
+                    return flight.land(name, lookup().await);
                 }
             }
         }
@@ -270,11 +309,11 @@ impl<E: Replicate> ResolutionCache<E> {
         let key = key(name);
         {
             let slots = self.slots.lock().expect("resolution cache");
-            if let Some(Slot::Held { addresses, until }) = slots.names.get(&key)
+            if let Some(Slot::Held { answer, until }) = slots.names.get(&key)
                 && *until > Instant::now()
             {
                 metrics::record_cache(resolver, CacheOutcome::Hit);
-                return Ok(addresses.to_vec());
+                return Ok(answer.addresses.to_vec());
             }
         }
         metrics::record_cache(resolver, CacheOutcome::Miss);
@@ -287,7 +326,7 @@ impl<E: Replicate> ResolutionCache<E> {
                 slots.names.insert(
                     key,
                     Slot::Held {
-                        addresses: lookup.addresses.as_slice().into(),
+                        answer: Answer::of(&lookup),
                         until: now + held,
                     },
                 );
@@ -352,18 +391,19 @@ struct Flight<'a, E> {
 }
 
 impl<E: Replicate> Flight<'_, E> {
-    fn land(mut self, found: Result<Lookup, E>) -> Result<Vec<IpAddr>, E> {
+    fn land(mut self, name: &str, found: Result<Lookup, E>) -> Result<Vec<IpAddr>, E> {
         let now = Instant::now();
         let mut slots = self.cache.slots.lock().expect("resolution cache");
         let (shared, result) = match found {
             Ok(lookup) => {
-                let addresses: Answer = lookup.addresses.as_slice().into();
+                let answer = Answer::of(&lookup);
+                answer.noted(name, false);
                 match self.cache.policy.hold(&lookup) {
                     Some(held) => {
                         slots.names.insert(
                             self.key.to_owned(),
                             Slot::Held {
-                                addresses: addresses.clone(),
+                                answer: answer.clone(),
                                 until: now + held,
                             },
                         );
@@ -373,7 +413,7 @@ impl<E: Replicate> Flight<'_, E> {
                         slots.names.remove(self.key);
                     }
                 }
-                (Ok(addresses), Ok(lookup.addresses))
+                (Ok(answer), Ok(lookup.addresses))
             }
             Err(error) => {
                 slots.names.remove(self.key);
@@ -413,12 +453,17 @@ static HOST: LazyLock<ResolutionCache<io::Error>> = LazyLock::new(ResolutionCach
     reason = "the host resolver every Host-resolved leg shares"
 )]
 pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
+    if host.parse::<IpAddr>().is_err() {
+        record::asking(host, record::Asker::host);
+    }
     HOST.resolve(Resolver::Host, host, || async {
         let found = tokio::net::lookup_host((host, 0)).await;
         metrics::record_resolution(Resolver::Host, found.is_ok());
         Ok(untimed(found?.map(|peer| peer.ip())))
     })
     .await
+    .inspect(|addresses| record::found(host, addresses))
+    .inspect_err(|error| record::failed_saying(host, error))
 }
 
 // `host_lookup` for a thread that may block.
@@ -472,5 +517,6 @@ fn untimed(found: impl Iterator<Item = IpAddr>) -> Lookup {
     Lookup {
         addresses,
         ttl: Ttl::Unknown,
+        nonexistent: false,
     }
 }

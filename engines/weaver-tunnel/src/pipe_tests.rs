@@ -1400,6 +1400,69 @@ async fn a_hop_resolved_by_weavers_servers_asks_them_from_the_egress() {
     assert_eq!(asked(&proxy.targets), vec![(PUBLIC.to_string(), 119)]);
 }
 
+// A recorded dial through a hop resolved by Weaver's servers says those
+// servers answered, what they answered and which address the hop reached,
+// and a name they do not know says so.
+#[tokio::test]
+async fn a_recorded_dial_says_weavers_servers_resolved_the_name() {
+    use crate::resolution::record::{
+        HostResolution, LookupError, LookupFailure, Recording, ResolvedBy,
+    };
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dns = dns_double(&[("news.invalid", PUBLIC)]).await;
+    let egress = Arc::new(Mapped {
+        to: dns.addr,
+        asked: Mutex::new(Vec::new()),
+    });
+    let proxy = connect_double(&[((PUBLIC, 119), origin.local_addr().unwrap())]).await;
+    let pipe = named_hop(
+        7,
+        &proxy.addr.ip().to_string(),
+        proxy.addr.port(),
+        Naming::servers(vec![ROUTED_DNS.parse().unwrap()], egress),
+        bottom(),
+    );
+
+    let recording = Arc::new(Recording::default());
+    recording
+        .scope(pipe.dial(&named("news.invalid", 119)))
+        .await
+        .unwrap();
+    let _accepted = origin.accept().await.unwrap();
+    assert_eq!(
+        recording.finish("news.invalid", 119, None),
+        Some(HostResolution {
+            host: "news.invalid".into(),
+            by: ResolvedBy::Servers,
+            proxy: None,
+            servers: vec![ROUTED_DNS.parse().unwrap()],
+            addresses: vec![PUBLIC.parse().unwrap()],
+            cached: false,
+            connected: Some(PUBLIC.parse().unwrap()),
+            error: None,
+        })
+    );
+
+    let recording = Arc::new(Recording::default());
+    assert!(
+        recording
+            .scope(pipe.dial(&named("missing.invalid", 119)))
+            .await
+            .is_err()
+    );
+    let resolution = recording.finish("missing.invalid", 119, None).unwrap();
+    assert_eq!(resolution.by, ResolvedBy::Servers);
+    assert!(resolution.addresses.is_empty());
+    assert_eq!(resolution.connected, None);
+    assert_eq!(
+        resolution.error,
+        Some(LookupError {
+            failure: LookupFailure::NoSuchName,
+            detail: format!("{ROUTED_DNS}: NXDOMAIN"),
+        })
+    );
+}
+
 fn lookups(dns: &crate::test_support::dns::DnsServerDouble, name: &str) -> usize {
     dns.queries
         .lock()

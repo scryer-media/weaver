@@ -126,13 +126,18 @@ function testVia(variables: Record<string, unknown>) {
   return {
     data: {
       testVia: paths.flatMap((path) => onTop.map((proxyId) => {
-        const shown = { ...path, proxyId, failingProxyId: null, sourceAddress: null, connectMillis: 0, params: {}, message: "" };
+        const shown = { ...path, proxyId, failingProxyId: null, sourceAddress: null, connectMillis: 0, params: {}, message: "", resolution: null };
         if (path.carrierIds.includes(SILENT) || proxyId === SILENT) {
           return { ...shown, success: false, code: "TIMED_OUT", params: { seconds: 10 }, message: "No answer within 10 seconds.", failingProxyId: SILENT };
         }
         const kind = profiles.find((profile) => profile.id === proxyId)?.kind;
         const code = target ? (proxyId === null ? "CONNECTED" : "FORWARDED") : kind === "SSH" || kind === "WIRE_GUARD" ? "CONNECTED" : "REACHABLE";
-        return { ...shown, success: true, code, sourceAddress: "192.0.2.10:40000", connectMillis: 12.5 };
+        // Given a host, a path says how it was resolved: by DNS servers asked through the proxy on top, else by this machine.
+        const resolution = target && {
+          host: target.host, resolvedBy: proxyId === null ? "HOST" : "PROXY_SERVERS", proxyId, dnsServers: proxyId === null ? [] : ["192.0.2.53"],
+          addresses: ["192.0.2.80", "192.0.2.81"], cached: false, connectedAddress: "192.0.2.81", error: null,
+        };
+        return { ...shown, success: true, code, sourceAddress: "192.0.2.10:40000", connectMillis: 12.5, resolution };
       })),
     },
   };

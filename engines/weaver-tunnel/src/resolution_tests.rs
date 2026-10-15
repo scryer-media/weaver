@@ -10,6 +10,7 @@ fn answer(ttl: Ttl) -> Lookup {
     Lookup {
         addresses: vec![address()],
         ttl,
+        nonexistent: false,
     }
 }
 
@@ -17,6 +18,7 @@ fn negative(ttl: Ttl) -> Lookup {
     Lookup {
         addresses: Vec::new(),
         ttl,
+        nonexistent: false,
     }
 }
 

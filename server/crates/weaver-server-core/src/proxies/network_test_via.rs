@@ -5,7 +5,10 @@
 // proxy that is only reachable through a tunnel is tested through that
 // tunnel.
 use super::*;
-use weaver_tunnel::{fault, pipe::Purpose};
+pub use weaver_tunnel::resolution::record::{
+    HostResolution, LookupError, LookupFailure, ResolvedBy,
+};
+use weaver_tunnel::{fault, pipe::Purpose, resolution::record::Recording};
 
 // The most paths one test tries, counting a pool under test by its members.
 pub const MAX_TEST_PATHS: usize = 64;
@@ -39,6 +42,9 @@ pub struct PathTest {
     pub failing_proxy: Option<u32>,
     pub source_address: Option<std::net::SocketAddr>,
     pub elapsed: Duration,
+    // How the host the path's last dial named was resolved: the target,
+    // else the DNS server or proxy endpoint the test reached.
+    pub resolution: Option<HostResolution>,
 }
 
 // A path's stages: the one beneath the proxy under test, and that proxy on
@@ -340,7 +346,6 @@ enum Stopped {
     Dial(DialError),
     // A proxy's own endpoint could not be reached from the stage beneath it.
     Endpoint(DialError),
-    Fault(ProxyFault),
 }
 
 impl Probe {
@@ -350,31 +355,46 @@ impl Probe {
             .subject
             .as_ref()
             .map_or(ROUTE_TEST_WAIT, ProxyProfile::timeout);
+        let mut resolution = None;
         let (outcome, failing_proxy, source_address) = match &self.stages {
             Err((fault, proxy)) => (Err(fault.clone()), *proxy, None),
             Ok((beneath, top)) => {
-                let stage = top.as_ref().unwrap_or(beneath);
-                let reached = tokio::time::timeout(
-                    stage.budget(),
-                    reach(beneath, top.as_ref(), self.subject.as_ref(), target),
-                )
-                .await;
-                match reached {
-                    Ok(Ok((pass, source))) => (Ok(pass), None, source),
-                    Ok(Err(Stopped::Fault(fault))) => (Err(fault), None, None),
-                    Ok(Err(Stopped::Dial(error))) => {
-                        let (fault, proxy) = blame(stage, &error, wait);
-                        (Err(fault), proxy, None)
+                match last(beneath, top.as_ref(), self.subject.as_ref(), target) {
+                    Err(fault) => (Err(fault), None, None),
+                    Ok(last) => {
+                        let stage = top.as_ref().unwrap_or(beneath);
+                        // The test's own lookups note how they went; no other
+                        // dial's do.
+                        let recording = Arc::new(Recording::default());
+                        let reached = recording
+                            .scope(tokio::time::timeout(stage.budget(), last.reach()))
+                            .await;
+                        let said = match &reached {
+                            Ok(Err(Stopped::Dial(error) | Stopped::Endpoint(error))) => {
+                                Some(error.to_string())
+                            }
+                            _ => None,
+                        };
+                        let (host, port) = last.named();
+                        resolution = recording.finish(host, port, said.as_deref());
+                        match reached {
+                            Ok(Ok((pass, source))) => (Ok(pass), None, source),
+                            Ok(Err(Stopped::Dial(error))) => {
+                                let (fault, proxy) = blame(stage, &error, wait);
+                                (Err(fault), proxy, None)
+                            }
+                            Ok(Err(Stopped::Endpoint(error))) => {
+                                let (fault, proxy) = blame(beneath, &error, wait);
+                                let proxy =
+                                    proxy.or(self.subject.as_ref().map(|subject| subject.id));
+                                (Err(fault), proxy, None)
+                            }
+                            Err(_) => match stage.failing_hop() {
+                                Some(hop) => (Err(hop.fault), Some(hop.proxy), None),
+                                None => (Err(self.timed_out(wait)), None, None),
+                            },
+                        }
                     }
-                    Ok(Err(Stopped::Endpoint(error))) => {
-                        let (fault, proxy) = blame(beneath, &error, wait);
-                        let proxy = proxy.or(self.subject.as_ref().map(|subject| subject.id));
-                        (Err(fault), proxy, None)
-                    }
-                    Err(_) => match stage.failing_hop() {
-                        Some(hop) => (Err(hop.fault), Some(hop.proxy), None),
-                        None => (Err(self.timed_out(wait)), None, None),
-                    },
                 }
             }
         };
@@ -387,6 +407,7 @@ impl Probe {
             failing_proxy,
             source_address,
             elapsed: started.elapsed(),
+            resolution,
         }
     }
 
@@ -413,63 +434,123 @@ fn blame(stage: &Arc<dyn Dialer>, error: &DialError, wait: Duration) -> (ProxyFa
     (error.fault(wait), proxy)
 }
 
-// How far one path gets. The route alone reaches the target. A proxy
+// The last thing a path does: the dial it ends at, or bringing a tunnel
+// up to its endpoint.
+enum Last<'a> {
+    Dial {
+        stage: &'a Arc<dyn Dialer>,
+        target: Target,
+        pass: ProxyTestPass,
+        // Whether the target is the endpoint of the proxy under test, so
+        // failing to reach it is that proxy's failure.
+        endpoint: bool,
+    },
+    Prepare {
+        stage: &'a Arc<dyn Dialer>,
+        endpoint: (String, u16),
+    },
+}
+
+impl Last<'_> {
+    // The host and port the path ends at.
+    fn named(&self) -> (&str, u16) {
+        match self {
+            Self::Dial { target, .. } => (&target.host, target.port),
+            Self::Prepare { endpoint, .. } => (&endpoint.0, endpoint.1),
+        }
+    }
+
+    async fn reach(&self) -> Result<(ProxyTestPass, Option<std::net::SocketAddr>), Stopped> {
+        match self {
+            Self::Dial {
+                stage,
+                target,
+                pass,
+                endpoint,
+            } => {
+                let dialed = stage.dial(target).await.map_err(|error| {
+                    if *endpoint {
+                        Stopped::Endpoint(error)
+                    } else {
+                        Stopped::Dial(error)
+                    }
+                })?;
+                Ok((*pass, dialed.source))
+            }
+            Self::Prepare { stage, .. } => {
+                stage.prepare().await.map_err(Stopped::Dial)?;
+                Ok((ProxyTestPass::Connected, None))
+            }
+        }
+    }
+}
+
+// How far one path goes. The route alone reaches the target. A proxy
 // reaches the target when one is given; otherwise an SSH or WireGuard
 // tunnel comes up, and a stream proxy carries a connection to a DNS server
 // it resolves with or, with none, answers at its endpoint.
-async fn reach(
-    beneath: &Arc<dyn Dialer>,
-    top: Option<&Arc<dyn Dialer>>,
+fn last<'a>(
+    beneath: &'a Arc<dyn Dialer>,
+    top: Option<&'a Arc<dyn Dialer>>,
     subject: Option<&ProxyProfile>,
     target: Option<&(String, u16)>,
-) -> Result<(ProxyTestPass, Option<std::net::SocketAddr>), Stopped> {
+) -> Result<Last<'a>, ProxyFault> {
     let probe = |host: String, port: u16| Target {
         host,
         port,
         purpose: Purpose::Probe,
         addresses: Vec::new(),
     };
+    let dial = |stage, target, pass| Last::Dial {
+        stage,
+        target,
+        pass,
+        endpoint: false,
+    };
     let (Some(top), Some(profile)) = (top, subject) else {
         let Some((host, port)) = target else {
-            return Err(Stopped::Fault(ProxyFault::Other {
+            return Err(ProxyFault::Other {
                 detail: NetworkRefusal::TestTargetRequired.to_string(),
-            }));
+            });
         };
-        let dialed = beneath
-            .dial(&probe(host.clone(), *port))
-            .await
-            .map_err(Stopped::Dial)?;
-        return Ok((ProxyTestPass::Connected, dialed.source));
+        return Ok(dial(
+            beneath,
+            probe(host.clone(), *port),
+            ProxyTestPass::Connected,
+        ));
     };
     if let Some((host, port)) = target {
-        let dialed = top
-            .dial(&probe(host.clone(), *port))
-            .await
-            .map_err(Stopped::Dial)?;
-        return Ok((ProxyTestPass::Forwarded, dialed.source));
+        return Ok(dial(
+            top,
+            probe(host.clone(), *port),
+            ProxyTestPass::Forwarded,
+        ));
     }
     if matches!(profile.kind, ProxyKind::Ssh | ProxyKind::WireGuard) {
-        top.prepare().await.map_err(Stopped::Dial)?;
-        return Ok((ProxyTestPass::Connected, None));
+        return Ok(Last::Prepare {
+            stage: top,
+            endpoint: (profile.host.clone(), profile.port),
+        });
     }
     if let Some(dns) = profile.proxy_dns_servers().first() {
-        let dialed = top
-            .dial(&probe(dns.to_string(), 53))
-            .await
-            .map_err(Stopped::Dial)?;
-        return Ok((ProxyTestPass::Forwarded, dialed.source));
+        return Ok(dial(
+            top,
+            probe(dns.to_string(), 53),
+            ProxyTestPass::Forwarded,
+        ));
     }
     if profile.kind == ProxyKind::Http3Connect {
-        return Err(Stopped::Fault(ProxyFault::TestNeedsDns));
+        return Err(ProxyFault::TestNeedsDns);
     }
-    let dialed = beneath
-        .dial(&Target {
+    Ok(Last::Dial {
+        stage: beneath,
+        target: Target {
             host: profile.host.clone(),
             port: profile.port,
             purpose: Purpose::ProxyEndpoint { proxy: profile.id },
             addresses: Vec::new(),
-        })
-        .await
-        .map_err(Stopped::Endpoint)?;
-    Ok((ProxyTestPass::Reachable, dialed.source))
+        },
+        pass: ProxyTestPass::Reachable,
+        endpoint: true,
+    })
 }
