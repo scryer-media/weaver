@@ -232,7 +232,10 @@ async fn a_proxy_test_answers_with_a_code() {
     );
     let result = h.execute(&test_via(&subject)).await;
     assert_no_errors(&result);
-    let tests = response_data(&result)["testVia"].as_array().unwrap().clone();
+    let tests = response_data(&result)["testVia"]
+        .as_array()
+        .unwrap()
+        .clone();
     assert_eq!(tests.len(), 1);
     let test = &tests[0];
     assert_eq!(test["leg"], 0);

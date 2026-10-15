@@ -2161,7 +2161,11 @@ mod tests {
     fn planned_route(config: &mut PoolConfig) -> Arc<crate::route_dialer::AddressPlanned> {
         let route = Arc::new(crate::route_dialer::AddressPlanned::new(
             "pool test".into(),
-            Arc::new(weaver_tunnel::pipe::Egress::new(0, crate::egress::SocketEgress::System, Duration::from_secs(30))),
+            Arc::new(weaver_tunnel::pipe::Egress::new(
+                0,
+                crate::egress::SocketEgress::System,
+                Duration::from_secs(30),
+            )),
         ));
         config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
             inner: route.clone(),

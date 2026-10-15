@@ -25,7 +25,11 @@ struct Row {
 
 fn direct_leg() -> HttpLeg {
     HttpLeg {
-        stage: Arc::new(weaver_tunnel::pipe::Egress::new(0, weaver_tunnel::egress::SocketEgress::System, Duration::from_secs(30))),
+        stage: Arc::new(weaver_tunnel::pipe::Egress::new(
+            0,
+            weaver_tunnel::egress::SocketEgress::System,
+            Duration::from_secs(30),
+        )),
     }
 }
 
