@@ -43,7 +43,9 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("proxy_profiles", Export, RequireEmpty),
     table!("proxy_routes", Export, RequireEmpty),
     table!("egress_interfaces", Export, Replace),
-    table!("egress_download_usage", Export, RequireZeroUsage),
+    // Background HTTP requests also count toward egress usage on a fresh
+    // instance. Job state and NNTP usage below guard against replacing downloads.
+    table!("egress_download_usage", Export, Replace),
     table!("proxy_pools", Export, RequireEmpty),
     table!("server_download_usage", Export, RequireZeroUsage),
     table!("server_tls_diagnostics", Export, Replace),

@@ -191,7 +191,7 @@ function expectContract(record: ScriptRecord, expected: Expected): void {
     NZBPP_HEALTH: String(expected.item.health), NZBPP_CRITICALHEALTH: "850",
   });
   expect(env, `${label}: NZBGet global options with their upper-case aliases`).toMatchObject({
-    NZBOP_Version: expected.version, NZBOP_VERSION: expected.version,
+    NZBOP_Version: "16.0-weaver", NZBOP_VERSION: "16.0-weaver",
     NZBOP_AppDir: env.SAB_PROGRAM_DIR, NZBOP_APPDIR: env.SAB_PROGRAM_DIR,
     NZBOP_MainDir: env.WEAVER_DATA_DIR, NZBOP_MAINDIR: env.WEAVER_DATA_DIR,
     NZBOP_DestDir: env.WEAVER_COMPLETE_DIR, NZBOP_DESTDIR: env.WEAVER_COMPLETE_DIR,

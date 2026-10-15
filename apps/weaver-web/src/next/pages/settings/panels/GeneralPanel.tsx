@@ -7,6 +7,7 @@ import {
   SET_UNACCEPTABLE_EXTENSIONS_MUTATION,
   SETTINGS_QUERY,
   UNACCEPTABLE_EXTENSIONS_QUERY,
+  UPDATE_ARCHIVE_PASSWORD_LIST_MUTATION,
   UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION,
   UPDATE_SETTINGS_MUTATION,
 } from "@/graphql/queries";
@@ -185,6 +186,7 @@ export function GeneralPanel() {
   }>({ query: UNACCEPTABLE_EXTENSIONS_QUERY });
   const [, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
   const [, updateArchivePasswords] = useMutation(UPDATE_ARCHIVE_PASSWORD_SETTINGS_MUTATION);
+  const [, updateArchivePasswordList] = useMutation(UPDATE_ARCHIVE_PASSWORD_LIST_MUTATION);
   const [, setExtensions] = useMutation(SET_UNACCEPTABLE_EXTENSIONS_MUTATION);
   // Each save answers with the setting as stored, so nothing is read again.
   const [settings, answerSettings] = useAnswered(data?.settings);
@@ -251,7 +253,7 @@ export function GeneralPanel() {
   // A list given replaces the stored one, and an empty list removes it; a
   // file left out keeps the stored file, and null forgets it.
   const sendArchive = async (variables: { passwords?: string[]; passwordFile?: string | null }) => {
-    const result = await updateArchivePasswords(variables);
+    const result = await ("passwordFile" in variables ? updateArchivePasswords : updateArchivePasswordList)(variables);
     const answer = result.data?.updateArchivePasswordSettings as ArchivePasswordSettings | undefined;
     if (result.error || !answer) {
       return refusal(result.error);

@@ -19,7 +19,7 @@ let settings = {
   },
 };
 // A list is stored: the daemon says so, and never sends the list itself.
-let archive: { hasPasswords: boolean; passwordFile: string | null } = { hasPasswords: true, passwordFile: null };
+let archive: { hasPasswords: boolean; passwordFile: string | null } = { hasPasswords: true, passwordFile: "/data/archive-passwords.txt" };
 // The unwanted extension list, saved apart from the rest and normalized as the daemon does.
 let extensions = ["bat", "cmd", "com", "exe", "js", "lnk", "msi", "ps1", "scr", "vbs"];
 // A machine that can run more than one hardware profile, so the panel offers the choice.
@@ -73,7 +73,16 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
     if (refuse[name] !== undefined) {
       return fromValue({ operation, data: undefined, error: new CombinedError({ graphQLErrors: [{ message: refuse[name] }] }) });
     }
-    return fromValue({ operation, data: store(name, variables) });
+    const argumentsForStore = { ...variables };
+    if (name === "UpdateArchivePasswordSettings" && definition?.kind === "OperationDefinition") {
+      const field = definition.selectionSet.selections.find(entry => entry.kind === "Field" && entry.name.value === "updateArchivePasswordSettings");
+      // Match the daemon: a referenced, absent file variable resolves to
+      // null; only omitting the argument itself leaves the stored file alone.
+      if (field?.kind === "Field" && field.arguments?.some(argument => argument.name.value === "passwordFile") && !("passwordFile" in variables)) {
+        argumentsForStore.passwordFile = null;
+      }
+    }
+    return fromValue({ operation, data: store(name, argumentsForStore) });
   }
   const answer = name === "Settings" ? { settings, globalState: null }
     : name === "ArchivePasswordSettings" ? { archivePasswordSettings: archive }

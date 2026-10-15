@@ -134,7 +134,9 @@ test("the password list stays shut until Edit passwords opens it, saves when lef
     const edit = section.getByRole("button", { name: "Edit passwords", exact: true });
     const list = section.getByRole("textbox", { name: "Passwords (one per line)", exact: true });
     const clear = section.getByRole("button", { name: "Clear", exact: true });
+    const file = section.getByRole("textbox", { name: "Password file", exact: true });
     await edit.waitFor();
+    assert.equal(await file.inputValue(), "/data/archive-passwords.txt");
     assert.equal(await list.count(), 0);
     await clear.waitFor();
     await shot(section, "archive-passwords");
@@ -169,6 +171,7 @@ test("the password list stays shut until Edit passwords opens it, saves when lef
     await confirm.getByRole("button", { name: "Clear", exact: true }).click();
     await clear.waitFor({ state: "detached" });
     assert.deepEqual(await sent(page, "UpdateArchivePasswordSettings"), [{ passwords: ["first-secret", "second-secret"] }, { passwords: [] }]);
+    assert.equal(await file.inputValue(), "/data/archive-passwords.txt");
     assert.equal(await list.count(), 0);
     // Nothing else was touched, so nothing else was sent.
     assert.equal((await sent(page, "SetUnacceptableExtensions")).length, 0);

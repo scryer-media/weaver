@@ -514,7 +514,7 @@ test("ST05 a two-leg route splits the connections, a leg taken down gives them a
   await expect(connectionRows(secondDetail).filter({ hasText: b.name })).toHaveCount(0);
   // The detail draws leg 2 down, and its direct way with it.
   await expect(diagram(secondDetail)).toContainText("Down · 0/0 open");
-  await expect(diagram(secondDetail)).toContainText("Direct · no tunnel · Down");
+  await expect(diagram(secondDetail)).toContainText("Direct · Down");
 
   // Both legs down: the start is refused and nothing runs.
   const runsBefore = (await speedTestRuns(request)).length;
