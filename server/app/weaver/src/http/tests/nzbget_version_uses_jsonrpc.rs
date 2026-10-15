@@ -1279,6 +1279,9 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
             weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
             "drone-history".to_string(),
         ),
+        ("nzbget.dupe_key".to_string(), "book-request-42".to_string()),
+        ("nzbget.dupe_score".to_string(), "-17".to_string()),
+        ("nzbget.dupe_mode".to_string(), "FORCE".to_string()),
         (
             weaver_server_core::ingest::ORIGINAL_TITLE_METADATA_KEY.to_string(),
             "Complete.Release.S01E01.1080p.WEB-DL".to_string(),
@@ -1354,6 +1357,12 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
     assert_eq!(complete["UnpackStatus"], "SUCCESS");
     assert_eq!(complete["Parameters"][0]["Name"], "drone");
     assert_eq!(complete["Parameters"][0]["Value"], "drone-history");
+    assert_eq!(complete["DupeKey"], "book-request-42");
+    assert_eq!(complete["DupeScore"], -17);
+    assert_eq!(complete["DupeMode"], "FORCE");
+    assert_eq!(failed["DupeKey"], "");
+    assert_eq!(failed["DupeScore"], 0);
+    assert_eq!(failed["DupeMode"], "SCORE");
     // A row with no kept failure kind is read from its error text: missing
     // articles at low health are a health failure, with no stage claim.
     assert_eq!(failed["ParStatus"], "NONE");
@@ -1432,10 +1441,15 @@ async fn nzbget_history_includes_terminal_memory_items_missing_from_db() {
         weaver_server_core::DownloadState::Complete,
         123,
         123,
-        vec![(
-            weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
-            "drone-terminal-memory".to_string(),
-        )],
+        vec![
+            (
+                weaver_server_api::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+                "drone-terminal-memory".to_string(),
+            ),
+            ("nzbget.dupe_key".to_string(), "book-request-43".to_string()),
+            ("nzbget.dupe_score".to_string(), "23".to_string()),
+            ("nzbget.dupe_mode".to_string(), "ALL".to_string()),
+        ],
     );
     let handle = scheduler_handle_with_mock_commands(vec![job]);
     let app = nzbget_test_router(
@@ -1474,6 +1488,9 @@ async fn nzbget_history_includes_terminal_memory_items_missing_from_db() {
     assert_eq!(item["ParStatus"], "SUCCESS");
     assert_eq!(item["Parameters"][0]["Name"], "drone");
     assert_eq!(item["Parameters"][0]["Value"], "drone-terminal-memory");
+    assert_eq!(item["DupeKey"], "book-request-43");
+    assert_eq!(item["DupeScore"], 23);
+    assert_eq!(item["DupeMode"], "ALL");
 }
 
 #[tokio::test]

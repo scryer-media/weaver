@@ -2358,6 +2358,12 @@ fn nzbget_history_entry(
         "Health": health,
         "CriticalHealth": critical_health,
         "Deleted": statuses.delete != "NONE",
+        "DupeKey": attribute_value(attributes, "nzbget.dupe_key").unwrap_or_default(),
+        "DupeScore": attribute_value(attributes, "nzbget.dupe_score")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0),
+        "DupeMode": attribute_value(attributes, "nzbget.dupe_mode")
+            .unwrap_or_else(|| "SCORE".to_string()),
         "RetryData": false,
         "Message": message,
         "MessageCount": 0,
