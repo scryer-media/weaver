@@ -75,7 +75,9 @@ Weaver has an incredibly powerful networking sub system. It enables you to compo
 | par3   | ⭐️***  | ❌      | ❌      |
 
 _*Weaver supports "store mode" optimizations that directly materialize the binary file through a streaming decoder rather than download => decode_
+
 _**Nzbget supports nested with an extension and it is limited in supported formats_
+
 _***par3 spec is still in alpha, and Weaver is ready to use it today so you're never behind when posters start uploading with it. Par3 can be faster than par2 repair and also can repair much larger holes in files_
 
 ## Install
