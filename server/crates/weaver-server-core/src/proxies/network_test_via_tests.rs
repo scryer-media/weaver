@@ -587,3 +587,92 @@ async fn a_test_through_a_route_that_cannot_carry_its_proxy_is_refused() {
     assert_eq!(tests[0].outcome, Ok(ProxyTestPass::Connected));
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_pool_carries_the_target_through_the_member_it_picks() {
+    use crate::proxies::Resolver as Naming;
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let to = target.local_addr().unwrap();
+    let double = ProxyServerDouble::start(
+        weaver_tunnel::transport::TransportKind::Socks5,
+        None,
+        HashMap::from([(("named.invalid".into(), to.port()), to)]),
+    )
+    .await;
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead = closed.local_addr().unwrap().port();
+    drop(closed);
+    let pool = |id, member_ids| ProxyPool {
+        id,
+        name: "pool".into(),
+        kind: ProxyKind::Socks5,
+        member_ids,
+        enabled: true,
+    };
+    let runtime = runtime_with(
+        vec![
+            socks_at(1, &double, Naming::Proxy, &[]),
+            ProxyProfile {
+                resolver: Naming::Proxy,
+                ..socks(2, dead)
+            },
+        ],
+        vec![pool(9, vec![2, 1]), pool(8, vec![2])],
+        vec![],
+    );
+    let route = draft(LegPath::Direct);
+    let named = Some(("named.invalid".to_owned(), to.port()));
+    let rows = |tests: &[PathTest]| {
+        tests
+            .iter()
+            .map(|test| (test.pool_id, test.proxy_id, test.outcome.is_ok()))
+            .collect::<Vec<_>>()
+    };
+
+    // The pool settles on the member that answers, and the lookup shown is
+    // that member's.
+    let tests = runtime
+        .test_via(&route, TestSubject::Pool(9), named.clone())
+        .await
+        .unwrap();
+    assert_eq!(tests.len(), 1);
+    assert_eq!(tests[0].outcome, Ok(ProxyTestPass::Forwarded));
+    assert_eq!(tests[0].pool_id, Some(9));
+    assert_eq!(tests[0].proxy_id, Some(1));
+    assert_eq!(tests[0].failing_proxy, None);
+    let resolution = tests[0].resolution.clone().unwrap();
+    assert_eq!(resolution.host, "named.invalid");
+    assert_eq!(resolution.by, ResolvedBy::Proxy);
+    assert_eq!(resolution.proxy, Some(1));
+    let _accepted = target.accept().await.unwrap();
+
+    // Each member on its own, with or without a target.
+    let tests = runtime
+        .test_via(&route, TestSubject::Members(9), named.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&tests),
+        [(None, Some(2), false), (None, Some(1), true)]
+    );
+    let _accepted = target.accept().await.unwrap();
+    let tests = runtime
+        .test_via(&route, TestSubject::Pool(9), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(&tests),
+        [(None, Some(2), false), (None, Some(1), true)]
+    );
+
+    // A pool no member of which answers picks none, and says what the last
+    // member to fail came to.
+    let tests = runtime
+        .test_via(&route, TestSubject::Pool(8), named)
+        .await
+        .unwrap();
+    assert_eq!(rows(&tests), [(Some(8), None, false)]);
+    assert_eq!(tests[0].outcome, Err(ProxyFault::ConnectionRefused));
+    assert_eq!(tests[0].failing_proxy, None);
+    runtime.shutdown().await;
+}

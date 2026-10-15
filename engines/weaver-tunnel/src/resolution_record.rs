@@ -168,6 +168,34 @@ impl Recording {
         RECORDING.scope(self.clone(), dial).await
     }
 
+    // The recording this task's lookups note into, when there is one, for
+    // a stage that dials in a task of its own to carry along.
+    pub fn current() -> Option<Arc<Self>> {
+        RECORDING.try_with(Arc::clone).ok()
+    }
+
+    // Takes `other`'s notes. A note this recording already holds stands.
+    pub fn adopt(&self, other: &Self) {
+        let taken = std::mem::take(&mut *other.names.lock().expect("resolution recording"));
+        let mut names = self.names.lock().expect("resolution recording");
+        for (host, note) in taken {
+            let entry = names.entry(host).or_default();
+            if entry.asker.is_none() {
+                entry.asker = note.asker;
+            }
+            entry.cached = entry.cached.or(note.cached);
+            if entry.answer.is_none() {
+                entry.answer = note.answer;
+            }
+            entry.connected = entry.connected.or(note.connected);
+        }
+        let taken = std::mem::take(&mut *other.bound.lock().expect("resolution recording"));
+        self.bound
+            .lock()
+            .expect("resolution recording")
+            .extend(taken);
+    }
+
     // How `host` was resolved for a dial to it at `port`, as far as the
     // notes tell. `failure` is what the dial said when it failed, which
     // names a lookup no note recorded. `None` when nothing tells.

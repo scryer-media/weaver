@@ -1774,6 +1774,7 @@ export const nextIt: LocaleDictionary = {
   "next.networking.pools.delete": "Elimina pool",
   "next.networking.pools.deleteBody": "Eliminare {{name}}? Va prima rimosso da tutti i percorsi.",
   "next.networking.pools.test": "Prova pool",
+  "next.networking.pools.testVia": "Prova via",
   "next.networking.routes.title": "Percorsi dei consumatori",
   "next.networking.routes.note": "ogni server e feed ha il suo percorso",
   "next.networking.routes.consumer": "Consumatore",

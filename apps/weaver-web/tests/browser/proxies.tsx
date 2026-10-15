@@ -128,14 +128,17 @@ function testVia(variables: Record<string, unknown>) {
     });
   });
   if (paths.some((path) => path.carrierIds.some((id) => tested.includes(id)))) return refusal("TEST_SUBJECT_IN_ROUTE");
-  const onTop: (number | null)[] = subject ? tested : [null];
-  if (paths.length * onTop.length > resultLimit()) return refusal("TEST_PATH_COUNT", { limit: resultLimit() });
+  // A pool given somewhere to go carries it through the member it picks: here, its first that answers.
+  const poolId = subject?.pool !== undefined && target ? subject.pool : null;
+  const onTop: (number | null)[] = poolId !== null ? [tested.find((id) => id !== SILENT) ?? null] : subject ? tested : [null];
+  if (paths.length * (subject ? tested.length : 1) > resultLimit()) return refusal("TEST_PATH_COUNT", { limit: resultLimit() });
   return {
     data: {
       testVia: paths.flatMap((path) => onTop.map((proxyId) => {
-        const shown = { ...path, proxyId, failingProxyId: null, sourceAddress: null, connectMillis: 0, params: {}, message: "", resolution: null };
-        if (path.carrierIds.includes(SILENT) || proxyId === SILENT) {
-          return { ...shown, success: false, code: "TIMED_OUT", params: { seconds: 10 }, message: "No answer within 10 seconds.", failingProxyId: SILENT };
+        const shown = { ...path, proxyId, poolId, failingProxyId: null, sourceAddress: null, connectMillis: 0, params: {}, message: "", resolution: null };
+        const silent = path.carrierIds.includes(SILENT) || proxyId === SILENT;
+        if (silent || (poolId !== null && proxyId === null)) {
+          return { ...shown, success: false, code: "TIMED_OUT", params: { seconds: 10 }, message: "No answer within 10 seconds.", failingProxyId: silent ? SILENT : null };
         }
         const kind = profiles.find((profile) => profile.id === proxyId)?.kind;
         const code = target ? (proxyId === null ? "CONNECTED" : "FORWARDED") : kind === "SSH" || kind === "WIRE_GUARD" ? "CONNECTED" : "REACHABLE";

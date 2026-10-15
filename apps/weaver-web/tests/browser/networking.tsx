@@ -50,11 +50,14 @@ function testVia(variables:TestVariables){
  const {subject,target}=variables;const seen=new Set<string>();
  const paths=variables.route.legs.flatMap((leg,index)=>{const ladder=leg.path.ladder;const carriers=ladder?[...ladder.rungs.flatMap(rung=>rung.proxy!==undefined?[[rung.proxy]]:rung.pool!==undefined?members(rung.pool).map(id=>[id]):[rung.chain??[]]),...(ladder.directFallback?[[]]:[])]:[[]];
   return carriers.flatMap(carrierIds=>{const key=`${leg.egressId}:${carrierIds.join(",")}`;if(seen.has(key))return [];seen.add(key);return [{leg:index,egressId:leg.egressId,carrierIds}];});});
- const onTop:(number|null)[]=subject?.proxy!==undefined?[subject.proxy]:subject?.pool!==undefined?members(subject.pool):[null];
+ // A pool given somewhere to go carries it through the member it picks: here, its first that is turned on.
+ const poolId=subject?.pool!==undefined&&target?subject.pool:null;
+ const onTop:(number|null)[]=poolId!==null?[members(poolId).find(id=>profiles.find(entry=>entry.id===id)?.enabled!==false)??null]:subject?.proxy!==undefined?[subject.proxy]:subject?.pool!==undefined?members(subject.pool):[null];
  return paths.flatMap(path=>onTop.map(proxyId=>{
   const off=[...path.carrierIds,...(proxyId===null?[]:[proxyId])].find(id=>profiles.find(entry=>entry.id===id)?.enabled===false);
-  const shown={...path,proxyId,params:{},message:"",sourceAddress:null,connectMillis:0,failingProxyId:null};
+  const shown={...path,proxyId,poolId,params:{},message:"",sourceAddress:null,connectMillis:0,failingProxyId:null};
   if(off!==undefined)return {...shown,success:false,code:"PROXY_UNAVAILABLE",message:"The proxy is disabled.",failingProxyId:off};
+  if(poolId!==null&&proxyId===null)return {...shown,success:false,code:"PROXY_UNAVAILABLE",message:"The proxy is disabled."};
   const address=egresses.find(egress=>egress.id===path.egressId)?.sourceAddress??"192.0.2.21";
   return {...shown,success:true,code:proxyId===null?"CONNECTED":target?"FORWARDED":["WIRE_GUARD","SSH"].includes(profiles.find(entry=>entry.id===proxyId)?.kind??"")?"CONNECTED":"REACHABLE",sourceAddress:`${address}:40000`,connectMillis:8.4};
  }));

@@ -41,6 +41,7 @@ export function PoolsPage({
 }) {
   const t = useTranslate();
   const [editing, setEditing] = useState<ProxyPool | null>(null);
+  const [testing, setTesting] = useState<ProxyPool | null>(null);
   const profileName = (id: number) =>
     data.proxyProfiles.find((profile) => profile.id === id)?.name ?? t("next.networking.proxyNumber", { id });
 
@@ -52,7 +53,7 @@ export function PoolsPage({
       id: "pools",
       title: t("next.networking.pools.title"),
       note: countLabel(t, "next.networking.pools.count", data.proxyPools.length),
-      columns: "minmax(0, 1fr) 132px minmax(0, 1.6fr) 104px 112px",
+      columns: "minmax(0, 1fr) 132px minmax(0, 1.6fr) 104px 208px",
       headers: [
         t("next.networking.pools.name"),
         t("next.networking.pools.type"),
@@ -88,7 +89,14 @@ export function PoolsPage({
               state={pool.enabled ? "UP" : "IDLE"}
               label={pool.enabled ? t("next.networking.enabled") : t("next.networking.disabled")}
             />,
-            <span key="edit" className="ml-auto" onClick={(event) => event.stopPropagation()}>
+            <span
+              key="actions"
+              className="ml-auto flex flex-wrap items-center justify-end gap-2"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <SecondaryButton size="compact" icon="test" onClick={() => setTesting(pool)}>
+                {t("next.networking.pools.testVia")}
+              </SecondaryButton>
               <SecondaryButton size="compact" onClick={() => open(pool)}>
                 {t("next.networking.pools.edit")}
               </SecondaryButton>
@@ -118,6 +126,9 @@ export function PoolsPage({
           busy={busy}
           onClose={() => setEditing(null)}
         />
+      ) : null}
+      {testing ? (
+        <TestViaDialog key={testing.id} subject={{ pool: testing.id }} onClose={() => setTesting(null)} />
       ) : null}
     </>
   );

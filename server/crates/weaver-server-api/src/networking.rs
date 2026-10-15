@@ -428,7 +428,10 @@ pub struct PathTestResult {
     pub leg: u32,
     pub egress_id: u32,
     pub carrier_ids: Vec<u32>,
+    // The proxy under test, or the member the pool under test picked.
     pub proxy_id: Option<u32>,
+    // The pool under test, when it carried the target.
+    pub pool_id: Option<u32>,
     pub success: bool,
     pub code: String,
     // The outcome in English, for a client with no sentence for its code.
@@ -539,6 +542,7 @@ impl From<core::PathTest> for PathTestResult {
             egress_id: test.egress_id,
             carrier_ids: test.carriers,
             proxy_id: test.proxy_id,
+            pool_id: test.pool_id,
             success,
             code: code.into(),
             message,
@@ -1230,8 +1234,10 @@ impl NetworkingMutation {
             failover: route.failover.into(),
         })
     }
-    // Tests every path through a drafted route, with a proxy or each member
-    // of a pool on top of it. Nothing is dialled outside the route.
+    // Tests every path through a drafted route, with a proxy or a pool on
+    // top of it. A pool carries the target through the member it picks;
+    // without a target each member is tried on its own. Nothing is dialled
+    // outside the route.
     #[graphql(guard = "AdminGuard")]
     async fn test_via(
         &self,
@@ -1305,7 +1311,7 @@ impl NetworkingMutation {
         Ok(test_via(
             &runtime,
             &direct_on(egress_id),
-            core::TestSubject::Pool(id),
+            core::TestSubject::Members(id),
             target,
         )
         .await?

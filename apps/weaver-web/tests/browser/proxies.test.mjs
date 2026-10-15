@@ -641,7 +641,7 @@ test("a test the daemon refuses says why in our words, and leaves no rows", asyn
   } finally { await page.close(); }
 });
 
-test("a pool is tested member by member through a route drafted for it", async () => {
+test("a pool is tested member by member through a route drafted for it, and carries a host through the member it picks", async () => {
   const page = await open("?pools");
   try {
     await page.getByText("Exits", { exact: true }).click();
@@ -665,5 +665,34 @@ test("a pool is tested member by member through a route drafted for it", async (
       target: null,
     });
     await shot(page, "test-via-pool");
+
+    // Given somewhere to go, the pool carries it, and its hop names the member it picked.
+    await action(dialog, "Optional").click();
+    await field(dialog, "Host").fill("news.fixture.invalid");
+    await action(dialog, "Test").click();
+    const rows = dialog.getByRole("list", { name: "Paths", exact: true }).getByRole("listitem");
+    await rows.first().getByText("Connected and forwarded through the proxy.", { exact: true }).waitFor();
+    assert.equal(await rows.count(), 1);
+    const hops = rows.first().locator("span").first();
+    assert.equal(await hops.textContent(), "System > Exits (Relay)");
+    assert.equal(await hops.locator("strong").textContent(), "Relay");
+    assert.equal(await hops.locator("span.text-wv-error-text").count(), 0);
+    assert.deepEqual((await runs(page)).at(-1).variables.target, { host: "news.fixture.invalid", port: 443 });
+    await shot(page, "test-via-pool-picked");
+  } finally { await page.close(); }
+});
+
+test("a pool's line opens Test via for the pool", async () => {
+  const page = await open("?pools");
+  try {
+    const dialog = await testingVia(page, "Exits");
+    await dialog.getByText("Exits · SOCKS5", { exact: true }).waitFor();
+    // The pool's editor stays closed.
+    assert.equal(await page.getByRole("dialog", { name: "Exits", exact: true }).count(), 0);
+    await action(dialog, "Test").click();
+    await paths(dialog, 1);
+    assert.deepEqual((await runs(page)).at(-1).variables.subject, { pool: 1 });
+    await action(dialog, "Close").click();
+    await dialog.waitFor({ state: "detached" });
   } finally { await page.close(); }
 });

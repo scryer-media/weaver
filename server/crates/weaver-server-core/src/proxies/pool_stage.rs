@@ -15,7 +15,10 @@ use weaver_nntp::{
     ADDRESS_ATTEMPT_LIMIT,
     candidate_plan::{Attempt, CandidatePlan, PlanSnapshot},
 };
-use weaver_tunnel::pipe::{DialError, Dialed, Dialer, Resolution, SetupHandle, Target};
+use weaver_tunnel::{
+    pipe::{DialError, Dialed, Dialer, Resolution, SetupHandle, Target},
+    resolution::record::Recording,
+};
 
 const POOL_IDLE_RETIRE: Duration = Duration::from_secs(600);
 // How far back a member's rate looks, as far as a leg's does.
@@ -245,6 +248,25 @@ impl Drop for MemberOpening {
     }
 }
 
+// A member's dial, noting into a recording of its own when the pool's dial
+// runs in one, so the pool keeps the notes of the member it settled on, or
+// of the last to fail, rather than a mix of every member's.
+async fn noted<T>(
+    noting: bool,
+    dial: impl std::future::Future<Output = T>,
+) -> (T, Option<Arc<Recording>>) {
+    if !noting {
+        return (dial.await, None);
+    }
+    let notes = Arc::new(Recording::default());
+    (notes.scope(dial).await, Some(notes))
+}
+fn keep(recording: Option<&Arc<Recording>>, notes: Option<Arc<Recording>>) {
+    if let (Some(recording), Some(notes)) = (recording, notes) {
+        recording.adopt(&notes);
+    }
+}
+
 struct PoolState {
     id: u32,
     plan: Mutex<CandidatePlan<u32>>,
@@ -322,6 +344,7 @@ impl PoolState {
         self: Arc<Self>,
         target: Target,
         reply: oneshot::Sender<Result<Dialed, DialError>>,
+        recording: Option<Arc<Recording>>,
     ) {
         let mut reply = Some(reply);
         loop {
@@ -370,18 +393,22 @@ impl PoolState {
                         announce.log(&format!("pool {}", self.id));
                     }
                     let mut last = DialError::Skipped("no enabled pool member".into());
+                    let mut last_notes = None;
                     for id in order {
                         let member = self.members.read().expect("pool members").get(&id).cloned();
                         let Some(member) = member else {
                             continue;
                         };
-                        match member.dial(&target).await {
+                        let (result, notes) =
+                            noted(recording.is_some(), member.dial(&target)).await;
+                        match result {
                             Ok((dialed, elapsed)) => {
                                 if !self.record(&member, |plan| {
                                     plan.connected(id, elapsed, Instant::now().into_std())
                                 }) {
                                     continue;
                                 }
+                                keep(recording.as_ref(), notes);
                                 let dialed = self.decorate(member.clone(), dialed);
                                 if shadow == Some(id) {
                                     // The plan judges a challenger by what its
@@ -415,9 +442,11 @@ impl PoolState {
                                     });
                                 }
                                 last = error;
+                                last_notes = notes;
                             }
                         }
                     }
+                    keep(recording.as_ref(), last_notes);
                     let _ = reply.take().unwrap().send(Err(self.pool_error(last)));
                     return;
                 }
@@ -431,21 +460,23 @@ impl PoolState {
                             .collect()
                     };
                     let mut last = DialError::Skipped("no enabled pool member".into());
+                    let mut last_notes = None;
                     let mut race = JoinSet::new();
                     for member in members {
                         if member.status.lock().expect("pool member").blocked.is_some() {
                             continue;
                         }
                         let target = target.clone();
+                        let noting = recording.is_some();
                         race.spawn(async move {
-                            let result = member.dial(&target).await;
-                            (member, result)
+                            let (result, notes) = noted(noting, member.dial(&target)).await;
+                            (member, result, notes)
                         });
                     }
                     let mut winner = None;
                     let mut slow = Vec::new();
                     while let Some(result) = race.join_next().await {
-                        let Ok((member, result)) = result else {
+                        let Ok((member, result, notes)) = result else {
                             continue;
                         };
                         let id = member.id;
@@ -461,6 +492,7 @@ impl PoolState {
                                 }
                                 if winner.is_none() && reply.is_some() {
                                     winner = Some(id);
+                                    keep(recording.as_ref(), notes);
                                     let _ = reply
                                         .take()
                                         .unwrap()
@@ -477,6 +509,7 @@ impl PoolState {
                                     });
                                 }
                                 last = error;
+                                last_notes = notes;
                             }
                         }
                     }
@@ -503,6 +536,7 @@ impl PoolState {
                         continue;
                     }
                     if let Some(reply) = reply {
+                        keep(recording.as_ref(), last_notes);
                         let _ = reply.send(Err(self.pool_error(last)));
                     }
                     return;
@@ -783,10 +817,15 @@ impl Dialer for PoolStage {
             return Err(DialError::Skipped("pool stopped".into()));
         }
         let (reply, answer) = oneshot::channel();
+        // The pool dials in a task of its own; a test's recording goes with it.
+        let recording = Recording::current();
         {
             let mut tasks = self.tasks.lock().expect("pool tasks");
             while tasks.try_join_next().is_some() {}
-            tasks.spawn_on(self.state.clone().run(target.clone(), reply), &self.handle);
+            tasks.spawn_on(
+                self.state.clone().run(target.clone(), reply, recording),
+                &self.handle,
+            );
         }
         answer
             .await

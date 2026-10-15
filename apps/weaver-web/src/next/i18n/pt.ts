@@ -1774,6 +1774,7 @@ export const nextPt: LocaleDictionary = {
   "next.networking.pools.delete": "Excluir pool",
   "next.networking.pools.deleteBody": "Excluir {{name}}? Ele precisa ser removido de todas as rotas antes.",
   "next.networking.pools.test": "Testar pool",
+  "next.networking.pools.testVia": "Testar via",
   "next.networking.routes.title": "Rotas dos consumidores",
   "next.networking.routes.note": "cada servidor e feed tem sua rota",
   "next.networking.routes.consumer": "Consumidor",

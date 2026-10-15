@@ -1774,6 +1774,7 @@ export const nextZh: LocaleDictionary = {
   "next.networking.pools.delete": "删除代理池",
   "next.networking.pools.deleteBody": "删除 {{name}}？需先从所有路由中移除。",
   "next.networking.pools.test": "测试代理池",
+  "next.networking.pools.testVia": "经由测试",
   "next.networking.routes.title": "使用方路由",
   "next.networking.routes.note": "每个服务器和订阅源都有自己的路由",
   "next.networking.routes.consumer": "使用方",

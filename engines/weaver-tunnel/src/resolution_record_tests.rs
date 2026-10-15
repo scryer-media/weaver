@@ -87,6 +87,45 @@ async fn the_first_note_of_each_kind_stands() {
 }
 
 #[tokio::test]
+async fn a_recording_is_carried_and_adopts_notes_without_overriding_its_own() {
+    let recording = Arc::new(Recording::default());
+    assert!(Recording::current().is_none());
+    let carried = recording.scope(async { Recording::current() }).await;
+    assert!(carried.is_some_and(|carried| Arc::ptr_eq(&carried, &recording)));
+    recording.scope(async { cached("name.test", true) }).await;
+    let member = Arc::new(Recording::default());
+    member
+        .scope(async {
+            asking("name.test", || Asker::proxy(7));
+            cached("name.test", false);
+            connected("name.test", ip("192.0.2.7"));
+            bound(SocketAddr::new(ip("192.0.2.8"), 51820), false);
+        })
+        .await;
+    recording.adopt(&member);
+    assert_eq!(
+        recording.finish("name.test", 443, None),
+        Some(HostResolution {
+            host: "name.test".into(),
+            by: ResolvedBy::Proxy,
+            proxy: Some(7),
+            servers: Vec::new(),
+            addresses: Vec::new(),
+            cached: true,
+            connected: Some(ip("192.0.2.7")),
+            error: None,
+        })
+    );
+    assert_eq!(
+        recording
+            .finish("192.0.2.8", 51820, None)
+            .unwrap()
+            .connected,
+        Some(ip("192.0.2.8"))
+    );
+}
+
+#[tokio::test]
 async fn a_lookup_still_out_when_the_dial_ended_ran_out_of_time() {
     let recording = Arc::new(Recording::default());
     recording

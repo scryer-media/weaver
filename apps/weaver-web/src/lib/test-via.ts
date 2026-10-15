@@ -5,8 +5,9 @@ import { codedSentence } from "./refusal.ts";
 
 /**
  * What a test stacks on top of the route it is drafted through: one proxy,
- * each member of a pool, or nothing, when the route itself is under test.
- * Shaped as the daemon's `TestSubjectInput` takes it.
+ * a pool, or nothing, when the route itself is under test. A pool carries a
+ * destination through the member it picks, and without one each member is
+ * tried on its own. Shaped as the daemon's `TestSubjectInput` takes it.
  */
 export type TestSubject = { proxy: number } | { pool: number } | null;
 
@@ -17,8 +18,10 @@ export type PathTestResult = {
   egressId: number;
   /** The proxies the path rides, nearest the egress first; none is direct. */
   carrierIds: number[];
-  /** The proxy tested on top of the path, when the test has a subject. */
+  /** The proxy tested on top of the path, or the member the pool under test picked. */
   proxyId: number | null;
+  /** The pool under test, when it carried the destination. */
+  poolId: number | null;
   success: boolean;
   code: string;
   /** The daemon's English, for a code this build has no sentence for. */

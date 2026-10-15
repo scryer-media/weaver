@@ -1774,6 +1774,7 @@ export const nextJa: LocaleDictionary = {
   "next.networking.pools.delete": "プールを削除",
   "next.networking.pools.deleteBody": "{{name}} を削除しますか？先にすべてのルートから外す必要があります。",
   "next.networking.pools.test": "プールをテスト",
+  "next.networking.pools.testVia": "経由でテスト",
   "next.networking.routes.title": "利用先ごとのルート",
   "next.networking.routes.note": "サーバーとフィードはそれぞれ独自のルートを持ちます",
   "next.networking.routes.consumer": "利用先",

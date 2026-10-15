@@ -3,7 +3,8 @@
 // own: each leg's direct line, each rung, each member of a pool rung. A
 // proxy under test sits on top of the path the way a chain carries it, so a
 // proxy that is only reachable through a tunnel is tested through that
-// tunnel.
+// tunnel. A pool under test sits there whole, and carries a target through
+// the member it picks.
 use super::*;
 pub use weaver_tunnel::resolution::record::{
     HostResolution, LookupError, LookupFailure, ResolvedBy,
@@ -22,8 +23,11 @@ pub enum TestSubject {
     // The target, over the route alone.
     Route,
     Proxy(u32),
-    // Each member of the pool.
+    // The pool, carrying the target through the member it picks; without a
+    // target, each member on its own.
     Pool(u32),
+    // Each member of the pool on its own.
+    Members(u32),
 }
 
 // What one path came to.
@@ -35,8 +39,11 @@ pub struct PathTest {
     // The proxies beneath the one under test, from the egress up; none on
     // the leg's direct line.
     pub carriers: Vec<u32>,
-    // The proxy under test, unless the route was tested alone.
+    // The proxy under test, unless the route was tested alone; under a pool
+    // that carried the target, the member it picked.
     pub proxy_id: Option<u32>,
+    // The pool under test, when it carried the target.
+    pub pool_id: Option<u32>,
     pub outcome: Result<ProxyTestPass, ProxyFault>,
     // The proxy a failure belongs to, when one hop is to blame.
     pub failing_proxy: Option<u32>,
@@ -56,6 +63,10 @@ struct Probe {
     egress_id: u32,
     carriers: Vec<u32>,
     subject: Option<ProxyProfile>,
+    // The pool on top of the path, which carries the target itself.
+    pool: Option<u32>,
+    // How long the path's last hop waits.
+    wait: Duration,
     stages: Stages,
 }
 
@@ -182,7 +193,7 @@ impl NetworkRuntime {
                 TestSubject::Route if !targeted => return Err(NetworkRefusal::TestTargetRequired),
                 TestSubject::Route => Vec::new(),
                 TestSubject::Proxy(id) => vec![id],
-                TestSubject::Pool(id) => config
+                TestSubject::Pool(id) | TestSubject::Members(id) => config
                     .pools
                     .get(&id)
                     .ok_or(NetworkRefusal::PoolGone)?
@@ -255,13 +266,20 @@ impl NetworkRuntime {
             failover: Failover::default(),
         });
         validate_wireguard_paths(&routes, &config.profiles, &config.pools)?;
+        // A pool carries the target through the member it picks.
+        let pool = match subject {
+            TestSubject::Pool(id) if targeted => Some(id),
+            _ => None,
+        };
         let wireguard = paths
             .iter()
             .flat_map(|(_, _, carriers)| carriers)
             .chain(subjects.iter().flatten())
             .any(|id| kind_of(id) == Some(ProxyKind::WireGuard));
+        // A pool races every member at once, each with a tunnel of its own.
+        let tunnels = if pool.is_some() { subjects.len() } else { 1 };
         let concurrency = if wireguard {
-            max_wireguard_instances().clamp(1, 4)
+            (max_wireguard_instances() / tunnels).clamp(1, 4)
         } else {
             4
         };
@@ -270,6 +288,37 @@ impl NetworkRuntime {
             let bottom = Self::bottom(&config, egress_id, ROUTE_TEST_WAIT)
                 .map_err(|_| NetworkRefusal::RouteEgressMissing)?;
             let beneath = self.carriers(&config, &carriers, &bottom);
+            if let Some(pool) = pool {
+                let stages = beneath.and_then(|stage| {
+                    let members = subjects
+                        .iter()
+                        .flatten()
+                        .map(|id| {
+                            self.hop(&config, *id, stage.clone(), bottom.clone(), &carriers)
+                                .map(|hop| (*id, hop))
+                                .map_err(|detail| (ProxyFault::Other { detail }, Some(*id)))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let top: Arc<dyn Dialer> = PoolStage::new(pool, members, self.handle.clone());
+                    Ok((stage, Some(top)))
+                });
+                probes.push(Probe {
+                    leg,
+                    egress_id,
+                    carriers,
+                    subject: None,
+                    pool: Some(pool),
+                    wait: subjects
+                        .iter()
+                        .flatten()
+                        .filter_map(|id| config.profiles.get(id))
+                        .map(ProxyProfile::timeout)
+                        .max()
+                        .unwrap_or(ROUTE_TEST_WAIT),
+                    stages,
+                });
+                continue;
+            }
             for subject in &subjects {
                 let stages = beneath.clone().and_then(|stage| match subject {
                     None => Ok((stage, None)),
@@ -278,11 +327,16 @@ impl NetworkRuntime {
                         .map(|top| (stage, Some(top)))
                         .map_err(|detail| (ProxyFault::Other { detail }, Some(*id))),
                 });
+                let subject = subject.and_then(|id| config.profiles.get(&id).cloned());
                 probes.push(Probe {
                     leg,
                     egress_id,
                     carriers: carriers.clone(),
-                    subject: subject.and_then(|id| config.profiles.get(&id).cloned()),
+                    wait: subject
+                        .as_ref()
+                        .map_or(ROUTE_TEST_WAIT, ProxyProfile::timeout),
+                    subject,
+                    pool: None,
                     stages,
                 });
             }
@@ -351,11 +405,9 @@ enum Stopped {
 impl Probe {
     async fn run(self, target: Option<&(String, u16)>) -> PathTest {
         let started = tokio::time::Instant::now();
-        let wait = self
-            .subject
-            .as_ref()
-            .map_or(ROUTE_TEST_WAIT, ProxyProfile::timeout);
+        let wait = self.wait;
         let mut resolution = None;
+        let mut picked = None;
         let (outcome, failing_proxy, source_address) = match &self.stages {
             Err((fault, proxy)) => (Err(fault.clone()), *proxy, None),
             Ok((beneath, top)) => {
@@ -378,7 +430,10 @@ impl Probe {
                         let (host, port) = last.named();
                         resolution = recording.finish(host, port, said.as_deref());
                         match reached {
-                            Ok(Ok((pass, source))) => (Ok(pass), None, source),
+                            Ok(Ok((pass, source, member))) => {
+                                picked = member;
+                                (Ok(pass), None, source)
+                            }
                             Ok(Err(Stopped::Dial(error))) => {
                                 let (fault, proxy) = blame(stage, &error, wait);
                                 (Err(fault), proxy, None)
@@ -402,7 +457,8 @@ impl Probe {
             leg: self.leg,
             egress_id: self.egress_id,
             carriers: self.carriers,
-            proxy_id: self.subject.map(|subject| subject.id),
+            proxy_id: self.subject.map(|subject| subject.id).or(picked),
+            pool_id: self.pool,
             outcome,
             failing_proxy,
             source_address,
@@ -460,7 +516,11 @@ impl Last<'_> {
         }
     }
 
-    async fn reach(&self) -> Result<(ProxyTestPass, Option<std::net::SocketAddr>), Stopped> {
+    // What the path came to, the address it left from, and the member a
+    // pool picked to carry it.
+    async fn reach(
+        &self,
+    ) -> Result<(ProxyTestPass, Option<std::net::SocketAddr>, Option<u32>), Stopped> {
         match self {
             Self::Dial {
                 stage,
@@ -475,20 +535,21 @@ impl Last<'_> {
                         Stopped::Dial(error)
                     }
                 })?;
-                Ok((*pass, dialed.source))
+                Ok((*pass, dialed.source, dialed.path.member))
             }
             Self::Prepare { stage, .. } => {
                 stage.prepare().await.map_err(Stopped::Dial)?;
-                Ok((ProxyTestPass::Connected, None))
+                Ok((ProxyTestPass::Connected, None, None))
             }
         }
     }
 }
 
-// How far one path goes. The route alone reaches the target. A proxy
-// reaches the target when one is given; otherwise an SSH or WireGuard
-// tunnel comes up, and a stream proxy carries a connection to a DNS server
-// it resolves with or, with none, answers at its endpoint.
+// How far one path goes. The route alone reaches the target, and a pool
+// carries it there. A proxy reaches the target when one is given; otherwise
+// an SSH or WireGuard tunnel comes up, and a stream proxy carries a
+// connection to a DNS server it resolves with or, with none, answers at its
+// endpoint.
 fn last<'a>(
     beneath: &'a Arc<dyn Dialer>,
     top: Option<&'a Arc<dyn Dialer>>,
@@ -513,11 +574,14 @@ fn last<'a>(
                 detail: NetworkRefusal::TestTargetRequired.to_string(),
             });
         };
-        return Ok(dial(
-            beneath,
-            probe(host.clone(), *port),
-            ProxyTestPass::Connected,
-        ));
+        return Ok(match top {
+            Some(pool) => dial(pool, probe(host.clone(), *port), ProxyTestPass::Forwarded),
+            None => dial(
+                beneath,
+                probe(host.clone(), *port),
+                ProxyTestPass::Connected,
+            ),
+        });
     };
     if let Some((host, port)) = target {
         return Ok(dial(

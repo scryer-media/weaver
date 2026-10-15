@@ -343,6 +343,89 @@ async fn a_test_says_how_its_host_was_resolved() {
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
+// A pool under test carries a target through the member it picks, and is
+// tried member by member without one; the old pool test stays member by
+// member.
+#[tokio::test]
+async fn a_pool_test_names_the_pool_and_the_member_it_picked() {
+    let h = harness().await;
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let mut ids = Vec::new();
+    for name in ["Primary", "Secondary"] {
+        let result = h
+            .execute(&format!(
+                r#"mutation {{ saveProxyProfile(input: {{
+            name: "{name}", kind: SOCKS5, resolver: PROXY, enabled: true,
+            host: "127.0.0.1", port: {port}
+        }}) {{ id }} }}"#
+            ))
+            .await;
+        assert_no_errors(&result);
+        ids.push(
+            response_data(&result)["saveProxyProfile"]["id"]
+                .as_u64()
+                .unwrap(),
+        );
+    }
+    let result = h
+        .execute(&format!(
+            r#"mutation {{ createProxyPool(input: {{
+        name: "Exits", kind: SOCKS5, memberIds: [{}, {}]
+    }}) {{ id }} }}"#,
+            ids[0], ids[1]
+        ))
+        .await;
+    assert_no_errors(&result);
+    let pool = response_data(&result)["createProxyPool"]["id"]
+        .as_u64()
+        .unwrap();
+    let test_via = |target: &str| {
+        format!(
+            r#"mutation {{ testVia(
+        route: {{ legs: [{{ egressId: 0, weight: 100, path: {{ direct: true }} }}] }},
+        subject: {{ pool: {pool} }}{target}
+    ) {{ poolId proxyId success }} }}"#
+        )
+    };
+    let result = h
+        .execute(&test_via(&format!(
+            r#", target: {{ host: "127.0.0.1", port: {port} }}"#
+        )))
+        .await;
+    assert_no_errors(&result);
+    assert_eq!(
+        response_data(&result)["testVia"],
+        serde_json::json!([{ "poolId": pool, "proxyId": null, "success": false }])
+    );
+    let result = h.execute(&test_via("")).await;
+    assert_no_errors(&result);
+    assert_eq!(
+        response_data(&result)["testVia"],
+        serde_json::json!([
+            { "poolId": null, "proxyId": ids[0], "success": false },
+            { "poolId": null, "proxyId": ids[1], "success": false },
+        ])
+    );
+    let result = h
+        .execute(&format!(
+            r#"mutation {{ testProxyPool(id: {pool}, egressId: 0, host: "127.0.0.1", port: {port}) {{
+        proxyId success
+    }} }}"#
+        ))
+        .await;
+    assert_no_errors(&result);
+    assert_eq!(
+        response_data(&result)["testProxyPool"],
+        serde_json::json!([
+            { "proxyId": ids[0], "success": false },
+            { "proxyId": ids[1], "success": false },
+        ])
+    );
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
 #[tokio::test]
 async fn feed_policy_is_atomic_preserved_and_blocks_referenced_profile_deletion() {
     let h = harness().await;

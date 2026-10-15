@@ -1782,6 +1782,7 @@ export const nextEn: LocaleDictionary = {
   "next.networking.pools.delete": "Delete pool",
   "next.networking.pools.deleteBody": "Delete {{name}}? It must be removed from every route first.",
   "next.networking.pools.test": "Test pool",
+  "next.networking.pools.testVia": "Test via",
   "next.networking.routes.title": "Consumer routes",
   "next.networking.routes.note": "each server and feed owns its route",
   "next.networking.routes.consumer": "Consumer",

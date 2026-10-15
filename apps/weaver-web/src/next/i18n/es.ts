@@ -1774,6 +1774,7 @@ export const nextEs: LocaleDictionary = {
   "next.networking.pools.delete": "Eliminar grupo",
   "next.networking.pools.deleteBody": "¿Eliminar {{name}}? Primero hay que quitarlo de todas las rutas.",
   "next.networking.pools.test": "Probar grupo",
+  "next.networking.pools.testVia": "Probar vía",
   "next.networking.routes.title": "Rutas de los consumidores",
   "next.networking.routes.note": "cada servidor y feed tiene su ruta",
   "next.networking.routes.consumer": "Consumidor",

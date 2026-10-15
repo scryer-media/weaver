@@ -1774,6 +1774,7 @@ export const nextKo: LocaleDictionary = {
   "next.networking.pools.delete": "풀 삭제",
   "next.networking.pools.deleteBody": "{{name}}을(를) 삭제할까요? 먼저 모든 경로에서 제거해야 합니다.",
   "next.networking.pools.test": "풀 테스트",
+  "next.networking.pools.testVia": "경유 테스트",
   "next.networking.routes.title": "소비자 경로",
   "next.networking.routes.note": "서버와 피드마다 고유한 경로가 있습니다",
   "next.networking.routes.consumer": "소비자",

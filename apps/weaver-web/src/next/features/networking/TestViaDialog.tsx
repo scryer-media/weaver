@@ -35,8 +35,8 @@ const millis = (value: number) => `${value < 10 ? value.toFixed(1) : Math.round(
  *
  * Nothing dials outside a route, so the test goes through one drafted here,
  * and the draft is never saved. The daemon tries every path through it, with
- * the proxy, or each of the pool's members, on top. A proxy cannot carry
- * itself, so the draft is not offered the subject's proxies.
+ * the proxy or the pool on top; a pool names the member it picked. A proxy
+ * cannot carry itself, so the draft is not offered the subject's proxies.
  */
 export function TestViaDialog({
   subject,
@@ -83,6 +83,7 @@ export function TestViaDialog({
   const egressName = (id: number) => data?.egressInterfaces.find((egress) => egress.id === id)?.name ?? String(id);
   const proxyName = (id: number) =>
     data?.proxyProfiles.find((profile) => profile.id === id)?.name ?? t("next.networking.proxyNumber", { id });
+  const poolName = (id: number) => data?.proxyPools.find((pool) => pool.id === id)?.name ?? String(id);
 
   const subjectNote = (() => {
     if (!data || subject === null) {
@@ -200,7 +201,13 @@ export function TestViaDialog({
                 <SectionHeader label={t("next.networking.testVia.paths")} count={results.length} sticky={false} />
                 <ul aria-label={t("next.networking.testVia.paths")} className="flex flex-col">
                   {results.map((result, index) => (
-                    <PathRow key={index} result={result} egressName={egressName} proxyName={proxyName} />
+                    <PathRow
+                      key={index}
+                      result={result}
+                      egressName={egressName}
+                      proxyName={proxyName}
+                      poolName={poolName}
+                    />
                   ))}
                 </ul>
               </>
@@ -212,27 +219,41 @@ export function TestViaDialog({
   );
 }
 
-/** One path the test tried: its hops by name, how it went, and what the daemon said of it. */
+/**
+ * One path the test tried: its hops by name, how it went, and what the daemon
+ * said of it. A pool's hop names the member it picked.
+ */
 function PathRow({
   result,
   egressName,
   proxyName,
+  poolName,
 }: {
   result: PathTestResult;
   egressName: (id: number) => string;
   proxyName: (id: number) => string;
+  poolName: (id: number) => string;
 }) {
   const t = useTranslate();
-  const hops = [
+  const hops: { key: string; name: string; picked?: string; failing: boolean }[] = [
     { key: "egress", name: egressName(result.egressId), failing: false },
     ...result.carrierIds.map((id, position) => ({
       key: `carrier-${position}`,
       name: proxyName(id),
       failing: !result.success && id === result.failingProxyId,
     })),
-    ...(result.proxyId === null
-      ? []
-      : [{ key: "subject", name: proxyName(result.proxyId), failing: !result.success && result.proxyId === result.failingProxyId }]),
+    ...(result.poolId !== null
+      ? [
+          {
+            key: "subject",
+            name: poolName(result.poolId),
+            picked: result.proxyId === null ? undefined : proxyName(result.proxyId),
+            failing: false,
+          },
+        ]
+      : result.proxyId === null
+        ? []
+        : [{ key: "subject", name: proxyName(result.proxyId), failing: !result.success && result.proxyId === result.failingProxyId }]),
   ];
   const label = result.success
     ? t("next.networking.testVia.passed")
@@ -251,6 +272,13 @@ function PathRow({
             <Fragment key={hop.key}>
               {position > 0 ? <span className="text-wv-muted">{" > "}</span> : null}
               <span className={hop.failing ? "text-wv-error-text" : undefined}>{hop.name}</span>
+              {hop.picked === undefined ? null : (
+                <>
+                  {" ("}
+                  <strong className="font-medium">{hop.picked}</strong>
+                  {")"}
+                </>
+              )}
             </Fragment>
           ))}
         </span>
