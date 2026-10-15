@@ -440,6 +440,7 @@ struct MemberCommits<'a> {
     event_tx: &'a broadcast::Sender<PipelineEvent>,
     verified: Arc<std::sync::Mutex<Vec<usize>>>,
     members: Vec<WrittenMember>,
+    pending: std::collections::HashMap<usize, usize>,
 }
 
 impl<'a> MemberCommits<'a> {
@@ -454,6 +455,7 @@ impl<'a> MemberCommits<'a> {
             event_tx,
             verified: Arc::new(std::sync::Mutex::new(Vec::new())),
             members: Vec::new(),
+            pending: std::collections::HashMap::new(),
         }
     }
 
@@ -471,6 +473,9 @@ impl<'a> MemberCommits<'a> {
     // Record a member whose bytes are all written, committing it now when
     // the archive records no CRC for it.
     fn written(&mut self, member: WrittenMember, has_crc: bool) {
+        if has_crc {
+            self.pending.insert(member.file_index, self.members.len());
+        }
         self.members.push(member);
         if !has_crc {
             let last = self.members.len() - 1;
@@ -487,11 +492,7 @@ impl<'a> MemberCommits<'a> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
         for file_index in verified {
-            if let Some(index) = self
-                .members
-                .iter()
-                .position(|member| member.file_index == file_index && !member.committed)
-            {
+            if let Some(index) = self.pending.remove(&file_index) {
                 self.commit(index);
             }
         }

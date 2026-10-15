@@ -657,6 +657,36 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
 }
 
 #[tokio::test]
+async fn rename_preserves_an_existing_working_directory_collision() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10067);
+    let old_dir = intermediate_dir.join("original");
+    std::fs::create_dir(&old_dir).unwrap();
+    crate::jobs::working_dir::mark_weaver_owned_working_dir(&intermediate_dir, &old_dir, job_id)
+        .unwrap();
+    let mut state = minimal_job_state(job_id, "renamed", old_dir.clone());
+    state.download_state = crate::jobs::model::DownloadState::Queued;
+    pipeline.jobs.insert(job_id, state);
+
+    std::fs::create_dir(intermediate_dir.join("renamed")).unwrap();
+    let collision = intermediate_dir.join("renamed.#10067");
+    std::fs::create_dir(&collision).unwrap();
+    std::fs::write(collision.join("keep.bin"), b"another job's data").unwrap();
+
+    pipeline.rederive_unwritten_working_dir(job_id);
+
+    assert_eq!(
+        std::fs::read(collision.join("keep.bin")).unwrap(),
+        b"another job's data"
+    );
+    assert_eq!(pipeline.jobs[&job_id].working_dir, old_dir);
+    assert!(crate::jobs::working_dir::is_weaver_owned_working_dir(
+        &old_dir
+    ));
+}
+
+#[tokio::test]
 async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;

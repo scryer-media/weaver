@@ -18,6 +18,69 @@ use lzma_turbo::{LzmaEncProps, XzWriter};
 
 static XZ_MT_DECODER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+fn commit_test_member(index: usize, phase: &Arc<PhaseCounters>) -> WrittenMember {
+    let attempt = Arc::new(PhaseAttemptCounters::new(Arc::clone(phase)));
+    attempt.reserve_total(1);
+    attempt.record_completed(1);
+    WrittenMember {
+        file_index: index,
+        name: format!("member-{index}"),
+        size: 1,
+        bytes_written: 1,
+        attempt,
+        committed: false,
+    }
+}
+
+#[test]
+fn sevenz_member_verdicts_commit_once_and_rollback_only_unverified_members() {
+    let phase = Arc::new(PhaseCounters::default());
+    let (tx, mut rx) = broadcast::channel(16);
+    let mut commits = MemberCommits::new(JobId(1), "archive", &tx);
+    commits.written(commit_test_member(usize::MAX, &phase), true);
+    commits.written(commit_test_member(3, &phase), true);
+    commits.written(commit_test_member(99, &phase), false);
+    commits.verified.lock().unwrap().extend([3, 3, 99]);
+    commits.settle();
+    assert!(
+        commits.finish().is_err(),
+        "missing CRC verdict must fail the set"
+    );
+    assert_eq!(phase.completed_bytes.load(Ordering::Relaxed), 2);
+    assert_eq!(phase.total_bytes.load(Ordering::Relaxed), 2);
+    let mut finished = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let PipelineEvent::ExtractionMemberFinished { member, .. } = event {
+            finished.push(member);
+        }
+    }
+    assert_eq!(finished, ["member-99", "member-3"]);
+}
+
+#[test]
+fn sevenz_many_delayed_verdicts_preserve_member_order() {
+    const COUNT: usize = 10_000;
+    let phase = Arc::new(PhaseCounters::default());
+    let (tx, _) = broadcast::channel(16);
+    let mut commits = MemberCommits::new(JobId(1), "archive", &tx);
+    for index in 0..COUNT {
+        commits.written(commit_test_member(index * 2, &phase), true);
+    }
+    commits
+        .verified
+        .lock()
+        .unwrap()
+        .extend((0..COUNT).rev().map(|index| index * 2));
+    let names = commits.finish().unwrap();
+    assert_eq!(
+        names,
+        (0..COUNT)
+            .map(|index| format!("member-{}", index * 2))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(phase.completed_bytes.load(Ordering::Relaxed), COUNT as u64);
+}
+
 // The sink holds a member to its declared length. Its CRC is the reader's to
 // check; see `a_member_failing_the_readers_crc_check_is_never_committed`.
 #[test]

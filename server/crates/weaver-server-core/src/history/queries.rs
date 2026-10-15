@@ -73,6 +73,23 @@ impl Database {
         &self,
         filter: &HistoryFilter,
     ) -> Result<Vec<JobHistoryRow>, StateError> {
+        self.list_job_history_with_visibility(filter, true)
+    }
+
+    // The facade's visibility predicate must be applied before pagination.
+    pub fn list_nzbget_history(
+        &self,
+        filter: &HistoryFilter,
+        include_hidden: bool,
+    ) -> Result<Vec<JobHistoryRow>, StateError> {
+        self.list_job_history_with_visibility(filter, include_hidden)
+    }
+
+    fn list_job_history_with_visibility(
+        &self,
+        filter: &HistoryFilter,
+        include_hidden: bool,
+    ) -> Result<Vec<JobHistoryRow>, StateError> {
         let datastore = self.datastore();
         let filter = filter.clone();
         self.run_sql_blocking_read(async move {
@@ -81,7 +98,9 @@ impl Database {
 
             append_history_from_clause(&mut sql, &mut args, &filter);
             append_history_row_filter_predicates(&mut sql, &mut args, &filter);
-
+            if !include_hidden {
+                sql.push_str(" AND h.nzbget_hidden = 0");
+            }
             sql.push_str(" ORDER BY h.completed_at DESC, h.job_id DESC");
 
             append_history_pagination(&mut sql, &mut args, &filter);

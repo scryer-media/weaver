@@ -217,10 +217,7 @@ async fn run_jsonrpc(
             RpcError::invalid_procedure(requested_method),
         );
     };
-    if required == RequiredScope::Control && !scope.can_control() {
-        return rpc_error_response(StatusCode::FORBIDDEN, id, RpcError::access_denied());
-    }
-    if required == RequiredScope::Admin && !scope.is_admin() {
+    if !facade_method_allowed(scope, &method, required) {
         return rpc_error_response(StatusCode::FORBIDDEN, id, RpcError::access_denied());
     }
 
@@ -324,6 +321,47 @@ fn method_required_scope(method: &str) -> Option<RequiredScope> {
     }
 }
 
+fn facade_method_allowed(scope: CallerScope, method: &str, required: RequiredScope) -> bool {
+    if scope == CallerScope::ScriptRun {
+        // Callback credentials retain queue compatibility without inheriting
+        // feed access (including URLs containing indexer credentials).
+        return matches!(
+            method,
+            "version"
+                | "status"
+                | "listgroups"
+                | "listfiles"
+                | "history"
+                | "config"
+                | "loadconfig"
+                | "log"
+                | "loadlog"
+                | "postqueue"
+                | "urlqueue"
+                | "servervolumes"
+                | "append"
+                | "appendurl"
+                | "editqueue"
+                | "pausedownload"
+                | "resumedownload"
+                | "pausedownload2"
+                | "resumedownload2"
+                | "pausepost"
+                | "resumepost"
+                | "pausescan"
+                | "resumescan"
+                | "scheduleresume"
+                | "rate"
+                | "writelog"
+        );
+    }
+    match required {
+        RequiredScope::Read => scope.can_read(),
+        RequiredScope::Control => scope.can_control(),
+        RequiredScope::Admin => scope.is_admin(),
+    }
+}
+
 async fn dispatch_method(
     ctx: &NzbgetFacadeContext,
     method: &str,
@@ -381,7 +419,7 @@ pub(super) async fn resolve_scope_for_facade(
         .await
         .is_some()
     {
-        return Ok(CallerScope::Control);
+        return Ok(CallerScope::ScriptRun);
     }
     super::auth::resolve_caller(
         &ctx.db,
@@ -500,10 +538,7 @@ pub(super) async fn xmlrpc_handler(
     let Some(required) = method_required_scope(&method) else {
         return xmlrpc_fault_response(StatusCode::OK, RpcError::invalid_procedure(&call.method));
     };
-    if required == RequiredScope::Control && !scope.can_control() {
-        return xmlrpc_fault_response(StatusCode::FORBIDDEN, RpcError::access_denied());
-    }
-    if required == RequiredScope::Admin && !scope.is_admin() {
+    if !facade_method_allowed(scope, &method, required) {
         return xmlrpc_fault_response(StatusCode::FORBIDDEN, RpcError::access_denied());
     }
 
@@ -1928,40 +1963,6 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     // history(Hidden): rows a client removed with HistoryDelete are listed
     // only when the first parameter is true.
     let include_hidden = optional_bool_param(&positional_params(params)?, 0)?.unwrap_or(false);
-    let db = ctx.db.clone();
-    let (mut rows, facade_states) = tokio::task::spawn_blocking(move || {
-        let rows = db.list_job_history(&HistoryFilter {
-            limit: Some(1000),
-            ..HistoryFilter::default()
-        })?;
-        let ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
-        let states = db.nzbget_history_states(&ids)?;
-        Ok::<_, weaver_server_core::StateError>((rows, states))
-    })
-    .await
-    .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
-    .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
-    // A hidden row still shadows its in-memory terminal job below.
-    let persisted_ids = rows.iter().map(|row| row.job_id).collect::<HashSet<_>>();
-    let is_hidden = |job_id: u64| facade_states.get(&job_id).is_some_and(|state| state.hidden);
-    if !include_hidden {
-        rows.retain(|row| !is_hidden(row.job_id));
-    }
-    let db = ctx.db.clone();
-    let history_job_ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
-    let post_processing_results = tokio::task::spawn_blocking(move || {
-        let mut results = HashMap::new();
-        for job_id in history_job_ids {
-            let scripts = db.job_post_processing_results(job_id)?;
-            if !scripts.is_empty() {
-                results.insert(job_id, scripts);
-            }
-        }
-        Ok::<_, weaver_server_core::StateError>(results)
-    })
-    .await
-    .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
-    .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
     let terminal_items = ctx
         .handle
         .list_jobs()
@@ -1979,7 +1980,48 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
             )
         })
         .collect::<Vec<_>>();
-
+    let terminal_ids = terminal_items
+        .iter()
+        .map(|(item, _)| item.id)
+        .collect::<Vec<_>>();
+    let db = ctx.db.clone();
+    let (rows, facade_states) = tokio::task::spawn_blocking(move || {
+        let rows = db.list_nzbget_history(
+            &HistoryFilter {
+                limit: Some(1000),
+                ..HistoryFilter::default()
+            },
+            include_hidden,
+        )?;
+        let ids = rows
+            .iter()
+            .map(|row| row.job_id)
+            .chain(terminal_ids)
+            .collect::<Vec<_>>();
+        let states = db.nzbget_history_states(&ids)?;
+        Ok::<_, weaver_server_core::StateError>((rows, states))
+    })
+    .await
+    .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
+    .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
+    // A hidden row still shadows its in-memory terminal job below.
+    let persisted_ids = facade_states.keys().copied().collect::<HashSet<_>>();
+    let is_hidden = |job_id: u64| facade_states.get(&job_id).is_some_and(|state| state.hidden);
+    let db = ctx.db.clone();
+    let history_job_ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
+    let post_processing_results = tokio::task::spawn_blocking(move || {
+        let mut results = HashMap::new();
+        for job_id in history_job_ids {
+            let scripts = db.job_post_processing_results(job_id)?;
+            if !scripts.is_empty() {
+                results.insert(job_id, scripts);
+            }
+        }
+        Ok::<_, weaver_server_core::StateError>(results)
+    })
+    .await
+    .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
+    .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
     let ids: Vec<u64> = terminal_items
         .iter()
         .map(|(item, _)| item.id)

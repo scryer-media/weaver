@@ -1005,16 +1005,19 @@ impl Pipeline {
         if new_dir == old_dir {
             return;
         }
-        let moved = std::fs::create_dir(&new_dir).and_then(|()| {
-            crate::jobs::working_dir::mark_weaver_owned_working_dir(
-                &self.intermediate_dir,
-                &new_dir,
-                job_id,
-            )
-        });
-        if let Err(error) = moved {
+        if let Err(error) = std::fs::create_dir(&new_dir) {
             tracing::warn!(job_id = job_id.0, %error, "keeping the working directory after a rename");
-            let _ = std::fs::remove_dir_all(&new_dir);
+            return;
+        }
+        if let Err(error) = crate::jobs::working_dir::mark_weaver_owned_working_dir(
+            &self.intermediate_dir,
+            &new_dir,
+            job_id,
+        ) {
+            tracing::warn!(job_id = job_id.0, %error, "keeping the working directory after a rename");
+            // Only remove the empty directory we created. A failed marker write
+            // does not establish ownership of any contents at this path.
+            let _ = std::fs::remove_dir(&new_dir);
             return;
         }
         if let Err(error) = crate::jobs::working_dir::remove_weaver_owned_working_dir(

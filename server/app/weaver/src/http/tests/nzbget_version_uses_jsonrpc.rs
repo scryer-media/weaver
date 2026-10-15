@@ -391,14 +391,25 @@ async fn nzbget_takes_a_running_scripts_token_as_its_control_password() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    // It controls the queue and nothing more.
-    let (status, _) = post_nzbget(
-        app.clone(),
-        serde_json::json!({"method": "loadextensions", "params": [], "id": "admin"}),
-        &basic_auth(&token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    // It controls the queue without gaining feed credentials or admin access,
+    // through either supported RPC encoding.
+    for method in ["loadextensions", "viewfeed", "previewfeed", "fetchfeeds"] {
+        let (status, _) = post_nzbget(
+            app.clone(),
+            serde_json::json!({"method": method, "params": [], "id": "forbidden"}),
+            &basic_auth(&token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method}");
+        let response = app.clone().oneshot(
+            Request::builder().method("POST").uri("/xmlrpc")
+                .header(header::AUTHORIZATION, basic_auth(&token))
+                .header(header::CONTENT_TYPE, "text/xml")
+                .body(Body::from(format!("<?xml version=\"1.0\"?><methodCall><methodName>{method}</methodName><params/></methodCall>")))
+                .unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
+    }
 
     // Once the run has ended the token opens nothing.
     drop(run);
@@ -4227,6 +4238,40 @@ fn history_ids(entries: &serde_json::Value) -> Vec<u64> {
         .iter()
         .map(|entry| entry["NZBID"].as_u64().unwrap())
         .collect()
+}
+
+#[tokio::test]
+async fn nzbget_hidden_history_does_not_consume_the_visible_page() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(1, "failed", 1, None))
+        .unwrap();
+    for id in 2..=1001 {
+        db.insert_job_history(&nzbget_history_row(id, "complete", id as i64, None))
+            .unwrap();
+        db.set_nzbget_history_hidden(id, true).unwrap();
+    }
+    // A hidden row still in the scheduler must not reappear as a memory-only item.
+    let hidden_job = nzbget_test_job(
+        1001,
+        JobStatus::Complete,
+        weaver_server_core::DownloadState::Complete,
+        123,
+        123,
+        vec![],
+    );
+    let app = nzbget_test_router(
+        db.clone(),
+        scheduler_handle_with_mock_commands(vec![hidden_job]),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let visible = rpc_result(app.clone(), "history", serde_json::json!([false])).await;
+    assert_eq!(history_ids(&visible), [1]);
+    let all = rpc_result(app, "history", serde_json::json!([true])).await;
+    assert_eq!(all.as_array().unwrap().len(), 1000);
+    assert!(!history_ids(&all).contains(&1));
+    // Visibility changes neither retained history nor duplicate-check data.
+    assert_eq!(db.count_job_history(&Default::default()).unwrap(), 1001);
 }
 
 #[tokio::test]

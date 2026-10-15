@@ -50,8 +50,28 @@
       <ComponentRef Id="StartMenuShortcuts" />
     </Feature>
 
-    <!-- Interactive installs start the user-session tray. Silent MSI and WinGet installs
-         have UILevel < 4, so they never launch a process or a browser. -->
+    <!-- Capture the invoking user's preference before the cached old MSI removes
+         its Run entry. Versions before 0.15.1 remove it even on a major upgrade. -->
+    <Property Id="WEAVERSTARTUPCOMMAND" Secure="yes">
+      <RegistrySearch Id="ExistingTrayStartup" Root="HKCU"
+                      Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                      Name="ScryerMedia.Weaver" Type="raw" Bitness="always64" />
+    </Property>
+    <CustomAction
+        Id="RestoreTrayStartupAfterUpgrade"
+        FileRef="WeaverTrayExe"
+        ExeCommand="--register-startup"
+        Execute="immediate"
+        Return="check"
+        Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="RestoreTrayStartupAfterUpgrade"
+              After="InstallFinalize"
+              Condition="WIX_UPGRADE_DETECTED AND WEAVERSTARTUPCOMMAND" />
+    </InstallExecuteSequence>
+
+    <!-- Interactive installs start the user-session tray. Silent MSI and WinGet
+         installs restore an existing startup preference without opening the UI. -->
     <CustomAction
         Id="LaunchTrayAfterInteractiveInstall"
         FileRef="WeaverTrayExe"
@@ -61,7 +81,7 @@
         Impersonate="yes" />
     <InstallExecuteSequence>
       <Custom Action="LaunchTrayAfterInteractiveInstall"
-              After="InstallFinalize"
+              After="RestoreTrayStartupAfterUpgrade"
               Condition="NOT Installed AND UILevel &gt;= 4" />
     </InstallExecuteSequence>
 

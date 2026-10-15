@@ -221,6 +221,7 @@ enum LaunchMode {
     Interactive,
     Login,
     Shutdown,
+    RegisterStartup,
     UnregisterStartup,
     UninstallCleanup,
     WebviewSmoke,
@@ -228,6 +229,11 @@ enum LaunchMode {
 
 pub(super) fn run() -> Result<(), String> {
     match launch_mode()? {
+        LaunchMode::RegisterStartup => {
+            let executable = std::env::current_exe()
+                .map_err(|error| format!("failed to resolve weaver-tray.exe path: {error}"))?;
+            return register_startup(&executable);
+        }
         LaunchMode::UnregisterStartup => return unregister_startup(),
         LaunchMode::Shutdown => return shutdown_existing_instance(),
         LaunchMode::UninstallCleanup => {
@@ -353,6 +359,7 @@ fn launch_mode() -> Result<LaunchMode, String> {
         None => Ok(LaunchMode::Interactive),
         Some(value) if value == "--login-start" => Ok(LaunchMode::Login),
         Some(value) if value == "--shutdown" => Ok(LaunchMode::Shutdown),
+        Some(value) if value == "--register-startup" => Ok(LaunchMode::RegisterStartup),
         Some(value) if value == "--unregister-startup" => Ok(LaunchMode::UnregisterStartup),
         Some(value) if value == "--uninstall-cleanup" => Ok(LaunchMode::UninstallCleanup),
         Some(value) if value == "--webview-smoke" => Ok(LaunchMode::WebviewSmoke),
