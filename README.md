@@ -47,6 +47,7 @@ Weaver runs a highly efficient pipeline that not only unpacks archives while dow
 
 ## Advanced Networking
 Weaver has an incredibly powerful networking sub system. It enables you to compose different building blocks into highly sophisticated netflows to ensure you're maximizing your bandwidth and privacy.
+
 ![advanced networking overview picture](docs/img/networking.png)
 
 ### Features
@@ -56,11 +57,30 @@ Weaver has an incredibly powerful networking sub system. It enables you to compo
 - **Proxy pools** (France VPN PoPs)
 - **Killswitch** (_never connect to X from my ISP without proxy protection_)
 
+## Compatability
+
+| Tech   | Weaver | Sabnzbd | Nzbget |
+| ------ | ------ | ------- | ------ |
+| RAR    | ⭐️⭐️*   | ⭐️      | ⭐️     | 
+| 7z     | ⭐️⭐️*   | ⭐️      | ⭐️     |
+| Nested | ⭐️     | ⭐️      | ⭕️**    |
+| ZIP    | ⭐️     | ⭐️      | ❌      |
+| TAR    | ⭐️     | ⭐️      | ❌      |
+| xz     | ⭐️     | ❌      | ❌      |
+| zstd   | ⭐️     | ❌      | ❌      |
+| br     | ⭐️     | ❌      | ❌      |
+| gzip   | ⭐️     | ❌      | ❌      |
+| bzip2  | ⭐️     | ❌      | ❌      |
+| par2   | ⭐️     | ⭐️      | ⭐️      |
+| par3   | ⭐️***  | ❌      | ❌      |
+
+_*Weaver supports "store mode" optimizations that directly materialize the binary file through a streaming decoder rather than download => decode_
+_**Nzbget supports nested with an extension and it is limited in supported formats_
+_***par3 spec is still in alpha, and Weaver is ready to use it today so you're never behind when posters start uploading with it. Par3 can be faster than par2 repair and also can repair much larger holes in files_
+
 ## Install
 
-See [Installation](https://www.scryer.media/weaver/docs/installation/) for supported install methods and [Getting Started](https://www.scryer.media/weaver/docs/getting-started/) for first-run setup.
-
-See [Network setup and browser access](docs/network-setup.md) for Compose defaults, one-time setup codes, environment overrides, trusted proxies, and legacy compatibility.
+See [Installation](https://www.scryer.media/weaver/docs/installation/) for installation instructions
 
 ## API
 
@@ -68,7 +88,7 @@ Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and su
 
 ## Metrics & dashboards
 
-Weaver serves Prometheus metrics at `/metrics` on the same port as the web UI. They cover download throughput, pipeline backpressure, per-server health and quotas, and post-processing — enough to answer "why is this slow right now?" without opening the UI.
+Weaver serves comprehensive Prometheus metrics at `/metrics` 
 
 ## Technology Radar
 
