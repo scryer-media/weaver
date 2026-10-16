@@ -10305,6 +10305,201 @@
       }
     },
     {
+      "path": "testdata/speed-test-100mb/par-files.par2",
+      "size": 41108,
+      "blake3": "3e59da2b9a250bd908cafb37c5ea1dfa6609c4668d1e5a65c25aa8f1d058a4cd",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/speed-test-100mb/par-files.vol000+01.par2",
+      "size": 91300,
+      "blake3": "40f10df0105ea2f0b143ed3a3fe1d2c208b1c0e5d3dbdc7c2731bb9388c5e081",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/speed-test-100mb/par-files.vol001+02.par2",
+      "size": 182492,
+      "blake3": "48f5323a1259a785f749de53bab9b183324a5320799a971973be23636bdb1acf",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/speed-test-100mb/par-files.vol003+04.par2",
+      "size": 323876,
+      "blake3": "f786f9d2ac71bbb9950eddbb64b78960e10c915aa387056f86d146839fc06dce",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/speed-test-100mb/par-files.vol007+08.par2",
+      "size": 565644,
+      "blake3": "a1c8d7900bfd716957c34c8d927c1dc58fdeed5aa45cabe9663143959ec1bd2b",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/speed-test-100mb/par-files.vol015+16.par2",
+      "size": 1008180,
+      "blake3": "c86f3c51c9e8e4e36a0ac200d80279f49a568da8e6e1685123153107007419f7",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/speed-test-100mb/par-files.vol031+32.par2",
+      "size": 1852252,
+      "blake3": "4960195c19d7e20f8af278baa77aa2cd5abb343b2bda67ee698bc758762a0124",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/speed-test-100mb/par-files.vol063+64.par2",
+      "size": 3499396,
+      "blake3": "82609d74e350f82b96fee3b829fcbc1c1dc289cce123d8c41af02b8270b3b9a4",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/speed-test-100mb/par-files.vol127+73.par2",
+      "size": 3951124,
+      "blake3": "77c6b2fc6cac0b3fd63eba22a304c1eb9a0a7f4efe987792eadad9ab6e540656",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/speed-test-100mb/rar-files.part1.rar",
+      "size": 26214400,
+      "blake3": "d47e5df68a2e3e8f33785e0796ac539e847bb3e3058f5265d600799efb6bc672",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/speed-test-100mb/rar-files.part2.rar",
+      "size": 26214400,
+      "blake3": "69a713490faf190813b48e8d9cce68108d399d51d47bfe5caf79cb19454206b5",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/speed-test-100mb/rar-files.part3.rar",
+      "size": 26214400,
+      "blake3": "e6f39738f0241a67047c23049cc8f194cfb4a5cfb2eb414da258384be39424f2",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/speed-test-100mb/rar-files.part4.rar",
+      "size": 21545773,
+      "blake3": "4060679596b9507541f7f05aed537d45e973300d62956ee2b26aa4073488af33",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
       "path": "testdata/split-7z-corrupted/archive.7z.001",
       "size": 31457280,
       "blake3": "6c0c9650d98cc4bb3c89a0aed159be924c8106bb72af08bc4b766f9bbb08238b",

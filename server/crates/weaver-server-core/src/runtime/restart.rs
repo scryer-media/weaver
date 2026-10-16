@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Whether this deployment may restart Weaver from its own UI, and the
 // in-process channel that asks the serve loop to do it.
 //

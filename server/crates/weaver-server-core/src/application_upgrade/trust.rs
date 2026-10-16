@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Process-wide TLS and Sigstore trust setup for upgrade downloads.
 //
 // `application-updater` builds its HTTP client on reqwest's
@@ -7,11 +10,13 @@
 // explicitly, which is why nothing else in the workspace installs one.
 
 use std::future::Future;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+use crate::proxies::{Consumer, ProxyRuntime, with_routed_client};
 
 // How long a successful refresh is trusted before the next one.
 const TRUST_ROOT_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -36,14 +41,32 @@ pub fn install_default_rustls_provider() {
 //
 // Detached on purpose: an upgrade must be installable on a host that cannot
 // reach the Sigstore TUF repository, and startup must not wait on the network.
-pub fn spawn_sigstore_trust_root_priming() -> JoinHandle<()> {
-    spawn_trust_root_priming(refresh_trust_roots)
+// The refresh goes out on the Default outbound route, like the upgrade it
+// serves.
+pub fn spawn_sigstore_trust_root_priming(proxies: Arc<ProxyRuntime>) -> JoinHandle<()> {
+    spawn_trust_root_priming(move || refresh_trust_roots(Arc::clone(&proxies)))
 }
 
-async fn refresh_trust_roots() -> Result<(), String> {
-    artifact_trust::prime_sigstore_trust_roots()
-        .await
-        .map_err(|error| error.to_string())
+async fn refresh_trust_roots(proxies: Arc<ProxyRuntime>) -> Result<(), String> {
+    with_routed_client(
+        &proxies,
+        Consumer::Outbound,
+        "Sigstore trust root",
+        trust_root_http_client,
+        |client| async move {
+            artifact_trust::prime_sigstore_trust_roots_with(client)
+                .await
+                .map_err(|error| error.to_string())
+        },
+    )
+    .await?
+}
+
+// The TUF repository serves HTTPS only, and the refresh bounds its own run.
+fn trust_root_http_client() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(30))
 }
 
 fn spawn_trust_root_priming<Refresh, Refreshing>(refresh: Refresh) -> JoinHandle<()>
@@ -99,5 +122,36 @@ mod tests {
     fn installing_the_default_provider_twice_is_harmless() {
         install_default_rustls_provider();
         install_default_rustls_provider();
+    }
+
+    // The refresh leaves on the Default outbound route. When that route's only
+    // proxy refuses it, the refresh fails and the repository was asked for
+    // through that proxy alone.
+    #[tokio::test]
+    async fn the_trust_root_refresh_leaves_on_the_outbound_route() {
+        install_default_rustls_provider();
+        let proxy = weaver_tunnel::test_support::proxy::ProxyServerDouble::start(
+            weaver_tunnel::transport::TransportKind::Socks5,
+            None,
+            std::collections::HashMap::new(),
+        )
+        .await;
+        let runtime = crate::proxies::outbound_only_through(
+            crate::proxies::ProxyKind::Socks5,
+            proxy.addr.port(),
+        );
+        let error = refresh_trust_roots(runtime.clone()).await.unwrap_err();
+        assert_eq!(
+            error,
+            "Sigstore trust root request failed on all permitted routes"
+        );
+        let targets = proxy.targets.lock().unwrap().clone();
+        assert!(!targets.is_empty());
+        assert!(
+            targets
+                .iter()
+                .all(|target| *target == ("tuf-repo-cdn.sigstore.dev".to_owned(), 443))
+        );
+        runtime.stop_all().await;
     }
 }

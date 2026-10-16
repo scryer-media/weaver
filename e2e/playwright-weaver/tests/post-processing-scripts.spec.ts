@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -191,7 +194,7 @@ function expectContract(record: ScriptRecord, expected: Expected): void {
     NZBPP_HEALTH: String(expected.item.health), NZBPP_CRITICALHEALTH: "850",
   });
   expect(env, `${label}: NZBGet global options with their upper-case aliases`).toMatchObject({
-    NZBOP_Version: expected.version, NZBOP_VERSION: expected.version,
+    NZBOP_Version: "16.0-weaver", NZBOP_VERSION: "16.0-weaver",
     NZBOP_AppDir: env.SAB_PROGRAM_DIR, NZBOP_APPDIR: env.SAB_PROGRAM_DIR,
     NZBOP_MainDir: env.WEAVER_DATA_DIR, NZBOP_MAINDIR: env.WEAVER_DATA_DIR,
     NZBOP_DestDir: env.WEAVER_COMPLETE_DIR, NZBOP_DESTDIR: env.WEAVER_COMPLETE_DIR,
@@ -330,7 +333,9 @@ test("PP02 a failed download runs its scripts with SAB_PP_STATUS -1 and FAILURE/
       note("observed", `${script}: SAB_FAIL_MSG=${JSON.stringify(record!.env.SAB_FAIL_MSG)}, history error=${JSON.stringify(item.error)}`);
     }
     const facade = await facadeHistory(request, jobId);
-    expect(facade).toMatchObject({ Status: "FAILURE/HEALTH", ParStatus: "NONE", UnpackStatus: "NONE", DeleteStatus: "HEALTH", ScriptStatus: "SUCCESS" });
+    // NZBGet history calls a health-aborted download deleted; the script
+    // environment above still reports FAILURE/HEALTH.
+    expect(facade).toMatchObject({ Status: "DELETED/HEALTH", ParStatus: "NONE", UnpackStatus: "NONE", DeleteStatus: "HEALTH", ScriptStatus: "SUCCESS" });
   } finally {
     await restore();
     removeFixtureScripts([sab, nzb]);
@@ -353,7 +358,7 @@ test("PP03 an unpacked and an unpack-failed job report PAR/UNPACK status, with a
     const cases = [
       { name: `${tag}-good`, data: zlib.gzipSync(Buffer.from(`pp03 payload ${tag}\n`.repeat(256))), state: "COMPLETED",
         sabStatus: "0", nzbStatus: "SUCCESS/ALL", unpack: "2", facade: "SUCCESS/ALL" },
-      { name: `${tag}-bad`, data: corruptGzip(), state: "FAILED", sabStatus: "2", nzbStatus: "FAILURE/UNPACK", unpack: "1", facade: "FAILURE/HEALTH" },
+      { name: `${tag}-bad`, data: corruptGzip(), state: "FAILED", sabStatus: "2", nzbStatus: "FAILURE/UNPACK", unpack: "1", facade: "FAILURE/UNPACK" },
     ];
     for (const testCase of cases) {
       const jobId = await fileJob(request, testCase.name, `${testCase.name}.gz`, testCase.data, { password });

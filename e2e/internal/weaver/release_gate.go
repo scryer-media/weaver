@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 package weaver
 
 import (
@@ -60,6 +63,9 @@ type weaverReleaseFlowSpec struct {
 	NetworkLayout weaverReleaseNetworkLayout
 	// DropNetRaw starts Weaver without CAP_NET_RAW.
 	DropNetRaw bool
+	// PublicTargets are the public hosts the proxy fixture resolves and
+	// forwards to, for a flow that reaches a real service.
+	PublicTargets []weaverPublicTarget
 	// Stages run the Playwright script once per stage, restarting Weaver
 	// between stages.
 	Stages []string
@@ -154,6 +160,7 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 	advancedNetworkingPartition("routes", []string{"network-ladders.spec.ts", "network-sessions.spec.ts", "network-rss.spec.ts"}, false),
 	advancedNetworkingPartition("pools", []string{"network-pools.spec.ts"}, false),
 	advancedNetworkingPartition("pool-reselection", []string{"network-pools.spec.ts"}, false),
+	speedTestReleaseFlow(),
 	advancedNetworkingNoNetRawReleaseFlow(),
 	advancedNetworkingExtendedReleaseFlow(),
 	eventScriptsReleaseFlow(),
@@ -524,7 +531,7 @@ func assignWeaverReleaseNetworkSubnets(
 			return err
 		}
 		if phase.Spec.NetworkLayout != weaverNetworkLayoutDefault {
-			if err := writeAdvancedNetworkOverride(phase); err != nil {
+			if err := writeAdvancedNetworkOverride(ctx, phase); err != nil {
 				return err
 			}
 			continue
@@ -1089,6 +1096,16 @@ func runWeaverBrowserReleaseFlow(ctx context.Context, spec weaverReleaseFlowSpec
 		}
 		return runWeaverBandwidthAndServerQuotasReleaseFlow(ctx, spec, datastore)
 	}
+	if len(spec.SeedFixtures) > 0 {
+		if err := ensureSeedingInfrastructureErr(); err != nil {
+			return err
+		}
+		for _, slug := range spec.SeedFixtures {
+			if err := seedFixture(filepath.Join(testdataDir(), slug)); err != nil {
+				return fmt.Errorf("seed probe fixture %s: %w", slug, err)
+			}
+		}
+	}
 	if len(spec.Stages) > 0 {
 		if err := ensureLocalWeaverPlaywrightImage(); err != nil {
 			return err
@@ -1100,16 +1117,6 @@ func runWeaverBrowserReleaseFlow(ctx context.Context, spec weaverReleaseFlowSpec
 			return err
 		}
 		return runWeaverUIPersistenceReleaseFlow(ctx, spec, datastore)
-	}
-	if len(spec.SeedFixtures) > 0 {
-		if err := ensureSeedingInfrastructureErr(); err != nil {
-			return err
-		}
-		for _, slug := range spec.SeedFixtures {
-			if err := seedFixture(filepath.Join(testdataDir(), slug)); err != nil {
-				return fmt.Errorf("seed probe fixture %s: %w", slug, err)
-			}
-		}
 	}
 	if err := startWeaverReleaseStack(spec, datastore); err != nil {
 		return err
@@ -1303,7 +1310,7 @@ func startWeaverReleaseStack(spec weaverReleaseFlowSpec, datastore weaverDatasto
 	} else {
 		setEnv("E2E_WEAVER_DATABASE_URL", "")
 	}
-	waitForReleaseHostPorts(spec.Services, os.Getenv, probeHostPortHeld, releaseHostPortPoll)
+	waitForReleaseHostPorts(releaseServicesNotRunning(spec.Services), os.Getenv, probeHostPortHeld, releaseHostPortPoll)
 	if err := dockerComposeUp(spec.Services...); err != nil {
 		return err
 	}
@@ -1360,6 +1367,21 @@ func waitForReleaseHostPorts(
 			}
 		}
 	}
+}
+
+// releaseServicesNotRunning drops the services this project already runs,
+// such as the NNTP server a fixture seed brought up: their ports are held by
+// this stack, not a previous one, and `up` leaves them as they are.
+func releaseServicesNotRunning(services []string) []string {
+	var pending []string
+	for _, service := range services {
+		status, err := dockerServiceReadyStatus(service)
+		if err == nil && (status == "healthy" || status == "running") {
+			continue
+		}
+		pending = append(pending, service)
+	}
+	return pending
 }
 
 // probeHostPortHeld returns why the port cannot be bound, or nil when it can.
@@ -2533,9 +2555,21 @@ func newWeaverReleaseGateRunDir() (string, error) {
 
 func weaverReleaseGateRoot() string {
 	if value := strings.TrimSpace(os.Getenv("E2E_WEAVER_RELEASE_GATE_ROOT")); value != "" {
-		return absolutePath(value)
+		return resolveSymlinkedRoot(absolutePath(value))
 	}
-	return filepath.Join("/tmp", "weaver-e2e-release-gate")
+	return filepath.Join(resolveSymlinkedRoot("/tmp"), "weaver-e2e-release-gate")
+}
+
+// Flows bind-mount files out of the run directory, so the path must be the
+// one the container engine sees. A Podman machine shares /private but not
+// /tmp, and macOS makes /tmp a symlink into /private, so resolve the root's
+// symlinks when it exists; a root yet to be created is returned as given.
+func resolveSymlinkedRoot(root string) string {
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return root
+	}
+	return resolved
 }
 
 func writeWeaverReleaseLatestPointer(runDir string) error {

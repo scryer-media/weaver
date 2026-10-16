@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 package fixturegen
 
 import (
@@ -1576,6 +1579,7 @@ func Recipes() []Recipe {
 	// ------------------------------------------------------- direct store
 	recipes = append(recipes, DirectStoreRecipes()...)
 	recipes = append(recipes, PAR3Recipes()...)
+	recipes = append(recipes, SpeedTestRecipes()...)
 	return recipes
 }
 

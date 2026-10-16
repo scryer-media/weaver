@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::HashSet;
 
 use super::*;
@@ -423,6 +426,7 @@ impl Pipeline {
         self.queue_scripts_completed.remove(&job_id);
         self.added_script_holds.remove(&job_id);
         self.jobs.remove(&job_id);
+        self.pipeline_failure_stages.remove(&job_id);
         crate::runtime::job_debug_ring::forget(job_id.0);
         self.posted_name_disagreement_logged.remove(&job_id);
         self.retire_stalled_download_lanes(job_id);
@@ -619,6 +623,16 @@ impl Pipeline {
         } else {
             self.semantic_terminal_causes.remove(&job_id)
         };
+        let failure_stage = self.pipeline_failure_stages.remove(&job_id);
+        let failure_kind = (!completed).then(|| {
+            crate::history::HistoryFailureKind::derive(
+                failure_stage,
+                typed_terminal_cause,
+                row.error_message.as_deref(),
+                row.health,
+                row.failed_bytes,
+            )
+        });
 
         self.persist_support_facts_before_archive(job_id);
         let archive_started = Instant::now();
@@ -626,6 +640,7 @@ impl Pipeline {
             job_id,
             row,
             typed_terminal_cause,
+            failure_kind,
         ) {
             Ok(archived) => archived,
             Err(e) => {

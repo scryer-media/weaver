@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use crate::Database;
 use crate::settings::{Config, SharedConfig};
 use crate::{NntpRuntimeActivation, SchedulerError, SchedulerHandle};
@@ -21,7 +24,7 @@ pub async fn load_global_pause_from_db(db: &Database) -> Result<bool, String> {
 // after a restart exactly as they do after a change.
 pub fn nntp_server_pool_configs(
     configured_servers: &[crate::servers::ServerConfig],
-    proxy_runtime: Option<&crate::proxies::ProxyRuntime>,
+    proxy_runtime: &crate::proxies::ProxyRuntime,
     transfer_registry: &weaver_nntp::transfer::ServerTransferRegistry,
     buffer_profile: weaver_nntp::connection::NntpBufferProfile,
 ) -> Result<Vec<weaver_nntp::pool::ServerPoolConfig>, String> {
@@ -35,17 +38,13 @@ pub fn nntp_server_pool_configs(
     active
         .iter()
         .map(|server| {
+            let dialer = proxy_runtime.network.nntp_dialer(
+                server.id,
+                server.connections,
+                std::time::Duration::from_secs(30),
+            )?;
             Ok(weaver_nntp::pool::ServerPoolConfig {
                 server: weaver_nntp::ServerConfig {
-                    dialer: proxy_runtime
-                        .map(|runtime| {
-                            runtime.network.nntp_dialer(
-                                server.id,
-                                server.connections,
-                                std::time::Duration::from_secs(30),
-                            )
-                        })
-                        .transpose()?,
                     host: server.host.clone(),
                     port: server.port,
                     tls: server.tls,
@@ -60,7 +59,7 @@ pub fn nntp_server_pool_configs(
                         server.supports_pipelining,
                     ),
                     pipelining_depth: server.pipelining_depth,
-                    ..Default::default()
+                    ..weaver_nntp::ServerConfig::new(dialer)
                 },
                 max_connections: server.connections as usize,
                 group: server.priority,
@@ -93,7 +92,9 @@ pub async fn rebuild_nntp_from_config(
         SchedulerError::Internal("server transfer policy registry unavailable".to_string())
     })?;
     let transfer_registry = policy_registry.transfer_registry();
-    let proxy_runtime = handle.proxy_runtime();
+    let proxy_runtime = handle
+        .proxy_runtime()
+        .ok_or_else(|| SchedulerError::Internal("proxy runtime unavailable".to_string()))?;
 
     let configured_servers = config.read().await.servers.clone();
     let registry = std::sync::Arc::clone(&policy_registry);
@@ -117,7 +118,7 @@ pub async fn rebuild_nntp_from_config(
 
     let servers = nntp_server_pool_configs(
         &configured_servers,
-        proxy_runtime.as_deref(),
+        &proxy_runtime,
         &transfer_registry,
         weaver_nntp::connection::NntpBufferProfile::adaptive(
             memory.cgroup_limit.unwrap_or(memory.available_bytes),
@@ -236,6 +237,9 @@ mod tests {
             )
             .unwrap(),
         );
+        let proxies =
+            crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
+                .unwrap();
         let datastore = db.datastore();
         db.run_sql_blocking(async move {
             SqlRuntime::execute(
@@ -273,6 +277,7 @@ mod tests {
         let state = SharedPipelineState::new(PipelineMetrics::new(), Vec::new());
         let handle = SchedulerHandle::new(cmd_tx, event_tx, state);
         handle.set_server_transfer_policy(policy);
+        handle.set_proxy_runtime(proxies);
         let error = rebuild_nntp_from_config(&config, &handle)
             .await
             .expect_err("policy failure must not replace the active generation");
@@ -359,6 +364,10 @@ mod tests {
             SharedPipelineState::new(PipelineMetrics::new(), vec![]),
         );
         handle.set_server_transfer_policy(registry);
+        handle.set_proxy_runtime(
+            crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
+                .unwrap(),
+        );
         let schedules = Arc::new(RwLock::new(vec![crate::bandwidth::ScheduleEntry {
             id: "provider-hold".into(),
             enabled: true,
@@ -425,6 +434,10 @@ mod tests {
             SharedPipelineState::new(PipelineMetrics::new(), vec![]),
         );
         handle.set_server_transfer_policy(registry);
+        handle.set_proxy_runtime(
+            crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
+                .unwrap(),
+        );
         let (generations, mut activations) = mpsc::channel(2);
         let pipeline = tokio::spawn(async move {
             let mut generation = 0;
@@ -497,6 +510,10 @@ mod tests {
             )
             .unwrap(),
         ));
+        handle.set_proxy_runtime(
+            crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
+                .unwrap(),
+        );
         let (rebuilt, mut rebuilds) = mpsc::channel(2);
         let pipeline = tokio::spawn(async move {
             let mut generation = 0;

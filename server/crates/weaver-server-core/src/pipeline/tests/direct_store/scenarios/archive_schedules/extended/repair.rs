@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Repair and demotion axes beyond the archive matrix proper: PAR3 as the
 // recovery format, and every demotion reason a schedule can force.
 use super::*;
@@ -432,6 +435,7 @@ fn direct_variant(reason: DemotionReason) -> usize {
         R::IdentityRosterUnfillable => 32,
         R::IdentityVolumeMismatch => 33,
         R::SevenZip(_) => 34,
+        R::SevenZipAesChecksumMismatch => 35,
     }
 }
 

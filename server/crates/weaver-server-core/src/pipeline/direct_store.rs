@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Direct-store coverage checkpoint — the coarse durability model.
 //
 // Weaver's durable state goes through a DB engine, so article-proportional

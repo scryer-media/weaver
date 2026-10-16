@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // CRC32 attribution + throughput probe.
 //
 // Evidence-gathering only: nothing here changes a production path. It answers

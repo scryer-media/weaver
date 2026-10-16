@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // One live direct set: its router, its coverage barrier, and the bookkeeping
 // that keeps the two agreeing.
 

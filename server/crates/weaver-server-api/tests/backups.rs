@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 mod common;
 use common::{TestHarness, assert_no_errors, response_data};
 use weaver_server_core::auth::CallerScope;

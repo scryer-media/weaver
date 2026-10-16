@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -947,6 +950,7 @@ impl Pipeline {
         let srrdb = srrdb_from_config.then(|| SrrdbInputs {
             base_url: deobfuscate::SRRDB_API_BASE.to_string(),
             crc32_by_member_path: HashMap::new(),
+            proxies: self.shared_state.proxy_runtime(),
         });
         let srrdb = match srrdb {
             Some(mut inputs) => {
@@ -1583,6 +1587,13 @@ impl Pipeline {
                 None
             }
         };
+        // The failing stage survives the restart here too, so the history row
+        // still records why the job failed.
+        if let Some(crate::post_processing::model::PipelineOutcome::Failed { stage, .. }) =
+            facts.as_ref().map(|facts| &facts.outcome)
+        {
+            self.pipeline_failure_stages.entry(job_id).or_insert(*stage);
+        }
         let summary = self
             .db
             .job_post_processing_summary(job_id.0)

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Tier two of the archive matrix: articles that arrive wrong, recovery sets
 // as posters author them, uuencode, and the wider shapes of real posts.
 //

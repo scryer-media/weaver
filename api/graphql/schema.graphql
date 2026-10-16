@@ -1879,6 +1879,8 @@ type NetworkFailingHop {
 	rung: Int!
 	proxyId: Int!
 	reason: String!
+	code: String!
+	params: JSON!
 }
 
 type NetworkFlow {
@@ -2170,7 +2172,9 @@ input ProxyProfileInput {
 
 type ProxyTestResult {
 	success: Boolean!
+	code: String!
 	message: String!
+	params: JSON!
 }
 
 type QueryRoot {
@@ -2764,6 +2768,8 @@ input RouteRungInput @oneOf {
 type RoutingFailure {
 	proxyId: Int!
 	message: String!
+	code: String!
+	params: JSON!
 }
 
 type RoutingPolicy {

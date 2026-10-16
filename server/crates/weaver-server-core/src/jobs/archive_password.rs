@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY;
 use crate::persistence::encryption::{decrypt_value, encrypt_value};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};

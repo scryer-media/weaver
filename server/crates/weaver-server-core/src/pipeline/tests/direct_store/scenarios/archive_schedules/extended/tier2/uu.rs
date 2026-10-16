@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Uuencode as the field still posts it: the dialects of the old posting
 // tools, over a lone volume, a whole set, a set beside a yEnc PAR2 set, a set
 // whose volumes alternate between the two encodings, and a PAR2 set that is

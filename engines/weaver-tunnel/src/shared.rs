@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Weaver's persistence and outcome adapters for the shared tunnel engine.
 use crate::{TunnelError, TunnelObserver, TunnelProvider, TunnelStream};
 use std::sync::Arc;

@@ -1,8 +1,14 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // DNS-over-TCP fixture. Only names in the explicit table receive addresses.
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -12,6 +18,9 @@ pub struct DnsServerDouble {
     pub addr: SocketAddr,
     pub names: Arc<Mutex<HashMap<String, Ipv4Addr>>>,
     pub queries: Arc<Mutex<Vec<String>>>,
+    // The TTL on every address answered; 0 unless a test sets it, so no
+    // answer is held between dials.
+    pub ttl: Arc<AtomicU32>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for DnsServerDouble {
@@ -27,12 +36,14 @@ impl DnsServerDouble {
         let queries = Arc::new(Mutex::new(Vec::new()));
         let table = names.clone();
         let log = queries.clone();
+        let ttl = Arc::new(AtomicU32::new(0));
+        let held = ttl.clone();
         let task = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
-                        let Ok((mut stream,_)) = accepted else { break; }; let table=table.clone(); let log=log.clone();
+                        let Ok((mut stream,_)) = accepted else { break; }; let table=table.clone(); let log=log.clone(); let held=held.load(Ordering::Relaxed);
                         tasks.spawn(async move {
                             let Ok(size)=stream.read_u16().await else { return; }; if size > 4096 { return; }
                             let mut query=vec![0;size as usize]; if stream.read_exact(&mut query).await.is_err() { return; }
@@ -41,7 +52,8 @@ impl DnsServerDouble {
                             let mut response=query.clone(); response[2]=0x81; response[3]=if address.is_some() {0x80} else {0x83};
                             if let Some(ip)=address.filter(|_| qtype == 1) {
                                 response[6..8].copy_from_slice(&1u16.to_be_bytes());
-                                response.extend_from_slice(&[0xc0,12,0,1,0,1,0,0,0,1,0,4]); response.extend_from_slice(&ip.octets());
+                                response.extend_from_slice(&[0xc0,12,0,1,0,1]); response.extend_from_slice(&held.to_be_bytes());
+                                response.extend_from_slice(&[0,4]); response.extend_from_slice(&ip.octets());
                             }
                             let _=stream.write_u16(response.len() as u16).await; let _=stream.write_all(&response).await;
                         });
@@ -54,6 +66,7 @@ impl DnsServerDouble {
             addr,
             names,
             queries,
+            ttl,
             task,
         }
     }

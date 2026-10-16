@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 pub mod connectivity;
 pub mod model;
 pub mod persistence;
@@ -10,7 +13,7 @@ pub mod transfer_policy;
 pub mod usage;
 
 pub use connectivity::{
-    ServerConnectivityResult, probe_server_connection, probe_server_connection_with_route,
+    ServerConnectivityResult, probe_server_connection, probe_server_route, probe_unsaved_server,
 };
 pub use model::{
     DownloadQuotaFault, MAX_PERSISTED_SERVER_DOWNLOAD_BYTES, ServerConfig,

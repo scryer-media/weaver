@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Shared per-server BODY transfer policy.
 //
 // A [`ServerTransferRegistry`] is intentionally independent from an
@@ -1264,6 +1267,12 @@ impl BodyTransferPermit {
         let bytes = bytes as u64;
         self.record_bytes(bytes);
         let _ = self.control.reserve_rate(bytes);
+    }
+
+    // Charge bytes against the quota without pacing or rate debt, for
+    // transfers the speed limits do not apply to.
+    pub fn record_unpaced(&mut self, bytes: usize) {
+        self.record_bytes(bytes as u64);
     }
 
     // Charge bytes and wait on the shared blocking aggregate limiter.

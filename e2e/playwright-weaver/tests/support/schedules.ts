@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import fs from "node:fs";
 import path from "node:path";
 import type { APIRequestContext } from "@playwright/test";
@@ -5,7 +8,7 @@ import { expect, graphql, nntpBodyMetrics, postProbeArticle, submitProbeNzb, tes
 import { literal, waitRows } from "./datastore";
 import { startDownload, waitTerminal } from "./downloads";
 import { clockFile, readClock } from "./e2e-clock";
-import { nzbDocument, nzbgetRpc } from "./script-settings";
+import { nzbDocument, nzbgetRpc, withControlKey } from "./script-settings";
 
 /**
  * Schedule rules through the public API, for the scheduling specs. Weaver
@@ -90,8 +93,13 @@ export async function schedules(request: APIRequestContext): Promise<ScheduleRow
 export class Rules {
   private readonly ids = new Set<string>();
   private serial = 0;
+  private readonly request: APIRequestContext;
+  private readonly tag: string;
 
-  constructor(private readonly request: APIRequestContext, private readonly tag: string) {}
+  constructor(request: APIRequestContext, tag: string) {
+    this.request = request;
+    this.tag = tag;
+  }
 
   label(): string {
     this.serial += 1;
@@ -135,6 +143,14 @@ export class Rules {
 
   async clear(): Promise<void> {
     for (const id of [...this.ids]) await this.delete(id);
+  }
+
+  /** Drain evaluator work before restoring runtime state; requires an unused global Speed track. */
+  async clearAndSettle(): Promise<void> {
+    await this.clear();
+    // Deleting a winning rule can expose an older hold between deletions.
+    // Wait for a tick with all owned rules gone before issuing operator resets.
+    await witnessTick(this.request);
   }
 }
 
@@ -310,21 +326,20 @@ export async function failedJob(request: APIRequestContext, name: string): Promi
   return result.jobId!;
 }
 
-/** A job cancelled while every download is paused by the operator. */
+/** Admit this job paused so a scheduled global resume cannot release it. */
 export async function cancelledJob(request: APIRequestContext, name: string): Promise<number> {
-  await graphql(request, "mutation { pauseAll }");
-  try {
-    const articles = [{ messageId: `${name}-${token}-held@e2e.invalid`, bytes: 16 * 1024 }];
-    await postProbeArticle(articles[0]!.messageId, articles[0]!.bytes);
-    const result = await submitProbeNzb(request, `${name}-${token}`, articles);
-    expect(result, `submit ${name}`).toMatchObject({ accepted: true });
-    await graphql(request, "mutation($id: Int!) { cancelJob(id: $id) }", { id: result.jobId });
-    await waitRows(`SELECT status FROM job_history WHERE job_id = ${literal(result.jobId!)}`,
-      rows => rows[0]?.status === "cancelled", `${name} recorded as cancelled`);
-    return result.jobId!;
-  } finally {
-    await resumeAll(request);
-  }
+  const articles = [{ messageId: `${name}-${token}-held@e2e.invalid`, bytes: 16 * 1024 }];
+  await postProbeArticle(articles[0]!.messageId, articles[0]!.bytes);
+  const nzb = Buffer.from(nzbDocument(`${name}-${token}`, articles)).toString("base64");
+  const id = await withControlKey(request, key => nzbgetRpc(request, key, "append", [
+    `${name}-${token}.nzb`, nzb, "", 0, false, true,
+  ])) as number;
+  expect(id, `submit ${name} paused`).toBeGreaterThan(0);
+  expect((await queueItem(request, id))?.state, `${name} admitted paused`).toBe("PAUSED");
+  await graphql(request, "mutation($id: Int!) { cancelJob(id: $id) }", { id });
+  await waitRows(`SELECT status FROM job_history WHERE job_id = ${literal(id)}`,
+    rows => rows[0]?.status === "cancelled", `${name} recorded as cancelled`);
+  return id;
 }
 
 export const localOutput = (outputDir: string) => outputDir.replace(/^\/data\/complete/, "/weaver-downloads");

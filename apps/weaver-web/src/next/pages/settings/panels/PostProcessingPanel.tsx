@@ -1,4 +1,7 @@
-import { useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+import { useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
 import { useMutation, useQuery, type CombinedError } from "urql";
 import { eventScriptDefaults, eventScriptOptions, eventScriptSection, type EventScriptOptions } from "@/next/components/EventScriptSettings";
 import {
@@ -82,7 +85,6 @@ interface ExecutionForm extends EventScriptOptions {
   powershellInterpreter: string;
   batchInterpreter: string;
   goInterpreter: string;
-  unacceptableExtensions: string;
 }
 
 /** The daemon runs between 1 and 128 scripts at once. */
@@ -98,15 +100,7 @@ const DEFAULTS: ExecutionForm = {
   powershellInterpreter: "",
   batchInterpreter: "",
   goInterpreter: "",
-  unacceptableExtensions: "",
 };
-
-function splitExtensions(value: string): string[] {
-  return value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-}
 
 function errorText(error: CombinedError): string {
   return error.graphQLErrors[0]?.message ?? error.message;
@@ -146,7 +140,6 @@ export function ScriptConfigurationPanel() {
             powershellInterpreter: settings.powershellInterpreter ?? "",
             batchInterpreter: settings.batchInterpreter ?? "",
             goInterpreter: settings.goInterpreter ?? "",
-            unacceptableExtensions: settings.unacceptableExtensions.join(", "),
           }
         : DEFAULTS,
     [settings],
@@ -181,7 +174,6 @@ export function ScriptConfigurationPanel() {
           powershellInterpreter: values.powershellInterpreter.trim() || null,
           batchInterpreter: values.batchInterpreter.trim() || null,
           goInterpreter: values.goInterpreter.trim() || null,
-          unacceptableExtensions: splitExtensions(values.unacceptableExtensions),
         },
       }).then((result) => {
         if (result.error) {
@@ -269,29 +261,6 @@ export function ScriptConfigurationPanel() {
             max: 600,
             suffix: t("next.general.seconds"),
             onChange: (next) => patch({ terminationGraceSeconds: next }),
-          },
-        },
-        {
-          id: "unacceptableExtensions",
-          label: t("next.postProcessing.extensions"),
-          help: t("next.postProcessing.extensionsHelp"),
-          keywords: values.unacceptableExtensions,
-          control: {
-            kind: "text",
-            value: values.unacceptableExtensions,
-            placeholder: "exe, bat, scr",
-            onChange: (next) => patch({ unacceptableExtensions: next }),
-          },
-        },
-        {
-          id: "strictSecurity",
-          label: t("next.postProcessing.strictSecurity"),
-          help: t("next.postProcessing.strictSecurityHelp"),
-          control: {
-            kind: "static",
-            value: settings?.strictSecurityRefusesExecution
-              ? t("next.postProcessing.refuses")
-              : t("next.postProcessing.permissive"),
           },
         },
       ],
@@ -491,7 +460,9 @@ export function ScriptListPanel() {
   const fetched = data?.scriptInstances;
   // The list as last read, for an answer that lands after a newer read than the one it was asked under.
   const fetchedRef = useRef(fetched);
-  fetchedRef.current = fetched;
+  useLayoutEffect(() => {
+    fetchedRef.current = fetched;
+  }, [fetched]);
   const instances = reordered && reordered.base === fetched ? reordered.value : (fetched ?? NO_INSTANCES);
   const scripts = discovered?.discoveredScripts.scripts ?? NO_SCRIPTS;
   const problems = discovered?.discoveredScripts.problems ?? [];

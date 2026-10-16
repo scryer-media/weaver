@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 const POSITIONAL_LOCATORS = [
   { pattern: /\.first\(\)/g, description: "positional .first() locator" },
   { pattern: /\.last\(\)/g, description: "positional .last() locator" },

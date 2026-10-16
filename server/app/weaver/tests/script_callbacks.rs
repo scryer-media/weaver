@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A running script calling weaver back: real scripts, the real supervisor,
 // and the run's token played the way the API plays it.
 //
@@ -98,6 +101,7 @@ fn job(db: &Database, directory: &Path) -> JobExecutionContext {
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         password_override: None,
+        supplied_password_candidates: Vec::new(),
     })
     .unwrap();
     JobExecutionContext {

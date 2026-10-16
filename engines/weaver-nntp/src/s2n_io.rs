@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // s2n's synchronous callback boundary for a userspace route.
 use crate::route_stream::BlockingSocket;
 use std::io::{self, Read, Write};

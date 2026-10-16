@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 mod common;
 
 use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
@@ -139,6 +142,38 @@ async fn public_facade_schema_exposes_core_surface() {
         sdl.contains("attributeEquals: AttributeInput"),
         "QueueFilterInput should expose exact attribute matching"
     );
+}
+
+// The input field a submitting integration probes for before it hands over
+// more than one archive password.
+#[tokio::test]
+async fn submit_nzb_input_exposes_password_candidates() {
+    assert!(
+        export_schema_sdl().contains("passwordCandidates: [String!]"),
+        "SubmitNzbInput should accept a passwordCandidates list"
+    );
+
+    let schema = Schema::build(
+        weaver_server_api::QueryRoot::default(),
+        weaver_server_api::MutationRoot::default(),
+        weaver_server_api::SubscriptionRoot::default(),
+    )
+    .finish();
+    let resp = schema
+        .execute(
+            "query PasswordCapabilities { __type(name: \"SubmitNzbInput\") { inputFields { name } } }",
+        )
+        .await;
+    assert!(resp.errors.is_empty(), "{:?}", resp.errors);
+    let data = resp.data.into_json().unwrap();
+    let fields: Vec<&str> = data["__type"]["inputFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|field| field["name"].as_str())
+        .collect();
+    assert!(fields.contains(&"password"), "{fields:?}");
+    assert!(fields.contains(&"passwordCandidates"), "{fields:?}");
 }
 
 #[tokio::test]

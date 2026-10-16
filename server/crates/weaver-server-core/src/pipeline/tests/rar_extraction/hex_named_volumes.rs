@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A multi-volume RAR set posted under obfuscated, extensionless hex names.
 //
 // Nothing in such a filename says which set a volume belongs to or where in

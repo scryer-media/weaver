@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Three named profiles that decide every hardware-derived limit at once.
 //
 // An operator picks a name, not a set of knobs: the profile answers how much

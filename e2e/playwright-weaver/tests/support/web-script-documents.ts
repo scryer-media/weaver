@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 /**
  * The script documents the web app sends, copied as they are written in the
  * web app's GraphQL module, so the post-processing flow runs the same shapes

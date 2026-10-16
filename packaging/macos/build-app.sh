@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 # Assemble Weaver.app around already-built binaries.
 #
 # The bundle is a wrapper, not a second build: the executables it contains are

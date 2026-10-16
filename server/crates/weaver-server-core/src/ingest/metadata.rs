@@ -1,4 +1,24 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 pub const ORIGINAL_TITLE_METADATA_KEY: &str = "weaver.original_title";
+// A name the job was given after submission. It replaces the NZB-derived
+// name, the release title and the completed folder name, and it survives a
+// restart because the NZB is parsed again on restore.
+pub const RENAMED_TITLE_METADATA_KEY: &str = "weaver.renamed_title";
+
+pub fn renamed_title(metadata: &[(String, String)]) -> Option<&str> {
+    metadata
+        .iter()
+        .find(|(key, _)| key == RENAMED_TITLE_METADATA_KEY)
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+pub fn set_renamed_title(metadata: &mut Vec<(String, String)>, name: &str) {
+    metadata.retain(|(key, _)| key != RENAMED_TITLE_METADATA_KEY);
+    metadata.push((RENAMED_TITLE_METADATA_KEY.to_string(), name.to_string()));
+}
 
 pub fn append_original_title_metadata(
     mut metadata: Vec<(String, String)>,
@@ -25,6 +45,9 @@ pub fn append_original_title_metadata(
 }
 
 pub fn original_release_title(job_name: &str, metadata: &[(String, String)]) -> String {
+    if let Some(renamed) = renamed_title(metadata) {
+        return renamed.to_string();
+    }
     metadata
         .iter()
         .find(|(key, _)| key == ORIGINAL_TITLE_METADATA_KEY)

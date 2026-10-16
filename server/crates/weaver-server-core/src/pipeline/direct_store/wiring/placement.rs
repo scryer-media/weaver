@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Direct-store placements off the pipeline task: a routed article's
 // destination writes run on a task of their own, and its commit is applied
 // when they return. See [`crate::pipeline::DirectPlacementFlight`].

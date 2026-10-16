@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use weaver_nntp::{NntpClient, NntpConnection, ServerConfig, ServerId, client::NntpClientConfig};
@@ -35,6 +38,7 @@ fn bridge_dialer(
 ) -> Arc<weaver_nntp::route_dialer::RouteDialer> {
     Arc::new(weaver_nntp::route_dialer::RouteDialer {
         inner: Arc::new(BridgeDialer(bridge)),
+        plan: None,
         egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::with_scope(
             weaver_nntp::transfer::TransferScope::Egress,
         )),
@@ -140,7 +144,6 @@ fn route(modes: &[Mode], timeout: Duration) -> Arc<ConsumerRoute> {
             Arc::new(ProxyHop {
                 profile: profile(id),
                 provider: Arc::new(NntpFixture { mode: *mode }),
-                wireguard: None,
             }),
         );
     }
@@ -160,7 +163,7 @@ fn config(route: &Arc<ConsumerRoute>) -> ServerConfig {
         host: "nntp-review.invalid".into(),
         port: 119,
         tls: false,
-        dialer: Some(bridge_dialer(route.bridge().unwrap())),
+        dialer: bridge_dialer(route.bridge().unwrap()),
         connect_timeout: NOT_UNDER_TEST,
         command_timeout: NOT_UNDER_TEST,
         ..Default::default()

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useState } from "react";
 import { useMutation } from "urql";
 import { SET_ACCESS_POLICY_MUTATION, SET_HTTP_BIND_ADDRESS_MUTATION } from "@/graphql/queries";

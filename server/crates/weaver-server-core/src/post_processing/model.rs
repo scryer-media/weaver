@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Typed contracts for post-processing scripts.
 //
 // A script has no identity beyond its name in the configured scripts directory:

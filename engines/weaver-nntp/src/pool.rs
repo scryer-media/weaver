@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::{Deref, DerefMut};
@@ -21,7 +24,7 @@ use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
-use crate::address_plan::{AddressPlan, AddressPlanSnapshot, AddressRoute};
+use crate::address_plan::AddressPlanSnapshot;
 use crate::connection::{NntpConnection, ServerConfig};
 
 async fn acquisition_budget<T>(
@@ -118,8 +121,6 @@ pub struct NntpPool {
     // would be a log flood; a silent one is what made the condition invisible.
     blocking_connect_warn_after: Vec<AtomicU64>,
     blocking_connect_failures_since_warning: Vec<AtomicU64>,
-    // Per-server choice of which resolved address new connections dial.
-    address_plans: Vec<Arc<AddressPlan>>,
     // Cold connection admission only; established BODY lanes never touch it.
     auth_admission: Vec<AuthAdmission>,
 }
@@ -331,10 +332,17 @@ pub struct ServerPoolConfig {
     pub retention_days: u32,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for ServerPoolConfig {
     fn default() -> Self {
+        Self::new(ServerConfig::default())
+    }
+}
+
+impl ServerPoolConfig {
+    pub fn new(server: ServerConfig) -> Self {
         Self {
-            server: ServerConfig::default(),
+            server,
             stable_id: StableServerId::default(),
             transfer_control: None,
             max_connections: 1,
@@ -369,7 +377,6 @@ impl NntpPool {
         let mut over_limit_episodes = Vec::with_capacity(server_count);
         let mut blocking_connect_warn_after = Vec::with_capacity(server_count);
         let mut blocking_connect_failures_since_warning = Vec::with_capacity(server_count);
-        let mut address_plans = Vec::with_capacity(server_count);
         let mut socket_budgets = Vec::with_capacity(server_count);
         let shutdown = CancellationToken::new();
 
@@ -385,12 +392,8 @@ impl NntpPool {
                 || crate::socket_budget::SocketBudget::new(spc.max_connections),
                 |control| Arc::clone(&control.socket_budget),
             );
-            if let Some((dialer, mut targets)) = spc
-                .server
-                .dialer
-                .as_ref()
-                .and_then(|dialer| dialer.inner.leg_targets().map(|targets| (dialer, targets)))
-            {
+            let dialer = &spc.server.dialer;
+            if let Some(mut targets) = dialer.inner.leg_targets() {
                 budget.configure_legs(&targets.borrow_and_update());
                 let watched_budget = budget.clone();
                 let mut sockets = budget.subscribe();
@@ -427,10 +430,6 @@ impl NntpPool {
             over_limit_episodes.push(SyncMutex::new(OverLimitEpisode::default()));
             blocking_connect_warn_after.push(AtomicU64::new(0));
             blocking_connect_failures_since_warning.push(AtomicU64::new(0));
-            address_plans.push(Arc::new(AddressPlan::new(format!(
-                "{}:{}",
-                spc.server.host, spc.server.port
-            ))));
             semaphores.push(Arc::new(Semaphore::new(spc.max_connections)));
             configs.push(spc.server.clone());
             pools.push(Arc::new(SyncMutex::new(ServerPool {
@@ -481,7 +480,6 @@ impl NntpPool {
             over_limit_episodes,
             blocking_connect_warn_after,
             blocking_connect_failures_since_warning,
-            address_plans,
             auth_admission: (0..server_count)
                 .map(|_| AuthAdmission {
                     state: AtomicU64::new(0),
@@ -498,9 +496,7 @@ impl NntpPool {
             return;
         }
         for (idx, config) in self.configs.iter().enumerate() {
-            let Some(dialer) = &config.dialer else {
-                continue;
-            };
+            let dialer = &config.dialer;
             let Some(mut targets) = dialer.inner.leg_targets() else {
                 continue;
             };
@@ -556,7 +552,7 @@ impl NntpPool {
                     let Some(pool) = weak.upgrade() else {
                         break;
                     };
-                    let route = pool.configs[idx].dialer.as_ref().expect("route probe");
+                    let route = &pool.configs[idx].dialer;
                     if !route.inner.needs_probe() {
                         continue;
                     }
@@ -632,37 +628,15 @@ impl NntpPool {
         }
     }
 
-    // How a new connection to this server picks its address.
-    fn address_route(&self, idx: usize) -> AddressRoute {
-        AddressRoute {
-            plan: Arc::clone(&self.address_plans[idx]),
-        }
-    }
-
-    // This server's address plan as it stands.
+    // The address plan of this server's direct leg as it stands: none for
+    // a server reached only through proxies.
     pub fn address_plan_snapshot(&self, server: ServerId) -> Option<AddressPlanSnapshot> {
-        self.address_plans.get(server.0).map(|plan| plan.snapshot())
-    }
-
-    // Book how long an article fetch on a connection to `ip` took.
-    pub fn record_address_body_latency(&self, server: ServerId, ip: IpAddr, elapsed: Duration) {
-        if let Some(plan) = self.address_plans.get(server.0) {
-            plan.record_body_latency(ip, elapsed);
-        }
-    }
-
-    // Book the bytes one warm article fetch on a connection to `ip` moved
-    // and the wire time they took.
-    pub fn record_address_delivery(
-        &self,
-        server: ServerId,
-        ip: IpAddr,
-        bytes: u64,
-        wire: Duration,
-    ) {
-        if let Some(plan) = self.address_plans.get(server.0) {
-            plan.record_delivery(ip, bytes, wire);
-        }
+        self.configs
+            .get(server.0)?
+            .dialer
+            .plan
+            .as_ref()
+            .map(|plan| plan.snapshot())
     }
 
     async fn connect_server(
@@ -697,10 +671,8 @@ impl NntpPool {
         idx: usize,
         initial_group: Option<&str>,
     ) -> Result<NntpConnection> {
-        let route = self.address_route(idx);
         let mut connection =
-            NntpConnection::connect_for_group(&self.configs[idx], Some(&route), initial_group)
-                .await?;
+            NntpConnection::connect_for_group(&self.configs[idx], initial_group).await?;
         connection.set_transfer_control(self.transfer_controls[idx].clone());
         Ok(connection)
     }
@@ -807,8 +779,8 @@ impl NntpPool {
         self.configs.get(idx).is_some_and(|config| {
             config
                 .dialer
-                .as_ref()
-                .and_then(|dialer| dialer.inner.leg_targets())
+                .inner
+                .leg_targets()
                 .is_none_or(|targets| targets.borrow().iter().any(|target| *target > 0))
         })
     }
@@ -910,16 +882,10 @@ impl NntpPool {
                         .admit(demanded)
                         .ok_or(NntpError::PoolExhausted)?;
                     let started = tokio::time::Instant::now();
-                    let connect = self.connect_server(idx, initial_group);
-                    let connected = if self.configs[idx].dialer.is_some() {
-                        let result = connect.await;
-                        if let Some(deadline) = deadline.as_deref_mut() {
-                            *deadline += started.elapsed();
-                        }
-                        result
-                    } else {
-                        acquisition_budget(deadline.as_deref(), connect).await
-                    };
+                    let connected = self.connect_server(idx, initial_group).await;
+                    if let Some(deadline) = deadline.as_deref_mut() {
+                        *deadline += started.elapsed();
+                    }
                     match connected {
                         Ok(mut c) => {
                             slot.set_path(c.route_path.as_ref());
@@ -946,11 +912,7 @@ impl NntpPool {
                                 for notification in &mut notifications {
                                     notification.as_mut().enable();
                                 }
-                                if self.configs[idx]
-                                    .dialer
-                                    .as_ref()
-                                    .is_some_and(|d| d.inner.has_capacity())
-                                {
+                                if self.configs[idx].dialer.inner.has_capacity() {
                                     continue;
                                 }
                                 acquisition_budget(deadline.as_deref(), async {
@@ -1054,16 +1016,10 @@ impl NntpPool {
             .try_acquire_replacement()
             .ok_or(NntpError::PoolExhausted)?;
         let started = tokio::time::Instant::now();
-        let connect = self.connect_server(idx, initial_group);
-        let connected = if self.configs[idx].dialer.is_some() {
-            let result = connect.await;
-            if let Some(deadline) = deadline {
-                *deadline += started.elapsed();
-            }
-            result
-        } else {
-            acquisition_budget(deadline.as_deref(), connect).await
-        };
+        let connected = self.connect_server(idx, initial_group).await;
+        if let Some(deadline) = deadline {
+            *deadline += started.elapsed();
+        }
         let conn = match connected {
             Ok(mut conn) => {
                 slot.set_path(conn.route_path.as_ref());
@@ -1357,15 +1313,8 @@ impl NntpPool {
         episode.probe_started = 0;
         deadline_slot.store(0, Ordering::Release);
         drop(episode);
-        if let Some(plan) = self.address_plans.get(idx) {
-            plan.note_over_limit_cleared();
-        }
-        if let Some(route) = self
-            .configs
-            .get(idx)
-            .and_then(|server| server.dialer.as_ref())
-        {
-            route.inner.over_limit_cleared();
+        if let Some(server) = self.configs.get(idx) {
+            server.dialer.inner.over_limit_cleared();
         }
         info!(
             server = idx,
@@ -1601,6 +1550,27 @@ impl NntpPool {
         &self.configs
     }
 
+    // The pool position of the server with this stable id.
+    pub fn server_for_stable_id(&self, id: StableServerId) -> Option<ServerId> {
+        self.stable_ids
+            .iter()
+            .position(|stable| *stable == id)
+            .map(ServerId)
+    }
+
+    // Lend `count` of this server's connections out of the pool until the
+    // loan is dropped. The budget is shared across client generations, so a
+    // rebuilt pool keeps the loan.
+    pub fn lend_connections(
+        &self,
+        server: ServerId,
+        count: usize,
+    ) -> Option<crate::socket_budget::ConnectionLoan> {
+        let budget = self.socket_budgets.get(server.0)?.clone();
+        budget.lend(count);
+        Some(crate::socket_budget::ConnectionLoan::new(budget, count))
+    }
+
     pub fn stable_server_id(&self, server: ServerId) -> Option<StableServerId> {
         self.stable_ids.get(server.0).copied()
     }
@@ -1669,13 +1639,12 @@ impl NntpPool {
         result
     }
 
-    // The config and address route a blocking connection to `server` uses.
-    pub fn blocking_connect_plan(&self, server: ServerId) -> Result<(ServerConfig, AddressRoute)> {
-        let idx = server.0;
-        if idx >= self.configs.len() {
-            return Err(NntpError::PoolExhausted);
-        }
-        Ok((self.configs[idx].clone(), self.address_route(idx)))
+    // The config a blocking connection to `server` dials with.
+    pub fn blocking_connect_config(&self, server: ServerId) -> Result<ServerConfig> {
+        self.configs
+            .get(server.0)
+            .cloned()
+            .ok_or(NntpError::PoolExhausted)
     }
 
     // Returns `(available_permits, configured_connections)` for the given server.
@@ -1929,12 +1898,13 @@ mod tests {
         let mut config = test_pool_config(4);
         config.health_config.degraded_threshold = 1;
         config.servers[0].server.tls = false;
-        config.servers[0].server.dialer = Some(Arc::new(crate::route_dialer::RouteDialer {
+        config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
             inner: probe.clone(),
+            plan: None,
             runtime: tokio::runtime::Handle::current(),
             server: 1,
             egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
-        }));
+        });
         let pool = Arc::new(NntpPool::new(config));
         let mut changed = pool.socket_budgets[0].subscribe();
         pool.start_route_probes();
@@ -2011,12 +1981,13 @@ mod tests {
         });
         let mut config = test_pool_config(4);
         config.servers[0].server.tls = false;
-        config.servers[0].server.dialer = Some(Arc::new(crate::route_dialer::RouteDialer {
+        config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
             inner: route.clone(),
+            plan: None,
             runtime: tokio::runtime::Handle::current(),
             server: 1,
             egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
-        }));
+        });
         let pool = Arc::new(NntpPool::new(config));
         pool.start_route_probes();
         checks.recv().await.unwrap();
@@ -2108,6 +2079,7 @@ mod tests {
         config.servers[0].server.host = "127.0.0.1".into();
         config.servers[0].server.port = listener.local_addr().unwrap().port();
         config.servers[0].server.tls = false;
+        let route = planned_route(&mut config);
         let pool = Arc::new(NntpPool::new(config));
         let server = tokio::spawn(async move {
             // A serialized first handshake cannot pass: the server deliberately
@@ -2152,7 +2124,7 @@ mod tests {
         .await;
         // Four cold dials at once still race the addresses only once; the
         // rest dial the address that race pinned.
-        let plan = pool.address_plan_snapshot(ServerId(0)).unwrap();
+        let plan = route.snapshot();
         assert_eq!(plan.races_won, 1);
         assert_eq!(
             plan.pinned.map(|address| address.ip()),
@@ -2168,6 +2140,7 @@ mod tests {
         config.servers[0].server.host = "127.0.0.1".into();
         config.servers[0].server.port = listener.local_addr().unwrap().port();
         config.servers[0].server.tls = false;
+        let route = planned_route(&mut config);
         let pool = Arc::new(NntpPool::new(config));
         let server = tokio::spawn(async move {
             // The first socket is closed unanswered; the second is greeted
@@ -2176,16 +2149,35 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             socket.write_all(b"502 not today\r\n").await.unwrap();
         });
-        let failures = |pool: &NntpPool| {
-            pool.address_plan_snapshot(ServerId(0)).unwrap().addresses[0].consecutive_failures
-        };
+        let failures = || route.snapshot().addresses[0].consecutive_failures;
 
         assert!(pool.connect_server(0, None).await.is_err());
-        assert_eq!(failures(&pool), 1);
+        assert_eq!(failures(), 1);
 
         assert!(pool.connect_server(0, None).await.is_err());
-        assert_eq!(failures(&pool), 0);
+        assert_eq!(failures(), 0);
         server.await.unwrap();
+    }
+
+    // Route the first server over a direct leg whose address plan the test
+    // reads.
+    fn planned_route(config: &mut PoolConfig) -> Arc<crate::route_dialer::AddressPlanned> {
+        let route = Arc::new(crate::route_dialer::AddressPlanned::new(
+            "pool test".into(),
+            Arc::new(weaver_tunnel::pipe::Egress::new(
+                0,
+                crate::egress::SocketEgress::System,
+                Duration::from_secs(30),
+            )),
+        ));
+        config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
+            inner: route.clone(),
+            plan: Some(route.plan.clone()),
+            egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+            runtime: tokio::runtime::Handle::current(),
+            server: 1,
+        });
+        route
     }
 
     fn test_pool_config(max_per_server: usize) -> PoolConfig {

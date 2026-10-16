@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Network routing metrics for the Prometheus exporter.
 //
 // Leg dial outcomes are counted per egress on the dial path with a relaxed

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A WireGuard session as the carrier of another WireGuard tunnel.
 //
 // The tunnel stacked on top sends its encrypted packets through a UDP socket
@@ -55,11 +58,14 @@ impl DatagramTransport for SessionDatagrams {
         let activity = session.activity.clone().read_owned().await;
         let capacity = session.capacity.acquire().map_err(tunnel_error)?;
         match provider.0.bind(peer).await {
-            Ok(socket) => Ok(Arc::new(HeldSocket {
-                socket,
-                _activity: activity,
-                _capacity: capacity,
-            })),
+            Ok(socket) => {
+                crate::resolution::record::bound(peer, true);
+                Ok(Arc::new(HeldSocket {
+                    socket,
+                    _activity: activity,
+                    _capacity: capacity,
+                }))
+            }
             Err(error) => {
                 drop(capacity);
                 drop(activity);

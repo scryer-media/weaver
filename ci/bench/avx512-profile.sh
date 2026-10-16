@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 # avx512-profile.sh — validate + benchmark weaver's NEW flat 512-bit VBMI2 yEnc
 # decode kernel (decode_kernel_avx512_raw) against rapidyenc's own VBMI2 tier, on
 # a real AVX-512 VBMI2 Linux box, weaver and rapidyenc same-run in one process.

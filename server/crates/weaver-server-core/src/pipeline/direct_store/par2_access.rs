@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A [`par2_rs::FileAccess`] over a direct set's virtual volumes.
 //
 // PAR2 describes **source volumes**: every file id in the recovery set names a

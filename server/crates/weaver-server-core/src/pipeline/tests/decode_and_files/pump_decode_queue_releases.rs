@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // `decode_and_files` tests, part of a mechanical split of the original file.
 
 use super::*;
@@ -2883,6 +2886,13 @@ async fn set_persisted_nzb(temp_dir: &tempfile::TempDir, job_id: JobId, nzb_zstd
     pool.close().await;
 }
 
+// The canonical harvest as the pair these tests assert on: the candidates,
+// and whether every source behind them was read.
+fn harvest(pipeline: &Pipeline, job_id: JobId) -> (Vec<ArchivePasswordCandidate>, bool) {
+    let harvest = pipeline.archive_password_candidates_for_job(job_id);
+    (harvest.candidates, harvest.complete)
+}
+
 fn nzb_half_candidates() -> Vec<ArchivePasswordCandidate> {
     vec![
         ArchivePasswordCandidate::new(ArchivePasswordSource::NzbMeta, "meta-key".to_string()),
@@ -2919,7 +2929,9 @@ async fn archive_password_sources_are_ordered_and_validated_password_is_private(
         )
         .await
         .unwrap();
-    let candidates = pipeline.archive_password_candidates_for_job(job_id);
+    let candidates = pipeline
+        .archive_password_candidates_for_job(job_id)
+        .candidates;
     assert_eq!(
         candidates
             .iter()
@@ -2995,7 +3007,7 @@ async fn add_job_keeps_nzb_password_candidates_so_the_harvest_never_rereads_the_
         ArchivePasswordCandidate::new(ArchivePasswordSource::Explicit, "spec-key".to_string()),
     );
     for _ in 0..2 {
-        let (candidates, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+        let (candidates, harvested) = harvest(&pipeline, job_id);
         assert!(harvested);
         assert!(candidates == expected);
     }
@@ -3018,13 +3030,13 @@ async fn the_first_harvest_parses_the_persisted_nzb_and_later_ones_read_memory()
     )
     .await;
 
-    let (first, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+    let (first, harvested) = harvest(&pipeline, job_id);
     assert!(harvested);
     assert!(first == nzb_half_candidates());
 
     corrupt_persisted_nzb(&temp_dir, job_id).await;
 
-    let (second, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+    let (second, harvested) = harvest(&pipeline, job_id);
     assert!(
         harvested,
         "a later harvest must not read the persisted NZB again"
@@ -3048,7 +3060,7 @@ async fn a_harvest_that_finds_no_persisted_nzb_remembers_the_empty_list() {
     .await;
     set_persisted_nzb(&temp_dir, job_id, None).await;
 
-    let (first, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+    let (first, harvested) = harvest(&pipeline, job_id);
     assert!(harvested);
     assert!(first.is_empty());
 
@@ -3060,7 +3072,7 @@ async fn a_harvest_that_finds_no_persisted_nzb_remembers_the_empty_list() {
         Some(sample_nzb_zstd_with_password("meta-key")),
     )
     .await;
-    let (second, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+    let (second, harvested) = harvest(&pipeline, job_id);
     assert!(harvested);
     assert!(
         second.is_empty(),
@@ -3077,7 +3089,7 @@ async fn a_harvest_whose_nzb_failed_to_parse_reads_the_row_again() {
     insert_active_job_with_persisted_nzb(&mut pipeline, job_id, spec, vec![0xFFu8; 64]).await;
 
     for _ in 0..2 {
-        let (candidates, harvested) = pipeline.harvest_archive_password_candidates(job_id);
+        let (candidates, harvested) = harvest(&pipeline, job_id);
         assert!(!harvested, "a parse failure is never remembered");
         assert!(candidates.is_empty());
     }

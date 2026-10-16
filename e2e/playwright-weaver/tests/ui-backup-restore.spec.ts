@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import fs from "node:fs";
 import path from "node:path";
 import type { Locator, Page } from "@playwright/test";
@@ -269,7 +272,7 @@ async function createSourceMarkersThroughUI(
   request: Parameters<typeof seedRestorableHistoryMetadata>[0],
   matrix: BackupMatrixState,
 ) {
-  await page.goto("/settings/bandwidth");
+  await page.goto("/settings/networking/egress");
   const ceiling = page.getByRole("spinbutton", { name: "Download ceiling", exact: true });
   await ceiling.fill(downloadCeiling(matrix));
   await ceiling.press("Tab");
@@ -428,7 +431,7 @@ async function expectProductMarkers(
   matrix: BackupMatrixState,
   present: boolean,
 ) {
-  await page.goto("/settings/bandwidth");
+  await page.goto("/settings/networking/egress");
   const ceiling = page.getByRole("spinbutton", { name: "Download ceiling", exact: true });
   await expect(ceiling).toBeVisible();
   if (present) {

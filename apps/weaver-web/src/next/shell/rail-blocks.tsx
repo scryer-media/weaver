@@ -1,14 +1,23 @@
-import { Fragment, type ReactNode } from "react";
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+import { Fragment, memo, type ReactNode } from "react";
 import { Link, NavLink, useLocation } from "react-router";
 import { useQuery } from "urql";
 import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
-import { useTranslate } from "@/lib/context/translate-context";
+import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { RailBlock, RailMetric } from "./NextShell";
 import { Bar, Square } from "../components/chrome";
 import { Icon, type IconName } from "../components/icons";
 import { UNCATEGORISED, type CategoryEntry } from "../data/categories";
-import { useNextData, type ProviderHealth } from "../data/next-data";
+import {
+  useNextData,
+  useNextDataSelector,
+  type NextData,
+  type ProviderHealth,
+} from "../data/next-data";
+import { sameItems } from "../data/settled";
 import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
 import { useNow } from "../data/clock";
 import { formatClock, formatDayClock, formatLatency, splitUptime } from "../data/format";
@@ -53,9 +62,9 @@ export function providerLoadPercent(provider: ProviderHealth): number {
   return (provider.connectionsActive / max) * 100;
 }
 
-export function ProvidersBlock() {
+export const ProvidersBlock = memo(function ProvidersBlock() {
   const t = useTranslate();
-  const { providers, providersLoaded } = useNextData();
+  const { providers, providersLoaded } = useNextData("providers", "providersLoaded");
   // A holdoff counts down in the rail, so the clock has to be a value React
   // knows about; it ticks only while something is actually counting down.
   const counting = providers.some((provider) => provider.activityUntilEpochMs != null);
@@ -134,7 +143,7 @@ export function ProvidersBlock() {
       )}
     </RailBlock>
   );
-}
+});
 
 /**
  * The rail's one loud control. With no provider nothing can download, so the
@@ -173,9 +182,20 @@ export interface AttentionItem {
  */
 export function useAttentionItems(): AttentionItem[] {
   const t = useTranslate();
-  const { providers, holdoffs, downloadBlock, isPaused } = useNextData();
-  const counting = providers.some((provider) => provider.activityUntilEpochMs != null);
+  const counting = useNextDataSelector((data) =>
+    data.providers.some((provider) => provider.activityUntilEpochMs != null),
+  );
   const now = useNow(1000, counting);
+  // The rows are worked out from each new value and handed back unchanged while
+  // they read the same, so the block draws again only when one of them moves.
+  return useNextDataSelector((data) => attentionItems(data, t, now), sameItems);
+}
+
+function attentionItems(
+  { providers, holdoffs, downloadBlock, isPaused }: NextData,
+  t: Translate,
+  now: number,
+): AttentionItem[] {
   const items: AttentionItem[] = [];
 
   for (const holdoff of holdoffs) {
@@ -236,7 +256,7 @@ export function useAttentionItems(): AttentionItem[] {
                 ? formatDayClock(downloadBlock.windowEndsAtEpochMs)
                 : formatClock(downloadBlock.windowEndsAtEpochMs),
           })
-        : t("next.attention.seeBandwidth"),
+        : t("next.monitoring.egressLink"),
       color: WV.warn,
     });
   }
@@ -244,7 +264,7 @@ export function useAttentionItems(): AttentionItem[] {
   return items;
 }
 
-export function AttentionBlock() {
+export const AttentionBlock = memo(function AttentionBlock() {
   const t = useTranslate();
   const items = useAttentionItems();
 
@@ -268,9 +288,9 @@ export function AttentionBlock() {
       ))}
     </RailBlock>
   );
-}
+});
 
-export function UptimeBlock() {
+export const UptimeBlock = memo(function UptimeBlock() {
   const t = useTranslate();
   const [{ data }] = useQuery<{ systemInfo: { uptimeSeconds: number; version: string } }>({
     query: SYSTEM_INFO_QUERY,
@@ -282,7 +302,7 @@ export function UptimeBlock() {
       <RailMetric value={uptime.value} unit={uptime.unit} note={t("next.rail.sinceRestart")} />
     </RailBlock>
   );
-}
+});
 
 /**
  * The rail's contextual middle block on the list screens: the configured
@@ -415,7 +435,7 @@ function PanelRowContent({
  * lists them indented beneath it, and only a panel's own row is ever the
  * active one.
  */
-export function PanelListBlock({
+export const PanelListBlock = memo(function PanelListBlock({
   eyebrow,
   items,
 }: {
@@ -457,4 +477,4 @@ export function PanelListBlock({
       </nav>
     </RailBlock>
   );
-}
+});

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useMemo, useState } from "react";
 
 export interface EtaJobInput {
@@ -184,6 +187,9 @@ function buildQueueEtaById(jobs: EtaJobInput[], speed: number): Map<number, stri
 }
 
 export function useStableEtaSpeed(jobs: EtaJobInput[], instantaneousSpeed: number): number {
+  // Every render is a sample, the same jobs and speed included: the estimate
+  // settles with the time between them, so it must not be cached by its inputs.
+  "use no memo";
   const [state] = useState<EtaEstimatorState>(() => ({
     signature: "",
     samples: [],

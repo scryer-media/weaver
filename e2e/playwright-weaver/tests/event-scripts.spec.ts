@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { randomBytes } from "node:crypto";
 import type { APIRequestContext } from "@playwright/test";
 import { expect, graphql, postProbeArticle, submitProbeNzb, test } from "./helpers";

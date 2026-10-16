@@ -1,4 +1,7 @@
-import { useCallback, useMemo, useRef, useState, type DragEvent } from "react";
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { useClient, useMutation, useQuery } from "urql";
 import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
 import {
@@ -26,6 +29,7 @@ import { Menu, MenuItem } from "../components/Menu";
 import { StorageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useNextData } from "../data/next-data";
+import { sameElements, sameEntries, sameItems, shallowEqual, useSettled } from "../data/settled";
 import { EM_DASH, formatDayClock, formatSize } from "../data/format";
 import { ratePhase } from "../data/phase-bars";
 import {
@@ -50,6 +54,7 @@ import { AddNzbDialog } from "../features/AddNzbDialog";
 import { SpeedLimitControl } from "../features/SpeedLimitDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
 import { DownloadRow } from "./downloads/DownloadRow";
+import { QueueEtaContext } from "./downloads/queue-eta";
 
 type TabId = "all" | "active" | "queued" | "paused";
 type SortId = "priority" | "name" | "size" | "progress" | "eta";
@@ -68,6 +73,7 @@ type BulkReport = "paused" | "resumed" | "priority" | "category" | "cancelled";
 
 /** The statuses a global pause or a download block holds back. */
 const HELD_BACK_STATUSES = new Set(["DOWNLOADING", "QUEUED", "PROPAGATING"]);
+const NO_ETAS: ReadonlyMap<number, string> = new Map();
 
 /** Group → the tab that shows it. "All" shows everything. */
 const TAB_FOR_GROUP: Record<DownloadGroup, TabId> = {
@@ -77,7 +83,11 @@ const TAB_FOR_GROUP: Record<DownloadGroup, TabId> = {
   attention: "all",
 };
 
-function sortJobs(jobs: JobData[], sort: SortId, etaById: Map<number, string>): JobData[] {
+function sortJobs(
+  jobs: readonly JobData[],
+  sort: SortId,
+  etaById: ReadonlyMap<number, string> | null,
+): readonly JobData[] {
   if (sort === "priority") {
     // Server order already is priority order; leave it alone.
     return jobs;
@@ -99,7 +109,7 @@ function sortJobs(jobs: JobData[], sort: SortId, etaById: Map<number, string>): 
       // A job's time left counts everything queued ahead of it, so estimates
       // grow in queue order and that order is the ranking; a small job behind a
       // large one finishes after it. Rows without an estimate sort last.
-      const rank = new Map([...etaById.keys()].map((id, index) => [id, index]));
+      const rank = new Map([...(etaById ?? NO_ETAS).keys()].map((id, index) => [id, index]));
       sorted.sort(
         (left, right) =>
           (rank.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
@@ -156,7 +166,10 @@ export function DownloadsPage() {
   );
 
   const etaSpeed = useStableEtaSpeed(jobs, speed);
-  const etaById = useStableQueueEta(jobs, speed);
+  const estimates = useStableQueueEta(jobs, speed);
+  // Kept while every estimate reads the same, so the rows' time-left text is
+  // drawn again only when some of it changes.
+  const etaById = useSettled(estimates, sameEntries);
 
   // Search narrows everything, so the category counts answer "how many rows
   // would I see if I clicked this" rather than "how many exist somewhere".
@@ -173,9 +186,12 @@ export function DownloadsPage() {
     );
   }, [jobs, query]);
 
-  const categories = useMemo<CategoryEntry[]>(
-    () => categoryFacets({ configured, rows: searched, extras: queue.categories }),
-    [configured, queue.categories, searched],
+  const categories = useSettled(
+    useMemo<CategoryEntry[]>(
+      () => categoryFacets({ configured, rows: searched, extras: queue.categories }),
+      [configured, queue.categories, searched],
+    ),
+    sameItems,
   );
 
   // Facets union: two of them asks for both, which is the only reading that
@@ -198,15 +214,26 @@ export function DownloadsPage() {
     return buckets;
   }, [inCategory]);
 
-  const tabCounts = useMemo(
-    () => ({
-      all: inCategory.length,
-      active: grouped.get("active")!.length,
-      queued: grouped.get("queued")!.length,
-      paused: grouped.get("paused")!.length,
-    }),
-    [grouped, inCategory.length],
+  const tabCounts = useSettled(
+    useMemo(
+      () => ({
+        all: inCategory.length,
+        active: grouped.get("active")!.length,
+        queued: grouped.get("queued")!.length,
+        paused: grouped.get("paused")!.length,
+      }),
+      [grouped, inCategory.length],
+    ),
+    shallowEqual,
   );
+  // The section tick boxes read the groups and the ticks on screen through
+  // these, so a box keeps its handler while the rows under it move.
+  const groupedRef = useRef(grouped);
+  const pickedRef = useRef(picked);
+  useLayoutEffect(() => {
+    groupedRef.current = grouped;
+    pickedRef.current = picked;
+  });
 
   const visibleGroups = DOWNLOAD_GROUP_ORDER.filter((group) => {
     const rows = grouped.get(group)!;
@@ -237,8 +264,9 @@ export function DownloadsPage() {
   }, []);
 
   /** Tick or untick a whole section, both ways, like select-all on a page. */
-  const toggleGroup = (rows: readonly JobData[]) => {
-    const allPicked = rows.every((job) => picked.has(job.id));
+  const toggleGroup = useCallback((group: DownloadGroup) => {
+    const rows = groupedRef.current.get(group) ?? [];
+    const allPicked = rows.every((job) => pickedRef.current.has(job.id));
     setPicked((current) => {
       const next = new Set(current);
       for (const job of rows) {
@@ -250,7 +278,9 @@ export function DownloadsPage() {
       }
       return next;
     });
-  };
+  }, []);
+
+  const refreshQueue = queue.refresh;
 
   /**
    * One aliased mutation for the whole selection, so a hundred ticked rows are
@@ -276,7 +306,7 @@ export function DownloadsPage() {
     const refused = ids.filter((_id, index) => result.data?.[`${definition.aliasPrefix}${index}`] !== true);
     setPicked(new Set());
     setReport(bulkReport(kind, ids.length, refused.length));
-    queue.refresh();
+    refreshQueue();
   };
 
   const pausePicked = () =>
@@ -321,7 +351,7 @@ export function DownloadsPage() {
     setConfirmCancel(false);
     setPicked(new Set());
     setReport(bulkReport("cancelled", ids.length, failed.length));
-    queue.refresh();
+    refreshQueue();
   };
 
   const priorityOptions = [
@@ -412,7 +442,7 @@ export function DownloadsPage() {
       });
       setReport(result.error?.message ?? t("next.inspector.removeFailed"));
     }
-    queue.refresh();
+    refreshQueue();
   };
   const rowCancelJob =
     confirmRowCancel === null ? null : (jobs.find((job) => job.id === confirmRowCancel) ?? null);
@@ -427,17 +457,21 @@ export function DownloadsPage() {
   const blockLabel =
     downloadBlock.kind === "SERVER_QUOTA" ? t("jobs.serverQuotaBadge") : t("jobs.egressQuotaBadge");
 
-  /** What stands in for time left: a hold, or an estimate; null when there is neither. */
-  const waitValue = useCallback(
+  /** What stands in for time left while a download is held; null when it is not. */
+  const heldValue = useCallback(
     (job: JobData): string | null => {
       if (statusToken(job.status) === "paused") return t("next.downloads.waitPaused");
       if (HELD_BACK_STATUSES.has(job.status)) {
         if (blocked) return blockEta;
         if (isPaused) return t("next.downloads.waitPaused");
       }
-      return etaById.get(job.id) ?? null;
+      return null;
     },
-    [blockEta, blocked, etaById, isPaused, t],
+    [blockEta, blocked, isPaused, t],
+  );
+  const holdValue = useCallback(
+    (job: JobData): string | null => (blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null),
+    [blockLabel, blocked],
   );
 
   return (
@@ -623,47 +657,27 @@ export function DownloadsPage() {
               body={t("next.downloads.noMatchBody")}
             />
           ) : (
-            visibleGroups.map((group) => {
-              const rows = sortJobs(grouped.get(group)!, sort, etaById);
-              return (
-                <section key={group} className="flex flex-none flex-col">
-                  <SectionHeader
-                    lead={
-                      <CheckBox
-                        label={t("next.downloads.selectGroup", { group: t(DOWNLOAD_GROUP_LABEL[group]) })}
-                        checked={rows.every((job) => picked.has(job.id))}
-                        onChange={() => toggleGroup(rows)}
-                      />
-                    }
-                    label={t(DOWNLOAD_GROUP_LABEL[group])}
-                    count={rows.length}
-                    note={DOWNLOAD_GROUP_NOTE[group] === null ? undefined : t(DOWNLOAD_GROUP_NOTE[group])}
-                  />
-                  {rows.map((job) => (
-                    <DownloadRow
-                      key={job.id}
-                      job={job}
-                      selected={job.id === selectedId}
-                      onSelect={setSelectedId}
-                      picked={picked.has(job.id)}
-                      onPick={togglePicked}
-                      statusLabel={statusLabel}
-                      onPause={pauseRow}
-                      onCancel={setConfirmRowCancel}
-                      wait={waitValue(job)}
-                      hold={blocked && HELD_BACK_STATUSES.has(job.status) ? blockLabel : null}
-                      statusTitle={
-                        job.status === "PROPAGATING" && job.downloadRetryAtEpochMs != null
-                          ? t("next.status.propagationUntil", {
-                              time: new Date(job.downloadRetryAtEpochMs).toLocaleString(),
-                            })
-                          : undefined
-                      }
-                    />
-                  ))}
-                </section>
-              );
-            })
+            <QueueEtaContext value={etaById}>
+              {visibleGroups.map((group) => (
+                <QueueGroup
+                  key={group}
+                  group={group}
+                  rows={grouped.get(group)!}
+                  sort={sort}
+                  etaById={sort === "eta" ? etaById : null}
+                  selectedId={selectedId}
+                  picked={picked}
+                  onToggleGroup={toggleGroup}
+                  onSelect={setSelectedId}
+                  onPick={togglePicked}
+                  statusLabel={statusLabel}
+                  onPause={pauseRow}
+                  onCancel={setConfirmRowCancel}
+                  heldOf={heldValue}
+                  holdOf={holdValue}
+                />
+              ))}
+            </QueueEtaContext>
           )}
         </div>
         {dropping ? (
@@ -677,7 +691,7 @@ export function DownloadsPage() {
         <DownloadInspector
           key={selected.id}
           job={selected}
-          eta={waitValue(selected) ?? EM_DASH}
+          eta={heldValue(selected) ?? etaById.get(selected.id) ?? EM_DASH}
           rate={ratePhase(selected.phaseProgress)?.rateBps ?? 0}
           onRemoved={handleRemoved}
         />
@@ -719,6 +733,96 @@ export function DownloadsPage() {
     </NextShell>
   );
 }
+
+
+/** Whether every prop is the same, the rows compared one by one. */
+function sameGroupProps(left: QueueGroupProps, right: QueueGroupProps): boolean {
+  return (Object.keys(right) as (keyof QueueGroupProps)[]).every((key) =>
+    key === "rows" ? sameElements(left.rows, right.rows) : Object.is(left[key], right[key]),
+  );
+}
+
+interface QueueGroupProps {
+  group: DownloadGroup;
+  /** In queue order; sorted here. */
+  rows: readonly JobData[];
+  sort: SortId;
+  /** Time left by id, in the order the sort ranks by, while that is the sort. */
+  etaById: ReadonlyMap<number, string> | null;
+  selectedId: number | null;
+  picked: ReadonlySet<number>;
+  onToggleGroup: (group: DownloadGroup) => void;
+  onSelect: (id: number) => void;
+  onPick: (id: number) => void;
+  statusLabel: (status: string) => string;
+  onPause: (id: number, paused: boolean) => void;
+  onCancel: (id: number) => void;
+  heldOf: (job: JobData) => string | null;
+  holdOf: (job: JobData) => string | null;
+}
+
+/**
+ * One section of the queue. A progress event replaces one job's object and
+ * leaves the rest as they were, so a section whose rows are all the same
+ * objects in the same order is not drawn again.
+ */
+const QueueGroup = memo(function QueueGroup({
+  group,
+  rows,
+  sort,
+  etaById,
+  selectedId,
+  picked,
+  onToggleGroup,
+  onSelect,
+  onPick,
+  statusLabel,
+  onPause,
+  onCancel,
+  heldOf,
+  holdOf,
+}: QueueGroupProps) {
+  const t = useTranslate();
+  const sorted = sortJobs(rows, sort, etaById);
+  return (
+    <section className="flex flex-none flex-col">
+      <SectionHeader
+        lead={
+          <CheckBox
+            label={t("next.downloads.selectGroup", { group: t(DOWNLOAD_GROUP_LABEL[group]) })}
+            checked={rows.every((job) => picked.has(job.id))}
+            onChange={() => onToggleGroup(group)}
+          />
+        }
+        label={t(DOWNLOAD_GROUP_LABEL[group])}
+        count={rows.length}
+        note={DOWNLOAD_GROUP_NOTE[group] === null ? undefined : t(DOWNLOAD_GROUP_NOTE[group])}
+      />
+      {sorted.map((job) => (
+        <DownloadRow
+          key={job.id}
+          job={job}
+          selected={job.id === selectedId}
+          onSelect={onSelect}
+          picked={picked.has(job.id)}
+          onPick={onPick}
+          statusLabel={statusLabel}
+          onPause={onPause}
+          onCancel={onCancel}
+          held={heldOf(job)}
+          hold={holdOf(job)}
+          statusTitle={
+            job.status === "PROPAGATING" && job.downloadRetryAtEpochMs != null
+              ? t("next.status.propagationUntil", {
+                  time: new Date(job.downloadRetryAtEpochMs).toLocaleString(),
+                })
+              : undefined
+          }
+        />
+      ))}
+    </section>
+  );
+}, sameGroupProps);
 
 /** Whether a drag is carrying files from the desktop, not text or a link from the page. */
 function carriesFiles(event: DragEvent): boolean {

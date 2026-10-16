@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -67,6 +70,9 @@ pub(crate) async fn run(
         )
     })
     .await??;
+    proxies.set_allow_private_network(
+        weaver_server_core::security::RuntimeSecurityConfig::from_env()?.rss_allow_private_network,
+    );
     let nntp = wiring::build_nntp_client(config, &profile, &server_transfer_policy, &proxies)?;
     let initial_global_paused = weaver_server_core::runtime::load_global_pause_from_db(db).await?;
 

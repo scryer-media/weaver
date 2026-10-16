@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Event-driven campaigns against retained PAR3 state. No wall clock, network,
 // reference executable, or optional corpus is needed. Each assertion names its
 // seed and a minimized event trace. WEAVER_PAR3_SCHEDULE_SEED replays one seed;
@@ -5,7 +8,7 @@
 
 use super::*;
 use par3_rs::creation::{
-    CreationCodec, CreationDurability, CreationOptions, CreationPlan, CreationSource, Deduplication,
+    CreationCodec, CreationOptions, CreationPlan, CreationSource, Deduplication,
 };
 use par3_rs::session::RepairStatus;
 use par3_rs::source::MemorySourceAccess;
@@ -218,10 +221,9 @@ impl Fixture {
             );
         }
         let paths = plan
-            .execute_with_durability(
+            .execute(
                 &self._root.path().join(format!("{stem}.par3")),
                 self._root.path(),
-                CreationDurability::Buffered,
             )
             .unwrap();
         self.carriers

@@ -1,4 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(test)]
 use reqwest::header::{ETAG, IF_NONE_MATCH};
@@ -10,7 +14,8 @@ use crate::RssRuleAction;
 use crate::SchedulerHandle;
 use crate::ingest::{SubmissionOptions, submit_nzb_bytes_with_options};
 use crate::jobs::{CallerScopedIdempotency, SubmissionOrigin};
-use crate::rss::model::{FeedItem, build_submission_metadata, unix_now_secs};
+use crate::proxies::{Consumer, FetchOptions, read_body, routed_fetch};
+use crate::rss::model::{FeedItem, apply_basic_auth, build_submission_metadata, unix_now_secs};
 #[cfg(test)]
 use crate::rss::model::{compile_rules, evaluate_item, parse_feed_items};
 use crate::security::RuntimeSecurityConfig;
@@ -168,11 +173,16 @@ impl RssService {
         if !response.status().is_success() {
             return Err(format!("failed to fetch NZB: HTTP {}", response.status()));
         }
+        let supplied_password_candidates = crate::ingest::header_archive_password_candidates(
+            crate::ingest::dnzb_header_passwords(response.headers())
+                .iter()
+                .map(String::as_str),
+        );
 
         let nzb_bytes = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err("scheduled RSS sync cancelled".into()),
-            result = read_response_with_limit(response, self.inner.security.nzb_decompressed_limit_bytes) => result.map_err(|e| format!("failed to read NZB body: {e}"))?,
+            result = read_body(response, self.inner.security.nzb_decompressed_limit_bytes) => result.map_err(|e| format!("failed to read NZB body: {e}"))?,
         };
         weaver_nzb::parse_nzb(&nzb_bytes).map_err(|e| format!("invalid NZB: {e}"))?;
 
@@ -221,6 +231,7 @@ impl RssService {
             SubmissionOptions {
                 origin: SubmissionOrigin::Rss,
                 idempotency,
+                supplied_password_candidates,
                 ..SubmissionOptions::default()
             },
         )
@@ -244,39 +255,42 @@ impl RssService {
     ) -> Result<reqwest::Response, RssServiceError> {
         let feed_url =
             reqwest::Url::parse(&feed.url).map_err(|e| RssServiceError::Http(e.to_string()))?;
-        let mut current_url =
-            reqwest::Url::parse(url).map_err(|e| RssServiceError::Http(e.to_string()))?;
-
-        for redirect_count in 0..=MAX_RSS_REDIRECTS {
-            let response = self
-                .send_routed_request(
-                    feed,
-                    &current_url,
-                    &feed_url,
-                    conditional && redirect_count == 0,
-                )
-                .await?;
-            if response.status().is_redirection() {
-                if redirect_count == MAX_RSS_REDIRECTS {
-                    return Err(RssServiceError::Http("too many redirects".to_string()));
+        let url = reqwest::Url::parse(url).map_err(|e| RssServiceError::Http(e.to_string()))?;
+        let runtime = self
+            .inner
+            .handle
+            .proxy_runtime()
+            .ok_or_else(|| RssServiceError::Http("RSS request has no route".into()))?;
+        let options = FetchOptions {
+            label: "RSS",
+            timeout: Duration::from_secs(30),
+            redirects: MAX_RSS_REDIRECTS,
+            user_agent: "weaver-rss/0.1",
+            https_only: false,
+            allow_private_network: self.inner.security.rss_allow_private_network,
+        };
+        routed_fetch(
+            &runtime,
+            Consumer::Rss(feed.id),
+            &url,
+            &options,
+            |mut request, hop_url, hop| {
+                if same_rss_origin(hop_url, &feed_url) {
+                    request = apply_basic_auth(request, feed);
                 }
-                let location = response
-                    .headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|value| value.to_str().ok())
-                    .ok_or_else(|| {
-                        RssServiceError::Http("redirect missing Location".to_string())
-                    })?;
-                current_url = current_url
-                    .join(location)
-                    .map_err(|e| RssServiceError::Http(format!("invalid redirect: {e}")))?;
-                continue;
-            }
-
-            return Ok(response);
-        }
-
-        Err(RssServiceError::Http("too many redirects".to_string()))
+                if conditional && hop == 0 {
+                    if let Some(etag) = &feed.etag {
+                        request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+                    }
+                    if let Some(modified) = &feed.last_modified {
+                        request = request.header(reqwest::header::IF_MODIFIED_SINCE, modified);
+                    }
+                }
+                request
+            },
+        )
+        .await
+        .map_err(RssServiceError::Http)
     }
 
     pub(super) fn record_seen(
@@ -315,39 +329,6 @@ pub(super) fn same_rss_origin(request_url: &reqwest::Url, feed_url: &reqwest::Ur
             .zip(feed_url.host_str())
             .is_some_and(|(request_host, feed_host)| request_host.eq_ignore_ascii_case(feed_host))
         && request_url.port_or_known_default() == feed_url.port_or_known_default()
-}
-
-pub(super) async fn read_response_with_limit(
-    mut response: reqwest::Response,
-    limit: u64,
-) -> Result<Vec<u8>, String> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit)
-    {
-        return Err(format!("response exceeds {limit} bytes"));
-    }
-
-    let route = response
-        .extensions()
-        .get::<super::routing::RoutedBodyContext>()
-        .cloned();
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| {
-        // reqwest labels every frame-read failure as Decode, including a
-        // truncated TCP response. Feed parsing happens after this complete read.
-        if let Some(route) = &route {
-            route.failed();
-        }
-        "body read failed".to_string()
-    })? {
-        let next_len = body.len().saturating_add(chunk.len());
-        if next_len as u64 > limit {
-            return Err(format!("response exceeds {limit} bytes"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 #[cfg(test)]

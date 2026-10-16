@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The container engine the tooling runs its Linux checks in.
 //
 // Docker and Podman take the same `run` arguments for what the tooling

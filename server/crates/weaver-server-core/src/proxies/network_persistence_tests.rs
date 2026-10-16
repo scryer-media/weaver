@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
-use crate::proxies::{Failover, ProxyKind, ProxySecrets, RouteLeg};
+use crate::proxies::{Failover, ProxyKind, ProxySecrets, Resolver, RouteLeg};
 
 // The code of the refusal a write was turned away with. A storage fault has
 // none, so a refusal that degrades into one fails here.
@@ -31,6 +34,7 @@ fn profile(id: u32) -> ProxyProfile {
         enabled: true,
         host: "proxy.example".into(),
         port: 1080,
+        resolver: Resolver::Proxy,
         dns_servers: vec!["192.0.2.53".parse().unwrap()],
         tunnel_addresses: vec![],
         peer_public_key: None,
@@ -172,6 +176,72 @@ fn referenced_resources_cannot_be_deleted_and_pool_edits_validate_existing_ladde
         refused(db.save_proxy_profile(&changed)),
         "PROXY_KIND_LOCKED_BY_POOL"
     );
+}
+
+#[test]
+fn a_pool_saves_with_any_member_count_but_a_route_needs_a_member() {
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&profile(1)).unwrap();
+    let mut pool = db
+        .create_proxy_pool(&ProxyPool {
+            id: 0,
+            name: "Region".into(),
+            kind: ProxyKind::Socks5,
+            member_ids: vec![],
+            enabled: true,
+        })
+        .unwrap();
+    assert!(pool.member_ids.is_empty());
+    let consumer = crate::proxies::Consumer::Server(1);
+    let pooled = RoutingPolicy {
+        legs: vec![RouteLeg {
+            egress_id: 0,
+            weight: 100,
+            path: LegPath::Ladder {
+                rungs: vec![Rung::Pool { id: pool.id }],
+                direct_fallback: false,
+            },
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        refused(db.save_proxy_routing_policy(consumer, &pooled)),
+        "ROUTE_POOL_EMPTY"
+    );
+    assert!(db.list_proxy_routes().unwrap().is_empty());
+
+    pool.member_ids = vec![1];
+    assert_eq!(db.update_proxy_pool(&pool).unwrap().member_ids, [1]);
+    db.save_proxy_routing_policy(consumer, &pooled).unwrap();
+
+    // The route keeps the pool's last member: not by emptying the pool, by
+    // deleting the proxy, or by changing its kind.
+    pool.member_ids.clear();
+    assert_eq!(refused(db.update_proxy_pool(&pool)), "POOL_IN_USE_EMPTY");
+    assert_eq!(refused(db.delete_proxy_profile(1)), "PROXY_IN_POOL");
+    let mut retyped = profile(1);
+    retyped.kind = ProxyKind::HttpConnect;
+    retyped.revision += 1;
+    assert_eq!(
+        refused(db.save_proxy_profile(&retyped)),
+        "PROXY_KIND_LOCKED_BY_POOL"
+    );
+    assert_eq!(db.list_proxy_pools().unwrap()[0].member_ids, [1]);
+
+    // Once no route uses it, the pool empties again.
+    db.save_proxy_routing_policy(
+        consumer,
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: 0,
+                weight: 100,
+                path: LegPath::Direct,
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(db.update_proxy_pool(&pool).unwrap().member_ids.is_empty());
 }
 
 #[test]

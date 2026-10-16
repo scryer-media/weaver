@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Gating behaviour of [`GatedSplitReader`]: what parks, what does not, and
 // what wakes a parked reader.
 //

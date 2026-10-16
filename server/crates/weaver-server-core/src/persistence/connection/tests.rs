@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -74,6 +77,7 @@ fn postgres_sample_job(job_id: crate::jobs::ids::JobId) -> ActiveJob {
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         password_override: None,
+        supplied_password_candidates: Vec::new(),
     }
 }
 
@@ -1352,6 +1356,7 @@ async fn postgres_lanes_commit_an_archive_after_its_jobs_earlier_writes() {
             job_id,
             history: Box::new(postgres_sample_history(job_id)),
             typed_terminal_cause: None,
+            failure_kind: None,
             committed: Some(committed_tx),
         },
     })
@@ -1545,6 +1550,7 @@ async fn postgres_lanes_run_attribution_alongside_job_writes_but_before_the_arch
             job_id,
             history: Box::new(postgres_sample_history(job_id)),
             typed_terminal_cause: None,
+            failure_kind: None,
             committed: Some(committed_tx),
         },
     })
@@ -2387,7 +2393,12 @@ async fn postgres_job_lane_writes_keep_order_and_archive_last_when_configured() 
     }
     let job_id = crate::jobs::ids::JobId(jobs[0]);
     let committed = db
-        .try_queue_archive_job_with_terminal_cause(job_id, postgres_sample_history(job_id), None)
+        .try_queue_archive_job_with_terminal_cause(
+            job_id,
+            postgres_sample_history(job_id),
+            None,
+            None,
+        )
         .unwrap();
     committed.await.unwrap();
     assert!(db.get_job_history(job_id.0).unwrap().is_some());
@@ -2820,6 +2831,7 @@ async fn postgres_runtime_smoke_when_configured() {
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         password_override: None,
+        supplied_password_candidates: Vec::new(),
     })
     .unwrap();
     db.upsert_file_progress_batch(&[ActiveFileProgress {

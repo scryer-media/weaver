@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Test helper module — not all items are used by every test binary.
 #![allow(dead_code)]
 
@@ -152,6 +155,9 @@ pub struct TestHarness {
     // the trusted-network list is observable from a test.
     pub security: weaver_server_core::security::RuntimeSecurityConfig,
     pub update_check: weaver_server_core::update_check::UpdateCheckService,
+    // The archive passwords each submission handed the scheduler beside the
+    // job's own, by job.
+    pub supplied_passwords: SuppliedPasswords,
     _scheduler_task: JoinHandle<()>,
     _tempdir: tempfile::TempDir,
 }
@@ -224,7 +230,9 @@ impl TestHarness {
         };
         let shared_config: SharedConfig = Arc::new(RwLock::new(config));
 
-        let (handle, metrics, shared_state, scheduler_task) = spawn_test_scheduler(db.clone());
+        let supplied_passwords = SuppliedPasswords::default();
+        let (handle, metrics, shared_state, scheduler_task) =
+            spawn_test_scheduler(db.clone(), supplied_passwords.clone());
         let rss = RssService::new(handle.clone(), shared_config.clone(), db.clone());
         let watch_folder = weaver_server_core::watch_folder::WatchFolderService::new(
             db.clone(),
@@ -244,11 +252,18 @@ impl TestHarness {
             .expect("failed to create server transfer policy registry"),
         );
         handle.set_server_transfer_policy(Arc::clone(&server_transfer_policy));
+        // Fetches leave only on a route; with nothing saved, each is direct.
+        let proxies = weaver_server_core::proxies::ProxyRuntime::new(
+            db.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        handle.set_proxy_runtime(proxies.clone());
 
         let scheduled_resume =
             weaver_server_api::ScheduledResumeCoordinator::new(db.clone(), handle.clone());
-        let update_check = weaver_server_core::update_check::UpdateCheckService::new(db.clone())
-            .expect("failed to create update checker");
+        let update_check =
+            weaver_server_core::update_check::UpdateCheckService::new(db.clone(), proxies.clone());
         // The upgrade surface is part of the schema, so the harness carries one
         // too. Its profile directory is the test's own temporary tree: nothing
         // here may touch a real installation.
@@ -259,6 +274,7 @@ impl TestHarness {
                 tempdir.path(),
                 weaver_server_core::application_upgrade::collect_installation_assessment(),
                 None,
+                proxies,
             );
         let schema = build_schema(SchemaContext {
             handle: handle.clone(),
@@ -323,6 +339,7 @@ impl TestHarness {
             auth_cache,
             security,
             update_check,
+            supplied_passwords,
             _scheduler_task: scheduler_task,
             _tempdir: tempdir,
         }
@@ -553,8 +570,12 @@ pub fn make_multi_file_nzb(name: &str, file_count: usize) -> String {
 
 // Spawn a mock scheduler that handles commands without performing real
 // downloads. Returns the handle and the background task.
+pub type SuppliedPasswords =
+    Arc<std::sync::Mutex<HashMap<JobId, Vec<weaver_server_core::jobs::ArchivePasswordCandidate>>>>;
+
 fn spawn_test_scheduler(
     db: Database,
+    supplied_passwords: SuppliedPasswords,
 ) -> (
     SchedulerHandle,
     Arc<PipelineMetrics>,
@@ -579,9 +600,14 @@ fn spawn_test_scheduler(
                     job_id,
                     spec,
                     nzb_path: _,
+                    options,
                     reply,
                     ..
                 } => {
+                    supplied_passwords
+                        .lock()
+                        .unwrap()
+                        .insert(job_id, options.supplied_password_candidates);
                     if jobs.contains_key(&job_id) {
                         let _ =
                             reply.send(Err(weaver_server_core::SchedulerError::JobExists(job_id)));
@@ -686,6 +712,10 @@ fn spawn_test_scheduler(
                         Err(weaver_server_core::SchedulerError::JobNotFound(job_id))
                     };
                     let _ = reply.send(result);
+                }
+                SchedulerCommand::SetSpeedTestPause { paused, reply } => {
+                    scheduler_state.set_speed_test_paused(paused);
+                    let _ = reply.send(());
                 }
                 SchedulerCommand::PauseAll { reply } => {
                     scheduler_state.set_paused(true);
@@ -919,6 +949,10 @@ fn spawn_test_scheduler(
                         None => Err(weaver_server_core::SchedulerError::JobNotFound(job_id)),
                     };
                     let _ = reply.send(result);
+                }
+                SchedulerCommand::UpdateHistory { job_id, reply, .. } => {
+                    let _ =
+                        reply.send(Err(weaver_server_core::SchedulerError::JobNotFound(job_id)));
                 }
                 SchedulerCommand::ReorderJob { job_id, reply, .. } => {
                     let result = if jobs.contains_key(&job_id) {

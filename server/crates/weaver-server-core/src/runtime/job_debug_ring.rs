@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The last few debug lines of each job, kept whatever the log level is.
 //
 // A stall is usually reported at INFO, where the lines that explain it —

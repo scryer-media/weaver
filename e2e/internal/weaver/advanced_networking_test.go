@@ -1,6 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 package weaver
 
 import (
+	"context"
 	"encoding/json"
 	"net/netip"
 	"os"
@@ -40,7 +44,7 @@ type composeOverride struct {
 
 func readOverride(t *testing.T, phase *weaverReleasePhase) composeOverride {
 	t.Helper()
-	if err := writeAdvancedNetworkOverride(phase); err != nil {
+	if err := writeAdvancedNetworkOverride(t.Context(), phase); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(phase.ComposeOverride)
@@ -117,6 +121,64 @@ func TestEgressOverrideAttachesEveryDestinationToBothNetworks(t *testing.T) {
 	}
 }
 
+func TestSpeedTestOverrideAllowlistsCloudflareOnTheFixture(t *testing.T) {
+	previous := lookupPublicHostIPv4
+	t.Cleanup(func() { lookupPublicHostIPv4 = previous })
+	var asked []string
+	lookupPublicHostIPv4 = func(_ context.Context, host string) ([]string, error) {
+		asked = append(asked, host)
+		return []string{"203.0.113.10", "203.0.113.11"}, nil
+	}
+	phase := advancedTestPhase(t, speedTestReleaseFlow(), "10.249.1.0/24", "10.249.2.0/24")
+	override := readOverride(t, phase)
+
+	if !slices.Equal(asked, []string{"speed.cloudflare.com"}) {
+		t.Fatalf("resolved %v, want only speed.cloudflare.com", asked)
+	}
+	var targets []struct {
+		Host      string   `json:"host"`
+		Port      int      `json:"port"`
+		Addresses []string `json:"addresses"`
+	}
+	if err := json.Unmarshal([]byte(override.Services["proxy-fixture"].Environment["PROXY_FIXTURE_PUBLIC_TARGETS"]), &targets); err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Host != "speed.cloudflare.com" || targets[0].Port != 443 || !slices.Equal(targets[0].Addresses, []string{"203.0.113.10", "203.0.113.11"}) {
+		t.Fatalf("public targets = %+v", targets)
+	}
+
+	plain := advancedTestPhase(t, advancedNetworkingReleaseFlow(), "10.249.1.0/24", "10.249.2.0/24")
+	if _, ok := readOverride(t, plain).Services["proxy-fixture"].Environment["PROXY_FIXTURE_PUBLIC_TARGETS"]; ok {
+		t.Fatal("a flow without public targets must not allowlist any")
+	}
+}
+
+func TestPublicTargetLookupUsesTheFlowContext(t *testing.T) {
+	previous := lookupPublicHostIPv4
+	t.Cleanup(func() { lookupPublicHostIPv4 = previous })
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	lookupPublicHostIPv4 = func(received context.Context, _ string) ([]string, error) {
+		if received != ctx {
+			t.Fatal("DNS lookup must use the enclosing flow context")
+		}
+		return nil, received.Err()
+	}
+	phase := advancedTestPhase(t, speedTestReleaseFlow(), "10.249.1.0/24", "10.249.2.0/24")
+	if _, err := advancedNetworkOverride(ctx, phase); err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("flow cancellation must reach the lookup: %v", err)
+	}
+}
+
+func TestResolvePublicTargetsRefusesAnUnresolvedHost(t *testing.T) {
+	previous := lookupPublicHostIPv4
+	t.Cleanup(func() { lookupPublicHostIPv4 = previous })
+	lookupPublicHostIPv4 = func(context.Context, string) ([]string, error) { return nil, nil }
+	if _, err := resolvePublicTargets(t.Context(), []weaverPublicTarget{{Host: "speed.cloudflare.com", Port: 443}}); err == nil {
+		t.Fatal("a host with no IPv4 address must be an error")
+	}
+}
+
 func TestNoNetRawOverrideDropsTheCapabilityOnOneNetwork(t *testing.T) {
 	override := readOverride(t, advancedTestPhase(t, advancedNetworkingNoNetRawReleaseFlow()))
 	if len(override.Networks) != 1 {
@@ -149,7 +211,7 @@ func TestFixtureAddressOverridePinsOnlyTheFixture(t *testing.T) {
 
 func TestEgressOverrideRefusesMissingEgressSubnets(t *testing.T) {
 	phase := advancedTestPhase(t, advancedNetworkingReleaseFlow(), "10.249.1.0/24")
-	if err := writeAdvancedNetworkOverride(phase); err == nil {
+	if err := writeAdvancedNetworkOverride(t.Context(), phase); err == nil {
 		t.Fatal("an egress layout with one egress subnet unexpectedly produced an override")
 	}
 }
@@ -352,6 +414,7 @@ func TestAdvancedNetworkingTimeScaleReachesOnlyItsFlows(t *testing.T) {
 		"advanced-networking-pools":            true,
 		"advanced-networking-pool-reselection": true,
 		"advanced-networking-no-net-raw":       true,
+		"speed-test":                           true,
 	}
 	t.Setenv("E2E_WEAVER_NETWORK_TIME_SCALE", "99")
 	for _, spec := range weaverReleaseFlowSpecs {

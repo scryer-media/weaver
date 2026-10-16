@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // What an idle pipeline costs: no job snapshot publishes, a slow metrics
 // tick, and no completion checks for jobs that cannot have changed.
 //

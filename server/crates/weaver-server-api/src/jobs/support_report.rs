@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // GraphQL surface for support reports. The reports themselves, and the
 // redaction they guarantee, live in `weaver_server_core::support`.
 

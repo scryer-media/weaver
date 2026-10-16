@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use hmac::{Hmac, Mac, digest::KeyInit};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

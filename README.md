@@ -6,7 +6,7 @@
 </h1>
 
 <p align="center">
-  A modern, all-in-one Usenet downloader built in Rust.<br/>
+  The fastest, most efficient, all-in-one Usenet downloader.<br/>
   Download, repair, and extract — in a single binary.
 </p>
 
@@ -28,33 +28,61 @@
 
 ## What is Weaver?
 
-Weaver is a Usenet binary downloader that handles the entire pipeline — downloading articles, decoding, PAR2/PAR3 verification and repair, and extraction (RAR, 7z, etc) — all within a single self-contained binary. No need to install `unrar`, `par2repair`, or any other external tools.
+Weaver is a Usenet binary downloader that handles the entire pipeline — downloading articles, decoding, PAR2/PAR3 verification and repair, and extraction (RAR, 7z, etc) — all within a single self-contained binary. No need to install `rar`, `par2cmdline-turbo`, or any other external tools.
 
-Built on [rarpar](https://github.com/scryer-media/rarpar), Rust libraries for RAR extraction and PAR2/PAR3 repair.
+Built on [rarpar](https://github.com/scryer-media/rarpar), the fastest libraries for RAR extraction and PAR2/PAR3 repair.
 
-PAR3 support includes selective recovery downloads, virtual and renamed sources,
-Cauchy and low-rate FFT sets, deduplicated blocks, Data packets, and protection
-embedded in ZIP/ZIP64 and 7z. Weaver verifies, repairs and extracts existing sets;
-it does not create them. Embedded discovery runs only for jobs without PAR2;
-PAR2 takes priority in mixed jobs. See the [native scenarios](e2e/docs/par3.md) for resource limits and validation.
+Weaver runs a highly efficient pipeline that not only unpacks archives while downloading, for "store mode" RAR and 7z archives (the majority of binary content on Usenet), Weaver streams the file straight to your disk, no sepearate unpack. This makes it use far less CPU than even NzbGet.
 
-Instead of the traditional sequential approach (download everything, then repair, then extract), Weaver can run downloading and extraction concurrently*. Extraction begins as soon as the first archive volume finishes downloading, so files appear on disk while the rest of the job is still in progress.
+## Key Features
 
-### Key Features
-
-- **Single binary** — no external `unrar`, `par2`, or other tools required
-- **Ultra fast** — weaver is native compiled machine code
-- **Incremental extraction** — starts extracting files while still downloading
+- **Single binary** — no external tooling required, the final binary is small
+- **Advanced Networking** - _See more below_
+- **NZBGet API Facade** - [Add Weaver as NZBGet](https://www.scryer.media/weaver/docs/guides/nzbget-api/) to your favorite tools today
+- **Ultra fast** — Weaver is performance tuned and architected for speed - [BENCHMARKS](https://www.scryer.media/weaver/benchmarks/)
+- **Incremental extraction** — starts extracting files while still downloading, for all archive types
 - **Real-time updates** — websocket push for job progress and system events, less chatty than other tools
-- **Download quotas** — configurable daily, weekly, or monthly data limits to work with ISP bandwidth caps
+- **Download limits** — configurable daily, weekly, or monthly data limits to work with ISP bandwidth caps. Speed limits per server and/or per WAN connection
 - **Observable** — Built in metrics and timeline views help visualize what happens during download with support for prometheus 
+
+## Advanced Networking
+Weaver has an incredibly powerful networking sub system. It enables you to compose different building blocks into highly sophisticated netflows to ensure you're maximizing your bandwidth and privacy.
+
+![advanced networking overview picture](docs/img/networking.png)
+
+### Features
+- **Multiple interface support** (have two ISPs? one Weaver can max them both!)
+- **Proxy support** (Wireguard, SSH, SOCKS, etc)
+- **Proxy chains** (Wireguard in Wireguard)
+- **Proxy pools** (France VPN PoPs)
+- **Killswitch** (_never connect to X from my ISP without proxy protection_)
+
+## Compatability
+
+| Tech   | Weaver | Sabnzbd | Nzbget |
+| ------ | ------ | ------- | ------ |
+| RAR    | ⭐️⭐️*   | ⭐️      | ⭐️     | 
+| 7z     | ⭐️⭐️*   | ⭐️      | ⭐️     |
+| Nested | ⭐️     | ⭐️      | ⭕️**    |
+| ZIP    | ⭐️     | ⭐️      | ❌      |
+| TAR    | ⭐️     | ⭐️      | ❌      |
+| xz     | ⭐️     | ❌      | ❌      |
+| zstd   | ⭐️     | ❌      | ❌      |
+| br     | ⭐️     | ❌      | ❌      |
+| gzip   | ⭐️     | ❌      | ❌      |
+| bzip2  | ⭐️     | ❌      | ❌      |
+| par2   | ⭐️     | ⭐️      | ⭐️      |
+| par3***| ⭐️     | ❌      | ❌      |
+
+_*Weaver supports "store mode" optimizations that directly materialize the binary file through a streaming decoder rather than download => decode_
+
+_**Nzbget supports nested with an extension and it is limited in supported formats_
+
+_***par3 spec is still in alpha, however Weaver is ready to use it today so you're never behind when posters start uploading with it. Par3 can be faster than par2 repair and also can repair much larger holes in files_
 
 ## Install
 
-See [Installation](https://www.scryer.media/weaver/docs/installation/) for supported install methods and [Getting Started](https://www.scryer.media/weaver/docs/getting-started/) for first-run setup.
-
-See [Network setup and browser access](docs/network-setup.md) for Compose defaults,
-one-time setup codes, environment overrides, trusted proxies, and legacy compatibility.
+See [Installation](https://www.scryer.media/weaver/docs/installation/) for installation instructions
 
 ## API
 
@@ -62,24 +90,7 @@ Weaver exposes a **GraphQL API** at `/graphql` with full query, mutation, and su
 
 ## Metrics & dashboards
 
-Weaver serves Prometheus metrics at `/metrics` on the same port as the web UI. They cover download throughput, pipeline backpressure, per-server health and quotas, and post-processing — enough to answer "why is this slow right now?" without opening the UI.
-
-`/metrics` is authenticated by default; to disable, set `WEAVER_METRICS_AUTH_REQUIRED=0`.
-Otherwise give Prometheus a persistent Read-scoped Weaver API key using its standard bearer authorization support:
-
-```yaml
-scrape_configs:
-  - job_name: weaver
-    static_configs:
-      - targets: ["weaver:9090"]
-    authorization:
-      type: Bearer
-      credentials_file: /run/secrets/weaver-metrics-api-key
-```
-
-This sends `Authorization: Bearer <key>` without reusing browser credentials.
-
-See [docs/metrics.md](docs/metrics.md) for the full metric catalogue, label conventions, and useful PromQL. Ready-made [Grafana dashboard](contrib/grafana/weaver-overview.json) and [Prometheus alert rules](contrib/prometheus/weaver-alerts.yml) live under `contrib/`.
+Weaver serves comprehensive Prometheus metrics at `/metrics` 
 
 ## Technology Radar
 

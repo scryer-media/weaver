@@ -1,8 +1,12 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, net::IpAddr, time::Duration};
+use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Duration};
 use weaver_tunnel::{
     Http3ProxyCredentials, Http3TunnelProvider, Http3TunnelSpec, TunnelError, TunnelSpec,
     WireGuardSpec, parse_key,
+    pipe::{Egress, Naming},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,6 +16,14 @@ pub enum ProxyKind {
     Socks5,
     Ssh,
     WireGuard,
+}
+
+// Who resolves a name dialled through a proxy: the next hop's endpoint, or
+// the destination when the proxy is the last hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Resolver {
+    Weaver,
+    Proxy,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -36,6 +48,9 @@ pub struct ProxyProfile {
     pub enabled: bool,
     pub host: String,
     pub port: u16,
+    pub resolver: Resolver,
+    // Asked in order by the resolver. Empty: the resolver's host resolves,
+    // Weaver's own DNS or the proxy's.
     pub dns_servers: Vec<IpAddr>,
     pub tunnel_addresses: Vec<String>,
     pub peer_public_key: Option<String>,
@@ -51,6 +66,23 @@ pub struct ProxyProfile {
 impl ProxyProfile {
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(u64::from(self.timeout_seconds))
+    }
+    // How a hop through this proxy resolves names, Weaver's servers asked
+    // from `egress`.
+    pub fn naming(&self, egress: Arc<Egress>) -> Naming {
+        match (self.resolver, self.dns_servers.is_empty()) {
+            (Resolver::Weaver, true) => Naming::Host,
+            (Resolver::Weaver, false) => Naming::servers(self.dns_servers.clone(), egress),
+            (Resolver::Proxy, true) => Naming::Proxy,
+            (Resolver::Proxy, false) => Naming::proxy_servers(self.dns_servers.clone()),
+        }
+    }
+    // The DNS servers asked through the proxy itself.
+    pub fn proxy_dns_servers(&self) -> &[IpAddr] {
+        match self.resolver {
+            Resolver::Proxy => &self.dns_servers,
+            Resolver::Weaver => &[],
+        }
     }
     pub fn validate(&self) -> Result<(), super::NetworkRefusal> {
         use super::NetworkRefusal as Refusal;
@@ -71,6 +103,13 @@ impl ProxyProfile {
         }
         if self.dns_servers.len() > 4 || self.tunnel_addresses.len() > 8 {
             return Err(Refusal::ProxyAddressCount);
+        }
+        // A WireGuard peer is handed packets, never a name.
+        if self.kind == ProxyKind::WireGuard
+            && self.resolver == Resolver::Proxy
+            && self.dns_servers.is_empty()
+        {
+            return Err(Refusal::ProxyWireGuardNeedsDnsServers);
         }
         for secret in [
             &self.secrets.username,
@@ -199,7 +238,7 @@ impl ProxyProfile {
                 .iter()
                 .map(|s| s.parse())
                 .collect::<Result<_, _>>()?,
-            dns_servers: self.dns_servers.clone(),
+            dns_servers: self.proxy_dns_servers().to_vec(),
             mtu: self.mtu,
             persistent_keepalive: self.keepalive_seconds.filter(|v| *v != 0),
             request_timeout: self.timeout(),
@@ -308,12 +347,16 @@ impl RoutingPolicy {
 pub enum Consumer {
     Server(u32),
     Rss(u32),
+    // Default outbound: everything Weaver fetches over HTTP that is not a
+    // server, a feed or a speed test. It always exists and has cap 1.
+    Outbound,
 }
 impl Consumer {
     pub fn key(self) -> String {
         match self {
             Self::Server(id) => format!("server:{id}"),
             Self::Rss(id) => format!("rss:{id}"),
+            Self::Outbound => "outbound".into(),
         }
     }
 }
@@ -329,7 +372,7 @@ pub enum RouteState {
 pub struct RoutingStatus {
     pub state: RouteState,
     pub selected_proxy_id: Option<u32>,
-    pub failures: Vec<(u32, String)>,
+    pub failures: Vec<(u32, super::ProxyFault)>,
 }
 impl Default for RoutingStatus {
     fn default() -> Self {

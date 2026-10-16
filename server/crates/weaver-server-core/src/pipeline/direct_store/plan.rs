@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Set admission and destination naming.
 //
 // A direct set is admitted from the **job spec alone**, before a byte lands:

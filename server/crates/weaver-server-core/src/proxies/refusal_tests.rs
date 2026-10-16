@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::NetworkRefusal as R;
@@ -98,7 +101,7 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
         (
             R::PoolMemberCount,
             "POOL_MEMBER_COUNT",
-            "a pool requires between two and sixteen members",
+            "a pool takes at most sixteen members",
         ),
         (
             R::PoolProxyRepeated,
@@ -125,6 +128,11 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             R::PoolEditRepeatsProxy,
             "POOL_EDIT_REPEATS_PROXY",
             "pool edit would repeat a proxy in an existing ladder",
+        ),
+        (
+            R::PoolInUseEmpty,
+            "POOL_IN_USE_EMPTY",
+            "a pool referenced by a server or RSS feed needs at least one member",
         ),
         (
             R::RouteLegCount,
@@ -177,6 +185,11 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "route references a missing pool",
         ),
         (
+            R::RoutePoolEmpty,
+            "ROUTE_POOL_EMPTY",
+            "route references a pool with no members",
+        ),
+        (
             R::RouteProxyMissing,
             "ROUTE_PROXY_MISSING",
             "route references a missing proxy",
@@ -205,16 +218,6 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             R::RouteChainTransport,
             "ROUTE_CHAIN_TRANSPORT",
             "WireGuard and HTTP/3 must be the first proxy in a chain, directly above the egress; WireGuard may also sit directly on another WireGuard proxy",
-        ),
-        (
-            R::RouteRssProxyNeedsDns,
-            "ROUTE_RSS_PROXY_NEEDS_DNS",
-            "every RSS proxy and pool member requires DNS servers",
-        ),
-        (
-            R::RssRouteProxyNeedsDns,
-            "ROUTE_RSS_PROXY_NEEDS_DNS",
-            "RSS proxy routes require configured DNS servers",
         ),
         (
             R::RouteHasAdvancedLegs,
@@ -267,6 +270,11 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             R::ProxyDnsServerInvalid,
             "PROXY_DNS_SERVER_INVALID",
             "DNS servers must be IP addresses",
+        ),
+        (
+            R::ProxyWireGuardNeedsDnsServers,
+            "PROXY_WIREGUARD_NEEDS_DNS_SERVERS",
+            "a WireGuard proxy resolves names only through DNS servers",
         ),
         (
             R::ProxyCredentialTooLarge,
@@ -350,6 +358,64 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "PROXY_HOST_KEY_NOT_SSH",
             "only SSH profiles have host-key trust",
         ),
+        (
+            R::SpeedTestAlreadyRunning { run: 4 },
+            "SPEED_TEST_ALREADY_RUNNING",
+            "speed test 4 is still running; cancel it or wait for it to finish",
+        ),
+        (
+            R::SpeedTestQueueBusy,
+            "SPEED_TEST_QUEUE_BUSY",
+            "the previous speed test is still giving the queue back; start again once it has",
+        ),
+        (
+            R::SpeedTestUsenetNeedsServer,
+            "SPEED_TEST_USENET_NEEDS_SERVER",
+            "a Usenet speed test runs on a server; a feed can run a bandwidth test only",
+        ),
+        (
+            R::SpeedTestLegDownAll,
+            "SPEED_TEST_LEG_DOWN_ALL",
+            "every leg of the route would be down; leave at least one leg up",
+        ),
+        (
+            R::SpeedTestQuotaBlocked {
+                holder: super::SpeedTestQuotaHolder::Egress,
+                id: 3,
+                name: "Uplink".into(),
+            },
+            "SPEED_TEST_QUOTA_BLOCKED",
+            "egress Uplink has used its download quota, and a speed test books its bytes against it",
+        ),
+        (
+            R::SpeedTestLeaseRefused {
+                server: 2,
+                name: "Primary".into(),
+                reason: "its health tracker has it out of service".into(),
+            },
+            "SPEED_TEST_LEASE_REFUSED",
+            "server Primary cannot lend its connections: its health tracker has it out of service",
+        ),
+        (
+            R::TestNeedsRoute,
+            "TEST_NEEDS_ROUTE",
+            "a test goes through a route drafted for it",
+        ),
+        (
+            R::TestTargetRequired,
+            "TEST_TARGET_REQUIRED",
+            "a test of the route alone needs a host and port to reach",
+        ),
+        (
+            R::TestSubjectInRoute,
+            "TEST_SUBJECT_IN_ROUTE",
+            "the route a proxy is tested through cannot carry that proxy",
+        ),
+        (
+            R::TestPathCount { limit: 64 },
+            "TEST_PATH_COUNT",
+            "a test tries every path through the route, and at most 64; draft a smaller route",
+        ),
     ]
 }
 
@@ -383,24 +449,24 @@ fn slot(refusal: &R) -> usize {
         R::PoolGone => 23,
         R::PoolInUse => 24,
         R::PoolEditRepeatsProxy => 25,
-        R::RouteLegCount => 26,
-        R::RouteLegWeightRange => 27,
-        R::RouteLegWeightSum => 28,
-        R::RouteLadderRungCount => 29,
-        R::RouteChainLength => 30,
-        R::RouteDirectPathFalse => 31,
-        R::RouteAndRoutingBoth => 32,
-        R::RouteEgressMissing => 33,
-        R::RouteEgressDisabled => 34,
-        R::RoutePoolMissing => 35,
-        R::RouteProxyMissing => 36,
-        R::RoutingProxyMissing => 37,
-        R::RouteProxyRepeated => 38,
-        R::RoutingProxyRepeated => 39,
-        R::RoutingProxyCount => 40,
-        R::RouteChainTransport => 41,
-        R::RouteRssProxyNeedsDns => 42,
-        R::RssRouteProxyNeedsDns => 43,
+        R::PoolInUseEmpty => 26,
+        R::RouteLegCount => 27,
+        R::RouteLegWeightRange => 28,
+        R::RouteLegWeightSum => 29,
+        R::RouteLadderRungCount => 30,
+        R::RouteChainLength => 31,
+        R::RouteDirectPathFalse => 32,
+        R::RouteAndRoutingBoth => 33,
+        R::RouteEgressMissing => 34,
+        R::RouteEgressDisabled => 35,
+        R::RoutePoolMissing => 36,
+        R::RoutePoolEmpty => 37,
+        R::RouteProxyMissing => 38,
+        R::RoutingProxyMissing => 39,
+        R::RouteProxyRepeated => 40,
+        R::RoutingProxyRepeated => 41,
+        R::RoutingProxyCount => 42,
+        R::RouteChainTransport => 43,
         R::RouteHasAdvancedLegs => 44,
         R::RouteConsumerGone => 45,
         R::WireGuardPathConflict { .. } => 46,
@@ -410,27 +476,38 @@ fn slot(refusal: &R) -> usize {
         R::ProxyTimeoutRange => 50,
         R::ProxyAddressCount => 51,
         R::ProxyDnsServerInvalid => 52,
-        R::ProxyCredentialTooLarge => 53,
-        R::ProxySshUsernameRequired => 54,
-        R::ProxySshKeyRequired => 55,
-        R::ProxySshPasswordUnsupported => 56,
-        R::ProxySocks5PasswordNeedsUsername => 57,
-        R::ProxySocks5CredentialLength => 58,
-        R::ProxyHttpUsernameColon => 59,
-        R::ProxyHttp3PasswordNeedsUsername => 60,
-        R::ProxyTunnel(_) => 61,
-        R::ProxyKindImmutable => 62,
-        R::ProxyKindLockedByPool => 63,
-        R::ProxyLimitReached => 64,
-        R::ProxyRevisionChanged => 65,
-        R::ProxyGone => 66,
-        R::ProxyNotFound => 67,
-        R::ProxyInPool => 68,
-        R::ProxyInUse => 69,
-        R::ProxyHostKeyNotSsh => 70,
+        R::ProxyWireGuardNeedsDnsServers => 53,
+        R::ProxyCredentialTooLarge => 54,
+        R::ProxySshUsernameRequired => 55,
+        R::ProxySshKeyRequired => 56,
+        R::ProxySshPasswordUnsupported => 57,
+        R::ProxySocks5PasswordNeedsUsername => 58,
+        R::ProxySocks5CredentialLength => 59,
+        R::ProxyHttpUsernameColon => 60,
+        R::ProxyHttp3PasswordNeedsUsername => 61,
+        R::ProxyTunnel(_) => 62,
+        R::ProxyKindImmutable => 63,
+        R::ProxyKindLockedByPool => 64,
+        R::ProxyLimitReached => 65,
+        R::ProxyRevisionChanged => 66,
+        R::ProxyGone => 67,
+        R::ProxyNotFound => 68,
+        R::ProxyInPool => 69,
+        R::ProxyInUse => 70,
+        R::ProxyHostKeyNotSsh => 71,
+        R::SpeedTestAlreadyRunning { .. } => 72,
+        R::SpeedTestQueueBusy => 73,
+        R::SpeedTestUsenetNeedsServer => 74,
+        R::SpeedTestLegDownAll => 75,
+        R::SpeedTestQuotaBlocked { .. } => 76,
+        R::SpeedTestLeaseRefused { .. } => 77,
+        R::TestTargetRequired => 78,
+        R::TestSubjectInRoute => 79,
+        R::TestPathCount { .. } => 80,
+        R::TestNeedsRoute => 81,
     }
 }
-const SLOTS: usize = 71;
+const SLOTS: usize = 82;
 
 #[test]
 fn every_refusal_keeps_its_code_and_its_sentence() {
@@ -474,7 +551,6 @@ fn codes_are_screaming_snake_case_and_shared_only_by_the_same_condition() {
             "PROXY_NOT_FOUND",
             "ROUTE_PROXY_MISSING",
             "ROUTE_PROXY_REPEATED",
-            "ROUTE_RSS_PROXY_NEEDS_DNS",
         ]
     );
 }
@@ -513,6 +589,22 @@ fn only_the_sentences_that_name_values_carry_them() {
                 params,
                 serde_json::json!({ "required": 3, "limit": 2, "instanceMib": 516 })
             ),
+            "SPEED_TEST_ALREADY_RUNNING" => {
+                assert_eq!(params, serde_json::json!({ "runId": 4 }))
+            }
+            "SPEED_TEST_QUOTA_BLOCKED" => assert_eq!(
+                params,
+                serde_json::json!({ "scope": "egress", "id": 3, "name": "Uplink" })
+            ),
+            "SPEED_TEST_LEASE_REFUSED" => assert_eq!(
+                params,
+                serde_json::json!({
+                    "serverId": 2,
+                    "name": "Primary",
+                    "reason": "its health tracker has it out of service",
+                })
+            ),
+            "TEST_PATH_COUNT" => assert_eq!(params, serde_json::json!({ "limit": 64 })),
             _ => assert_eq!(params, serde_json::json!({}), "{code}"),
         }
     }
@@ -557,7 +649,11 @@ fn validators_refuse_with_the_variant_for_what_is_wrong() {
         enabled: true,
     };
     let profiles = HashMap::new();
-    assert_eq!(pool(vec![1]).validate(&profiles), Err(R::PoolMemberCount));
+    assert_eq!(pool(vec![]).validate(&profiles), Ok(()));
+    assert_eq!(
+        pool((1..=17).collect()).validate(&profiles),
+        Err(R::PoolMemberCount)
+    );
     assert_eq!(
         pool(vec![1, 2]).validate(&profiles),
         Err(R::PoolProxyMissing)

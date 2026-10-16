@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 /// <reference types="vite/client" />
 
 declare const __WEAVER_DEV_BACKEND_ORIGIN__: string | undefined;

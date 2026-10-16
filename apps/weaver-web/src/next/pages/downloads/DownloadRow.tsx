@@ -1,4 +1,7 @@
-import { memo } from "react";
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+import { memo, useContext, useMemo } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
@@ -9,8 +12,10 @@ import { Icon, type IconName } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
 import { ListRow, ValueCell } from "@/next/components/rows";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
+
 import { statusColor, WV } from "@/next/data/palette";
 import { useDownloadRate } from "@/next/data/use-download-rate";
+import { QueueEtaContext } from "./queue-eta";
 
 /**
  * One queue row.
@@ -26,7 +31,7 @@ export const DownloadRow = memo(function DownloadRow({
   picked,
   onPick,
   statusLabel,
-  wait,
+  held,
   hold,
   statusTitle,
   onPause,
@@ -39,8 +44,8 @@ export const DownloadRow = memo(function DownloadRow({
   picked: boolean;
   onPick: (id: number) => void;
   statusLabel: (status: string) => string;
-  /** A hold or an estimate for the last column; without one it shows the phase's progress. */
-  wait: string | null;
+  /** What stands in for time left while the download is held; null to show its estimate. */
+  held: string | null;
   /** Why the download is held back despite its status, in a word: `ISP cap`. */
   hold: string | null;
   /** A longer account of the wait, shown on hover. */
@@ -59,8 +64,12 @@ export const DownloadRow = memo(function DownloadRow({
   // phase still settling is not what the row says it is doing.
   const phase =
     progress.bars.find((bar) => bar.phase === progress.status) ?? progress.bars.at(-1) ?? null;
-  const trailing =
-    wait ?? (phase && progress.status !== "QUEUED" ? `${Math.round(phase.progressPercent)}%` : EM_DASH);
+  const progressText =
+    phase && progress.status !== "QUEUED" ? `${Math.round(phase.progressPercent)}%` : EM_DASH;
+  const lead = useMemo(
+    () => <CheckBox label={t("next.common.selectItem", { name })} checked={picked} onChange={() => onPick(job.id)} />,
+    [job.id, name, onPick, picked, t],
+  );
 
   return (
     <ListRow
@@ -69,9 +78,7 @@ export const DownloadRow = memo(function DownloadRow({
       picked={picked}
       onClick={() => onSelect(job.id)}
       title={name}
-      lead={
-        <CheckBox label={t("next.common.selectItem", { name })} checked={picked} onChange={() => onPick(job.id)} />
-      }
+      lead={lead}
       left={
         <div className="flex min-w-0 flex-[1_1_240px] flex-col gap-[9px]">
           <span className="truncate text-[13.5px] font-medium tracking-[-0.005em] text-wv-fg">
@@ -111,23 +118,62 @@ export const DownloadRow = memo(function DownloadRow({
             </span>
           </div>
           <ValueCell>{formatSize(job.totalBytes)}</ValueCell>
-          <ValueCell>{trailing}</ValueCell>
-          <div className="-mx-[6px] flex flex-none items-center gap-0.5">
-            <RowIconButton
-              icon={isPaused ? "resume" : "pause"}
-              label={isPaused ? t("action.resume") : t("action.pause")}
-              onClick={() => onPause(job.id, !isPaused)}
-            />
-            <RowIconButton
-              icon="cancelDownload"
-              label={t("next.job.cancelTitle")}
-              danger
-              onClick={() => onCancel(job.id)}
-            />
-          </div>
+          <ValueCell>
+            <RowWait id={job.id} held={held} fallback={progressText} />
+          </ValueCell>
+          <RowActions id={job.id} paused={isPaused} onPause={onPause} onCancel={onCancel} />
         </>
       }
     />
+  );
+});
+
+/**
+ * The last column: a hold, the time left, or failing both the phase's progress.
+ *
+ * A queued row's estimate counts everything ahead of it, so it moves with every
+ * progress event in the queue; this text redraws on its own, not the row.
+ */
+const RowWait = memo(function RowWait({
+  id,
+  held,
+  fallback,
+}: {
+  id: number;
+  held: string | null;
+  fallback: string;
+}) {
+  const etaById = useContext(QueueEtaContext);
+  return held ?? etaById.get(id) ?? fallback;
+});
+
+/** Pause or resume, and cancel; the same two buttons whatever else on the row moves. */
+const RowActions = memo(function RowActions({
+  id,
+  paused,
+  onPause,
+  onCancel,
+}: {
+  id: number;
+  paused: boolean;
+  onPause: (id: number, paused: boolean) => void;
+  onCancel: (id: number) => void;
+}) {
+  const t = useTranslate();
+  return (
+    <div className="-mx-[6px] flex flex-none items-center gap-0.5">
+      <RowIconButton
+        icon={paused ? "resume" : "pause"}
+        label={paused ? t("action.resume") : t("action.pause")}
+        onClick={() => onPause(id, !paused)}
+      />
+      <RowIconButton
+        icon="cancelDownload"
+        label={t("next.job.cancelTitle")}
+        danger
+        onClick={() => onCancel(id)}
+      />
+    </div>
   );
 });
 

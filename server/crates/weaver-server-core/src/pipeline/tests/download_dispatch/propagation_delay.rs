@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // propagation delay
 
 use super::*;
@@ -1007,6 +1010,53 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
 }
 
 #[tokio::test]
+async fn speed_test_hold_preserves_later_schedule_pause() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (reply, received) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::SetSpeedTestPause {
+            paused: true,
+            reply,
+        })
+        .await;
+    received.await.unwrap();
+    assert!(pipeline.shared_state.is_paused());
+    assert!(
+        !pipeline.global_paused,
+        "the transient hold does not become a persisted pause"
+    );
+    let (reply, received) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::ApplyScheduleAction {
+            action: crate::bandwidth::ScheduleAction::Pause,
+            reply,
+        })
+        .await;
+    received.await.unwrap();
+    let (reply, received) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::SetSpeedTestPause {
+            paused: false,
+            reply,
+        })
+        .await;
+    received.await.unwrap();
+    assert!(pipeline.global_paused);
+    assert!(pipeline.scheduled_pause);
+    assert!(pipeline.shared_state.is_paused());
+    let (reply, received) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::ApplyScheduleAction {
+            action: crate::bandwidth::ScheduleAction::Resume,
+            reply,
+        })
+        .await;
+    received.await.unwrap();
+    assert!(!pipeline.shared_state.is_paused());
+}
+
+#[tokio::test]
 async fn streamed_decoded_download_bypasses_decode_backlog() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -1125,6 +1175,7 @@ async fn add_job_with_options_initially_paused_publishes_queued_lane_from_real_p
                 initially_paused: true,
                 semantic_materialization_generation: None,
                 semantic_promotion_generation: None,
+                supplied_password_candidates: Vec::new(),
             },
         )
         .await

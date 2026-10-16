@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Explicit socket ownership for revoking a consumer's current route.
 use socket2::{SockRef, Socket};
 use std::{

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Campaigns beyond the bounded four-article matrix: wider format coverage,
 // further repair and demotion axes, and deeper schedules over the core
 // direct-store RAR layouts.

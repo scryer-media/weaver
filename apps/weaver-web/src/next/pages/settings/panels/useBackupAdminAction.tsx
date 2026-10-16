@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useRef, useState } from "react";
 import { CombinedError } from "urql";
 import { authHeaders, fetchWithSessionRetry } from "@/graphql/client";
@@ -18,6 +21,31 @@ export async function createStoredBackup(password: string, t: Translate): Promis
   }
 }
 
+// Outside the hook, so the hook itself compiles: each resolves to what went wrong, never throws.
+
+/** Runs the action, then `onSuccess`; resolves to what either threw, or null. */
+async function attemptAction(action: () => Promise<void>, onSuccess?: () => void): Promise<{ failure: unknown } | null> {
+  try { await action(); onSuccess?.(); return null; }
+  catch (failure) { return { failure }; }
+}
+
+/** Has the server check the account password; resolves to why it refused, or null once it accepted. */
+async function verifyAccountPassword(t: Translate, password: string): Promise<string | null> {
+  try {
+    const response = await fetchWithSessionRetry(new URL("api/auth/verify", document.baseURI), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null) as { error?: string } | null;
+      throw new Error(payload?.error ?? t("next.backup.requestFailed", { status: response.status }));
+    }
+    return null;
+  } catch (failure) {
+    return failure instanceof Error ? failure.message : String(failure);
+  }
+}
+
 export function useBackupAdminAction(onSuccess?: () => void) {
   const t = useTranslate();
   const [busy, setBusy] = useState(false);
@@ -28,8 +56,9 @@ export function useBackupAdminAction(onSuccess?: () => void) {
   const [verificationError, setVerificationError] = useState<string | null>(null);
   const run = async (action: () => Promise<void>) => {
     setBusy(true); setError(null);
-    try { await action(); onSuccess?.(); }
-    catch (failure) {
+    const failed = await attemptAction(action, onSuccess);
+    if (failed) {
+      const { failure } = failed;
       if (failure instanceof BackupReauthenticationRequired || (failure instanceof CombinedError && failure.graphQLErrors.some((item) => item.extensions?.code === "REAUTH_REQUIRED"))) {
         pendingAction.current = action;
         setVerificationError(null);
@@ -38,26 +67,20 @@ export function useBackupAdminAction(onSuccess?: () => void) {
         setError(failure instanceof Error ? failure.message : String(failure));
       }
     }
-    finally { setBusy(false); }
+    setBusy(false);
   };
   const verifyAndContinue = async () => {
     setBusy(true); setVerificationError(null);
-    try {
-      const response = await fetchWithSessionRetry(new URL("api/auth/verify", document.baseURI), {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: accountPassword }),
-      });
-      if (!response.ok) {
-        const payload = await response.json().catch(() => null) as { error?: string } | null;
-        throw new Error(payload?.error ?? t("next.backup.requestFailed", { status: response.status }));
-      }
+    const refused = await verifyAccountPassword(t, accountPassword);
+    if (refused !== null) {
+      setVerificationError(refused);
+    } else {
       const action = pendingAction.current;
       pendingAction.current = null;
       setAccountPassword(""); setReauthenticating(false);
       if (action) await run(action);
-    } catch (failure) {
-      setVerificationError(failure instanceof Error ? failure.message : String(failure));
-    } finally { setBusy(false); }
+    }
+    setBusy(false);
   };
   const reauthentication = (
     <ConfirmDialog open={reauthenticating} title={t("next.security.currentPassword")} destructive={false} busy={busy || !accountPassword} confirmLabel={t("next.firstRun.continue")} onConfirm={() => void verifyAndContinue()} onDismiss={() => {

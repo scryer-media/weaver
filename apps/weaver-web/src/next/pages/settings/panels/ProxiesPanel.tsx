@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useId, useRef, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import {
@@ -5,12 +8,12 @@ import {
   PROXY_PROFILES_QUERY,
   RESET_PROXY_TRUST_MUTATION,
   SAVE_PROXY_MUTATION,
-  TEST_PROXY_MUTATION,
 } from "@/graphql/proxies";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { proxyLabels, type ProxyKind, type ProxyProfile } from "@/lib/proxies";
+import { proxyLabels, type ProxyKind, type ProxyProfile, type ProxyResolver } from "@/lib/proxies";
 import { cn } from "@/lib/utils";
 import { refusalMessage } from "@/lib/refusal";
+import { TestViaDialog } from "../../../features/networking/TestViaDialog";
 import {
   WIREGUARD_KEY,
   parseWireguardConfig,
@@ -21,7 +24,7 @@ import {
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
-import { SecondaryButton, Segmented, TextArea, TextField } from "../../../components/controls";
+import { DangerButton, SecondaryButton, Segmented, TextArea, TextField } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { WV } from "../../../data/palette";
 import {
@@ -52,6 +55,9 @@ interface ProxyForm {
   enabled: boolean;
   host: string;
   port: number;
+  resolver: ProxyResolver;
+  /** The resolver's host resolves, or the servers in `dns`, in order. */
+  dnsSource: DnsSource;
   dns: string;
   addresses: string;
   peerPublicKey: string;
@@ -80,6 +86,7 @@ const TIMEOUT_MAX = 300;
 const KEEPALIVE_DEFAULT = 25;
 /** The largest configuration read: no real one comes near it. */
 const CONFIG_MAX = 65536;
+type DnsSource = "host" | "servers";
 /** Where a WireGuard profile's details come from. */
 type WireguardStart = "upload" | "paste" | "manual";
 const CONFIG_KEYS = {
@@ -98,6 +105,8 @@ const NEW_PROXY: ProxyForm = {
   enabled: true,
   host: "",
   port: DEFAULT_PORTS.WIRE_GUARD,
+  resolver: "WEAVER",
+  dnsSource: "host",
   dns: "",
   addresses: "",
   peerPublicKey: "",
@@ -135,6 +144,8 @@ function formFor(profile: ProxyProfile): ProxyForm {
     enabled: profile.enabled,
     host: profile.host,
     port: profile.port,
+    resolver: profile.resolver,
+    dnsSource: profile.dnsServers.length ? "servers" : "host",
     dns: profile.dnsServers.join("\n"),
     addresses: profile.tunnelAddresses.join("\n"),
     peerPublicKey: profile.peerPublicKey ?? "",
@@ -195,6 +206,11 @@ function wireguardProblem(t: Translate, form: ProxyForm, profile: ProxyProfile |
   return null;
 }
 
+/** WireGuard carries no name to its peer, so a WireGuard proxy resolves only with servers. */
+function dnsSource(form: ProxyForm): DnsSource {
+  return form.kind === "WIRE_GUARD" && form.resolver === "PROXY" ? "servers" : form.dnsSource;
+}
+
 function proxyInput(form: ProxyForm) {
   const secrets = { ...form.secrets };
   if (form.kind === "SSH") {
@@ -207,7 +223,8 @@ function proxyInput(form: ProxyForm) {
     enabled: form.enabled,
     host: form.host.trim(),
     port: form.port,
-    dnsServers: splitList(form.dns),
+    resolver: form.resolver,
+    dnsServers: dnsSource(form) === "servers" ? splitList(form.dns) : [],
     tunnelAddresses: splitList(form.addresses),
     peerPublicKey: form.peerPublicKey || null,
     mtu: Number(form.mtu || MTU_DEFAULT),
@@ -222,9 +239,12 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
   const [{ data, fetching }, reexecute] = useQuery<{ proxyProfiles: ProxyProfile[] }>({
     query: PROXY_PROFILES_QUERY,
   });
-  const [, testProxy] = useMutation(TEST_PROXY_MUTATION);
-
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
+  const [testingId, setTestingId] = useState<number | null>(null);
+  const [removing, setRemoving] = useState<ProxyProfile | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const [{ fetching: removeBusy }, deleteProxy] = useMutation(DELETE_PROXY_MUTATION);
+  // Each proxy's last test in this session, in one sentence.
   const [health, setHealth] = useState<Record<number, string>>({});
 
   const profiles = data?.proxyProfiles ?? [];
@@ -232,24 +252,12 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
     ? (profiles.find((profile) => profile.id === editingId) ?? null)
     : null;
 
-  const runTest = async (profile: ProxyProfile) => {
-    setHealth((current) => ({ ...current, [profile.id]: t("next.proxies.testing") }));
-    const result = await testProxy({ id: profile.id });
-    const outcome = result.data?.testProxyProfile;
-    setHealth((current) => ({
-      ...current,
-      [profile.id]: outcome ? (outcome.message || (outcome.success ? t("next.proxies.reachable") : t("next.proxies.failed")))
-        : (result.error?.message ?? t("next.proxies.failed")),
-    }));
-  };
-
   const blocks: SettingsBlock[] = [
     {
       kind: "table",
       id: "proxies",
       title: t("next.settings.panel.proxies"),
-      note: t("next.proxies.tableNote"),
-      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 180px",
+      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 240px",
       headers: [
         t("next.proxies.name"),
         t("next.proxies.type"),
@@ -279,16 +287,23 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
           <Cell key="host" mono className="text-wv-muted">
             {profile.host}:{profile.port}
           </Cell>,
-          <Cell key="health" mono className="text-wv-muted">
+          <Cell key="health" mono className="text-wv-muted" title={health[profile.id]}>
             {health[profile.id] ?? "—"}
           </Cell>,
-          <span key="actions" className="ml-auto flex items-center gap-2" onClick={(event) => event.stopPropagation()}>
-            <SecondaryButton icon="test" className="h-7 px-2" onClick={() => void runTest(profile)}>
-              {t("next.proxies.test")}
+          <span
+            key="actions"
+            className="ml-auto flex flex-wrap items-center justify-end gap-2"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <SecondaryButton icon="test" className="h-7 px-2" onClick={() => setTestingId(profile.id)}>
+              {t("next.proxies.testVia")}
             </SecondaryButton>
-            <SecondaryButton className="h-7 px-2" onClick={() => setEditingId(profile.id)}>
-              {t("next.proxies.edit")}
+            <SecondaryButton icon="edit" className="h-7 px-2" onClick={() => setEditingId(profile.id)}>
+              {t("next.common.edit")}
             </SecondaryButton>
+            <DangerButton icon="remove" className="h-7 px-2" onClick={() => setRemoving(profile)}>
+              {t("next.common.remove")}
+            </DangerButton>
           </span>,
         ],
       })),
@@ -311,6 +326,51 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
           }}
         />
       )}
+
+      {testingId === null ? null : (
+        <TestViaDialog
+          key={testingId}
+          subject={{ proxy: testingId }}
+          onTested={(summary) => setHealth((current) => ({ ...current, [testingId]: summary }))}
+          onClose={() => setTestingId(null)}
+        />
+      )}
+
+      <ConfirmDialog
+        open={removing !== null}
+        title={t("next.proxies.remove")}
+        note={removing?.name}
+        busy={removeBusy}
+        confirmLabel={t("next.proxies.remove")}
+        body={
+          <>
+            {t("next.proxies.removeBody")}
+            {removeError === null ? null : (
+              <span role="alert" className="mt-3 block text-[12.5px] text-wv-error-text">
+                {removeError}
+              </span>
+            )}
+          </>
+        }
+        onConfirm={() => {
+          if (removing) {
+            void deleteProxy({ id: removing.id }).then((result) => {
+              if (result.error) {
+                setRemoveError(refusalMessage(t, result.error));
+                return;
+              }
+              setRemoving(null);
+              setRemoveError(null);
+              void reexecute({ requestPolicy: "network-only" });
+              onChanged?.();
+            });
+          }
+        }}
+        onDismiss={() => {
+          setRemoving(null);
+          setRemoveError(null);
+        }}
+      />
     </>
   );
 }
@@ -487,7 +547,10 @@ export function ProxyEditor({
       host: endpoint?.host || current.host,
       port: endpoint?.port ?? current.port,
       addresses: parsed.tunnelAddresses || current.addresses,
-      dns: parsed.tunnelDnsServers || current.dns,
+      // The tunnel's DNS servers answer inside it, so the proxy resolves.
+      ...(parsed.tunnelDnsServers
+        ? { resolver: "PROXY" as const, dnsSource: "servers" as const, dns: parsed.tunnelDnsServers }
+        : {}),
       peerPublicKey: parsed.peerPublicKey || current.peerPublicKey,
       mtu: digits(parsed.tunnelMtu, CONFIG_KEYS.mtu) || current.mtu,
       keepaliveSeconds: digits(keepalive, CONFIG_KEYS.keepalive) || current.keepaliveSeconds,
@@ -553,6 +616,10 @@ export function ProxyEditor({
         setError(problem);
         return;
       }
+    }
+    if (dnsSource(clean) === "servers" && splitList(clean.dns).length === 0) {
+      setError(t("next.proxies.needsDns"));
+      return;
     }
     setBusy(true);
     const result = await saveProxy({
@@ -690,17 +757,6 @@ export function ProxyEditor({
           },
         },
         {
-          id: "dns",
-          label: t("next.proxies.dns"),
-          help: t("next.proxies.dnsHelp"),
-          control: {
-            kind: "textarea",
-            value: form.dns,
-            rows: 2,
-            onChange: (next) => patch({ dns: next }),
-          },
-        },
-        {
           id: "mtu",
           label: "MTU",
           help: t("next.proxies.mtuHelp", { value: MTU_DEFAULT }),
@@ -791,6 +847,55 @@ export function ProxyEditor({
             ]
           : []),
       ];
+
+  const source = dnsSource(form);
+  const resolutionFields: FieldSpec[] = [
+    {
+      id: "resolver",
+      label: t("next.proxies.resolvedBy"),
+      control: {
+        kind: "segmented",
+        value: form.resolver,
+        options: [
+          { value: "WEAVER", label: t("next.proxies.resolverWeaver") },
+          { value: "PROXY", label: t("next.proxies.resolverProxy") },
+        ],
+        onChange: (next) => patch({ resolver: next as ProxyResolver }),
+      },
+    },
+    ...(isWireguard && form.resolver === "PROXY"
+      ? []
+      : [
+          {
+            id: "dnsSource",
+            label: t("next.proxies.using"),
+            control: {
+              kind: "segmented" as const,
+              value: form.dnsSource,
+              options: [
+                { value: "host", label: t("next.proxies.dnsHost") },
+                { value: "servers", label: t("next.proxies.dns") },
+              ],
+              onChange: (next: string) => patch({ dnsSource: next as DnsSource }),
+            },
+          },
+        ]),
+    ...(source === "servers"
+      ? [
+          {
+            id: "dns",
+            label: t("next.proxies.dns"),
+            help: t("next.proxies.dnsHelp"),
+            control: {
+              kind: "textarea" as const,
+              value: form.dns,
+              rows: 3,
+              onChange: (next: string) => patch({ dns: next }),
+            },
+          },
+        ]
+      : []),
+  ];
 
   const problemList = (problems: readonly string[]) =>
     problems.length === 0 ? null : (
@@ -905,6 +1010,7 @@ export function ProxyEditor({
             note: t("next.proxies.secretsNote"),
             fields: credentialFields,
           },
+          { id: "resolution", title: t("next.proxies.resolution"), fields: resolutionFields },
         ]
       : []),
   ];

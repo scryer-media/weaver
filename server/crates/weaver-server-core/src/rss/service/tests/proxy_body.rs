@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::proxy_routing::{Fixture, service};
 use super::*;
 use crate::proxies::{Consumer, ProxyKind, RoutingPolicy};
@@ -35,7 +38,7 @@ async fn truncated_nzb_body_is_not_submitted_or_spliced_and_does_not_blame_the_r
         .send_rss_request(&feed, &feed.url, false)
         .await
         .unwrap();
-    assert!(read_response_with_limit(response, 2000).await.is_err());
+    assert!(read_body(response, 2000).await.is_err());
     let route = runtime
         .route(Consumer::Rss(1), Duration::from_secs(30))
         .unwrap();
@@ -79,7 +82,7 @@ async fn changing_feed_policy_closes_an_active_response_before_mutation_complete
         )
         .unwrap();
     runtime.reload().await.unwrap();
-    assert!(read_response_with_limit(response, 2000).await.is_err());
+    assert!(read_body(response, 2000).await.is_err());
     assert!(
         service
             .send_rss_request(&feed, &feed.url, false)

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 package weaver
 
 import (
@@ -690,7 +693,7 @@ func runRealUsenetCase(api realUsenetAPI, config *realUsenetConfig, root string,
 		var saved struct{ SaveProxyProfile struct{ ID int } }
 		if err := api.query("mutation($input:ProxyProfileInput!) {saveProxyProfile(input:$input) {id}}", map[string]any{"input": map[string]any{
 			"name": testCase.Name, "kind": kind, "enabled": true, "host": relayIP, "port": port,
-			"username": "fixture", "password": "fixture", "dnsServers": []string{relayIP},
+			"username": "fixture", "password": "fixture", "resolver": "PROXY", "dnsServers": []string{relayIP},
 		}}, &saved); err != nil {
 			return result, err
 		}

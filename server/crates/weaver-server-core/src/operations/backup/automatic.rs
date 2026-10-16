@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::manifest::io_err;
 use super::{BackupInfo, BackupService, BackupServiceError, BackupTrigger};
 use crate::persistence::encryption::{decrypt_value, encrypt_value};

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Secret removal for everything the diagnostics package collects.
 //
 // The package is written to be attached to a bug report, so the redaction

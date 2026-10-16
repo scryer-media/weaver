@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 package weaver
 
 import (
@@ -5,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -129,6 +133,60 @@ func advancedNetworkingPartition(name string, files []string, restart bool) weav
 		spec.StageScripts = map[string]string{"restarted": spec.Name + "-restarted"}
 	}
 	return spec
+}
+
+// The speed test runs on the networking stack, a fresh one of its own: it
+// tests a laddered route against the proxy fixture and pauses the queue.
+func speedTestReleaseFlow() weaverReleaseFlowSpec {
+	spec := advancedNetworkingPartition("speed-test", []string{"speed-test.spec.ts"}, false)
+	spec.Name = "speed-test"
+	spec.PlaywrightScript = "speed-test"
+	spec.Timeout = 30 * time.Minute
+	// The reference posting a Usenet run is pointed at.
+	spec.SeedFixtures = []string{"speed-test-100mb"}
+	// The public endpoint a bandwidth run is pointed at.
+	spec.PublicTargets = []weaverPublicTarget{{Host: cloudflareSpeedHost, Port: 443}}
+	return spec
+}
+
+// A public host the proxy fixture forwards to and answers for.
+type weaverPublicTarget struct {
+	Host string
+	Port int
+}
+
+// The Cloudflare bandwidth test endpoint the speed test's bandwidth run uses.
+const cloudflareSpeedHost = "speed.cloudflare.com"
+
+// lookupPublicHostIPv4 resolves a public target on the host; the fixture
+// answers Weaver with these addresses and forwards to the first.
+var lookupPublicHostIPv4 = netLookupIPv4
+
+func netLookupIPv4(ctx context.Context, host string) ([]string, error) {
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+	if err != nil {
+		return nil, err
+	}
+	addresses := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		addresses = append(addresses, ip.String())
+	}
+	return addresses, nil
+}
+
+func resolvePublicTargets(ctx context.Context, targets []weaverPublicTarget) ([]map[string]any, error) {
+	resolved := make([]map[string]any, 0, len(targets))
+	for _, target := range targets {
+		addresses, err := lookupPublicHostIPv4(ctx, target.Host)
+		if err != nil {
+			return nil, fmt.Errorf("resolve public target %s: %w", target.Host, err)
+		}
+		if len(addresses) == 0 {
+			return nil, fmt.Errorf("resolve public target %s: no IPv4 address", target.Host)
+		}
+		resolved = append(resolved, map[string]any{"host": target.Host, "port": target.Port, "addresses": addresses})
+	}
+	return resolved, nil
 }
 
 // The Bind refusal needs a Weaver without CAP_NET_RAW, which is a container
@@ -296,7 +354,7 @@ func networkDefinition(subnet string) (map[string]any, error) {
 
 // advancedNetworkOverride builds the phase's whole generated Compose override.
 // JSON is valid YAML, and marshalling keeps paths and the host table quoted.
-func advancedNetworkOverride(phase *weaverReleasePhase) (map[string]any, error) {
+func advancedNetworkOverride(ctx context.Context, phase *weaverReleasePhase) (map[string]any, error) {
 	layout := phase.Spec.NetworkLayout
 	if len(phase.EgressSubnets) != layout.egressNetworks() {
 		return nil, fmt.Errorf("%s needs %d egress subnets, has %d", phase.Flow, layout.egressNetworks(), len(phase.EgressSubnets))
@@ -378,11 +436,20 @@ func advancedNetworkOverride(phase *weaverReleasePhase) (map[string]any, error) 
 	if layout == weaverNetworkLayoutEgress {
 		fixtureAddresses = append(fixtureAddresses, hostAddresses["proxy-fixture"]...)
 	}
-	service("proxy-fixture")["environment"] = map[string]any{
+	fixtureEnv := map[string]any{
 		"PROXY_FIXTURE_IP":        resolverIP,
 		"PROXY_FIXTURE_ADDRESSES": strings.Join(fixtureAddresses, ","),
 		"PROXY_FIXTURE_HOSTS":     string(fixtureHostsJSON),
 	}
+	if len(phase.Spec.PublicTargets) > 0 {
+		targets, err := resolvePublicTargets(ctx, phase.Spec.PublicTargets)
+		if err != nil {
+			return nil, err
+		}
+		targetsJSON, _ := json.Marshal(targets)
+		fixtureEnv["PROXY_FIXTURE_PUBLIC_TARGETS"] = string(targetsJSON)
+	}
+	service("proxy-fixture")["environment"] = fixtureEnv
 
 	resolverPath := filepath.Join(phase.RootDir, "proxy-resolv.conf")
 	if err := os.WriteFile(resolverPath, []byte("nameserver "+resolverIP+"\noptions timeout:1 attempts:1\n"), 0o644); err != nil {
@@ -416,8 +483,8 @@ func advancedNetworkOverride(phase *weaverReleasePhase) (map[string]any, error) 
 	return map[string]any{"networks": networks, "services": services}, nil
 }
 
-func writeAdvancedNetworkOverride(phase *weaverReleasePhase) error {
-	override, err := advancedNetworkOverride(phase)
+func writeAdvancedNetworkOverride(ctx context.Context, phase *weaverReleasePhase) error {
+	override, err := advancedNetworkOverride(ctx, phase)
 	if err != nil {
 		return err
 	}

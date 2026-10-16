@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import type { ReactNode } from "react";
 import type { Egress, NetworkFlow as Flow } from "@/lib/networking";
 import type { Consumer, NetworkingAction, NetworkingData } from "./data";

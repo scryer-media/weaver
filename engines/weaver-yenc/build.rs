@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Optional: when `WEAVER_RAPIDYENC_SRC` points at a rapidyenc checkout, compile
 // its decode sources + a tiny extern-"C" shim via `cc` and link them, and emit
 // `cfg(rapidyenc_linked)` so the timing harness can A/B against the real

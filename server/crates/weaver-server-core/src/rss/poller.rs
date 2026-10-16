@@ -1,12 +1,16 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use tracing::{info, warn};
 
+use crate::proxies::read_body;
 use crate::rss::model::{
     RSS_SEEN_RETENTION_SECS, RSS_SYNC_TICK_SECS, compile_rules, evaluate_item, is_due,
     parse_feed_items,
 };
 use crate::rss::service::{
     DueSyncOutcome, MAX_RSS_FEED_BODY_BYTES, RssFeedSyncReport, RssService, RssServiceError,
-    RssSyncReport, read_response_with_limit,
+    RssSyncReport,
 };
 use crate::{RssFeedRow, RssRuleAction};
 
@@ -40,7 +44,7 @@ impl RssService {
                 response.status()
             )));
         }
-        let body = read_response_with_limit(response, MAX_RSS_FEED_BODY_BYTES)
+        let body = read_body(response, MAX_RSS_FEED_BODY_BYTES)
             .await
             .map_err(RssServiceError::Http)?;
         let body = crate::post_processing::feed::transform_feed(
@@ -351,11 +355,12 @@ impl RssService {
     // Between the row insert and the proxy runtime reload that installs its
     // route, a new feed has none, so a sweep leaves it for the wake the
     // reload sends instead of polling it unrouted or recording a failure.
+    // Without a runtime no feed has a route.
     fn has_route(&self, feed_id: u32) -> bool {
         self.inner
             .handle
             .proxy_runtime()
-            .is_none_or(|runtime| runtime.routes_consumer(crate::proxies::Consumer::Rss(feed_id)))
+            .is_some_and(|runtime| runtime.routes_consumer(crate::proxies::Consumer::Rss(feed_id)))
     }
 
     async fn sync_feed(
@@ -408,7 +413,7 @@ impl RssService {
         let body = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Ok(RssFeedSyncReport::default()),
-            result = read_response_with_limit(response, MAX_RSS_FEED_BODY_BYTES) => result.map_err(RssServiceError::Http)?,
+            result = read_body(response, MAX_RSS_FEED_BODY_BYTES) => result.map_err(RssServiceError::Http)?,
         };
         let body = crate::post_processing::feed::transform_feed(
             &self.inner.db,

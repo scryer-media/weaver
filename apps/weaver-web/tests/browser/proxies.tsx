@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { MemoryRouter } from "react-router";
@@ -5,7 +8,7 @@ import { Client, Provider, fetchExchange } from "urql";
 import { TranslateContext } from "@/lib/context/translate-context";
 import en from "@/lib/i18n/locales/en";
 import { PasswordManagersKeptOut } from "@/lib/password-manager";
-import type { ProxyKind } from "@/lib/proxies";
+import type { ProxyKind, ProxyResolver } from "@/lib/proxies";
 import type { NetworkingData } from "@/next/features/networking/data";
 import { PoolsPage } from "@/next/features/networking/PoolsPage";
 import { RoutesPage } from "@/next/features/networking/RoutesPage";
@@ -20,13 +23,13 @@ import "@/next/theme.css";
 const SECRETS = ["username", "password", "privateKey", "passphrase", "presharedKey"] as const;
 type Stored = {
   id: number; name: string; kind: ProxyKind; enabled: boolean; host: string; port: number;
-  dnsServers: string[]; tunnelAddresses: string[]; peerPublicKey: string | null; mtu: number;
+  resolver: ProxyResolver; dnsServers: string[]; tunnelAddresses: string[]; peerPublicKey: string | null; mtu: number;
   keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null;
   secrets: Partial<Record<(typeof SECRETS)[number], string>>;
 };
 const stored = (id: number, name: string, kind: ProxyKind, port: number, extra: Partial<Stored> = {}): Stored => ({
-  id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port, dnsServers: [],
-  tunnelAddresses: [], peerPublicKey: null, mtu: 1280, keepaliveSeconds: 25, timeoutSeconds: 30,
+  id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port,
+  resolver: kind === "WIRE_GUARD" ? "WEAVER" : "PROXY", dnsServers: [], tunnelAddresses: [], peerPublicKey: null, mtu: 1280, keepaliveSeconds: 25, timeoutSeconds: 30,
   hostKeyFingerprint: null, secrets: {}, ...extra,
 });
 const profiles: Stored[] = [
@@ -66,7 +69,8 @@ function graphql(name: string, variables: Record<string, unknown>) {
     const saved: Stored = {
       id: existing?.id ?? Math.max(0, ...profiles.map((profile) => profile.id)) + 1,
       name: input.name as string, kind: input.kind as ProxyKind, enabled: input.enabled as boolean,
-      host: input.host as string, port: input.port as number, dnsServers: input.dnsServers as string[],
+      host: input.host as string, port: input.port as number, resolver: input.resolver as ProxyResolver,
+      dnsServers: input.dnsServers as string[],
       tunnelAddresses: input.tunnelAddresses as string[], peerPublicKey: input.peerPublicKey as string | null,
       mtu: input.mtu as number, keepaliveSeconds: input.keepaliveSeconds as number,
       timeoutSeconds: input.timeoutSeconds as number, hostKeyFingerprint: existing?.hostKeyFingerprint ?? null, secrets,
@@ -75,9 +79,85 @@ function graphql(name: string, variables: Record<string, unknown>) {
     else profiles.push(saved);
     return { data: { saveProxyProfile: { id: saved.id } } };
   }
-  return { data: { proxyProfiles: profiles.map(view), testProxyProfile: { success: true, message: "" } } };
+  if (name === "Networking") return { data: { ...pools, egressInterfaces: egresses, proxyProfiles: profiles.map(view) } };
+  if (name === "TestVia") return testVia(variables);
+  if (name === "DeleteProxyProfile") {
+    const id = variables.id as number;
+    // As the daemon does: a pool's member stays until it leaves the pool.
+    if (members(1).includes(id)) return refusal("PROXY_IN_POOL");
+    profiles.splice(profiles.findIndex((profile) => profile.id === id), 1);
+    return { data: { deleteProxyProfile: true } };
+  }
+  return { data: { proxyProfiles: profiles.map(view) } };
 }
-const fixture = { profiles, requests, changes: 0 };
+
+/*
+ * A test through a drafted route, as the daemon runs one: every path the route
+ * has, once each, with every proxy under test on top. Seedbox never answers,
+ * so whatever it carries or is fails at it.
+ */
+const egress = (id: number, name: string, enabled: boolean) => ({
+  id, name, bindingKind: "SYSTEM", interfaceName: null, sourceAddress: null, enabled, maxDownloadSpeed: 0, health: "UP", reason: null,
+});
+const egresses = [egress(4, "Backup", false), egress(0, "System", true), egress(5, "Fiber", true)];
+const SILENT = 2;
+/* The daemon allows 64 results; this one allows three, or `?limit`, so a test can reach the limit. */
+const resultLimit = () => Number(query.get("limit") ?? 3);
+type RungInput = { proxy?: number; pool?: number; chain?: number[] };
+type LegInput = { egressId: number; path: { direct?: boolean; ladder?: { directFallback: boolean; rungs: RungInput[] } } };
+const members = (pool: number) => pools.proxyPools.find((candidate) => candidate.id === pool)?.memberIds ?? [];
+const refusal = (code: string, params: Record<string, unknown> = {}) => ({ errors: [{ message: code, extensions: { code, params } }] });
+function testVia(variables: Record<string, unknown>) {
+  const legs = (variables.route as { legs: LegInput[] }).legs;
+  const subject = variables.subject as { proxy?: number; pool?: number } | null;
+  const target = variables.target as { host: string; port: number } | null;
+  if (!subject && !target) return refusal("TEST_TARGET_REQUIRED");
+  const tested = subject?.proxy !== undefined ? [subject.proxy] : subject?.pool !== undefined ? members(subject.pool) : [];
+  const seen = new Set<string>();
+  const paths = legs.flatMap((leg, index) => {
+    const ladder = leg.path.ladder;
+    const carriers = ladder
+      ? [
+          ...ladder.rungs.flatMap((rung) =>
+            rung.proxy !== undefined ? [[rung.proxy]] : rung.pool !== undefined ? members(rung.pool).map((id) => [id]) : [rung.chain ?? []]),
+          ...(ladder.directFallback ? [[]] : []),
+        ]
+      : [[]];
+    return carriers.flatMap((carrierIds) => {
+      const key = `${leg.egressId}:${carrierIds.join(",")}`;
+      if (seen.has(key)) return [];
+      seen.add(key);
+      return [{ leg: index, egressId: leg.egressId, carrierIds }];
+    });
+  });
+  if (paths.some((path) => path.carrierIds.some((id) => tested.includes(id)))) return refusal("TEST_SUBJECT_IN_ROUTE");
+  // A pool given somewhere to go carries it through the member it picks: here, its first that answers.
+  const poolId = subject?.pool !== undefined && target ? subject.pool : null;
+  const onTop: (number | null)[] = poolId !== null ? [tested.find((id) => id !== SILENT) ?? null] : subject ? tested : [null];
+  if (paths.length * (subject ? tested.length : 1) > resultLimit()) return refusal("TEST_PATH_COUNT", { limit: resultLimit() });
+  return {
+    data: {
+      testVia: paths.flatMap((path) => onTop.map((proxyId) => {
+        const shown = { ...path, proxyId, poolId, failingProxyId: null, sourceAddress: null, connectMillis: 0, params: {}, message: "", resolution: null };
+        const silent = path.carrierIds.includes(SILENT) || proxyId === SILENT;
+        if (silent || (poolId !== null && proxyId === null)) {
+          return { ...shown, success: false, code: "TIMED_OUT", params: { seconds: 10 }, message: "No answer within 10 seconds.", failingProxyId: silent ? SILENT : null };
+        }
+        const kind = profiles.find((profile) => profile.id === proxyId)?.kind;
+        const code = target ? (proxyId === null ? "CONNECTED" : "FORWARDED") : kind === "SSH" || kind === "WIRE_GUARD" ? "CONNECTED" : "REACHABLE";
+        // Given a host, a path says how it was resolved: by DNS servers asked through the proxy on top, else by this machine.
+        const resolution = target && {
+          host: target.host, resolvedBy: proxyId === null ? "HOST" : "PROXY_SERVERS", proxyId, dnsServers: proxyId === null ? [] : ["192.0.2.53"],
+          addresses: ["192.0.2.80", "192.0.2.81"], cached: false, connectedAddress: "192.0.2.81", error: null,
+        };
+        return { ...shown, success: true, code, sourceAddress: "192.0.2.10:40000", connectMillis: 12.5, resolution };
+      })),
+    },
+  };
+}
+/* Every pool save the pools page sends, as it sends it. */
+const poolSaves: Record<string, unknown>[] = [];
+const fixture = { profiles, requests, poolSaves, changes: 0 };
 const panel = <ProxiesPanel onChanged={() => { fixture.changes += 1; }} />;
 /* With `?pools` the table sits where the app shows it, under the pools that group its proxies. */
 const pools = {
@@ -89,7 +169,7 @@ const pools = {
 const consumers = [{ key: "server:1", id: 1, name: "news.fixture.invalid", kind: "SERVER" as const, cap: 20, route: null }];
 const query = new URLSearchParams(window.location.search);
 const screen = query.has("pools")
-  ? <PoolsPage data={pools} action={async () => null} busy={false} proxies={panel} />
+  ? <PoolsPage data={pools} action={async (_document, variables) => { poolSaves.push(structuredClone(variables)); return null; }} busy={false} proxies={panel} />
   : query.has("routes")
     ? <RoutesPage data={{ ...pools, proxyProfiles: [...pools.proxyProfiles, view(stored(4, "Paris", "WIRE_GUARD", 51820)) as NetworkingData["proxyProfiles"][number]] }} consumers={consumers} flow={{ legs: [], pools: [] }} action={async () => null} busy={false} />
     : panel;

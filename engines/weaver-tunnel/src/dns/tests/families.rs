@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use std::sync::{Arc, Mutex};
 
@@ -9,17 +12,9 @@ struct Resolver {
 }
 
 #[async_trait::async_trait]
-impl TunnelProvider for Resolver {
-    fn describe(&self) -> String {
-        "synthetic routed DNS".into()
-    }
-
-    async fn dial(
-        &self,
-        host: &str,
-        port: u16,
-    ) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
-        assert_eq!((host, port), ("192.0.2.53", 53));
+impl Carrier for Resolver {
+    async fn open(&self, server: IpAddr) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+        assert_eq!(server.to_string(), "192.0.2.53");
         let (client, mut server) = tokio::io::duplex(1024);
         let failed_family = self.failed_family;
         let disconnect = self.disconnect;
@@ -72,13 +67,14 @@ async fn one_family_survives_peer_protocol_or_transport_failure() {
                 stall: false,
                 queries: Default::default(),
             };
-            let addresses = resolve(
+            let addresses = resolve_name(
                 &resolver,
                 &["192.0.2.53".parse().unwrap()],
                 "fixture.invalid",
             )
             .await
-            .unwrap();
+            .unwrap()
+            .addresses;
             assert_eq!(addresses.len(), 1);
             assert_eq!(addresses[0].is_ipv4(), failed_family == 28);
             assert_eq!(*resolver.queries.lock().unwrap(), [1, 28]);
@@ -94,15 +90,14 @@ async fn both_family_failures_remain_an_error() {
         stall: false,
         queries: Default::default(),
     };
-    assert!(
-        resolve(
-            &resolver,
-            &["192.0.2.53".parse().unwrap()],
-            "fixture.invalid"
-        )
-        .await
-        .is_err()
-    );
+    let unanswered = resolve_name(
+        &resolver,
+        &["192.0.2.53".parse().unwrap()],
+        "fixture.invalid",
+    )
+    .await
+    .unwrap_err();
+    assert!(unanswered.reached, "the server was reached and refused");
     assert_eq!(*resolver.queries.lock().unwrap(), [1, 28]);
 }
 
@@ -117,7 +112,7 @@ async fn a_silent_family_does_not_consume_the_outer_request_deadline() {
         };
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            resolve(
+            resolve_name(
                 &resolver,
                 &["192.0.2.53".parse().unwrap()],
                 "fixture.invalid",
@@ -125,7 +120,8 @@ async fn a_silent_family_does_not_consume_the_outer_request_deadline() {
         )
         .await
         .expect("working family must survive before the request deadline")
-        .unwrap();
+        .unwrap()
+        .addresses;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].is_ipv4(), failed_family == 28);
         assert_eq!(*resolver.queries.lock().unwrap(), [1, 28]);
@@ -140,13 +136,14 @@ async fn both_successful_families_are_retained() {
         stall: false,
         queries: Default::default(),
     };
-    let result = resolve(
+    let result = resolve_name(
         &resolver,
         &["192.0.2.53".parse().unwrap()],
         "fixture.invalid",
     )
     .await
-    .unwrap();
+    .unwrap()
+    .addresses;
     assert_eq!(result.len(), 2);
     assert!(result.iter().any(IpAddr::is_ipv4));
     assert!(result.iter().any(IpAddr::is_ipv6));
@@ -160,17 +157,9 @@ struct DeadRoute {
 }
 
 #[async_trait::async_trait]
-impl TunnelProvider for DeadRoute {
-    fn describe(&self) -> String {
-        "dead route".into()
-    }
-
-    async fn dial(
-        &self,
-        host: &str,
-        _port: u16,
-    ) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
-        self.dials.lock().unwrap().push(host.to_string());
+impl Carrier for DeadRoute {
+    async fn open(&self, server: IpAddr) -> Result<Box<dyn crate::TunnelStream>, TunnelError> {
+        self.dials.lock().unwrap().push(server.to_string());
         if self.hang {
             std::future::pending::<()>().await;
         }
@@ -186,13 +175,13 @@ async fn a_dead_route_is_dialled_once_per_server_not_once_per_family() {
             dials: Default::default(),
         };
         let started = tokio::time::Instant::now();
-        let result = resolve(
+        let result = resolve_name(
             &route,
             &["192.0.2.53".parse().unwrap(), "192.0.2.54".parse().unwrap()],
             "fixture.invalid",
         )
         .await;
-        assert!(result.is_err());
+        assert!(!result.unwrap_err().reached, "hang={hang}");
         assert_eq!(
             *route.dials.lock().unwrap(),
             ["192.0.2.53", "192.0.2.54"],

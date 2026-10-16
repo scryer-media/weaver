@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { memo } from "react";
 import { LOG_LEVEL_COLORS } from "../data/palette";
 import type { LogKeyValue, LogLine } from "../data/service-log-buffer";

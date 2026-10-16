@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Bounded, sequential execution of a job's post-processing instances.
 //
 // A job runs its scripts one after another, and each script takes a slot

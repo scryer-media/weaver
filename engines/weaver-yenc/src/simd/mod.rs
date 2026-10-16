@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // SIMD and lookup-table accelerated yEnc decoding.
 //
 // The decoder keeps the public streaming state in `decode.rs`, but normalizes it

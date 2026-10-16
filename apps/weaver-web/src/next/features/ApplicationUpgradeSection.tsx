@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useApplicationUpgrade, RunProgress } from "@/next/features/updates/use-application-upgrade";
 import { useTranslate } from "@/lib/context/translate-context";
 import { SectionHeader } from "../components/chrome";

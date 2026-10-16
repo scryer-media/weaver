@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // One loopback front per proxy configuration, started lazily.
 //
 // ## Why `ensure_*` is synchronous and never blocks

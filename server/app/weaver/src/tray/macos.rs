@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The macOS desktop wrapper: a menu-bar status item and a `WKWebView` window.
 //
 // This mirrors the Windows tray one behaviour at a time — the same menu, the
@@ -529,6 +532,7 @@ define_class!(
             self.stop_supervision_polling();
             self.hide_popover();
             let _ = self.ivars().supervisor.borrow_mut().stop();
+            self.ivars().supervisor.borrow_mut().shutdown_logging();
         }
     }
 

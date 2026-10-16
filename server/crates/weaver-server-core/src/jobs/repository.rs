@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use crate::StateError;
 use crate::history;
 use crate::history::persistence::replace_job_history_attributes_tx;
@@ -172,6 +175,7 @@ async fn archive_job_sql(
     job_id: JobId,
     history: history::JobHistoryRow,
     typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
+    failure_kind: Option<history::HistoryFailureKind>,
 ) -> Result<Option<history::JobHistoryRow>, StateError> {
     let archived = SqlRuntime::run_in_transaction(&datastore, "archive_job", |tx| {
         let mut history = history.clone();
@@ -251,6 +255,16 @@ async fn archive_job_sql(
             .map(history::queries::job_history_row_from_sql)
             .transpose()?;
             if let Some(row) = &archived {
+                // Set on every archive so a re-archived job never keeps the
+                // kind of an earlier failure.
+                tx.execute(
+                    "UPDATE job_history SET failure_kind = {} WHERE job_id = {}",
+                    &[
+                        SqlArg::OptText(failure_kind.map(|kind| kind.as_str().to_string())),
+                        SqlArg::I64(job_id.0 as i64),
+                    ],
+                )
+                .await?;
                 replace_job_history_attributes_tx(tx, row).await?;
                 crate::jobs::duplicate_persistence::transition_duplicate_snapshot_for_history_tx(
                     tx,
@@ -285,7 +299,7 @@ impl Database {
         // history-delete that bumps the generation makes the re-cache a no-op
         // instead of resurrecting the just-deleted row.
         let observed_generation = self.job_history_cache_generation();
-        let result = self.run_sql_blocking(archive_job_sql(datastore, job_id, history, None));
+        let result = self.run_sql_blocking(archive_job_sql(datastore, job_id, history, None, None));
         if let Ok(Some(row)) = &result {
             self.cache_job_history_at(row.clone(), observed_generation);
         }
@@ -394,7 +408,13 @@ impl DatabaseWriterExecutor {
         history: &history::JobHistoryRow,
     ) -> Result<Option<history::JobHistoryRow>, StateError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(archive_job_sql(datastore, job_id, history.clone(), None))
+        self.run_sql_blocking(archive_job_sql(
+            datastore,
+            job_id,
+            history.clone(),
+            None,
+            None,
+        ))
     }
 
     pub(crate) fn archive_job_with_terminal_cause(
@@ -402,6 +422,7 @@ impl DatabaseWriterExecutor {
         job_id: JobId,
         history: &history::JobHistoryRow,
         typed_terminal_cause: Option<crate::jobs::SemanticTerminalCause>,
+        failure_kind: Option<history::HistoryFailureKind>,
     ) -> Result<Option<history::JobHistoryRow>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(archive_job_sql(
@@ -409,6 +430,7 @@ impl DatabaseWriterExecutor {
             job_id,
             history.clone(),
             typed_terminal_cause,
+            failure_kind,
         ))
     }
 }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::manifest::{BACKUP_FORMAT_VERSION, io_err};
 use super::{BackupArtifact, BackupService, BackupServiceError};
 use chrono::{DateTime, Utc};

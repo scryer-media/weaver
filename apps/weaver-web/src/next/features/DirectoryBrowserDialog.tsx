@@ -1,4 +1,16 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useClient } from "urql";
 import { BROWSE_DIRECTORIES_QUERY, BROWSE_FILES_QUERY, CREATE_DIRECTORY_MUTATION } from "@/graphql/queries";
@@ -88,32 +100,39 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
 
   const browse = useCallback(
     async (path: string | null, otherwise: Stop[] = [], select?: string) => {
-      const request = ++requestRef.current;
-      setLoading(true);
-      setError(null);
-      setCreateError(null);
-      const result = await client
-        .query<{ browseDirectories: DirectoryListing }>(
-          files ? BROWSE_FILES_QUERY : BROWSE_DIRECTORIES_QUERY,
-          { path },
-          { requestPolicy: "network-only" },
-        )
-        .toPromise();
-      if (request !== requestRef.current) {
-        return;
-      }
-      if (result.error || !result.data?.browseDirectories) {
-        const [next, ...rest] = otherwise;
-        if (next) {
-          void browse(next.path, rest, next.select);
+      // Each stop is a request of its own, tried in turn until one reads.
+      let stop: Stop = { path, select };
+      let rest = otherwise;
+      while (true) {
+        const request = ++requestRef.current;
+        setLoading(true);
+        setError(null);
+        setCreateError(null);
+        const result = await client
+          .query<{ browseDirectories: DirectoryListing }>(
+            files ? BROWSE_FILES_QUERY : BROWSE_DIRECTORIES_QUERY,
+            { path: stop.path },
+            { requestPolicy: "network-only" },
+          )
+          .toPromise();
+        if (request !== requestRef.current) {
+          return;
+        }
+        if (result.error || !result.data?.browseDirectories) {
+          const [next, ...others] = rest;
+          if (next) {
+            stop = next;
+            rest = others;
+            continue;
+          }
+          setLoading(false);
+          setError(result.error ? failureMessage(result.error) : t("next.folders.readFailed"));
           return;
         }
         setLoading(false);
-        setError(result.error ? failureMessage(result.error) : t("next.folders.readFailed"));
+        show(result.data.browseDirectories, stop.select);
         return;
       }
-      setLoading(false);
-      show(result.data.browseDirectories, select);
     },
     [client, files, show, t],
   );
@@ -181,7 +200,7 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
   );
   const shown = filterEntries(entries, filter);
   // A folder's row opens it; a file's row picks it.
-  const activate = (entry: (typeof entries)[number]) => {
+  const activate = (entry: ListedEntry) => {
     if (entry.file) {
       setSelected(entry.path);
     } else {
@@ -191,15 +210,6 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
   const currentPath = listing?.currentPath ?? "";
   const parent = listing ? (listing.parentPath ?? parentOf(listing.currentPath)) : null;
   const busy = loading || creating;
-
-  const virtualizer = useVirtualizer({
-    count: loading || error !== null ? 0 : shown.length,
-    getScrollElement: () => scrollRef.current,
-    getItemKey: (index) => shown[index]?.path ?? index,
-    estimateSize: () => ROW_HEIGHT,
-    overscan: 12,
-    useFlushSync: false,
-  });
 
   // A new folder or a new filter starts from the top of the list, and the
   // breadcrumb keeps its deepest folder in view.
@@ -335,56 +345,17 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
           </Cell>
         </GridRow>
 
-        <div
-          ref={scrollRef}
-          className="relative h-[420px] min-h-[136px] flex-[0_1_420px] overflow-y-auto bg-wv-list"
-        >
-          {loading ? (
-            <div role="status" className="flex items-center gap-3 px-4 py-4 text-[12.5px] text-wv-muted sm:px-6">
-              <LoadingMark reveal />
-              {t("next.folders.reading")}
-            </div>
-          ) : error !== null ? (
-            <div className="px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">{error}</div>
-          ) : shown.length === 0 ? (
-            <div className="px-4 py-4 text-[12.5px] text-wv-muted sm:px-6">
-              {entries.length === 0
-                ? t(files ? "next.files.empty" : "next.folders.empty")
-                : t(files ? "next.files.noMatch" : "next.folders.noMatch")}
-            </div>
-          ) : (
-            <div style={{ height: virtualizer.getTotalSize() }} className="relative w-full">
-              {virtualizer.getVirtualItems().map((item) => {
-                const entry = shown[item.index]!;
-                return (
-                  <div
-                    key={item.key}
-                    className="absolute top-0 left-0 w-full"
-                    style={{ height: ROW_HEIGHT, transform: `translateY(${item.start}px)` }}
-                  >
-                    <GridRow
-                      columns={COLUMNS}
-                      title={entry.path}
-                      selected={entry.path === selected}
-                      onClick={busy ? undefined : () => activate(entry)}
-                      className="h-full border-b border-wv-hairline px-4 sm:px-[22px]"
-                    >
-                      <Cell className="text-wv-fg">{entry.name}</Cell>
-                      {/* Among files, a folder is the row that opens. */}
-                      {files && !entry.file ? (
-                        <span aria-hidden className="text-right font-wv-mono text-[11px] text-wv-faint">
-                          ›
-                        </span>
-                      ) : (
-                        <span />
-                      )}
-                    </GridRow>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
+        <EntryList
+          scrollRef={scrollRef}
+          loading={loading}
+          error={error}
+          empty={entries.length === 0}
+          shown={shown}
+          files={files}
+          selected={selected}
+          busy={busy}
+          onActivate={activate}
+        />
 
         {files ? null : (
           <div className="flex flex-none flex-wrap items-center gap-2 border-t border-wv-line-strong px-4 py-3 sm:px-6">
@@ -419,6 +390,100 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
   );
 }
 
+/** A folder's entry as the picker lists it: a file only when picking a file. */
+type ListedEntry = DirectoryEntry & { file: boolean };
+
+/**
+ * The listing itself, of which only the rows in view are in the document. The
+ * virtualizer lives here, so scrolling draws the rows again and not the picker
+ * around them.
+ */
+const EntryList = memo(function EntryList({
+  scrollRef,
+  loading,
+  error,
+  empty,
+  shown,
+  files,
+  selected,
+  busy,
+  onActivate,
+}: {
+  scrollRef: RefObject<HTMLDivElement | null>;
+  loading: boolean;
+  error: string | null;
+  /** Whether the folder holds nothing at all, before the filter. */
+  empty: boolean;
+  shown: readonly ListedEntry[];
+  files: boolean;
+  selected: string | null;
+  busy: boolean;
+  onActivate: (entry: ListedEntry) => void;
+}) {
+  const t = useTranslate();
+  const virtualizer = useVirtualizer({
+    count: loading || error !== null ? 0 : shown.length,
+    getScrollElement: () => scrollRef.current,
+    getItemKey: (index) => shown[index]?.path ?? index,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: 12,
+    useFlushSync: false,
+  });
+
+  return (
+    <div
+      ref={scrollRef}
+      className="relative h-[420px] min-h-[136px] flex-[0_1_420px] overflow-y-auto bg-wv-list"
+    >
+      {loading ? (
+        <div role="status" className="flex items-center gap-3 px-4 py-4 text-[12.5px] text-wv-muted sm:px-6">
+          <LoadingMark reveal />
+          {t("next.folders.reading")}
+        </div>
+      ) : error !== null ? (
+        <div className="px-4 py-4 text-[12.5px] text-wv-error-text sm:px-6">{error}</div>
+      ) : shown.length === 0 ? (
+        <div className="px-4 py-4 text-[12.5px] text-wv-muted sm:px-6">
+          {empty
+            ? t(files ? "next.files.empty" : "next.folders.empty")
+            : t(files ? "next.files.noMatch" : "next.folders.noMatch")}
+        </div>
+      ) : (
+        <div style={{ height: virtualizer.getTotalSize() }} className="relative w-full">
+          {virtualizer.getVirtualItems().map((item) => {
+            const entry = shown[item.index]!;
+            return (
+              <div
+                key={item.key}
+                className="absolute top-0 left-0 w-full"
+                style={{ height: ROW_HEIGHT, transform: `translateY(${item.start}px)` }}
+              >
+                <GridRow
+                  columns={COLUMNS}
+                  title={entry.path}
+                  selected={entry.path === selected}
+                  onClick={busy ? undefined : () => onActivate(entry)}
+                  className="h-full border-b border-wv-hairline px-4 sm:px-[22px]"
+                >
+                  <Cell className="text-wv-fg">{entry.name}</Cell>
+                  {/* Among files, a folder is the row that opens. */}
+                  {files && !entry.file ? (
+                    <span aria-hidden className="text-right font-wv-mono text-[11px] text-wv-faint">
+                      ›
+                    </span>
+                  ) : (
+                    <span />
+                  )}
+                </GridRow>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+});
+
 /**
  * A path text field with a Browse button beside it. Focusing the field opens
  * the picker too; closing it hands focus back to the field without reopening,
@@ -428,6 +493,7 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
 export function PathField({
   value,
   onChange,
+  onCommit,
   label,
   placeholder,
   pick,
@@ -437,6 +503,8 @@ export function PathField({
 }: {
   value: string;
   onChange: (next: string) => void;
+  /** The path, when the field is left, Enter is pressed in it, or the picker chooses one. */
+  onCommit?: (value: string) => void;
   label: string;
   placeholder?: string;
   pick?: "folder" | "file";
@@ -485,6 +553,16 @@ export function PathField({
         value={value}
         placeholder={placeholder}
         onChange={onChange}
+        onBlur={onCommit ? () => onCommit(value) : undefined}
+        onKeyDown={
+          onCommit
+            ? (event) => {
+                if (event.key === "Enter") {
+                  onCommit(event.currentTarget.value);
+                }
+              }
+            : undefined
+        }
         onFocus={() => {
           if (quietFocus.current) {
             quietFocus.current = false;
@@ -510,6 +588,7 @@ export function PathField({
         onClose={closePicker}
         onChoose={(path) => {
           onChange(path);
+          onCommit?.(path);
           closePicker();
         }}
       />

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 pub fn derive_release_name(primary: Option<&str>, secondary: Option<&str>) -> String {
     for candidate in [primary, secondary].into_iter().flatten() {
         let trimmed = candidate.trim();
@@ -26,6 +29,9 @@ pub fn derive_release_name(primary: Option<&str>, secondary: Option<&str>) -> St
 // filesystem cannot hold is taken out. A job with no original title keeps its
 // display name.
 pub fn completed_folder_name(display_name: &str, metadata: &[(String, String)]) -> String {
+    if let Some(renamed) = super::metadata::renamed_title(metadata) {
+        return weaver_model::files::sanitize_path_component(renamed);
+    }
     metadata
         .iter()
         .find(|(key, _)| key == super::metadata::ORIGINAL_TITLE_METADATA_KEY)

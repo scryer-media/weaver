@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -324,7 +327,7 @@ fn spawn_tls_nntp_server_with_upgrade(
     });
 
     let config = ServerConfig {
-        dialer: None,
+        dialer: crate::route_dialer::RouteDialer::direct_for_tests(),
         host: "localhost".to_string(),
         port,
         tls: !starttls,
@@ -420,7 +423,7 @@ fn test_transfer_control(
 }
 
 fn connect_with_backend(config: &ServerConfig, backend: NntpTlsBackend) -> BlockingNntpConnection {
-    BlockingNntpConnection::connect_with_backend(config, None, Some(backend), None).unwrap()
+    BlockingNntpConnection::connect_with_backend(config, Some(backend), None).unwrap()
 }
 
 // A plain server that answers each AUTHINFO line as it arrives, then
@@ -574,7 +577,6 @@ fn probe_server_lane(config: &ServerConfig, groups: &[&str]) -> BlockingBodyLane
         StableServerId(9001),
         None,
         config,
-        None,
         &groups,
         Duration::from_secs(30),
         crate::pool::BlockingConnectionPermit::for_tests(),
@@ -781,7 +783,6 @@ fn blocking_known_pipelining_servers_authenticate_then_get_the_group_in_one_writ
 
     let mut conn = BlockingNntpConnection::connect_for_group(
         &blocking_pipelined_setup_config(port),
-        None,
         Some("alt.test"),
     )
     .unwrap();
@@ -809,7 +810,6 @@ fn blocking_unproven_server_gets_no_mode_reader_and_no_group() {
 
     let mut conn = BlockingNntpConnection::connect_for_group(
         &blocking_pipelined_setup_config(port),
-        None,
         Some("alt.test"),
     )
     .unwrap();
@@ -841,12 +841,9 @@ fn blocking_500_after_setup_leaves_the_connection_alone() {
         b"500 unknown command\r\n",
     );
 
-    let mut conn = BlockingNntpConnection::connect_for_group(
-        &blocking_pipelined_setup_config(port),
-        None,
-        None,
-    )
-    .unwrap();
+    let mut conn =
+        BlockingNntpConnection::connect_for_group(&blocking_pipelined_setup_config(port), None)
+            .unwrap();
 
     let response = conn
         .send_command(&Command::Body(ArticleId::MessageId(
@@ -879,7 +876,6 @@ fn blocking_412_after_setup_records_the_group_requirement() {
 
     let mut conn = BlockingNntpConnection::connect_for_group(
         &blocking_pipelined_setup_config(port),
-        None,
         Some("alt.test"),
     )
     .unwrap();
@@ -1274,7 +1270,6 @@ fn blocking_starttls_refusal_fails_the_connect() {
     };
     let Err(error) = BlockingNntpConnection::connect_with_backend(
         &config,
-        None,
         Some(NntpTlsBackend::ManualRustls),
         None,
     ) else {
@@ -1746,7 +1741,6 @@ fn test_body_lane(config: &ServerConfig) -> BlockingBodyLane {
         StableServerId(9001),
         None,
         config,
-        None,
         &["alt.test".to_string()],
         Duration::from_secs(30),
         crate::pool::BlockingConnectionPermit::for_tests(),
@@ -2059,20 +2053,22 @@ fn routed_socket_preserves_implicit_tls_and_starttls_body_delivery() {
             )],
             upgrade,
         );
-        let egress = std::sync::Arc::new(weaver_tunnel::pipe::Egress {
-            id: 0,
-            binding: weaver_tunnel::egress::SocketEgress::System,
-            timeout: config.connect_timeout,
-        });
-        config.dialer = Some(std::sync::Arc::new(crate::route_dialer::RouteDialer {
-            inner: std::sync::Arc::new(crate::route_dialer::AddressPlanned::new(
-                "fixture".into(),
-                egress,
-            )),
+        let egress = std::sync::Arc::new(weaver_tunnel::pipe::Egress::new(
+            0,
+            weaver_tunnel::egress::SocketEgress::System,
+            config.connect_timeout,
+        ));
+        let planned = std::sync::Arc::new(crate::route_dialer::AddressPlanned::new(
+            "fixture".into(),
+            egress,
+        ));
+        config.dialer = std::sync::Arc::new(crate::route_dialer::RouteDialer {
+            plan: Some(planned.plan.clone()),
+            inner: planned,
             egress_controls: std::sync::Arc::new(crate::transfer::ServerTransferRegistry::new()),
             runtime: runtime.handle().clone(),
             server: 1,
-        }));
+        });
         let mut connection = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
         connection.select_group("alt.test").unwrap();
         assert_eq!(

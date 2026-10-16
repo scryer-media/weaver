@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // PAR3 recovery telemetry: relaxed atomics only, fixed storage, no allocation.
 //
 // Every field here is written from either the pipeline actor or a blocking

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // NZBGet `manifest.json` v2 parsing and legacy bare-script adapter detection.
 //
 // The manifest supplies a display name, the options schema (including which

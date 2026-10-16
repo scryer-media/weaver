@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // HTTP/3 uses the same native stream and revocation paths as SSH and WireGuard.
 use crate::{TunnelError, shared::SharedProvider};
 pub use proxy_tunnels::{Http3ProxyCredentials, Http3TunnelSpec};

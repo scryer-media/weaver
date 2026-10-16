@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A job that resumes after a restart must keep advancing its durable floor.
 //
 // The restored prefix is committed straight into assembly and never enters the

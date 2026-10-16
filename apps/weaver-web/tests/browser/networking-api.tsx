@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Link, MemoryRouter } from "react-router";
@@ -16,6 +19,6 @@ const actionsRef={current:null};
 const setFlags=()=>{};
 function Fixture(){
  const [host,setHost]=useState<HTMLDivElement|null>(null);
- return <main className="bg-wv-bg text-wv-primary" style={{padding:16,display:"grid",gap:16}}><nav style={{display:"flex",gap:16}}><Link to="/settings/networking/overview">Overview</Link><Link to="/settings/networking/egress">Egress interfaces</Link><Link to="/settings/networking/routes">Routes</Link></nav><div ref={setHost}/>{host&&<SettingsShellProvider search="" actionsRef={actionsRef} setFlags={setFlags} controlsHost={host}><NetworkingWorkspace proxies={()=>null} bandwidth={null} proxyEditor={()=>null}/></SettingsShellProvider>}</main>;
+ return <main className="bg-wv-bg text-wv-primary" style={{padding:16,display:"grid",gap:16}}><nav style={{display:"flex",gap:16}}><Link to="/settings/networking/overview">Overview</Link><Link to="/settings/networking/egress">Egress interfaces</Link><Link to="/settings/networking/routes">Routes</Link></nav><div ref={setHost}/>{host&&<SettingsShellProvider search="" actionsRef={actionsRef} setFlags={setFlags} controlsHost={host}><NetworkingWorkspace proxies={()=>null} proxyEditor={()=>null}/></SettingsShellProvider>}</main>;
 }
 createRoot(document.getElementById("root")!).render(<Provider value={client}><TranslateContext.Provider value={{t:(key,values)=>translateDictionary(en,key,values),uiLanguage:"eng",selectedLanguage:{code:"eng",label:"English"},setLanguagePreference:()=>{}}}><MemoryRouter initialEntries={["/settings/networking/egress"]}><Fixture/></MemoryRouter></TranslateContext.Provider></Provider>);

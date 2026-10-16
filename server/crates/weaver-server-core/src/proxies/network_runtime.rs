@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, RwLock},
@@ -17,12 +20,17 @@ use weaver_tunnel::{
 use super::*;
 use crate::Database;
 
-#[path = "network_feed.rs"]
-mod feed;
-pub use feed::FeedAttempt;
+#[path = "network_fetch.rs"]
+mod fetch;
+pub use fetch::FetchAttempt;
 #[path = "network_draft.rs"]
 mod draft;
 pub use draft::DraftNetworkRoute;
+#[path = "network_test_via.rs"]
+mod test_via;
+pub use test_via::{
+    HostResolution, LookupError, LookupFailure, MAX_TEST_PATHS, PathTest, ResolvedBy, TestSubject,
+};
 
 // The health reason of an egress whose download quota is used up.
 pub const QUOTA_REACHED: &str = "Quota reached";
@@ -52,8 +60,17 @@ impl Configuration {
                         .into_iter()
                         .map(|feed| (Consumer::Rss(feed.id), feed.name, 1)),
                 )
+                .chain(std::iter::once((
+                    Consumer::Outbound,
+                    "Default outbound".to_owned(),
+                    1,
+                )))
                 .collect(),
-            consumers: ProxyRuntime::load_consumers(db).map_err(|e| e.to_string())?,
+            consumers: ProxyRuntime::load_consumers(db)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(Consumer::key)
+                .collect(),
             egresses: db
                 .list_egress_interfaces()
                 .map_err(|e| e.to_string())?
@@ -165,11 +182,6 @@ pub struct LiveNetworkRoute {
     pub legs: RwLock<Vec<LiveLeg>>,
     cap: std::sync::atomic::AtomicU16,
     timeout: Duration,
-}
-
-pub struct NetworkProbe {
-    pub source_address: Option<std::net::SocketAddr>,
-    pub elapsed: Duration,
 }
 
 type StagedPoolMembers = HashMap<(u32, u32), Vec<(u32, Arc<dyn Dialer>)>>;
@@ -493,11 +505,12 @@ impl NetworkRuntime {
             EgressBinding::Interface { name } => SocketEgress::Interface(name.clone()),
             EgressBinding::SourceAddress { address } => SocketEgress::SourceAddress(*address),
         };
-        Ok(Arc::new(Egress {
-            id,
-            binding,
-            timeout,
-        }))
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the runtime builds a route's egress from the saved egress"
+        )]
+        let egress = Egress::new(id, binding, timeout);
+        Ok(Arc::new(egress))
     }
     fn hop(
         &self,
@@ -512,11 +525,15 @@ impl NetworkRuntime {
             return Ok(Arc::new(Unavailable(format!("proxy {id} is disabled"))));
         }
         // A canonical hop has the profile's timeout, independent of its first consumer.
-        let bottom = Arc::new(Egress {
-            id: bottom.id,
-            binding: bottom.binding.clone(),
-            timeout: profile.timeout(),
-        });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a hop's egress is the leg's, with the profile's timeout"
+        )]
+        let bottom = Arc::new(Egress::new(
+            bottom.id(),
+            bottom.binding().clone(),
+            profile.timeout(),
+        ));
         let inner: Arc<dyn Dialer> = if prefix.is_empty() {
             bottom.clone()
         } else {
@@ -530,7 +547,7 @@ impl NetworkRuntime {
             .iter()
             .map(|id| (*id, config.profiles.get(id).map(|p| p.revision)))
             .collect();
-        let key = format!("{}:{:?}:{revisions:?}", bottom.id, bottom.binding);
+        let key = format!("{}:{:?}:{revisions:?}", bottom.id(), bottom.binding());
         let mut sessions = self.sessions.lock().expect("network sessions");
         if let Some(stage) = sessions
             .get(&key)
@@ -561,6 +578,7 @@ impl NetworkRuntime {
                 },
                 inner,
                 timeout: profile.timeout(),
+                naming: profile.naming(bottom.clone()),
                 failure: Default::default(),
             }),
             _ => {
@@ -640,7 +658,7 @@ impl NetworkRuntime {
                     inner,
                     transport,
                     path: DialPath {
-                        egress: bottom.id,
+                        egress: bottom.id(),
                         proxies: prefix.to_vec(),
                         ..Default::default()
                     },
@@ -650,6 +668,7 @@ impl NetworkRuntime {
                         .ok()
                         .map(|ip| std::net::SocketAddr::new(ip, profile.port)),
                     timeout: profile.timeout(),
+                    naming: profile.naming(bottom.clone()),
                     resolver,
                     failure: Default::default(),
                 })
@@ -670,13 +689,13 @@ impl NetworkRuntime {
                 .pools
                 .lock()
                 .expect("network pools")
-                .get(&(id, bottom.id))
+                .get(&(id, bottom.id()))
             {
                 if self.compiling {
                     self.pool_updates
                         .lock()
                         .expect("staged pools")
-                        .insert((id, bottom.id), Vec::new());
+                        .insert((id, bottom.id()), Vec::new());
                 } else {
                     stage.set_members(Vec::new());
                 }
@@ -695,12 +714,12 @@ impl NetworkRuntime {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let mut pools = self.pools.lock().expect("network pools");
-        let stage = if let Some(stage) = pools.get(&(id, bottom.id)) {
+        let stage = if let Some(stage) = pools.get(&(id, bottom.id())) {
             if self.compiling {
                 self.pool_updates
                     .lock()
                     .expect("staged pools")
-                    .insert((id, bottom.id), members);
+                    .insert((id, bottom.id()), members);
             } else {
                 let revision = stage.revision();
                 stage.set_members(members);
@@ -711,7 +730,7 @@ impl NetworkRuntime {
             stage.clone()
         } else {
             let stage = PoolStage::new(id, members, self.handle.clone());
-            pools.insert((id, bottom.id), stage.clone());
+            pools.insert((id, bottom.id()), stage.clone());
             if !self.compiling {
                 stage.prewarm();
             }
@@ -746,6 +765,10 @@ impl NetworkRuntime {
         let stage: Arc<dyn Dialer> = match &leg.path {
             LegPath::Direct => {
                 if matches!(consumer, Consumer::Server(_)) {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a server's direct leg is its route"
+                    )]
                     let plan = Arc::new(AddressPlanned::new(
                         format!("{} leg {}", consumer.key(), position),
                         bottom.clone(),
@@ -803,7 +826,7 @@ impl NetworkRuntime {
         let signature = format!(
             "{}:{:?}:{}:{versions:?}:{pool_versions:?}",
             leg.egress_id,
-            bottom.binding,
+            bottom.binding(),
             serde_json::to_string(&leg.path).map_err(|e| e.to_string())?
         );
         Ok(LiveLeg {
@@ -888,8 +911,15 @@ impl NetworkRuntime {
         timeout: Duration,
     ) -> Result<Arc<RouteDialer>, String> {
         let route = self.route(Consumer::Server(id), cap, timeout)?;
+        let plan = route
+            .legs
+            .read()
+            .expect("network route legs")
+            .iter()
+            .find_map(|leg| leg.address_plan.as_ref().map(|plan| plan.plan.clone()));
         Ok(Arc::new(RouteDialer {
             inner: route.weighted.clone(),
+            plan,
             egress_controls: self.egress_controls.clone(),
             runtime: self.handle.clone(),
             server: id,
@@ -1100,60 +1130,6 @@ impl NetworkRuntime {
             }
         }
     }
-    pub async fn test_path(
-        &self,
-        id: u32,
-        proxy: Option<u32>,
-        host: Option<&str>,
-        port: Option<u16>,
-    ) -> Result<NetworkProbe, String> {
-        let isolated = self.isolated_probe_runtime();
-        let stage = {
-            let config = isolated
-                .configuration
-                .read()
-                .expect("network configuration");
-            let egress = config.egresses.get(&id).ok_or("egress does not exist")?;
-            if !egress.enabled {
-                return Err("egress is disabled".into());
-            }
-            let bottom = Self::bottom(&config, id, Duration::from_secs(15))?;
-            match proxy {
-                Some(proxy) => isolated.hop(&config, proxy, bottom.clone(), bottom, &[])?,
-                None => bottom as Arc<dyn Dialer>,
-            }
-        };
-        let started = tokio::time::Instant::now();
-        let result = async {
-            let source_address = match (host, port) {
-                (Some(host), Some(port)) => {
-                    let dialed = stage
-                        .dial(&Target {
-                            host: host.into(),
-                            port,
-                            purpose: weaver_tunnel::pipe::Purpose::Probe,
-                            addresses: Vec::new(),
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    dialed.source
-                }
-                (None, None) if proxy.is_some() => {
-                    stage.prepare().await.map_err(|e| e.to_string())?;
-                    None
-                }
-                _ => return Err("host and port must be provided together".into()),
-            };
-            Ok(NetworkProbe {
-                source_address,
-                elapsed: started.elapsed(),
-            })
-        }
-        .await;
-        isolated.shutdown().await;
-        result
-    }
-
     pub async fn shutdown(&self) {
         if let Some(task) = self.poll.lock().expect("network health task").take() {
             task.abort();

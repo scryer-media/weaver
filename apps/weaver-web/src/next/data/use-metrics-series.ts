@@ -1,4 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+import { createContext, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useSubscription } from "urql";
 import {
   METRICS_HISTORY_QUERY,
@@ -118,6 +121,12 @@ interface MetricsPageResponse {
   globalState: { isPaused: boolean; downloadBlock: DownloadBlockState };
 }
 
+/**
+ * The snapshot a screen holds, for the parts of it that show a figure from
+ * it: a new sample redraws those, not the screen around them.
+ */
+export const MetricsSnapshotContext = createContext<MetricsSnapshot | null>(null);
+
 /** The full live metrics snapshot — the stat strip reads every field of it. */
 export function useMetricsSnapshot(): MetricsSnapshot | null {
   const connection = useGraphqlConnectionState();
@@ -129,14 +138,25 @@ export function useMetricsSnapshot(): MetricsSnapshot | null {
   }>({ query: METRICS_PAGE_SUBSCRIPTION });
 
   const [polled, setPolled] = useState<MetricsPageResponse>();
+  // Whether a polled answer is held. A live sample clears one only when there
+  // is one: clearing nothing still costs the screen a render on every sample.
+  const holdingPolled = useRef(false);
   useReconnectPolling<MetricsPageResponse>({
     enabled: connection.status === "disconnected",
     query: METRICS_PAGE_QUERY,
-    onData: setPolled,
+    onData: (data) => {
+      holdingPolled.current = true;
+      setPolled(data);
+    },
   });
 
   useEffect(() => {
-    if (connection.status === "connected" && subscriptionData?.systemMetricsUpdates) {
+    if (
+      holdingPolled.current &&
+      connection.status === "connected" &&
+      subscriptionData?.systemMetricsUpdates
+    ) {
+      holdingPolled.current = false;
       setPolled(undefined);
     }
   }, [connection.status, subscriptionData]);

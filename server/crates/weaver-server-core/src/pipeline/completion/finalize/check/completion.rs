@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Continuation of the `impl Pipeline` block from `finalize/check.rs`.
 // Split out mechanically to keep the parent file readable; no behavior lives here
 // that is not simply a method of the same type.
@@ -242,7 +245,7 @@ impl Pipeline {
                             error = %error,
                             "failed to join a RAR chase armed at completion"
                         );
-                        self.fail_job(job_id, error);
+                        self.fail_job_on_extraction_error(job_id, error);
                         return;
                     }
                 }
@@ -257,7 +260,7 @@ impl Pipeline {
                         error = %error,
                         "failed to start RAR full-set extraction"
                     );
-                    self.fail_job(job_id, error);
+                    self.fail_job_on_extraction_error(job_id, error);
                     return;
                 }
             }

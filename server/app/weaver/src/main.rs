@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// Tests dial their own loopback fixtures.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 // Windows and everything else get different allocators, so the module that
 // `allocator` names differs by target; both define the same three items.
 #[cfg(target_os = "windows")]
@@ -45,6 +51,14 @@ use crate::logging::{LocalTimer, LogColor, LogFormat};
 const LOG_FILE_ENV: &str = "WEAVER_LOG_FILE";
 const DOTENV_FILE: &str = ".env";
 
+struct FileLogWriter(weaver_server_core::runtime::log_delivery::LogDelivery);
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileLogWriter {
+    type Writer = weaver_server_core::runtime::log_delivery::EventWriter<'a>;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.0.make_writer()
+    }
+}
+
 // The platform allocators this binary would otherwise get are the wrong shape
 // for the pipeline's cross-thread article buffers: musl's serializes threaded
 // allocation heavily (measured −18% CPU on the container download benchmark
@@ -66,6 +80,14 @@ fn main() {
             eprintln!("upgrade helper failed: {error}");
             std::process::exit(1);
         }
+    }
+    // A server started by a process that interrupted another console server
+    // inherits the ignore-Ctrl+C flag, and must clear it to stay stoppable.
+    // The helper above keeps it: it sends those interrupts itself.
+    #[cfg(windows)]
+    {
+        // SAFETY: A null handler with FALSE only clears this process's flag.
+        unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) };
     }
     if let Some(code) =
         weaver_server_core::post_processing::runner::maybe_run_supervisor_from_process_args()
@@ -159,21 +181,33 @@ async fn async_main() {
         env_log_file.as_deref(),
         default_windows_log_file_path(),
     );
+    let log_policy = weaver_server_core::runtime::log_file::LogFilePolicy::from_env()
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1)
+        });
+    let mut log_file_guard = None;
     let log_file_writer = match log_file_config.as_ref() {
         Some(config) => {
-            match weaver_server_core::runtime::log_buffer::open_log_file(&config.path) {
-                Ok(writer) => {
+            match weaver_server_core::runtime::log_file::open_log_delivery(
+                &config.path,
+                log_policy,
+                "file",
+            ) {
+                Ok((writer, guard)) => {
+                    log_file_guard = Some(guard);
                     // Record the path the resolution above actually picked, so
                     // the diagnostics package copies the real log files rather
                     // than re-deriving the rules and guessing.
                     weaver_server_core::runtime::log_buffer::set_log_file_path(config.path.clone());
-                    Some(writer)
+                    Some(FileLogWriter(writer))
                 }
                 Err(error) if config.explicit => {
                     eprintln!(
                         "failed to open Weaver log file at {}: {error}",
                         config.path.display()
                     );
+                    drop(log_file_guard.take());
                     std::process::exit(1);
                 }
                 Err(error) => {
@@ -208,12 +242,12 @@ async fn async_main() {
                 tracing_subscriber::fmt::layer()
                     .with_timer(LocalTimer)
                     .json()
-                    .with_writer(LogFileMakeWriter(writer)),
+                    .with_writer(writer),
             ),
             LogFormat::Text => Box::new(
                 tracing_subscriber::fmt::layer()
                     .with_timer(LocalTimer)
-                    .with_writer(LogFileMakeWriter(writer))
+                    .with_writer(writer)
                     .with_ansi(false),
             ),
         });
@@ -251,9 +285,13 @@ async fn async_main() {
 
     let command = match command {
         Command::Par2 { command } => match commands::par2::run(command) {
-            Ok(code) => std::process::exit(code),
+            Ok(code) => {
+                drop(log_file_guard.take());
+                std::process::exit(code)
+            }
             Err(error) => {
                 error!("par2 command failed: {error}");
+                drop(log_file_guard.take());
                 std::process::exit(2);
             }
         },
@@ -262,6 +300,7 @@ async fn async_main() {
 
     if let Err(error) = weaver_server_core::e2e_clock::validate() {
         error!("invalid Weaver e2e clock: {error}");
+        drop(log_file_guard.take());
         std::process::exit(1);
     }
     install_e2e_network_time_scale();
@@ -288,6 +327,7 @@ async fn async_main() {
                 .await
         {
             error!("failed to reset automatic-backup settings before startup: {error}");
+            drop(log_file_guard.take());
             std::process::exit(1);
         }
         let backup_result = if skip_upgrade_backup {
@@ -308,6 +348,7 @@ async fn async_main() {
                 error!(
                     "pre-migration backup preparation failed; refusing migration because backup protection is required: {error}"
                 );
+                drop(log_file_guard.take());
                 std::process::exit(1);
             }
             error!(
@@ -319,6 +360,7 @@ async fn async_main() {
         Ok(db) => db,
         Err(error) => {
             error!("failed to open database: {error}");
+            drop(log_file_guard.take());
             std::process::exit(1);
         }
     };
@@ -327,6 +369,7 @@ async fn async_main() {
             Ok(result) => result,
             Err(error) => {
                 error!("failed to apply staged restore: {error}");
+                drop(log_file_guard.take());
                 std::process::exit(1);
             }
         };
@@ -351,6 +394,7 @@ async fn async_main() {
             Ok(config) => config,
             Err(error) => {
                 error!("failed to load restored config: {error}");
+                drop(log_file_guard.take());
                 std::process::exit(1);
             }
         };
@@ -360,6 +404,7 @@ async fn async_main() {
             Ok(result) => result,
             Err(error) => {
                 error!("failed to load config: {error}");
+                drop(log_file_guard.take());
                 std::process::exit(1);
             }
         }
@@ -368,6 +413,7 @@ async fn async_main() {
         Ok(seed) => seed,
         Err(error) => {
             error!("invalid environment config: {error}");
+            drop(log_file_guard.take());
             std::process::exit(1);
         }
     };
@@ -376,11 +422,13 @@ async fn async_main() {
     let data_dir = PathBuf::from(&config.data_dir);
     if let Err(error) = bootstrap::bootstrap_encryption(&data_dir, &mut db, &mut config) {
         error!("failed to bootstrap encryption key: {error}");
+        drop(log_file_guard.take());
         std::process::exit(1);
     }
     bootstrap::reset_login_if_requested(&mut db);
     if let Err(error) = bootstrap::apply_core_env_seed(&db, &mut config, &env_seed) {
         error!("failed to seed config settings from environment: {error}");
+        drop(log_file_guard.take());
         std::process::exit(1);
     }
     let seeded_probe_latencies =
@@ -388,6 +436,7 @@ async fn async_main() {
             Ok(latencies) => latencies,
             Err(error) => {
                 error!("failed to seed servers from environment: {error}");
+                drop(log_file_guard.take());
                 std::process::exit(1);
             }
         };
@@ -396,6 +445,7 @@ async fn async_main() {
         for message in &errors {
             error!("config: {message}");
         }
+        drop(log_file_guard.take());
         std::process::exit(1);
     }
 
@@ -411,12 +461,14 @@ async fn async_main() {
     }
     if let Err(error) = bootstrap::ensure_runtime_directories(&required_directories) {
         error!("{error}");
+        drop(log_file_guard.take());
         std::process::exit(1);
     }
     let canonical_data_dir = match std::fs::canonicalize(&data_dir) {
         Ok(path) => path,
         Err(error) => {
             error!("failed to canonicalize data directory: {error}");
+            drop(log_file_guard.take());
             std::process::exit(1);
         }
     };
@@ -429,6 +481,7 @@ async fn async_main() {
             .map(std::path::Path::new),
     ) {
         error!("failed to initialize post-processing scripts directory: {error}");
+        drop(log_file_guard.take());
         std::process::exit(1);
     }
 
@@ -457,6 +510,7 @@ async fn async_main() {
             .await
             {
                 error!("download failed: {error}");
+                drop(log_file_guard.take());
                 std::process::exit(1);
             }
         }
@@ -471,8 +525,10 @@ async fn async_main() {
                 seeded_probe_latencies,
             )
             .await
+            .and_then(|stop| stop.finish(|| drop(log_file_guard.take())))
             {
                 error!("server failed: {error}");
+                drop(log_file_guard.take());
                 std::process::exit(1);
             }
         }
@@ -608,17 +664,6 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBufferWriter {
 
     fn make_writer(&'a self) -> Self::Writer {
         self.0.clone()
-    }
-}
-
-#[derive(Clone)]
-struct LogFileMakeWriter(weaver_server_core::runtime::log_buffer::LogFileWriter);
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogFileMakeWriter {
-    type Writer = weaver_server_core::runtime::log_buffer::LogFileWriteHandle;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.0.make_writer()
     }
 }
 

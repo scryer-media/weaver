@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Byte-sniffing an unclassified file's first bytes for a RAR volume head or a
 // 7z signature header.
 //

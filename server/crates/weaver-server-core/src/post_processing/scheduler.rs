@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Runs schedule jobs at the times saved on each job.
 //
 // The evaluator ticks once a minute from memory. It reads the jobs from the

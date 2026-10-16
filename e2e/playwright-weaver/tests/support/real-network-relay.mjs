@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import dgram from "node:dgram";
 import net from "node:net";
 import { lookup } from "node:dns/promises";
@@ -97,7 +100,7 @@ export async function startAPIRelay(target) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   // This file contains endpoint addresses only, never provider credentials.
   const config = JSON.parse(readFileSync("/run/real-network/relay.json", "utf8"));
-  const fixture = await startProxyFixture({ ip: config.ip, publicTargets: config.publicTargets });
+  const fixture = await startProxyFixture({ ip: config.ip, publicTargets: config.publicTargets, publicOnly: true });
   const relays = await startWireGuardRelays(config.wireguard);
   const api = config.api ? await startAPIRelay(config.api) : null;
   writeFileSync("/tmp/real-network-ready", "ready\n");

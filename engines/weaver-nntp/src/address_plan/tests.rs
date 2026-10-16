@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -25,6 +28,7 @@ struct ScriptedDialer {
     resolved: Mutex<Option<Vec<SocketAddr>>>,
     answers: Mutex<HashMap<SocketAddr, Answer>>,
     dialled: Mutex<Vec<SocketAddr>>,
+    forgotten: Mutex<usize>,
 }
 
 impl ScriptedDialer {
@@ -33,6 +37,7 @@ impl ScriptedDialer {
             resolved: Mutex::new(Some(resolved.to_vec())),
             answers: Mutex::new(HashMap::new()),
             dialled: Mutex::new(Vec::new()),
+            forgotten: Mutex::new(0),
         })
     }
 
@@ -83,6 +88,10 @@ impl AddressDialer for ScriptedDialer {
             let _ = gate.recv();
         }
         Ok(addr)
+    }
+
+    fn forget(&self) {
+        *self.forgotten.lock().unwrap() += 1;
     }
 }
 
@@ -967,6 +976,25 @@ fn a_failed_first_race_holds_further_races_off_for_a_while() {
     assert_eq!(snapshot.pinned, Some(second));
 }
 
+// A race in which no address answered drops the answer the resolver holds,
+// so the next race asks it again; a race that is won keeps it.
+#[test]
+fn a_race_no_address_answered_drops_the_held_answer() {
+    let (first, second) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[first, second]);
+    dialer.answer(first, Answer::Refuse);
+    dialer.answer(second, Answer::Refuse);
+    plan().connect(&dialer).unwrap_err();
+    settle_all(&dialer);
+    assert_eq!(*dialer.forgotten.lock().unwrap(), 1);
+
+    let dialer = ScriptedDialer::new(&[first, second]);
+    dialer.answer(first, Answer::Refuse);
+    plan().connect(&dialer).unwrap();
+    settle_all(&dialer);
+    assert_eq!(*dialer.forgotten.lock().unwrap(), 0);
+}
+
 #[test]
 fn a_failed_first_race_with_nothing_resolved_fails_later_connects_without_dialling() {
     let dialer = ScriptedDialer::new(&[]);
@@ -1039,11 +1067,8 @@ fn pin_that_never_reaches_the_server(
     others: &[SocketAddr],
 ) {
     pin(plan, dialer, pinned, others);
-    let route = AddressRoute {
-        plan: Arc::clone(plan),
-    };
-    drop(route.watch_setup(pinned));
-    drop(route.watch_setup(pinned));
+    plan.record_setup(pinned, false);
+    plan.record_setup(pinned, false);
 }
 
 #[test]
@@ -1095,13 +1120,10 @@ fn a_session_that_reaches_the_server_clears_the_pins_failed_setups() {
     let dialer = ScriptedDialer::new(&[pinned, other]);
     let plan = plan();
     pin(&plan, &dialer, pinned, &[other]);
-    let route = AddressRoute {
-        plan: Arc::clone(&plan),
-    };
 
-    drop(route.watch_setup(pinned));
-    route.watch_setup(pinned).reached_server();
-    drop(route.watch_setup(pinned));
+    plan.record_setup(pinned, false);
+    plan.record_setup(pinned, true);
+    plan.record_setup(pinned, false);
     let (_, next) = plan.connect(&dialer).unwrap();
 
     assert_eq!(next, pinned);

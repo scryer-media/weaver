@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Script instances: a script wired to one trigger, with the inputs,
 // categories and run policy the operator saved for it.
 //

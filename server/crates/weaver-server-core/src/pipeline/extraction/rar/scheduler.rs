@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use crate::pipeline::{RAR_CAPACITY_RETRY_DELAY, RarCapacityRetry, RarCapacityRetryKind};
 
@@ -19,51 +22,16 @@ enum RarExtractionSettle {
 }
 
 impl Pipeline {
-    fn fail_terminal_extraction_rejection(&mut self, job_id: JobId, error: &str) -> bool {
-        if !JobExtractionBudget::is_rejection(error) {
+    fn fail_terminal_extraction_rejection(
+        &mut self,
+        job_id: JobId,
+        error: &ExtractionError,
+    ) -> bool {
+        if !error.is(ExtractionErrorClass::Rejected) {
             return false;
         }
-        if let Some(budget) = self.extraction_budgets.get(&job_id) {
-            budget.cancel_with_error(error);
-        }
-        self.fail_job(job_id, error.to_string());
+        self.fail_job_on_extraction_error(job_id, error.clone());
         true
-    }
-
-    // Whether a full-set extraction failed on its archive's bytes, which a
-    // repair can still change, rather than on something no repair reaches.
-    pub(in crate::pipeline) fn is_recoverable_full_set_extraction_error(error: &str) -> bool {
-        if error.starts_with(
-            crate::pipeline::completion::finalize::extract::SEVENZ_BLOCK_DATA_ERROR_PREFIX,
-        ) {
-            return true;
-        }
-        let lower = error.to_ascii_lowercase();
-        lower.contains("checksum")
-            || lower.contains("crc mismatch")
-            || lower.contains("crcmismatch")
-            || lower.contains("no crc-valid start header")
-            // A decoded part can be complete yet truncated on the wire.
-            // Its length mismatch must reach verification and repair.
-            || lower.contains("has no candidate of the required size")
-            || lower.contains("truncated header at offset")
-            || lower.contains("not a rar archive (bad signature)")
-            || lower.contains("failed to fill whole buffer")
-    }
-
-    // Refusals raised while *opening* the archive, about its structure rather
-    // than any member's bytes: two members that sanitize to one destination,
-    // or a member path that escapes the output root. Both come from
-    // `ensure_unique_sanitized_rar_member_paths` before a single member is
-    // read, and nothing a retry can bring — a re-download, a PAR2 verdict, a
-    // header refresh — changes the answer, because the names are the archive.
-    //
-    // Matched on the exact message prefixes those two checks produce, and on
-    // nothing looser: this classification ends the job, so it must never
-    // catch a member-level failure that a repair could still turn around.
-    pub(in crate::pipeline) fn is_terminal_archive_structure_error(error: &str) -> bool {
-        error.starts_with("RAR archive contains colliding sanitized member path: ")
-            || error.starts_with("unsafe RAR member path: ")
     }
 
     async fn normalize_extraction_output_tree(
@@ -98,18 +66,6 @@ impl Pipeline {
 
     fn rar_set_worker_limit(plan: &crate::pipeline::archive::rar_state::RarDerivedPlan) -> usize {
         if plan.is_solid { 1 } else { 2 }
-    }
-
-    fn is_stale_topology_batch_extraction_error(error: &str) -> bool {
-        let lower = error.to_ascii_lowercase();
-        error.contains("member not found in archive")
-            || lower.contains("not registered")
-            || lower.contains("unavailable")
-            || lower.contains("no on-disk rar volumes")
-    }
-
-    fn is_capacity_pressure_batch_extraction_error(error: &str) -> bool {
-        crate::pipeline::capacity::is_fd_capacity_error_message(error)
     }
 
     pub(in crate::pipeline) fn schedule_rar_capacity_retry(
@@ -782,7 +738,7 @@ impl Pipeline {
                 let budget = match self.extraction_budget(job_id, &output_dir) {
                     Ok(budget) => budget,
                     Err(error) => {
-                        self.fail_job(job_id, error);
+                        self.fail_job_on_extraction_error(job_id, error);
                         return;
                     }
                 };
@@ -796,7 +752,7 @@ impl Pipeline {
                 let task_permit = match budget.task_permit_for_root(root) {
                     Ok(permit) => permit,
                     Err(error) => {
-                        self.fail_job(job_id, error);
+                        self.fail_job_on_extraction_error(job_id, error.into());
                         return;
                     }
                 };
@@ -817,9 +773,10 @@ impl Pipeline {
                 let shared_kdf_cache_for_task = shared_kdf_cache.clone();
                 let policy_for_task = Arc::clone(&policy);
                 let pp_pool = self.pp_pool.clone();
+                let settle_budget = Arc::clone(&budget);
                 tokio::task::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        pp_pool.install(move || {
+                        pp_pool.install(move || -> Result<_, ExtractionError> {
                             let _task_permit = task_permit;
                             let root = _task_permit.root();
                             let selection =
@@ -839,11 +796,13 @@ impl Pipeline {
                             if let Some(member) =
                                 Self::blocked_rar_member(&selection.archive, &policy_for_task)
                             {
-                                return Err(budget.reject_content_policy(
-                                    crate::post_processing::model::unwanted_extension_reason(
-                                        &member,
-                                    ),
-                                ));
+                                return Err(budget
+                                    .reject_content_policy(
+                                        crate::post_processing::model::unwanted_extension_reason(
+                                            &member,
+                                        ),
+                                    )
+                                    .into());
                             }
                             let _memory_permit =
                                 budget.reserve_memory_wait(selection.decoder_memory_bytes)?;
@@ -867,7 +826,9 @@ impl Pipeline {
                                 let Some(idx) = archive.find_member_sanitized(member_name) else {
                                     outcome.failed.push((
                                         member_name.clone(),
-                                        "member not found in archive".to_string(),
+                                        ExtractionError::stale_topology(
+                                            "member not found in archive",
+                                        ),
                                     ));
                                     continue;
                                 };
@@ -919,12 +880,13 @@ impl Pipeline {
                                         outcome.extracted.push(extracted_name);
                                     }
                                     Err(error) => {
+                                        let error = error.settle(&budget);
                                         let _ =
                                             event_tx.send(PipelineEvent::ExtractionMemberFailed {
                                                 job_id,
                                                 set_name: set_name_for_task.clone(),
                                                 member: member_name.clone(),
-                                                error: error.clone(),
+                                                error: error.message().to_string(),
                                             });
                                         outcome.failed.push((member_name.clone(), error));
                                     }
@@ -938,8 +900,11 @@ impl Pipeline {
 
                     let result = match result {
                         Ok(result) => result,
-                        Err(error) => Err(format!("extraction task panicked: {error}")),
-                    };
+                        Err(error) => Err(ExtractionError::terminal(format!(
+                            "extraction task panicked: {error}"
+                        ))),
+                    }
+                    .map_err(|error| error.settle(&settle_budget));
                     let _ = extract_done_tx
                         .send(ExtractionDone::Batch {
                             job_id,
@@ -1260,7 +1225,7 @@ impl Pipeline {
                             .failed
                             .iter()
                             .map(|(_, error)| error)
-                            .find(|error| JobExtractionBudget::is_rejection(error))
+                            .find(|error| error.is(ExtractionErrorClass::Rejected))
                             .cloned()
                             && self.fail_terminal_extraction_rejection(job_id, &error)
                         {
@@ -1347,7 +1312,7 @@ impl Pipeline {
                                 );
                                 continue;
                             }
-                            if Self::is_stale_topology_batch_extraction_error(error) {
+                            if error.is(ExtractionErrorClass::StaleTopology) {
                                 warn!(
                                     job_id = job_id.0,
                                     set_name = %set_name,
@@ -1355,7 +1320,7 @@ impl Pipeline {
                                     error = %error,
                                     "RAR batch member hit stale topology; queueing validation refresh"
                                 );
-                            } else if Self::is_capacity_pressure_batch_extraction_error(error) {
+                            } else if error.is(ExtractionErrorClass::CapacityPressure) {
                                 warn!(
                                     job_id = job_id.0,
                                     set_name = %set_name,
@@ -1382,7 +1347,7 @@ impl Pipeline {
                             .filter_map(|(member, error)| {
                                 (current_attempted.contains(member)
                                     && !already_extracted.contains(member)
-                                    && Self::is_stale_topology_batch_extraction_error(error))
+                                    && error.is(ExtractionErrorClass::StaleTopology))
                                 .then_some(member.clone())
                             })
                             .collect::<Vec<_>>();
@@ -1392,7 +1357,7 @@ impl Pipeline {
                             .filter_map(|(member, error)| {
                                 (current_attempted.contains(member)
                                     && !already_extracted.contains(member)
-                                    && Self::is_capacity_pressure_batch_extraction_error(error))
+                                    && error.is(ExtractionErrorClass::CapacityPressure))
                                 .then_some(member.clone())
                             })
                             .collect::<Vec<_>>();
@@ -1438,7 +1403,7 @@ impl Pipeline {
                                 error = %error,
                                 "ignoring stale RAR batch extraction failure for non-current or already extracted members"
                             );
-                        } else if Self::is_terminal_archive_structure_error(&error) {
+                        } else if error.is(ExtractionErrorClass::StructureRefused) {
                             // The full-set arm already ends the job on this
                             // error. The batch arm has to as well: latched as
                             // an ordinary member failure, a job without a
@@ -1458,11 +1423,11 @@ impl Pipeline {
                             );
                             let _ = self.event_tx.send(PipelineEvent::ExtractionFailed {
                                 job_id,
-                                error: error.clone(),
+                                error: error.message().to_string(),
                             });
-                            self.fail_job(job_id, error);
+                            self.fail_job_on_extraction_error(job_id, error);
                             return;
-                        } else if Self::is_stale_topology_batch_extraction_error(&error) {
+                        } else if error.is(ExtractionErrorClass::StaleTopology) {
                             warn!(
                                 job_id = job_id.0,
                                 set_name = %set_name,
@@ -1481,7 +1446,7 @@ impl Pipeline {
                                 &set_name,
                                 &current_failed_members,
                             );
-                        } else if Self::is_capacity_pressure_batch_extraction_error(&error) {
+                        } else if error.is(ExtractionErrorClass::CapacityPressure) {
                             capacity_retry = true;
                             warn!(
                                 job_id = job_id.0,
@@ -1600,7 +1565,7 @@ impl Pipeline {
                         .failed
                         .iter()
                         .map(|(_, error)| error)
-                        .find(|error| JobExtractionBudget::is_rejection(error))
+                        .find(|error| error.is(ExtractionErrorClass::Rejected))
                         .cloned()
                         && self.fail_terminal_extraction_rejection(job_id, &error)
                     {
@@ -1671,7 +1636,7 @@ impl Pipeline {
                     let full_set_capacity_pressure = outcome
                         .failed
                         .iter()
-                        .any(|(_, error)| Self::is_capacity_pressure_batch_extraction_error(error));
+                        .any(|(_, error)| error.is(ExtractionErrorClass::CapacityPressure));
                     if full_set_capacity_pressure {
                         warn!(
                             job_id = job_id.0,
@@ -1773,7 +1738,7 @@ impl Pipeline {
                     );
                     let rar_capacity_pressure =
                         self.rar_sets.contains_key(&(job_id, set_name.clone()))
-                            && Self::is_capacity_pressure_batch_extraction_error(&e);
+                            && e.is(ExtractionErrorClass::CapacityPressure);
                     if let Some(set_state) = self.rar_sets.get_mut(&(job_id, set_name.clone())) {
                         set_state.active_workers = 0;
                         set_state.in_flight_members.clear();
@@ -1806,7 +1771,7 @@ impl Pipeline {
                     // Parked as waiting on it, it takes the missing-volume
                     // route — repair when recovery data can rebuild it, a
                     // failure naming the volumes seen when nothing can.
-                    if crate::pipeline::archive::topology::is_missing_first_rar_volume_error(&e)
+                    if e.is(ExtractionErrorClass::MissingFirstVolume)
                         && self.park_rar_set_waiting_for_first_volume(job_id, &set_name)
                     {
                         self.phase_end_extracting_if_idle(job_id);
@@ -1819,9 +1784,7 @@ impl Pipeline {
                     // retry route already recognises.
                     let strong_decode_claim_reopened =
                         self.reopen_strong_decode_claim_after_failed_extraction(job_id, &set_name);
-                    if strong_decode_claim_reopened
-                        || Self::is_recoverable_full_set_extraction_error(&e)
-                    {
+                    if strong_decode_claim_reopened || e.is(ExtractionErrorClass::Recoverable) {
                         self.phase_end_extracting_if_idle(job_id);
                         self.set_failed_extraction_member(job_id, &set_name);
                         self.check_job_completion(job_id).await;
@@ -1835,9 +1798,9 @@ impl Pipeline {
                     );
                     let _ = self.event_tx.send(PipelineEvent::ExtractionFailed {
                         job_id,
-                        error: e.clone(),
+                        error: e.message().to_string(),
                     });
-                    self.fail_job(job_id, e);
+                    self.fail_job_on_extraction_error(job_id, e);
                 }
             },
         }

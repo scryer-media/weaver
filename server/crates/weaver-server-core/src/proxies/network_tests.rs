@@ -1,4 +1,8 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
+use crate::proxies::Resolver;
 
 fn route(weights: &[u8], failover: Failover) -> Route {
     Route {
@@ -22,6 +26,7 @@ fn profile(id: u32, kind: ProxyKind) -> ProxyProfile {
         enabled: true,
         host: "proxy.example".into(),
         port: 443,
+        resolver: Resolver::Proxy,
         dns_servers: vec!["192.0.2.53".parse().unwrap()],
         tunnel_addresses: vec![],
         peer_public_key: None,
@@ -192,7 +197,7 @@ fn legacy_writes_refuse_lossy_routes() {
 }
 
 #[test]
-fn reference_validation_catches_overlap_udp_chains_and_rss_dns() {
+fn reference_validation_catches_overlap_and_udp_chains() {
     let egresses = HashMap::from([(0, EgressInterface::system())]);
     let mut profiles = HashMap::from([
         (1, profile(1, ProxyKind::Socks5)),
@@ -215,7 +220,7 @@ fn reference_validation_catches_overlap_udp_chains_and_rss_dns() {
     };
     assert_eq!(
         route
-            .validate_references(&egresses, &profiles, &pools, false)
+            .validate_references(&egresses, &profiles, &pools)
             .unwrap_err(),
         NetworkRefusal::RouteProxyRepeated
     );
@@ -226,27 +231,20 @@ fn reference_validation_catches_overlap_udp_chains_and_rss_dns() {
     profiles.get_mut(&2).unwrap().kind = ProxyKind::WireGuard;
     assert_eq!(
         route
-            .validate_references(&egresses, &profiles, &pools, false)
+            .validate_references(&egresses, &profiles, &pools)
             .unwrap_err(),
         NetworkRefusal::RouteChainTransport
     );
     profiles.get_mut(&2).unwrap().kind = ProxyKind::Socks5;
     assert!(
         route
-            .validate_references(&egresses, &profiles, &pools, true)
+            .validate_references(&egresses, &profiles, &pools)
             .is_ok()
-    );
-    profiles.get_mut(&2).unwrap().dns_servers.clear();
-    assert_eq!(
-        route
-            .validate_references(&egresses, &profiles, &pools, true)
-            .unwrap_err(),
-        NetworkRefusal::RouteRssProxyNeedsDns
     );
     route.legs[0].egress_id = 7;
     assert_eq!(
         route
-            .validate_references(&egresses, &profiles, &pools, false)
+            .validate_references(&egresses, &profiles, &pools)
             .unwrap_err(),
         NetworkRefusal::RouteEgressMissing
     );
@@ -270,7 +268,7 @@ fn a_wireguard_hop_may_sit_only_on_the_egress_or_another_wireguard_hop() {
             rungs: vec![Rung::Chain { ids: ids.to_vec() }],
             direct_fallback: false,
         };
-        route.validate_references(&egresses, &profiles, &pools, false)
+        route.validate_references(&egresses, &profiles, &pools)
     };
     for accepted in [
         &[1, 2][..],

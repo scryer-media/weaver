@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The admin-only diagnostics package endpoint.
 //
 // One request produces one `weaver-diagnostics-<timestamp>.tar.zst` holding
@@ -429,7 +432,19 @@ fn collect_host_facts(dirs: (PathBuf, PathBuf, PathBuf)) -> HostFacts {
 
 // The rolling log files, as the running process resolved their location.
 async fn collect_log_files() -> Vec<Component> {
-    let paths = weaver_server_core::runtime::log_buffer::existing_log_files();
+    let paths = match tokio::task::spawn_blocking(
+        weaver_server_core::runtime::log_buffer::existing_log_files,
+    )
+    .await
+    {
+        Ok(paths) => paths,
+        Err(error) => {
+            return vec![Component::failed(
+                "weaver.log",
+                format!("log discovery failed: {error}"),
+            )];
+        }
+    };
     if paths.is_empty() {
         return vec![Component::failed(
             "weaver.log",

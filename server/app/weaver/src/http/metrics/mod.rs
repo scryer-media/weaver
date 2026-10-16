@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The Prometheus `/metrics` endpoint.
 //
 // Layout:
@@ -247,6 +250,7 @@ impl PrometheusMetricsExporter {
             weaver_server_core::proxies::network_metrics::snapshot(&runtime.network)
         });
         let tunnel = weaver_server_core::proxies::network_metrics::tunnel::snapshot();
+        let speed_tests = weaver_server_core::speed_test::speed_test_metrics_snapshot();
         // The samplers' last readings: a scrape never stats a filesystem, so a
         // slow mount cannot hold it.
         let disk_space = disk_space.snapshots();
@@ -284,6 +288,7 @@ impl PrometheusMetricsExporter {
         input.schedules = Some(&schedules);
         input.network = network.as_ref();
         input.tunnel = Some(&tunnel);
+        input.speed_tests = Some(&speed_tests);
         input.build = self.build;
         input.start_time_seconds = process_start_epoch_seconds();
         input.per_job_series = per_job_series;

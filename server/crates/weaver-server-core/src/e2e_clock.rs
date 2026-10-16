@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Explicit, file-backed clock override for deterministic end-to-end tests.
 //
 // Production always uses the system clock. The override is consulted only
@@ -54,6 +57,20 @@ pub fn validate() -> Result<(), String> {
     match clock_config() {
         ClockConfig::System => Ok(()),
         ClockConfig::File(path) => read_clock(path).map(|_| ()),
+    }
+}
+
+pub(crate) fn override_enabled() -> bool {
+    matches!(clock_config(), ClockConfig::File(_))
+}
+
+// An explicit E2E control holds between articles, where no socket read is
+// outstanding. This lets the driver advance the deadline without racing an
+// unrelated network timeout. Production never reads the control file.
+pub(crate) fn hold_speed_test_after_article() -> bool {
+    match clock_config() {
+        ClockConfig::System => false,
+        ClockConfig::File(path) => path.with_extension("speed-test-hold").exists(),
     }
 }
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Format coverage beyond the archive matrix proper: obfuscated RAR4 sets and
 // the solid and encrypted multi-volume compressed layouts.
 use super::*;

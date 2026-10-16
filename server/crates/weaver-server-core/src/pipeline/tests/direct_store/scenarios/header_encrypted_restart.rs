@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A header-encrypted (`-hp`) set across a restart.
 //
 // Restoring a set rebuilds its layout from cached volume facts, and that
@@ -5,9 +8,9 @@
 // happens and where the archive key is proved. The password itself is never
 // persisted, so the restore seam has to hand the set's header gate the same
 // candidates the live seam would have: the job spec's password and the job's
-// harvest (NZB meta, file-name convention). A gate with an empty candidate
-// ring refuses under a sticky `NoPassword`, and the set throws its checkpoint
-// away and downloads every volume again.
+// harvest (NZB meta, file-name convention, the global list). A gate with an
+// empty candidate ring refuses under a sticky `NoPassword`, and the set throws
+// its checkpoint away and downloads every volume again.
 
 use super::*;
 

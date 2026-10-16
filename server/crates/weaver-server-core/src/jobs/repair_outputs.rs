@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Durable ownership of reconstructed files that have no NZB articles.
 
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
@@ -212,6 +215,7 @@ mod tests {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             password_override: None,
+            supplied_password_candidates: Vec::new(),
         }
     }
 

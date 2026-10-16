@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 /**
  * Single source of truth mapping backend job/pipeline statuses to semantic
  * status tokens. Screens resolve a token's colour through `next/data/palette`.

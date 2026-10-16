@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -44,9 +47,8 @@ impl NntpClientConfig {
     pub fn single(server: ServerConfig, max_connections: usize) -> Self {
         NntpClientConfig {
             servers: vec![ServerPoolConfig {
-                server,
                 max_connections,
-                ..ServerPoolConfig::default()
+                ..ServerPoolConfig::new(server)
             }],
             max_idle_age: Duration::from_secs(300),
             max_retries_per_server: 1,
@@ -2406,8 +2408,9 @@ impl NntpClient {
         &self.pool
     }
 
-    // Feed the fetch times of successful attempts to the address plans of
-    // the servers that served them.
+    // Feed the fetch times of successful attempts to the routes of the
+    // connections that served them; a direct leg books them on its address
+    // plan.
     pub fn record_fetch_attempts(&self, attempts: &[FetchAttemptTrace]) {
         for attempt in attempts {
             if attempt.outcome != FetchAttemptOutcome::Success {
@@ -2415,13 +2418,6 @@ impl NntpClient {
             }
             if let Some(feedback) = &attempt.route_feedback {
                 feedback.body_latency(attempt.elapsed);
-            }
-            if let Some(ip) = attempt.remote_ip {
-                self.pool.record_address_body_latency(
-                    ServerId(attempt.server_idx),
-                    ip,
-                    attempt.elapsed,
-                );
             }
         }
     }
@@ -2446,10 +2442,6 @@ impl NntpClient {
         };
         if let Some(feedback) = &served.route_feedback {
             feedback.delivered(payload_bytes, wire);
-        }
-        if let Some(ip) = served.remote_ip {
-            self.pool
-                .record_address_delivery(ServerId(served.server_idx), ip, payload_bytes, wire);
         }
     }
 
@@ -2539,9 +2531,9 @@ impl NntpClient {
                     continue;
                 }
             };
-            let (config, route) = self
+            let config = self
                 .pool
-                .blocking_connect_plan(server)
+                .blocking_connect_config(server)
                 .map_err(BlockingBodyLaneAcquireError::Other)?;
             if !supports_blocking_body_lane(&config) {
                 continue;
@@ -2566,7 +2558,6 @@ impl NntpClient {
                     self.pool.stable_server_id(server).unwrap_or_default(),
                     self.pool.server_transfer_control(server),
                     &config,
-                    Some(&route),
                     groups,
                     self.soft_timeout,
                     permit,
@@ -2669,7 +2660,7 @@ impl NntpClient {
             if self.pool.server_load(server.0).1 == 0 {
                 return false;
             }
-            let Ok((config, _)) = self.pool.blocking_connect_plan(server) else {
+            let Ok(config) = self.pool.blocking_connect_config(server) else {
                 return false;
             };
             supports_blocking_body_lane(&config)

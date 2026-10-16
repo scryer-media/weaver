@@ -1,11 +1,17 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import {
   createContext,
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
+  use,
   type ReactNode,
 } from "react";
 import { useQuery, useSubscription } from "urql";
@@ -29,6 +35,7 @@ import {
 } from "@/lib/context/live-data-context";
 import type { JobDownloadRate } from "@/lib/live-job-download-rates";
 import { formatRate } from "./format";
+import { sameItems, shallowEqual, useSettled } from "./settled";
 import { withLiveConnections, type ProviderConnections } from "./provider-connections";
 import { useHistoryLiveRefresh } from "./use-history-live-refresh";
 import { useLiveQueue, type LiveQueue } from "./use-live-queue";
@@ -155,15 +162,115 @@ const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
 const EMPTY_PROVIDERS: ProviderHealth[] = [];
 const EMPTY_HOLDOFFS: ProviderHoldoff[] = [];
 
-/** Exported so a fixture can hand a screen the data it reads without the live streams. */
+/**
+ * The whole value, new on every render of the provider, so its reader renders
+ * in the provider's own pass each time: the queue's time-left estimate samples
+ * on every render it gets and settles with the time between them. Exported so
+ * a fixture can hand a screen the data it reads without the live streams.
+ */
 export const NextDataContext = createContext<NextData | null>(null);
 
-export function useNextData(): NextData {
-  const value = useContext(NextDataContext);
-  if (!value) {
+/**
+ * The provider's value, read a slice at a time.
+ *
+ * The speed moves several times a second and almost nothing else does, but a
+ * context renders every reader again whenever its value changes: the rail, the
+ * page and every panel under it redrew on each speed tick for a figure most of
+ * them never show. The provider publishes here instead, and a reader renders
+ * again only when what it asked for changes.
+ */
+interface NextDataStore {
+  get: () => NextData;
+  set: (data: NextData) => void;
+  subscribe: (listener: () => void) => () => void;
+}
+
+function createNextDataStore(initial: NextData): NextDataStore {
+  let data = initial;
+  const listeners = new Set<() => void>();
+  return {
+    get: () => data,
+    set: (next) => {
+      if (next === data) {
+        return;
+      }
+      data = next;
+      for (const listener of listeners) {
+        listener();
+      }
+    },
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+}
+
+const NextDataStoreContext = createContext<NextDataStore | null>(null);
+const subscribeNowhere = () => () => {};
+
+/**
+ * The whole value, or only the named keys. Named, the caller renders again only
+ * when one of them changes, not on every speed tick.
+ */
+export function useNextData(): NextData;
+export function useNextData<K extends keyof NextData>(...keys: K[]): Pick<NextData, K>;
+export function useNextData<K extends keyof NextData>(...keys: K[]): NextData | Pick<NextData, K> {
+  const whole = keys.length === 0;
+  const data = whole ? use(NextDataContext) : null;
+  const picked = useNextDataSelector<Pick<NextData, K> | null>(
+    (next) => (whole ? null : pick(next, keys)),
+    samePick,
+  );
+  if (!whole) {
+    return picked!;
+  }
+  if (!data) {
     throw new Error("useNextData must be used inside NextDataProvider");
   }
-  return value;
+  return data;
+}
+
+function samePick<T extends object>(left: T | null, right: T | null): boolean {
+  return left === right || (left !== null && right !== null && shallowEqual(left, right));
+}
+
+/**
+ * One figure worked out from the data, such as a count; the caller renders
+ * again only when `isEqual` says it changed.
+ */
+export function useNextDataSelector<T>(
+  select: (data: NextData) => T,
+  isEqual: (left: T, right: T) => boolean = Object.is,
+): T {
+  const store = useContext(NextDataStoreContext);
+  // Read only without a provider: under one, this context changes on every
+  // render of it, and a slice reader is not to render with it.
+  const fixture = store === null ? use(NextDataContext) : null;
+  // The last answer, handed back while a new one is equal to it, so a reader
+  // whose slice did not change sees the same value and does not render.
+  const last = useRef<{ value: T } | null>(null);
+  const getSnapshot = () => {
+    const data = store?.get() ?? fixture;
+    if (!data) {
+      throw new Error("useNextData must be used inside NextDataProvider");
+    }
+    const value = select(data);
+    if (last.current !== null && isEqual(last.current.value, value)) {
+      return last.current.value;
+    }
+    last.current = { value };
+    return value;
+  };
+  return useSyncExternalStore(store?.subscribe ?? subscribeNowhere, getSnapshot);
+}
+
+function pick<K extends keyof NextData>(data: NextData, keys: readonly K[]): Pick<NextData, K> {
+  const picked = {} as Pick<NextData, K>;
+  for (const key of keys) {
+    picked[key] = data[key];
+  }
+  return picked;
 }
 
 export function NextDataProvider({ children }: { children: ReactNode }) {
@@ -247,13 +354,14 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   }, [metricsSubscriptionError, reexecuteMetrics]);
 
   const speed = snapshot?.metrics?.currentDownloadSpeed ?? 0;
-  const peakSpeedRef = useRef(0);
-  if (speed > peakSpeedRef.current) {
-    peakSpeedRef.current = speed;
+  // Raised while rendering, so the published peak never trails the speed.
+  const [peakSpeed, setPeakSpeed] = useState(0);
+  if (speed > peakSpeed) {
+    setPeakSpeed(speed);
   }
 
   const globalState = snapshot?.globalState;
-  const downloadBlock = globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK;
+  const downloadBlock = useSettled(globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK, shallowEqual);
   const isPaused = globalState?.isPaused ?? false;
   const speedLimit = globalState?.speedLimitBytesPerSec ?? 0;
   const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
@@ -264,12 +372,15 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   // Health is re-read on a slow beat; the counts on the meters follow the
   // metrics stream instead, so they move as the pool opens connections.
   const liveConnections = snapshot?.providerConnections;
-  const providers = useMemo(
-    () => withLiveConnections(providerData?.serverHealth ?? EMPTY_PROVIDERS, liveConnections),
-    [providerData, liveConnections],
+  const providers = useSettled(
+    useMemo(
+      () => withLiveConnections(providerData?.serverHealth ?? EMPTY_PROVIDERS, liveConnections),
+      [providerData, liveConnections],
+    ),
+    sameItems,
   );
   const providersLoaded = providerData !== undefined;
-  const holdoffs = snapshot?.providerHoldoffs ?? EMPTY_HOLDOFFS;
+  const holdoffs = useSettled(snapshot?.providerHoldoffs ?? EMPTY_HOLDOFFS, sameItems);
   const version = versionData?.version ?? "";
   const update = useMemo(
     () =>
@@ -282,13 +393,21 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   useDocumentTitle(speed, isPaused);
   const historyCount = historyCountData?.all ?? 0;
   const isPolling = reconnectPolling.isPolling;
+  const connection = useMemo(
+    () => ({
+      status: connectionState.status,
+      isDisconnected: connectionState.status === "disconnected",
+      isPolling,
+    }),
+    [connectionState.status, isPolling],
+  );
 
   const value = useMemo<NextData>(
     () => ({
       version,
       update,
       speed,
-      peakSpeed: peakSpeedRef.current,
+      peakSpeed,
       isPaused,
       speedLimit,
       downloadBlock,
@@ -300,20 +419,16 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       providers,
       providersLoaded,
       holdoffs,
-      connection: {
-        status: connectionState.status,
-        isDisconnected: connectionState.status === "disconnected",
-        isPolling,
-      },
+      connection,
     }),
     [
       categories,
-      connectionState.status,
+      connection,
       downloadBlock,
       historyCount,
       holdoffs,
       isPaused,
-      isPolling,
+      peakSpeed,
       providers,
       providersLoaded,
       queue,
@@ -326,13 +441,28 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
     ],
   );
 
+  const [store] = useState(() => createNextDataStore(value));
+  useLayoutEffect(() => {
+    store.set(value);
+  }, [store, value]);
+  const live = useFreshCopy(value);
+
   return (
-    <NextDataContext.Provider value={value}>
-      <LiveJobDownloadRatesProvider rates={snapshot?.jobDownloadRates}>
-        {children}
-      </LiveJobDownloadRatesProvider>
-    </NextDataContext.Provider>
+    <NextDataStoreContext.Provider value={store}>
+      <NextDataContext value={live}>
+        <LiveJobDownloadRatesProvider rates={snapshot?.jobDownloadRates}>
+          {children}
+        </LiveJobDownloadRatesProvider>
+      </NextDataContext>
+    </NextDataStoreContext.Provider>
   );
+}
+
+/** A copy of `value` made on every render of its caller. */
+function useFreshCopy<T extends object>(value: T): T {
+  // A new one on every call is the point: compiled, it would be made once.
+  "use no memo";
+  return { ...value };
 }
 
 /** How long the tab title holds one speed before it takes the next. */

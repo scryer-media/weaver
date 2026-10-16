@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use crate::{
     auth::AdminGuard,
     observability::{refusal_error, spawn_blocking_db},
@@ -391,28 +394,196 @@ pub struct EgressTestResult {
     pub connect_millis: Option<f64>,
     pub proxy_id: Option<u32>,
 }
-impl EgressTestResult {
-    fn from_probe(
-        proxy_id: Option<u32>,
-        result: std::result::Result<core::NetworkProbe, String>,
-    ) -> Self {
-        match result {
-            Ok(probe) => Self {
+impl From<core::PathTest> for EgressTestResult {
+    fn from(test: core::PathTest) -> Self {
+        match test.outcome {
+            Ok(_) => Self {
                 success: true,
                 message: "Connection succeeded".into(),
-                source_address: probe.source_address.map(|s| s.to_string()),
-                connect_millis: Some(probe.elapsed.as_secs_f64() * 1000.0),
-                proxy_id,
+                source_address: test.source_address.map(|s| s.to_string()),
+                connect_millis: Some(test.elapsed.as_secs_f64() * 1000.0),
+                proxy_id: test.proxy_id,
             },
-            Err(message) => Self {
+            Err(fault) => Self {
                 success: false,
-                message,
+                message: fault.to_string(),
                 source_address: None,
                 connect_millis: None,
-                proxy_id,
+                proxy_id: test.proxy_id,
             },
         }
     }
+}
+// What a test through a drafted route stacks on top of it.
+#[derive(Clone, Copy, Debug, OneofObject)]
+pub enum TestSubjectInput {
+    Proxy(u32),
+    Pool(u32),
+}
+#[derive(Clone, Debug, InputObject)]
+pub struct TestTargetInput {
+    pub host: String,
+    pub port: u16,
+}
+// One path through a drafted route, and the proxy tested on top of it.
+#[derive(SimpleObject)]
+pub struct PathTestResult {
+    pub leg: u32,
+    pub egress_id: u32,
+    pub carrier_ids: Vec<u32>,
+    // The proxy under test, or the member the pool under test picked.
+    pub proxy_id: Option<u32>,
+    // The pool under test, when it carried the target.
+    pub pool_id: Option<u32>,
+    pub success: bool,
+    pub code: String,
+    // The outcome in English, for a client with no sentence for its code.
+    pub message: String,
+    // The values the client's sentence for the code may name.
+    pub params: async_graphql::Json<serde_json::Map<String, serde_json::Value>>,
+    pub failing_proxy_id: Option<u32>,
+    pub source_address: Option<String>,
+    pub connect_millis: f64,
+    // How the host the path's final dial named was resolved.
+    pub resolution: Option<HostResolution>,
+}
+// Who turned a test's host into addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+pub enum ResolvedBy {
+    // The host is an address.
+    Literal,
+    // The operating system's resolver.
+    Host,
+    // Weaver asked DNS servers from the route's egress.
+    Servers,
+    // The proxy was handed the name.
+    Proxy,
+    // Weaver asked DNS servers through the proxy.
+    ProxyServers,
+}
+impl From<core::ResolvedBy> for ResolvedBy {
+    fn from(value: core::ResolvedBy) -> Self {
+        match value {
+            core::ResolvedBy::Literal => Self::Literal,
+            core::ResolvedBy::Host => Self::Host,
+            core::ResolvedBy::Servers => Self::Servers,
+            core::ResolvedBy::Proxy => Self::Proxy,
+            core::ResolvedBy::ProxyServers => Self::ProxyServers,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+pub enum LookupErrorCode {
+    NoSuchName,
+    NoAddress,
+    TimedOut,
+    ServerFailure,
+    NoReply,
+    Other,
+}
+impl From<core::LookupFailure> for LookupErrorCode {
+    fn from(value: core::LookupFailure) -> Self {
+        match value {
+            core::LookupFailure::NoSuchName => Self::NoSuchName,
+            core::LookupFailure::NoAddress => Self::NoAddress,
+            core::LookupFailure::TimedOut => Self::TimedOut,
+            core::LookupFailure::ServerFailure => Self::ServerFailure,
+            core::LookupFailure::NoReply => Self::NoReply,
+            core::LookupFailure::Other => Self::Other,
+        }
+    }
+}
+#[derive(SimpleObject)]
+pub struct LookupError {
+    pub code: LookupErrorCode,
+    // The resolver's own words.
+    pub detail: String,
+}
+#[derive(SimpleObject)]
+pub struct HostResolution {
+    pub host: String,
+    pub resolved_by: ResolvedBy,
+    // The proxy that resolved it, or that Weaver asked through.
+    pub proxy_id: Option<u32>,
+    pub dns_servers: Vec<String>,
+    pub addresses: Vec<String>,
+    // The answer was held from an earlier lookup.
+    pub cached: bool,
+    pub connected_address: Option<String>,
+    pub error: Option<LookupError>,
+}
+impl From<core::HostResolution> for HostResolution {
+    fn from(value: core::HostResolution) -> Self {
+        Self {
+            host: value.host,
+            resolved_by: value.by.into(),
+            proxy_id: value.proxy,
+            dns_servers: value.servers.iter().map(ToString::to_string).collect(),
+            addresses: value.addresses.iter().map(ToString::to_string).collect(),
+            cached: value.cached,
+            connected_address: value.connected.map(|ip| ip.to_string()),
+            error: value.error.map(|error| LookupError {
+                code: error.failure.into(),
+                detail: error.detail,
+            }),
+        }
+    }
+}
+impl From<core::PathTest> for PathTestResult {
+    fn from(test: core::PathTest) -> Self {
+        let (success, code, message, params) = match &test.outcome {
+            Ok(pass) => (true, pass.code(), pass.to_string(), serde_json::Map::new()),
+            Err(fault) => (
+                false,
+                fault.code(),
+                fault.to_string(),
+                core::fault_params(fault),
+            ),
+        };
+        Self {
+            leg: u32::try_from(test.leg).unwrap_or(u32::MAX),
+            egress_id: test.egress_id,
+            carrier_ids: test.carriers,
+            proxy_id: test.proxy_id,
+            pool_id: test.pool_id,
+            success,
+            code: code.into(),
+            message,
+            params: async_graphql::Json(params),
+            failing_proxy_id: test.failing_proxy,
+            source_address: test.source_address.map(|s| s.to_string()),
+            connect_millis: test.elapsed.as_secs_f64() * 1000.0,
+            resolution: test.resolution.map(Into::into),
+        }
+    }
+}
+// A route of one direct leg on an egress, for the tests that name only it.
+fn direct_on(egress_id: u32) -> core::Route {
+    core::Route {
+        legs: vec![core::RouteLeg {
+            egress_id,
+            weight: 100,
+            path: core::LegPath::Direct,
+        }],
+        failover: core::Failover::default(),
+    }
+}
+async fn test_via(
+    runtime: &ProxyRuntime,
+    route: &core::Route,
+    subject: core::TestSubject,
+    target: Option<(String, u16)>,
+) -> Result<Vec<core::PathTest>> {
+    let _guard = runtime.mutations.lock().await;
+    let test: std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<Vec<core::PathTest>, NetworkRefusal>,
+                > + Send
+                + '_,
+        >,
+    > = Box::pin(runtime.network.test_via(route, subject, target));
+    test.await.map_err(refusal_error)
 }
 #[derive(Clone, Debug, InputObject)]
 pub struct ProxyPoolInput {
@@ -457,12 +628,15 @@ impl From<core::ProxyPool> for ProxyPoolGql {
 pub enum NetworkConsumerKind {
     Server,
     Rss,
+    // Default outbound. There is one, so its id is ignored.
+    Outbound,
 }
 impl NetworkConsumerKind {
-    fn consumer(self, id: u32) -> core::Consumer {
+    pub(crate) fn consumer(self, id: u32) -> core::Consumer {
         match self {
             Self::Server => core::Consumer::Server(id),
             Self::Rss => core::Consumer::Rss(id),
+            Self::Outbound => core::Consumer::Outbound,
         }
     }
 }
@@ -498,7 +672,11 @@ pub struct NetworkLegFlow {
 pub struct NetworkFailingHop {
     pub rung: usize,
     pub proxy_id: u32,
+    // The failure in English, for a client with no sentence for its code.
     pub reason: String,
+    pub code: String,
+    // The values the client's sentence for the code may name.
+    pub params: async_graphql::Json<serde_json::Map<String, serde_json::Value>>,
 }
 #[derive(Clone, PartialEq, SimpleObject)]
 pub struct NetworkConsumerFlow {
@@ -536,9 +714,12 @@ pub struct NetworkPoolMemberFlow {
     pub blocked: Option<String>,
     pub handshake_ms: Option<f64>,
     pub connect_ms: Option<f64>,
+    // The delivery rate the pool judges the member by, per connection.
     pub bytes_per_second: Option<f64>,
     pub samples: u32,
     pub failures: u32,
+    // What the member's open connections carry now, all together.
+    pub live_bytes_per_second: u64,
 }
 pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
     let mut legs = Vec::new();
@@ -604,7 +785,9 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                         hop.map(|hop| NetworkFailingHop {
                             rung,
                             proxy_id: hop.proxy,
-                            reason: hop.reason,
+                            reason: hop.fault.to_string(),
+                            code: hop.fault.code().into(),
+                            params: async_graphql::Json(core::fault_params(&hop.fault)),
                         })
                     })
                     .collect(),
@@ -673,6 +856,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                         bytes_per_second: evidence.and_then(|c| c.bytes_per_second),
                         samples: evidence.map_or(0, |c| c.samples),
                         failures: evidence.map_or(0, |c| c.failures),
+                        live_bytes_per_second: m.bytes_per_second,
                     }
                 })
                 .collect(),
@@ -705,6 +889,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                         bytes_per_second: None,
                         samples: 0,
                         failures: 0,
+                        live_bytes_per_second: 0,
                     });
                 }
             }
@@ -720,6 +905,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
             let (kind, id) = match consumer {
                 core::Consumer::Server(id) => (NetworkConsumerKind::Server, id),
                 core::Consumer::Rss(id) => (NetworkConsumerKind::Rss, id),
+                core::Consumer::Outbound => (NetworkConsumerKind::Outbound, 0),
             };
             NetworkConsumerFlow {
                 key: consumer.key(),
@@ -1036,6 +1222,7 @@ impl NetworkingMutation {
                     db.list_servers()?.iter().any(|server| server.id == id)
                 }
                 core::Consumer::Rss(id) => db.get_rss_feed(id)?.is_some(),
+                core::Consumer::Outbound => true,
             };
             if !exists {
                 return Err(NetworkRefusal::RouteConsumerGone.into());
@@ -1050,7 +1237,36 @@ impl NetworkingMutation {
             failover: route.failover.into(),
         })
     }
+    // Tests every path through a drafted route, with a proxy or a pool on
+    // top of it. A pool carries the target through the member it picks;
+    // without a target each member is tried on its own. Nothing is dialled
+    // outside the route.
     #[graphql(guard = "AdminGuard")]
+    async fn test_via(
+        &self,
+        ctx: &Context<'_>,
+        route: RouteInput,
+        subject: Option<TestSubjectInput>,
+        target: Option<TestTargetInput>,
+    ) -> Result<Vec<PathTestResult>> {
+        let runtime = runtime(ctx)?;
+        let route = route.route()?;
+        let subject = match subject {
+            None => core::TestSubject::Route,
+            Some(TestSubjectInput::Proxy(id)) => core::TestSubject::Proxy(id),
+            Some(TestSubjectInput::Pool(id)) => core::TestSubject::Pool(id),
+        };
+        let target = target.map(|target| (target.host, target.port));
+        Ok(test_via(&runtime, &route, subject, target)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+    #[graphql(
+        guard = "AdminGuard",
+        deprecation = "Use testVia with a direct route on the egress."
+    )]
     async fn test_egress_interface(
         &self,
         ctx: &Context<'_>,
@@ -1060,15 +1276,18 @@ impl NetworkingMutation {
         port: u16,
     ) -> Result<EgressTestResult> {
         let runtime = runtime(ctx)?;
-        Ok(EgressTestResult::from_probe(
-            proxy_id,
-            runtime
-                .network
-                .test_path(id, proxy_id, Some(&host), Some(port))
-                .await,
-        ))
+        let subject = proxy_id.map_or(core::TestSubject::Route, core::TestSubject::Proxy);
+        test_via(&runtime, &direct_on(id), subject, Some((host, port)))
+            .await?
+            .into_iter()
+            .next()
+            .map(Into::into)
+            .ok_or_else(|| "the test tried no path".into())
     }
-    #[graphql(guard = "AdminGuard")]
+    #[graphql(
+        guard = "AdminGuard",
+        deprecation = "Use testVia with a direct route on the egress."
+    )]
     async fn test_proxy_pool(
         &self,
         ctx: &Context<'_>,
@@ -1091,27 +1310,17 @@ impl NetworkingMutation {
         {
             return Err("host and port are required for a SOCKS5 or HTTP CONNECT pool test".into());
         }
-        use async_graphql::futures_util::StreamExt;
-        let concurrency = if pool.kind == core::ProxyKind::WireGuard {
-            core::max_wireguard_instances().min(4)
-        } else {
-            4
-        };
-        let results = async_graphql::futures_util::stream::iter(pool.member_ids)
-            .map(|member| {
-                let network = &runtime.network;
-                let host = host.as_deref();
-                async move {
-                    EgressTestResult::from_probe(
-                        Some(member),
-                        network.test_path(egress_id, Some(member), host, port).await,
-                    )
-                }
-            })
-            .buffered(concurrency)
-            .collect()
-            .await;
-        Ok(results)
+        let target = host.zip(port);
+        Ok(test_via(
+            &runtime,
+            &direct_on(egress_id),
+            core::TestSubject::Members(id),
+            target,
+        )
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect())
     }
 }
 

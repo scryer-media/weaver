@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -631,4 +634,108 @@ async fn check_now_never_polls_when_checks_are_off() {
 
     assert_eq!(fetcher.calls(), 0);
     assert_eq!(status.last_error.as_deref(), Some(DISABLED_NOTICE));
+}
+
+// --- the fetch over Default outbound -------------------------------------
+
+const RELEASE_PAYLOAD: &str = r#"{
+    "tag_name": "weaver-v1.4.0",
+    "html_url": "https://github.com/scryer-media/weaver/releases/tag/weaver-v1.4.0",
+    "published_at": "2026-01-02T03:04:05Z",
+    "draft": false,
+    "prerelease": false
+}"#;
+
+type Hosts = Arc<Mutex<Vec<String>>>;
+
+// Serves the release payload, and logs each request's Host.
+async fn release_origin() -> (std::net::SocketAddr, Hosts, tokio::task::JoinHandle<()>) {
+    let hosts: Hosts = Arc::default();
+    let log = hosts.clone();
+    let app = axum::Router::new().route(
+        "/releases/latest",
+        axum::routing::get(move |headers: axum::http::HeaderMap| {
+            let log = log.clone();
+            async move {
+                let host = headers[axum::http::header::HOST].to_str().unwrap();
+                log.lock().unwrap().push(host.to_owned());
+                RELEASE_PAYLOAD
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, hosts, task)
+}
+
+async fn connect_proxy(
+    mapping: std::collections::HashMap<(String, u16), std::net::SocketAddr>,
+) -> weaver_tunnel::test_support::proxy::ProxyServerDouble {
+    weaver_tunnel::test_support::proxy::ProxyServerDouble::start(
+        weaver_tunnel::transport::TransportKind::HttpConnect,
+        None,
+        mapping,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn the_release_check_goes_through_the_outbound_proxy() {
+    let (origin, hosts, task) = release_origin().await;
+    let proxy = connect_proxy([(("release.invalid".to_owned(), 80), origin)].into()).await;
+    let runtime = crate::proxies::outbound_only_through(
+        crate::proxies::ProxyKind::HttpConnect,
+        proxy.addr.port(),
+    );
+    let fetcher = GithubReleaseFetcher {
+        proxies: runtime.clone(),
+        endpoint: "http://release.invalid/releases/latest".into(),
+    };
+    let outcome = fetcher.fetch_latest(None).await.unwrap();
+    let FetchOutcome::Fetched {
+        release: Some(release),
+        ..
+    } = outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(release.version, "1.4.0");
+    assert_eq!(
+        proxy.targets.lock().unwrap().clone(),
+        [("release.invalid".to_owned(), 80)]
+    );
+    assert_eq!(hosts.lock().unwrap().clone(), ["release.invalid"]);
+    runtime.stop_all().await;
+    task.abort();
+}
+
+// A release check that cannot go the way its route says reports nothing
+// rather than leave Weaver directly.
+#[tokio::test]
+async fn the_release_check_fails_closed_when_the_outbound_proxy_fails() {
+    let (origin, hosts, task) = release_origin().await;
+    let proxy = connect_proxy(Default::default()).await;
+    let runtime = crate::proxies::outbound_only_through(
+        crate::proxies::ProxyKind::HttpConnect,
+        proxy.addr.port(),
+    );
+    let fetcher = GithubReleaseFetcher {
+        proxies: runtime.clone(),
+        endpoint: format!("http://localhost:{}/releases/latest", origin.port()),
+    };
+    let error = fetcher.fetch_latest(None).await.unwrap_err();
+    assert_eq!(
+        error,
+        "Release check request failed on all permitted routes"
+    );
+    assert_eq!(
+        proxy.targets.lock().unwrap().clone(),
+        [("localhost".to_owned(), origin.port())]
+    );
+    assert!(hosts.lock().unwrap().is_empty());
+    runtime.stop_all().await;
+    task.abort();
 }

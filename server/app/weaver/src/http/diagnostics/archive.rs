@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The tar + zstd writer and the manifest that describes what went in.
 //
 // Components are collected before the archive is written, each one carrying

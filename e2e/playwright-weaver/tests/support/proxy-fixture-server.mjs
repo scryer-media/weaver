@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Isolated e2e infrastructure. Ordinary runs forward only fixture destinations;
 // the opt-in real-provider runner supplies an exact host/port allowlist.
 import net from "node:net";
@@ -83,7 +86,10 @@ export async function startProxyFixture(options = {}) {
   const extraRoutes = options.routes ?? parseRouteList(process.env.PROXY_FIXTURE_ROUTES);
   const addresses = options.addresses ?? parseAddressList(process.env.PROXY_FIXTURE_ADDRESSES, ip);
   const hosts = options.hosts ?? parseHostTable(process.env.PROXY_FIXTURE_HOSTS);
-  const publicTargets = parsePublicTargets(JSON.stringify(options.publicTargets ?? []));
+  // Public hosts the fixture forwards to and answers for, beside the fixture
+  // destinations; the relay runs with publicOnly and forwards nothing else.
+  const publicTargets = parsePublicTargets(options.publicTargets ? JSON.stringify(options.publicTargets) : process.env.PROXY_FIXTURE_PUBLIC_TARGETS);
+  const publicOnly = Boolean(options.publicOnly);
   const ports = {
     primary: 8081, secondary: 8082, tertiary: 8083, dns: 53, nntp: 119, http: 8089, control: 8090,
     ...Object.fromEntries(extraRoutes.map(name => [name, EXTRA_ROUTES[name].port])),
@@ -98,6 +104,9 @@ export async function startProxyFixture(options = {}) {
   let sequence = 0;
   let feedToken = "initial";
   let nzb = "";
+  // The TTL on every address answered locally. 0 unless a flow sets it, so
+  // Weaver holds no answer between lookups.
+  let dnsTtl = 0;
   // Article bytes arrive in many chunks per connection; consecutive chunks on
   // one route fold into the last event so a long download cannot push the
   // events a test asserts (connections, DNS, held bodies) out of the log. The
@@ -157,7 +166,7 @@ export async function startProxyFixture(options = {}) {
     const publicTarget = publicTargets.find(target => target.port === port
       && (target.host === host.toLowerCase() || target.addresses.includes(host)));
     const allowedHost = host === ip || addresses.includes(host) || /^[a-z0-9-]+\.proxy\.test$/.test(host);
-    const fixtureTarget = publicTargets.length === 0 && allowedHost && [ports.dns, ports.nntp, ports.http].includes(port);
+    const fixtureTarget = !publicOnly && allowedHost && [ports.dns, ports.nntp, ports.http].includes(port);
     const fixtureDns = (host === ip || addresses.includes(host)) && port === ports.dns;
     if ((!publicTarget && !fixtureTarget && !fixtureDns) || !routes[route].up) {
       reply(false); client.end(); return;
@@ -306,7 +315,8 @@ export async function startProxyFixture(options = {}) {
     header.writeUInt16BE(known ? 0x8180 : 0x8183, 2);
     header.writeUInt16BE(1, 4);
     if (known && type === 1) {
-      const answers = (local ?? addresses).map(address => Buffer.from([0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, ...address.split(".").map(Number)]));
+      const ttl = [dnsTtl >>> 24, (dnsTtl >>> 16) & 255, (dnsTtl >>> 8) & 255, dnsTtl & 255];
+      const answers = (local ?? addresses).map(address => Buffer.from([0xc0, 0x0c, 0, 1, 0, 1, ...ttl, 0, 4, ...address.split(".").map(Number)]));
       header.writeUInt16BE(answers.length, 6);
       return Buffer.concat([header, question, ...answers]);
     }
@@ -379,6 +389,10 @@ export async function startProxyFixture(options = {}) {
           route.socksReply = command.socksReply;
         }
         if (command.cut) for (const socket of route.sockets) socket.destroy();
+      }
+      if ("dnsTtl" in command) {
+        if (!(Number.isInteger(command.dnsTtl) && command.dnsTtl >= 0 && command.dnsTtl <= 86400)) throw new Error("dnsTtl must be whole seconds from 0 to 86400");
+        dnsTtl = command.dnsTtl;
       }
       if (typeof command.nzb === "string") nzb = command.nzb;
       if (typeof command.feedToken === "string" && /^[a-z0-9-]+$/.test(command.feedToken)) feedToken = command.feedToken;

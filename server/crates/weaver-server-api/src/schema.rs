@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -53,6 +56,7 @@ pub struct QueryRoot(
     crate::backup::BackupQuery,
     crate::networking::NetworkingQuery,
     crate::proxies::ProxiesQuery,
+    crate::speed_test::SpeedTestQuery,
     auth_query::AuthQuery,
     categories_query::CategoriesQuery,
     history_query::HistoryQuery,
@@ -73,6 +77,7 @@ pub struct MutationRoot(ConnectivityMutations, ApplicationMutations);
 struct ConnectivityMutations(
     crate::networking::NetworkingMutation,
     crate::proxies::ProxiesMutation,
+    crate::speed_test::SpeedTestMutation,
     auth_mutation::AuthMutation,
     rss_mutation::RssMutation,
     servers_mutation::ServersMutation,

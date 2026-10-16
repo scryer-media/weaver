@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // End-to-end post-processing: real scripts, the real supervisor, the real executor.
 //
 // A test harness cannot serve as its own process supervisor, so every request

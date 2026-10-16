@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Local HTTP/3 CONNECT fixture with an explicit destination map and private CA.
 use crate::{Http3ProxyCredentials, Http3TunnelSpec, TunnelProvider, shared::SharedProvider};
 use base64::Engine;

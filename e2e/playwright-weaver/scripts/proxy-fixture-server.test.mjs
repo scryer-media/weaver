@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import net from "node:net";
@@ -245,6 +248,25 @@ test("multi-network DNS answers every fixture address and the host table", async
     assert.equal(infra.readUInt16BE(6), 2);
     assert.deepEqual([...infra.subarray(-20, -16)], [10, 1, 0, 20]);
     assert.deepEqual([...infra.subarray(-4)], [10, 2, 0, 20]);
+  } finally { socket.close(); await fixture.close(); }
+});
+
+test("local answers carry the TTL the control sets, 0 until it does", async () => {
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: zeroPorts });
+  const socket = dgram.createSocket("udp4");
+  const ttl = async id => {
+    const response = once(socket, "message");
+    socket.send(dnsQuery(id, "news.proxy.test"), fixture.ports.dnsUdp, "127.0.0.1");
+    const [body] = await response;
+    return body.readUInt32BE(body.length - 10);
+  };
+  try {
+    assert.equal(await ttl(1), 0);
+    assert.equal((await control(fixture, "/", { dnsTtl: 3600 })).status, 200);
+    assert.equal(await ttl(2), 3600);
+    assert.equal((await control(fixture, "/", { dnsTtl: -1 })).status, 400);
+    assert.equal((await control(fixture, "/", { dnsTtl: 0 })).status, 200);
+    assert.equal(await ttl(3), 0);
   } finally { socket.close(); await fixture.close(); }
 });
 

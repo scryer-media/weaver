@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A minimal SOCKS5 front, hand-rolled over tokio.
 //
 // This is the adaptor that makes a tunnel look like an ordinary transport

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // GraphQL sockets over a live connection: who may open one, and that an open
 // socket loses its access the moment the credential it was admitted with does.
 

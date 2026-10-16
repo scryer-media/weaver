@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A routed article's destination writes run off the pipeline task. These pin
 // what that must not change: the pipeline keeps serving while a write is
 // held open, a demotion that overtakes a write hands its article back, and

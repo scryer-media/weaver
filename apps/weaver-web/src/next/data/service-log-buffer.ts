@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 /**
  * The service log buffer: parsing a line, and folding a fresh snapshot into
  * the lines already held.

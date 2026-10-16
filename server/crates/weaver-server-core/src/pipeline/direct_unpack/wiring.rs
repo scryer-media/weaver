@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The controller: deciding which archive sets to chase, feeding the chase, and
 // ending it.
 //
@@ -53,13 +56,13 @@ use super::reader::GatedSplitReader;
 use super::settings::{DirectUnpackGate, DirectUnpackSettings};
 use super::start_header::{SIGNATURE_HEADER_LEN, StartHeader};
 use crate::jobs::ids::JobId;
-use crate::pipeline::FullSetExtractionOutcome;
 use crate::pipeline::Pipeline;
 use crate::pipeline::completion::finalize::extract::{
     SevenZipDecodeMemory, SevenZipExtractionContext, extract_7z_stream,
     extract_zip_stream_candidates,
 };
 use crate::pipeline::extraction::ExtractionRoot;
+use crate::pipeline::{ExtractionError, FullSetExtractionOutcome};
 
 // Buffer between the decoder and the gated reader.
 //
@@ -202,6 +205,8 @@ impl DemotionReason {
 // member list, the byte totals the Extracting phase needs, and the directory
 // to move from.
 pub struct ChaseOutcome {
+    pub(in crate::pipeline) positional:
+        Option<crate::pipeline::completion::finalize::extract::positional::PositionalHandoff>,
     pub result: Result<FullSetExtractionOutcome, String>,
     pub elapsed: Duration,
     pub staging_dir: PathBuf,
@@ -236,7 +241,13 @@ impl ChaseOutcome {
     // [`ChaseDisposition::Ready`] means.
     pub(in crate::pipeline) fn into_installable(
         self,
-    ) -> (FullSetExtractionOutcome, PathBuf, u64, u64) {
+    ) -> (
+        FullSetExtractionOutcome,
+        PathBuf,
+        u64,
+        u64,
+        Option<crate::pipeline::completion::finalize::extract::positional::PositionalHandoff>,
+    ) {
         let members = self
             .result
             .expect("a Ready disposition carries an Ok outcome");
@@ -245,6 +256,7 @@ impl ChaseOutcome {
             self.staging_dir,
             self.total_bytes,
             self.completed_bytes,
+            self.positional,
         )
     }
 }
@@ -321,6 +333,7 @@ impl DirectUnpackCounters {
 
 // One set currently being chased.
 struct ArmedSet {
+    positional: crate::pipeline::completion::finalize::extract::positional::PositionalSlot,
     coverage: Arc<SetCoverage>,
     paths: Vec<PathBuf>,
     physical_rar: bool,
@@ -343,7 +356,9 @@ struct ArmedSet {
 // A chase that has not finished yet, handed to the extraction context so it
 // can be awaited there rather than on the orchestrator loop.
 pub(in crate::pipeline) struct PendingChase {
-    _cancel_on_drop: PendingChaseCancellation,
+    pub(in crate::pipeline) cancel_on_drop: PendingChaseCancellation,
+    pub(in crate::pipeline) positional:
+        crate::pipeline::completion::finalize::extract::positional::PositionalSlot,
     pub(in crate::pipeline) budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
     pub(in crate::pipeline) handle:
         tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>>,
@@ -355,17 +370,37 @@ pub(in crate::pipeline) struct PendingChase {
     pub(in crate::pipeline) set_name: String,
 }
 
-struct PendingChaseCancellation {
+pub(in crate::pipeline) struct PendingChaseCancellation {
+    completed: bool,
     coverage: Arc<SetCoverage>,
     budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
+}
+
+impl PendingChaseCancellation {
+    pub(in crate::pipeline) fn new(
+        coverage: Arc<SetCoverage>,
+        budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
+    ) -> Self {
+        Self {
+            completed: false,
+            coverage,
+            budget,
+        }
+    }
+
+    pub(in crate::pipeline) fn completed(&mut self) {
+        self.completed = true;
+    }
 }
 
 impl Drop for PendingChaseCancellation {
     fn drop(&mut self) {
         // The completion task may be cancelled before it is ever polled. Keep
         // this guard in the transferred ownership itself, not in its await.
-        self.coverage.abort("direct-unpack consumer dropped");
-        self.budget.cancel();
+        if !self.completed {
+            self.coverage.abort("direct-unpack consumer dropped");
+            self.budget.cancel();
+        }
     }
 }
 
@@ -1288,6 +1323,12 @@ impl Pipeline {
         let password = self.primary_archive_password_for_job(job_id);
         let boost_paths = paths.clone();
         let counters = Arc::new(crate::jobs::PhaseCounters::default());
+        let positional = Arc::new(std::sync::Mutex::new(None));
+        let destination = if matches!(format, ChaseFormat::SevenZip { .. }) {
+            self.extraction_staging_dir(job_id)
+        } else {
+            output_dir.clone()
+        };
         let handle = self.spawn_direct_unpack_worker(
             job_id,
             set_name.to_string(),
@@ -1299,6 +1340,8 @@ impl Pipeline {
             Arc::clone(&counters),
             format,
             virtual_source.as_ref().map(|(_, input)| input.clone()),
+            destination,
+            Arc::clone(&positional),
         );
 
         self.direct_unpack
@@ -1309,6 +1352,7 @@ impl Pipeline {
         self.direct_unpack.armed.insert(
             (job_id, set_name.to_string()),
             ArmedSet {
+                positional,
                 aborted_at: None,
                 paths: boost_paths.clone(),
                 physical_rar: matches!(format, ChaseFormat::Rar),
@@ -1749,6 +1793,7 @@ impl Pipeline {
             0,
             Arc::clone(&self.metrics),
         )
+        .map_err(String::from)
     }
 
     // The contiguous, verified prefix the download has committed for a part.
@@ -1874,14 +1919,14 @@ impl Pipeline {
         counters: Arc<crate::jobs::PhaseCounters>,
         format: ChaseFormat,
         virtual_source: Option<super::rar_virtual::VirtualRarInput>,
+        destination: PathBuf,
+        positional: crate::pipeline::completion::finalize::extract::positional::PositionalSlot,
     ) -> tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>> {
         // The chase's own pool, never the shared post-processing one: `install`
         // holds a worker for as long as the closure runs, and this closure parks.
         let pp_pool = self.chase_pool.clone();
-        // How wide a 7z chase may decode once complete runs have piled up
-        // behind its frontier: the same width the conventional pass gets from
-        // its pool. These threads are the decoder's own, not pool workers; the
-        // chase keeps the one worker it was admitted on.
+        // Positional runs use this pool directly. Unsupported 7z graphs keep
+        // the ordinary decoder's existing thread allowance and delivery path.
         let decode_threads = u32::try_from(pp_pool.current_num_threads()).unwrap_or(u32::MAX);
         // And how it spends them: the profile in force when the chase starts.
         let widening = self.shared_state.chase_widening();
@@ -1919,6 +1964,77 @@ impl Pipeline {
             // that never logged "worker started" was never dispatched; one that
             // logged it and never logged "worker exited" is inside the decode.
             // Three e2e rounds could not tell those apart.
+            // A positional coordinator waits on coverage outside the chase pool;
+            // its owned run jobs use that pool without occupying a parked slot.
+            if let ChaseFormat::SevenZip { end_header_bytes } = format {
+                let log_set = set_name.clone();
+                info!(job_id = job_id.0, set_name = %log_set, queued_ms = 0u64,
+                    "direct unpack worker started");
+                let started_at = Instant::now();
+                let outcome = (|| {
+                    coverage
+                        .resolve_position(0, 0)
+                        .map_err(|error| error.to_string())?;
+                    let pw = password
+                        .as_ref()
+                        .map_or_else(sevenz_turbo::Password::empty, |value| {
+                            sevenz_turbo::Password::new(value)
+                        });
+                    let (silent_events, _) = tokio::sync::broadcast::channel(1);
+                    let context = SevenZipExtractionContext {
+                        job_id,
+                        set_name,
+                        output_dir,
+                        root,
+                        budget: Arc::clone(&budget),
+                        password: pw,
+                        event_tx: silent_events,
+                        phase_counters: counters,
+                        decode_memory: SevenZipDecodeMemory::ReservedPerPass {
+                            end_header_bytes,
+                            widening,
+                        },
+                        decode_threads,
+                    };
+                    if let Some(outcome) =
+                        crate::pipeline::completion::finalize::extract::positional::try_extract(
+                            &context,
+                            &paths,
+                            &coverage,
+                            &pp_pool,
+                            &destination,
+                            &positional,
+                        )?
+                    {
+                        return Ok(outcome);
+                    }
+                    pp_pool.install(|| {
+                        extract_7z_stream(&context, || {
+                            GatedSplitReader::open(&paths, Arc::clone(&coverage))
+                                .map(|reader| {
+                                    std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader)
+                                })
+                                .map_err(|error| {
+                                    ExtractionError::from_io(
+                                        format!("failed to open 7z direct-unpack reader: {error}"),
+                                        &error,
+                                    )
+                                })
+                        })
+                        .map_err(String::from)
+                    })
+                })();
+                match &outcome {
+                    Ok(members) => info!(job_id = job_id.0, set_name = %log_set,
+                        members = members.extracted.len(),
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "direct unpack worker exited"),
+                    Err(error) => info!(job_id = job_id.0, set_name = %log_set, error = %error,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "direct unpack worker exited"),
+                }
+                return outcome;
+            }
             let queued_at = Instant::now();
             let log_job = job_id;
             let log_set = set_name.clone();
@@ -2053,61 +2169,7 @@ impl Pipeline {
                             selected_password,
                         });
                     }
-                    let ChaseFormat::SevenZip { end_header_bytes } = format else {
-                        unreachable!()
-                    };
-                    // No decoder-memory permit is taken here. The extraction body
-                    // reserves per pass — header-sized while it lists the archive,
-                    // decoder-sized while it decodes — from the chase-only
-                    // `ProcessMemoryBudget` that `budget` draws on.
-                    //
-                    // This closure used to take the whole configured ceiling first
-                    // and hold it until it returned, across every park. With one
-                    // permit being the whole pool, every chase in the process
-                    // single-filed through it, and a chase parked on a damage gate
-                    // held the rest back for as long as its repair took — which,
-                    // when the repair was never summoned, was its entire
-                    // consumption deadline. `parked_chases_share_the_decoder_memory_pool`
-                    // is the regression test.
-                    //
-                    // RESIDUAL: chases still contend for `chase_pool`'s worker
-                    // threads, and for the pool when their right-sized needs
-                    // genuinely exceed it. The 30-second wait warn names that.
-                    let pw = match password {
-                        Some(ref value) => sevenz_turbo::Password::new(value),
-                        None => sevenz_turbo::Password::empty(),
-                    };
-
-                    // The chase is invisible: its member events go to a channel
-                    // with no receivers, and its byte counters are its own rather
-                    // than the job's, so neither the phase display nor the event
-                    // stream learns that a decode is running mid-download.
-                    let (silent_events, _) = tokio::sync::broadcast::channel(1);
-                    let context = SevenZipExtractionContext {
-                        job_id,
-                        set_name,
-                        output_dir,
-                        root,
-                        budget: Arc::clone(&budget),
-                        password: pw,
-                        event_tx: silent_events,
-                        phase_counters: counters,
-                        decode_memory: SevenZipDecodeMemory::ReservedPerPass {
-                            end_header_bytes,
-                            widening,
-                        },
-                        decode_threads,
-                    };
-
-                    extract_7z_stream(&context, || {
-                        GatedSplitReader::open(&paths, Arc::clone(&coverage))
-                            .map(|reader| {
-                                std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader)
-                            })
-                            .map_err(|error| {
-                                format!("failed to open 7z direct-unpack reader: {error}")
-                            })
-                    })
+                    unreachable!("all chase formats were dispatched above")
                 })();
                 match &outcome {
                     Ok(members) => info!(
@@ -2781,6 +2843,11 @@ impl Pipeline {
             self.direct_unpack.outcomes.insert(
                 key,
                 ChaseOutcome {
+                    positional: armed
+                        .positional
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take(),
                     result,
                     elapsed,
                     staging_dir: armed.staging_dir,
@@ -2864,10 +2931,11 @@ impl Pipeline {
         self.direct_unpack.counters.consumed += 1;
         record_event("consumed");
         ChaseDisposition::Pending(PendingChase {
-            _cancel_on_drop: PendingChaseCancellation {
-                coverage: Arc::clone(&armed.coverage),
-                budget: Arc::clone(&armed.budget),
-            },
+            cancel_on_drop: PendingChaseCancellation::new(
+                Arc::clone(&armed.coverage),
+                Arc::clone(&armed.budget),
+            ),
+            positional: armed.positional,
             budget: armed.budget,
             handle: armed.handle,
             staging_dir: armed.staging_dir,
@@ -3223,7 +3291,17 @@ impl Pipeline {
                 // consumed prefix. Rejected reads retry after repair handback.
                 armed.coverage.pause_for_repair();
             }
-            if self.direct_unpack_set_is_vouched(job_id, &set_name, verification) {
+            let replay = self
+                .direct_unpack
+                .armed
+                .get(&(job_id, set_name.clone()))
+                .is_some_and(|armed| armed.coverage.has_run_replay());
+            if replay && self.prepare_positional_run_repair(job_id, &set_name, verification) {
+                self.direct_unpack
+                    .parked_through_repair
+                    .insert((job_id, set_name));
+            } else if !replay && self.direct_unpack_set_is_vouched(job_id, &set_name, verification)
+            {
                 info!(
                     job_id = job_id.0,
                     set_name,
@@ -3236,6 +3314,53 @@ impl Pipeline {
                 self.taint_direct_unpack_set(job_id, &set_name);
             }
         }
+    }
+
+    // Positional output can discard only the affected run records. Bindings,
+    // filenames and used part boundaries still obey the ordinary repair gate.
+    fn prepare_positional_run_repair(
+        &self,
+        job_id: JobId,
+        set_name: &str,
+        verification: Option<&par2_rs::VerificationResult>,
+    ) -> bool {
+        let Some(armed) = self
+            .direct_unpack
+            .armed
+            .get(&(job_id, set_name.to_string()))
+        else {
+            return false;
+        };
+        let Ok(paths) = self.archive_set_part_paths(job_id, set_name) else {
+            return false;
+        };
+        if paths != armed.paths {
+            return false;
+        }
+        let mut prefixes = Vec::with_capacity(paths.len());
+        for path in &paths {
+            let Some(file_id) = self.direct_unpack_file_id_for_part(job_id, path) else {
+                return false;
+            };
+            if let Some(len) = self.direct_unpack_known_part_len(job_id, path)
+                && self
+                    .resolve_par2_file_binding(file_id)
+                    .is_some_and(|binding| binding.described_length != len)
+            {
+                return false;
+            }
+            let prefix = if self.par2_analysis_found_part_complete(file_id, verification) {
+                u64::MAX
+            } else if let Some(prefix) = self.in_stream_intact_prefix(file_id) {
+                prefix
+            } else {
+                // Missing recovery evidence cannot authorize replay. An
+                // explicitly vouched empty prefix still permits re-decoding.
+                return false;
+            };
+            prefixes.push(prefix);
+        }
+        armed.coverage.set_run_vouches(&prefixes)
     }
 
     pub(in crate::pipeline) fn prepare_direct_unpack_for_par3_repair(&mut self, job_id: JobId) {

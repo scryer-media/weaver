@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -68,6 +71,11 @@ pub struct TerminalDiscard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArchivePasswordSource {
     Explicit,
+    // A password a calling integration handed over beside the job's own one,
+    // such as GraphQL submit's `passwordCandidates` list.
+    Integration,
+    // An `X-DNZB-Password` response header weaver read on its own NZB fetch.
+    DnzbHeader,
     NzbMeta,
     FilenameConvention,
     Settings,
@@ -78,11 +86,27 @@ impl ArchivePasswordSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
+            Self::Integration => "integration",
+            Self::DnzbHeader => "dnzb_header",
             Self::NzbMeta => "nzb_meta",
             Self::FilenameConvention => "filename_convention",
             Self::Settings => "settings",
             Self::PasswordFile => "password_file",
         }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        [
+            Self::Explicit,
+            Self::Integration,
+            Self::DnzbHeader,
+            Self::NzbMeta,
+            Self::FilenameConvention,
+            Self::Settings,
+            Self::PasswordFile,
+        ]
+        .into_iter()
+        .find(|source| source.as_str() == label)
     }
 }
 
@@ -207,11 +231,17 @@ pub struct JobUpdate {
     // Archive/unpack password override. `Clear` removes a password even when
     // the NZB itself carries one; the override persists across restarts.
     pub password: FieldUpdate<String>,
+    // A new job name. It is kept in the metadata so a restore, which parses
+    // the NZB again, keeps it too.
+    pub name: Option<String>,
 }
 
 impl JobUpdate {
     pub fn is_empty(&self) -> bool {
-        self.category.is_unchanged() && self.metadata.is_unchanged() && self.password.is_unchanged()
+        self.category.is_unchanged()
+            && self.metadata.is_unchanged()
+            && self.password.is_unchanged()
+            && self.name.is_none()
     }
 
     pub fn apply_to_spec(&self, spec: &mut JobSpec) {
@@ -231,6 +261,11 @@ impl JobUpdate {
             FieldUpdate::Unchanged => {}
             FieldUpdate::Clear => spec.password = None,
             FieldUpdate::Set(password) => spec.password = Some(password.clone()),
+        }
+
+        if let Some(name) = &self.name {
+            spec.name = name.clone();
+            crate::ingest::set_renamed_title(&mut spec.metadata, name);
         }
     }
 }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Published byte coverage for the PAR3 engine. Filesystem sparse extents are
 // never evidence of arrival; only committed assembly/direct-store ranges are.
 

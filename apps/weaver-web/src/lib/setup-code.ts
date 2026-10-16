@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 /** Characters in a one-time setup code, not counting its hyphen. */
 export const SETUP_CODE_CHARACTERS = 6;
 

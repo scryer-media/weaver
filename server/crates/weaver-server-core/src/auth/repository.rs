@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::service::{decode_jwt_secret, encode_jwt_secret, generate_jwt_secret};
 use crate::StateError;
 use crate::persistence::Database;

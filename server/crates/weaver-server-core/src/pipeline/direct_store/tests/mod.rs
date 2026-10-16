@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Tests for the direct-store coverage checkpoint.
 //
 // Fixture names are invented throughout — never real media titles.
@@ -406,6 +409,7 @@ fn direct_active_job() -> crate::ActiveJob {
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         password_override: None,
+        supplied_password_candidates: Vec::new(),
     }
 }
 

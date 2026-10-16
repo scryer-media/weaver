@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useState } from "react";
 import { useMutation } from "urql";
 import { UPDATE_SETTINGS_MUTATION } from "@/graphql/queries";
@@ -14,14 +17,15 @@ const MIB = 1024 * 1024;
  * The download ceiling dialog, opened from the queue header and the rail's
  * Throughput gauge.
  *
- * It writes the same `maxDownloadSpeed` setting as Settings → Bandwidth, so the
- * two never disagree and a limit set here outlives a restart. The ceiling it
+ * It writes the same `maxDownloadSpeed` setting as the download ceiling on
+ * Settings → Networking → Egress, so the two never disagree and a limit set
+ * here outlives a restart. The ceiling it
  * starts from is the one the live metrics stream carries, so every opener sees
  * a change within a tick without refetching the settings.
  */
 export function useSpeedLimitDialog() {
   const t = useTranslate();
-  const { speedLimit: ceiling, downloadBlock } = useNextData();
+  const { speedLimit: ceiling, downloadBlock } = useNextData("speedLimit", "downloadBlock");
   const [saveState, updateSettings] = useMutation(UPDATE_SETTINGS_MUTATION);
   const [open, setOpen] = useState(false);
   const [megabytes, setMegabytes] = useState(0);
@@ -91,7 +95,7 @@ export function useSpeedLimitDialog() {
  * the configured ceiling. Zero is unlimited.
  */
 export function useSpeedLimitInForce() {
-  const { speedLimit, downloadBlock } = useNextData();
+  const { speedLimit, downloadBlock } = useNextData("speedLimit", "downloadBlock");
   const scheduled = downloadBlock.scheduledSpeedLimit;
   return { inForce: scheduled > 0 ? scheduled : speedLimit, bySchedule: scheduled > 0 };
 }

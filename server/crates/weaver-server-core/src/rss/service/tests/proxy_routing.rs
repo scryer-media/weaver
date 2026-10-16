@@ -1,6 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use crate::proxies::{
-    Consumer, ProxyKind, ProxyProfile, ProxyRuntime, ProxySecrets, RouteState, RoutingPolicy,
+    Consumer, ProxyKind, ProxyProfile, ProxyRuntime, ProxySecrets, Resolver, RouteState,
+    RoutingPolicy,
 };
 use std::{
     collections::HashMap,
@@ -41,6 +45,7 @@ impl Fixture {
             enabled: true,
             host: "127.0.0.1".into(),
             port: 1,
+            resolver: Resolver::Proxy,
             dns_servers: vec![DNS.parse().unwrap()],
             tunnel_addresses: vec![],
             peer_public_key: None,
@@ -53,9 +58,12 @@ impl Fixture {
             revision: 1,
             secrets: ProxySecrets::default(),
         };
+        // A proxy handed a name reaches the destination by it.
         let mapping = HashMap::from([
             ((DNS.into(), 53), dns.addr),
             ((PUBLIC.to_string(), 80), destination),
+            (("feed.invalid".into(), 80), destination),
+            (("download.invalid".into(), 80), destination),
         ]);
         let mut standard = None;
         let mut http3 = None;
@@ -227,7 +235,7 @@ async fn routed_http(kind: ProxyKind) {
         .await
         .unwrap();
     assert_eq!(
-        read_response_with_limit(response, 1024).await.unwrap(),
+        read_body(response, 1024).await.unwrap(),
         b"through selected route"
     );
     let requests = captured.lock().unwrap().clone();
@@ -292,6 +300,75 @@ async fn ssh_rss_uses_routed_dns_and_validated_addresses() {
 #[tokio::test]
 async fn wireguard_rss_uses_tunnel_dns_and_preserves_host() {
     routed_http(ProxyKind::WireGuard).await;
+}
+
+// A proxy set to resolve with its own host is handed the feed's name, and no
+// DNS server is asked for it. The private-network block is on, but Weaver
+// never sees the address the proxy resolves, so there is nothing to check.
+#[tokio::test]
+async fn a_proxy_resolving_with_its_host_is_handed_the_feeds_name() {
+    for kind in [ProxyKind::Ssh, ProxyKind::Socks5] {
+        let temp = TempDir::new().unwrap();
+        let (addr, captured, task) = origin().await;
+        let mut fixture = Fixture::start(kind, addr).await;
+        fixture.profile.dns_servers.clear();
+        let (service, runtime, feed, _) =
+            service(&temp, &fixture, "http://feed.invalid/redirect", false);
+        let response = service
+            .send_rss_request(&feed, &feed.url, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_body(response, 1024).await.unwrap(),
+            b"through selected route"
+        );
+        assert_eq!(
+            captured.lock().unwrap().clone(),
+            vec![
+                ("/redirect".into(), true, "feed.invalid".into()),
+                ("/final".into(), false, "download.invalid".into())
+            ]
+        );
+        let asked = match (&fixture.targets, &fixture._ssh) {
+            (Some(targets), _) => targets.lock().unwrap().clone(),
+            (None, Some(ssh)) => ssh.forwarded_targets(),
+            _ => unreachable!(),
+        };
+        assert!(
+            asked.contains(&("feed.invalid".into(), 80)),
+            "{kind:?}: {asked:?}"
+        );
+        assert!(
+            asked.contains(&("download.invalid".into(), 80)),
+            "{kind:?}: {asked:?}"
+        );
+        assert!(fixture.dns.queries.lock().unwrap().is_empty(), "{kind:?}");
+        runtime.stop_all().await;
+        task.abort();
+    }
+}
+
+// An address the URL names itself is still checked through a proxy that
+// resolves with its own host: a private one is refused before the proxy is
+// asked for anything.
+#[tokio::test]
+async fn a_proxy_resolving_with_its_host_is_never_handed_a_private_address() {
+    let temp = TempDir::new().unwrap();
+    let (addr, captured, task) = origin().await;
+    let mut fixture = Fixture::start(ProxyKind::Socks5, addr).await;
+    fixture.profile.dns_servers.clear();
+    let (service, runtime, feed, _) =
+        service(&temp, &fixture, &format!("http://{addr}/feed"), false);
+    assert!(
+        service
+            .send_rss_request(&feed, &feed.url, false)
+            .await
+            .is_err()
+    );
+    assert!(captured.lock().unwrap().is_empty());
+    assert!(fixture.targets.as_ref().unwrap().lock().unwrap().is_empty());
+    runtime.stop_all().await;
+    task.abort();
 }
 
 #[tokio::test]
@@ -411,9 +488,7 @@ async fn inherit_feed_routing(kind: ProxyKind) {
         .await
         .unwrap();
     assert_eq!(
-        read_response_with_limit(direct_download, 1024 * 1024)
-            .await
-            .unwrap(),
+        read_body(direct_download, 1024 * 1024).await.unwrap(),
         sample_nzb_bytes()
     );
     runtime.stop_all().await;

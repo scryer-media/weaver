@@ -1,24 +1,25 @@
-import { useState, type ReactNode } from "react";
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+import { createContext, memo, useContext, useMemo, useState, type ReactNode } from "react";
 import { Navigate, useLocation } from "react-router";
-import { UPDATE_EGRESS } from "@/graphql/networking";
 import { useTranslate } from "@/lib/context/translate-context";
-import type { Egress } from "@/lib/networking";
-import { EmptyState, MetricCell, MetricStrip } from "../../components/chrome";
-import { NumberField, SecondaryButton } from "../../components/controls";
-import { countLabel } from "../../i18n/labels";
+import type { Egress, NetworkFlow as Flow, ProxyPool } from "@/lib/networking";
+import type { ProxyProfile } from "@/lib/proxies";
+import { EmptyState } from "../../components/chrome";
+import { SecondaryButton } from "../../components/controls";
 import {
-  FieldRows,
   SettingsBlocks,
   usePanelStatus,
   useSearchReport,
   useSettingsPanelSlug,
-  type FieldSpec,
+  type SettingsBlock,
 } from "../../pages/settings/framework";
 import {
-  egressInput,
+  EMPTY_FLOW,
   NETWORKING_PAGES,
   useNetworkingWorkspace,
-  type NetworkingAction,
+  type Consumer,
   type NetworkingPage,
 } from "./data";
 import { EgressPage } from "./EgressPage";
@@ -26,7 +27,8 @@ import { FlowEditor } from "./FlowEditor";
 import { NetworkFlow, type FlowTarget } from "./NetworkFlow";
 import { PoolsPage } from "./PoolsPage";
 import { RoutesPage } from "./RoutesPage";
-import { formatRate, Hint, MIB, NoticeBand } from "./presentation";
+import { SpeedPage } from "./SpeedPage";
+import { NoticeBand } from "./presentation";
 
 export type { NetworkingData } from "./data";
 
@@ -35,6 +37,38 @@ function ActionStatus({ message, failed }: { message: string | null; failed: boo
   usePanelStatus(message, failed);
   return null;
 }
+
+/** The live flow, apart, so a sample draws the overview's diagram and not the blocks around it. */
+const LiveFlowContext = createContext<Flow>(EMPTY_FLOW);
+
+/** The overview's diagram, the one part of the page each sample changes. */
+const OverviewFlow = memo(function OverviewFlow({
+  egresses,
+  profiles,
+  pools,
+  consumers,
+  onEdit,
+}: {
+  egresses: Egress[];
+  profiles: ProxyProfile[];
+  pools: ProxyPool[];
+  consumers: Consumer[];
+  onEdit: (target: FlowTarget) => void;
+}) {
+  const flow = useContext(LiveFlowContext);
+  return (
+    <NetworkFlow
+      flow={flow}
+      egresses={egresses}
+      profiles={profiles}
+      pools={pools}
+      consumers={consumers}
+      onEdit={onEdit}
+      traffic
+      trace
+    />
+  );
+});
 
 /**
  * Networking: where connections leave, how each server and feed reaches the
@@ -45,12 +79,10 @@ function ActionStatus({ message, failed }: { message: string | null; failed: boo
  */
 export function NetworkingWorkspace({
   proxies,
-  bandwidth,
   proxyEditor,
 }: {
   /** The stored proxies' table. It calls back when one is saved or removed. */
   proxies: (onChanged: () => void) => ReactNode;
-  bandwidth: ReactNode;
   /** One stored proxy's editor, for a proxy picked in the flow. */
   proxyEditor: (id: number, onClose: () => void, onChanged: () => void) => ReactNode;
 }) {
@@ -65,9 +97,24 @@ export function NetworkingWorkspace({
     : (location.pathname.split("/networking/")[1] ?? "overview");
   const workspace = useNetworkingWorkspace(page);
   const [editing, setEditing] = useState<FlowTarget | null>(null);
-  const { data, error, fetching, flow, consumers, egresses, measured, action, busy, message, failed } = workspace;
+  const { data, error, fetching, flow, consumers, egresses, profiles, pools, action, busy, message, failed } = workspace;
   // The pages draw their blocks only once the data is here.
   useSearchReport(0, !data && fetching);
+  // Held while what it names is the same: the diagram reads each sample itself.
+  const overviewBlocks = useMemo<SettingsBlock[]>(
+    () => [
+      {
+        kind: "custom",
+        id: "flow",
+        title: t("next.networking.overview.flow"),
+        searchText: [...consumers.map((consumer) => consumer.name), ...egresses.map((egress) => egress.name)].join(" "),
+        body: (
+          <OverviewFlow egresses={egresses} profiles={profiles} pools={pools} consumers={consumers} onEdit={setEditing} />
+        ),
+      },
+    ],
+    [consumers, egresses, pools, profiles, t],
+  );
 
   if (!NETWORKING_PAGES.includes(page as NetworkingPage)) {
     return <Navigate to="/settings/networking/overview" replace />;
@@ -75,8 +122,8 @@ export function NetworkingWorkspace({
 
   return (
     <>
-      {/* The bandwidth page's own settings own the status bar there. */}
-      {page === "bandwidth" ? null : <ActionStatus message={message} failed={failed} />}
+      {/* The egress page's download ceiling owns the status bar there, and reports these actions with its own. */}
+      {page === "egress" ? null : <ActionStatus message={message} failed={failed} />}
       {error ? (
         <EmptyState
           title={t("next.networking.loadFailed")}
@@ -100,177 +147,40 @@ export function NetworkingWorkspace({
           ) : null}
           {page === "overview" ? (
             <>
-              <MetricStrip>
-                <MetricCell
-                  variant="strip"
-                  eyebrow={t("next.networking.overview.egresses")}
-                  value={egresses.length}
-                  note={t("next.networking.overview.egressesUp", {
-                    count: egresses.filter((egress) => egress.health === "UP").length,
-                  })}
-                />
-                <MetricCell
-                  variant="strip"
-                  eyebrow={t("next.networking.overview.proxies")}
-                  value={data.proxyProfiles.length}
-                  note={countLabel(t, "next.networking.pools.count", data.proxyPools.length)}
-                />
-                <MetricCell
-                  variant="strip"
-                  eyebrow={t("next.networking.overview.legs")}
-                  value={flow.legs.length}
-                  note={countLabel(t, "next.networking.overview.consumers", consumers.length)}
-                />
-                <MetricCell
-                  variant="strip"
-                  eyebrow={t("next.networking.overview.open")}
-                  value={flow.legs.reduce((sum, leg) => sum + leg.open, 0)}
-                  note={formatRate(flow.legs.reduce((sum, leg) => sum + (leg.bytesPerSecond ?? 0), 0))}
-                />
-              </MetricStrip>
               {workspace.liveError ? (
                 <NoticeBand tone="warn" role="status">
                   {t("next.networking.liveUnavailable")}
                 </NoticeBand>
               ) : null}
-              <SettingsBlocks
-                blocks={[
-                  {
-                    kind: "custom",
-                    id: "flow",
-                    title: t("next.networking.overview.flow"),
-                    note: t("next.networking.overview.flowNote"),
-                    searchText: [...consumers.map((consumer) => consumer.name), ...egresses.map((egress) => egress.name)].join(" "),
-                    body: (
-                      <NetworkFlow
-                        flow={flow}
-                        egresses={egresses}
-                        profiles={measured.proxies ?? data.proxyProfiles}
-                        pools={measured.proxyPools ?? data.proxyPools}
-                        consumers={consumers}
-                        onEdit={setEditing}
-                      />
-                    ),
-                  },
-                ]}
-              />
-              <FlowEditor
-                target={editing}
-                onClose={() => setEditing(null)}
-                data={data}
-                egresses={egresses}
-                consumers={consumers}
-                flow={flow}
-                action={action}
-                busy={busy}
-                proxyEditor={(id, onClose) => proxyEditor(id, onClose, workspace.retry)}
-              />
+              <LiveFlowContext.Provider value={flow}>
+                <SettingsBlocks blocks={overviewBlocks} />
+              </LiveFlowContext.Provider>
+              {/* Nothing is drawn until a box is picked, so nothing is drawn again for each sample either. */}
+              {editing ? (
+                <FlowEditor
+                  target={editing}
+                  onClose={() => setEditing(null)}
+                  data={data}
+                  egresses={egresses}
+                  consumers={consumers}
+                  flow={flow}
+                  action={action}
+                  busy={busy}
+                  proxyEditor={(id, onClose) => proxyEditor(id, onClose, workspace.retry)}
+                />
+              ) : null}
             </>
           ) : null}
-          {page === "egress" ? <EgressPage data={data} egresses={egresses} action={action} busy={busy} /> : null}
+          {page === "egress" ? (
+            <EgressPage data={data} egresses={egresses} action={action} busy={busy} message={message} failed={failed} />
+          ) : null}
           {page === "proxies" ? <PoolsPage data={data} action={action} busy={busy} proxies={proxies(workspace.retry)} /> : null}
           {page === "routes" ? (
             <RoutesPage key={location.search} data={data} consumers={consumers} flow={flow} action={action} busy={busy} />
           ) : null}
-          {page === "bandwidth" ? (
-            <>
-              {bandwidth}
-              <EgressLimits egresses={egresses} action={action} busy={busy} message={message} failed={failed} />
-            </>
-          ) : null}
+          {page === "speed" ? <SpeedPage key={location.search} data={data} consumers={consumers} /> : null}
         </>
       ) : null}
     </>
-  );
-}
-
-/** Each egress's own ceiling, on top of the global and per-server ones above it. */
-function EgressLimits({
-  egresses,
-  action,
-  busy,
-  message,
-  failed,
-}: {
-  egresses: Egress[];
-  action: NetworkingAction;
-  busy: boolean;
-  message: string | null;
-  failed: boolean;
-}) {
-  const t = useTranslate();
-  const fields: FieldSpec[] = egresses.map((egress) => ({
-    id: `egress-${egress.id}`,
-    label: egress.name,
-    help: t("next.networking.egress.limitHelp"),
-    control: {
-      kind: "custom",
-      control: <EgressLimit key={`${egress.id}:${egress.maxDownloadSpeed}`} egress={egress} action={action} busy={busy} />,
-    },
-  }));
-  return (
-    <SettingsBlocks
-      blocks={[
-        {
-          kind: "custom",
-          id: "egress-limits",
-          title: t("next.networking.limits.title"),
-          searchText: [
-            t("next.networking.limits.note"),
-            t("next.networking.egress.limitHelp"),
-            ...fields.map((field) => field.label),
-          ].join(" "),
-          body: (
-            <>
-              <Hint>{t("next.networking.limits.note")}</Hint>
-              <FieldRows fields={fields} />
-              {message ? (
-                <div
-                  role={failed ? "alert" : "status"}
-                  className={
-                    failed
-                      ? "px-4 py-3 text-[12.5px] text-wv-error-text sm:px-6"
-                      : "px-4 py-3 text-[12.5px] text-wv-muted sm:px-6"
-                  }
-                >
-                  {message}
-                </div>
-              ) : null}
-            </>
-          ),
-        },
-      ]}
-    />
-  );
-}
-
-function EgressLimit({ egress, action, busy }: { egress: Egress; action: NetworkingAction; busy: boolean }) {
-  const t = useTranslate();
-  const saved = egress.maxDownloadSpeed / MIB;
-  const [limit, setLimit] = useState(saved);
-  return (
-    <div className="flex items-center gap-[10px]">
-      <NumberField
-        label={t("next.networking.limits.limitFor", { name: egress.name })}
-        value={limit}
-        min={0}
-        step={0.1}
-        precision={1}
-        suffix="MiB/s"
-        onChange={setLimit}
-      />
-      <SecondaryButton
-        size="compact"
-        disabled={busy || limit === saved}
-        onClick={() =>
-          void action(UPDATE_EGRESS, {
-            id: egress.id,
-            input: egressInput({ ...egress, maxDownloadSpeed: Math.round(limit * MIB) }),
-          })
-        }
-      >
-        {t("next.networking.limits.save")}
-      </SecondaryButton>
-    </div>
   );
 }

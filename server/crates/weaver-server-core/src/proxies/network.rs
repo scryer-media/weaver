@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
@@ -241,7 +244,8 @@ impl ProxyPool {
         if self.name.trim().is_empty() || self.name.chars().count() > 128 {
             return Err(NetworkRefusal::PoolNameLength);
         }
-        if !(2..=16).contains(&self.member_ids.len()) {
+        // A pool may be saved empty and filled later; only a route needs a member.
+        if self.member_ids.len() > 16 {
             return Err(NetworkRefusal::PoolMemberCount);
         }
         let mut seen = HashSet::new();
@@ -348,7 +352,6 @@ impl Route {
         egresses: &HashMap<u32, EgressInterface>,
         profiles: &HashMap<u32, ProxyProfile>,
         pools: &HashMap<u32, ProxyPool>,
-        require_dns: bool,
     ) -> Result<(), NetworkRefusal> {
         self.validate_shape()?;
         for leg in &self.legs {
@@ -368,6 +371,9 @@ impl Route {
                     Rung::Pool { id } => {
                         let pool = pools.get(id).ok_or(NetworkRefusal::RoutePoolMissing)?;
                         pool.validate(profiles)?;
+                        if pool.member_ids.is_empty() {
+                            return Err(NetworkRefusal::RoutePoolEmpty);
+                        }
                         &pool.member_ids
                     }
                     Rung::Chain { ids } => ids,
@@ -390,9 +396,6 @@ impl Route {
                         && !carried
                     {
                         return Err(NetworkRefusal::RouteChainTransport);
-                    }
-                    if require_dns && profile.dns_servers.is_empty() {
-                        return Err(NetworkRefusal::RouteRssProxyNeedsDns);
                     }
                 }
             }

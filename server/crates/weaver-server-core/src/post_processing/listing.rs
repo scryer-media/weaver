@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Live listing of the configured scripts directory.
 //
 // Nothing here is persisted: a script is whatever is in the directory when the

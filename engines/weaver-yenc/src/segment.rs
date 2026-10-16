@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Segment-CRC checkpointing: one CRC pass over decoded article bytes that
 // also yields PAR2 block CRC32s.
 //

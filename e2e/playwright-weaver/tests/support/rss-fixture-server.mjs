@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import http from "node:http";
 
 const port = Number(process.env.RSS_FIXTURE_PORT ?? 8089);

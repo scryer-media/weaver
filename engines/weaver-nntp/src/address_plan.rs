@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Which of a server's resolved addresses new connections dial.
 //
 // A provider hostname usually resolves to several addresses, and they are
@@ -54,7 +57,7 @@
 use crate::candidate_plan::{CandidatePlan, Next};
 type PlanState = CandidatePlan<SocketAddr>;
 use std::io;
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
@@ -231,6 +234,9 @@ pub(crate) trait AddressDialer: Send + Sync + 'static {
     fn resolve(&self) -> io::Result<Vec<SocketAddr>>;
 
     fn dial(&self, addr: SocketAddr) -> io::Result<Self::Stream>;
+
+    // Drops the answer `resolve` holds, after none of its addresses answered.
+    fn forget(&self) {}
 }
 
 // Plain TCP to a hostname's resolved addresses.
@@ -259,71 +265,22 @@ impl TcpDialer {
 impl AddressDialer for TcpDialer {
     type Stream = TcpStream;
 
+    #[expect(clippy::disallowed_methods, reason = "the address plan's direct leg")]
     fn resolve(&self) -> io::Result<Vec<SocketAddr>> {
-        Ok((self.host.as_str(), self.port)
-            .to_socket_addrs()?
-            .filter(|a| self.egress.supports_address(a.ip()))
+        Ok(weaver_tunnel::resolution::host_lookup_blocking(&self.host)?
+            .into_iter()
+            .filter(|ip| self.egress.supports_address(*ip))
+            .map(|ip| SocketAddr::new(ip, self.port))
             .collect())
     }
 
+    #[expect(clippy::disallowed_methods, reason = "the address plan's direct leg")]
     fn dial(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         self.egress.connect_blocking(addr, self.timeout)
     }
-}
 
-// The address plan a new connection to one server goes through.
-#[derive(Clone)]
-pub struct AddressRoute {
-    pub(crate) plan: Arc<AddressPlan>,
-}
-
-impl AddressRoute {
-    // Open a TCP socket to the address this route's plan picks.
-    pub(crate) fn connect_tcp(
-        &self,
-        host: &str,
-        port: u16,
-        timeout: Duration,
-    ) -> io::Result<(TcpStream, SocketAddr)> {
-        let dialer = Arc::new(TcpDialer::new(host, port, timeout));
-        self.plan.connect(&dialer)
-    }
-
-    // Watch the session being set up on a socket this route opened to
-    // `addr`.
-    pub(crate) fn watch_setup(&self, addr: SocketAddr) -> SetupWatch {
-        SetupWatch {
-            plan: Arc::clone(&self.plan),
-            addr,
-            reached: false,
-        }
-    }
-}
-
-// One session's setup on a connected socket, from the connect to the point
-// where the server has answered over it. Dropped before that point, it books
-// a failed setup against the address: a handshake that failed, a greeting
-// that never came, or a setup abandoned because it ran out of time.
-pub(crate) struct SetupWatch {
-    plan: Arc<AddressPlan>,
-    addr: SocketAddr,
-    reached: bool,
-}
-
-impl SetupWatch {
-    // The server answered over this socket. What it said is the server's
-    // answer, not the address's.
-    pub(crate) fn reached_server(mut self) {
-        self.reached = true;
-        self.plan.record_setup(self.addr, true);
-    }
-}
-
-impl Drop for SetupWatch {
-    fn drop(&mut self) {
-        if !self.reached {
-            self.plan.record_setup(self.addr, false);
-        }
+    fn forget(&self) {
+        weaver_tunnel::resolution::forget_host(&self.host);
     }
 }
 
@@ -536,6 +493,7 @@ impl AddressPlan {
         for addr in slow {
             self.record_connect(addr, None);
         }
+        dialer.forget();
         let error = last_error.unwrap_or_else(|| {
             io::Error::new(io::ErrorKind::AddrNotAvailable, "no address answered")
         });

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -33,6 +36,47 @@ pub(super) fn encrypt_archive_password(
     crate::persistence::encryption::encrypt_value(key, password)
         .map(Some)
         .map_err(StateError::Database)
+}
+
+// A job's supplied archive passwords, sealed as one value the way its
+// password is: a JSON list of `[source label, password]` pairs. An empty list
+// stores nothing.
+pub(super) fn encrypt_supplied_passwords(
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
+    candidates: &[crate::jobs::ArchivePasswordCandidate],
+) -> Result<Option<String>, StateError> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let pairs: Vec<(&str, &str)> = candidates
+        .iter()
+        .map(|candidate| (candidate.source().as_str(), candidate.value()))
+        .collect();
+    let json = serde_json::to_string(&pairs)
+        .map_err(|error| StateError::Database(format!("invalid archive passwords: {error}")))?;
+    encrypt_archive_password(key, Some(&json))
+}
+
+pub(crate) fn decrypt_supplied_passwords(
+    key: Option<&crate::persistence::encryption::EncryptionKey>,
+    stored: Option<String>,
+) -> Result<Vec<crate::jobs::ArchivePasswordCandidate>, StateError> {
+    let json = match decrypt_archive_password(key, stored)? {
+        Some(json) if !json.is_empty() => json,
+        _ => return Ok(Vec::new()),
+    };
+    let pairs: Vec<(String, String)> = serde_json::from_str(&json)
+        .map_err(|error| StateError::Database(format!("invalid archive passwords: {error}")))?;
+    pairs
+        .into_iter()
+        .map(|(label, value)| {
+            crate::jobs::ArchivePasswordSource::from_label(&label)
+                .map(|source| crate::jobs::ArchivePasswordCandidate::new(source, value))
+                .ok_or_else(|| {
+                    StateError::Database(format!("unknown archive password source {label}"))
+                })
+        })
+        .collect()
 }
 
 pub(crate) fn decrypt_archive_password(
@@ -548,6 +592,10 @@ impl Database {
                 self.encryption_key(),
                 job.password_override.as_deref(),
             )?),
+            SqlArg::OptText(encrypt_supplied_passwords(
+                self.encryption_key(),
+                &job.supplied_password_candidates,
+            )?),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "create_active_job", |tx| {
@@ -555,8 +603,8 @@ impl Database {
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO active_jobs
-                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password)
-                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                         &args,
                     )
                     .await?;
@@ -596,6 +644,10 @@ impl Database {
                 self.encryption_key(),
                 job.password_override.as_deref(),
             )?),
+            SqlArg::OptText(encrypt_supplied_passwords(
+                self.encryption_key(),
+                &job.supplied_password_candidates,
+            )?),
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
@@ -607,8 +659,8 @@ impl Database {
                     Box::pin(async move {
                         tx.execute(
                             "INSERT INTO active_jobs
-                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password)
-                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                             &args,
                         )
                         .await?;
@@ -709,6 +761,10 @@ impl Database {
             SqlArg::OptText(encrypt_archive_password(
                 self.encryption_key(),
                 job.password_override.as_deref(),
+            )?),
+            SqlArg::OptText(encrypt_supplied_passwords(
+                self.encryption_key(),
+                &job.supplied_password_candidates,
             )?),
         ];
         self.run_sql_blocking(async move {
@@ -825,8 +881,8 @@ impl Database {
                         .await?;
                         tx.execute(
                             "INSERT INTO active_jobs
-                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password)
-                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                             &args,
                         )
                         .await?;
@@ -958,6 +1014,29 @@ impl Database {
             self.cache_script_effects(job_id.0, effects);
         }
         Ok(())
+    }
+
+    pub fn update_active_job_output_dir(
+        &self,
+        job_id: JobId,
+        output_dir: &std::path::Path,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let output_dir = output_dir.to_string_lossy().into_owned();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "update_active_job_output_dir", |tx| {
+                let output_dir = output_dir.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE active_jobs SET output_dir = {} WHERE job_id = {}",
+                        &[SqlArg::Text(output_dir), SqlArg::I64(job_id.0 as i64)],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
     }
 
     // Persist the manual queue order as one transaction. Positions are the
@@ -3336,6 +3415,7 @@ mod tests {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             password_override: None,
+            supplied_password_candidates: Vec::new(),
         }
     }
 

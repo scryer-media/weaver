@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Upgrade the post-processing lists and options shipped in 0.14.7.
 // Saved SQL/JSON shapes and emitted defaults are local to this hook. Header
 // parsing and script/option validation use the running build; fixture tests

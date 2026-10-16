@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Interleaved A/B harness for the yEnc decode CRC32 path.
 //
 // Measurement only: nothing here changes a production path. It compares, in

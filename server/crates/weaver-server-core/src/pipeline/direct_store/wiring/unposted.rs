@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Continuation of the `impl Pipeline` block from `direct_store/wiring.rs`.
 //
 // Volumes a name-admitted set has but the post never carried. The recovery

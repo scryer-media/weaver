@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 # avx2-profile.sh — find WHY weaver's AVX2 yEnc decode is slower than rapidyenc,
 # on a real AVX2 Linux box, using perf (topdown + per-instruction), with weaver
 # and rapidyenc profiled SIDE BY SIDE in the same process.

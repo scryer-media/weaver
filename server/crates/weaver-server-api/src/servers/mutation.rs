@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::path::PathBuf;
 
 use async_graphql::{Context, Object, Result};
@@ -47,7 +50,7 @@ impl ServersMutation {
         let normalized =
             NormalizedServerInput::from_input(input, None).map_err(async_graphql::Error::new)?;
 
-        let probe = validate_server_before_save(&normalized, route.as_ref()).await?;
+        let probe = validate_server_before_save(&normalized, &route).await?;
 
         let id = {
             let db = db.clone();
@@ -154,7 +157,7 @@ impl ServersMutation {
         let probe = if routing_changed && normalized.same_connection_as(&existing) {
             None
         } else {
-            validate_server_before_save(&normalized, route.as_ref()).await?
+            validate_server_before_save(&normalized, &route).await?
         };
         let mut server = normalized.as_runtime_server_config(id);
         server.supports_pipelining = probe
@@ -363,7 +366,7 @@ impl ServersMutation {
             weaver_server_core::proxies::Consumer::Server(id),
             None,
         )?;
-        let probe = probe_through_route(&server, route.as_ref()).await?;
+        let probe = probe_through_route(&server, &route).await?;
         if let Ok(handle) = ctx.data::<SchedulerHandle>() {
             note_probe_first_byte_latency(handle, id, Some(&probe));
         }
@@ -406,7 +409,7 @@ impl ServersMutation {
         };
 
         Ok(
-            probe_through_route(&normalized.as_runtime_server_config(0), route.as_ref())
+            probe_through_route(&normalized.as_runtime_server_config(0), &route)
                 .await?
                 .into(),
         )
@@ -573,29 +576,12 @@ impl From<RoutedProbe> for TestConnectionResult {
 // Probe every draft leg without changing live selection or tunnel sessions.
 fn probe_through_route<'a>(
     server: &'a weaver_server_core::servers::ServerConfig,
-    route: Option<&'a std::sync::Arc<weaver_server_core::proxies::DraftNetworkRoute>>,
+    route: &'a std::sync::Arc<weaver_server_core::proxies::DraftNetworkRoute>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RoutedProbe>> + Send + 'a>> {
     Box::pin(async move {
-        let mut results = Vec::new();
-        for position in 0..route.map_or(1, |route| route.leg_count()) {
-            let dialer = match route {
-                Some(route) => match route.nntp_dialer_for_leg(position, server.id) {
-                    Ok(dialer) => Some(dialer),
-                    Err(error) => {
-                        route.revoke().await;
-                        return Err(async_graphql::Error::new(error));
-                    }
-                },
-                None => None,
-            };
-            results.push(
-                weaver_server_core::servers::probe_server_connection_with_route(server, dialer)
-                    .await,
-            );
-        }
-        if let Some(route) = route {
-            route.revoke().await;
-        }
+        let mut results = weaver_server_core::servers::probe_server_route(server, route)
+            .await
+            .map_err(async_graphql::Error::new)?;
         let legs = results
             .iter()
             .enumerate()
@@ -626,12 +612,12 @@ fn probe_through_route<'a>(
 // inactive and no probe ran, so previously learned facts are kept.
 async fn validate_server_before_save(
     input: &NormalizedServerInput,
-    route: Option<&std::sync::Arc<weaver_server_core::proxies::DraftNetworkRoute>>,
+    route: &std::sync::Arc<weaver_server_core::proxies::DraftNetworkRoute>,
 ) -> Result<Option<ServerConnectivityResult>> {
     if !input.active
-        || route.is_some_and(|r| {
-            r.policy.legs.is_empty() && r.policy.proxy_ids.is_empty() && !r.policy.allow_direct
-        })
+        || (route.policy.legs.is_empty()
+            && route.policy.proxy_ids.is_empty()
+            && !route.policy.allow_direct)
     {
         return Ok(None);
     }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The 32-byte 7z signature header, parsed on its own.
 //
 // Direct unpack needs the archive's exact total length before a single packed

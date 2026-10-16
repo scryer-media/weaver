@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{NaiveDate, Utc};
@@ -237,6 +240,7 @@ impl ReleaseLane {
 struct SignalForwarder {
     previous_sigint: libc::sigaction,
     previous_sigterm: libc::sigaction,
+    previous_sighup: libc::sigaction,
 }
 
 #[cfg(unix)]
@@ -246,6 +250,7 @@ impl Drop for SignalForwarder {
         unsafe {
             let _ = libc::sigaction(libc::SIGINT, &self.previous_sigint, std::ptr::null_mut());
             let _ = libc::sigaction(libc::SIGTERM, &self.previous_sigterm, std::ptr::null_mut());
+            let _ = libc::sigaction(libc::SIGHUP, &self.previous_sighup, std::ptr::null_mut());
         }
     }
 }
@@ -811,6 +816,7 @@ fn list_port_pids(ctx: &TaskContext, port: u16, probe: &mut PortProbeState) -> R
         .collect())
 }
 
+#[expect(clippy::disallowed_methods, reason = "tooling probes a local port")]
 fn port_accepts_tcp(port: u16) -> bool {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&address, TCP_PORT_PROBE_TIMEOUT).is_ok()
@@ -2700,7 +2706,7 @@ fn build_rust_log(spec: Option<&str>) -> String {
 
 fn stop_port(port: u16) -> Result<()> {
     let mut lsof = Command::new("lsof");
-    lsof.args(["-tiTCP", &port.to_string(), "-sTCP:LISTEN"]);
+    lsof.args([&format!("-tiTCP:{port}"), "-sTCP:LISTEN"]);
     let output = lsof.output()?;
     let pids = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -2717,7 +2723,7 @@ fn stop_port(port: u16) -> Result<()> {
     thread::sleep(std::time::Duration::from_secs(1));
 
     let mut lsof = Command::new("lsof");
-    lsof.args(["-tiTCP", &port.to_string(), "-sTCP:LISTEN"]);
+    lsof.args([&format!("-tiTCP:{port}"), "-sTCP:LISTEN"]);
     let output = lsof.output()?;
     let stubborn = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -2733,12 +2739,11 @@ fn stop_port(port: u16) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_backend(pid: u32, port: u16, log_path: &Path) -> Result<()> {
+fn wait_for_backend(child: &mut Child, port: u16, log_path: &Path) -> Result<()> {
     for _ in 0..60 {
-        let status = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()?;
-        if !status.success() {
+        // `kill -0` succeeds on a child that exited and was not reaped, and
+        // a leftover listener would then answer for it below.
+        if child.try_wait()?.is_some() {
             let tail = tail_file(log_path, 50)?;
             bail!(
                 "Weaver failed to start. Tail of {}:\n{tail}",
@@ -2767,7 +2772,7 @@ fn wait_for_backend(pid: u32, port: u16, log_path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn configure_backend_process_group(command: &mut Command) {
+fn configure_own_process_group(command: &mut Command) {
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == 0 {
@@ -2780,7 +2785,7 @@ fn configure_backend_process_group(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn configure_backend_process_group(_command: &mut Command) {}
+fn configure_own_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn install_backend_signal_forwarder(process_id: u32) -> Result<SignalForwarder> {
@@ -2791,7 +2796,10 @@ fn install_backend_signal_forwarder(process_id: u32) -> Result<SignalForwarder> 
     let action = forward_backend_sigaction();
     let mut previous_sigint = unsafe { std::mem::zeroed() };
     let mut previous_sigterm = unsafe { std::mem::zeroed() };
+    let mut previous_sighup = unsafe { std::mem::zeroed() };
 
+    // The backend has its own process group, so a closed terminal's hangup
+    // reaches it only through this forwarder.
     unsafe {
         if libc::sigaction(libc::SIGINT, &action, &mut previous_sigint) != 0 {
             return Err(io::Error::last_os_error()).context("failed to install SIGINT forwarder");
@@ -2800,11 +2808,17 @@ fn install_backend_signal_forwarder(process_id: u32) -> Result<SignalForwarder> 
             let _ = libc::sigaction(libc::SIGINT, &previous_sigint, std::ptr::null_mut());
             return Err(io::Error::last_os_error()).context("failed to install SIGTERM forwarder");
         }
+        if libc::sigaction(libc::SIGHUP, &action, &mut previous_sighup) != 0 {
+            let _ = libc::sigaction(libc::SIGINT, &previous_sigint, std::ptr::null_mut());
+            let _ = libc::sigaction(libc::SIGTERM, &previous_sigterm, std::ptr::null_mut());
+            return Err(io::Error::last_os_error()).context("failed to install SIGHUP forwarder");
+        }
     }
 
     Ok(SignalForwarder {
         previous_sigint,
         previous_sigterm,
+        previous_sighup,
     })
 }
 
@@ -2813,22 +2827,22 @@ fn install_backend_signal_forwarder(_process_id: u32) -> Result<SignalForwarder>
     Ok(SignalForwarder)
 }
 
-fn terminate_backend(backend: &mut Child) {
+fn terminate_process_group(child: &mut Child) {
     #[cfg(unix)]
     {
-        let process_id = backend.id();
+        let process_id = child.id();
         let _ = signal_process_group(process_id, libc::SIGINT);
-        if wait_for_child_exit(backend, BACKEND_SHUTDOWN_GRACE_PERIOD) {
+        if wait_for_child_exit(child, BACKEND_SHUTDOWN_GRACE_PERIOD) {
             return;
         }
         let _ = signal_process_group(process_id, libc::SIGKILL);
-        let _ = backend.wait();
+        let _ = child.wait();
     }
 
     #[cfg(not(unix))]
     {
-        let _ = backend.kill();
-        let _ = backend.wait();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -3152,6 +3166,32 @@ fn build_frontend_assets(ctx: &TaskContext, web_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// A production build of the web UI that rebuilds whenever its source changes.
+// A debug or e2e backend reads the embedded assets from disk, so it serves
+// each rebuild as it lands.
+fn spawn_frontend_watch(ctx: &TaskContext, web_dir: &Path, log_path: &Path) -> Result<Child> {
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(log_path, "")?;
+    let log = OpenOptions::new().append(true).open(log_path)?;
+    let log_err = log.try_clone()?;
+    let mut watch = ctx.command_in("npm", web_dir);
+    configure_own_process_group(&mut watch);
+    // Earlier chunks stay on disk, so a page loaded before a rebuild can still
+    // open the routes it has not loaded yet.
+    watch
+        .args(["run", "build", "--", "--watch", "--emptyOutDir=false"])
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    watch.spawn().with_context(|| {
+        format!(
+            "failed to start the frontend watch build in {}",
+            web_dir.display()
+        )
+    })
+}
+
 fn seed_runtime_dirs(db_path: &Path, data_dir: &Path) -> Result<()> {
     let intermediate_dir = data_dir.join("intermediate");
     let complete_dir = data_dir.join("complete");
@@ -3213,8 +3253,7 @@ fn bootstrap_state_dir(
         child.env("WEAVER_ENCRYPTION_KEY", key);
     }
     let mut child = child.spawn()?;
-    let pid = child.id();
-    wait_for_backend(pid, backend_port, backend_log)?;
+    wait_for_backend(&mut child, backend_port, backend_log)?;
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
@@ -3237,6 +3276,10 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     let backend_log = PathBuf::from(
         std::env::var("WEAVER_DEV_BACKEND_LOG")
             .unwrap_or_else(|_| "/tmp/weaver-dev-backend.log".to_string()),
+    );
+    let frontend_build_log = PathBuf::from(
+        std::env::var("WEAVER_DEV_FRONTEND_BUILD_LOG")
+            .unwrap_or_else(|_| "/tmp/weaver-dev-frontend-build.log".to_string()),
     );
     let state_dir = PathBuf::from(
         std::env::var("WEAVER_DEV_STATE_DIR")
@@ -3340,7 +3383,7 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     let log_offset = log.metadata()?.len();
     let log_err = log.try_clone()?;
     let mut backend = ctx.command(&backend_binary);
-    configure_backend_process_group(&mut backend);
+    configure_own_process_group(&mut backend);
     backend
         .env("RUST_LOG", &rust_log)
         .args([
@@ -3359,9 +3402,9 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     let mut backend = backend.spawn()?;
     let backend_pid = backend.id();
     let backend_signal_forwarder = install_backend_signal_forwarder(backend_pid)?;
-    if let Err(error) = wait_for_backend(backend_pid, backend_port, &backend_log) {
+    if let Err(error) = wait_for_backend(&mut backend, backend_port, &backend_log) {
         backend_signal_forwarder.uninstall();
-        terminate_backend(&mut backend);
+        terminate_process_group(&mut backend);
         if !keep_data {
             drop(temp_dir);
         }
@@ -3372,9 +3415,32 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
     // log by the time the backend answers.
     let setup_code = read_setup_code(&backend_log, log_offset)?;
 
+    // A release backend embedded the assets when it was compiled, so a
+    // rebuild would never reach it.
+    let mut frontend_watch = None;
+    if !args.production_build {
+        match spawn_frontend_watch(ctx, &web_dir, &frontend_build_log) {
+            Ok(watch) => frontend_watch = Some(watch),
+            Err(error) => {
+                backend_signal_forwarder.uninstall();
+                terminate_process_group(&mut backend);
+                if !keep_data {
+                    drop(temp_dir);
+                }
+                return Err(error);
+            }
+        }
+    }
+
     println!("==> Weaver backend ready");
     println!("    Backend:  {backend_url}");
     println!("    Frontend: {frontend_url}");
+    if frontend_watch.is_some() {
+        println!(
+            "    Production build: {backend_url}, rebuilt on change (tail -f {})",
+            frontend_build_log.display()
+        );
+    }
     println!("    State:    {}", state_dir.display());
     println!("    Data:     {}", data_dir.display());
     println!("    Log:      tail -f {}", backend_log.display());
@@ -3408,8 +3474,11 @@ fn run_serve(ctx: &TaskContext, args: ServeArgs) -> Result<()> {
         ]);
     let result = run_status(&mut vite);
 
+    if let Some(watch) = frontend_watch.as_mut() {
+        terminate_process_group(watch);
+    }
     backend_signal_forwarder.uninstall();
-    terminate_backend(&mut backend);
+    terminate_process_group(&mut backend);
     if !keep_data {
         drop(temp_dir);
     }
@@ -3573,7 +3642,7 @@ fn run_deploy_local(ctx: &TaskContext, args: DeployLocalArgs) -> Result<()> {
         .stderr(Stdio::from(log_err));
     let mut child = child.spawn()?;
     let child_id = child.id();
-    if let Err(error) = wait_for_backend(child_id, port, &log_file) {
+    if let Err(error) = wait_for_backend(&mut child, port, &log_file) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);

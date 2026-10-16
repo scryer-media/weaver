@@ -367,6 +367,7 @@
         "testdata/single-7z/**",
         "testdata/single-mkv-sparse-nzb/**",
         "testdata/single-mkv/**",
+        "testdata/speed-test-100mb/**",
         "testdata/split-7z-corrupted/**",
         "testdata/split-7z-encrypted/**",
         "testdata/split-7z/**",

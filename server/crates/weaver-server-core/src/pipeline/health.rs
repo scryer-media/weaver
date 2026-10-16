@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use crate::jobs::model::{HealthDeferral, HealthDeferralKind};
 
@@ -1368,7 +1371,31 @@ impl Pipeline {
     }
 
     // Mark a job as failed and purge its queued segments.
+    //
+    // A failure that arrives as plain text is an extraction refusal when the
+    // job's extraction budget has recorded one: the budget stopped every
+    // worker on it, so whatever the job fails on now, it fails behind it.
     pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
+        let rejection = self
+            .extraction_budgets
+            .get(&job_id)
+            .and_then(|budget| budget.rejection());
+        self.fail_job_with_rejection(job_id, error, rejection);
+    }
+
+    // Mark a job as failed on an extraction error, routed on its class.
+    pub(super) fn fail_job_on_extraction_error(&mut self, job_id: JobId, error: ExtractionError) {
+        let reason = error.job_failure_reason();
+        let rejection = error.rejection().cloned();
+        self.fail_job_with_rejection(job_id, reason, rejection);
+    }
+
+    fn fail_job_with_rejection(
+        &mut self,
+        job_id: JobId,
+        error: String,
+        rejection: Option<crate::pipeline::extraction::ExtractionFailure>,
+    ) {
         tracing::error!(job_id = job_id.0, reason = %error, "job failed");
         self.clear_health_deferral(job_id);
         // Terminal transition: a job dying without a recovery set never had a
@@ -1389,6 +1416,11 @@ impl Pipeline {
                 _ => crate::post_processing::model::PipelineFailureStage::Download,
             })
             .unwrap_or(crate::post_processing::model::PipelineFailureStage::Download);
+        // The first failure wins: a later fail_job for the same job comes
+        // from cleanup, not from the stage that broke.
+        self.pipeline_failure_stages
+            .entry(job_id)
+            .or_insert(failure_stage);
         // Scripts run on failure too, so the job's own failure survives them:
         // the primary failure is carried through and re-applied afterwards.
         let scripts_may_run = self
@@ -1402,11 +1434,10 @@ impl Pipeline {
                 );
                 false
             });
-        let extraction_rejected = JobExtractionBudget::is_rejection(&error);
+        let extraction_rejected = rejection.is_some();
         if extraction_rejected && let Some(budget) = self.extraction_budgets.get(&job_id) {
-            budget.cancel_with_error(&error);
+            budget.stop_for_rejection();
         }
-        let error = JobExtractionBudget::job_failure_reason(error);
         let should_defer = !extraction_rejected
             && scripts_may_run
             && self.jobs.contains_key(&job_id)

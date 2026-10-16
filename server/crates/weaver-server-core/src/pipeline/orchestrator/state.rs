@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 
 impl Pipeline {
@@ -32,14 +35,13 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         staging: &std::path::Path,
-    ) -> Result<Arc<JobExtractionBudget>, String> {
+    ) -> Result<Arc<JobExtractionBudget>, crate::pipeline::ExtractionError> {
         if let Some(budget) = self.extraction_budgets.get(&job_id) {
             return Ok(Arc::clone(budget));
         }
-        let state = self
-            .jobs
-            .get(&job_id)
-            .ok_or_else(|| format!("job {job_id:?} not found"))?;
+        let state = self.jobs.get(&job_id).ok_or_else(|| {
+            crate::pipeline::ExtractionError::terminal(format!("job {job_id:?} not found"))
+        })?;
         let archive_sources = state
             .assembly
             .archive_topologies()
@@ -82,12 +84,12 @@ impl Pipeline {
                     0,
                     Arc::clone(&self.metrics),
                 )?;
-                let rejection = if error.contains("symlink") || error.contains("reparse") {
-                    budget.reject_unsafe_path(error)
-                } else {
-                    budget.reject_unsupported_entry(error)
-                };
-                return Err(rejection);
+                let rejection = error.reject(&budget);
+                // Kept as the job's budget: the job fails on this refusal,
+                // and every later look at the budget must find it stopped
+                // on it rather than open a fresh one.
+                self.extraction_budgets.insert(job_id, budget);
+                return Err(rejection.into());
             }
         };
         let budget = JobExtractionBudget::with_capacity(
@@ -185,9 +187,7 @@ impl Pipeline {
     }
 
     pub(crate) fn publish_active_stage_metrics(&self) {
-        self.metrics
-            .active_downloads
-            .store(self.active_downloads, Ordering::Relaxed);
+        self.metrics.set_active_downloads(self.active_downloads);
         self.metrics.active_decodes.store(
             self.active_decodes_by_job.values().sum::<usize>(),
             Ordering::Relaxed,

@@ -1,12 +1,16 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import {
   Fragment,
   createContext,
+  memo,
   useContext,
   useEffect,
+  useEffectEvent,
   useId,
   useLayoutEffect,
   useMemo,
-  useRef,
   useState,
   useSyncExternalStore,
   type ReactNode,
@@ -28,6 +32,7 @@ import {
   Toggle,
 } from "@/next/components/controls";
 import { FormRow } from "@/next/components/rows";
+import type { IconName } from "@/next/components/icons";
 import { cn } from "@/lib/utils";
 import { filterBlocks, type SearchRegistry } from "./search";
 
@@ -91,12 +96,16 @@ export type FieldControl =
       autoComplete?: string;
       /** Keep password managers out. Defaults to on for a password that is not the Weaver login. */
       secret?: boolean;
+      /** The value as typed, when the field is left or Enter is pressed in it. */
+      onCommit?: (value: string) => void;
     }
   /** A folder on the daemon's filesystem, or a file: typed, or picked with Browse. */
   | {
       kind: "path";
       value: string;
       onChange: (next: string) => void;
+      /** The path, when the field is left, Enter is pressed in it, or Browse picks one. */
+      onCommit?: (value: string) => void;
       placeholder?: string;
       pick?: "folder" | "file";
       /** The folder Browse opens in while the field is empty. */
@@ -193,11 +202,22 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           label={spec.label}
         />
       );
-    case "text":
+    case "text": {
+      const commit = control.onCommit;
       return (
         <TextField
           value={control.value}
           onChange={control.onChange}
+          onBlur={commit ? () => commit(control.value) : undefined}
+          onKeyDown={
+            commit
+              ? (event) => {
+                  if (event.key === "Enter") {
+                    commit(event.currentTarget.value);
+                  }
+                }
+              : undefined
+          }
           label={spec.label}
           placeholder={control.placeholder}
           mono={control.mono ?? true}
@@ -207,11 +227,13 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           className={control.className ?? "w-[268px] max-w-full"}
         />
       );
+    }
     case "path":
       return (
         <PathField
           value={control.value}
           onChange={control.onChange}
+          onCommit={control.onCommit}
           label={spec.label}
           placeholder={control.placeholder}
           pick={control.pick}
@@ -277,34 +299,38 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
 export function FieldRows({ fields }: { fields: readonly FieldSpec[] }) {
   return (
     <>
-      {fields.map((field) => {
-        const row = (
-          <FormRow key={field.id} label={field.label} help={field.help}>
-            <FieldControlView spec={field} />
-          </FormRow>
-        );
-        if (field.collapsed === undefined) {
-          return row;
-        }
-        // Animating the grid track from 0fr to 1fr slides the row to its real
-        // height without measuring it; `inert` keeps a shut row out of the tab
-        // order and away from assistive technology.
-        return (
-          <div
-            key={field.id}
-            inert={field.collapsed}
-            className={cn(
-              "grid transition-[grid-template-rows,opacity] duration-200 ease-out motion-reduce:transition-none",
-              field.collapsed ? "grid-rows-[0fr] opacity-0" : "grid-rows-[1fr] opacity-100",
-            )}
-          >
-            <div className="min-h-0 overflow-hidden">{row}</div>
-          </div>
-        );
-      })}
+      {fields.map((field) => (
+        <FieldRow key={field.id} field={field} />
+      ))}
     </>
   );
 }
+
+/** One field's row; a field a panel kept from its last render is not drawn again. */
+const FieldRow = memo(function FieldRow({ field }: { field: FieldSpec }) {
+  const row = (
+    <FormRow label={field.label} help={field.help}>
+      <FieldControlView spec={field} />
+    </FormRow>
+  );
+  if (field.collapsed === undefined) {
+    return row;
+  }
+  // Animating the grid track from 0fr to 1fr slides the row to its real
+  // height without measuring it; `inert` keeps a shut row out of the tab
+  // order and away from assistive technology.
+  return (
+    <div
+      inert={field.collapsed}
+      className={cn(
+        "grid transition-[grid-template-rows,opacity] duration-200 ease-out motion-reduce:transition-none",
+        field.collapsed ? "grid-rows-[0fr] opacity-0" : "grid-rows-[1fr] opacity-100",
+      )}
+    >
+      <div className="min-h-0 overflow-hidden">{row}</div>
+    </div>
+  );
+});
 
 /* ------------------------------------------------------------------- blocks */
 
@@ -355,6 +381,8 @@ export interface SettingsTableModel {
   /** Raw `grid-template-columns`, so panels keep the handoff's exact tracks. */
   columns: string;
   headers: ReactNode[];
+  /** The columns whose header and cells sit centred, such as a lone toggle. */
+  centered?: number[];
   rows: SettingsTableRowModel[];
   /**
    * Rows that fall into kinds: each group follows `rows` under a heading of
@@ -369,6 +397,13 @@ export interface SettingsTableModel {
    * Every list is added to from the same place, so it is never in the top bar.
    */
   add?: { label: string; onClick: () => void; disabled?: boolean };
+  /**
+   * The one action a list with no Add is worked through, such as Compare,
+   * centred under the table where an Add would be.
+   */
+  action?: { label: string; icon: IconName; onClick: () => void };
+  /** What the action opens, drawn under it. */
+  below?: ReactNode;
   /**
    * A trailing row of the table's other actions, such as "Clear history".
    * The top bar carries a panel's actions; a table that owns more than one
@@ -399,8 +434,9 @@ export type SettingsBlock =
  * shell mounts every panel and hides its page; each list of blocks draws only
  * what matched, under that panel's heading in the cross-panel results, and
  * reports how much it found so the heading and the shell's empty state know.
+ * Blocks a panel kept from its last render are not filtered or drawn again.
  */
-export function SettingsBlocks({
+export const SettingsBlocks = memo(function SettingsBlocks({
   blocks,
   loading = false,
 }: {
@@ -409,8 +445,9 @@ export function SettingsBlocks({
   loading?: boolean;
 }) {
   const t = useTranslate();
-  const { search } = useShell();
+  const search = useContext(SearchContext);
   const scope = useContext(PanelScopeContext);
+  const resultsHost = useContext(ResultsHostContext);
   const searching = search.trim() !== "";
 
   const present = blocks.filter(
@@ -422,10 +459,10 @@ export function SettingsBlocks({
   if (searching && scope !== null) {
     // The panel's own page is hidden while searching; the matches belong in
     // the results, under the panel's heading.
-    if (loading || visible.length === 0 || scope.resultsHost === null) {
+    if (loading || visible.length === 0 || resultsHost === null) {
       return null;
     }
-    return createPortal(<BlockList blocks={visible} />, scope.resultsHost);
+    return createPortal(<BlockList blocks={visible} />, resultsHost);
   }
 
   if (loading) {
@@ -450,7 +487,7 @@ export function SettingsBlocks({
   }
 
   return <BlockList blocks={visible} />;
-}
+});
 
 /**
  * Tell the search what this part of a panel found, while there is a query.
@@ -461,11 +498,11 @@ export function SettingsBlocks({
  * layout effect, so the first frame of a search already knows.
  */
 export function useSearchReport(count: number, pending: boolean): void {
-  const { search, registry } = useShell();
+  const { registry } = useShell();
+  const searching = useContext(SearchingContext);
   const scope = useContext(PanelScopeContext);
   const key = useId();
   const slug = scope?.slug ?? null;
-  const searching = search.trim() !== "";
 
   useLayoutEffect(() => {
     if (!searching || slug === null) {
@@ -480,18 +517,25 @@ function BlockList({ blocks }: { blocks: readonly SettingsBlock[] }) {
   return (
     <>
       {blocks.map((block) => (
-        <section key={block.id} aria-label={block.title} className="flex flex-none flex-col">
-          <SectionHeader label={block.title} tag={block.tag} note={block.note} />
-          {block.kind === "section" ? (
-            <FieldRows fields={block.fields} />
-          ) : null}
-          {block.kind === "custom" ? block.body : null}
-          {block.kind === "table" ? <SettingsTable block={block} /> : null}
-        </section>
+        <BlockView key={block.id} block={block} />
       ))}
     </>
   );
 }
+
+/** One block; a block a panel kept from its last render is not drawn again. */
+const BlockView = memo(function BlockView({ block }: { block: SettingsBlock }) {
+  return (
+    <section aria-label={block.title} className="flex flex-none flex-col">
+      <SectionHeader label={block.title} tag={block.tag} note={block.note} />
+      {block.kind === "section" ? (
+        <FieldRows fields={block.fields} />
+      ) : null}
+      {block.kind === "custom" ? block.body : null}
+      {block.kind === "table" ? <SettingsTable block={block} /> : null}
+    </section>
+  );
+});
 
 /**
  * A settings table scrolls sideways rather than folding.
@@ -516,6 +560,7 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
     const line = (
       <div
         key={disclosure ? undefined : entry.id}
+        data-row-id={entry.id}
         {...(interactive
           ? {
               role: "button",
@@ -545,7 +590,9 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
           return (
             <div
               key={index}
-              className="flex min-w-0 items-center"
+              className={`flex min-w-0 items-center${
+                block.centered?.includes(index) ? " justify-center" : ""
+              }`}
               style={span > 1 ? { gridColumn: `span ${span}` } : undefined}
             >
               {cell}
@@ -577,7 +624,11 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
             style={{ gridTemplateColumns: block.columns }}
           >
             {block.headers.map((header, index) => (
-              <Eyebrow key={index} tone="rail" className="truncate">
+              <Eyebrow
+                key={index}
+                tone="rail"
+                className={`truncate${block.centered?.includes(index) ? " text-center" : ""}`}
+              >
                 {header}
               </Eyebrow>
             ))}
@@ -621,6 +672,14 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
           </PrimaryButton>
         </div>
       )}
+      {block.action === undefined ? null : (
+        <div className="flex flex-none justify-center px-4 sm:px-6 py-3">
+          <PrimaryButton icon={block.action.icon} onClick={block.action.onClick}>
+            {block.action.label}
+          </PrimaryButton>
+        </div>
+      )}
+      {block.below}
     </>
   );
 }
@@ -642,15 +701,20 @@ interface PanelActions {
 }
 
 interface ShellApi {
-  search: string;
   actionsRef: { current: PanelActions | null };
   setFlags: (flags: PanelFlags) => void;
-  controlsHost: HTMLElement | null;
   /** What each panel's lists found for the search, for the headings and the empty state. */
   registry: SearchRegistry;
 }
 
 const ShellContext = createContext<ShellApi | null>(null);
+
+// The query, whether there is one, and the top bar's slot each reach only the
+// components that read them: a keystroke or the slot arriving does not draw
+// every panel again.
+const SearchContext = createContext("");
+const SearchingContext = createContext(false);
+const ControlsHostContext = createContext<HTMLElement | null>(null);
 
 export function SettingsShellProvider({
   search,
@@ -659,13 +723,19 @@ export function SettingsShellProvider({
   controlsHost,
   registry,
   children,
-}: ShellApi & { children: ReactNode }) {
+}: ShellApi & { search: string; controlsHost: HTMLElement | null; children: ReactNode }) {
   const value = useMemo<ShellApi>(
-    () => ({ search, actionsRef, setFlags, controlsHost, registry }),
-    [actionsRef, controlsHost, registry, search, setFlags],
+    () => ({ actionsRef, setFlags, registry }),
+    [actionsRef, registry, setFlags],
   );
   return (
-    <ShellContext.Provider value={value}>{children}</ShellContext.Provider>
+    <ShellContext.Provider value={value}>
+      <SearchContext.Provider value={search}>
+        <SearchingContext.Provider value={search.trim() !== ""}>
+          <ControlsHostContext.Provider value={controlsHost}>{children}</ControlsHostContext.Provider>
+        </SearchingContext.Provider>
+      </SearchContext.Provider>
+    </ShellContext.Provider>
   );
 }
 
@@ -678,7 +748,7 @@ function useShell(): ShellApi {
 }
 
 export function useSettingsSearch(): string {
-  return useShell().search;
+  return useContext(SearchContext);
 }
 
 /* -------------------------------------------------------------- panel scope */
@@ -687,11 +757,12 @@ interface PanelScope {
   slug: string;
   /** The panel the route names: the one whose Save, Revert and controls the top bar carries. */
   active: boolean;
-  /** Where this panel's search matches draw, under its heading. */
-  resultsHost: HTMLElement | null;
 }
 
 const PanelScopeContext = createContext<PanelScope | null>(null);
+
+/** Where this panel's search matches draw, under its heading; apart, so its arrival draws only the blocks. */
+const ResultsHostContext = createContext<HTMLElement | null>(null);
 
 /** The slug of the panel this component renders in, or null outside one. */
 export function useSettingsPanelSlug(): string | null {
@@ -731,45 +802,48 @@ export function SettingsPanelScope({
   children: ReactNode;
 }) {
   const t = useTranslate();
-  const { search, registry } = useShell();
-  const searching = search.trim() !== "";
+  const { registry } = useShell();
+  const searching = useContext(SearchingContext);
   const [resultsHost, setResultsHost] = useState<HTMLElement | null>(null);
   const found = useSyncExternalStore(registry.subscribe, () => registry.panel(slug).count);
-  const scope = useMemo<PanelScope>(() => ({ slug, active, resultsHost }), [active, resultsHost, slug]);
+  const scope = useMemo<PanelScope>(() => ({ slug, active }), [active, slug]);
   const shown = searching && found > 0;
 
   return (
     <PanelScopeContext.Provider value={scope}>
-      <section aria-label={title} hidden={!shown} className="flex flex-none flex-col">
-        <div className="flex items-center gap-[10px] border-b border-wv-hairline bg-wv-list px-4 pt-5 pb-2 sm:px-6">
-          {active ? (
-            <span className="text-[13px] font-medium text-wv-fg">{title}</span>
-          ) : (
-            <button
-              type="button"
-              onClick={onOpen}
-              aria-label={t("next.settings.searchOpenPanel", { panel: title })}
-              className="cursor-pointer text-[13px] font-medium text-wv-fg underline-offset-4 hover:underline"
-            >
-              {title}
-            </button>
-          )}
-          {active ? <Eyebrow className="ml-auto">{t("next.settings.searchOpenNow")}</Eyebrow> : null}
-        </div>
-        {/*
-          Another panel's matches are a preview: its Save and Revert are not
-          in the top bar, so an edit made here could not be kept. `inert`
-          keeps them out of reach, and a click anywhere on them opens the
-          panel, where they are live.
-        */}
-        <div
-          onClick={active ? undefined : onOpen}
-          className={active ? undefined : "cursor-pointer opacity-80"}
-        >
-          <div ref={setResultsHost} inert={!active} className="flex flex-col" />
-        </div>
-      </section>
-      <div className={searching ? "hidden" : "contents"}>{children}</div>
+      {/* Matches draw there only while searching, so its arrival on mount draws nothing else. */}
+      <ResultsHostContext.Provider value={searching ? resultsHost : null}>
+        <section aria-label={title} hidden={!shown} className="flex flex-none flex-col">
+          <div className="flex items-center gap-[10px] border-b border-wv-hairline bg-wv-list px-4 pt-5 pb-2 sm:px-6">
+            {active ? (
+              <span className="text-[13px] font-medium text-wv-fg">{title}</span>
+            ) : (
+              <button
+                type="button"
+                onClick={onOpen}
+                aria-label={t("next.settings.searchOpenPanel", { panel: title })}
+                className="cursor-pointer text-[13px] font-medium text-wv-fg underline-offset-4 hover:underline"
+              >
+                {title}
+              </button>
+            )}
+            {active ? <Eyebrow className="ml-auto">{t("next.settings.searchOpenNow")}</Eyebrow> : null}
+          </div>
+          {/*
+            Another panel's matches are a preview: its Save and Revert are not
+            in the top bar, so an edit made here could not be kept. `inert`
+            keeps them out of reach, and a click anywhere on them opens the
+            panel, where they are live.
+          */}
+          <div
+            onClick={active ? undefined : onOpen}
+            className={active ? undefined : "cursor-pointer opacity-80"}
+          >
+            <div ref={setResultsHost} inert={!active} className="flex flex-col" />
+          </div>
+        </section>
+        <div className={searching ? "hidden" : "contents"}>{children}</div>
+      </ResultsHostContext.Provider>
     </PanelScopeContext.Provider>
   );
 }
@@ -781,7 +855,7 @@ export function SettingsPanelScope({
  * and storing it in state above would loop.
  */
 export function PanelControls({ children }: { children: ReactNode }) {
-  const { controlsHost } = useShell();
+  const controlsHost = useContext(ControlsHostContext);
   const active = useSettingsPanelActive();
   return controlsHost && active ? createPortal(children, controlsHost) : null;
 }
@@ -807,37 +881,36 @@ export function usePanelState({
   save: () => void;
   revert: () => void;
 }): void {
-  const shell = useShell();
+  const { actionsRef, setFlags } = useShell();
   // A panel mounted only to answer the search does not own the top bar.
   const active = useSettingsPanelActive();
 
   useEffect(() => {
     if (active) {
-      shell.actionsRef.current = { save, revert };
+      actionsRef.current = { save, revert };
     }
   });
 
   useEffect(() => {
     if (active) {
-      shell.setFlags({ dirty, busy, status, failed });
+      setFlags({ dirty, busy, status, failed });
     }
-  }, [active, busy, dirty, failed, shell, status]);
+  }, [active, busy, dirty, failed, setFlags, status]);
 
   useEffect(() => {
     if (!active) {
       return;
     }
-    const actions = shell.actionsRef;
     return () => {
-      actions.current = null;
-      shell.setFlags({
+      actionsRef.current = null;
+      setFlags({
         dirty: false,
         busy: false,
         status: null,
         failed: false,
       });
     };
-  }, [active, shell]);
+  }, [actionsRef, active, setFlags]);
 }
 
 /**
@@ -848,27 +921,27 @@ export function usePanelState({
  * belongs in the status bar.
  */
 export function usePanelStatus(status: string | null, failed = false): void {
-  const shell = useShell();
+  const { setFlags } = useShell();
   const active = useSettingsPanelActive();
 
   useEffect(() => {
     if (active) {
-      shell.setFlags({ dirty: false, busy: false, status, failed });
+      setFlags({ dirty: false, busy: false, status, failed });
     }
-  }, [active, failed, shell, status]);
+  }, [active, failed, setFlags, status]);
 
   useEffect(() => {
     if (!active) {
       return;
     }
     return () =>
-      shell.setFlags({
+      setFlags({
         dirty: false,
         busy: false,
         status: null,
         failed: false,
       });
-  }, [active, shell]);
+  }, [active, setFlags]);
 }
 
 /**
@@ -889,12 +962,16 @@ export interface Draft<T> {
 export function useDraft<T>(source: T | null, onEdit?: () => void): Draft<T> {
   const [draft, setDraft] = useState<T | null>(source);
   const [dirty, setDirty] = useState(false);
-  const dirtyRef = useRef(dirty);
-  dirtyRef.current = dirty;
+  // Reads `dirty` as it stands without re-seeding when only `dirty` changes.
+  const reseed = useEffectEvent((next: T) => {
+    if (!dirty) {
+      setDraft(next);
+    }
+  });
 
   useEffect(() => {
-    if (source !== null && !dirtyRef.current) {
-      setDraft(source);
+    if (source !== null) {
+      reseed(source);
     }
   }, [source]);
 
