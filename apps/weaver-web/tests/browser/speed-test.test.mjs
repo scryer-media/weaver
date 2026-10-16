@@ -305,7 +305,7 @@ test("picking another route keeps the test as it was set, and a feed takes it as
 test("the route editor has no speed test of its own: the speed test page runs every test", async () => {
   const { page, errors } = await open("?routes", "news.fixture.invalid");
   try {
-    await page.locator('main [data-row-id="server:1"]').getByRole("button", { name: "Edit route", exact: true }).click();
+    await page.locator('main [data-row-id="server:1"]').getByRole("button", { name: "Edit", exact: true }).click();
     const editor = page.getByRole("dialog", { name: "Route for news.fixture.invalid", exact: true });
     await editor.waitFor();
     // A server's route splits its connections, and says so above the legs and on each one.
@@ -327,7 +327,7 @@ test("Default outbound's route comes first and is edited with nothing said about
     // Its name says what it is, and one leg splits nothing, so its summary is empty.
     assert.equal(await page.locator("main [data-row-id]").first().getAttribute("data-row-id"), "outbound");
     const row = page.locator('main [data-row-id="outbound"]');
-    await row.getByRole("button", { name: "Edit route", exact: true }).click();
+    await row.getByRole("button", { name: "Edit", exact: true }).click();
     assert.equal(await row.getByText(/\bleg/).count(), 0);
     const editor = page.getByRole("dialog", { name: "Route for Default outbound", exact: true });
     await editor.getByRole("button", { name: "Egress", exact: true }).waitFor();

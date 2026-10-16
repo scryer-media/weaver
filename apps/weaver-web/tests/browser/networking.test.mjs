@@ -21,7 +21,7 @@ test("create an egress and two-leg route, then disable the egress through GraphQ
  await page.getByRole("button",{name:/^Fixture WAN/}).waitFor();
  console.log("Created egress through the editor");
  await page.getByRole("link",{name:"Routes",exact:true}).click();
- await page.getByRole("button",{name:"Edit route",exact:true}).click();
+ await page.getByRole("button",{name:"Edit",exact:true}).click();
  await page.getByRole("button",{name:"Add leg",exact:true}).click();
  await page.getByRole("group",{name:"Leg 2",exact:true}).getByRole("button",{name:"Egress",exact:true}).click();
  await page.getByRole("menuitemradio",{name:"Fixture WAN",exact:true}).click();

@@ -378,6 +378,8 @@ export interface SettingsTableModel {
   /** Raw `grid-template-columns`, so panels keep the handoff's exact tracks. */
   columns: string;
   headers: ReactNode[];
+  /** The columns whose header and cells sit centred, such as a lone toggle. */
+  centered?: number[];
   rows: SettingsTableRowModel[];
   /**
    * Rows that fall into kinds: each group follows `rows` under a heading of
@@ -585,7 +587,9 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
           return (
             <div
               key={index}
-              className="flex min-w-0 items-center"
+              className={`flex min-w-0 items-center${
+                block.centered?.includes(index) ? " justify-center" : ""
+              }`}
               style={span > 1 ? { gridColumn: `span ${span}` } : undefined}
             >
               {cell}
@@ -617,7 +621,11 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
             style={{ gridTemplateColumns: block.columns }}
           >
             {block.headers.map((header, index) => (
-              <Eyebrow key={index} tone="rail" className="truncate">
+              <Eyebrow
+                key={index}
+                tone="rail"
+                className={`truncate${block.centered?.includes(index) ? " text-center" : ""}`}
+              >
                 {header}
               </Eyebrow>
             ))}

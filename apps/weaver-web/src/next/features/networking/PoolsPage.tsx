@@ -53,7 +53,7 @@ export function PoolsPage({
       id: "pools",
       title: t("next.networking.pools.title"),
       note: countLabel(t, "next.networking.pools.count", data.proxyPools.length),
-      columns: "minmax(0, 1fr) 132px minmax(0, 1.6fr) 104px 228px",
+      columns: "minmax(0, 1fr) 132px minmax(0, 1.6fr) 104px 160px",
       headers: [
         t("next.networking.pools.name"),
         t("next.networking.pools.type"),
@@ -98,7 +98,7 @@ export function PoolsPage({
                 {t("next.networking.pools.testVia")}
               </SecondaryButton>
               <SecondaryButton size="compact" icon="edit" onClick={() => open(pool)}>
-                {t("next.networking.pools.edit")}
+                {t("next.common.edit")}
               </SecondaryButton>
             </span>,
           ],

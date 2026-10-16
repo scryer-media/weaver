@@ -325,8 +325,8 @@ async function opensBothWays(page, text, edit, title) {
 test("a pool and a proxy open from anywhere on their line and from its Edit button", async () => {
   const page = await open("?pools");
   try {
-    await opensBothWays(page, "Exits", "Edit pool", "Exits");
-    await opensBothWays(page, "Seedbox", "Edit proxy", "Seedbox");
+    await opensBothWays(page, "Exits", "Edit", "Exits");
+    await opensBothWays(page, "Seedbox", "Edit", "Seedbox");
     await shot(page, "pools-and-proxies-edit");
   } finally {
     await page.close();
@@ -365,7 +365,7 @@ test("a proxy is removed from its own line once confirmed, and a refusal says wh
 test("a route opens from anywhere on its line and from its Edit button", async () => {
   const page = await open("?routes", "news.fixture.invalid");
   try {
-    await opensBothWays(page, "news.fixture.invalid", "Edit route", "Route for news.fixture.invalid");
+    await opensBothWays(page, "news.fixture.invalid", "Edit", "Route for news.fixture.invalid");
     await shot(page, "routes-edit");
   } finally {
     await page.close();
@@ -375,7 +375,7 @@ test("a route opens from anywhere on its line and from its Edit button", async (
 test("a rung starts on the first target it offers, and a chain's hops offer only the proxies that can still follow", async () => {
   const page = await open("?routes", "news.fixture.invalid");
   try {
-    await action(page, "Edit route").click();
+    await action(page, "Edit").click();
     const editor = page.getByRole("dialog", { name: "Route for news.fixture.invalid", exact: true });
     // A ladder starts with its first rung.
     await option(editor, "Proxy ladder").click();

@@ -254,7 +254,7 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
       kind: "table",
       id: "proxies",
       title: t("next.settings.panel.proxies"),
-      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 320px",
+      columns: "minmax(0, 1fr) 150px minmax(0, 1fr) minmax(0, 1fr) 240px",
       headers: [
         t("next.proxies.name"),
         t("next.proxies.type"),
@@ -296,7 +296,7 @@ export function ProxiesPanel({ onChanged }: { onChanged?: () => void }) {
               {t("next.proxies.testVia")}
             </SecondaryButton>
             <SecondaryButton icon="edit" className="h-7 px-2" onClick={() => setEditingId(profile.id)}>
-              {t("next.proxies.edit")}
+              {t("next.common.edit")}
             </SecondaryButton>
             <DangerButton icon="remove" className="h-7 px-2" onClick={() => setRemoving(profile)}>
               {t("next.common.remove")}

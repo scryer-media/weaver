@@ -39,9 +39,9 @@ test("the egress table carries each egress's quota usage, System first", async (
   // The daemon listed System last; the table leads with it.
   assert.deepEqual(await names(page), ["System", "WAN Fiber", "LTE standby"]);
   // The quota column: used against allowance, then what is left and when the window resets, and the refusal when there is one.
-  assert.deepEqual((await cells(row("System"))).slice(4), ["—", "Edit egress"]);
-  assert.deepEqual((await cells(row("WAN Fiber"))).slice(4), ["400 GB / 1.0 TB\n624 GB remaining · Resets 1 Nov, 00:00", "Edit egress"]);
-  assert.deepEqual((await cells(row("LTE standby"))).slice(4), ["20.0 GB / 20.0 GB\nBLOCKED\n0 B remaining · Resets 1 Nov, 00:00", "Edit egress"]);
+  assert.deepEqual((await cells(row("System"))).slice(4), ["—", "Edit"]);
+  assert.deepEqual((await cells(row("WAN Fiber"))).slice(4), ["400 GB / 1.0 TB\n624 GB remaining · Resets 1 Nov, 00:00", "Edit"]);
+  assert.deepEqual((await cells(row("LTE standby"))).slice(4), ["20.0 GB / 20.0 GB\nBLOCKED\n0 B remaining · Resets 1 Nov, 00:00", "Edit"]);
   assert.equal(await row("WAN Fiber").getByText("Blocked", { exact: true }).count(), 0);
   // One list of egresses: the usage is not drawn a second time.
   assert.deepEqual(await regions(page), ["Limits", "Egress interfaces"]);
@@ -110,7 +110,7 @@ test("the egress editor saves a download quota, and refuses one switched on with
   await row("LTE standby").waitFor();
   // The line opens its egress, and so does the button on it.
   const editor = page.getByRole("dialog", { name: "WAN Fiber", exact: true });
-  await row("WAN Fiber").getByRole("button", { name: "Edit egress", exact: true }).click();
+  await row("WAN Fiber").getByRole("button", { name: "Edit", exact: true }).click();
   await editor.getByRole("button", { name: "Cancel", exact: true }).click();
   await editor.waitFor({ state: "detached" });
   await page.getByText("WAN Fiber", { exact: true }).click();

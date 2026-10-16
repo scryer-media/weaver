@@ -449,7 +449,8 @@ export function ProvidersPanel() {
       id: "servers",
       title: t("next.providers.servers"),
       note: t("next.settings.panel.serversNote"),
-      columns: "minmax(0, 1.2fr) 132px minmax(0, 1fr) minmax(0, 0.8fr) 92px 272px",
+      columns: "minmax(0, 1.2fr) 132px minmax(0, 1fr) minmax(0, 0.8fr) 92px 208px",
+      centered: [4],
       headers: [
         t("next.providers.host"),
         t("next.providers.connections"),
@@ -494,7 +495,7 @@ export function ProvidersPanel() {
               {t("next.networking.speed.title")}
             </SecondaryButton>
             <SecondaryButton size="compact" icon="edit" onClick={() => editProvider(server.id)}>
-              {t("next.providers.edit")}
+              {t("next.common.edit")}
             </SecondaryButton>
           </span>,
         ],

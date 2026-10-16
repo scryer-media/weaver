@@ -68,7 +68,7 @@ export function RoutesPage({
       id: "routes",
       title: t("next.networking.routes.title"),
       note: t("next.networking.routes.note"),
-      columns: "minmax(0, 1.2fr) minmax(0, 1.4fr) minmax(0, 1fr) 248px",
+      columns: "minmax(0, 1.2fr) minmax(0, 1.4fr) minmax(0, 1fr) 208px",
       headers: [
         t("next.networking.routes.consumer"),
         t("next.networking.routes.route"),
@@ -111,7 +111,7 @@ export function RoutesPage({
                 {t("next.networking.speed.title")}
               </SecondaryButton>
               <SecondaryButton size="compact" icon="edit" onClick={() => setEditing(consumer)}>
-                {t("next.networking.routes.edit")}
+                {t("next.common.edit")}
               </SecondaryButton>
             </span>,
           ],
