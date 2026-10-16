@@ -157,15 +157,7 @@ const cloudflareSpeedHost = "speed.cloudflare.com"
 
 // lookupPublicHostIPv4 resolves a public target on the host; the fixture
 // answers Weaver with these addresses and forwards to the first.
-var lookupPublicHostIPv4 = func(host string) ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	addresses, err := netLookupIPv4(ctx, host)
-	if err != nil {
-		return nil, err
-	}
-	return addresses, nil
-}
+var lookupPublicHostIPv4 = netLookupIPv4
 
 func netLookupIPv4(ctx context.Context, host string) ([]string, error) {
 	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
@@ -179,10 +171,10 @@ func netLookupIPv4(ctx context.Context, host string) ([]string, error) {
 	return addresses, nil
 }
 
-func resolvePublicTargets(targets []weaverPublicTarget) ([]map[string]any, error) {
+func resolvePublicTargets(ctx context.Context, targets []weaverPublicTarget) ([]map[string]any, error) {
 	resolved := make([]map[string]any, 0, len(targets))
 	for _, target := range targets {
-		addresses, err := lookupPublicHostIPv4(target.Host)
+		addresses, err := lookupPublicHostIPv4(ctx, target.Host)
 		if err != nil {
 			return nil, fmt.Errorf("resolve public target %s: %w", target.Host, err)
 		}
@@ -359,7 +351,7 @@ func networkDefinition(subnet string) (map[string]any, error) {
 
 // advancedNetworkOverride builds the phase's whole generated Compose override.
 // JSON is valid YAML, and marshalling keeps paths and the host table quoted.
-func advancedNetworkOverride(phase *weaverReleasePhase) (map[string]any, error) {
+func advancedNetworkOverride(ctx context.Context, phase *weaverReleasePhase) (map[string]any, error) {
 	layout := phase.Spec.NetworkLayout
 	if len(phase.EgressSubnets) != layout.egressNetworks() {
 		return nil, fmt.Errorf("%s needs %d egress subnets, has %d", phase.Flow, layout.egressNetworks(), len(phase.EgressSubnets))
@@ -447,7 +439,7 @@ func advancedNetworkOverride(phase *weaverReleasePhase) (map[string]any, error) 
 		"PROXY_FIXTURE_HOSTS":     string(fixtureHostsJSON),
 	}
 	if len(phase.Spec.PublicTargets) > 0 {
-		targets, err := resolvePublicTargets(phase.Spec.PublicTargets)
+		targets, err := resolvePublicTargets(ctx, phase.Spec.PublicTargets)
 		if err != nil {
 			return nil, err
 		}
@@ -488,8 +480,8 @@ func advancedNetworkOverride(phase *weaverReleasePhase) (map[string]any, error) 
 	return map[string]any{"networks": networks, "services": services}, nil
 }
 
-func writeAdvancedNetworkOverride(phase *weaverReleasePhase) error {
-	override, err := advancedNetworkOverride(phase)
+func writeAdvancedNetworkOverride(ctx context.Context, phase *weaverReleasePhase) error {
+	override, err := advancedNetworkOverride(ctx, phase)
 	if err != nil {
 		return err
 	}

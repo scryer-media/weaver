@@ -1622,6 +1622,7 @@ mod tests {
 
     #[cfg(not(windows))]
     use tokio::io::AsyncWriteExt;
+    #[cfg(not(windows))]
     use tokio::net::{TcpListener, TcpStream};
     #[cfg(not(windows))]
     use tokio::sync::oneshot;

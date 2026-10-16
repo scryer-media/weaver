@@ -256,7 +256,7 @@ test("a proxy Weaver resolves for is handed the address and carries a download",
     `mutation($input: ServerInput!) { addServer(input: $input) { id } }`, { input: { ...input, active: true } });
   try {
     const jobId = await startDownload(request, "proxy-weaver-resolves");
-    await expect.poll(async () => await jobState(request, jobId), { timeout: 60_000 }).toBe("COMPLETED");
+    await expect.poll(async () => await jobState(request, jobId), { timeout: 0 }).toBe("COMPLETED");
     const seen = (await events(start)).events;
     expect(seen.some(event => event.kind === "direct-dns" && event.name === name), "Weaver asks the host's resolver").toBeTruthy();
     expect(seen.filter(event => event.kind === "routed-dns" && event.name === name), "the proxy is never asked for the name").toEqual([]);
@@ -315,7 +315,7 @@ test("a proxy hop holds its DNS servers' answer for its TTL", async ({ request }
   const lookups = (seen: Event[]) => seen.filter(event => event.kind === "routed-dns" && event.name === name);
   try {
     const jobId = await startDownload(request, "proxy-held-answers");
-    await expect.poll(async () => await jobState(request, jobId), { timeout: 60_000 }).toBe("COMPLETED");
+    await expect.poll(async () => await jobState(request, jobId), { timeout: 0 }).toBe("COMPLETED");
 
     let start = await mark();
     await probe();

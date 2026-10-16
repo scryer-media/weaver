@@ -1,6 +1,7 @@
 package weaver
 
 import (
+	"context"
 	"encoding/json"
 	"net/netip"
 	"os"
@@ -40,7 +41,7 @@ type composeOverride struct {
 
 func readOverride(t *testing.T, phase *weaverReleasePhase) composeOverride {
 	t.Helper()
-	if err := writeAdvancedNetworkOverride(phase); err != nil {
+	if err := writeAdvancedNetworkOverride(t.Context(), phase); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(phase.ComposeOverride)
@@ -121,7 +122,7 @@ func TestSpeedTestOverrideAllowlistsCloudflareOnTheFixture(t *testing.T) {
 	previous := lookupPublicHostIPv4
 	t.Cleanup(func() { lookupPublicHostIPv4 = previous })
 	var asked []string
-	lookupPublicHostIPv4 = func(host string) ([]string, error) {
+	lookupPublicHostIPv4 = func(_ context.Context, host string) ([]string, error) {
 		asked = append(asked, host)
 		return []string{"203.0.113.10", "203.0.113.11"}, nil
 	}
@@ -149,11 +150,28 @@ func TestSpeedTestOverrideAllowlistsCloudflareOnTheFixture(t *testing.T) {
 	}
 }
 
+func TestPublicTargetLookupUsesTheFlowContext(t *testing.T) {
+	previous := lookupPublicHostIPv4
+	t.Cleanup(func() { lookupPublicHostIPv4 = previous })
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	lookupPublicHostIPv4 = func(received context.Context, _ string) ([]string, error) {
+		if received != ctx {
+			t.Fatal("DNS lookup must use the enclosing flow context")
+		}
+		return nil, received.Err()
+	}
+	phase := advancedTestPhase(t, speedTestReleaseFlow(), "10.249.1.0/24", "10.249.2.0/24")
+	if _, err := advancedNetworkOverride(ctx, phase); err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("flow cancellation must reach the lookup: %v", err)
+	}
+}
+
 func TestResolvePublicTargetsRefusesAnUnresolvedHost(t *testing.T) {
 	previous := lookupPublicHostIPv4
 	t.Cleanup(func() { lookupPublicHostIPv4 = previous })
-	lookupPublicHostIPv4 = func(string) ([]string, error) { return nil, nil }
-	if _, err := resolvePublicTargets([]weaverPublicTarget{{Host: "speed.cloudflare.com", Port: 443}}); err == nil {
+	lookupPublicHostIPv4 = func(context.Context, string) ([]string, error) { return nil, nil }
+	if _, err := resolvePublicTargets(t.Context(), []weaverPublicTarget{{Host: "speed.cloudflare.com", Port: 443}}); err == nil {
 		t.Fatal("a host with no IPv4 address must be an error")
 	}
 }
@@ -190,7 +208,7 @@ func TestFixtureAddressOverridePinsOnlyTheFixture(t *testing.T) {
 
 func TestEgressOverrideRefusesMissingEgressSubnets(t *testing.T) {
 	phase := advancedTestPhase(t, advancedNetworkingReleaseFlow(), "10.249.1.0/24")
-	if err := writeAdvancedNetworkOverride(phase); err == nil {
+	if err := writeAdvancedNetworkOverride(t.Context(), phase); err == nil {
 		t.Fatal("an egress layout with one egress subnet unexpectedly produced an override")
 	}
 }

@@ -528,7 +528,7 @@ func assignWeaverReleaseNetworkSubnets(
 			return err
 		}
 		if phase.Spec.NetworkLayout != weaverNetworkLayoutDefault {
-			if err := writeAdvancedNetworkOverride(phase); err != nil {
+			if err := writeAdvancedNetworkOverride(ctx, phase); err != nil {
 				return err
 			}
 			continue

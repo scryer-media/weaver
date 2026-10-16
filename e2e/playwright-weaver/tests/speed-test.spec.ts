@@ -238,7 +238,6 @@ const connectionRows = (detail: Locator) =>
   detail.getByRole("table", { name: "Connections", exact: true }).getByRole("row").filter({ has: detail.page().getByRole("cell") });
 
 test("ST01 a Usenet run measures through the proxy rung, the same run with that rung down goes direct, and a job on the route moves the same bytes", async ({ cleanPage: page, request }) => {
-  test.setTimeout(0);
   const parts = 32;
   const { a, connect1, server } = await ladderedServer();
   const nzb = await servedNzb(request, "st01-agreement", parts);
@@ -344,7 +343,6 @@ test("ST01 a Usenet run measures through the proxy rung, the same run with that 
 });
 
 test("ST02 a run started while the queue is paused leaves it paused", async ({ cleanPage: page, request }) => {
-  test.setTimeout(0);
   const { server } = await ladderedServer();
   const nzb = await servedNzb(request, "st02-paused", 16);
   const queueControl = await downloadsTab(page);
@@ -369,7 +367,6 @@ test("ST02 a run started while the queue is paused leaves it paused", async ({ c
 });
 
 test("ST03 cancelling a run ends it Cancelled and resumes the queue it paused", async ({ cleanPage: page, request }) => {
-  test.setTimeout(0);
   const { server } = await ladderedServer();
   const nzb = await servedNzb(request, "st03-cancel", 64);
   // Slow every article body so the run is still measuring when it is cancelled.
@@ -404,7 +401,6 @@ test("ST03 cancelling a run ends it Cancelled and resumes the queue it paused", 
 const CLOUDFLARE_HOST = "speed.cloudflare.com";
 
 test("ST04 a bandwidth run against Cloudflare measures through the proxy rung and books nothing as downloaded", async ({ cleanPage: page, request }) => {
-  test.setTimeout(0);
   const { a, connect1, server } = await ladderedServer();
   const queueControl = await downloadsTab(page);
   await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
@@ -459,7 +455,6 @@ type RunConnection = NonNullable<SpeedTestRun["result"]>["connections"][number];
 const byLeg = (connections: RunConnection[], leg: number) => connections.filter(connection => connection.leg === leg);
 
 test("ST05 a two-leg route splits the connections, a leg taken down gives them all to the other, both down is refused, and two runs compare", async ({ cleanPage: page, request }) => {
-  test.setTimeout(0);
   const parts = 32;
   const a = await world.egress("a");
   const b = await world.egress("b");
@@ -540,7 +535,6 @@ test("ST05 a two-leg route splits the connections, a leg taken down gives them a
 const FIXTURE_NZB = "/work/fixtures/speed-test-100mb/speed-test-100mb.nzb";
 
 test("ST06 a Usenet run of the seeded 100 MB posting over a plaintext direct leg delivers every article and books its wire bytes", async ({ cleanPage: page, request }) => {
-  test.setTimeout(0);
   const a = await world.egress("a");
   const server = await world.server({ host: DIRECT_HOST, connections: 4, route: { legs: [directLeg(a.id, 100)] } });
   const xml = fs.readFileSync(FIXTURE_NZB, "utf8");
@@ -583,7 +577,6 @@ test("ST06 a Usenet run of the seeded 100 MB posting over a plaintext direct leg
 });
 
 test("ST07 a run whose NZB URL does not serve an NZB fails, says why, and leaves the queue running", async ({ cleanPage: page, request }) => {
-  test.setTimeout(0);
   const { server } = await ladderedServer();
   const port = (await fixtureState(request)).ports.http;
   const queueControl = await downloadsTab(page);
@@ -609,7 +602,6 @@ test("ST07 a run whose NZB URL does not serve an NZB fails, says why, and leaves
 });
 
 test("ST08 a run reaching its maximum duration completes with what it measured", async ({ cleanPage: page, request }) => {
-  test.setTimeout(0);
   // The fixture sleeps 5 ms per body line: a 16 KiB article takes well
   // over half a second, so 128 of them over 4 connections need some twenty
   // seconds, and the run is allowed ten.
@@ -643,7 +635,6 @@ test("ST08 a run reaching its maximum duration completes with what it measured",
 });
 
 test("ST09 a run books against the server's download quota, stops at it, and is refused once it is used up", async ({ cleanPage: page, request }) => {
-  test.setTimeout(0);
   const parts = 32;
   const { server } = await ladderedServer();
   const nzb = await servedNzb(request, "st09-quota", parts);
