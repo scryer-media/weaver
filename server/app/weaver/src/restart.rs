@@ -16,7 +16,7 @@ use weaver_server_core::runtime::restart::{current_restart_capability, resolvabl
 // The capability is settled again here rather than trusted from whenever the
 // button was rendered: the deployment cannot change under a running process,
 // but the program file can — an upgrade may have replaced or removed it.
-pub(crate) fn restart_now() -> Result<(), String> {
+pub(crate) fn restart_now(drain_logs: impl FnOnce()) -> Result<(), String> {
     let capability = current_restart_capability();
     if !capability.supported {
         let reason = capability
@@ -30,7 +30,12 @@ pub(crate) fn restart_now() -> Result<(), String> {
     })?;
 
     info!(executable = %executable.display(), "restarting Weaver");
-    restart_process(&executable)
+    drain_logs();
+    restart_process(&executable).inspect_err(|error| {
+        // The file sink is stopped: this must survive through the supervisor's
+        // stderr capture (or the native service's stderr), even with RUST_LOG=off.
+        eprintln!("Weaver restart failed: {error}");
+    })
 }
 
 // Re-exec in place. The PID is preserved, so a systemd unit or a launchd job
@@ -64,7 +69,7 @@ fn restart_process(executable: &Path) -> Result<(), String> {
 #[cfg(windows)]
 fn restart_process(executable: &Path) -> Result<(), String> {
     if post_tray_restart() {
-        info!("handed the restart to the Weaver tray");
+        eprintln!("handed the restart to the Weaver tray");
         return Ok(());
     }
     spawn_replacement(executable)
@@ -89,9 +94,9 @@ fn post_tray_restart() -> bool {
     }
     // SAFETY: The target is a same-session Weaver tray window identified by its private class.
     if unsafe { PostMessageW(window, crate::tray_ipc::RESTART_MESSAGE, 0, 0) } == 0 {
-        error!(
-            error = %std::io::Error::last_os_error(),
-            "failed to ask the Weaver tray to restart the server"
+        eprintln!(
+            "failed to ask the Weaver tray to restart the server: {}",
+            std::io::Error::last_os_error()
         );
         return false;
     }
@@ -112,6 +117,9 @@ fn spawn_replacement(executable: &Path) -> Result<(), String> {
         .spawn()
         .map_err(|error| format!("failed to start {}: {error}", executable.display()))?;
 
-    info!(pid = child.id(), "started the replacement Weaver process");
+    eprintln!(
+        "started the replacement Weaver process (pid {})",
+        child.id()
+    );
     Ok(())
 }

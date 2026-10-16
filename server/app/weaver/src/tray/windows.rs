@@ -1223,6 +1223,7 @@ impl TrayState {
         unsafe { self.remove_icon(window) };
         let _ = self.supervisor.stop();
         self.stop_adopted_server();
+        self.supervisor.shutdown_logging();
     }
 
     // Stop the installed server answering on the tray's port when the tray
