@@ -105,11 +105,10 @@ pub(super) fn build_7z_shaped(
         );
     }
     writer.set_content_methods(methods);
-    if encrypt_header {
-        writer.set_encrypt_header(true);
-    }
+    writer.set_encrypt_header(encrypt_header);
     for entry in entries {
         let mut written = ArchiveEntry::new_file(entry.name);
+        written.size = entry.bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);
         written.is_anti_item = entry.anti;
         if let Some(attributes) = entry.attributes {
             written.has_windows_attributes = true;
@@ -1323,14 +1322,56 @@ async fn restart_a_sevenz_set(
     stated: impl Fn(u32) -> u32 + Copy,
     expected_queue: &[(u32, u32)],
 ) -> SetWitness {
-    let member = payload(29, 60_000);
-    let archive = build_7z(
+    restart_a_sevenz_set_with_aes(job_id, articles, withheld, stated, expected_queue, None).await
+}
+
+#[tokio::test]
+async fn sevenz_aes_store_restarts_with_padding_and_header_candidates() {
+    for encrypted_header in [false, true] {
+        restart_a_sevenz_set_with_aes(
+            JobId(9_640),
+            ARTICLES_PER_VOLUME,
+            (1, 1),
+            |size| size,
+            // The first middle-volume article ends inside the cipher block
+            // shared with the missing article. Its floor cannot certify it;
+            // bytes above that hole also cannot be re-encrypted durably.
+            &[(1, 0), (1, 1), (2, 0), (2, 1)],
+            Some(encrypted_header),
+        )
+        .await;
+    }
+}
+
+async fn restart_a_sevenz_set_with_aes(
+    job_id: JobId,
+    articles: usize,
+    withheld: (u32, u32),
+    stated: impl Fn(u32) -> u32 + Copy,
+    expected_queue: &[(u32, u32)],
+    aes: Option<bool>,
+) -> SetWitness {
+    let member = payload(29, if aes.is_some() { 60_003 } else { 60_000 });
+    let archive = build_7z_shaped(
         &[Entry::file(MEMBER, member.clone())],
         EncoderMethod::COPY,
-        None,
+        aes.map(|_| "fixture-key"),
+        aes.unwrap_or(false),
     );
     let volumes = split_volumes(&archive, 3);
     let temp_dir = tempfile::tempdir().unwrap();
+    let make_spec = || {
+        let mut spec = sevenz_job_spec_stating(&volumes, articles, stated);
+        spec.password = aes.map(|encrypted_header| {
+            if encrypted_header {
+                "wrong-first"
+            } else {
+                "fixture-key"
+            }
+            .to_string()
+        });
+        spec
+    };
 
     // Everything but one mid-container article, so the tail — and with it the
     // end header — is already parsed when the process goes down.
@@ -1342,8 +1383,18 @@ async fn restart_a_sevenz_set(
     let working_dir = {
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-        let spec = sevenz_job_spec_stating(&volumes, articles, stated);
-        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+        let spec = make_spec();
+        let working_dir = if aes == Some(true) {
+            insert_active_job_with_persisted_nzb(
+                &mut pipeline,
+                job_id,
+                spec,
+                sample_nzb_zstd_with_password("fixture-key"),
+            )
+            .await
+        } else {
+            insert_active_job(&mut pipeline, job_id, spec).await
+        };
         for (file_index, segment_number) in &arrivals {
             submit_volume_article_of(
                 &mut pipeline,
@@ -1369,7 +1420,14 @@ async fn restart_a_sevenz_set(
         .restore_job(RestoreJobRequest {
             job_id,
             job_hash: [0; 32],
-            spec: sevenz_job_spec_stating(&volumes, articles, stated),
+            spec: {
+                let mut spec = make_spec();
+                if aes == Some(true) {
+                    // The winning header candidate changes priority on restart.
+                    spec.password = Some("fixture-key".to_string());
+                }
+                spec
+            },
             complete_files: HashSet::new(),
             file_progress: HashMap::new(),
             detected_archives: HashMap::new(),
@@ -1413,6 +1471,22 @@ async fn restart_a_sevenz_set(
             articles,
         )
         .await;
+    }
+    if aes.is_some() {
+        let set = pipeline.direct_store.set(job_id, 0).unwrap();
+        let lengths = volumes
+            .iter()
+            .enumerate()
+            .map(|(index, (_, bytes))| (index as u32, bytes.len() as u64))
+            .collect();
+        let provider = set.virtual_provider(&lengths);
+        for (index, (_, posted)) in volumes.iter().enumerate() {
+            let mut reader = provider.open(index as u32).unwrap();
+            let mut reconstructed = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut reconstructed).unwrap();
+            assert_eq!(&reconstructed, posted, "restored ciphertext volume {index}");
+        }
+        assert!(provider.cipher_counters().reencrypted_bytes() > 0);
     }
     let mut peak_working_bytes = 0u64;
     let mut witness = SetWitness::default();
@@ -1575,7 +1649,24 @@ struct MissingVolumeRun {
 // `missing_volume`, hands the job its recovery set, and drives it to a
 // terminal status.
 async fn run_with_a_wholly_missing_volume(job_id: JobId, missing_volume: u32) -> MissingVolumeRun {
-    let member = payload(37, 30_000);
+    run_missing_volume_with_aes(job_id, missing_volume, false).await
+}
+
+async fn run_missing_volume_with_aes(
+    job_id: JobId,
+    missing_volume: u32,
+    aes: bool,
+) -> MissingVolumeRun {
+    run_sevenz_recovery_case(job_id, Some(missing_volume), aes, false).await
+}
+
+async fn run_sevenz_recovery_case(
+    job_id: JobId,
+    missing_volume: Option<u32>,
+    aes: bool,
+    corrupt_ciphertext: bool,
+) -> MissingVolumeRun {
+    let member = payload(37, if aes { 30_003 } else { 30_000 });
     let second = payload(41, 6_000);
     let archive = build_7z(
         &[
@@ -1583,28 +1674,35 @@ async fn run_with_a_wholly_missing_volume(job_id: JobId, missing_volume: u32) ->
             Entry::file(SECOND_MEMBER, second.clone()),
         ],
         EncoderMethod::COPY,
-        None,
+        aes.then_some("fixture-key"),
     );
     let volumes = split_volumes(&archive, 3);
     let par2_bytes = repairable_par2_index(&volumes, 96);
+    let mut posted = volumes.clone();
+    if corrupt_ciphertext {
+        posted[1].1[100] ^= 1;
+    }
 
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
 
     let mut spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
+    if aes {
+        spec.password = Some("fixture-key".to_string());
+    }
     let index_file_index = append_par2_index(&mut spec, &par2_bytes);
     insert_active_job(&mut pipeline, job_id, spec).await;
 
     let mut witness = SetWitness::default();
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
-        if file_index == missing_volume {
+        if Some(file_index) == missing_volume {
             continue;
         }
         submit_volume_article_of(
             &mut pipeline,
             job_id,
-            &volumes,
+            &posted,
             file_index,
             segment_number,
             ARTICLES_PER_VOLUME,
@@ -1667,13 +1765,13 @@ async fn run_with_a_wholly_missing_volume(job_id: JobId, missing_volume: u32) ->
             break;
         }
         for (file_index, segment_number) in lease_the_queue(&mut pipeline) {
-            if file_index == missing_volume {
+            if Some(file_index) == missing_volume {
                 continue;
             }
             submit_volume_article_of(
                 &mut pipeline,
                 job_id,
-                &volumes,
+                &posted,
                 file_index,
                 segment_number,
                 ARTICLES_PER_VOLUME,
@@ -1761,6 +1859,45 @@ async fn sevenz_store_par2_rebuilds_a_wholly_missing_middle_volume() {
             .exists(),
         "the rebuilt volume is scratch, never published under its own name"
     );
+    run.assert_members_published();
+}
+
+#[tokio::test]
+async fn sevenz_aes_store_par2_rebuilds_missing_ciphertext() {
+    let run = run_missing_volume_with_aes(JobId(9_629), 1, true).await;
+    assert_eq!(
+        job_status_for_assert(&run.pipeline, run.job_id),
+        Some(JobStatus::Complete),
+        "{}",
+        run.sets()
+    );
+    assert_eq!(
+        run.pipeline.direct_store.finalized_sets,
+        1,
+        "{}",
+        run.sets()
+    );
+    assert!(!run.witness.contains("Demoted"), "{}", run.sets());
+    assert_eq!(run.pipeline.direct_store.repair_materialized_volumes, 1);
+    run.assert_members_published();
+}
+
+#[tokio::test]
+async fn sevenz_aes_plaintext_refusal_still_repairs_actual_par2_damage() {
+    let run = run_sevenz_recovery_case(JobId(9_631), None, true, true).await;
+    assert!(
+        run.witness.contains("SevenZipAesChecksumMismatch"),
+        "{}",
+        run.sets()
+    );
+    assert_eq!(
+        job_status_for_assert(&run.pipeline, run.job_id),
+        Some(JobStatus::Complete),
+        "{}",
+        run.sets()
+    );
+    // Every copy supplied by the wire has the same damaged cipher byte.
+    // Exact plaintext therefore requires the recovery set to repair it.
     run.assert_members_published();
 }
 
@@ -2132,32 +2269,40 @@ async fn sevenz_store_declines_an_end_header_it_cannot_parse() {
     );
 }
 
-// A header-encrypted container opens with the job's password.
-//
-// `-mhe` puts the map itself in an encrypted block, so with no key there is
-// nothing to route and nothing to say about the archive beyond that. With the
-// key the map reads, and the verdict moves to what the map actually says:
-// `7z a -mhe=on -p` encrypts the content too, and an encrypted stored member
-// is reported rather than routed. Reaching that refusal is the proof the
-// header opened.
 #[tokio::test]
 async fn sevenz_store_opens_a_header_encrypted_container_with_the_job_password() {
-    let member = payload(47, 30_000);
+    route_sevenz_aes_members(true).await;
+}
+
+#[tokio::test]
+async fn sevenz_store_routes_aes_copy_with_a_plain_header_and_padding() {
+    route_sevenz_aes_members(false).await;
+}
+
+async fn route_sevenz_aes_members(encrypt_header: bool) {
+    let members = [
+        ("aes-one.bin", payload(47, 30_003)),
+        ("aes-two.bin", payload(31, 19)),
+    ];
+    let entries: Vec<_> = members
+        .iter()
+        .map(|(name, bytes)| Entry::file(name, bytes.clone()))
+        .collect();
     let archive = build_7z_shaped(
-        &[Entry::file(MEMBER, member.clone())],
+        &entries,
         EncoderMethod::COPY,
-        Some("silver"),
-        true,
+        Some("fixture-key"),
+        encrypt_header,
     );
-    let volumes = split_volumes(&archive, 2);
+    let volumes = split_volumes(&archive, 3);
     let job_id = JobId(9_610);
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
-    let spec = sevenz_job_spec_with_password(&volumes, ARTICLES_PER_VOLUME, "silver");
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    let spec = sevenz_job_spec_with_password(&volumes, ARTICLES_PER_VOLUME, "fixture-key");
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
     let mut witness = SetWitness::default();
-    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+    for (file_index, segment_number) in scrambled(volumes.len()) {
         submit_volume_article_of(
             &mut pipeline,
             job_id,
@@ -2169,15 +2314,105 @@ async fn sevenz_store_opens_a_header_encrypted_container_with_the_job_password()
         .await;
         witness.observe(&pipeline, job_id);
     }
-    settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
-    let sets = witness.render();
-    assert!(
-        sets.contains("EncryptedContent"),
-        "the keyed header must be read, and its encrypted content reported\nsets: {sets}"
+    let router = &pipeline.direct_store.set(job_id, 0).unwrap().router;
+    assert_eq!(router.unaccounted_staged_bytes(), 0);
+    assert_eq!(
+        router.staged_bytes(),
+        0,
+        "a successful AES drain releases its original ciphertext staging"
     );
+    let mut peak = 0;
+    drive_sevenz(
+        &mut pipeline,
+        job_id,
+        &working_dir,
+        &mut peak,
+        None,
+        &mut witness,
+    )
+    .await;
+    let sets = witness.render();
+    assert!(!sets.contains("Demoted"), "sets: {sets}");
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete),
+        "sets: {sets}"
+    );
+    let output_root =
+        complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
+    for (name, expected) in members {
+        let actual = [output_root.join(name), working_dir.join(name)]
+            .iter()
+            .find_map(|path| std::fs::read(path).ok());
+        assert_eq!(
+            actual.as_deref(),
+            Some(expected.as_slice()),
+            "{name}: {sets}"
+        );
+    }
     assert!(
-        !sets.contains("EncryptedHeader"),
-        "a container the job holds the password for must not refuse unread\nsets: {sets}"
+        !volumes
+            .iter()
+            .any(|(name, _)| working_dir.join(name).exists()),
+        "sets: {sets}"
+    );
+}
+
+#[tokio::test]
+async fn sevenz_aes_wrong_candidate_demotes_with_byte_exact_ciphertext() {
+    let archive = build_7z_shaped(
+        &[Entry::file(MEMBER, payload(71, 30_003))],
+        EncoderMethod::COPY,
+        Some("fixture-key"),
+        false,
+    );
+    let volumes = split_volumes(&archive, 3);
+    let job_id = JobId(9_630);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = sevenz_job_spec_with_password(&volumes, ARTICLES_PER_VOLUME, "wrong-key");
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let mut witness = SetWitness::default();
+    for (file_index, segment_number) in scrambled(volumes.len()) {
+        dispatch_and_submit(
+            &mut pipeline,
+            job_id,
+            &volumes,
+            file_index,
+            segment_number,
+            ARTICLES_PER_VOLUME,
+        )
+        .await;
+        witness.observe(&pipeline, job_id);
+    }
+    settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
+    assert!(
+        witness.contains("SevenZipAesChecksumMismatch"),
+        "{}",
+        witness.render()
+    );
+    assert_eq!(pipeline.direct_store.finalized_sets, 0);
+    let queued = peek_queued_segments(&mut pipeline, job_id);
+    assert!(
+        queued.is_empty(),
+        "all received ciphertext survives the demotion without refetch: {queued:?}"
+    );
+    for (index, (name, posted)) in volumes.iter().enumerate() {
+        let reconstructed = std::fs::read(working_dir.join(name)).unwrap();
+        assert_eq!(
+            &reconstructed, posted,
+            "reconstructed ciphertext volume {index}"
+        );
+    }
+    // Demotion reconstructs source volumes through the cipher overlay. It
+    // must never publish the plaintext that failed the member CRC.
+    assert!(!working_dir.join(MEMBER).exists());
+    assert!(
+        !complete_dir
+            .join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"))
+            .join(MEMBER)
+            .exists()
     );
 }
 
@@ -2210,19 +2445,20 @@ async fn header_encrypted_verdict_with_global(
 ) -> String {
     let member = payload(59, 30_000);
     let archive = build_7z_shaped(
-        &[Entry::file(MEMBER, member)],
+        &[Entry::file(MEMBER, member.clone())],
         EncoderMethod::COPY,
         Some(archive_password),
         true,
     );
     let volumes = split_volumes(&archive, 2);
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     seed_global_passwords(&pipeline, temp_dir.path(), global);
     let mut spec = sevenz_job_spec(&volumes, ARTICLES_PER_VOLUME);
     spec.password = spec_password.map(str::to_owned);
-    insert_active_job_with_persisted_nzb(&mut pipeline, job_id, spec, nzb_zstd).await;
+    let working_dir =
+        insert_active_job_with_persisted_nzb(&mut pipeline, job_id, spec, nzb_zstd).await;
     let mut witness = SetWitness::default();
     for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
         submit_volume_article_of(
@@ -2237,6 +2473,29 @@ async fn header_encrypted_verdict_with_global(
         witness.observe(&pipeline, job_id);
     }
     settle_sevenz_verdict(&mut pipeline, job_id, &mut witness).await;
+    if !witness.contains("Demoted") {
+        let mut peak = 0;
+        drive_sevenz(
+            &mut pipeline,
+            job_id,
+            &working_dir,
+            &mut peak,
+            None,
+            &mut witness,
+        )
+        .await;
+        assert_eq!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete),
+            "{}",
+            witness.render()
+        );
+        assert_eq!(pipeline.direct_store.finalized_sets, 1);
+        let output = complete_dir
+            .join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"))
+            .join(MEMBER);
+        assert_eq!(std::fs::read(output).unwrap(), member);
+    }
     witness.render()
 }
 
@@ -2245,8 +2504,8 @@ async fn header_encrypted_verdict_with_global(
 // The spec's password is only the *first* of the job's candidates. Reading it
 // alone refuses a container for a password the job was holding all along —
 // which is the same reason the `-hp` gate is offered the whole harvest rather
-// than `spec.password`. Reaching the content refusal is the proof the meta
-// candidate was tried after the guess was refuted.
+// than `spec.password`. Routing proves the meta candidate was tried after
+// the guess was refuted.
 #[tokio::test]
 async fn sevenz_store_opens_a_container_keyed_by_the_nzb_meta_password() {
     let sets = header_encrypted_verdict(
@@ -2257,8 +2516,8 @@ async fn sevenz_store_opens_a_container_keyed_by_the_nzb_meta_password() {
     )
     .await;
     assert!(
-        sets.contains("EncryptedContent"),
-        "the meta candidate must be tried after the spec's guess\nsets: {sets}"
+        !sets.contains("Demoted"),
+        "the meta candidate must route after the spec's guess is refuted\nsets: {sets}"
     );
     assert!(
         !sets.contains("EncryptedHeader"),

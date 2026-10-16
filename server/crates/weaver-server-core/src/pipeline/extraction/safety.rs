@@ -15,6 +15,9 @@ use super::error::ExtractionError;
 use crate::operations::disk::{Capacity, CapacityDebits, CapacityReader, probe_nearest_disk_space};
 use crate::operations::metrics::PipelineMetrics;
 
+mod positional;
+pub(crate) use positional::PositionalOutput;
+
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 const TIB: u64 = 1024 * GIB;
@@ -1435,8 +1438,15 @@ impl JobExtractionBudget {
     }
 
     fn reserve_write(&self, member_written: u64, bytes: usize) -> Result<(), ExtractionFailure> {
+        self.reserve_write_bytes(member_written, u64::try_from(bytes).unwrap_or(u64::MAX))
+    }
+
+    fn reserve_write_bytes(
+        &self,
+        member_written: u64,
+        bytes: u64,
+    ) -> Result<(), ExtractionFailure> {
         self.check_active()?;
-        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         let requested_member = member_written.saturating_add(bytes);
         if requested_member > self.limits.max_member_bytes {
             return Err(self.reject(

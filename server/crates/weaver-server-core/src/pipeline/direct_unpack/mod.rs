@@ -90,6 +90,7 @@ pub(crate) mod rar_reader;
 pub(crate) mod rar_virtual;
 pub mod reader;
 pub mod settings;
+pub(crate) mod sevenz_runs;
 pub mod start_header;
 pub(crate) mod wiring;
 

@@ -1811,7 +1811,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1952,7 +1952,7 @@ checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
  "io-lifetimes 2.0.4",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2672,7 +2672,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2946,9 +2946,9 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b9ccc3065ff5558e94314fcf941f2508a6ace67da9b2cdc85a6f4e436ab2f0b"
+checksum = "b5a20bb337557ccb473bf0a25e458032bd75c13c7d01b097066bf33c468e8009"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
@@ -3383,9 +3383,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.9"
+version = "0.10.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a040599a72f3ac1809c64990d7aa1c543459856815dd38c2a99937c0cc2e8c"
+checksum = "880c04c0082776d35e05d8a7b66609deb9d83526cb98eb813de14270d1a43d1a"
 dependencies = [
  "aws-lc-sys",
  "bytes",
@@ -3402,9 +3402,9 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.5.2"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22a435c8f3dfe883b67e9731f411ba9107cf80564a3c8e0f7859d00075c9ee16"
+checksum = "a4ec3d4a0db7132f60c6559e71ac19c64677bbe62aafe3789a91b0a8cf0621bb"
 dependencies = [
  "blake3",
  "cap-std",
@@ -3804,7 +3804,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4198,7 +4198,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4266,7 +4266,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4574,13 +4574,12 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4abe071a8b7d5f393996f6f7e1c210510ac014de56db49e0228a3a2ce8523a06"
+version = "0.27.1"
+source = "git+https://github.com/scryer-media/sevenz-turbo?rev=fa361c5211cdff5e7ed200d43cd912173a581d37#fa361c5211cdff5e7ed200d43cd912173a581d37"
 dependencies = [
  "aes",
  "aws-lc-rs",
- "brotli 9.0.0",
+ "brotli 8.0.4",
  "bzip2",
  "cap-std",
  "cbc",
@@ -5146,10 +5145,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5733,9 +5732,9 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "374d56427700534ae07ae77280b6d95071ab11b02d1737493e02e425d20b00bf"
+checksum = "f7efea328c2c3b1e2176ed002931a10402a970e092d30d9f0195c5b22caba6ce"
 dependencies = [
  "aws-lc-rs",
  "aws-lc-sys",
@@ -6297,7 +6296,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6425,15 +6424,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]
@@ -6620,7 +6610,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
  "bitflags 2.13.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

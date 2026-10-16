@@ -432,6 +432,7 @@ fn direct_variant(reason: DemotionReason) -> usize {
         R::IdentityRosterUnfillable => 32,
         R::IdentityVolumeMismatch => 33,
         R::SevenZip(_) => 34,
+        R::SevenZipAesChecksumMismatch => 35,
     }
 }
 
