@@ -65,20 +65,20 @@ export function StoredBackups({ generation }: { generation: number }) {
         setAuto(null); setKey(""); setClearKey(false);
       })}>{t("next.settings.saveChanges")}</SecondaryButton> } },
     ] },
-    { kind: "table", id: "storedBackups", title: t("next.backup.stored"), columns: "minmax(140px, 1fr) 90px 90px 100px 90px 272px", headers: [t("next.backup.taken"), t("next.backup.trigger"), t("next.backup.status"), t("next.backup.size"), t("next.backup.version"), t("next.backup.actions")], rows: (data?.backups ?? []).map((backup) => ({ id: backup.filename, searchText: `${backup.filename} ${backup.trigger} ${backup.status} ${backup.sourceWeaverVersion}`, cells: [
+    { kind: "table", id: "storedBackups", title: t("next.backup.stored"), columns: "minmax(140px, 1fr) 90px 90px 100px 90px 256px", headers: [t("next.backup.taken"), t("next.backup.trigger"), t("next.backup.status"), t("next.backup.size"), t("next.backup.version"), t("next.backup.actions")], rows: (data?.backups ?? []).map((backup) => ({ id: backup.filename, searchText: `${backup.filename} ${backup.trigger} ${backup.status} ${backup.sourceWeaverVersion}`, cells: [
       <Cell key="created" title={backup.filename}>{formatDate(Date.parse(backup.createdAt))}</Cell>,
       <Cell key="trigger">{t(backup.trigger === "AUTO" ? "next.backup.triggerAuto" : "next.backup.triggerManual")}</Cell>,
       <Cell key="status" title={backup.error ?? undefined}>{t(backup.status === "READY" ? "next.backup.ready" : backup.status === "CREATING" ? "next.backup.creating" : "next.backup.failed")}{backup.error ? <span className="text-wv-error-text">: {backup.error}</span> : null}</Cell>,
       <Cell key="size">{(backup.sizeBytes / 1024 / 1024).toFixed(2)} MiB</Cell>,
       <Cell key="version">{backup.sourceWeaverVersion}</Cell>,
-      <div key="actions" className="flex gap-2"><SecondaryButton icon="downloadFile" disabled={busy || backup.status !== "READY"} onClick={() => void run(async () => {
+      <div key="actions" className="flex gap-2"><SecondaryButton size="compact" icon="downloadFile" disabled={busy || backup.status !== "READY"} onClick={() => void run(async () => {
         const token = await downloadToken({ filename: backup.filename });
         if (token.error) throw token.error;
         const url = new URL(`api/backup/download/${encodeURIComponent(backup.filename)}`, document.baseURI);
         const response = await fetch(url, { headers: { ...authHeaders(), "X-Weaver-Backup-Token": token.data.createBackupDownloadToken } });
         if (!response.ok) throw new Error(t("next.backup.requestFailed", { status: response.status }));
         await saveResponseAsDownload(response, backup.filename);
-      })}>{t("next.backup.downloadStored")}</SecondaryButton><DangerButton icon="remove" disabled={busy || backup.status === "CREATING"} onClick={() => setDeleting(backup.filename)}>{t("next.backup.deleteStored")}</DangerButton></div>,
+      })}>{t("next.backup.downloadStored")}</SecondaryButton><DangerButton size="compact" icon="remove" disabled={busy || backup.status === "CREATING"} onClick={() => setDeleting(backup.filename)}>{t("next.backup.deleteStored")}</DangerButton></div>,
     ] })) },
   ];
   return <>
