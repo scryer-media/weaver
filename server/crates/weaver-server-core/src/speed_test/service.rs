@@ -829,26 +829,22 @@ impl ServiceInner {
 
 // What a run holds while it has the line, given back on every exit path.
 struct Gate {
-    db: Database,
-    // Whether this run paused the queue, and so must resume it.
+    handle: SchedulerHandle,
+    // This run's transient hold never owns an operator or schedule pause.
     paused: AtomicBool,
     loan: Mutex<Option<Arc<ConnectionLoan>>>,
     draft: Mutex<Option<Arc<DraftNetworkRoute>>>,
 }
 
 impl Gate {
-    // Restore the budget, resume the queue if this run paused it, revoke
-    // the draft.
+    // Restore the budget, release this run's hold, and revoke the draft.
     async fn release(&self, handle: &SchedulerHandle) {
         let loan = self.loan.lock().expect("speed test loan").take();
         drop(loan);
         if self.paused.load(Ordering::Acquire) {
-            if let Err(error) = handle.resume_all().await {
-                warn!(%error, "speed test could not resume the queue; clearing the stored pause");
-                let db = self.db.clone();
-                let _ =
-                    tokio::task::spawn_blocking(move || db.set_setting("global_paused", "false"))
-                        .await;
+            if let Err(error) = handle.set_speed_test_pause(false).await {
+                warn!(%error, "speed test scheduler stopped; clearing its transient hold");
+                handle.clear_speed_test_pause();
             }
             self.paused.store(false, Ordering::Release);
         }
@@ -865,14 +861,14 @@ impl Drop for Gate {
     // give themselves back as they drop.
     fn drop(&mut self) {
         if self.paused.load(Ordering::Acquire) {
-            let _ = self.db.set_setting("global_paused", "false");
+            self.handle.clear_speed_test_pause();
         }
     }
 }
 
 async fn drive(inner: Arc<ServiceInner>, cell: Arc<RunCell>, plan: RunPlan) {
     let gate = Arc::new(Gate {
-        db: inner.db.clone(),
+        handle: inner.handle.clone(),
         paused: AtomicBool::new(false),
         loan: Mutex::new(None),
         draft: Mutex::new(Some(plan.draft.clone())),
@@ -1060,13 +1056,11 @@ async fn execute(
         None
     };
 
-    // Pause, unless the queue already is.
+    // Hold admission independently of any operator or schedule pause.
     inner.set_phase(&cell, SpeedTestPhase::Pausing);
-    if !inner.handle.is_globally_paused() {
-        gate.paused.store(true, Ordering::Release);
-        if let Err(error) = inner.handle.pause_all().await {
-            return Outcome::Failed(format!("could not pause downloads: {error}"));
-        }
+    gate.paused.store(true, Ordering::Release);
+    if let Err(error) = inner.handle.set_speed_test_pause(true).await {
+        return Outcome::Failed(format!("could not pause downloads: {error}"));
     }
 
     // Drain: the in-flight gauge is the condition.
@@ -1086,9 +1080,13 @@ async fn execute(
             // Lease: the live pool gives the server's connections back.
             inner.set_phase(&cell, SpeedTestPhase::Leasing);
             let connections: u16 = plan.legs.iter().map(|leg| leg.target).sum();
-            if let Some(pool) = inner.handle.nntp_pool()
-                && let Some(index) = pool.server_for_stable_id(StableServerId(server.id))
             {
+                let Some(pool) = inner.handle.nntp_pool() else {
+                    return Outcome::FailedWith(SpeedTestFailure::ServerLeftPool);
+                };
+                let Some(index) = pool.server_for_stable_id(StableServerId(server.id)) else {
+                    return Outcome::FailedWith(SpeedTestFailure::ServerLeftPool);
+                };
                 if let Some(reason) = inner.lease_refusal(server.id).await {
                     return Outcome::FailedWith(SpeedTestFailure::LeaseRefused {
                         server: server.id,
@@ -1170,7 +1168,7 @@ async fn execute(
                 },
                 cell.progress.clone(),
                 metrics,
-                stop.with_deadline(tokio::time::Instant::now() + max_duration),
+                stop.with_duration(max_duration),
             )
             .await;
             sampler.abort();

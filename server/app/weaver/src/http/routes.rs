@@ -174,6 +174,8 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         scheduled_resume,
         disk_space.reader(weaver_server_core::operations::StorageRoot::Complete),
     );
+    let script_callbacks =
+        (!base_url.is_empty()).then(|| build_script_callback_routes(nzbget_context.clone()));
     let nzbget_rpc_routes = build_nzbget_rpc_routes(nzbget_context);
 
     let inner = Router::new()
@@ -266,6 +268,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
                 get(move || async move { axum::response::Redirect::permanent(&bare) }),
             )
             .nest(&base_url, inner)
+            .merge(script_callbacks.expect("nonempty base URL has script callback routes"))
     }
 }
 
@@ -300,6 +303,19 @@ pub(super) fn with_response_hardening(router: Router) -> Router {
 
 pub(super) fn build_nzbget_rpc_routes(
     nzbget_context: super::nzbget::NzbgetFacadeContext,
+) -> Router {
+    build_rpc_routes(nzbget_context, false)
+}
+
+pub(super) fn build_script_callback_routes(
+    nzbget_context: super::nzbget::NzbgetFacadeContext,
+) -> Router {
+    build_rpc_routes(nzbget_context, true)
+}
+
+fn build_rpc_routes(
+    nzbget_context: super::nzbget::NzbgetFacadeContext,
+    script_only: bool,
 ) -> Router {
     // 32 MiB of JSON/XML envelope carries roughly 24 MiB of decoded base64 NZB
     // data, comfortably above observed real-world payloads while keeping the
@@ -354,6 +370,12 @@ pub(super) fn build_nzbget_rpc_routes(
                         );
                     }
                 };
+                if script_only && scope != weaver_server_core::auth::CallerScope::ScriptRun {
+                    return super::nzbget::authentication_error_response(
+                        &path,
+                        StatusCode::FORBIDDEN,
+                    );
+                }
                 req.extensions_mut()
                     .insert(super::nzbget::NzbgetCallerScope(scope));
                 let Ok(_permit) = rpc_buffer_gate.acquire().await else {

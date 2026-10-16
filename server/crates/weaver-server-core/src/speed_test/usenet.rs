@@ -210,6 +210,10 @@ impl Worker {
                 }
             }
             progress.counted();
+            if crate::e2e_clock::hold_speed_test_after_article() {
+                self.stop.stopped().await;
+                return;
+            }
         }
     }
 }

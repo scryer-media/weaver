@@ -33,14 +33,28 @@ fn refusal(response: &async_graphql::Response) -> (String, String) {
 async fn add_server(h: &TestHarness, nntp: &NntpFixture) -> u64 {
     let response = h
         .execute(&format!(
-            r#"mutation{{addServer(input:{{host:"127.0.0.1",port:{},tls:false,connections:2,active:false}}){{id}}}}"#,
+            r#"mutation{{addServer(input:{{host:"127.0.0.1",port:{},tls:false,connections:2,active:true}}){{id}}}}"#,
             nntp.addr.port()
         ))
         .await;
     assert_no_errors(&response);
-    response_data(&response)["addServer"]["id"]
+    let id = response_data(&response)["addServer"]["id"]
         .as_u64()
-        .unwrap()
+        .unwrap();
+    // The mock scheduler does not install a download pool. Supply the live
+    // membership and loan budget required by a speed test explicitly.
+    h.handle
+        .set_nntp_pool(std::sync::Arc::new(weaver_nntp::pool::NntpPool::new(
+            weaver_nntp::pool::PoolConfig {
+                servers: vec![weaver_nntp::pool::ServerPoolConfig {
+                    stable_id: weaver_nntp::transfer::StableServerId(id as u32),
+                    max_connections: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )));
+    id
 }
 
 const DIRECT: &str = "{legs:[{egressId:0,weight:100,path:{direct:true}}]}";

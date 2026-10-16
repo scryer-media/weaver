@@ -108,6 +108,7 @@ pub struct SharedPipelineState {
     jobs: Arc<RwLock<PublishedJobs>>,
     job_revision: tokio::sync::watch::Sender<u64>,
     paused: Arc<AtomicBool>,
+    speed_test_paused: Arc<AtomicBool>,
     schedule_replay_paused: Arc<AtomicBool>,
     // Why the schedule evaluator is holding download admission, while it is.
     schedule_hold_reason: Arc<RwLock<Option<String>>>,
@@ -190,6 +191,7 @@ impl SharedPipelineState {
             })),
             job_revision,
             paused: Arc::new(AtomicBool::new(false)),
+            speed_test_paused: Arc::new(AtomicBool::new(false)),
             schedule_replay_paused: Arc::new(AtomicBool::new(false)),
             schedule_hold_reason: Arc::new(RwLock::new(None)),
             post_processing_paused: Arc::new(AtomicBool::new(false)),
@@ -275,7 +277,15 @@ impl SharedPipelineState {
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
+        self.paused.load(Ordering::Relaxed) || self.speed_test_paused()
+    }
+
+    pub(crate) fn speed_test_paused(&self) -> bool {
+        self.speed_test_paused.load(Ordering::Acquire)
+    }
+
+    pub fn set_speed_test_paused(&self, paused: bool) {
+        self.speed_test_paused.store(paused, Ordering::Release);
     }
 
     pub(crate) fn schedule_replay_paused(&self) -> bool {
@@ -865,6 +875,11 @@ pub enum SchedulerCommand {
     },
     // Pause all jobs globally (pipeline-wide).
     PauseAll {
+        reply: oneshot::Sender<()>,
+    },
+    // An in-memory hold independent of operator and schedule pauses.
+    SetSpeedTestPause {
+        paused: bool,
         reply: oneshot::Sender<()>,
     },
     // Resume all jobs globally.
@@ -1482,6 +1497,20 @@ impl SchedulerHandle {
         rx.await
             .map(|diagnostics| *diagnostics)
             .map_err(|_| SchedulerError::ChannelClosed)
+    }
+
+    // Change only the speed test's transient download hold.
+    pub(crate) async fn set_speed_test_pause(&self, paused: bool) -> Result<(), SchedulerError> {
+        let (reply, received) = oneshot::channel();
+        self.cmd_tx
+            .send(SchedulerCommand::SetSpeedTestPause { paused, reply })
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+        received.await.map_err(|_| SchedulerError::ChannelClosed)
+    }
+
+    pub(crate) fn clear_speed_test_pause(&self) {
+        self.state.set_speed_test_paused(false);
     }
 
     // Pause all download dispatch globally.

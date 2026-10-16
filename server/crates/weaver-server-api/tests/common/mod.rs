@@ -710,6 +710,10 @@ fn spawn_test_scheduler(
                     };
                     let _ = reply.send(result);
                 }
+                SchedulerCommand::SetSpeedTestPause { paused, reply } => {
+                    scheduler_state.set_speed_test_paused(paused);
+                    let _ = reply.send(());
+                }
                 SchedulerCommand::PauseAll { reply } => {
                     scheduler_state.set_paused(true);
                     let _ = reply.send(());

@@ -51,6 +51,10 @@ async fn rig() -> Rig {
     tokio::spawn(async move {
         while let Some(command) = cmd_rx.recv().await {
             match command {
+                SchedulerCommand::SetSpeedTestPause { paused, reply } => {
+                    scheduler_state.set_speed_test_paused(paused);
+                    let _ = reply.send(());
+                }
                 SchedulerCommand::PauseAll { reply } => {
                     scheduler_state.set_paused(true);
                     let _ = reply.send(());
@@ -102,6 +106,17 @@ async fn add_server(rig: &Rig, nntp: &NntpFixture, tls_ca: Option<&std::path::Pa
     }))
     .unwrap();
     rig.config.write().await.servers.push(server);
+    rig.handle
+        .set_nntp_pool(Arc::new(weaver_nntp::pool::NntpPool::new(
+            weaver_nntp::pool::PoolConfig {
+                servers: vec![weaver_nntp::pool::ServerPoolConfig {
+                    stable_id: weaver_nntp::transfer::StableServerId(1),
+                    max_connections: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )));
     1
 }
 
@@ -270,6 +285,149 @@ async fn a_cancel_while_draining_ends_without_a_result_and_resumes_the_queue() {
     assert_eq!(run.status, SpeedTestStatus::Cancelled);
     assert!(run.result.is_none());
     assert!(!rig.handle.is_globally_paused());
+}
+
+#[tokio::test]
+async fn a_later_operator_pause_survives_speed_test_cancellation() {
+    let rig = rig().await;
+    let nntp = NntpFixture::start(vec![], None, None).await;
+    let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
+    let server = add_server(&rig, &nntp, None).await;
+    rig.metrics.set_active_downloads(1);
+    let started = rig
+        .service
+        .start(usenet_request(
+            server,
+            format!("http://{}/test.nzb", http.addr),
+        ))
+        .await
+        .unwrap();
+    let mut revision = rig.service.subscribe();
+    while rig
+        .service
+        .run(started.id)
+        .unwrap()
+        .phase_label()
+        .as_deref()
+        != Some("draining 1")
+    {
+        revision.changed().await.unwrap();
+    }
+    rig.handle.pause_all().await.unwrap();
+    assert!(rig.service.cancel(started.id));
+    assert_eq!(
+        finished(&rig, started.id).await.status,
+        SpeedTestStatus::Cancelled
+    );
+    assert!(rig.handle.is_globally_paused());
+    rig.handle.resume_all().await.unwrap();
+    assert!(!rig.handle.is_globally_paused());
+}
+
+#[tokio::test]
+async fn an_https_endpoint_cannot_redirect_measurement_to_plain_http() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let rig = rig().await;
+    let plain = HttpFixture::start(String::new(), 1024, None).await;
+    let (acceptor, cert, _) = loopback_tls();
+    rig.service.trust_roots_for_tests(vec![cert]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let target = plain.addr;
+    let redirect = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(acceptor.accept(socket).await.unwrap());
+        loop {
+            let mut line = String::new();
+            if stream.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{target}/blob\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+    });
+    let started = rig
+        .service
+        .start(bandwidth_request(format!("https://{addr}/blob")))
+        .await
+        .unwrap();
+    let run = finished(&rig, started.id).await;
+    redirect.await.unwrap();
+    assert_eq!(run.status, SpeedTestStatus::Failed);
+    assert_eq!(
+        *plain.requests().borrow(),
+        0,
+        "no plaintext request follows the redirect"
+    );
+}
+
+#[tokio::test]
+async fn a_server_removed_while_draining_cannot_bypass_its_pool_loan() {
+    let rig = rig().await;
+    let nntp = NntpFixture::start(vec![], None, None).await;
+    let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
+    let server = add_server(&rig, &nntp, None).await;
+    rig.metrics.set_active_downloads(1);
+    let started = rig
+        .service
+        .start(usenet_request(
+            server,
+            format!("http://{}/test.nzb", http.addr),
+        ))
+        .await
+        .unwrap();
+    let mut revision = rig.service.subscribe();
+    while rig
+        .service
+        .run(started.id)
+        .unwrap()
+        .phase_label()
+        .as_deref()
+        != Some("draining 1")
+    {
+        revision.changed().await.unwrap();
+    }
+    rig.handle
+        .set_nntp_pool(Arc::new(weaver_nntp::pool::NntpPool::new(
+            Default::default(),
+        )));
+    rig.metrics.set_active_downloads(0);
+    let run = finished(&rig, started.id).await;
+    assert_eq!(run.status, SpeedTestStatus::Failed);
+    assert_eq!(
+        run.error,
+        Some(super::failure::SpeedTestFailure::ServerLeftPool)
+    );
+    assert_eq!(*nntp.connections().borrow(), 0);
+    assert!(!rig.handle.is_globally_paused());
+}
+
+#[tokio::test]
+async fn a_disabled_server_without_live_pool_membership_is_refused() {
+    let rig = rig().await;
+    let nntp = NntpFixture::start(vec![], None, None).await;
+    let http = HttpFixture::start(nzb(&[("only@fixture", 9_000)]), 0, None).await;
+    let server = add_server(&rig, &nntp, None).await;
+    rig.config.write().await.servers[0].active = false;
+    rig.handle
+        .set_nntp_pool(Arc::new(weaver_nntp::pool::NntpPool::new(
+            Default::default(),
+        )));
+    let started = rig
+        .service
+        .start(usenet_request(
+            server,
+            format!("http://{}/test.nzb", http.addr),
+        ))
+        .await
+        .unwrap();
+    let run = finished(&rig, started.id).await;
+    assert_eq!(run.status, SpeedTestStatus::Failed);
+    assert_eq!(
+        run.error,
+        Some(super::failure::SpeedTestFailure::ServerLeftPool)
+    );
+    assert_eq!(*nntp.connections().borrow(), 0);
 }
 
 #[tokio::test]

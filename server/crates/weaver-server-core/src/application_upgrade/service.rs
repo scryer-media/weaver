@@ -956,7 +956,38 @@ impl ApplicationUpgradeService {
     // reboot is still outstanding. Called once, early in startup, before the
     // upgrade surface can accept anything new.
     pub fn finalize_journal(&self) -> ApplicationUpgradeResult<Vec<String>> {
-        self.finalize_journal_with_boot_time(super::operating_system_boot_time())
+        let awaiting = self.finalize_journal_with_boot_time(super::operating_system_boot_time())?;
+        if let Some(journal) = load_journal(&self.journal_path())?
+            && awaiting.contains(&journal.run_id)
+            && let Some(written_at) = journal.written_at
+        {
+            let remaining = (written_at + REBOOT_WAIT_LIMIT - Utc::now())
+                .to_std()
+                .unwrap_or_default();
+            self.schedule_reboot_wait_expiry(journal, remaining);
+        }
+        Ok(awaiting)
+    }
+
+    fn schedule_reboot_wait_expiry(
+        &self,
+        journal: ApplicationUpgradeJournal,
+        remaining: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let service = self.clone();
+        let deadline = tokio::time::Instant::now() + remaining;
+        tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            let _guard = service.inner.admission.lock().await;
+            let still_waiting = service.inner.state.borrow().as_ref().is_some_and(|run| {
+                run.run_id == journal.run_id
+                    && !run.status.is_terminal()
+                    && run.phase == phases::REBOOT_REQUIRED
+            });
+            if still_waiting {
+                service.fail_abandoned_reboot_wait(&journal, REBOOT_WAIT_EXPIRED_ERROR);
+            }
+        })
     }
 
     // [`Self::finalize_journal`] with an injectable operating-system boot time.
@@ -2716,6 +2747,31 @@ mod tests {
         let run = service.snapshot().latest_run.expect("the run is published");
         assert_eq!(run.status, ApplicationUpgradeRunStatus::Failed);
         assert_eq!(run.error.as_deref(), Some(REBOOT_DID_NOT_INSTALL_ERROR));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reboot_wait_expires_without_another_startup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let service =
+            service_with_update(temp.path(), Some(TEST_VERSION), portable_assessment(), None).await;
+        let written = Utc::now();
+        let journal = reboot_journal(temp.path(), "99.99.99", written);
+        write_journal(&service.journal_path(), &journal).unwrap();
+        service
+            .finalize_journal_at(Some(SystemTime::from(written - hours(1))), written)
+            .unwrap();
+        let expiry =
+            service.schedule_reboot_wait_expiry(journal, std::time::Duration::from_secs(60));
+        assert!(service.snapshot().active_run.is_some());
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        expiry.await.unwrap();
+        let snapshot = service.snapshot();
+        assert!(snapshot.active_run.is_none());
+        assert_eq!(
+            snapshot.latest_run.unwrap().error.as_deref(),
+            Some(REBOOT_WAIT_EXPIRED_ERROR)
+        );
+        assert!(service.journal_path().exists());
     }
 
     // Without a restart, the run waits — but not forever.

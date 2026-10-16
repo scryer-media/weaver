@@ -460,6 +460,19 @@ impl Pipeline {
                 };
                 let _ = reply.send(result);
             }
+            SchedulerCommand::SetSpeedTestPause { paused, reply } => {
+                self.shared_state.set_speed_test_paused(paused);
+                if paused {
+                    self.download_restart_durable_lead_retry_after.clear();
+                }
+                self.publish_download_block();
+                let _ = self.event_tx.send(if self.shared_state.is_paused() {
+                    PipelineEvent::GlobalPaused
+                } else {
+                    PipelineEvent::GlobalResumed
+                });
+                let _ = reply.send(());
+            }
             SchedulerCommand::PauseAll { reply } => {
                 self.global_paused = true;
                 self.scheduled_pause = false;
@@ -489,7 +502,11 @@ impl Pipeline {
                 {
                     error!(error = %e, "db write failed for ResumeAll");
                 }
-                let _ = self.event_tx.send(PipelineEvent::GlobalResumed);
+                let _ = self.event_tx.send(if self.shared_state.is_paused() {
+                    PipelineEvent::GlobalPaused
+                } else {
+                    PipelineEvent::GlobalResumed
+                });
                 let _ = reply.send(());
             }
             SchedulerCommand::PausePostProcessing { reply }

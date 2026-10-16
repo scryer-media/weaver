@@ -342,6 +342,88 @@ async fn nzbget_auth_accepts_basic_password_as_persistent_api_key() {
 }
 
 #[tokio::test]
+async fn base_url_root_callbacks_accept_only_live_script_tokens() {
+    use weaver_server_core::post_processing::model::ScriptEventLabel;
+    use weaver_server_core::post_processing::runner::RunIdentity;
+    let db = Database::open_in_memory().unwrap();
+    db.set_script_api_url("http://127.0.0.1:6789/weaver/graphql");
+    let mut identity = RunIdentity {
+        run_id: "callback-run".into(),
+        instance_id: "callback-instance".into(),
+        ..Default::default()
+    };
+    let run = db.open_script_run(
+        &mut identity,
+        Some(7),
+        &ScriptEventLabel::PostProcessing,
+        None,
+        false,
+    );
+    let token = identity.token.unwrap();
+    let app = nzbget_test_router_with_base_url(
+        db,
+        test_scheduler_handle(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+        "/weaver",
+    );
+    for prefix in ["", "/weaver"] {
+        for request in [
+            json_post(
+                &format!("{prefix}/jsonrpc"),
+                Some(&basic_auth(&token)),
+                "version",
+            ),
+            xml_post(
+                &format!("{prefix}/xmlrpc"),
+                Some(&basic_auth(&token)),
+                "version",
+            ),
+        ] {
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+    }
+    for credential in ["control-key", "session-token", "browser-session-token"] {
+        let response = app
+            .clone()
+            .oneshot(json_post(
+                "/jsonrpc",
+                Some(&basic_auth(credential)),
+                "version",
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !response.status().is_success(),
+            "root alias accepted {credential}"
+        );
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(json_post(
+                "/weaver/jsonrpc",
+                Some(&basic_auth("control-key")),
+                "version"
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    drop(run);
+    assert_eq!(
+        app.oneshot(json_post("/jsonrpc", Some(&basic_auth(&token)), "version"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
 async fn nzbget_takes_a_running_scripts_token_as_its_control_password() {
     use weaver_server_core::post_processing::model::ScriptEventLabel;
     use weaver_server_core::post_processing::runner::RunIdentity;

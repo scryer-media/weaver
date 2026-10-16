@@ -494,11 +494,13 @@ impl Pipeline {
         // Every early return below except an operator pause is a gate that
         // can lift with no event to announce it, so the pass is retried on
         // the idle tick until one gets as far as the eligible jobs.
-        self.download_dispatch_retry = !self.global_paused;
+        self.download_dispatch_retry =
+            !self.global_paused && !self.shared_state.speed_test_paused();
         // Lanes already connected and waiting in the actor are answered
         // before any dial: an established socket outranks a new one.
         self.service_held_download_refills();
         if self.global_paused
+            || self.shared_state.speed_test_paused()
             || self.shared_state.schedule_replay_paused()
             || self.rate_limiter.should_wait()
         {

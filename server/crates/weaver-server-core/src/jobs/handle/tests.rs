@@ -384,6 +384,10 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     shared_state.set_paused(true);
                     let _ = reply.send(());
                 }
+                SchedulerCommand::SetSpeedTestPause { paused, reply } => {
+                    shared_state.set_speed_test_paused(paused);
+                    let _ = reply.send(());
+                }
                 SchedulerCommand::ResumeAll { reply } => {
                     shared_state.set_paused(false);
                     let _ = reply.send(());

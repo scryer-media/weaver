@@ -1493,7 +1493,8 @@ impl Pipeline {
     pub(crate) fn pause_barrier_scope(command: &SchedulerCommand) -> Option<Option<JobId>> {
         match command {
             SchedulerCommand::PauseJob { job_id, .. } => Some(Some(*job_id)),
-            SchedulerCommand::PauseAll { .. } => Some(None),
+            SchedulerCommand::PauseAll { .. }
+            | SchedulerCommand::SetSpeedTestPause { paused: true, .. } => Some(None),
             _ => None,
         }
     }

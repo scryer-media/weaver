@@ -206,6 +206,16 @@ fn nzbget_test_router(
     config: SharedConfig,
     api_key_cache: ApiKeyCache,
 ) -> Router {
+    nzbget_test_router_with_base_url(db, handle, config, api_key_cache, "")
+}
+
+fn nzbget_test_router_with_base_url(
+    db: Database,
+    handle: SchedulerHandle,
+    config: SharedConfig,
+    api_key_cache: ApiKeyCache,
+    base_url: &str,
+) -> Router {
     // Production initializes the scripts directory before constructing HTTP
     // routes. Mirror that bootstrap contract for the in-memory facade fixture.
     let data_dir = std::env::temp_dir().join("weaver-nzbget-http-tests");
@@ -246,7 +256,13 @@ fn nzbget_test_router(
         weaver_server_core::operations::CapacityReader::unknown(),
     );
 
-    routes::build_nzbget_rpc_routes(context)
+    if base_url.is_empty() {
+        routes::build_nzbget_rpc_routes(context)
+    } else {
+        Router::new()
+            .nest(base_url, routes::build_nzbget_rpc_routes(context.clone()))
+            .merge(routes::build_script_callback_routes(context))
+    }
 }
 
 async fn post_nzbget_xmlrpc(app: Router, body: &str, auth_value: &str) -> (StatusCode, String) {

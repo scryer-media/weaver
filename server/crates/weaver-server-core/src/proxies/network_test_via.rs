@@ -200,6 +200,9 @@ impl NetworkRuntime {
                     .member_ids
                     .clone(),
             };
+            if ids.is_empty() && matches!(subject, TestSubject::Pool(_) | TestSubject::Members(_)) {
+                return Err(NetworkRefusal::RoutePoolEmpty);
+            }
             for id in &ids {
                 let profile = config
                     .profiles

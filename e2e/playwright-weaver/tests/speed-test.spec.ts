@@ -1,7 +1,9 @@
 import fs from "node:fs";
+import path from "node:path";
 import type { APIRequestContext, Locator, Page } from "@playwright/test";
 import { expect, graphql, submitProbeNzb, test, weaverRoute } from "./helpers";
 import { postProbeFile, waitTerminal } from "./support/downloads";
+import { advanceClock, clockFile } from "./support/e2e-clock";
 import { directLeg, ladderLeg, rung } from "./support/network-flow";
 import { DIRECT_HOST, NetworkWorld, PROXIED_HOST } from "./support/network-scenario";
 import { type FixtureEvent, directEvents, fixtureEvents, fixtureMark, fixtureState, setFixtureNzb } from "./support/proxy-fixture";
@@ -602,36 +604,43 @@ test("ST07 a run whose NZB URL does not serve an NZB fails, says why, and leaves
 });
 
 test("ST08 a run reaching its maximum duration completes with what it measured", async ({ cleanPage: page, request }) => {
-  // The fixture sleeps 5 ms per body line: a 16 KiB article takes well
-  // over half a second, so 128 of them over 4 connections need some twenty
-  // seconds, and the run is allowed ten.
+  // Hold between articles, then advance the explicit E2E deadline only after
+  // this run has delivered and accounted for data.
   const parts = 128;
   const maxDuration = 10;
   const { server } = await ladderedServer();
   const nzb = await servedNzb(request, "st08-deadline", parts, 16 * 1024);
-  await world.holdChaosSession();
-  await world.setChaos("slow_body=5");
-  const queueControl = await downloadsTab(page);
-  await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
-  const speed = new SpeedPage(page);
-  await speed.open(server);
-  await speed.useNzbUrl(nzb.url, maxDuration);
+  const clock = path.parse(clockFile());
+  const hold = path.join(clock.dir, `${clock.name}.speed-test-hold`);
+  fs.writeFileSync(hold, "");
+  try {
+    const queueControl = await downloadsTab(page);
+    await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+    const speed = new SpeedPage(page);
+    await speed.open(server);
+    await speed.useNzbUrl(nzb.url, maxDuration);
 
-  const before = await bytesDownloaded(request);
-  const id = await speed.run();
-  await speed.finished(id, "Completed");
-  const run = await speedTestRun(request, id);
-  expect(run).toMatchObject({ status: "COMPLETED", failure: null });
-  const result = run.result!;
-  expect(result.bytes).toBeGreaterThan(0);
-  expect(result.usenet!.delivered).toBeGreaterThan(0);
-  expect(result.usenet!.delivered, "the deadline ended the run before the NZB was drained").toBeLessThan(parts);
-  expect(result.usenet!.articlesRequested).toBeLessThan(parts);
-  expect(result.usenet!.missing).toBe(0);
-  expect((await queueState(request)).isPaused).toBe(false);
-  await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
-  // Only delivered articles are booked; the one cut off by the deadline is not.
-  await expectBooked(request, before, result.bytes, "the deadline run");
+    const before = await bytesDownloaded(request);
+    const id = await speed.run();
+    await expect.poll(async () => (await speedTestRun(request, id)).result?.usenet?.delivered ?? 0,
+      { timeout: 0, message: "this run delivered an article before advancing its deadline" }).toBeGreaterThan(0);
+    advanceClock(maxDuration * 1000);
+    await speed.finished(id, "Completed");
+    const run = await speedTestRun(request, id);
+    expect(run).toMatchObject({ status: "COMPLETED", failure: null });
+    const result = run.result!;
+    expect(result.bytes).toBeGreaterThan(0);
+    expect(result.usenet!.delivered).toBeGreaterThan(0);
+    expect(result.usenet!.delivered, "the deadline ended the run before the NZB was drained").toBeLessThan(parts);
+    expect(result.usenet!.articlesRequested).toBeLessThan(parts);
+    expect(result.usenet!.missing).toBe(0);
+    expect((await queueState(request)).isPaused).toBe(false);
+    await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+    // Only delivered articles are booked; the one cut off by the deadline is not.
+    await expectBooked(request, before, result.bytes, "the deadline run");
+  } finally {
+    fs.rmSync(hold, { force: true });
+  }
 });
 
 test("ST09 a run books against the server's download quota, stops at it, and is refused once it is used up", async ({ cleanPage: page, request }) => {

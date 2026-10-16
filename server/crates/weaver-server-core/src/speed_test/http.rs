@@ -143,6 +143,14 @@ impl RoutedClient {
                     return attempt.error("too many redirects");
                 }
                 let url = attempt.url();
+                if url.scheme() == "http"
+                    && attempt
+                        .previous()
+                        .iter()
+                        .any(|previous| previous.scheme() == "https")
+                {
+                    return attempt.error("HTTPS speed-test redirects must remain HTTPS");
+                }
                 if matches!(url.scheme(), "http" | "https")
                     && url.host_str().map(|h| h.trim_matches(['[', ']']))
                         == Some(same_host.as_str())

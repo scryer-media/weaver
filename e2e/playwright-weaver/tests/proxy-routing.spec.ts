@@ -226,7 +226,6 @@ test("proxy ladder: ordered recovery, host fallback, fail closed and active revo
 // Weaver resolves the server's name with the host's resolver, here the
 // fixture's canary, and hands the proxy the address it got back.
 test("a proxy Weaver resolves for is handed the address and carries a download", async ({ request }) => {
-  test.setTimeout(4 * 60_000);
   const events = async (after: number) => {
     const response = await request.get(`${controlUrl}/events?after=${after}`);
     expect(response.ok()).toBeTruthy();
@@ -276,7 +275,6 @@ test("a proxy Weaver resolves for is handed the address and carries a download",
 // the servers again while their answers are for no time at all, and not once
 // they are held.
 test("a proxy hop holds its DNS servers' answer for its TTL", async ({ request }) => {
-  test.setTimeout(4 * 60_000);
   const events = async (after: number) => {
     const response = await request.get(`${controlUrl}/events?after=${after}`);
     expect(response.ok()).toBeTruthy();

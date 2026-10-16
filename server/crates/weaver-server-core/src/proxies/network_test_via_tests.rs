@@ -89,6 +89,31 @@ async fn refusal(runtime: &NetworkRuntime, path: LegPath, subject: TestSubject) 
         .unwrap_err()
 }
 
+#[tokio::test]
+async fn empty_pool_tests_are_refused_before_planning() {
+    let runtime = runtime_with(
+        vec![],
+        vec![ProxyPool {
+            id: 7,
+            name: "empty".into(),
+            kind: ProxyKind::Socks5,
+            member_ids: vec![],
+            enabled: true,
+        }],
+        vec![],
+    );
+    for subject in [TestSubject::Pool(7), TestSubject::Members(7)] {
+        for target in [None, Some(("example.test".to_owned(), 443))] {
+            let error = runtime
+                .test_via(&draft(LegPath::Direct), subject, target)
+                .await
+                .unwrap_err();
+            assert_eq!(error, NetworkRefusal::RoutePoolEmpty);
+        }
+    }
+    runtime.shutdown().await;
+}
+
 #[test]
 fn every_path_through_a_route_is_tried_once() {
     let pools = HashMap::from([(
