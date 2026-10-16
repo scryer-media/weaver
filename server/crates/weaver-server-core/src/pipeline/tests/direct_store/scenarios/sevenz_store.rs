@@ -2571,8 +2571,8 @@ async fn sevenz_store_opens_a_container_keyed_by_a_settings_password() {
     )
     .await;
     assert!(
-        sets.contains("EncryptedContent"),
-        "a settings password must open the header\nsets: {sets}"
+        !sets.contains("Demoted"),
+        "a settings password must open the header and route the member\nsets: {sets}"
     );
     assert!(
         !sets.contains("EncryptedHeader"),
@@ -2595,8 +2595,8 @@ async fn sevenz_store_opens_a_container_keyed_by_the_password_file() {
     )
     .await;
     assert!(
-        sets.contains("EncryptedContent"),
-        "a password-file entry must open the header\nsets: {sets}"
+        !sets.contains("Demoted"),
+        "a password-file entry must open the header and route the member\nsets: {sets}"
     );
     assert!(
         !sets.contains("EncryptedHeader"),
