@@ -522,7 +522,7 @@ test("a proxy's names are resolved by Weaver or the proxy, with the host's DNS o
 
 /** Opens Test via from the proxy's own line. */
 async function testingVia(page, name) {
-  await action(line(page, name), "Test via").click();
+  await action(line(page, name), "Test").click();
   const dialog = page.getByRole("dialog", { name: "Test via", exact: true });
   await action(dialog, "Egress").waitFor();
   return dialog;
