@@ -89,7 +89,7 @@ pub(super) fn unrar_0_11_block_header_checksum_mismatch(detail: &str) -> bool {
     detail.starts_with("RAR5 block header checksum mismatch")
 }
 
-// sevenz-turbo 0.27.0: `Error::BlockDecode` keeps its cause only as the
+// sevenz-turbo 0.28.0: `Error::BlockDecode` keeps its cause only as the
 // rendered `message`, the debug form of the error the block failed on. The
 // password, the I/O kind, and a checksum failure wrapped in an I/O error are
 // all read back from it.
@@ -99,7 +99,7 @@ pub(super) fn unrar_0_11_block_header_checksum_mismatch(detail: &str) -> bool {
 // `cause` and answers `io_error()`, `is_password_required()` and
 // `has_checksum_mismatch()`. Delete this function and its call when weaver's
 // sevenz-turbo pin moves to a release that carries it.
-pub(super) fn sevenz_0_27_block_error_class(
+pub(super) fn sevenz_0_28_block_error_class(
     kind: sevenz_turbo::BlockErrorKind,
     message: &str,
     rendering: &str,
@@ -109,7 +109,7 @@ pub(super) fn sevenz_0_27_block_error_class(
     }
     if kind == sevenz_turbo::BlockErrorKind::Io
         && matches!(
-            sevenz_0_27_block_io_error_kind(message),
+            sevenz_0_28_block_io_error_kind(message),
             Some(io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof)
         )
     {
@@ -133,7 +133,7 @@ pub(super) fn sevenz_0_27_block_error_class(
 // `Kind(UnexpectedEof)`, or `kind: InvalidData` in the custom, message and OS
 // shapes. The first kind named is the reader's own, never one quoted inside
 // its message.
-fn sevenz_0_27_block_io_error_kind(message: &str) -> Option<io::ErrorKind> {
+fn sevenz_0_28_block_io_error_kind(message: &str) -> Option<io::ErrorKind> {
     let start = ["kind: ", "Kind("]
         .iter()
         .filter_map(|marker| message.find(marker).map(|at| at + marker.len()))
@@ -149,10 +149,10 @@ fn sevenz_0_27_block_io_error_kind(message: &str) -> Option<io::ErrorKind> {
     }
 }
 
-// sevenz-turbo 0.27.0: `Error::Other` raised outside a block carries only
+// sevenz-turbo 0.28.0: `Error::Other` raised outside a block carries only
 // text. One of its texts names a checksum, and a 7z failure naming one has
 // always been kept for repair.
-pub(super) fn sevenz_0_27_other_names_checksum(text: &str) -> bool {
+pub(super) fn sevenz_0_28_other_names_checksum(text: &str) -> bool {
     text.to_ascii_lowercase().contains("checksum")
 }
 

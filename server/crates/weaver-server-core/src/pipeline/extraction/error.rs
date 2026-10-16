@@ -295,7 +295,7 @@ pub(crate) fn sevenz_error_class(error: &sevenz_turbo::Error) -> ExtractionError
             ..
         } => ExtractionErrorClass::Recoverable,
         Error::BlockDecode { kind, message, .. } => {
-            adapters::sevenz_0_27_block_error_class(*kind, message, &error.to_string())
+            adapters::sevenz_0_28_block_error_class(*kind, message, &error.to_string())
         }
         Error::ChecksumVerificationFailed | Error::NextHeaderCrcMismatch => {
             ExtractionErrorClass::Recoverable
@@ -303,7 +303,7 @@ pub(crate) fn sevenz_error_class(error: &sevenz_turbo::Error) -> ExtractionError
         Error::Io(error, _) | Error::FileOpen(error, _) | Error::MaybeBadPassword(error) => {
             io_error_class(error)
         }
-        Error::Other(text) if adapters::sevenz_0_27_other_names_checksum(text) => {
+        Error::Other(text) if adapters::sevenz_0_28_other_names_checksum(text) => {
             ExtractionErrorClass::Recoverable
         }
         _ => ExtractionErrorClass::Terminal,

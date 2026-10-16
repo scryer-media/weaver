@@ -326,7 +326,7 @@ fn unrar_0_11_block_header_checksum_mismatch_is_recognised() {
 }
 
 #[test]
-fn sevenz_0_27_block_errors_are_read_from_their_rendering() {
+fn sevenz_0_28_block_errors_are_read_from_their_rendering() {
     use sevenz_turbo::BlockErrorKind;
     let block = |kind, message: String| sevenz_turbo::Error::BlockDecode {
         block_index: 0,
@@ -345,7 +345,7 @@ fn sevenz_0_27_block_errors_are_read_from_their_rendering() {
         let sevenz_turbo::Error::BlockDecode { kind, message, .. } = error else {
             unreachable!()
         };
-        sevenz_0_27_block_error_class(*kind, message, &error.to_string())
+        sevenz_0_28_block_error_class(*kind, message, &error.to_string())
     };
     let recoverable = [
         read_failure(io::ErrorKind::UnexpectedEof.into()),
@@ -381,14 +381,14 @@ fn sevenz_0_27_block_errors_are_read_from_their_rendering() {
     );
 }
 
-// The one `Error::Other` text sevenz-turbo 0.27.0 raises that names a
+// The one `Error::Other` text sevenz-turbo 0.28.0 raises that names a
 // checksum. It is raised only when a decoder ends a verified stream without
 // reporting its checksum, which no input built here can provoke, so its text
 // is copied from the crate.
 #[test]
-fn sevenz_0_27_other_checksum_text_is_recognised() {
-    assert!(sevenz_0_27_other_names_checksum(
+fn sevenz_0_28_other_checksum_text_is_recognised() {
+    assert!(sevenz_0_28_other_names_checksum(
         "the decoder reported no checksum for bytes that were read to their end"
     ));
-    assert!(!sevenz_0_27_other_names_checksum("unsupported archive"));
+    assert!(!sevenz_0_28_other_names_checksum("unsupported archive"));
 }
