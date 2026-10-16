@@ -237,33 +237,36 @@ fn try_extract_inner(
         // listing's full-dictionary estimate would reject otherwise bounded
         // runs before their size is known. Header parsing/KDF limits stay the
         // same; unsupported payload graphs return to the ordinary path.
+        // The parse failure keeps its class until the password retry below
+        // has read it; the other failures are reported as they read.
         let permit = context
             .budget
             .reserve_memory_wait(chase_header_pass_memory_bytes(
                 end_header_bytes,
                 context.budget.max_memory_bytes(),
-            ))?;
+            ))
+            .map_err(|error| ExtractionError::terminal(String::from(error)))?;
         let reader = GatedSplitReader::open(paths, Arc::clone(coverage))
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ExtractionError::terminal(error.to_string()))?;
         let reader = BudgetedReader::new(
             std::io::BufReader::with_capacity(64 << 10, reader),
             Arc::clone(&context.budget),
         );
         let mut reader = HeaderReads::new(reader, context.budget.max_memory_bytes())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ExtractionError::terminal(error.to_string()))?;
         let archive = sevenz_turbo::Archive::read_with_limits(
             &mut reader,
             password,
             &sevenz_archive_limits(&context.budget),
         )
         .map_err(|error| sevenz_extraction_error(&error))?;
-        Ok::<_, String>((archive, permit, reader.ranges))
+        Ok::<_, ExtractionError>((archive, permit, reader.ranges))
     };
     let ((archive, _header_memory, header_ranges), encrypted_headers) = loop {
         let parsed = match read_header(&sevenz_turbo::Password::empty()) {
             Ok(archive) => Ok((archive, false)),
             Err(error)
-                if error.starts_with("WEAVER_PASSWORD_REQUIRED:")
+                if error.is(ExtractionErrorClass::PasswordRequired)
                     && !context.password.is_empty() =>
             {
                 read_header(&context.password).map(|archive| (archive, true))
@@ -274,7 +277,7 @@ fn try_extract_inner(
             epoch = coverage.run_epoch().map_err(|error| error.to_string())?;
             continue;
         }
-        break parsed?;
+        break parsed.map_err(String::from)?;
     };
     let archive = Arc::new(archive);
     // New positional adapters retain file maps/checksum boundaries and a
@@ -467,7 +470,10 @@ mod tests {
     use super::*;
     use crate::operations::metrics::PipelineMetrics;
     use crate::pipeline::extraction::ExtractionLimits;
-    use sevenz_turbo::{ArchiveEntry, ArchiveWriter, SourceReader, encoder_options::Lzma2Options};
+    use sevenz_turbo::{
+        ArchiveEntry, ArchiveWriter, SourceReader,
+        encoder_options::{AesEncoderOptions, Lzma2Options},
+    };
     use std::io::Cursor;
 
     fn fixture(copy: bool) -> (Vec<u8>, Vec<Vec<u8>>) {
@@ -628,6 +634,46 @@ mod tests {
                 .load(Ordering::Relaxed),
             parts.iter().map(|part| part.len() as u64).sum::<u64>()
         );
+    }
+
+    // A header encrypted with the content lists only once the job's password
+    // opens it, so the chase reads it again with that password.
+    #[test]
+    fn positional_chase_reads_an_encrypted_header_with_the_jobs_password() {
+        let temp = tempfile::tempdir().unwrap();
+        let member: Vec<u8> = (0..262_161usize)
+            .map(|i| ((i * 29) ^ (i >> 7)) as u8)
+            .collect();
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        let mut options = Lzma2Options::from_level_mt(1, 2, 1 << 20);
+        options.set_dictionary_size(1 << 16);
+        writer.set_content_methods(vec![
+            AesEncoderOptions::new(sevenz_turbo::Password::new("fixture password")).into(),
+            options.into(),
+        ]);
+        writer.set_encrypt_header(true);
+        let mut entry = ArchiveEntry::new_file("member");
+        entry.size = member.len() as u64;
+        writer
+            .push_archive_entry(entry, Some(Cursor::new(&member)))
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let (paths, coverage, end_header) = source(temp.path(), &bytes);
+        let mut context = test_context(temp.path(), bytes.len() as u64, end_header);
+        context.password = sevenz_turbo::Password::new("fixture password");
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap(),
+        );
+        let destination = temp.path().join("destination");
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        // AES content is no positional run, so the set goes on to the
+        // streaming chase instead of failing as if it had no password.
+        let outcome = try_extract(&context, &paths, &coverage, &pool, &destination, &slot);
+        assert!(matches!(outcome, Ok(None)), "{:?}", outcome.err());
+        assert!(slot.lock().unwrap().is_none());
     }
 
     #[test]
