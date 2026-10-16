@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use crate::pipeline::direct_store::{DirectStoreSettings, wiring::DirectStoreRuntime};
 use crate::pipeline::repair::par3::work::Coordinator;

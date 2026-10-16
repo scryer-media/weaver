@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Event-driven campaigns against retained PAR3 state. No wall clock, network,
 // reference executable, or optional corpus is needed. Each assertion names its
 // seed and a minimized event trace. WEAVER_PAR3_SCHEDULE_SEED replays one seed;

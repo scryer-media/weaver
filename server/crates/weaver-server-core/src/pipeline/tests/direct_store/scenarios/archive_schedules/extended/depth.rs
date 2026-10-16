@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Deeper schedules over the core direct-store RAR layouts: a fifth article,
 // a second duplicate, and two interruptions in one run.
 //

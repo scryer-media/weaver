@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Per-stage timing of the whole-buffer article decode (`decode_nntp`), the
 // path the download pipeline runs for every yEnc article.
 //

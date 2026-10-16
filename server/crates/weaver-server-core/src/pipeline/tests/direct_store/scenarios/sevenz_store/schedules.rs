@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Tail-metadata discovery under every bounded arrival/duplicate schedule.
 use super::super::archive_schedules::{
     ExtractionProfile, Interruption, RecoveryFormat, Route, Schedule, ScheduleOptions, Selection,

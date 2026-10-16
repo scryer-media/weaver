@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Public endpoints a bandwidth run can pull bytes from. Every one serves
 // arbitrary bytes over a plain HTTPS GET with no token.
 

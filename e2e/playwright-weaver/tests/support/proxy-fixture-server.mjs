@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Isolated e2e infrastructure. Ordinary runs forward only fixture destinations;
 // the opt-in real-provider runner supplies an exact host/port allowlist.
 import net from "node:net";

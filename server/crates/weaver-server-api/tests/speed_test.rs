@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 mod common;
 use async_graphql::{Request, UploadValue, Variables};
 use common::{TestHarness, assert_no_errors, response_data};

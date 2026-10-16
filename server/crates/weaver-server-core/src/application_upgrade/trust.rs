@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Process-wide TLS and Sigstore trust setup for upgrade downloads.
 //
 // `application-updater` builds its HTTP client on reqwest's

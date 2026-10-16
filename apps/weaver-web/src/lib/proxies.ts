@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { closedPath, directLeg, routeInput, type NetworkRoute } from "./networking.ts";
 export type ProxyKind = "HTTP_CONNECT" | "HTTP3_CONNECT" | "SOCKS5" | "SSH" | "WIRE_GUARD";
 /** Who resolves a name dialled through a proxy: Weaver, or the proxy. */

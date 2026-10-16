@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 function stripTrailingComment(line: string): string {
   for (let index = 0; index < line.length; index += 1) {
     const character = line[index];

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // How far a database schema upgrade has got.
 //
 // Migrations run before Weaver can serve anything, so a long upgrade looks,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Exhaust every publication subset around a placement's write and actor
 // commit. Semaphores control I/O; receipt application is a separate event.
 use super::*;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A test reaches what it tests through a route the operator drafted for it,
 // and through nothing else. Every path through the draft is tried on its
 // own: each leg's direct line, each rung, each member of a pool rung. A

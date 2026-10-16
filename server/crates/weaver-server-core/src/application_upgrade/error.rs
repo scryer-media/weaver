@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The boundary between Weaver's upgrade errors and the shared upgrade core.
 //
 // Weaver's own [`crate::error::Error`] covers configuration and I/O, which is

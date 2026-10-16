@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // HTTP request counters and latency, keyed by **route template**.
 //
 // Raw request paths are never used as a label: `/api/jobs/{job_id}/nzb` would

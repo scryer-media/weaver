@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useClient, useQuery } from "urql";
 import { QUEUE_EVENTS_SUBSCRIPTION, QUEUE_PAGE_QUERY } from "@/graphql/queries";

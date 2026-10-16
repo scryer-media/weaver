@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Hooks the binary installs so the pipeline can hand allocator memory back
 // at the two points where it knows the memory is no longer wanted: a thread
 // going to sleep, and a job reaching a terminal state.

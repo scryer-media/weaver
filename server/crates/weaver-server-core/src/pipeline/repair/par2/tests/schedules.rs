@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Replayable source/recovery schedules, checked against fresh native sessions.
 // Fixtures contain real GF(2^16) recovery, never placeholder recovery bytes.
 use crate::pipeline::repair::backend::RepairBackend;

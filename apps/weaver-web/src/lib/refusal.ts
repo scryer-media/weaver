@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import type { Translate } from "@/lib/context/translate-context";
 
 /** As much of a failed GraphQL request as the sentence shown for it needs. */

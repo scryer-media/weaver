@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The Windows desktop wrapper: a notification-area icon and a WebView2 window.
 //
 // The tray window itself is invisible and exists only to own the shell icon,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use weaver_nntp::{NntpClient, NntpConnection, ServerConfig, ServerId, client::NntpClientConfig};

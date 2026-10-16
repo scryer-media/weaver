@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::{Par3RepairRequest, RepairBackend};
 use par3_rs::ingest::{PacketScanner, ScanEvent};
 use par3_rs::runtime::{EngineError, ExecutionOptions};

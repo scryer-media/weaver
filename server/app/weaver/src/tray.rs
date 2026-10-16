@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // `weaver-tray`: the desktop wrapper around the Weaver server.
 //
 // The wrapper is not a second implementation of Weaver. It starts and stops

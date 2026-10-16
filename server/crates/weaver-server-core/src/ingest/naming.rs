@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 pub fn derive_release_name(primary: Option<&str>, secondary: Option<&str>) -> String {
     for candidate in [primary, secondary].into_iter().flatten() {
         let trimmed = candidate.trim();

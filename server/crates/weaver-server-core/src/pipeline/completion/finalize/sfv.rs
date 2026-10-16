@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // SFV verification for jobs with no PAR2 set.
 //
 // A job carrying recovery data is adjudicated by PAR2 and never reaches this

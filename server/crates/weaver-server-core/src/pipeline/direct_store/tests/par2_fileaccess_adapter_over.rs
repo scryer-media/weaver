@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The PAR2 `FileAccess` adapter over virtual volumes
 // Restart primitives — the pieces the end-to-end restart tests exercise only in
 // The restart gate re-arm, over a router rebuilt from cached facts

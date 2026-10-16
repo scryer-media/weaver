@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Turns a runtime snapshot into Prometheus exposition text.
 //
 // Every label set that mirrors an enum is derived from that enum's `ALL`

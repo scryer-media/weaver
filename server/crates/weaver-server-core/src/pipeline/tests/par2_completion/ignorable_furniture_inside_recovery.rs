@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Ignorable "furniture" inside the recovery set
 // Post-verdict re-entry
 // Partial recovery volumes

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A full-set extraction failure is routed on the class its engine's error
 // mapped to: damaged bytes wait for recovery, a structure no repair changes
 // and a password no candidate opened end the job. Each error here comes

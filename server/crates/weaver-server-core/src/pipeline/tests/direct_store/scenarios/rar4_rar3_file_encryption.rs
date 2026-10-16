@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // RAR4/RAR3 file encryption
 // Header-encrypted (`-hp`) sets
 // The dual-CRC grid, fed from the direct seam

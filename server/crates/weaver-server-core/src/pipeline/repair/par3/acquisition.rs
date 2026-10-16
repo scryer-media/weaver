@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Bounded recovery windows. Download estimates control scheduling, never proof.
 use super::*;
 use crate::jobs::ids::SegmentId;

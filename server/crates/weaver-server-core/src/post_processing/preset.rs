@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // What a script's header offers as a starting point for an instance.
 //
 // A preset fills a form and seeds the instances a header asks for. It is read

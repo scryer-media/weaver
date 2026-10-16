@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // PAR3 across its surface: a sidecar set, a set inserted inside a 7z after
 // its end header, and both at once; Cauchy and FFT codes; recovery with
 // margin, exact and one block short; three block sizes; one member and two;

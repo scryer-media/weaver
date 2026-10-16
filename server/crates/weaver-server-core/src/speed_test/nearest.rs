@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The nearest server of a list provider: every listed server's ping
 // endpoint is asked at once through the run's leg, and the first to answer
 // with a success status is the shortest round trip through the route.

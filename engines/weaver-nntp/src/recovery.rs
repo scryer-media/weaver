@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Connection-scoped recovery admission and stale-outcome fencing.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

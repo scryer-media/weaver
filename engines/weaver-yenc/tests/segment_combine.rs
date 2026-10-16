@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Pins the CRC32 combine this crate exposes bit-identical to
 // `par2_rs::checksum::Crc32CombineOp` — the combine weaver's fused pipeline
 // already uses to compose part CRCs into a completed-file CRC without

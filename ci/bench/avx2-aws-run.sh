@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 # avx2-aws-run.sh — launch a self-contained, repeatable AVX2 weaver-vs-rapidyenc
 # perf profile on a fresh AWS AMD Zen2/Zen3 (c5a/c6a) instance. One command:
 # bundles the current commit, uploads it to S3, boots

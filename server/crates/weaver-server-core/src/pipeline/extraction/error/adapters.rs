@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Causes that reach weaver only as rendered text.
 //
 // Each function reads one crate's rendering of one cause, because that crate

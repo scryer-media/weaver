@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Named secrets: a value the operator types once, stored encrypted, and
 // linked by reference from any number of instance inputs.
 //

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { Component, useContext, useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { isRouteErrorResponse, useNavigate, useRouteError } from "react-router";
 import { BrandLockup } from "@/lib/brand";

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // An obfuscated split 7z: hex names, and parts that carry nothing saying
 // which part they are.
 //

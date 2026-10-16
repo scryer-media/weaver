@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use crate::pipeline::archive::test_support::{
     RAR5_SIGNATURE as TEST_RAR5_SIG, end_header as build_test_rar_end_header,

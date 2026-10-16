@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::model::{
     DEFAULT_UNACCEPTABLE_EXTENSIONS, OptionName, OptionValue, PostProcessingSettings,
     PostProcessingSummary, ResolvedOption, ScriptAdapter, ScriptManifest, ScriptName, ScriptOption,

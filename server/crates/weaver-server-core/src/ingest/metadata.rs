@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 pub const ORIGINAL_TITLE_METADATA_KEY: &str = "weaver.original_title";
 // A name the job was given after submission. It replaces the NZB-derived
 // name, the release title and the completed folder name, and it survives a

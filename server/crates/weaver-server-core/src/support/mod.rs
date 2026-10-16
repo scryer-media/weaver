@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Support reports: an NZB analysis plus what Weaver did with the job.
 //
 // The NZB half is [`weaver_nzb::analysis`]. This half appends the job's

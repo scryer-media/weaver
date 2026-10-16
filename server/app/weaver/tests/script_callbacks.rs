@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A running script calling weaver back: real scripts, the real supervisor,
 // and the run's token played the way the API plays it.
 //

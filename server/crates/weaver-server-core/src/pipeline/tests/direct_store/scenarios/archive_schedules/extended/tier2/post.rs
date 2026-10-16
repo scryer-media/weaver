@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // What a tier-two job posts, article by article, as the wire carries it.
 //
 // Every article is rendered to the bytes a server would send and decoded by

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 # Build the pinned e2e oracle images a corpus-generation job needs, and no
 # others. `ONLY` is a space-separated list of toolchain ids (from
 # `fixturegen --list-json`); a pin whose id is not in the list is skipped, the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // searchEnd (end-detection) tax decomposition harness.
 //
 // Same protocol as `decode_timing` (min of 2000 iters, in-process A/B against

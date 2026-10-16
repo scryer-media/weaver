@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 # avx512-aws-userdata.sh — EC2 cloud-init user-data. Runs on boot as root on a
 # fresh Ubuntu 24.04 Intel AVX-512 (c6i/c7i) or AMD Zen4 (c7a) instance and drives
 # the whole VBMI2 weaver-vs-rapidyenc validation end to end, unattended:

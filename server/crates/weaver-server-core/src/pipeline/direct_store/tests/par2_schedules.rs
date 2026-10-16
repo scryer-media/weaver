@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Coverage withdrawal and replacement through the real direct-volume adapter.
 use super::*;
 use crate::pipeline::tests::build_repairable_par2_set_for_files;

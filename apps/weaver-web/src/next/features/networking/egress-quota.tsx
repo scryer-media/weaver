@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useQuery } from "urql";
 import { EGRESS_QUOTAS_QUERY } from "@/graphql/networking";
 import type { Translate } from "@/lib/context/translate-context";

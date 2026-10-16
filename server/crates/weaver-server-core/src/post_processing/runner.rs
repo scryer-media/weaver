@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Process execution for one script.
 //
 // The SABnzbd and NZBGet environment contracts are the load-bearing asset here:

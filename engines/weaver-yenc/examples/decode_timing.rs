@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Standalone weaver-yenc decode timing harness (no rapidyenc dependency).
 //
 // Times `decode_rapidyenc` on the same five fixtures as the parity bench so a

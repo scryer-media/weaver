@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use crate::decode::DecodeOptions;
 use crate::error::YencError;
 use crate::types::{YencHeaderDefects, YencMetadata};

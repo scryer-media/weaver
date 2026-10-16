@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useLiveJobDownloadRate } from "@/lib/context/live-data-context";
 import type { JobData } from "@/lib/job-types";
 

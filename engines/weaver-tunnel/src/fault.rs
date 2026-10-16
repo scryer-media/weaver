@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Why a proxy failed, as a stable code and the values its sentence names.
 // The web words each code itself; `Display` is the English for logs and for
 // a web build that has no sentence for the code.

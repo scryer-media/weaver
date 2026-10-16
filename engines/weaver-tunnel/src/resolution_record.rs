@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // How the names a test dial named were resolved.
 //
 // A test runs its dial inside a recording, and every lookup on that dial's

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::classify::{
     NameShape, StemClass, classify_name, file_ext, parse_subject_numbers, stem_class,
 };

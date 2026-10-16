@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Lanes must not idle while a job still has work they could serve.
 //
 // An established connection asking for its next articles is the cheapest

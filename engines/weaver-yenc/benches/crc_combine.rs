@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // CRC32 combine: the native zlib-style operator against `crc-fast`'s
 // zeros-operator matrices, at the lengths the pipeline actually combines
 // (checkpoint segments, article sizes, file-sized tails).

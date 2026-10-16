@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Naming policy for the files a finished job delivers.
 //
 // [`crate::deobfuscate`] answers "is this *posted* file's name meaningless",

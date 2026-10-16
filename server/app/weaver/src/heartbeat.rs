@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Periodic liveness and process-memory reporting.
 //
 // A process that vanishes without writing a line leaves nothing to correlate

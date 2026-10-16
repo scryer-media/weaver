@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A WireGuard session as the carrier of another WireGuard tunnel.
 //
 // The tunnel stacked on top sends its encrypted packets through a UDP socket

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Continuation of the `impl Pipeline` block from `repair/par2.rs`.
 // Split out mechanically to keep the parent file readable; no behavior lives here
 // that is not simply a method of the same type.

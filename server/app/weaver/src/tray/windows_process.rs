@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Process plumbing for the Windows tray that the shared upgrade core does not
 // provide; finding, asking and stopping Weaver processes is
 // `application_updater::windows_process`.

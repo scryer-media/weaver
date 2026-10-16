@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Which of a server's resolved addresses new connections dial.
 //
 // A provider hostname usually resolves to several addresses, and they are

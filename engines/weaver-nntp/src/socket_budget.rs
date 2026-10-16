@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Physical socket ownership, independent of checked-out work and client generations.
 
 use std::collections::BTreeMap;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::path::PathBuf;
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 use std::sync::{

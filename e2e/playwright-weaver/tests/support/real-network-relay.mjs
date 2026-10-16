@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import dgram from "node:dgram";
 import net from "node:net";
 import { lookup } from "node:dns/promises";

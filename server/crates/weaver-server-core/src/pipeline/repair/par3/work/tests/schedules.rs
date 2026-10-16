@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Worker execution and actor handback are distinct events. Holding WorkDone
 // gives a deterministic gate after native work without a clock or a sleep.
 use super::*;

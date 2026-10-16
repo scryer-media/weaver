@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The parts of the Weaver desktop wrapper that are the same on every platform.
 //
 // Both wrappers supervise the same `weaver` server process, poll the same

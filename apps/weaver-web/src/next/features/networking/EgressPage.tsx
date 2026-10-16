@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { memo, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "urql";
 import { CREATE_EGRESS, DELETE_EGRESS, RESET_EGRESS_USAGE, UPDATE_EGRESS } from "@/graphql/networking";

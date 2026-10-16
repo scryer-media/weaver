@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Why a run that started failed, or why one of its connections ended. A
 // cause of its own is a variant a client words itself; `Display` is the
 // daemon's own account, naming the URL, host or status, for logs and for a

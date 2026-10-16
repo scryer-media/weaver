@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // History state that only the NZBGet-compatible API reads or writes. It lives
 // on the history row, so erasing the row erases it too, and the web UI never
 // sees it.

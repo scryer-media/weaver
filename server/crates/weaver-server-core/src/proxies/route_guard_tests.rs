@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // The guard that keeps every outbound connection on its route. clippy.toml
 // bans dialing, resolving and building HTTP clients outside the routing
 // layer. These tests pin the ban, every place it is lifted, and the crates

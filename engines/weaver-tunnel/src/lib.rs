@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Weaver adapters for shared tunnels and consumer routing.
 //
 // SSH, WireGuard and HTTP/3 protocols live in the Git-pinned `proxy-tunnels` crate.

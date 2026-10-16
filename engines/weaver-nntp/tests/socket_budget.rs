@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Loopback regressions for mixed backend ownership. No provider is contacted.
 use std::sync::Arc;
 use std::time::Duration;

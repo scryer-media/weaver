@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useClient, useQuery, type Client } from "urql";
 import {

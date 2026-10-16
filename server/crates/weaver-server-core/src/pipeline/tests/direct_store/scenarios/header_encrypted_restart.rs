@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A header-encrypted (`-hp`) set across a restart.
 //
 // Restoring a set rebuilds its layout from cached volume facts, and that

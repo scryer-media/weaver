@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { createContext, memo, useContext, useMemo, useState, type ReactNode } from "react";
 import { Navigate, useLocation } from "react-router";
 import { useTranslate } from "@/lib/context/translate-context";

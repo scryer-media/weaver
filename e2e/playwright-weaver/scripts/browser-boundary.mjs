@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 const helperImportPattern =
   /import\s*\{([^}]*)\}\s*from\s*["']\.\/helpers["']\s*;?/g;
 const importSourcePattern = /from\s*["']([^"']+)["']/g;

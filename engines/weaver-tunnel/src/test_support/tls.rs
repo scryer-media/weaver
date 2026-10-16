@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A self-signed certificate for loopback TLS fixtures.
 pub struct LoopbackCertificate {
     pub cert_der: Vec<u8>,

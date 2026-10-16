@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // yEnc encoding and decoding for Usenet binary articles.
 //
 // This crate provides synchronous yEnc decode and encode functions.

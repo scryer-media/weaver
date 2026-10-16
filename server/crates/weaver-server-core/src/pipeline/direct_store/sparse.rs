@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Sparse marking for the files direct-store creates with holes in them.
 //
 // Three populations are sparse by construction, and all three are created by

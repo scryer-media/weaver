@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import type { LocaleDictionary } from "@/lib/i18n/types";
 
 /** French strings for the Next interface; the keys and their order follow `en.ts`. */

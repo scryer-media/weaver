@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::rar_state::{self, RarDerivedPlan, RarSetPhase, RarSetState};
 use crate::jobs::assembly::{
     ArchiveMember as JobArchiveMember, ArchivePendingSpan as JobArchivePendingSpan,

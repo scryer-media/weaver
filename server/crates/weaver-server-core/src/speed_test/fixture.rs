@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Loopback sources for speed test tests: an NNTP server that serves yEnc
 // articles and can hold its answers, an HTTP(S) server that serves a test
 // NZB, other pages and fixed-size blobs, and a server that never answers.

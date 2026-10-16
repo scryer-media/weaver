@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 const ARGON2_M_COST: u32 = 19 * 1024;
 const ARGON2_T_COST: u32 = 2;
 const ARGON2_P_COST: u32 = 1;

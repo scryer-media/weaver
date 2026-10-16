@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A PAR2 repair re-entering an **encrypted** set, at the router.
 //
 // The set is driven through [`DirectSetRouter`] directly rather than through a

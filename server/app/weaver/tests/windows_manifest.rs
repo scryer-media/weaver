@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 #[test]
 fn windows_manifest_opts_into_long_paths() {
     let manifest = include_str!("../resources/windows/weaver.exe.manifest");

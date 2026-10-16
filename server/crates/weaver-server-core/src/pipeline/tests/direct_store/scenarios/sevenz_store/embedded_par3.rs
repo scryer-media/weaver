@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // A one-volume stored 7z that carries its own PAR3 recovery after the end
 // header: `[7z][PAR3 packets]`, the shape an inside-insertion writes.
 //

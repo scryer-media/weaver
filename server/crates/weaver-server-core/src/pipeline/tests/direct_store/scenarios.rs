@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Scenario fixtures shared by the direct-store test leaves below, plus
 // the leaves themselves. Every leaf sees this module and its parent through
 // `use super::*`.

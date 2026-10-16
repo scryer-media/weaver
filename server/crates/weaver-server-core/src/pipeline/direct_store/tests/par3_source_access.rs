@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use super::*;
 use crate::pipeline::repair::par3::virtual_source::{ReaderCache, VirtualInput, VirtualSource};
 use par3_rs::runtime::{EngineError, ExecutionOptions, HandleBudget};

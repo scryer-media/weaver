@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Duration};
 use weaver_tunnel::{

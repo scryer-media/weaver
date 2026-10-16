@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Command fixturegen rebuilds the Weaver e2e fixture corpus from the
 // declarative recipes in internal/fixturegen.
 //

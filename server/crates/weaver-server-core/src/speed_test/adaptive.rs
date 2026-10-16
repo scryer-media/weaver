@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // When a bandwidth run adds a connection, when its warm-up ends and when it
 // stops. It is fed the run's counters one tick at a time and keeps no clock
 // of its own.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // DNS-over-TCP fixture. Only names in the explicit table receive addresses.
 use std::{
     collections::HashMap,

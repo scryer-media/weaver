@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::fs::{self, File};
 use std::io::{self, Read, Seek};
 use std::path::{Component, Path, PathBuf};

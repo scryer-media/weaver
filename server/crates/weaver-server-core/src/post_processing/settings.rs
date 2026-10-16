@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Durable state for post-processing: settings, the scripts root, and the
 // per-job script results appended to the job's own rows.
 //

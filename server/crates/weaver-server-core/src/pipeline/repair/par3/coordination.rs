@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Cross-format repair ordering and source-evidence handoff.
 //
 // Engine-native verdicts remain separate; shared bytes are freshly verified

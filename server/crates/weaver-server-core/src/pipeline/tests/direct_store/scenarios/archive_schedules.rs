@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Bounded exhaustive schedules over four articles: one, two or four volumes,
 // every arrival permutation, loss subset and single duplicate/interruption.
 // This enumerates delivery boundaries, not background worker or filesystem

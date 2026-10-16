@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Per-job reuse for repeated message IDs. Ordinary batches do not enter here.
 // Cache files are disposable; restart reestablishes article evidence normally.
 

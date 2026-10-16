@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Authenticated PAR3 carrier discovery. All scanning runs on blocking workers;
 // the actor retains packet locations and incomplete metadata between arrivals.
 

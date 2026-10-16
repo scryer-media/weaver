@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Direct unpack: extracting archive members while their source is downloading.
 //
 // RAR uses incremental physical header prefixes and separate gated volume

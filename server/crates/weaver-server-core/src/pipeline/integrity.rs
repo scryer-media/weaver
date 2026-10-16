@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // In-stream PAR2 block verification from the decode pass's CRC segments.
 //
 // # Verification policy

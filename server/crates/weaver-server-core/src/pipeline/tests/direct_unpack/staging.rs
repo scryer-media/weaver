@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Where a chase stages its output, and who makes that directory.
 //
 // Arming runs on the pipeline task, so it must not touch the staging tree at

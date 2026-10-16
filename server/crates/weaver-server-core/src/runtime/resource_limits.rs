@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 #[cfg(any(unix, test))]
 const OPEN_FILE_LIMIT_TARGETS: [u64; 4] = [65_536, 16_384, 4_096, 1_024];
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // How much of an archive set is on disk, and the parking spot for a reader that has
 // run ahead of it.
 //

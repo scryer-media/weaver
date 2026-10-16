@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Live probe of every public endpoint a speed test reaches. It talks to the
 // internet, so it is ignored and runs only when asked for by name:
 // cargo nextest run -p weaver-server-core -E 'test(/providers::live/)' --run-ignored all

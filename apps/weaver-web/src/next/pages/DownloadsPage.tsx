@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { useClient, useMutation, useQuery } from "urql";
 import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";

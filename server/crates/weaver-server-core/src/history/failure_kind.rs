@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Why a failed job failed, kept on its history row so clients that report
 // per-stage results can tell a repair failure from a bad password, a full
 // disk or a failed move.

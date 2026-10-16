@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // PAR2 as the field posts it: the slice sizes posters choose, their
 // redundancy, recovery that is ample, exact or one block short, block counts
 // in the hundreds and the thousands, articles that line up with slices and

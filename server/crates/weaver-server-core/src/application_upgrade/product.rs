@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Weaver's product identity for in-application upgrades.
 //
 // Every string here appears in a signed manifest, on disk, or in a process

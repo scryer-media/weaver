@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 use std::io;
 
 pub(in crate::pipeline) const FD_CAPACITY_ERROR_MARKER: &str = "RAR source FD capacity pressure";

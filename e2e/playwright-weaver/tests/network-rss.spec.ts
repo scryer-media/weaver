@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import { expect, graphql, test } from "./helpers";
 import { type NetworkFlow, flowAfter, flowMark, ladderLeg, legOn, rssKey, rung } from "./support/network-flow";
 import { NetworkWorld, saveEvidence } from "./support/network-scenario";

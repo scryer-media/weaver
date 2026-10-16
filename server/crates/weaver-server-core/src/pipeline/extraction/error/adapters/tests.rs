@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Each adapter against the rendering the pinned crate produces. Where the
 // crate can be made to fail for real, it is; where the cause is a variant the
 // crate renders through its own `Display`, that rendering is taken from the

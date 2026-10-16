@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 // Small glob helpers for operator-supplied patterns.
 
 // Case-insensitive glob matcher supporting `*` (any sequence) and `?` (any

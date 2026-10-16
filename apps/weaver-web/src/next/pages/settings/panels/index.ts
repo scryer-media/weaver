@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import type { ComponentType } from "react";
 import type { IconName } from "../../../components/icons";
 import type { PanelListItem } from "../../../shell/rail-blocks";

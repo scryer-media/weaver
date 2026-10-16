@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
 import test from "node:test";
 import assert from "node:assert/strict";
 import { appendProxy, chainHopProfiles, moveProxy, directRouting, proxyLabels, withChainHop } from "../src/lib/proxies.ts";
