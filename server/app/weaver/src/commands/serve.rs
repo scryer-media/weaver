@@ -19,7 +19,7 @@ pub(crate) async fn run(
     base_url: &str,
     log_ring_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
     seeded_probe_latencies: Vec<(u32, std::time::Duration)>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<ServeStop, Box<dyn std::error::Error>> {
     let started_at = std::time::Instant::now();
     let mut security = RuntimeSecurityConfig::from_env()?;
     // Transitional, removed in 0.9.1: an install upgraded from a pre-0.9 data
@@ -665,20 +665,7 @@ pub(crate) async fn run(
     // are only distinguishable if the orderly one leaves this behind.
     heartbeat::log_peak_rss();
 
-    match stop {
-        ServeStop::Signal => Ok(()),
-        // Unix re-execs in place, so on success this never returns.
-        ServeStop::Restart => restart::restart_now().map_err(Into::into),
-        // The Windows upgrade helper is already waiting for these files to be
-        // released; restarting would only take them back.
-        ServeStop::ExitOnly => Ok(()),
-        // The bundle this process was launched from has been replaced, so the
-        // running wrapper cannot become the new build by restarting the server.
-        // This exit code is the whole of the request to relaunch the app.
-        ServeStop::BundleRelaunch => {
-            std::process::exit(crate::bundle_relaunch::BUNDLE_RELAUNCH_EXIT_CODE)
-        }
-    }
+    Ok(stop)
 }
 
 // The GraphQL endpoint as a script on this host reaches it, given the address
@@ -834,7 +821,7 @@ mod migration_tests {
 // Why the serve loop is leaving a healthy process: a signal, or a restart the
 // operator asked for. The teardown is identical; only the last step differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServeStop {
+pub(crate) enum ServeStop {
     Signal,
     Restart,
     // Shut down and stay down: an upgrade handed the installation to a helper
@@ -857,6 +844,25 @@ impl From<weaver_server_core::runtime::restart::RestartAction> for ServeStop {
 }
 
 impl ServeStop {
+    // The owner of the log guard supplies the drain before any exec/exit path
+    // that skips Rust destructors. Teardown has completed before this point.
+    pub(crate) fn finish(
+        self,
+        drain_logs: impl FnOnce(),
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::Restart => restart::restart_now(drain_logs).map_err(Into::into),
+            Self::Signal | Self::ExitOnly => {
+                drain_logs();
+                Ok(())
+            }
+            Self::BundleRelaunch => {
+                drain_logs();
+                std::process::exit(crate::bundle_relaunch::BUNDLE_RELAUNCH_EXIT_CODE)
+            }
+        }
+    }
+
     fn flush_context(self) -> &'static str {
         match self {
             Self::Signal => "serve shutdown",

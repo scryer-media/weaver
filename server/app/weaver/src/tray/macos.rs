@@ -529,6 +529,7 @@ define_class!(
             self.stop_supervision_polling();
             self.hide_popover();
             let _ = self.ivars().supervisor.borrow_mut().stop();
+            self.ivars().supervisor.borrow_mut().shutdown_logging();
         }
     }
 

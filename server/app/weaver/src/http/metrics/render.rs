@@ -296,6 +296,13 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         render_speed_tests(&mut out, metrics);
     }
 
+    let logs = weaver_server_core::runtime::log_delivery::counter_snapshot();
+    for (sink, (dropped, _)) in &logs {
+        out.sample(&f::LOG_DROPPED_EVENTS, &[("sink", *sink)], *dropped);
+    }
+    for (sink, (_, errors)) in &logs {
+        out.sample(&f::LOG_WRITE_ERRORS, &[("sink", *sink)], *errors);
+    }
     out.finish()
 }
 

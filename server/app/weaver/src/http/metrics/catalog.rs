@@ -37,6 +37,10 @@ macro_rules! metric_families {
 }
 
 metric_families! {
+    LOG_DROPPED_EVENTS = ("weaver_log_dropped_events_total", Counter, ["sink"],
+        "Whole log events dropped because of size, queue pressure, or shutdown.");
+    LOG_WRITE_ERRORS = ("weaver_log_write_errors_total", Counter, ["sink"],
+        "Log events whose sink write failed.");
     // ---- process / build ------------------------------------------------
     BUILD_INFO = ("weaver_build_info", Gauge,
         ["version", "commit", "target_arch", "target_os", "decoder_tier", "database_backend",

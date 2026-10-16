@@ -8,6 +8,8 @@ pub mod hardware_profile;
 pub mod job_debug_ring;
 pub mod kernels;
 pub mod log_buffer;
+pub mod log_delivery;
+pub mod log_file;
 pub mod log_filter;
 pub(crate) mod perf_probe;
 pub mod postprocess_pool;
