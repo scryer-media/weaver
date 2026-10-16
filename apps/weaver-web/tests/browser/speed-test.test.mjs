@@ -62,6 +62,10 @@ test("a leg taken down is left out of the test, the run is followed to its resul
     const plan = page.locator("main");
     const legSwitch = plan.getByRole("radiogroup", { name: "Leg 2", exact: true });
     await legSwitch.waitFor();
+    // The route's one earlier run is listed, and there is nothing to compare it with yet.
+    const runRow = (id) => page.locator(`main [data-row-id="${id}"]`);
+    await runRow(1).waitFor();
+    assert.equal(await page.getByRole("button", { name: "Compare", exact: true }).count(), 0);
     // Every box the route passes through has its Up/Down switch, Up until it is turned: both egresses, both legs, the pool's rung and each of its members.
     for (const name of ["WAN Fiber", "System", "Leg 1", "Leg 2", "Leg 1 rung 1", "Amsterdam", "Frankfurt"]) {
       const choices = plan.getByRole("radiogroup", { name, exact: true }).getByRole("radio");
@@ -139,12 +143,10 @@ test("a leg taken down is left out of the test, the run is followed to its resul
     for (const eyebrow of ["Average", "Peak", "Downloaded", "Decoded"]) await stat(result, eyebrow).waitFor();
     await page.getByRole("button", { name: "Run", exact: true }).and(page.locator(":enabled")).waitFor();
 
-    // The runs table holds this route's runs; the feed's run before it shows under All routes.
+    // The runs table holds this route's runs: the new one beside the one before it.
     const rows = page.locator("main").getByRole("button").filter({ hasText: "Usenet · 100 MB" });
     await rows.filter({ hasText: "Completed" }).waitFor();
-    assert.equal(await page.locator("main").getByRole("button").filter({ hasText: "Feed mirror" }).count(), 0);
-    await page.getByRole("checkbox", { name: "All routes", exact: true }).click();
-    await page.locator("main").getByRole("button").filter({ hasText: "Feed mirror" }).waitFor();
+    await runRow(1).waitFor();
     await rows.filter({ hasText: "leg 2" }).first().waitFor();
 
     // A run opens on its own detail; until Compare is pressed a row has no box to check.
@@ -161,7 +163,6 @@ test("a leg taken down is left out of the test, the run is followed to its resul
     assert.equal(await compare.getByText(hint, { exact: true }).count(), 2);
     await shot(page, "speed-compare-empty");
     // The whole row is the box's target, and a row no longer opens: the first pick takes the left side, the next the right.
-    const runRow = (id) => page.locator(`main [data-row-id="${id}"]`);
     await runRow(2).click();
     await page.getByRole("checkbox", { name: "Compare run 2", checked: true, exact: true }).waitFor();
     assert.equal(await runRow(2).getAttribute("aria-expanded"), null);
@@ -191,9 +192,8 @@ test("a leg taken down is left out of the test, the run is followed to its resul
     await page.getByRole("button", { name: "Stop", exact: true }).click();
     await compare.waitFor({ state: "detached" });
     assert.equal(await page.getByRole("checkbox", { name: "Compare run 2", exact: true }).count(), 0);
-    // A run started elsewhere runs again exactly as the daemon kept its request.
-    const feed = page.locator("main").getByRole("button").filter({ hasText: "Feed mirror" });
-    await feed.click();
+    // A run from before the page opened runs again exactly as the daemon kept its request.
+    await runRow(1).click();
     // The run's flow ends at the host it measured against.
     await page.locator("main svg").getByText("speed.fixture.invalid", { exact: true }).waitFor();
     // A bandwidth result is its rates; how much it downloaded is not one of its figures.
@@ -207,7 +207,7 @@ test("a leg taken down is left out of the test, the run is followed to its resul
     await page.waitForFunction(() => window.speedFixture.requests.filter((request) => request.name === "StartSpeedTest").length === 3);
     const stored = (await sent(page, "StartSpeedTest"))[2];
     assert.deepEqual(stored.input.bandwidth, { providerId: "cloudflare", server: null, customUrl: null });
-    assert.equal(stored.input.kind, "RSS");
+    assert.equal(stored.input.kind, "SERVER");
     assert.equal(errors.length, 0, errors.join("\n"));
   } finally {
     await page.close();
@@ -221,6 +221,9 @@ test("a feed is tested for bandwidth only, and a custom URL must be HTTPS before
     await page.getByRole("menuitemradio", { name: "Feed mirror", exact: true }).click();
     await page.getByRole("radio", { name: "Bandwidth", checked: true, exact: true }).waitFor();
     assert.equal(await page.getByRole("radio", { name: "Usenet", exact: true }).isDisabled(), true);
+    // The server's run stays with the server: the feed has none of its own.
+    await page.locator("main").getByText("No runs yet.", { exact: true }).waitFor();
+    assert.equal(await page.locator('main [data-row-id="1"]').count(), 0);
     // A bandwidth test asks only what to measure against, and runs as it opens; the flow ends there.
     const flow = page.getByRole("group", { name: "Egress interfaces connect through route legs and proxies to endpoints", exact: true });
     await flow.getByText("Cloudflare", { exact: true }).waitFor();

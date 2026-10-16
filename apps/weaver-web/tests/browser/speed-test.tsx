@@ -64,10 +64,10 @@ const providers = [
 
 const noOverrides = () => ({ downLegs: [], downRungs: [], downProxies: [], downEgresses: [] });
 const MIB = 1024 * 1024;
-/** A feed's bandwidth run from before the page opened, shown only under "All routes". */
+/** The server's bandwidth run from before the page opened, listed under its route alone. */
 const runs: SpeedTestRun[] = [
   {
-    id: 1, consumer: "rss:1", consumerName: "Feed mirror", kind: "BANDWIDTH",
+    id: 1, consumer: "server:1", consumerName: "news.fixture.invalid", kind: "BANDWIDTH",
     request: { bandwidth: { providerId: "cloudflare", server: null, customUrl: null }, usenet: null },
     status: "COMPLETED", phase: null, startedAt: 1790640000000, finishedAt: 1790640010000, failure: null,
     tested: { legs: [{ position: 0, egressId: 0, weight: 100, down: false, downReason: null, path: { kind: "DIRECT" }, target: 4 }], failover: "REDISTRIBUTE", overrides: noOverrides(), names: [{ kind: "egress", id: 0, name: "System" }] },

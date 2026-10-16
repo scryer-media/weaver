@@ -26,7 +26,7 @@ import { splitBytes, splitSpeed } from "../../data/format";
 import { SettingsBlocks, type SettingsBlock } from "../../pages/settings/framework";
 import { consumerName, defaultRoute, type Consumer, type NetworkingData } from "./data";
 import type { FlowEndpoint } from "./NetworkFlow";
-import { CheckRow, ControlLabel, StatusMark, stateLabel } from "./presentation";
+import { ControlLabel, StatusMark, stateLabel } from "./presentation";
 import { RoutePlanView, type LiveLeg } from "./RouteView";
 import {
   betterStats,
@@ -439,7 +439,6 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
   const consumer = consumers.find((candidate) => candidate.key === selected) ?? consumers[0];
   const [overrides, setOverrides] = useState<PathOverride>(noOverrides());
   const [form, setForm] = useState<TestForm>(() => defaultForm(consumer ?? { kind: "SERVER", cap: 1 }));
-  const [allRoutes, setAllRoutes] = useState(false);
   const [open, setOpen] = useState<Set<number>>(new Set());
   // Compare mode, and the run picked into each side of it: left first, then right.
   const [comparing, setComparing] = useState(false);
@@ -470,6 +469,9 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
     const next = consumers.find((candidate) => candidate.key === key);
     setSelected(key);
     setOverrides(noOverrides());
+    // The runs listed are the route's own, so a comparison does not outlive it.
+    setComparing(false);
+    setPicked([null, null]);
     if (next) {
       // The test carries over; only what the new route cannot take gives way: only
       // a server has a Usenet test, and it takes no more connections than its cap.
@@ -516,7 +518,7 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
     speedTest.start(requestInput(run, owner));
   };
 
-  const shown = allRoutes ? runs : runs.filter((run) => run.consumer === consumer.key);
+  const shown = runs.filter((run) => run.consumer === consumer.key);
   const pick = (id: number) =>
     setPicked(([left, right]) => {
       if (left === id) return [null, right];
@@ -601,7 +603,6 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
       kind: "table",
       id: "speed-runs",
       title: t("next.networking.speed.runs"),
-      note: t("next.networking.speed.runsNote"),
       columns: "20px 84px minmax(0, 1fr) minmax(0, 0.8fr) minmax(0, 0.8fr) 48px 88px 88px 80px 80px 104px",
       headers: [
         "",
@@ -680,18 +681,20 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
           ],
         };
       }),
-      footer: <CheckRow checked={allRoutes} onChange={setAllRoutes} label={t("next.networking.speed.allRoutes")} />,
+      // Two runs are the least there is to compare.
       action: comparing
         ? { label: t("next.networking.speed.stopComparing"), icon: "close", onClick: () => setComparing(false) }
-        : {
-            label: t("next.networking.speed.compare"),
-            icon: "compare",
-            onClick: () => {
-              setComparing(true);
-              setOpen(new Set());
-              setPicked([null, null]);
+        : shown.length < 2
+          ? undefined
+          : {
+              label: t("next.networking.speed.compare"),
+              icon: "compare",
+              onClick: () => {
+                setComparing(true);
+                setOpen(new Set());
+                setPicked([null, null]);
+              },
             },
-          },
       below: comparing ? (
         // Side by side, each run's eight parts sit on rows the two share, so like lines up with like.
         // A side with no run picked yet holds its place with a hint.
