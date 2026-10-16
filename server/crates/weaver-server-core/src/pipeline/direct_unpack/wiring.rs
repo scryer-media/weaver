@@ -2082,19 +2082,27 @@ impl Pipeline {
                         },
                         decode_threads,
                     };
-                    // A positional chase writes every member in place, child
-                    // archives included; those reach the nested engine from
-                    // disk once the set is installed.
-                    if let Some(outcome) =
-                        crate::pipeline::completion::finalize::extract::positional::try_extract(
-                            &context,
-                            &paths,
-                            &coverage,
-                            &pp_pool,
-                            &destination,
-                            &positional,
-                        )?
-                    {
+                    // A positional chase writes every member in place. With a
+                    // stream attached, child archives belong to it instead, so
+                    // the positional pass stands aside for an archive that has
+                    // any.
+                    use crate::pipeline::completion::finalize::extract::positional::{
+                        ChildArchives, try_extract,
+                    };
+                    let children = if channel.is_some() {
+                        ChildArchives::Streamed
+                    } else {
+                        ChildArchives::Written
+                    };
+                    if let Some(outcome) = try_extract(
+                        &context,
+                        &paths,
+                        &coverage,
+                        &pp_pool,
+                        &destination,
+                        &positional,
+                        children,
+                    )? {
                         return Ok(outcome);
                     }
                     let open_reader = || {

@@ -14,6 +14,17 @@ pub(in crate::pipeline) struct PositionalHandoff {
 
 pub(in crate::pipeline) type PositionalSlot = Arc<std::sync::Mutex<Option<PositionalHandoff>>>;
 
+/// What a positional chase does with a member that is itself an archive.
+#[derive(Clone, Copy)]
+pub(in crate::pipeline) enum ChildArchives {
+    /// Written in place like any other member; the nested engine opens them
+    /// from disk once the set is installed.
+    Written,
+    /// Owed to the set's stream, so the positional pass declines the archive
+    /// and the streaming decoder routes them.
+    Streamed,
+}
+
 struct ReplaySelection<'a> {
     coverage: &'a SetCoverage,
     selected: bool,
@@ -206,10 +217,21 @@ pub(in crate::pipeline) fn try_extract(
     pool: &Arc<rayon::ThreadPool>,
     destination: &Path,
     slot: &PositionalSlot,
+    children: ChildArchives,
 ) -> Result<Option<FullSetExtractionOutcome>, String> {
-    try_extract_inner(context, paths, coverage, pool, destination, slot, |_| {})
+    try_extract_inner(
+        context,
+        paths,
+        coverage,
+        pool,
+        destination,
+        slot,
+        children,
+        |_| {},
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_extract_inner(
     context: &SevenZipExtractionContext,
     paths: &[PathBuf],
@@ -217,6 +239,7 @@ fn try_extract_inner(
     pool: &Arc<rayon::ThreadPool>,
     destination: &Path,
     slot: &PositionalSlot,
+    children: ChildArchives,
     on_created: impl FnOnce(&Arc<PositionalManifest>),
 ) -> Result<Option<FullSetExtractionOutcome>, String> {
     let end_header_bytes = match context.decode_memory {
@@ -279,6 +302,16 @@ fn try_extract_inner(
         }
         break parsed.map_err(String::from)?;
     };
+    if matches!(children, ChildArchives::Streamed)
+        && archive.files.iter().any(|entry| {
+            !entry.is_directory()
+                && crate::pipeline::extraction::output::routes_to_child_engine(Path::new(
+                    entry.name(),
+                ))
+        })
+    {
+        return Ok(None);
+    }
     let archive = Arc::new(archive);
     // New positional adapters retain file maps/checksum boundaries and a
     // per-volume handle cache alongside the parsed archive. Include both
@@ -606,9 +639,17 @@ mod tests {
         );
         let destination = temp.path().join("destination");
         let slot = Arc::new(std::sync::Mutex::new(None));
-        let outcome = try_extract(&context, &paths, &coverage, &pool, &destination, &slot)
-            .unwrap()
-            .unwrap();
+        let outcome = try_extract(
+            &context,
+            &paths,
+            &coverage,
+            &pool,
+            &destination,
+            &slot,
+            ChildArchives::Written,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(outcome.extracted.len(), 4);
         assert!(!destination.join("folder/member-0").exists());
         let handoff = slot.lock().unwrap().take().unwrap();
@@ -670,7 +711,15 @@ mod tests {
         let slot = Arc::new(std::sync::Mutex::new(None));
         // AES content is no positional run, so the set goes on to the
         // streaming chase instead of failing as if it had no password.
-        let outcome = try_extract(&context, &paths, &coverage, &pool, &destination, &slot);
+        let outcome = try_extract(
+            &context,
+            &paths,
+            &coverage,
+            &pool,
+            &destination,
+            &slot,
+            ChildArchives::Written,
+        );
         assert!(matches!(outcome, Ok(None)), "{:?}", outcome.err());
         assert!(slot.lock().unwrap().is_none());
     }
@@ -690,9 +739,17 @@ mod tests {
         let destination = temp.path().join("destination");
         let slot = Arc::new(std::sync::Mutex::new(None));
         assert!(
-            try_extract(&context, &paths, &coverage, &pool, &destination, &slot)
-                .unwrap()
-                .is_some()
+            try_extract(
+                &context,
+                &paths,
+                &coverage,
+                &pool,
+                &destination,
+                &slot,
+                ChildArchives::Written
+            )
+            .unwrap()
+            .is_some()
         );
         let handoff = slot.lock().unwrap().take().unwrap();
         coverage.pause_for_repair();
@@ -717,9 +774,17 @@ mod tests {
         let context = test_context(temp.path(), bytes.len() as u64, end_header);
         let destination = temp.path().join("destination");
         assert!(
-            try_extract(&context, &paths, &coverage, &pool, &destination, &slot)
-                .unwrap()
-                .is_none()
+            try_extract(
+                &context,
+                &paths,
+                &coverage,
+                &pool,
+                &destination,
+                &slot,
+                ChildArchives::Written
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(!coverage.has_run_replay());
         assert!(!destination.exists());
@@ -749,6 +814,7 @@ mod tests {
             &pool,
             &destination,
             &slot,
+            ChildArchives::Written,
             |manifest| {
                 manifest.observe_writes(Arc::new(move |file, _| {
                     // The first two independently writable folders must both reach
@@ -803,9 +869,17 @@ mod tests {
         std::fs::write(&old, b"unverified previous process output").unwrap();
         let slot = Arc::new(std::sync::Mutex::new(None));
         assert!(
-            try_extract(&context, &paths, &coverage, &pool, &destination, &slot)
-                .unwrap()
-                .is_some()
+            try_extract(
+                &context,
+                &paths,
+                &coverage,
+                &pool,
+                &destination,
+                &slot,
+                ChildArchives::Written
+            )
+            .unwrap()
+            .is_some()
         );
         let handoff = slot.lock().unwrap().take().unwrap();
         handoff
@@ -870,6 +944,7 @@ mod tests {
                 &pool,
                 &worker_destination,
                 &worker_slot,
+                ChildArchives::Written,
                 |manifest| {
                     manifest.observe_writes(Arc::new(move |_, _| {
                         if worker_writes.fetch_add(1, Ordering::AcqRel) == 0 {
@@ -961,6 +1036,7 @@ mod tests {
                 &pool,
                 &worker_destination,
                 &worker_slot,
+                ChildArchives::Written,
             )?
             .ok_or_else(|| "fixture must select positional decoding".to_string())
         });
@@ -1178,9 +1254,17 @@ mod tests {
         let destination = temp.path().join("destination");
         let slot = Arc::new(std::sync::Mutex::new(None));
         assert!(
-            try_extract(&context, &paths, &coverage, &pool, &destination, &slot)
-                .unwrap()
-                .is_some()
+            try_extract(
+                &context,
+                &paths,
+                &coverage,
+                &pool,
+                &destination,
+                &slot,
+                ChildArchives::Written
+            )
+            .unwrap()
+            .is_some()
         );
         let handoff = slot.lock().unwrap().take().unwrap();
         handoff
@@ -1204,9 +1288,17 @@ mod tests {
         );
         let destination = temp.path().join("destination");
         let slot = Arc::new(std::sync::Mutex::new(None));
-        try_extract(&context, &paths, &coverage, &pool, &destination, &slot)
-            .unwrap()
-            .unwrap();
+        try_extract(
+            &context,
+            &paths,
+            &coverage,
+            &pool,
+            &destination,
+            &slot,
+            ChildArchives::Written,
+        )
+        .unwrap()
+        .unwrap();
         let handoff = slot.lock().unwrap().take().unwrap();
         std::fs::create_dir(destination.join("folder")).unwrap();
         let collision = destination.join("folder/member-1");
@@ -1388,9 +1480,17 @@ mod tests {
         );
         let destination = temp.path().join("destination");
         let slot = Arc::new(std::sync::Mutex::new(None));
-        let outcome = try_extract(&context, &paths, &coverage, &pool, &destination, &slot)
-            .unwrap()
-            .unwrap();
+        let outcome = try_extract(
+            &context,
+            &paths,
+            &coverage,
+            &pool,
+            &destination,
+            &slot,
+            ChildArchives::Written,
+        )
+        .unwrap()
+        .unwrap();
         std::fs::create_dir(destination.join("folder")).unwrap();
         let collision = destination.join("folder/member-1");
         std::fs::write(&collision, b"existing output").unwrap();

@@ -45,7 +45,7 @@ impl DirectSetRouter {
         // Every volume, not just this one: a header landing here is exactly what
         // resolves a *later* volume's split-continuation offset, so its holds
         // become routable in the same call.
-        spans.extend(self.drain_staged_volumes()?);
+        self.drain_staged_volumes(spans)?;
 
         // A breach — of this set's budget, or of the process-wide limit every
         // set shares — pages rather than demoting. Demotion is what is left
@@ -490,7 +490,7 @@ impl DirectSetRouter {
             }
         }
         self.check_eligibility()?;
-        spans.extend(self.drain_staged_volumes()?);
+        self.drain_staged_volumes(spans)?;
         Ok(())
     }
 
@@ -2050,7 +2050,12 @@ impl DirectSetRouter {
     // and the decryptor still transforms its usual contiguous buffer in place.
     // Cipher chunks overlap emitted plaintext for this drain only; resident
     // accounting counts chunks, regardless of their pending/routed markers.
-    fn drain_staged_volumes(&mut self) -> Result<Vec<RoutedSpan>, DemotionReason> {
+    //
+    // Everything else a drain emits before a later volume refuses belongs to
+    // the caller: a nested source cannot refetch bytes an earlier volume's
+    // drain already trimmed. Only the cipher rollback withholds its spans,
+    // because the staging it restores will emit them again.
+    fn drain_staged_volumes(&mut self, spans: &mut Vec<RoutedSpan>) -> Result<(), DemotionReason> {
         let preserve_cipher = self.plan.format == SetFormat::SevenZip
             && self.members.values().any(|member| member.crypt.is_some());
         let before: Vec<_> = if preserve_cipher {
@@ -2062,10 +2067,11 @@ impl DirectSetRouter {
             Vec::new()
         };
         let volumes: Vec<u32> = self.staging.keys().copied().collect();
-        let mut spans = self.take_migrated_spans();
+        spans.extend(self.take_migrated_spans());
+        let mut drained = Vec::new();
         for (index, &volume) in volumes.iter().enumerate() {
             match self.drain_volume_inner(volume, !preserve_cipher) {
-                Ok(drained) => spans.extend(drained),
+                Ok(emitted) => drained.extend(emitted),
                 Err(reason) => {
                     if preserve_cipher {
                         if reason == DemotionReason::SevenZipAesChecksumMismatch {
@@ -2075,14 +2081,15 @@ impl DirectSetRouter {
                                     staging.routed = routed;
                                 }
                             }
-                        } else {
-                            // Match the existing early-return lifetime for all
-                            // other failures: completed drains already trimmed.
-                            for &completed in &volumes[..index] {
-                                self.trim_volume(completed);
-                            }
+                            return Err(reason);
+                        }
+                        // Match the existing early-return lifetime for all
+                        // other failures: completed drains already trimmed.
+                        for &completed in &volumes[..index] {
+                            self.trim_volume(completed);
                         }
                     }
+                    spans.extend(drained);
                     return Err(reason);
                 }
             }
@@ -2092,7 +2099,8 @@ impl DirectSetRouter {
                 self.trim_volume(volume);
             }
         }
-        Ok(spans)
+        spans.extend(drained);
+        Ok(())
     }
 
     // Maps and emits every pending byte of one volume whose destination the
