@@ -8,10 +8,42 @@ fn sevenz_password_error(error: &sevenz_turbo::Error) -> bool {
         == ExtractionErrorClass::PasswordRequired
 }
 
+#[cfg(test)]
 pub(super) fn extract_7z_with_password_candidates<R, F>(
+    context: SevenZipExtractionContext,
+    passwords: &[crate::jobs::ArchivePasswordCandidate],
+    open_reader: F,
+) -> Result<FullSetExtractionOutcome, ExtractionError>
+where
+    R: std::io::Read + std::io::Seek + Send + 'static,
+    F: FnMut() -> Result<R, ExtractionError>,
+{
+    with_password_candidate(context, passwords, open_reader, extract_7z_stream)
+}
+
+pub(super) fn extract_7z_with_password_candidates_to<R, F, O: ArchiveOutput>(
+    context: SevenZipExtractionContext,
+    passwords: &[crate::jobs::ArchivePasswordCandidate],
+    open_reader: F,
+    output: &O,
+) -> Result<FullSetExtractionOutcome, ExtractionError>
+where
+    R: std::io::Read + std::io::Seek + Send + 'static,
+    F: FnMut() -> Result<R, ExtractionError>,
+{
+    with_password_candidate(context, passwords, open_reader, |context, reader| {
+        extract_7z_to(context.stream_context(), output, reader)
+    })
+}
+
+fn with_password_candidate<R, F>(
     mut context: SevenZipExtractionContext,
     passwords: &[crate::jobs::ArchivePasswordCandidate],
     mut open_reader: F,
+    extract: impl FnOnce(
+        &SevenZipExtractionContext,
+        F,
+    ) -> Result<FullSetExtractionOutcome, ExtractionError>,
 ) -> Result<FullSetExtractionOutcome, ExtractionError>
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
@@ -49,7 +81,7 @@ where
             if !encrypted {
                 drop(_permit);
                 context.password = sevenz_turbo::Password::empty();
-                return extract_7z_stream(&context, open_reader);
+                return extract(&context, open_reader);
             }
         }
         Err(error) if error.is(ExtractionErrorClass::PasswordRequired) => {}
@@ -96,7 +128,6 @@ where
             &context.set_name,
             BudgetedReader::new(open_reader()?, Arc::clone(&budget)),
             None,
-            &context.output_dir,
             password.clone(),
             limits,
             SevenZipDecodeThreads::Fixed(context.decode_threads),
@@ -131,7 +162,7 @@ where
         match probe {
             Ok(_) => {
                 context.password = password;
-                let mut outcome = extract_7z_stream(&context, open_reader)?;
+                let mut outcome = extract(&context, open_reader)?;
                 outcome.selected_password = Some(candidate.value().to_string());
                 return Ok(outcome);
             }

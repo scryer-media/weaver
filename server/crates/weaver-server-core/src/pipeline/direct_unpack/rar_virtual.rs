@@ -43,7 +43,7 @@ impl VirtualRarInput {
         // Held articles are not committed source bytes. Do not pin them or
         // advertise them as readable to speculative decompression.
         for volume in &mut volumes {
-            volume.held = Arc::new(Vec::new());
+            volume.retain_placed_only();
         }
         let bytes = volumes
             .iter()
@@ -222,6 +222,7 @@ mod tests {
         let mut covered = ByteRanges::new();
         covered.insert(0, committed);
         VirtualVolume {
+            backing_leases: Default::default(),
             volume_index: 0,
             envelope: path.to_path_buf(),
             extents: Vec::new(),
@@ -231,6 +232,7 @@ mod tests {
             held: Arc::default(),
             len: 8,
             ciphers: Arc::default(),
+            nested: Default::default(),
         }
     }
 
@@ -297,6 +299,55 @@ mod tests {
             .unwrap();
         let mut reader = input.get_volume(0).unwrap();
         reader.seek(SeekFrom::Start(3)).unwrap();
+        assert_eq!(
+            reader.read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn chase_cannot_consume_live_holds_from_a_nested_source() {
+        use crate::pipeline::direct_store::provider::HeldRun;
+        use crate::pipeline::direct_store::router::MemberExtent;
+
+        let path = std::path::Path::new("unopened.envelope");
+        let mut child = volume(path, 0);
+        child.held = Arc::new(vec![HeldRun::memory(
+            0,
+            bytes::Bytes::from_static(b"abcdefgh"),
+            0,
+            8,
+        )]);
+        let mut composed = volume(path, 0);
+        composed.extents.push(MemberExtent {
+            member_id: 0,
+            physical_offset: 0,
+            logical_offset: 0,
+            len: 8,
+        });
+        composed.nested = std::collections::HashMap::from([(0, child)]).into();
+        assert_eq!(composed.readable_ranges(), vec![(0, 8)]);
+        let input = VirtualRarInput::new(Arc::new(SetCoverage::new(1)));
+        let memory = Arc::new(ProcessMemoryBudget::new(1024 * 1024));
+        input
+            .publish(
+                vec![composed.clone()],
+                HashSet::new(),
+                HashSet::new(),
+                &[(0, 8)],
+                &memory,
+            )
+            .unwrap();
+        let published = input.snapshot().unwrap();
+        let published = published.provider.volume(0).unwrap();
+        assert!(published.readable_ranges().is_empty());
+        assert_eq!(published.retained_payloads().count(), 0);
+        assert_eq!(
+            composed.readable_ranges(),
+            vec![(0, 8)],
+            "repair keeps the original readable view"
+        );
+        let mut reader = input.get_volume(0).unwrap();
         assert_eq!(
             reader.read(&mut [0; 1]).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof

@@ -18,9 +18,12 @@ const BLOCK: usize = 1024;
 const VOLUMES: usize = 4;
 const ARTICLES_PER_VOLUME: usize = 32;
 
+mod standard_store;
+
 // Each family's name and scenario count.
 pub(super) fn totals() -> Vec<(&'static str, usize)> {
     vec![
+        ("standard store", standard_store::family().total()),
         ("index that lies", lies::family().total()),
         ("nesting", nesting::family().total()),
         ("scale", scale::family().total()),
@@ -32,7 +35,8 @@ pub(super) fn totals() -> Vec<(&'static str, usize)> {
     ]
 }
 
-pub(super) const TOTAL: usize = lies::TOTAL
+pub(super) const TOTAL: usize = standard_store::TOTAL
+    + lies::TOTAL
     + nesting::TOTAL
     + scale::TOTAL
     + withheld::TOTAL
@@ -40,6 +44,10 @@ pub(super) const TOTAL: usize = lies::TOTAL
     + wire::TOTAL
     + naming::TOTAL
     + sets::TOTAL;
+
+// The previous nesting family contained 299,904 cases. Count the expansion
+// together with ordinary stored posts against the operator's added budget.
+const _: () = assert!(standard_store::TOTAL + nesting::TOTAL - 299_904 <= 5_000_000);
 
 // What recovery a post carries beside its archive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -445,13 +453,16 @@ pub(super) mod nesting {
         SevenZipInside,
         // A 7z holding a RAR holding the member.
         RarInside7z,
+        // A Copy-mode 7z holding another Copy-mode 7z.
+        SevenZipInside7z,
     }
 
-    const DEPTHS: [Depth; 4] = [
+    const DEPTHS: [Depth; 5] = [
         Depth::Two,
         Depth::Three,
         Depth::SevenZipInside,
         Depth::RarInside7z,
+        Depth::SevenZipInside7z,
     ];
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -470,11 +481,24 @@ pub(super) mod nesting {
     pub(in super::super) fn cells() -> Vec<NestCell> {
         let mut cells = Vec::new();
         for depth in DEPTHS {
-            for volumes in [1, VOLUMES] {
+            for volumes in [1, 2, 3, VOLUMES, 8] {
                 for recovery in [Recovery::Par2(Margin::With), Recovery::None] {
                     for locked in [false, true] {
                         for members in [1, 2] {
                             for outer in [Container::Rar5, Container::Rar4] {
+                                // The fixed 7z outer does not have a RAR-version
+                                // axis. Locked inner RAR builders carry one member.
+                                if matches!(depth, Depth::RarInside7z | Depth::SevenZipInside7z)
+                                    && outer == Container::Rar4
+                                    || locked
+                                        && members == 2
+                                        && !matches!(
+                                            depth,
+                                            Depth::SevenZipInside | Depth::SevenZipInside7z
+                                        )
+                                {
+                                    continue;
+                                }
                                 cells.push(NestCell {
                                     depth,
                                     volumes,
@@ -492,8 +516,8 @@ pub(super) mod nesting {
         cells
     }
 
-    // 128 cells under three profiles, 781 of the combined cases each.
-    breadth_family!(NestCell, cells(), Pool::Combined, 781, 299_904, 128);
+    // 270 distinct cells under three profiles, 781 combined cases each.
+    breadth_family!(NestCell, cells(), Pool::Combined, 781, 632_610, 270);
 
     impl NestCell {
         fn members(self) -> Vec<(String, Vec<u8>)> {
@@ -506,7 +530,7 @@ pub(super) mod nesting {
 
         // The innermost archive, one volume, over the members.
         fn innermost(self, members: &[(String, Vec<u8>)]) -> Vec<u8> {
-            if self.depth == Depth::SevenZipInside {
+            if matches!(self.depth, Depth::SevenZipInside | Depth::SevenZipInside7z) {
                 let entries: Vec<Entry> = members
                     .iter()
                     .map(|(name, bytes)| Entry::file(leak(name), bytes.clone()))
@@ -549,7 +573,8 @@ pub(super) mod nesting {
     impl Cell for NestCell {
         fn post(self, interruption: Interruption) -> Built {
             let mut members = self.members();
-            if self.locked && self.depth != Depth::SevenZipInside {
+            if self.locked && !matches!(self.depth, Depth::SevenZipInside | Depth::SevenZipInside7z)
+            {
                 // See `innermost`: one member when the inner RAR is encrypted.
                 members.truncate(1);
             }
@@ -569,6 +594,9 @@ pub(super) mod nesting {
                 }
                 Depth::RarInside7z => {
                     stored(Container::SevenZip, "inner.rar", &inner, self.volumes)
+                }
+                Depth::SevenZipInside7z => {
+                    stored(Container::SevenZip, "inner.7z", &inner, self.volumes)
                 }
             };
             let mut post = data_post(outer, ARTICLE, members);
@@ -649,11 +677,11 @@ pub(super) mod nesting {
         }
     }
 
-    // The campaign: 300 shards of about a thousand cases.
+    // The campaign: 700 shards of at most 904 cases.
     mod combined_nesting {
         use super::*;
 
-        tier2_shards!(family, 300; h0 0 h1 1 h2 2);
+        tier2_shards!(family, 700; h0 0 h1 1 h2 2 h3 3 h4 4 h5 5 h6 6);
     }
 }
 

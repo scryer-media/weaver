@@ -701,9 +701,23 @@ pub(crate) enum DirectDestination {
     Envelope { volume_index: u32 },
 }
 
-// One run of bytes the caller must write before the article counts as placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RawChild {
+    pub(crate) node: u32,
+    pub(crate) volume: u32,
+    pub(crate) generation: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpanOwner {
+    pub(crate) node: u32,
+    pub(crate) generation: u64,
+    pub(crate) raw_child: Option<RawChild>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutedSpan {
+    pub(crate) owner: SpanOwner,
     pub(crate) destination: DirectDestination,
     // Offset within the destination file.
     pub(crate) destination_offset: u64,
@@ -724,6 +738,30 @@ impl RoutedSpan {
             total.saturating_add(piece.len() as u64)
         })
     }
+
+    pub(crate) fn placement(&self) -> PlacementReceipt {
+        PlacementReceipt {
+            owner: self.owner,
+            destination: self.destination,
+            destination_offset: self.destination_offset,
+            volume_index: self.volume_index,
+            source_offset: self.source_offset,
+            len: self.len(),
+        }
+    }
+}
+
+/// Metadata about a completed write. Forwarding to another router does not
+/// produce this receipt: only physical placement does. Ancestors translate
+/// these coordinates without retaining another copy of the payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlacementReceipt {
+    pub(crate) owner: SpanOwner,
+    pub(crate) destination: DirectDestination,
+    pub(crate) destination_offset: u64,
+    pub(crate) volume_index: u32,
+    pub(crate) source_offset: u64,
+    pub(crate) len: u64,
 }
 
 // (offset, len, crc32) runs over one contiguous logical space, composed on
@@ -1274,7 +1312,17 @@ fn open_scratch_file(
         // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
         options.share_mode(0x1 | 0x2 | 0x4);
     }
-    let file = options.open(path)?;
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Namespace directories are lazy: a child that never spills needs
+            // no scratch directory. Existing roots keep the single-open path.
+            let parent = path.parent().ok_or(error)?;
+            std::fs::create_dir_all(parent)?;
+            options.open(path)?
+        }
+        Err(error) => return Err(error),
+    };
     if let Err(error) = super::sparse::SparseMarker::mark_sparse(sparse, &file) {
         drop(file);
         let _ = std::fs::remove_file(path);
@@ -2285,6 +2333,7 @@ struct MemberRouting {
     // Working-directory-relative `.direct.partial`.
     relative_partial: String,
     unpacked_size: u64,
+    size_known: bool,
     // Logical coverage, so a duplicate never advances a gate twice.
     covered: ByteRanges,
     // Per-part CRC composition, indexed by the part's position in the chain.
@@ -2328,9 +2377,38 @@ struct MemberRouting {
     crypt: Option<MemberCrypt>,
 }
 
+// Resource admission belongs to the archive transaction, not to its chosen
+// engine. A decoded namespace can admit a STORE engine with these same leases
+// without manufacturing a parent router.
+#[derive(Clone)]
+pub(crate) struct RouterResources {
+    pub(crate) accountant: std::sync::Arc<super::accountant::HoldsAccountant>,
+    pub(crate) holds_budget: u64,
+    pub(crate) scratch_ceiling: u64,
+    pub(crate) sparse: SparseMarking,
+    pub(crate) migration_ceiling_bytes: u64,
+}
+
+impl RouterResources {
+    pub(crate) fn router(&self, plan: DirectSetPlan) -> DirectSetRouter {
+        let mut router = DirectSetRouter::new(plan);
+        router.private_destinations = true;
+        router.retain_backings = true;
+        router.set_holds_accountant(std::sync::Arc::clone(&self.accountant));
+        router.holds_budget = self.holds_budget;
+        router.set_holds_scratch_ceiling(self.scratch_ceiling);
+        router.set_sparse_marking(self.sparse);
+        router.migration_ceiling_bytes = self.migration_ceiling_bytes;
+        router
+    }
+}
+
 // One archive set's router.
 pub(crate) struct DirectSetRouter {
     plan: DirectSetPlan,
+    namespace_identity: std::sync::OnceLock<u64>,
+    private_destinations: bool,
+    retain_backings: bool,
     // `None` until a volume's signature names the set's archive format.
     //
     // The format is **read, not assumed**: a RAR4 set opened against a RAR5
@@ -2623,6 +2701,18 @@ impl Drop for DirectSetRouter {
 }
 
 impl DirectSetRouter {
+    pub(crate) fn namespace_identity(&self) -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        *self.namespace_identity.get_or_init(|| {
+            NEXT.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |value| value.checked_add(1),
+            )
+            .expect("archive namespace identity exhausted")
+        })
+    }
+
     pub(crate) fn new(plan: DirectSetPlan) -> Self {
         // One cache for the whole set: the key rings verify and derive into
         // it, and every header walk over every volume shares it.
@@ -2630,6 +2720,9 @@ impl DirectSetRouter {
         Self {
             scratch: HoldsScratch::new(plan.holds_scratch_path(), HOLDS_SCRATCH_CEILING_BYTES),
             plan,
+            namespace_identity: std::sync::OnceLock::new(),
+            private_destinations: false,
+            retain_backings: false,
             layout: None,
             declared_volume_sizes: BTreeMap::new(),
             sevenz_start: None,
@@ -2675,6 +2768,20 @@ impl DirectSetRouter {
             repair_batch: None,
             repair_transaction: None,
             demoted: None,
+        }
+    }
+
+    pub(crate) fn retain_checkpoint_backings(&mut self) {
+        self.retain_backings = true;
+    }
+
+    pub(crate) fn resources(&self) -> RouterResources {
+        RouterResources {
+            accountant: std::sync::Arc::clone(&self.accountant),
+            holds_budget: self.holds_budget,
+            scratch_ceiling: self.scratch.ceiling,
+            sparse: self.scratch.sparse,
+            migration_ceiling_bytes: self.migration_ceiling_bytes,
         }
     }
 
@@ -3484,6 +3591,10 @@ impl DirectSetRouter {
         self.plan.bind_identity_volume(volume_index, file_index)
     }
 
+    pub(crate) fn close_nested_roster(&mut self, expected: u32) -> bool {
+        self.plan.close_identity_roster(expected)
+    }
+
     // See [`DirectSetPlan::note_unposted_volume`].
     pub(crate) fn note_unposted_volume(&mut self, volume_index: u32) -> bool {
         self.plan.note_unposted_volume(volume_index)
@@ -3784,6 +3895,13 @@ impl DirectSetRouter {
                 Some((member.name.clone(), member.unpacked_size))
             })
             .collect()
+    }
+
+    // Unlike digest entries, this preserves an unresolved size. Zero is a
+    // valid declared length and must not stand in for missing header facts.
+    pub(crate) fn member_declared_length(&self, member_id: u32) -> Option<u64> {
+        let member = self.members.get(&member_id)?;
+        member.size_known.then_some(member.unpacked_size)
     }
 
     // Recomputes [`Self::member_partials`]' archive order. Called on adoption

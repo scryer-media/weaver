@@ -1,4 +1,5 @@
 use super::*;
+mod composition;
 mod passwords;
 mod zip64;
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ fn commit_test_member(index: usize, phase: &Arc<PhaseCounters>) -> WrittenMember
         bytes_written: 1,
         attempt,
         committed: false,
+        output: None,
     }
 }
 
@@ -37,11 +39,17 @@ fn sevenz_member_verdicts_commit_once_and_rollback_only_unverified_members() {
     let phase = Arc::new(PhaseCounters::default());
     let (tx, mut rx) = broadcast::channel(16);
     let mut commits = MemberCommits::new(JobId(1), "archive", &tx);
-    commits.written(commit_test_member(usize::MAX, &phase), true);
-    commits.written(commit_test_member(3, &phase), true);
-    commits.written(commit_test_member(99, &phase), false);
+    commits
+        .written(commit_test_member(usize::MAX, &phase), true)
+        .unwrap();
+    commits
+        .written(commit_test_member(3, &phase), true)
+        .unwrap();
+    commits
+        .written(commit_test_member(99, &phase), false)
+        .unwrap();
     commits.verified.lock().unwrap().extend([3, 3, 99]);
-    commits.settle();
+    commits.settle().unwrap();
     assert!(
         commits.finish().is_err(),
         "missing CRC verdict must fail the set"
@@ -64,7 +72,9 @@ fn sevenz_many_delayed_verdicts_preserve_member_order() {
     let (tx, _) = broadcast::channel(16);
     let mut commits = MemberCommits::new(JobId(1), "archive", &tx);
     for index in 0..COUNT {
-        commits.written(commit_test_member(index * 2, &phase), true);
+        commits
+            .written(commit_test_member(index * 2, &phase), true)
+            .unwrap();
     }
     commits
         .verified
@@ -1249,7 +1259,6 @@ fn sevenzip_extraction_restores_entry_times_and_skips_anti_items() {
     let context = SevenZipExtractionContext {
         job_id: JobId(41812),
         set_name: "silver_horizon.7z".to_string(),
-        output_dir: out_dir.clone(),
         root: Arc::new(root),
         budget,
         password: sevenz_turbo::Password::empty(),
@@ -1324,7 +1333,7 @@ fn sevenz_archive_with_dictionary(dictionary: u32, members: &[(&str, &[u8])]) ->
 }
 
 fn conventional_7z_context(
-    out_dir: &Path,
+    _out_dir: &Path,
     root: ExtractionRoot,
     budget: Arc<JobExtractionBudget>,
     archive: &[u8],
@@ -1334,7 +1343,6 @@ fn conventional_7z_context(
     SevenZipExtractionContext {
         job_id: JobId(41813),
         set_name: "wide_dictionary.7z".to_string(),
-        output_dir: out_dir.to_path_buf(),
         root: Arc::new(root),
         budget,
         password: sevenz_turbo::Password::empty(),
@@ -2302,7 +2310,6 @@ fn chase_decode_widens_on_a_backlog_of_complete_runs() {
         "silver_horizon.7z",
         Cursor::new(archive.clone()),
         None,
-        &out_dir,
         sevenz_turbo::Password::empty(),
         sevenz_archive_limits(&budget),
         SevenZipDecodeThreads::Adaptive {
@@ -2378,7 +2385,6 @@ fn chase_7z_extraction_decodes_a_multi_run_block_adaptively() {
     let context = SevenZipExtractionContext {
         job_id: JobId(41816),
         set_name: "silver_horizon.7z".to_string(),
-        output_dir: out_dir.clone(),
         root: Arc::new(root),
         budget: Arc::clone(&budget),
         password: sevenz_turbo::Password::empty(),

@@ -15,6 +15,7 @@ mod delayed_header_admission;
 mod demotion_sweep_chase;
 mod header_encrypted_parse_cost;
 mod header_encrypted_restart;
+mod nested_graph;
 mod par3_spill;
 mod placement_flights;
 mod quick_open;
@@ -875,7 +876,7 @@ async fn run_hp_gate_with_global(
         }
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let status = job_status_for_assert(&pipeline, job_id);
     let (member, member_location) = member_after_gate(&complete_dir, &working_dir, member_name);
@@ -1113,7 +1114,7 @@ async fn hp_fallback_outcome(
         pipeline.schedule_job_completion_check(job_id);
         drain_rar_refreshes(&mut pipeline).await;
         sample(&mut materialized);
-        drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+        drive_extractions_to_terminal(&mut pipeline, job_id).await;
         sample(&mut materialized);
     }
 

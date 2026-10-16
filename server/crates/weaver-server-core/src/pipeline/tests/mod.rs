@@ -63,6 +63,7 @@ mod post_processing_pause;
 mod rar_extraction;
 mod restart_resume_floor;
 mod restore_history;
+mod scoped_repair;
 mod script_events;
 mod sequential_unpack;
 mod server_attribution;
@@ -1876,6 +1877,36 @@ fn with_priority(mut spec: JobSpec, priority: &str) -> JobSpec {
     spec
 }
 
+fn persist_restore_fixture(
+    pipeline: &Pipeline,
+    job_id: JobId,
+    spec: &JobSpec,
+    working_dir: &std::path::Path,
+) {
+    pipeline
+        .db
+        .create_active_job(&crate::ActiveJob {
+            job_id,
+            nzb_hash: [0; 32],
+            nzb_path: working_dir.join("fixture.nzb"),
+            nzb_zstd: sample_nzb_zstd(),
+            output_dir: working_dir.to_owned(),
+            created_at: 0,
+            category: spec.category.clone(),
+            metadata: spec.metadata.clone(),
+            status: "downloading",
+            download_state: "downloading",
+            post_state: "idle",
+            run_state: "active",
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            password_override: None,
+            supplied_password_candidates: Vec::new(),
+        })
+        .unwrap();
+}
+
 async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec) -> PathBuf {
     insert_active_job_with_persisted_nzb(pipeline, job_id, spec, sample_nzb_zstd()).await
 }
@@ -2036,8 +2067,10 @@ fn sevenz_fixture_bytes(prefix: &str) -> Vec<(String, Vec<u8>)> {
     files
 }
 
-async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, max_rounds: usize) {
-    for _ in 0..max_rounds {
+async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId) {
+    // Progress and child completion events do not correspond to archive depth.
+    // Wait for this job's terminal condition; the test runner bounds a stall.
+    loop {
         pump_pipeline_runtime_queues(pipeline).await;
         if matches!(
             job_status_for_assert(pipeline, job_id),
@@ -2068,14 +2101,10 @@ async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, m
         pipeline.handle_extraction_done(done).await;
         pump_pipeline_runtime_queues(pipeline).await;
     }
-
-    panic!("job {job_id} did not reach a terminal state after {max_rounds} extraction rounds");
 }
 
 async fn settle_inflight_moves(pipeline: &mut Pipeline) {
     while !pipeline.inflight_moves.is_empty() {
-        // The same bound the terminal-state driver gives a move: a loaded
-        // Windows runner can take seconds to close handles and scan the tree.
         let done = pipeline
             .move_done_rx
             .recv()
@@ -2811,7 +2840,9 @@ fn debug_job_state(pipeline: &Pipeline, job_id: JobId) -> String {
 //
 // They are settled in one loop because they chain: an analysis verdict
 // re-enters the completion check, which can decide on a repair whose
-// read-back is a direct-store ticket of its own.
+// read-back is a direct-store ticket of its own. Native chase acceptance and
+// namespace progress use the extraction channel, so service that channel while
+// tickets are pending as well: a ticket may depend on its acknowledgment.
 async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
     enum Ticket {
         PostRepair(crate::pipeline::DirectPostRepairWorkDone),
@@ -2820,6 +2851,7 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         Repair(crate::pipeline::RepairWorkDone),
         Rearm(crate::pipeline::DirectRearmDone),
         Barrier(crate::pipeline::DirectBarrierDone),
+        Extraction(ExtractionDone),
     }
     // PAR3 jobs whose idle coordinator has already been offered a completion
     // check by this call.
@@ -2922,7 +2954,11 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
         let repair_rx = &mut pipeline.repair_work_done_rx;
         let rearm_rx = &mut pipeline.direct_rearm_done_rx;
         let barrier_rx = &mut pipeline.direct_barrier_done_rx;
+        let extraction_rx = &mut pipeline.extract_done_rx;
         let ticket = tokio::select! {
+            done = extraction_rx.recv() => {
+                Ticket::Extraction(done.expect("extraction completion channel should stay open"))
+            }
             done = post_repair_rx.recv(), if post_repair_pending => {
                 Ticket::PostRepair(done.expect("direct post-repair completion channel should stay open"))
             }
@@ -2943,6 +2979,7 @@ async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
             }
         };
         match ticket {
+            Ticket::Extraction(done) => pipeline.handle_extraction_done(done).await,
             Ticket::PostRepair(done) => pipeline.handle_direct_post_repair_done(done),
             Ticket::Tolerated(done) => pipeline.handle_direct_tolerated_done(done).await,
             Ticket::Demotion(done) => pipeline.handle_direct_demotion_done(done).await,

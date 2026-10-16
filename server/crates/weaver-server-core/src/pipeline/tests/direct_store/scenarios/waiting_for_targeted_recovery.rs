@@ -693,7 +693,7 @@ async fn two_sets_sharing_a_clamped_partial_keep_their_bytes_apart() {
         "the fixture must admit two direct sets or it is testing nothing"
     );
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     assert_eq!(
         pipeline.direct_store.finalized_sets, 2,
@@ -2000,7 +2000,7 @@ async fn an_encrypted_span_that_arrives_before_its_predecessor_block_is_held_the
     );
 
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     let (member, member_location) = member_after_gate(&complete_dir, &working_dir, member_name);
     let status = job_status_for_assert(&pipeline, job_id);
 
@@ -2216,7 +2216,7 @@ async fn a_password_that_arrives_before_the_first_article_still_admits_the_set()
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let output_root =
         complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
@@ -2289,7 +2289,7 @@ async fn a_password_corrected_before_the_first_article_admits_with_the_correctio
     );
 
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     let (member, location) = member_after_gate(&complete_dir, &working_dir, member_name);
     assert_eq!(
         member.as_deref(),
@@ -2395,7 +2395,7 @@ async fn an_encrypted_set_restarted_mid_download_honours_its_floors_and_complete
         "the keyed member gate must have re-read the pre-restart plaintext before finalizing"
     );
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let complete_dir = temp_dir.path().join("complete");
     let (restarted, location) = member_after_gate(&complete_dir, &working_dir, member_name);
@@ -2565,7 +2565,7 @@ async fn encrypted_routing_leaves_the_plan_135_guarantees_untouched() {
     // The sweep and finalization wait: the job still finishes, in one place,
     // byte-identical.
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     let (member, location) = member_after_gate(&complete_dir, &working_dir, member_name);
     assert_eq!(member.as_deref(), Some(payload.as_slice()));
     assert_eq!(location, Some("complete"));
@@ -3287,7 +3287,7 @@ async fn a_par2_bearing_encrypted_set_restarted_mid_download_verifies_and_comple
     );
 
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     let (member, location) = member_after_gate(&complete_dir, &working_dir, member_name);
     assert_eq!(
         member.as_deref(),

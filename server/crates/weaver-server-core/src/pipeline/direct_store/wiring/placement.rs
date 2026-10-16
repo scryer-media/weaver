@@ -376,6 +376,7 @@ impl Pipeline {
             && self.direct_store.set(job_id, set_index).is_some_and(|set| {
                 !set.is_demoted()
                     && !set.is_finalized()
+                    && !set.is_delegated()
                     && set_name.is_none_or(|name| set.set_name() == name)
             })
     }
@@ -448,6 +449,10 @@ impl Pipeline {
             } = placement;
             self.record_direct_placement(job_id, set_index, &spans);
             drop(spans);
+            if let Err(error) = Box::pin(self.refresh_direct_live_inputs(job_id, &set_name)).await {
+                self.fail_job(job_id, error);
+                return;
+            }
             match kind {
                 DirectPlacementKind::Article {
                     segment,

@@ -484,12 +484,12 @@ pub(crate) async fn restore_job<P: CoveragePersist + ?Sized>(
     rows: HashMap<String, Vec<u8>>,
     expected: &HashMap<String, ExpectedSet>,
     persist: &mut P,
-) -> RestoreOutcome {
+) -> Result<RestoreOutcome, String> {
     if !gate.is_enabled() {
-        return RestoreOutcome {
+        return Ok(RestoreOutcome {
             ignored: rows.len(),
             ..RestoreOutcome::default()
-        };
+        });
     }
 
     let mut outcome = RestoreOutcome::default();
@@ -507,20 +507,13 @@ pub(crate) async fn restore_job<P: CoveragePersist + ?Sized>(
                 outcome.accepted.insert(set_name, snapshot);
             }
             Err(rejection) => {
-                if let Err(error) = persist.delete(job_id, &set_name) {
-                    tracing::warn!(
-                        job_id = job_id.0,
-                        set_name = %set_name,
-                        %error,
-                        "failed to delete a refused direct-store coverage row"
-                    );
-                }
+                persist.delete(job_id, &set_name)?;
                 outcome.rejected.push((set_name, rejection));
             }
         }
     }
 
-    outcome
+    Ok(outcome)
 }
 
 // Whether a finalized set's installation marker still describes this spec and
@@ -798,20 +791,472 @@ fn rebuild_identity_plans(
     plans
 }
 
+pub(crate) enum ArchiveRestoreRows {
+    Legacy(HashMap<String, Vec<u8>>),
+    Graph(Box<super::manifest::graph::JobGraph>),
+}
+
 impl Pipeline {
-    // Restores a job's direct-store sets and the segments their coverage lets
-    // the job skip.
-    //
-    // Called from `restore_job` before the assembly is built. It never inserts
-    // anything into the pipeline itself — the job state does not exist yet — so
-    // the caller installs [`DirectRestore::sets`] once it does.
+    async fn restore_archive_graph(
+        &mut self,
+        job_id: JobId,
+        spec: &JobSpec,
+        working_dir: &Path,
+        conventional: &HashMap<u32, u64>,
+        graph: super::manifest::graph::JobGraph,
+    ) -> Result<DirectRestore, String> {
+        use super::manifest::graph::PhysicalDestination;
+        if !self.direct_store.gate().is_enabled() {
+            return Err("job archive graph requires direct-store routing; backing retained".into());
+        }
+        graph.validate().map_err(|error| error.to_string())?;
+        let destination = self.deterministic_extraction_staging_dir(job_id);
+        let (mut plans, _) = DirectSetPlan::discover(spec, working_dir, &destination);
+        if plans.is_empty() {
+            let rows = graph
+                .roots
+                .iter()
+                .map(|root| (root.set_name.clone(), root.snapshot.clone()))
+                .collect();
+            plans = rebuild_identity_plans(job_id, spec, working_dir, &destination, &rows);
+        }
+        let mut result = DirectRestore::default();
+        for (root_index, root) in graph.roots.iter().enumerate() {
+            if root.decoded.is_some() {
+                continue;
+            }
+            let plan = plans
+                .iter()
+                .find(|plan| plan.set_name == root.set_name)
+                .ok_or("graph root no longer matches job specification")?;
+            if plan
+                .files
+                .keys()
+                .any(|file| conventional.get(file).copied().unwrap_or(0) > 0)
+            {
+                return Err("job graph conflicts with conventional source coverage".into());
+            }
+            let mut set = DirectSet::new(job_id, plan.clone());
+            self.direct_store.apply_ceilings(&mut set);
+            set.router.set_password(spec.password.as_deref());
+            set.router
+                .note_par2_available(super::plan::spec_carries_par2(spec));
+            set.router
+                .note_par3_available(super::plan::spec_defers_to_par3(spec));
+            let mut facts = BTreeMap::new();
+            for input in &root.inputs {
+                let image = &graph.images[input.original as usize];
+                if let Some(fact) = &image.facts {
+                    facts.insert(input.volume, fact.clone());
+                }
+            }
+            set.restore_layout(&facts)
+                .map_err(|_| "job graph layout cannot be rebuilt")?;
+            let mut snapshot =
+                super::snapshot::decode(&root.snapshot).map_err(|error| error.to_string())?;
+            if snapshot.plan_digest != set.plan_digest() {
+                return Err("job graph root layout digest mismatch".into());
+            }
+            for floor in &snapshot.floors {
+                if plan.volumes.get(&floor.volume_index) != Some(&floor.file_index) {
+                    return Err("job graph source binding mismatch".into());
+                }
+                let input = root
+                    .inputs
+                    .iter()
+                    .find(|input| input.volume == floor.volume_index)
+                    .ok_or("job graph source image missing")?;
+                if input.original == input.effective
+                    && (floor.floor > 0 || floor.complete)
+                    && !facts.contains_key(&floor.volume_index)
+                {
+                    return Err("job graph source cannot be classified from intrinsic facts".into());
+                }
+                let image = &graph.images[input.effective as usize];
+                let mut covered = super::ByteRanges::new();
+                for claim in &image.claims {
+                    covered.insert(claim.start, claim.end - claim.start);
+                }
+                if !covered.missing(0, floor.floor).is_empty()
+                    || (floor.complete && floor.floor != image.length)
+                {
+                    return Err("job graph source floor exceeds backing coverage".into());
+                }
+            }
+            for file in &graph.files {
+                if file.archive_root() != Some(root_index as u32) || file.node() != 0 {
+                    continue;
+                }
+                let relative = match &file.destination {
+                    PhysicalDestination::SessionInput { .. } => {
+                        return Err("session input has direct owner".into());
+                    }
+                    PhysicalDestination::Member { relative_path } => relative_path.clone(),
+                    PhysicalDestination::Envelope { volume } => {
+                        plan.envelope_relative_path(*volume)
+                    }
+                    PhysicalDestination::RawInput { .. } => continue,
+                };
+                let extents = file
+                    .extents
+                    .iter()
+                    .map(|&(start, end)| super::snapshot::DestinationExtent { start, end })
+                    .collect();
+                if let Some(claim) = snapshot
+                    .destinations
+                    .iter_mut()
+                    .find(|claim| claim.relative_path == relative)
+                {
+                    claim.extents = extents;
+                } else if let PhysicalDestination::Envelope { volume } = file.destination {
+                    snapshot
+                        .destinations
+                        .push(super::snapshot::DestinationClaim {
+                            member_index: super::set::envelope_destination_key(volume),
+                            relative_path: relative,
+                            extents,
+                            crypt: None,
+                        });
+                } else {
+                    return Err("job graph physical destination is absent from layout".into());
+                }
+            }
+            for child in root.nodes.iter().filter(|node| node.parent == 0) {
+                for input in &child.inputs {
+                    let image = &graph.images[input.original as usize];
+                    let ranges = image
+                        .claims
+                        .iter()
+                        .map(|claim| super::snapshot::DestinationExtent {
+                            start: claim.start,
+                            end: claim.end,
+                        })
+                        .collect();
+                    if let Some(claim) = snapshot
+                        .destinations
+                        .iter_mut()
+                        .find(|claim| claim.relative_path == input.parent_path)
+                    {
+                        claim.extents = ranges;
+                    } else {
+                        let member_index = set
+                            .router
+                            .member_partials()
+                            .into_iter()
+                            .find_map(|(member, _, relative)| {
+                                (relative == input.parent_path).then_some(member)
+                            })
+                            .ok_or("forwarded graph member absent from root catalog")?;
+                        snapshot
+                            .destinations
+                            .push(super::snapshot::DestinationClaim {
+                                member_index,
+                                relative_path: input.parent_path.clone(),
+                                extents: ranges,
+                                crypt: set
+                                    .router
+                                    .member_crypt_snapshots()
+                                    .get(&member_index)
+                                    .cloned(),
+                            });
+                    }
+                }
+            }
+            snapshot
+                .destinations
+                .sort_by_key(|claim| claim.member_index);
+            let mut original_snapshot = snapshot.clone();
+            for floor in &mut original_snapshot.floors {
+                let input = root
+                    .inputs
+                    .iter()
+                    .find(|input| input.volume == floor.volume_index)
+                    .ok_or("original source image absent")?;
+                let image = &graph.images[input.original as usize];
+                let mut covered = super::ByteRanges::new();
+                for claim in &image.claims {
+                    covered.insert(claim.start, claim.end - claim.start);
+                }
+                floor.floor = covered.contiguous_from(0);
+                floor.complete = floor.floor == image.length && floor.complete;
+            }
+            let complete_volumes = original_snapshot
+                .floors
+                .iter()
+                .filter(|floor| floor.complete)
+                .map(|floor| (floor.volume_index, floor.floor))
+                .collect();
+            set.apply_restored_snapshot(&original_snapshot, &complete_volumes);
+            if set.is_demoted() {
+                return Err("job graph crypt metadata cannot be restored".into());
+            }
+            // Floors cover only a contiguous prefix. Durable graph backings
+            // can also prove routed member bytes beyond a source hole.
+            for input in &root.inputs {
+                let image = &graph.images[input.original as usize];
+                for claim in &image.claims {
+                    use super::manifest::graph::Backing;
+                    let mapping = match claim.backing {
+                        Backing::Member { file, offset } => {
+                            let PhysicalDestination::Member { relative_path } =
+                                &graph.files[file as usize].destination
+                            else {
+                                return Err("root member backing destination differs".into());
+                            };
+                            Some((relative_path.as_str(), offset))
+                        }
+                        Backing::Image {
+                            image: source,
+                            offset,
+                        } if graph.images[source as usize].node != 0 => {
+                            let source = &graph.images[source as usize];
+                            let child = root
+                                .nodes
+                                .iter()
+                                .find(|node| node.id == source.node && node.parent == 0)
+                                .ok_or("root backing child absent")?;
+                            let input = child
+                                .inputs
+                                .iter()
+                                .find(|input| input.original == source.id)
+                                .ok_or("root backing original input absent")?;
+                            Some((input.parent_path.as_str(), offset))
+                        }
+                        _ => None,
+                    };
+                    if let Some((relative, offset)) = mapping {
+                        set.router
+                            .restore_backed_extent(
+                                input.volume,
+                                claim.start,
+                                relative,
+                                offset,
+                                claim.end - claim.start,
+                            )
+                            .map_err(|error| {
+                                format!("root backing projection differs: {error:?}")
+                            })?;
+                    }
+                }
+            }
+            let nested = super::nested::NestedGraph::restore_checkpoint(
+                &set.router,
+                &graph,
+                root_index as u32,
+            )
+            .map_err(|error| error.to_string())?;
+            let mut placements = Vec::new();
+            for file in graph
+                .files
+                .iter()
+                .filter(|file| file.archive_root() == Some(root_index as u32))
+            {
+                let router = nested.router(&set.router, file.node());
+                let (routed_destination, raw_child) = match &file.destination {
+                    PhysicalDestination::SessionInput { .. } => {
+                        return Err("session input has direct owner".into());
+                    }
+                    PhysicalDestination::Envelope { volume } => (
+                        super::router::DirectDestination::Envelope {
+                            volume_index: *volume,
+                        },
+                        None,
+                    ),
+                    PhysicalDestination::Member { relative_path } => {
+                        let member_id = router
+                            .member_partials()
+                            .into_iter()
+                            .find_map(|(id, _, path)| (path == relative_path).then_some(id))
+                            .ok_or("restored physical member identity missing")?;
+                        (super::router::DirectDestination::Member { member_id }, None)
+                    }
+                    PhysicalDestination::RawInput { child, volume } => {
+                        let child_node = nested.node(*child);
+                        let member_id = child_node
+                            .inputs
+                            .get(volume)
+                            .ok_or("restored raw input identity missing")?
+                            .parent_member;
+                        (
+                            super::router::DirectDestination::Member { member_id },
+                            Some(super::router::RawChild {
+                                node: *child,
+                                volume: *volume,
+                                generation: child_node.generation,
+                            }),
+                        )
+                    }
+                };
+                let base = if file.root == 0 {
+                    working_dir
+                } else {
+                    &destination
+                };
+                placements.push((
+                    super::router::SpanOwner {
+                        node: file.node(),
+                        generation: file.generation(),
+                        raw_child,
+                    },
+                    routed_destination,
+                    base.join(&file.path),
+                    file.extents.clone(),
+                ));
+            }
+            set.install_restored_nested(nested);
+            for (owner, destination, path, ranges) in placements {
+                set.seed_qualified_placement(owner, destination, path, ranges);
+            }
+            for input in &root.inputs {
+                let image = &graph.images[input.original as usize];
+                set.seed_root_source_coverage(
+                    input.volume,
+                    image
+                        .claims
+                        .iter()
+                        .map(|claim| (claim.start, claim.end))
+                        .collect(),
+                );
+            }
+            let skip = coverage_skip_plan(
+                job_id,
+                spec,
+                &refetch_floors(&snapshot),
+                &complete_files(&snapshot),
+            );
+            result.skip.extend(skip.skip);
+            result.file_progress.extend(skip.file_progress);
+            result.sets.push(set);
+        }
+        for installed in &graph.installed {
+            let plan = plans
+                .iter()
+                .find(|plan| plan.set_name == installed.set_name)
+                .ok_or("installed graph root no longer matches job specification")?;
+            let marker = super::snapshot::encode_installed(&installed.marker)
+                .map_err(|error| error.to_string())?;
+            let marker = installed_set_still_present(plan, &marker).await?;
+            let complete: HashSet<_> = plan.files.keys().copied().collect();
+            let floors = complete.iter().map(|&file| (file, 0)).collect();
+            let skip = coverage_skip_plan(job_id, spec, &floors, &complete);
+            result.skip.extend(skip.skip);
+            result.file_progress.extend(skip.file_progress);
+            if let Some(set) = result
+                .sets
+                .iter_mut()
+                .find(|set| set.set_name() == installed.set_name)
+            {
+                if !set.retain_restored_finalized() {
+                    return Err("retained installed graph is not fully reconstructible".into());
+                }
+                set.mark_finalized();
+            } else {
+                let mut set = DirectSet::new(job_id, plan.clone());
+                set.mark_finalized();
+                result.sets.push(set);
+            }
+            result
+                .installed
+                .push((installed.set_name.clone(), marker.extracted));
+        }
+        result.accepted = result.sets.len();
+        let mut runtime = if let Some(saved) = &graph.runtime {
+            crate::pipeline::extraction::runtime::ArchiveRuntime::restore_runtime_checkpoint(
+                saved,
+                working_dir,
+                &destination,
+            )
+            .map_err(|error| error.to_string())?
+        } else {
+            crate::pipeline::extraction::runtime::ArchiveRuntime::restore_checkpoint(
+                &graph.sessions,
+            )
+            .map_err(|_| "invalid archive session checkpoint")?
+        };
+        for (index, root) in graph.roots.iter().enumerate() {
+            if root.decoded.is_some() {
+                let state = self
+                    .build_decoded_graph_root(job_id, working_dir, &graph, index as u32, &runtime)
+                    .await?;
+                runtime.decoded.push(state);
+            }
+        }
+        if let Some(saved) = &graph.runtime {
+            let delegated = saved.selected_delegated_roots();
+            for set in &mut result.sets {
+                if delegated.contains(set.set_name()) {
+                    set.delegate_effective_extraction();
+                }
+            }
+        }
+        self.archive_runtime.insert(job_id, runtime);
+        for set in &mut result.sets {
+            set.enable_nested_checkpoint_authority();
+        }
+        Ok(result)
+    }
+
+    pub(crate) async fn load_archive_restore_rows(
+        &self,
+        job_id: JobId,
+        working_dir: &Path,
+    ) -> Result<ArchiveRestoreRows, String> {
+        // Authority is selected before planning or probing any legacy claim.
+        // A job checkpoint replaces the entire legacy inventory, including
+        // when its manifest cannot be read or its schema cannot be restored.
+        match self
+            .db_blocking(move |db| db.load_archive_authority(job_id))
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            crate::jobs::archive_checkpoint::ArchiveAuthority::Legacy(rows) => {
+                Ok(ArchiveRestoreRows::Legacy(rows.into_iter().collect()))
+            }
+            crate::jobs::archive_checkpoint::ArchiveAuthority::Job(reference) => {
+                let working = working_dir.to_path_buf();
+                let destination = self.deterministic_extraction_staging_dir(job_id);
+                let graph = tokio::task::spawn_blocking(move || {
+                    let bytes = super::manifest::ManifestStore::for_job(&working, job_id)
+                        .read(&reference.reference)?;
+                    let graph = super::manifest::graph::JobGraph::decode(&bytes)?;
+                    if graph.generation != reference.generation {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "job graph authority generation mismatch",
+                        ));
+                    }
+                    graph.probe(&working, &destination)?;
+                    Ok::<_, std::io::Error>(graph)
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+                Ok(ArchiveRestoreRows::Graph(Box::new(graph)))
+            }
+            crate::jobs::archive_checkpoint::ArchiveAuthority::JobGone => {
+                Err("archive restore job no longer exists".into())
+            }
+        }
+    }
+
+    // The caller selects authority before filesystem recovery or skip planning,
+    // then installs these sets after constructing the original job assembly.
     pub(crate) async fn restore_direct_store_coverage(
         &mut self,
         job_id: JobId,
         spec: &JobSpec,
         working_dir: &Path,
         conventional_floors: &HashMap<u32, u64>,
-    ) -> DirectRestore {
+        rows: ArchiveRestoreRows,
+    ) -> Result<DirectRestore, String> {
+        let rows = match rows {
+            ArchiveRestoreRows::Legacy(rows) => rows,
+            ArchiveRestoreRows::Graph(graph) => {
+                return self
+                    .restore_archive_graph(job_id, spec, working_dir, conventional_floors, *graph)
+                    .await;
+            }
+        };
         let gate = self.direct_store.gate();
         // Deterministic, and it has to be: this runs before the job state
         // exists, so `state.staging_dir` cannot be consulted — and a resumed set
@@ -856,20 +1301,35 @@ impl Pipeline {
             Vec::new()
         };
 
-        let rows = match self
-            .db_blocking(move |db| db.load_direct_coverage(job_id))
-            .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::error!(
-                    job_id = job_id.0,
-                    %error,
-                    "failed to load direct-store coverage rows; the job redownloads"
-                );
-                HashMap::new()
+        let checkpoint_dir = working_dir.to_path_buf();
+        let rows = tokio::task::spawn_blocking(move || {
+            let mut resolved = HashMap::with_capacity(rows.len());
+            for (name, blob) in rows {
+                if !gate.is_enabled() || !super::manifest::is_reference(&blob) {
+                    resolved.insert(name, blob);
+                    continue;
+                }
+                // An unavailable working directory is not a corrupt checkpoint.
+                // Stop restore before any claim deletion or orphan sweep.
+                if !std::fs::metadata(&checkpoint_dir)?.is_dir() {
+                    return Err(std::io::Error::other("checkpoint directory is unavailable"));
+                }
+                let store = super::manifest::ManifestStore::new(&checkpoint_dir, job_id, &name);
+                let body = match store.read(&blob) {
+                    Ok(body) => body,
+                    Err(error) if matches!(error.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::NotFound) => {
+                        tracing::warn!(set_name = %name, %error, "direct checkpoint refused; coverage will be rebuilt");
+                        // Keep the root name so the ordinary refusal path owns
+                        // cleanup; the bad reference itself claims no bytes.
+                        blob
+                    }
+                    Err(error) => return Err(error),
+                };
+                resolved.insert(name, body);
             }
-        };
+            Ok::<_, std::io::Error>(resolved)
+        }).await.map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
         // Every set the job's durable rows still name, whether or not any plan
         // of this spec produces it. Taken before the rows are judged, because
         // judging a refused row deletes it — and a set admitted by identity
@@ -932,20 +1392,12 @@ impl Pipeline {
                             "direct-store installation marker refused at restore; the set \
                              redownloads"
                         );
-                        if let Err(error) = self
-                            .db_blocking({
-                                let set_name = set_name.clone();
-                                move |db| db.delete_direct_coverage(job_id, &set_name)
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                job_id = job_id.0,
-                                set_name = %set_name,
-                                %error,
-                                "failed to delete a refused direct-store installation marker"
-                            );
-                        }
+                        self.db_blocking({
+                            let set_name = set_name.clone();
+                            move |db| db.delete_direct_coverage(job_id, &set_name)
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?;
                     }
                 }
             }
@@ -1032,8 +1484,9 @@ impl Pipeline {
             restored.insert(set_name, set);
         }
 
-        let mut persist = DatabaseCoveragePersist::new(self.db.clone());
-        let mut outcome = restore_job(gate, job_id, &roots, rows, &expected, &mut persist).await;
+        let mut persist =
+            DatabaseCoveragePersist::new(self.db.clone()).with_manifests(working_dir.to_path_buf());
+        let mut outcome = restore_job(gate, job_id, &roots, rows, &expected, &mut persist).await?;
         // A row is only as trustworthy as the invariant it was written under:
         // a volume binds while none of its bytes live in a conventional file.
         // A demotion's handback breaks that on purpose, one volume at a time —
@@ -1059,14 +1512,7 @@ impl Pipeline {
             };
             outcome.accepted.remove(&plan.set_name);
             restored.remove(&plan.set_name);
-            if let Err(error) = persist.delete(job_id, &plan.set_name) {
-                tracing::warn!(
-                    job_id = job_id.0,
-                    set_name = %plan.set_name,
-                    error = %error,
-                    "failed to delete a direct-store coverage row refused for conventional bytes"
-                );
-            }
+            persist.delete(job_id, &plan.set_name)?;
             outcome.rejected.push((
                 plan.set_name.clone(),
                 CoverageRejection::ConventionalBytes { file_index },
@@ -1325,7 +1771,28 @@ impl Pipeline {
             "direct_store.restart.skipped_segments",
             result.skip.len() as u64,
         );
-        result
+        let checkpoint_dir = working_dir.to_path_buf();
+        let cleanup = self
+            .db_blocking(move |db| {
+                let rows = match db
+                    .load_archive_authority(job_id)
+                    .map_err(|error| error.to_string())?
+                {
+                    crate::jobs::archive_checkpoint::ArchiveAuthority::Legacy(rows) => {
+                        rows.into_iter().collect()
+                    }
+                    // A different authority can never be interpreted as an
+                    // empty legacy inventory for reclamation.
+                    _ => return Err("archive authority changed during legacy restore".into()),
+                };
+                super::manifest::reclaim_unreferenced(&checkpoint_dir, job_id, &rows)
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+        if let Err(error) = cleanup {
+            tracing::warn!(%error, "could not reclaim orphan direct checkpoints");
+        }
+        Ok(result)
     }
 
     // Puts back the runtime record of every set restored as installed: its

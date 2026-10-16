@@ -1178,6 +1178,13 @@ impl Pipeline {
             let Some(path) = self.resolve_job_input_path(job_id, filename) else {
                 continue;
             };
+            if self
+                .archive_runtime
+                .get(&job_id)
+                .is_some_and(|runtime| runtime.retains_input_path(&path))
+            {
+                continue;
+            }
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => removed += 1,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

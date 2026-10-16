@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use cap_fs_ext::{DirExt, SystemTimeSpec};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, SystemTimeSpec};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use tracing::{info, warn};
@@ -904,6 +904,7 @@ pub(crate) struct JobExtractionBudget {
     entry_count: AtomicU64,
     memory_reserved: AtomicU64,
     cancelled: AtomicBool,
+    stopped: tokio::sync::Notify,
     failure: Mutex<Option<ExtractionFailure>>,
     disk: Mutex<DiskBudgetState>,
     active: Mutex<ActiveState>,
@@ -1008,6 +1009,7 @@ impl JobExtractionBudget {
             entry_count: AtomicU64::new(initial_entries),
             memory_reserved: AtomicU64::new(0),
             cancelled: AtomicBool::new(false),
+            stopped: tokio::sync::Notify::new(),
             failure: Mutex::new(None),
             disk: Mutex::new(DiskBudgetState {
                 capacity,
@@ -1384,13 +1386,29 @@ impl JobExtractionBudget {
     // failing on an extraction refusal, possibly one another budget raised.
     pub(crate) fn stop_for_rejection(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.stopped.notify_waiters();
     }
 
     // Stop active decoders at their next budgeted read, write, or admission
     // checkpoint. The task permits notify cleanup once every worker has left.
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.stopped.notify_waiters();
         self.idle.notify_all();
+    }
+
+    pub(crate) async fn wait_until_stopped(&self) -> io::Error {
+        loop {
+            let stopped = self.stopped.notified();
+            tokio::pin!(stopped);
+            // Register before observing the latch, so cancellation between the
+            // check and await cannot strand a blocked output producer.
+            stopped.as_mut().enable();
+            if let Err(error) = self.check_active_io() {
+                return error;
+            }
+            stopped.await;
+        }
     }
 
     pub(crate) fn wait_for_idle(&self) {
@@ -1546,7 +1564,10 @@ impl JobExtractionBudget {
                 "extraction rejected by security budget"
             );
         }
-        stored.clone().unwrap_or(failure)
+        let result = stored.clone().unwrap_or(failure);
+        drop(stored);
+        self.stopped.notify_waiters();
+        result
     }
 
     fn writer_started(self: &Arc<Self>) {
@@ -1740,13 +1761,17 @@ pub(crate) struct BudgetedWriter<W> {
 }
 
 impl<W> BudgetedWriter<W> {
-    fn new(inner: W, budget: Arc<JobExtractionBudget>) -> Self {
+    pub(crate) fn new(inner: W, budget: Arc<JobExtractionBudget>) -> Self {
         budget.writer_started();
         Self {
             inner,
             budget,
             member_written: 0,
         }
+    }
+
+    pub(crate) fn get_ref(&self) -> &W {
+        &self.inner
     }
 }
 
@@ -1771,28 +1796,6 @@ impl<W: Write> Write for BudgetedWriter<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
-    }
-}
-
-impl BudgetedWriter<cap_std::fs::File> {
-    // Stamp the archive's recorded times on the finished output.
-    //
-    // Called after the last byte is written: the write itself moves the
-    // modification time, so stamping earlier is stamping nothing.
-    pub(crate) fn set_times(&self, times: std::fs::FileTimes) -> io::Result<()> {
-        // The capability file has no time setter of its own; a duplicated
-        // handle hands the same open file to std, which does.
-        #[cfg(unix)]
-        let file = {
-            use std::os::fd::AsFd;
-            std::fs::File::from(self.inner.as_fd().try_clone_to_owned()?)
-        };
-        #[cfg(windows)]
-        let file = {
-            use std::os::windows::io::AsHandle;
-            std::fs::File::from(self.inner.as_handle().try_clone_to_owned()?)
-        };
-        file.set_times(times)
     }
 }
 
@@ -1828,6 +1831,29 @@ impl ExtractionRoot {
             Path::new(root_name),
             "extraction staging root",
         )?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            dir,
+        })
+    }
+
+    pub(crate) fn open_existing(path: &Path) -> Result<Self, String> {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+        {
+            return Err("namespace root is not an absolute normalized path".into());
+        }
+        let (anchor_path, parent_name, root_name) = staging_root_components(path)?;
+        let anchor = Dir::open_ambient_dir(anchor_path, ambient_authority())
+            .map_err(|error| error.to_string())?;
+        let parent = anchor
+            .open_dir_nofollow(parent_name)
+            .map_err(|error| error.to_string())?;
+        let dir = parent
+            .open_dir_nofollow(root_name)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             path: path.to_path_buf(),
             dir,
@@ -1894,6 +1920,248 @@ impl ExtractionRoot {
     }
 
     pub(crate) fn validate_relative_path(&self, raw_name: &str) -> Result<PathBuf, String> {
+        Self::parse_relative_path(raw_name)
+    }
+
+    // Pin each directory before descending. Checking metadata and then opening
+    // an ambient path would let a concurrent rename substitute a symlink.
+    pub(crate) fn open_input(&self, relative: &Path) -> io::Result<cap_std::fs::File> {
+        self.open_existing_regular_file(relative, false)
+    }
+
+    pub(crate) fn sync_file(&self, relative: &Path) -> io::Result<()> {
+        self.open_existing_regular_file(relative, true)?.sync_all()
+    }
+
+    fn open_existing_regular_file(
+        &self,
+        relative: &Path,
+        sync: bool,
+    ) -> io::Result<cap_std::fs::File> {
+        #[cfg(not(windows))]
+        let _ = sync;
+        let invalid =
+            || io::Error::new(io::ErrorKind::InvalidInput, "invalid namespace input path");
+        let mut components = relative.components().peekable();
+        let mut directory = self.dir.try_clone()?;
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(invalid());
+            };
+            if is_windows_drive_component(name) {
+                return Err(invalid());
+            }
+            if components.peek().is_some() {
+                directory = directory.open_dir_nofollow(name)?;
+            } else {
+                let mut options = OpenOptions::new();
+                options.read(true).follow(FollowSymlinks::No);
+                #[cfg(windows)]
+                options.write(sync);
+                #[cfg(unix)]
+                {
+                    use cap_std::fs::OpenOptionsExt;
+                    // A substituted FIFO must not block before the handle's
+                    // regular-file check. This flag has no effect on files.
+                    options.custom_flags(libc::O_NONBLOCK);
+                }
+                let file = directory.open_with(name, &options)?;
+                if !file.metadata()?.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "namespace input is not a regular file",
+                    ));
+                }
+                return Ok(file);
+            }
+        }
+        Err(invalid())
+    }
+
+    /// Open a private placement without truncating previously placed ranges.
+    /// The caller accounts for entries and bytes before issuing writes.
+    pub(crate) fn open_partial(&self, relative: &Path) -> io::Result<cap_std::fs::File> {
+        let invalid =
+            || io::Error::new(io::ErrorKind::InvalidInput, "invalid namespace output path");
+        let mut components = relative.components().peekable();
+        let mut directory = self.dir.try_clone()?;
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(invalid());
+            };
+            if is_windows_drive_component(name) {
+                return Err(invalid());
+            }
+            if components.peek().is_some() {
+                directory = open_or_create_directory_nofollow(
+                    &directory,
+                    Path::new(name),
+                    "namespace output directory",
+                )
+                .map_err(io::Error::other)?;
+            } else {
+                let mut options = OpenOptions::new();
+                options.write(true).create(true).follow(FollowSymlinks::No);
+                #[cfg(unix)]
+                {
+                    use cap_std::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NONBLOCK);
+                }
+                let file = directory.open_with(name, &options)?;
+                if !file.metadata()?.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "namespace output is not a regular file",
+                    ));
+                }
+                return Ok(file);
+            }
+        }
+        Err(invalid())
+    }
+
+    pub(crate) fn probe_directory(&self, relative: &Path) -> io::Result<()> {
+        let (parent, name) = self.namespace_parent(relative, false)?;
+        parent.open_dir_nofollow(name)?;
+        Ok(())
+    }
+
+    pub(crate) fn remove_owned_backing(&self, relative: &Path, directory: bool) -> io::Result<()> {
+        let (parent, name) = self.namespace_parent(relative, false)?;
+        let metadata = parent.symlink_metadata(&name)?;
+        if metadata.file_type().is_symlink() || metadata.is_dir() != directory {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "backing type changed before cleanup",
+            ));
+        }
+        if directory {
+            parent.remove_dir_all(name)
+        } else {
+            parent.remove_file(name)
+        }
+    }
+
+    pub(crate) fn remove_empty_directory(&self, relative: &Path) -> io::Result<()> {
+        let (parent, name) = self.namespace_parent(relative, false)?;
+        parent.remove_dir(name)
+    }
+
+    pub(crate) fn sync_directory(&self, relative: &Path) -> io::Result<()> {
+        let (parent, name) = self.namespace_parent(relative, false)?;
+        let directory = parent.open_dir_nofollow(name)?;
+        #[cfg(unix)]
+        {
+            // Capability directory handles may use O_PATH on Linux. Reopen
+            // the pinned inode for reading before requesting durability.
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            directory.open_with(".", &options)?.sync_all()?;
+            parent.open_with(".", &options)?.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        drop((directory, parent));
+        Ok(())
+    }
+
+    fn namespace_parent(
+        &self,
+        relative: &Path,
+        create: bool,
+    ) -> io::Result<(Dir, std::ffi::OsString)> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid namespace path");
+        let mut components = relative.components().peekable();
+        let mut directory = self.dir.try_clone()?;
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(invalid());
+            };
+            if is_windows_drive_component(name) {
+                return Err(invalid());
+            }
+            if components.peek().is_none() {
+                return Ok((directory, name.to_owned()));
+            }
+            directory = if create {
+                open_or_create_directory_nofollow(
+                    &directory,
+                    Path::new(name),
+                    "namespace directory",
+                )
+                .map_err(io::Error::other)?
+            } else {
+                directory.open_dir_nofollow(name)?
+            };
+        }
+        Err(invalid())
+    }
+
+    /// Publish an immutable input under a new name while retaining its backing.
+    pub(crate) fn link_input_to(
+        &self,
+        relative: &Path,
+        target: &Self,
+        target_relative: &Path,
+    ) -> io::Result<()> {
+        let (source, name) = self.namespace_parent(relative, false)?;
+        let (destination, target_name) = target.namespace_parent(target_relative, true)?;
+        if !source.symlink_metadata(&name)?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "namespace input is not a regular file",
+            ));
+        }
+        source.hard_link(&name, &destination, &target_name)?;
+        // A substituted final symlink must never become a published input.
+        if !destination.symlink_metadata(&target_name)?.is_file() {
+            destination.remove_file(&target_name)?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "namespace input changed during publication",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn list_entries_no_links(
+        &self,
+        skip_top: &[&str],
+    ) -> io::Result<Vec<(PathBuf, cap_std::fs::Metadata)>> {
+        let mut pending = vec![(self.dir.try_clone()?, PathBuf::new())];
+        let mut entries = Vec::new();
+        while let Some((directory, relative)) = pending.pop() {
+            for entry in directory.entries()? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if relative.as_os_str().is_empty() && skip_top.iter().any(|skip| name == *skip) {
+                    continue;
+                }
+                let path = relative.join(&name);
+                let metadata = directory.symlink_metadata(&name)?;
+                #[cfg(target_os = "windows")]
+                if is_windows_cap_reparse_point(&metadata) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "namespace contains a reparse point",
+                    ));
+                }
+                let kind = metadata.file_type();
+                if kind.is_dir() {
+                    pending.push((directory.open_dir_nofollow(&name)?, path.clone()));
+                } else if !kind.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "namespace contains a link or special file",
+                    ));
+                }
+                entries.push((path, metadata));
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
+    }
+
+    pub(crate) fn parse_relative_path(raw_name: &str) -> Result<PathBuf, String> {
         if raw_name.contains('\0') {
             return Err(format!("unsafe archive entry path: {raw_name}"));
         }
@@ -1976,16 +2244,30 @@ impl ExtractionRoot {
     // entry from its parent works everywhere, and not following a symlink
     // means a link swapped in under the directory's name is stamped itself,
     // never its target.
-    pub(crate) fn set_dir_times(
+    pub(crate) fn set_directory_metadata(
         &self,
         relative: &Path,
-        modified: SystemTime,
+        modified: Option<SystemTime>,
         accessed: Option<SystemTime>,
+        unix_mode: Option<u32>,
     ) -> io::Result<()> {
-        let absolute =
-            |time: SystemTime| SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(time));
-        self.dir
-            .set_symlink_times(relative, accessed.map(absolute), Some(absolute(modified)))
+        if modified.is_some() || accessed.is_some() {
+            let absolute =
+                |time| SystemTimeSpec::Absolute(cap_std::time::SystemTime::from_std(time));
+            self.dir
+                .set_symlink_times(relative, accessed.map(absolute), modified.map(absolute))?;
+        }
+        #[cfg(unix)]
+        if let Some(mode) = unix_mode {
+            use std::os::unix::fs::PermissionsExt;
+            self.dir.set_symlink_permissions(
+                relative,
+                cap_std::fs::Permissions::from_std(std::fs::Permissions::from_mode(mode)),
+            )?;
+        }
+        #[cfg(not(unix))]
+        let _ = unix_mode;
+        Ok(())
     }
 
     pub(crate) fn create_file(
@@ -2391,6 +2673,177 @@ mod tests {
             root.validate_relative_path("safe/nested.txt").unwrap(),
             PathBuf::from("safe/nested.txt")
         );
+    }
+
+    #[test]
+    fn namespace_input_pins_regular_files_and_rejects_unsafe_paths() {
+        let (temp, root, _) = root_and_budget();
+        std::fs::create_dir(temp.path().join("nested")).unwrap();
+        std::fs::write(temp.path().join("nested/input"), b"original").unwrap();
+        let mut input = root.open_input(Path::new("nested/input")).unwrap();
+        std::fs::rename(temp.path().join("nested"), temp.path().join("retired")).unwrap();
+        std::fs::create_dir(temp.path().join("nested")).unwrap();
+        std::fs::write(temp.path().join("nested/input"), b"replacement").unwrap();
+        let mut bytes = Vec::new();
+        input.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original");
+        for path in ["", "../input", "/input", "C:/input", "nested"] {
+            assert!(root.open_input(Path::new(path)).is_err(), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespace_input_rejects_symlinks_and_fifo_without_opening_the_target() {
+        use std::os::unix::fs::symlink;
+        let (temp, root, _) = root_and_budget();
+        std::fs::create_dir(temp.path().join("nested")).unwrap();
+        std::fs::write(temp.path().join("nested/input"), b"input").unwrap();
+        symlink("nested", temp.path().join("alias")).unwrap();
+        symlink("nested/input", temp.path().join("link")).unwrap();
+        assert!(root.open_input(Path::new("alias/input")).is_err());
+        assert!(root.open_input(Path::new("link")).is_err());
+        let fifo = std::ffi::CString::new(temp.path().join("fifo").as_os_str().as_encoded_bytes())
+            .unwrap();
+        // SAFETY: the CString is a valid, live, terminated pathname.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(root.open_input(Path::new("fifo")).is_err());
+    }
+
+    #[test]
+    fn namespace_partial_preserves_existing_ranges_and_pins_its_handle() {
+        let (temp, root, _) = root_and_budget();
+        root.open_partial(Path::new("nested/partial"))
+            .unwrap()
+            .write_all(b"original")
+            .unwrap();
+        let mut output = root.open_partial(Path::new("nested/partial")).unwrap();
+        output.seek(SeekFrom::Start(4)).unwrap();
+        std::fs::rename(temp.path().join("nested"), temp.path().join("retained")).unwrap();
+        std::fs::create_dir(temp.path().join("nested")).unwrap();
+        std::fs::write(temp.path().join("nested/partial"), b"replacement").unwrap();
+        output.write_all(b"HERE").unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("retained/partial")).unwrap(),
+            b"origHERE"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("nested/partial")).unwrap(),
+            b"replacement"
+        );
+        for path in ["", "../escape", "/escape", "C:/escape", "nested"] {
+            assert!(root.open_partial(Path::new(path)).is_err(), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespace_partial_rejects_links_and_special_files() {
+        use std::os::unix::fs::symlink;
+        let (temp, root, _) = root_and_budget();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("target"), b"untouched").unwrap();
+        symlink(outside.path(), temp.path().join("alias")).unwrap();
+        symlink(outside.path().join("target"), temp.path().join("link")).unwrap();
+        assert!(root.open_partial(Path::new("alias/target")).is_err());
+        assert!(root.open_partial(Path::new("link")).is_err());
+        let fifo = std::ffi::CString::new(temp.path().join("fifo").as_os_str().as_encoded_bytes())
+            .unwrap();
+        // SAFETY: the CString is a valid, live, terminated pathname.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(root.open_partial(Path::new("fifo")).is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("target")).unwrap(),
+            b"untouched"
+        );
+    }
+
+    #[test]
+    fn namespace_link_keeps_original_and_never_replaces_an_existing_output() {
+        let (source_dir, source, _) = root_and_budget();
+        let (target_dir, target, _) = root_and_budget();
+        std::fs::write(source_dir.path().join("input"), b"immutable").unwrap();
+        source
+            .link_input_to(Path::new("input"), &target, Path::new("nested/output"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(source_dir.path().join("input")).unwrap(),
+            b"immutable"
+        );
+        assert_eq!(
+            std::fs::read(target_dir.path().join("nested/output")).unwrap(),
+            b"immutable"
+        );
+        assert!(
+            source
+                .link_input_to(Path::new("input"), &target, Path::new("nested/output"))
+                .is_err()
+        );
+        assert!(
+            source
+                .link_input_to(Path::new("input"), &target, Path::new("../escape"))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespace_link_refuses_source_and_destination_symlinks() {
+        use std::os::unix::fs::symlink;
+        let (source_dir, source, _) = root_and_budget();
+        let (target_dir, target, _) = root_and_budget();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(source_dir.path().join("input"), b"immutable").unwrap();
+        symlink("input", source_dir.path().join("alias")).unwrap();
+        symlink(outside.path(), target_dir.path().join("alias")).unwrap();
+        assert!(
+            source
+                .link_input_to(Path::new("alias"), &target, Path::new("output"))
+                .is_err()
+        );
+        assert!(
+            source
+                .link_input_to(Path::new("input"), &target, Path::new("alias/output"))
+                .is_err()
+        );
+        assert!(!outside.path().join("output").exists());
+    }
+
+    #[test]
+    fn namespace_inventory_preserves_empty_directories() {
+        let (directory, root, _) = root_and_budget();
+        std::fs::create_dir_all(directory.path().join("parent/empty")).unwrap();
+        std::fs::write(directory.path().join("parent/payload"), b"data").unwrap();
+        let entries = root.list_entries_no_links(&[]).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(path, metadata)| (path.to_str().unwrap(), metadata.is_dir()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("parent", true),
+                ("parent/empty", true),
+                ("parent/payload", false)
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespace_inventory_skips_private_roots_before_traversal() {
+        let (directory, root, _) = root_and_budget();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), directory.path().join("private")).unwrap();
+        std::fs::create_dir_all(directory.path().join("visible/private")).unwrap();
+        std::fs::write(directory.path().join("visible/private/file"), b"data").unwrap();
+        let entries = root.list_entries_no_links(&["private"]).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries
+                .iter()
+                .any(|(path, _)| path == Path::new("visible/private/file"))
+        );
+        assert!(root.list_entries_no_links(&[]).is_err());
     }
 
     #[test]

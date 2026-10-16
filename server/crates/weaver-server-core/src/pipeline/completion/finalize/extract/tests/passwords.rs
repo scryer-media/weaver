@@ -53,6 +53,94 @@ fn sevenzip(password: Option<&str>, encrypt_header: bool) -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
+#[tokio::test]
+async fn prepared_sevenz_password_selection_streams_only_the_validated_attempt() {
+    use crate::pipeline::extraction::catalog::decoded::DecodedCatalog;
+    use crate::pipeline::extraction::output::channel::{ChannelOutput, Event, StreamOwner};
+
+    for (password, header, wrong_first) in [
+        (None, false, true),
+        (Some("right"), false, false),
+        (Some("right"), true, false),
+        (Some("right"), false, true),
+        (Some("right"), true, true),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("input.7z");
+        fs::write(&path, sevenzip(password, header)).unwrap();
+        let out = temp.path().join("output");
+        fs::create_dir(&out).unwrap();
+        let (root, budget) = test_extraction_security_with_memory(&out, 256 * 1024 * 1024);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let (output, generation) = ChannelOutput::new(
+            StreamOwner {
+                root: 1,
+                node: 1,
+                generation: 1,
+            },
+            budget.try_reserve_memory(4096).unwrap(),
+            sender,
+            tokio::runtime::Handle::current(),
+            Arc::clone(&budget),
+        )
+        .unwrap();
+        let mut catalog =
+            DecodedCatalog::new(generation.clone(), budget.try_reserve_memory(4096).unwrap());
+        let (event_tx, _) = tokio::sync::broadcast::channel(32);
+        let request = prepared::PreparedSevenZip {
+            job_id: JobId(1),
+            set_name: "input".into(),
+            part_candidates: vec![(0, path)],
+            uu_paths: HashSet::new(),
+            passwords: candidates(
+                wrong_first
+                    .then_some("wrong")
+                    .into_iter()
+                    .chain(["right"])
+                    .map(str::to_owned),
+            ),
+            root: Arc::new(root),
+            budget,
+            event_tx,
+            phase_counters: Arc::default(),
+            sevenz_decode_memory: 128 * 1024 * 1024,
+            sevenz_decode_threads: 1,
+        };
+        let worker = tokio::task::spawn_blocking(move || output.run(|sink| request.run_to(sink)));
+        let mut bytes = Vec::new();
+        let mut declarations = 0;
+        while let Some(frame) = receiver.recv().await {
+            catalog.accept(&frame).unwrap();
+            match frame.event {
+                Event::File { .. } => declarations += 1,
+                Event::Bytes {
+                    offset,
+                    bytes: payload,
+                } => {
+                    assert_eq!(offset, bytes.len() as u64);
+                    bytes.extend_from_slice(&payload);
+                }
+                _ => {}
+            }
+        }
+        let result = worker.await.unwrap();
+        assert!(!out.join("synthetic.mkv").exists());
+        if password.is_some() && wrong_first {
+            assert!(result.is_err());
+            assert!(generation.is_revoked());
+            assert_eq!(declarations, 0);
+            assert!(bytes.is_empty());
+            continue;
+        }
+        let result = result.unwrap();
+        catalog.close().unwrap();
+        assert!(!generation.is_revoked());
+        assert_eq!(declarations, 1);
+        assert_eq!(bytes, b"synthetic archive member");
+        assert_eq!(result.selected_password.as_deref(), password);
+    }
+}
+
 fn extract_zip_bytes(
     bytes: Vec<u8>,
     values: &[&str],

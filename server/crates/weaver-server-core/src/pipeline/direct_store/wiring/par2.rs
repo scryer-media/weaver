@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod graph_repair;
+
 // Why a job's demoted direct set is still holding the PAR2 verdict up.
 //
 // Every variant names one file of one set and what is still owed on it, so a
@@ -407,9 +409,37 @@ impl Pipeline {
             if !belongs_to_recovery_set {
                 continue;
             }
-            let set_volumes = match retained {
-                Some(volumes) => volumes.to_vec(),
-                None => set.virtual_volumes(&lengths),
+            let selected = self
+                .archive_runtime
+                .get(&job_id)
+                .and_then(|runtime| runtime.selected_graph_files(set.set_name(), 0));
+            let set_volumes = if let Some(selected) = selected {
+                selected
+                    .into_iter()
+                    .filter_map(|(volume_index, path)| {
+                        let length = *lengths.get(&volume_index)?;
+                        let mut covered = super::super::ByteRanges::new();
+                        covered.insert(0, length);
+                        Some(super::super::provider::VirtualVolume {
+                            backing_leases: None,
+                            volume_index,
+                            envelope: path,
+                            extents: Vec::new(),
+                            partials: std::sync::Arc::default(),
+                            nested: Default::default(),
+                            covered: covered.clone(),
+                            envelope_covered: covered,
+                            held: std::sync::Arc::default(),
+                            len: length,
+                            ciphers: std::sync::Arc::default(),
+                        })
+                    })
+                    .collect()
+            } else {
+                match retained {
+                    Some(volumes) => volumes.to_vec(),
+                    None => set.virtual_volumes(&lengths),
+                }
             };
             for mut volume in set_volumes {
                 let Some((file_index, par2_file_id, binding_set_id)) =
@@ -2352,10 +2382,29 @@ impl Pipeline {
         job_id: JobId,
         verification: &par2_rs::VerificationResult,
     ) -> DirectRepairAnswer {
+        let graph_authority = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| set.has_nested_checkpoint_authority());
         let Some(par2_set) = self.par2_set(job_id).cloned() else {
+            if graph_authority {
+                self.fail_job(
+                    job_id,
+                    "archive graph repair recovery set is unavailable".into(),
+                );
+                return DirectRepairAnswer::Acted;
+            }
             return DirectRepairAnswer::Declined;
         };
         let Some(overlay) = self.direct_par2_overlay(job_id) else {
+            if graph_authority {
+                self.fail_job(
+                    job_id,
+                    "archive graph repair source binding is unavailable".into(),
+                );
+                return DirectRepairAnswer::Acted;
+            }
             return DirectRepairAnswer::Declined;
         };
         // The same settle guard the demotion path carries, in the same shape:
@@ -2378,6 +2427,59 @@ impl Pipeline {
             super::super::repair::damaged_files_by_set(verification, |file_id| {
                 overlay.owner_of(file_id)
             });
+        let graph_damage = by_set.keys().any(|index| {
+            self.direct_store
+                .set(job_id, *index)
+                .is_some_and(|set| set.has_nested_checkpoint_authority())
+        });
+        if graph_damage {
+            if !payload_settled
+                && by_set.keys().any(|index| {
+                    self.direct_store
+                        .set(job_id, *index)
+                        .is_none_or(|set| !set.all_volumes_complete())
+                })
+            {
+                return DirectRepairAnswer::Deferred;
+            }
+            if let par2_rs::verify::Repairability::Insufficient { blocks_needed, .. } =
+                verification.repairable
+                && self.defer_direct_repair_for_recovery(
+                    job_id,
+                    blocks_needed,
+                    verification.recovery_blocks_available,
+                )
+            {
+                return DirectRepairAnswer::Deferred;
+            }
+            let prepared = by_set
+                .iter()
+                .map(|(index, files)| {
+                    self.prepare_direct_set_repair(
+                        job_id,
+                        *index,
+                        &par2_set,
+                        verification,
+                        &overlay,
+                        files,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>();
+            let answer = match prepared {
+                Ok(prepared) => {
+                    self.repair_graph_roots(job_id, &prepared, &par2_set, &overlay)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = answer {
+                self.fail_job(
+                    job_id,
+                    format!("immutable archive graph repair failed: {error}"),
+                );
+            }
+            return DirectRepairAnswer::Acted;
+        }
         let conventional = if unowned.is_empty() {
             Vec::new()
         } else {
@@ -2580,6 +2682,17 @@ impl Pipeline {
             Ok(()) => DirectRepairAnswer::Acted,
             Err(failure) => {
                 Self::record_direct_repair_failure(job_id, &failure);
+                if attempted.iter().any(|index| {
+                    self.direct_store
+                        .set(job_id, *index)
+                        .is_some_and(|set| set.has_nested_checkpoint_authority())
+                }) {
+                    self.fail_job(
+                        job_id,
+                        format!("immutable archive graph repair failed: {failure}"),
+                    );
+                    return DirectRepairAnswer::Acted;
+                }
                 warn!(
                     job_id = job_id.0,
                     failure = %failure,
@@ -3013,7 +3126,7 @@ impl Pipeline {
             .flat_map(|volume| volume.rewrite.iter())
             .map(|(start, end)| end.saturating_sub(*start))
             .sum();
-        if rewrite_bytes > holds_budget {
+        if rewrite_bytes > holds_budget && !set.has_nested_checkpoint_authority() {
             return Err(
                 super::super::repair::DirectRepairFailure::RewriteOverBudget {
                     bytes: rewrite_bytes,
@@ -3043,6 +3156,15 @@ impl Pipeline {
         verification: &par2_rs::VerificationResult,
         overlay: &DirectPar2Overlay,
     ) -> Result<(), super::super::repair::DirectRepairFailure> {
+        if prepared.iter().any(|repair| {
+            self.direct_store
+                .set(job_id, repair.set_index)
+                .is_some_and(|set| set.has_nested_checkpoint_authority())
+        }) {
+            return self
+                .repair_graph_roots(job_id, &prepared, par2_set, overlay)
+                .await;
+        }
         // The conventional targets' share of the same first irreversible step:
         // their latch, and the retirement of every claim over bytes the repair
         // is about to write. The grid's verdicts for these files describe what

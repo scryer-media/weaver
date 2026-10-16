@@ -1878,6 +1878,10 @@ impl Pipeline {
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
+        let archive_rows = self
+            .load_archive_restore_rows(job_id, &working_dir)
+            .await
+            .map_err(crate::SchedulerError::Internal)?;
         let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
         if working_dir.starts_with(&self.intermediate_dir)
             && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
@@ -1956,8 +1960,10 @@ impl Pipeline {
                 &spec,
                 &working_dir,
                 &restore_skip_plan.file_progress,
+                archive_rows,
             )
-            .await;
+            .await
+            .map_err(crate::SchedulerError::Internal)?;
         restore_skip_plan.skip.extend(direct_restore.skip.iter());
         for (file_index, floor) in &direct_restore.file_progress {
             let slot = restore_skip_plan
@@ -2204,6 +2210,9 @@ impl Pipeline {
         let direct_swept = direct_restore.swept;
         let direct_installed = direct_restore.installed;
         self.direct_store.install_restored(job_id, direct_sets);
+        self.replay_direct_archive_prefixes(job_id)
+            .await
+            .map_err(crate::SchedulerError::Internal)?;
         self.reinstate_restored_identity_sets(job_id);
         self.restore_download_finalization_runtime(job_id).await;
         self.note_download_activity(job_id);

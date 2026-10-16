@@ -1136,6 +1136,218 @@ fn direct_coverage_roundtrip_and_delete() {
 }
 
 #[test]
+fn archive_checkpoint_handover_fences_stale_writers_and_cascades() {
+    use crate::jobs::archive_checkpoint::{
+        ArchiveAuthority, ArchiveCheckpointRef, CheckpointCommit,
+    };
+    let db = Database::open_in_memory().unwrap();
+    let job = JobId(1);
+    assert_eq!(
+        db.load_archive_authority(job).unwrap(),
+        ArchiveAuthority::JobGone
+    );
+    db.create_active_job(&sample_job(1)).unwrap();
+    db.save_direct_coverage(job, "outer", &[1]).unwrap();
+    db.save_rar_volume_facts(job, "outer", 0, &[7; 128])
+        .unwrap();
+    assert_eq!(
+        fetch_i64(&db, "SELECT COUNT(*) FROM active_rar_volume_facts", vec![]),
+        1
+    );
+    assert_eq!(
+        db.load_archive_authority(job).unwrap(),
+        ArchiveAuthority::Legacy(std::collections::BTreeMap::from([(
+            "outer".into(),
+            vec![1]
+        )]))
+    );
+    let first = ArchiveCheckpointRef {
+        generation: 1,
+        reference: vec![2; 76],
+    };
+    assert_eq!(
+        db.commit_archive_checkpoint(job, None, first.clone())
+            .unwrap(),
+        CheckpointCommit::Committed
+    );
+    assert!(db.load_direct_coverage(job).unwrap().is_empty());
+    assert_eq!(
+        fetch_i64(&db, "SELECT COUNT(*) FROM active_rar_volume_facts", vec![]),
+        0
+    );
+    db.save_rar_volume_facts(job, "late-facts", 1, &[8; 128])
+        .unwrap();
+    assert_eq!(
+        fetch_i64(&db, "SELECT COUNT(*) FROM active_rar_volume_facts", vec![]),
+        0
+    );
+    assert_eq!(
+        db.load_archive_authority(job).unwrap(),
+        ArchiveAuthority::Job(first.clone())
+    );
+    assert!(
+        db.save_direct_coverage(job, "late-root-flight", &[3])
+            .is_err()
+    );
+    assert!(db.load_direct_coverage(job).unwrap().is_empty());
+    assert_eq!(
+        db.commit_archive_checkpoint(job, None, first.clone())
+            .unwrap(),
+        CheckpointCommit::Conflict
+    );
+    let next = ArchiveCheckpointRef {
+        generation: 2,
+        reference: vec![4; 76],
+    };
+    assert_eq!(
+        db.commit_archive_checkpoint(job, Some(1), next.clone())
+            .unwrap(),
+        CheckpointCommit::Committed
+    );
+    assert_eq!(
+        db.commit_archive_checkpoint(job, Some(1), next.clone())
+            .unwrap(),
+        CheckpointCommit::Conflict
+    );
+    assert_eq!(db.load_archive_checkpoint(job).unwrap(), Some(next.clone()));
+    assert_eq!(
+        db.load_archive_authority(job).unwrap(),
+        ArchiveAuthority::Job(next)
+    );
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) FROM active_archive_checkpoint",
+            vec![]
+        ),
+        1
+    );
+    db.delete_active_job(job).unwrap();
+    assert_eq!(db.load_archive_checkpoint(job).unwrap(), None);
+    assert_eq!(
+        db.commit_archive_checkpoint(job, None, first).unwrap(),
+        CheckpointCommit::JobGone
+    );
+    assert_eq!(db.load_archive_checkpoint(job).unwrap(), None);
+}
+
+#[test]
+fn archive_checkpoint_failed_handover_preserves_legacy_authority() {
+    use crate::jobs::archive_checkpoint::ArchiveCheckpointRef;
+    let db = Database::open_in_memory().unwrap();
+    let job = JobId(1);
+    db.create_active_job(&sample_job(1)).unwrap();
+    db.save_direct_coverage(job, "outer", &[1]).unwrap();
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::execute(datastore.read_exec(), "CREATE TRIGGER reject_checkpoint_handover BEFORE DELETE ON active_direct_coverage BEGIN SELECT RAISE(ABORT, 'injected handover failure'); END", &[]).await?;
+        Ok(())
+    }).unwrap();
+    assert!(
+        db.commit_archive_checkpoint(
+            job,
+            None,
+            ArchiveCheckpointRef {
+                generation: 1,
+                reference: vec![2; 76]
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(db.load_archive_checkpoint(job).unwrap(), None);
+    assert_eq!(db.load_direct_coverage(job).unwrap()["outer"], vec![1]);
+}
+
+#[test]
+fn archive_checkpoint_concurrent_successors_have_one_winner() {
+    use crate::jobs::archive_checkpoint::{ArchiveCheckpointRef, CheckpointCommit};
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    db.commit_archive_checkpoint(
+        JobId(1),
+        None,
+        ArchiveCheckpointRef {
+            generation: 1,
+            reference: vec![1; 76],
+        },
+    )
+    .unwrap();
+    let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let workers: Vec<_> = [2, 3]
+        .into_iter()
+        .map(|value| {
+            let db = db.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                let next = ArchiveCheckpointRef {
+                    generation: 2,
+                    reference: vec![value; 76],
+                };
+                (
+                    db.commit_archive_checkpoint(JobId(1), Some(1), next.clone())
+                        .unwrap(),
+                    next,
+                )
+            })
+        })
+        .collect();
+    start.wait();
+    let outcomes: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|(result, _)| *result == CheckpointCommit::Committed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|(result, _)| *result == CheckpointCommit::Conflict)
+            .count(),
+        1
+    );
+    let winner = outcomes
+        .into_iter()
+        .find(|(result, _)| *result == CheckpointCommit::Committed)
+        .unwrap()
+        .1;
+    assert_eq!(db.load_archive_checkpoint(JobId(1)).unwrap(), Some(winner));
+}
+
+#[test]
+fn archive_checkpoint_rejects_unbounded_payloads_and_invalid_generations() {
+    use crate::jobs::archive_checkpoint::ArchiveCheckpointRef;
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    for (expected, generation, length) in [
+        (None, 0, 76),
+        (None, 2, 76),
+        (Some(0), 1, 76),
+        (Some(i64::MAX as u64), i64::MAX as u64 + 1, 76),
+        (None, 1, 0),
+        (None, 1, 257),
+    ] {
+        assert!(
+            db.commit_archive_checkpoint(
+                JobId(1),
+                expected,
+                ArchiveCheckpointRef {
+                    generation,
+                    reference: vec![2; length]
+                }
+            )
+            .is_err()
+        );
+    }
+    assert_eq!(db.load_archive_checkpoint(JobId(1)).unwrap(), None);
+}
+
+#[test]
 fn direct_coverage_is_dropped_with_the_active_job() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();

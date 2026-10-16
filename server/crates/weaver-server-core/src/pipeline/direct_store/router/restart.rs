@@ -11,6 +11,30 @@ impl DirectSetRouter {
         Some((member.name.clone(), member.split_before, member.split_after))
     }
 
+    // A checkpoint captures facts without consuming the independent legacy
+    // cache writer's dirty set. The container description is stored once.
+    pub(crate) fn checkpoint_facts(&self) -> BTreeMap<u32, DirectVolumeFacts> {
+        if self.plan.format == SetFormat::SevenZip {
+            return self
+                .declared_volume_sizes
+                .iter()
+                .map(|(&volume, &declared_len)| {
+                    (
+                        volume,
+                        DirectVolumeFacts::SevenZip(Box::new(SevenZipVolumeFacts {
+                            declared_len,
+                            container: (volume == 0).then(|| self.sevenz_facts.clone()).flatten(),
+                        })),
+                    )
+                })
+                .collect();
+        }
+        self.volume_facts
+            .iter()
+            .map(|(&volume, facts)| (volume, DirectVolumeFacts::Rar(Box::new(facts.clone()))))
+            .collect()
+    }
+
     // ---- Restart ----------------------------------------------------------
     //
     // A restarted set rebuilds its layout from the **cached volume facts**, not
@@ -91,6 +115,21 @@ impl DirectSetRouter {
         &mut self,
         facts: &BTreeMap<u32, DirectVolumeFacts>,
     ) -> Result<(), DemotionReason> {
+        self.restore_layout_inner(facts, false)
+    }
+
+    pub(crate) fn restore_retained_layout(
+        &mut self,
+        facts: &BTreeMap<u32, DirectVolumeFacts>,
+    ) -> Result<(), DemotionReason> {
+        self.restore_layout_inner(facts, true)
+    }
+
+    fn restore_layout_inner(
+        &mut self,
+        facts: &BTreeMap<u32, DirectVolumeFacts>,
+        retained: bool,
+    ) -> Result<(), DemotionReason> {
         if self.plan.format == SetFormat::SevenZip {
             return self.restore_sevenz_layout(facts);
         }
@@ -106,6 +145,12 @@ impl DirectSetRouter {
                 // The row names a volume this job no longer plans. Refusing is
                 // the same stance the checkpoint reader takes on an unknown set.
                 return Err(self.fail(DemotionReason::ConflictingVolumeFacts));
+            }
+            if volume_facts.members.iter().any(|member| {
+                crate::pipeline::extraction::validate_sanitized_rar_member_path(&member.name)
+                    .is_err()
+            }) {
+                return Err(self.fail(DemotionReason::UnsafeDestination));
             }
             if self.layout.is_none() {
                 let format = volume_facts.archive_format();
@@ -132,12 +177,20 @@ impl DirectSetRouter {
             self.volume_facts
                 .insert(*volume_index, (**volume_facts).clone());
             self.member_order_stale = true;
+            if retained {
+                // Rebuild the historical catalog before a later volume can
+                // close a provisional member with an ineligible checksum.
+                // Safety and crypt admission checks still run in sync_members.
+                self.sync_members()?;
+            }
         }
         if self.layout.is_none() {
             return Ok(());
         }
         self.sync_members()?;
-        self.check_eligibility()?;
+        if !retained {
+            self.check_eligibility()?;
+        }
         Ok(())
     }
 
@@ -246,6 +299,82 @@ impl DirectSetRouter {
                 .set_sevenz_password(&admission.secret, admission.password);
         }
         self.adopt_container_facts(container)
+    }
+
+    pub(crate) fn restore_backed_extent(
+        &mut self,
+        volume: u32,
+        source_offset: u64,
+        relative_partial: &str,
+        logical_offset: u64,
+        len: u64,
+    ) -> Result<(), DemotionReason> {
+        let member_id = self
+            .members
+            .iter()
+            .find_map(|(&id, member)| (member.relative_partial == relative_partial).then_some(id))
+            .ok_or(DemotionReason::ConflictingVolumeFacts)?;
+        let index = self
+            .layout_index_for_member(member_id)
+            .ok_or(DemotionReason::ConflictingVolumeFacts)?;
+        let end = source_offset
+            .checked_add(len)
+            .ok_or(DemotionReason::ConflictingVolumeFacts)?;
+        let logical_end = logical_offset
+            .checked_add(len)
+            .ok_or(DemotionReason::ConflictingVolumeFacts)?;
+        if len == 0
+            || !self.members[&member_id]
+                .covered
+                .missing(logical_offset, len)
+                .is_empty()
+        {
+            return Err(DemotionReason::ConflictingVolumeFacts);
+        }
+        let mut proven = ByteRanges::new();
+        for part in &self.layout_members()[index].parts {
+            if part.volume != volume {
+                continue;
+            }
+            let start = source_offset.max(part.data_offset);
+            let stop = end.min(
+                part.data_offset
+                    .checked_add(part.data_size)
+                    .ok_or(DemotionReason::ConflictingVolumeFacts)?,
+            );
+            if start >= stop {
+                continue;
+            }
+            let member_start = part
+                .logical_offset
+                .ok_or(DemotionReason::ConflictingVolumeFacts)?
+                .checked_add(start - part.data_offset)
+                .ok_or(DemotionReason::ConflictingVolumeFacts)?;
+            if member_start
+                != logical_offset
+                    .checked_add(start - source_offset)
+                    .ok_or(DemotionReason::ConflictingVolumeFacts)?
+                || member_start
+                    .checked_add(stop - start)
+                    .is_none_or(|end| end > logical_end)
+            {
+                return Err(DemotionReason::ConflictingVolumeFacts);
+            }
+            proven.insert(start, stop - start);
+        }
+        if !proven.missing(source_offset, len).is_empty() {
+            return Err(DemotionReason::ConflictingVolumeFacts);
+        }
+        self.record_routed_extent(
+            volume,
+            MemberExtent {
+                member_id,
+                physical_offset: source_offset,
+                logical_offset,
+                len,
+            },
+        );
+        Ok(())
     }
 
     // Seeds one member's coverage from a checkpoint's destination claim.

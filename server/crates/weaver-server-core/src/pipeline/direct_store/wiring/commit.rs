@@ -1,12 +1,21 @@
 // Direct-store writes and finalization, including mixed-member chase handoff.
 
+mod nested;
+
 use super::*;
 use crate::pipeline::direct_store::barrier::{BarrierError, CoveragePersist};
 use crate::pipeline::{DirectBarrierDone, DirectBarrierFlight, DirectRearmDone};
 
-fn installed_tolerated_members(targets: &[ToleratedTarget]) -> Result<ToleratedExtraction, String> {
+fn installed_tolerated_members(
+    targets: &[ToleratedTarget],
+    streamed: &HashSet<String>,
+) -> Result<ToleratedExtraction, String> {
     let mut result = ToleratedExtraction::default();
     for target in targets {
+        if streamed.contains(&target.name) {
+            result.streamed.push(target.name.clone());
+            continue;
+        }
         if target.is_directory {
             let metadata = std::fs::symlink_metadata(&target.destination)
                 .map_err(|error| error.to_string())?;
@@ -177,6 +186,10 @@ impl Pipeline {
         let job_id = file_id.job_id;
         let decoded_size = segment.decoded_size;
         let part_crc = segment.part_crc;
+        if let Err(error) = Box::pin(self.promote_direct_archive_graph(job_id)).await {
+            self.fail_job(job_id, format!("archive graph promotion failed: {error}"));
+            return DirectRouteOutcome::Routed;
+        }
         // The dual-CRC grid's half of the article, carried past routing to the
         // commit seam. The router is handed refcounted views of the decoder's
         // own buffers rather than a flattened copy, and `segment` keeps its
@@ -734,6 +747,18 @@ impl Pipeline {
 
         let mut grouped: HashMap<PathBuf, Vec<(u64, Vec<bytes::Bytes>)>> = HashMap::new();
         for span in spans {
+            if set.has_nested_checkpoint_authority() {
+                let Some(path) = set.placement_path(span.owner, span.destination) else {
+                    // A stale generation has no writable destination. Its
+                    // receipt is refused again by graph placement validation.
+                    continue;
+                };
+                grouped
+                    .entry(path)
+                    .or_default()
+                    .push((span.destination_offset, span.bytes.clone()));
+                continue;
+            }
             // The two roots part company here, and this is the seam the whole
             // split exists for: member payload is written straight into the
             // job's staging root on the **complete** volume, so the commit
@@ -1181,6 +1206,64 @@ impl Pipeline {
         {
             return;
         }
+        if let Err(error) = Box::pin(self.promote_direct_archive_graph(job_id)).await {
+            self.fail_job(job_id, format!("archive graph promotion failed: {error}"));
+            return;
+        }
+        let graph_roots: Vec<_> = self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| {
+                set.has_nested_checkpoint_authority()
+                    && set.all_volumes_complete()
+                    && !set.is_delegated()
+                    && !set.is_finalized()
+                    && !set.is_demoted()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in graph_roots {
+            let name = self
+                .direct_store
+                .set(job_id, index)
+                .expect("selected root")
+                .plan()
+                .set_name
+                .clone();
+            if let Err(error) = Box::pin(self.refresh_direct_live_inputs(job_id, &name)).await {
+                self.fail_job(job_id, error);
+                return;
+            }
+            if let Err(error) =
+                Box::pin(self.settle_direct_nested_materialization(job_id, index)).await
+            {
+                self.fail_job(job_id, format!("nested materialization failed: {error}"));
+                return;
+            }
+            if let Err(error) = Box::pin(self.rearm_direct_graph(job_id, index)).await {
+                self.fail_job(
+                    job_id,
+                    format!("nested archive integrity rearm failed: {error}"),
+                );
+                return;
+            }
+            if let Err(error) = Box::pin(self.refresh_direct_live_inputs(job_id, &name)).await {
+                self.fail_job(job_id, error);
+                return;
+            }
+        }
+        if self
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| set.has_nested_checkpoint_authority() && set.due(Instant::now()).is_some())
+            && let Err(error) = self.commit_archive_graph(job_id).await
+        {
+            self.fail_job(job_id, format!("archive checkpoint failed: {error}"));
+            return;
+        }
         // The gate re-arm, and deliberately **before** the PAR2 wait: the
         // re-read is about the member gates, not about verification, and
         // running it at the download/verify boundary means a par2-bearing set
@@ -1220,6 +1303,7 @@ impl Pipeline {
             .filter(|(_, set)| {
                 !set.is_demoted()
                     && !set.is_finalized()
+                    && !set.is_delegated()
                     && set.all_volumes_complete()
                     // Native completion and router settlement are separate
                     // actor steps. The latter still owns this damage verdict.
@@ -1293,6 +1377,7 @@ impl Pipeline {
                 .filter(|(index, set)| {
                     !set.is_demoted()
                         && !set.is_finalized()
+                        && !set.is_delegated()
                         && !set.ready_to_finalize()
                         && !self.direct_set_has_pending_volume_tail(job_id, *index)
                         && !self.direct_rearm_in_flight.contains(&(job_id, *index))
@@ -1316,6 +1401,9 @@ impl Pipeline {
             .iter()
             .enumerate()
             .any(|(index, set)| {
+                if set.is_delegated() {
+                    return false;
+                }
                 if set.is_demoted() {
                     let extracted = self
                         .extracted_archives
@@ -1487,6 +1575,14 @@ impl Pipeline {
         trigger: super::super::barrier::BarrierTrigger,
     ) {
         if self
+            .direct_store
+            .set(job_id, set_index)
+            .is_some_and(|set| set.has_nested_checkpoint_authority())
+        {
+            self.schedule_job_completion_check(job_id);
+            return;
+        }
+        if self
             .direct_barrier_flights
             .contains_key(&(job_id, set_index))
         {
@@ -1618,11 +1714,12 @@ impl Pipeline {
             .map(|((relative, _), outcome)| (relative, outcome.map_err(|error| error.to_string())))
             .collect();
         let mut sync = PreSyncedDestinations { results };
-        let mut persist = DatabaseCoveragePersist::new(self.db.clone());
         let now = Instant::now();
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
         };
+        let mut persist = DatabaseCoveragePersist::new(self.db.clone())
+            .with_manifests(set.plan().working_dir.clone());
         let outcome = set.commit_barrier(prepared, now, &mut sync, &mut persist);
         Self::report_direct_barrier(job_id, dirty_bytes, outcome);
     }
@@ -1689,6 +1786,27 @@ impl Pipeline {
             Box::pin(self.settle_direct_placements(job_id, set_index)).await;
         }
         self.join_direct_barrier_flight(job_id, set_index).await;
+        if self
+            .direct_store
+            .set(job_id, set_index)
+            .is_some_and(|set| set.has_nested_checkpoint_authority())
+        {
+            let indices: Vec<_> = self
+                .direct_store
+                .sets_for(job_id)
+                .iter()
+                .enumerate()
+                .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
+                .map(|(index, _)| index)
+                .collect();
+            for index in indices {
+                self.await_direct_placement_io(job_id, index).await;
+            }
+            if let Err(error) = self.commit_archive_graph(job_id).await {
+                self.fail_job(job_id, format!("archive checkpoint failed: {error}"));
+            }
+            return;
+        }
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return;
         };
@@ -1726,11 +1844,12 @@ impl Pipeline {
 
         let mut drain = InlineDrain;
         let mut sync = PreSyncedDestinations { results };
-        let mut persist = DatabaseCoveragePersist::new(self.db.clone());
         let now = Instant::now();
         let Some(set) = self.direct_store.set_mut(job_id, set_index) else {
             return;
         };
+        let mut persist = DatabaseCoveragePersist::new(self.db.clone())
+            .with_manifests(set.plan().working_dir.clone());
         let outcome = set.run_barrier(trigger, now, &mut drain, &mut sync, &mut persist);
         Self::report_direct_barrier(job_id, dirty_bytes, outcome);
     }
@@ -1783,33 +1902,14 @@ impl Pipeline {
         // finalization, while repair scratch is a materialized write target
         // nothing reads afterwards. A repair that ran earlier in this job has
         // already deleted its own.
-        let envelopes = set.plan().envelope_paths();
+        let envelopes = set.all_envelope_paths();
         let repair_scratch = set.plan().repair_paths();
         // `member_partials` is in **archive order** — `(first volume, physical
         // offset)` — and the commit loop below walks it in that order, so two
         // members whose names sanitize to the same destination overwrite each
         // other exactly the way the incremental extractor makes them overwrite
         // each other: last one in the archive wins.
-        let unpacked_sizes: HashMap<String, u64> =
-            set.router.member_digest_entries().into_iter().collect();
-        let members: Vec<(String, u64, PathBuf, PathBuf)> = set
-            .router
-            .member_partials()
-            .into_iter()
-            .filter_map(|(_, name, partial)| {
-                let destination = set.plan().member_output_path(name).ok()?;
-                // Both under the staging root, so the commit below is a
-                // same-directory rename — never the cross-device rename the
-                // working-dir-relative shape produced on a split-volume
-                // install.
-                Some((
-                    name.to_string(),
-                    unpacked_sizes.get(name).copied().unwrap_or(0),
-                    set.plan().destination_path(partial),
-                    destination,
-                ))
-            })
-            .collect();
+        let members = set.finalization_members();
         // Extractor-claimed names only: a sibling direct set that finalized the
         // same member *name* is rename-order semantics, not a second checkpoint
         // system owning this member (see `extraction_claimed_members`).
@@ -1836,6 +1936,12 @@ impl Pipeline {
         let mut recorded: Vec<String> = Vec::new();
         let tolerated_directories = match self.extract_tolerated_members(job_id, set_index).await {
             Ok(Some(extracted)) => {
+                if let Some(runtime) = self.archive_runtime.get_mut(&job_id) {
+                    // These names identify consumed stream sources, not files
+                    // installed in the output tree. Reconciliation must never
+                    // require an archive that was decoded without materializing.
+                    runtime.consumed.extend(extracted.streamed);
+                }
                 for name in extracted.members {
                     recorded.push(name.clone());
                     self.record_direct_extracted(job_id, name);
@@ -1882,6 +1988,10 @@ impl Pipeline {
         // that is already the unhappy one, and staging every rename to commit
         // them together needs a directory-level atomic swap the filesystem does
         // not offer.
+        let retain_originals = self
+            .direct_store
+            .set(job_id, set_index)
+            .is_some_and(|set| set.has_nested_checkpoint_authority());
         for (name, unpacked_size, partial, destination) in &members {
             crate::pipeline::release_cached_write_handle(partial);
             if let Some(parent) = destination.parent()
@@ -1903,7 +2013,36 @@ impl Pipeline {
             // has no partial to rename — but the archive declares the file and
             // the conventional extractor creates it, so finalization does too,
             // in the same archive order as every other member.
-            let committed = match tokio::fs::rename(partial, destination).await {
+            let installed = if retain_originals {
+                let (partial, destination, unpacked_size) =
+                    (partial.clone(), destination.clone(), *unpacked_size);
+                tokio::task::spawn_blocking(move || {
+                    if unpacked_size == 0 && !partial.try_exists()? {
+                        if let Some(parent) = partial.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&partial)?;
+                    }
+                    let parent = destination
+                        .parent()
+                        .ok_or_else(|| std::io::Error::other("installed member has no parent"))?;
+                    let temporary = tempfile::Builder::new()
+                        .prefix(".weaver-install-")
+                        .tempdir_in(parent)?;
+                    let link = temporary.path().join("member");
+                    std::fs::hard_link(&partial, &link)?;
+                    std::fs::rename(link, destination)
+                })
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|result| result)
+            } else {
+                tokio::fs::rename(partial, destination).await
+            };
+            let committed = match installed {
                 Err(error)
                     if *unpacked_size == 0 && error.kind() == std::io::ErrorKind::NotFound =>
                 {
@@ -2067,7 +2206,6 @@ impl Pipeline {
             set.router.discard_scratch();
         }
 
-        let mut persist = DatabaseCoveragePersist::new(self.db.clone());
         let stored: HashSet<&str> = members.iter().map(|(name, ..)| name.as_str()).collect();
         let produced_paths = self.direct_store.set(job_id, set_index).and_then(|set| {
             recorded
@@ -2085,7 +2223,34 @@ impl Pipeline {
                 .set(job_id, set_index)
                 .and_then(|set| installed_marker(set.plan(), &members, produced, recorded))
         });
-        if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+        let graph_authority = self
+            .direct_store
+            .set(job_id, set_index)
+            .is_some_and(|set| set.has_nested_checkpoint_authority());
+        if graph_authority {
+            let marker = installed
+                .as_deref()
+                .and_then(|blob| super::super::snapshot::decode_installed(blob).ok());
+            let Some(marker) = marker else {
+                self.fail_job(
+                    job_id,
+                    "failed to capture finalized archive installation".into(),
+                );
+                return;
+            };
+            if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+                set.set_installed_snapshot(marker);
+            }
+            if let Err(error) = self.commit_archive_graph(job_id).await {
+                self.fail_job(
+                    job_id,
+                    format!("failed to commit finalized archive graph: {error}"),
+                );
+                return;
+            }
+        } else if let Some(set) = self.direct_store.set_mut(job_id, set_index) {
+            let mut persist = DatabaseCoveragePersist::new(self.db.clone())
+                .with_manifests(set.plan().working_dir.clone());
             if let Err(error) = set.retire(&mut persist) {
                 warn!(job_id = job_id.0, error = %error, "failed to retire a direct-store checkpoint");
             }
@@ -2146,6 +2311,21 @@ impl Pipeline {
             .entry(job_id)
             .or_default()
             .insert(set_name.clone());
+        // A mixed native chase can register this verified direct source as
+        // its containing namespace without creating a nested STORE graph.
+        // Its children may publish only after the source commit succeeds.
+        if self
+            .archive_runtime
+            .get(&job_id)
+            .is_some_and(|runtime| runtime.graph_owners.contains_key(&(set_name.clone(), 0)))
+            && let Err(error) = self.close_scoped_graph_owner(job_id, &set_name, 0).await
+        {
+            self.fail_job(
+                job_id,
+                format!("direct source verification close failed: {error}"),
+            );
+            return;
+        }
         crate::runtime::perf_probe::record(
             "direct_store.set.finalized",
             std::time::Duration::from_nanos(1),
@@ -2201,6 +2381,16 @@ impl Pipeline {
         job_id: JobId,
         set_index: usize,
     ) -> bool {
+        if self
+            .direct_store
+            .set(job_id, set_index)
+            .is_some_and(|set| set.has_nested_checkpoint_authority())
+        {
+            return self
+                .direct_store
+                .set_mut(job_id, set_index)
+                .is_some_and(|set| set.retain_restored_finalized());
+        }
         if !self.job_spec_has_par2_file(job_id) {
             return false;
         }
@@ -2298,6 +2488,9 @@ impl Pipeline {
                 continue;
             };
             let set_name = set.set_name().to_string();
+            if set.has_nested_checkpoint_authority() {
+                continue;
+            }
             let envelopes = set.plan().envelope_paths();
             for envelope in &envelopes {
                 crate::pipeline::remove_file_after_cached_write_handle(envelope);
@@ -2548,28 +2741,65 @@ impl Pipeline {
         );
         let done_tx = self.direct_tolerated_done_tx.clone();
         self.update_mixed_rar_chase(job_id, set_index);
+        let chase_owner = self.chase_stream_owner(job_id, &set_name);
         let disposition = self.take_direct_unpack_disposition(job_id, &set_name);
         let install_root = staging.clone();
-        let expected_names: HashSet<_> = targets.iter().map(|target| target.name.clone()).collect();
+        let expected_names = crate::pipeline::direct_unpack::ChaseExpectedMembers {
+            declared: targets.iter().map(|target| target.name.clone()).collect(),
+            manifest: self.chase_stream_manifest(job_id, &set_name),
+        };
         tokio::spawn(async move {
-            let chased = crate::pipeline::completion::finalize::extract::install_direct_unpack(
-                disposition,
-                install_root,
-                std::sync::Arc::new(crate::jobs::PhaseCounters::default()),
-                job_id,
-                &set_name,
-                None,
-                Some(&expected_names),
-            )
-            .await
-            .is_some();
+            let resolution =
+                crate::pipeline::completion::finalize::extract::install_direct_unpack_checked(
+                    disposition,
+                    install_root,
+                    std::sync::Arc::new(crate::jobs::PhaseCounters::default()),
+                    job_id,
+                    &set_name,
+                    None,
+                    Some(&expected_names),
+                )
+                .await;
+            let mut retirement = resolution.retirement;
+            let (chased, failure) = match resolution.result {
+                Ok(Some(_)) => (true, None),
+                Ok(None) => (false, None),
+                Err(error) => (false, Some(error.to_string())),
+            };
+            if failure.is_some() || (chase_owner.is_some() && !chased) {
+                let retry_after_chase = failure.is_none();
+                let _ = done_tx
+                    .send(DirectToleratedWorkDone {
+                        set_name,
+                        job_id,
+                        work_id,
+                        set_index,
+                        used_chase: false,
+                        chase_owner,
+                        retry_after_chase,
+                        retirement,
+                        result: Err(failure.unwrap_or_else(|| {
+                            "retired native chase requires fresh extraction".into()
+                        })),
+                    })
+                    .await;
+                return;
+            }
+            if chase_owner.is_none()
+                && let Some(retirement) = retirement.take()
+            {
+                retirement.retire(job_id, &set_name).await;
+            }
             let joined = tokio::task::spawn_blocking(move || {
                 if chased {
                     // The chase verified the member bytes, and installation
                     // checked the final router manifest and destination paths.
                     // Capture directory times before stored-member renames;
                     // neither a second header walk nor decoder admission is needed.
-                    return installed_tolerated_members(&targets);
+                    return installed_tolerated_members(
+                        &targets,
+                        &expected_names.manifest.streamed(),
+                    );
                 }
                 let reader = provider
                     .open(first_volume)
@@ -2678,6 +2908,7 @@ impl Pipeline {
                     produced.push(name.clone());
                 }
                 Ok::<ToleratedExtraction, String>(ToleratedExtraction {
+                    streamed: Vec::new(),
                     members: produced,
                     directories,
                 })
@@ -2688,10 +2919,15 @@ impl Pipeline {
                 .and_then(|result| result);
             let _ = done_tx
                 .send(DirectToleratedWorkDone {
+                    set_name,
                     job_id,
                     work_id,
                     set_index,
                     result,
+                    used_chase: chased,
+                    chase_owner,
+                    retry_after_chase: false,
+                    retirement,
                 })
                 .await;
         });
@@ -2710,6 +2946,7 @@ impl Pipeline {
         done: DirectToleratedWorkDone,
     ) {
         let Some(in_flight) = self.direct_tolerated_in_flight.get(&done.job_id) else {
+            self.retire_rejected_tolerated(done).await;
             return;
         };
         if in_flight.work_id != done.work_id || in_flight.set_index != done.set_index {
@@ -2718,6 +2955,7 @@ impl Pipeline {
                 work_id = done.work_id,
                 "discarding a stale direct tolerated-extraction ticket"
             );
+            self.retire_rejected_tolerated(done).await;
             return;
         }
         let elapsed = in_flight.submitted_at.elapsed();
@@ -2736,12 +2974,75 @@ impl Pipeline {
         crate::runtime::perf_probe::record("direct_store.tolerated_extract", elapsed);
         if !self.jobs.contains_key(&done.job_id) {
             self.direct_tolerated_in_flight.remove(&done.job_id);
+            self.retire_rejected_tolerated(done).await;
+            return;
+        }
+        if let Some(set_name) = self
+            .direct_store
+            .set(done.job_id, done.set_index)
+            .map(|set| set.set_name().to_owned())
+        {
+            if let Some(chase_owner) = done.chase_owner
+                && self.chase_stream_owner(done.job_id, &set_name) != done.chase_owner
+            {
+                if self.chase_stream_owner(done.job_id, &set_name).is_some() || done.used_chase {
+                    self.retire_rejected_tolerated(done).await;
+                    return;
+                }
+                let Some(runtime) = self.archive_runtime.get_mut(&done.job_id) else {
+                    self.retire_rejected_tolerated(done).await;
+                    return;
+                };
+                if runtime.join_abandoned_owner(chase_owner).await.is_err() {
+                    self.retire_rejected_tolerated(done).await;
+                    return;
+                }
+            }
+            if done.used_chase && done.result.is_ok() {
+                if done.chase_owner.is_some() && !self.accept_chase_stream(done.job_id, &set_name) {
+                    self.retire_rejected_tolerated(done).await;
+                    return;
+                }
+            } else {
+                self.discard_chase_stream_joined(done.job_id, &set_name)
+                    .await;
+            }
+            if let Some(retirement) = done.retirement {
+                retirement.retire(done.job_id, &set_name).await;
+            }
+        } else {
+            self.retire_rejected_tolerated(done).await;
+            return;
+        }
+        if done.retry_after_chase {
+            self.direct_tolerated_in_flight.remove(&done.job_id);
+            self.finalize_ready_direct_sets(done.job_id).await;
+            self.schedule_job_completion_check(done.job_id);
             return;
         }
         self.direct_tolerated_results
             .insert(done.job_id, (done.set_index, done.result));
         self.finalize_ready_direct_sets(done.job_id).await;
         self.schedule_job_completion_check(done.job_id);
+    }
+
+    async fn retire_rejected_tolerated(&mut self, done: DirectToleratedWorkDone) {
+        if self
+            .direct_tolerated_in_flight
+            .get(&done.job_id)
+            .is_some_and(|work| work.work_id == done.work_id && work.set_index == done.set_index)
+        {
+            self.direct_tolerated_in_flight.remove(&done.job_id);
+            self.schedule_job_completion_check(done.job_id);
+        }
+        if let Some(owner) = done.chase_owner
+            && let Some(runtime) = self.archive_runtime.get_mut(&done.job_id)
+        {
+            let _ = runtime.retire_owner_joined(owner).await;
+        }
+        if let Some(retirement) = done.retirement {
+            retirement.retire(done.job_id, &done.set_name).await;
+        }
     }
 }
 
@@ -2865,12 +3166,15 @@ mod installed_tests {
         std::fs::create_dir(&directory).unwrap();
         let archived = filetime::FileTime::from_unix_time(1_600_000_000, 0);
         filetime::set_file_times(&directory, archived, archived).unwrap();
-        let result = installed_tolerated_members(&[ToleratedTarget {
-            name: "folder".into(),
-            destination: directory.clone(),
-            relative: "folder".into(),
-            is_directory: true,
-        }])
+        let result = installed_tolerated_members(
+            &[ToleratedTarget {
+                name: "folder".into(),
+                destination: directory.clone(),
+                relative: "folder".into(),
+                is_directory: true,
+            }],
+            &HashSet::new(),
+        )
         .unwrap();
         // There is no archive or virtual source in this fixture.
         std::fs::write(directory.join("stored.bin"), b"committed").unwrap();

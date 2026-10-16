@@ -727,3 +727,20 @@ checksum_algo = "blake3"
 kind = "rust"
 hook_id = "name_proxy_resolvers_v64"
 scope = "upgrade_only"
+
+[[migration]]
+version = 65
+description = "one bounded archive graph checkpoint reference per active job"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0065_active_archive_checkpoint/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0065_active_archive_checkpoint/postgres.sql"
+engine = "postgres"
+scope = "all"

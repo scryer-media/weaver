@@ -549,6 +549,7 @@ fn provider_fixture_with_extents(covered: ByteRanges, with_extents: bool) -> Pro
 
     ProviderFixture {
         volume: super::provider::VirtualVolume {
+            backing_leases: Default::default(),
             volume_index: 0,
             envelope,
             extents,
@@ -562,6 +563,7 @@ fn provider_fixture_with_extents(covered: ByteRanges, with_extents: bool) -> Pro
             // No encrypted member: the re-encrypting overlay is off, which is
             // the shape every assertion below was written against.
             ciphers: std::sync::Arc::default(),
+            nested: Default::default(),
         },
         _dir: dir,
         conventional,
@@ -676,6 +678,7 @@ fn cipher_volume(
     let mut covered = ByteRanges::new();
     covered.insert(0, volume_len);
     super::provider::VirtualVolume {
+        backing_leases: Default::default(),
         volume_index: 0,
         envelope,
         extents: vec![super::router::MemberExtent {
@@ -690,6 +693,7 @@ fn cipher_volume(
         held: Arc::new(Vec::new()),
         len: volume_len,
         ciphers: Arc::new([(0u32, facts)].into_iter().collect()),
+        nested: Default::default(),
     }
 }
 
@@ -1331,6 +1335,7 @@ fn a_long_run_behind_one_gap_is_not_recopied_per_arrival() {
     );
 }
 
+mod checkpoint;
 mod par2_fileaccess_adapter_over;
 mod par2_schedules;
 mod par3_source_access;
@@ -1377,6 +1382,61 @@ fn straddle_router_in(dir: &Path, member: &[u8], header_bytes: u64) -> (DirectSe
 // disk, in the order it puts it there.
 fn span_bytes(span: &super::router::RoutedSpan) -> Vec<u8> {
     span.bytes.iter().flat_map(|piece| piece.to_vec()).collect()
+}
+
+#[test]
+fn a_later_volume_refusal_preserves_outputs_already_drained_for_the_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let (initial, _) = straddle_router_in(dir.path(), b"first", 64);
+    let mut plan = initial.plan().clone();
+    plan.volumes.insert(1, 1);
+    plan.files.insert(1, 1);
+    let mut router = DirectSetRouter::new(plan);
+    let mut first = member_facts("first.bin", 64, 5, 5);
+    first.data_crc32 = Some(par2_rs::checksum::crc32(b"first"));
+    let mut second = member_facts("second.bin", 64, 6, 6);
+    second.data_crc32 = Some(par2_rs::checksum::crc32(b"second"));
+    router
+        .restore_layout(&std::collections::BTreeMap::from([
+            (0, volume_facts(0, true, vec![first])),
+            (1, volume_facts(1, false, vec![second])),
+        ]))
+        .unwrap();
+    router.stage_for_test(0, 64, b"first");
+    let mut emitted = Vec::new();
+    let result = router.route_into(1, 64, &[bytes::Bytes::from_static(b"broken")], &mut emitted);
+    assert!(result.is_err(), "the second member must fail its CRC");
+    assert!(emitted.iter().any(|span| {
+        span.volume_index == 0 && span.source_offset == 64 && span_bytes(span) == b"first"
+    }));
+}
+
+#[test]
+fn a_paging_refusal_preserves_outputs_already_drained_for_the_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let (initial, _) = straddle_router_in(dir.path(), b"first", 64);
+    let mut plan = initial.plan().clone();
+    plan.volumes.insert(1, 1);
+    plan.files.insert(1, 1);
+    let mut router = DirectSetRouter::new(plan);
+    let mut first = member_facts("first.bin", 64, 5, 5);
+    first.data_crc32 = Some(par2_rs::checksum::crc32(b"first"));
+    router
+        .restore_layout(&std::collections::BTreeMap::from([(
+            0,
+            volume_facts(0, true, vec![first]),
+        )]))
+        .unwrap();
+    // This volume's header has not arrived, so its bytes cannot drain.
+    router.stage_for_test(1, 1_024, &[7; 256]);
+    router.set_holds_budget(0);
+    router.set_holds_scratch_ceiling(0);
+    let mut emitted = Vec::new();
+    let result = router.route_into(0, 64, &[bytes::Bytes::from_static(b"first")], &mut emitted);
+    assert!(result.is_err(), "unroutable holds cannot fit either budget");
+    assert!(emitted.iter().any(|span| {
+        span.volume_index == 0 && span.source_offset == 64 && span_bytes(span) == b"first"
+    }));
 }
 
 const TOUCH_MEMBER_BYTES: usize = 400;
@@ -1470,6 +1530,7 @@ fn a_paged_piece_inside_a_run_reads_back_as_one_piece_and_the_bytes_are_unchange
 #[test]
 fn a_routed_span_reports_the_length_of_every_piece_it_carries() {
     let span = super::router::RoutedSpan {
+        owner: Default::default(),
         destination: super::router::DirectDestination::Envelope { volume_index: 3 },
         destination_offset: 512,
         volume_index: 3,

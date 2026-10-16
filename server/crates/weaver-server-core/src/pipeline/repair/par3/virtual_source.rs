@@ -135,15 +135,7 @@ impl VirtualSource {
             payloads,
             pins,
         } = image;
-        let mut paths = std::collections::BTreeSet::new();
-        if !volume.envelope_covered.ranges().is_empty() {
-            paths.insert(volume.envelope.clone());
-        }
-        for extent in &volume.extents {
-            if let Some(path) = volume.partials.get(&extent.member_id) {
-                paths.insert(path.clone());
-            }
-        }
+        let paths = volume.backing_paths();
         let mut backing = Vec::with_capacity(paths.len());
         for path in paths {
             options.cancel.check()?;
@@ -245,16 +237,20 @@ impl VirtualSource {
     }
 
     fn new_reader(&self) -> io::Result<Reader> {
-        // Cover one bounded cipher temporary, the chain-to-seed buffer and the
-        // owned metadata clone. Handles are leased before either can open.
+        // Cipher temporaries can coexist along a recursive read. Each level
+        // also retains its envelope; the deepest level retains one partial.
+        // Acquire the entire bound before opening any of these handles.
+        let levels = self.volume.bounded_reader_levels();
         let memory = assessment::ViewReservation::acquire(
-            (512usize << 10).saturating_add(self.volume.retained_metadata_bytes()),
+            (512usize << 10)
+                .saturating_mul(levels)
+                .saturating_add(self.volume.retained_metadata_bytes()),
         )
         .map_err(|error| budget::source_pressure(self.source, error))?;
-        let handles = [
-            self.options.handles.acquire().map_err(io::Error::other)?,
-            self.options.handles.acquire().map_err(io::Error::other)?,
-        ];
+        let handles = (0..levels.saturating_add(1))
+            .map(|_| self.options.handles.acquire())
+            .collect::<EngineResult<Vec<_>>>()
+            .map_err(io::Error::other)?;
         let pins = (0..self.volume.retained_handles())
             .map(|_| self.options.handles.acquire())
             .collect::<EngineResult<Vec<_>>>()
@@ -382,7 +378,7 @@ struct Reader {
     inner: VirtualVolumeReader<true>,
     _memory: assessment::ViewReservation,
     _payloads: Arc<Vec<Arc<budget::PayloadLease>>>,
-    _handles: [HandleLease; 2],
+    _handles: Vec<HandleLease>,
     _pins: Vec<HandleLease>,
 }
 

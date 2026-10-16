@@ -351,7 +351,7 @@ async fn an_encrypted_rar4_set_restarted_mid_download_completes_byte_identically
         .await;
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let complete_dir = temp_dir.path().join("complete");
     let (restarted, location) = member_after_gate(&complete_dir, &working_dir, member_name);
@@ -1794,7 +1794,7 @@ async fn a_header_encrypted_set_keys_from_a_password_supplied_after_its_harvest_
          got {shape}"
     );
 
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     let (member, member_location) = member_after_gate(&complete_dir, &working_dir, member_name);
     assert!(
         !volumes
@@ -1917,7 +1917,7 @@ async fn a_header_encrypted_set_restarted_mid_download_completes_byte_identicall
         .await;
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let complete_dir = temp_dir.path().join("complete");
     let (restarted, location) = member_after_gate(&complete_dir, &working_dir, member_name);
@@ -2047,7 +2047,7 @@ async fn a_header_encrypted_set_prefers_the_proved_candidate_over_the_spec_passw
         "the spec's password must never displace one the archive's own check proved, got {shape}"
     );
 
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let (member, member_location) = member_after_gate(&complete_dir, &working_dir, member_name);
     assert!(

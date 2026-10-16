@@ -1563,6 +1563,7 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
     );
     let working_dir = temp_dir.path().join("restore-progress-floor");
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    persist_restore_fixture(&pipeline, job_id, &spec, &working_dir);
     tokio::fs::write(working_dir.join("b.bin"), vec![0u8; 100])
         .await
         .unwrap();
@@ -1678,6 +1679,7 @@ async fn restore_job_rehydrates_existing_deterministic_staging_dir() {
     );
     let working_dir = temp_dir.path().join("restore-staged-extraction");
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    persist_restore_fixture(&pipeline, job_id, &spec, &working_dir);
     let staging_dir = pipeline.deterministic_extraction_staging_dir(job_id);
     tokio::fs::create_dir_all(&staging_dir).await.unwrap();
 
@@ -1728,6 +1730,7 @@ async fn restore_job_normalizes_persisted_checking_to_queued_when_work_remains()
     );
     let working_dir = temp_dir.path().join("restore-checking-pending");
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    persist_restore_fixture(&pipeline, job_id, &spec, &working_dir);
 
     pipeline
         .restore_job(RestoreJobRequest {
@@ -1774,6 +1777,7 @@ async fn restore_job_normalizes_persisted_checking_to_complete_when_no_work_rema
     );
     let working_dir = temp_dir.path().join("restore-checking-complete");
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    persist_restore_fixture(&pipeline, job_id, &spec, &working_dir);
 
     pipeline
         .restore_job(RestoreJobRequest {
@@ -1823,6 +1827,7 @@ async fn restore_queued_postprocessing_schedules_completion_check() {
     let spec = standalone_job_spec("Restore queued repair", &[("sample.bin".to_string(), 100)]);
     let working_dir = temp_dir.path().join("restore-queued-repair");
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    persist_restore_fixture(&pipeline, job_id, &spec, &working_dir);
 
     pipeline
         .restore_job(RestoreJobRequest {

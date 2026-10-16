@@ -235,7 +235,7 @@ async fn direct_store_payload_and_publish_across_two_filesystems() {
         "and hold the whole member"
     );
 
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     // (4) The published member.
     let published: Vec<Found> = walk(&complete_dir)

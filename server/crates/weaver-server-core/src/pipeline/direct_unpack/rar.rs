@@ -9,17 +9,18 @@ use std::sync::atomic::Ordering;
 
 use crate::jobs::PhaseCounters;
 use crate::pipeline::FullSetExtractionOutcome;
+use crate::pipeline::extraction::output::{
+    ArchiveOutput, FileOutput, Integrity, Metadata, OutputMember,
+};
 use crate::pipeline::extraction::{
-    ExtractionRoot, JobExtractionBudget, apply_rar_member_filesystem_metadata,
-    apply_server_rar_limits_with_memory_limit, rar_entry_via, rar_member_decoder_memory_bytes,
-    validate_sanitized_rar_member_path,
+    ExtractionRoot, JobExtractionBudget, apply_server_rar_limits_with_memory_limit, rar_entry_via,
+    rar_member_decoder_memory_bytes, validate_sanitized_rar_member_path,
 };
 
 pub(crate) struct RarChaseContext<'a> {
     pub provider: &'a dyn unrar_rs::VolumeProvider,
     pub volume_count: usize,
     pub root: &'a ExtractionRoot,
-    pub output_dir: &'a Path,
     pub budget: &'a Arc<JobExtractionBudget>,
     pub password: Option<String>,
     pub counters: &'a PhaseCounters,
@@ -49,11 +50,53 @@ pub(crate) fn extract(
     context: RarChaseContext<'_>,
     should_extract: impl Fn(&str) -> Result<bool, String>,
 ) -> Result<FullSetExtractionOutcome, String> {
-    let RarChaseContext {
+    let output = FileOutput {
+        root: context.root,
+        budget: context.budget,
+    };
+    extract_to(
+        RarStreamContext {
+            provider: context.provider,
+            volume_count: context.volume_count,
+            budget: context.budget,
+            password: context.password,
+            counters: context.counters,
+            policy: context.policy,
+        },
+        &output,
+        should_extract,
+    )
+}
+
+pub(crate) struct RarStreamContext<'a> {
+    pub provider: &'a dyn unrar_rs::VolumeProvider,
+    pub volume_count: usize,
+    pub budget: &'a Arc<JobExtractionBudget>,
+    pub password: Option<String>,
+    pub counters: &'a PhaseCounters,
+    pub policy: &'a crate::post_processing::model::PostProcessingSettings,
+}
+
+pub(crate) fn extract_to<O: ArchiveOutput>(
+    context: RarStreamContext<'_>,
+    output: &O,
+    should_extract: impl Fn(&str) -> Result<bool, String>,
+) -> Result<FullSetExtractionOutcome, String> {
+    let count = context.volume_count;
+    extract_from_roster_to(context, output, |index| Ok(index < count), should_extract)
+}
+
+// A namespace supplies its own roster boundary. Discovery may finish before
+// or after decoding starts; the codec sees the same ordered input contract.
+pub(crate) fn extract_from_roster_to<O: ArchiveOutput>(
+    context: RarStreamContext<'_>,
+    output: &O,
+    has_volume: impl Fn(usize) -> Result<bool, String>,
+    should_extract: impl Fn(&str) -> Result<bool, String>,
+) -> Result<FullSetExtractionOutcome, String> {
+    let RarStreamContext {
         provider,
-        volume_count,
-        root,
-        output_dir,
+        volume_count: _,
         budget,
         password,
         counters,
@@ -74,14 +117,15 @@ pub(crate) fn extract(
     let mut next_member = 0;
     let mut extracted = Vec::new();
     let mut destinations = HashSet::new();
-    let mut directories: Vec<(unrar_rs::MemberInfo, std::path::PathBuf)> = Vec::new();
+    let mut directories: Vec<(usize, unrar_rs::MemberInfo, std::path::PathBuf)> = Vec::new();
     // The archive keeps its dictionary between members. Keep its reservations
     // too, including while it waits for headers or the next volume.
     let mut reservations = Vec::new();
     let mut reserved = 0;
     let ceiling =
         apply_server_rar_limits_with_memory_limit(&mut archive, budget.max_memory_bytes());
-    for volume in 0..volume_count {
+    let mut volume = 0usize;
+    while has_volume(volume)? {
         let mut requested = NonZeroUsize::MIN;
         loop {
             let count = archive
@@ -143,8 +187,10 @@ pub(crate) fn extract(
                     reserved = needed;
                 }
                 if info.is_directory {
-                    root.create_dir(&relative, budget)?;
-                    directories.push((info, output_dir.join(&relative)));
+                    output
+                        .directory(index, &relative)
+                        .map_err(|error| error.to_string())?;
+                    directories.push((index, info, relative));
                 } else {
                     // Count as the member decodes, against a total reserved from
                     // its header, so a chase still finishing after the download
@@ -154,13 +200,30 @@ pub(crate) fn extract(
                         .total_bytes
                         .fetch_add(reserved_total, Ordering::Relaxed);
                     let mut file = ChaseProgressWriter {
-                        inner: root.create_file(&relative, budget)?,
+                        inner: output
+                            .file(index, &relative, info.unpacked_size)
+                            .map_err(|error| error.to_string())?,
                         counters,
                     };
                     let written = rar_entry_via(&mut archive, index, provider, &options)
                         .and_then(|entry| entry.copy_to(&mut file))
                         .map_err(|error| error.to_string())?;
                     file.flush().map_err(|error| error.to_string())?;
+                    file.inner
+                        .metadata(Metadata::rar(&info))
+                        .map_err(|error| error.to_string())?;
+                    let pending = file
+                        .inner
+                        .finish_data()
+                        .map_err(|error| error.to_string())?;
+                    let integrity = if info.crc32.is_some() || info.hash.is_some() {
+                        Integrity::Verified
+                    } else {
+                        Integrity::NoChecksum
+                    };
+                    pending
+                        .integrity(integrity)
+                        .map_err(|error| error.to_string())?;
                     if written > reserved_total {
                         counters
                             .total_bytes
@@ -170,7 +233,6 @@ pub(crate) fn extract(
                             .total_bytes
                             .fetch_sub(reserved_total - written, Ordering::Relaxed);
                     }
-                    apply_rar_member_filesystem_metadata(&info, &output_dir.join(&relative))?;
                 }
                 extracted.push(name);
             }
@@ -181,9 +243,12 @@ pub(crate) fn extract(
                 .checked_add(1)
                 .ok_or("RAR header count overflow")?;
         }
+        volume = volume.checked_add(1).ok_or("RAR volume count overflow")?;
     }
-    for (info, path) in directories.into_iter().rev() {
-        apply_rar_member_filesystem_metadata(&info, &path)?;
+    for (index, info, path) in directories.into_iter().rev() {
+        output
+            .directory_metadata(index, &path, Metadata::rar(&info))
+            .map_err(|error| error.to_string())?;
     }
     Ok(FullSetExtractionOutcome {
         extracted,

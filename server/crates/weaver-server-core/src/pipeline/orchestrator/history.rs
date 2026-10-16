@@ -441,7 +441,6 @@ impl Pipeline {
         self.clear_terminal_segment_failures(job_id);
         self.terminal_reconciliations.remove(&job_id);
         self.clear_par2_runtime_state(job_id);
-        self.clear_job_extraction_runtime(job_id);
         self.extraction_budgets.remove(&job_id);
         self.unacceptable_extension_policies.remove(&job_id);
         self.inflight_moves.remove(&job_id);
@@ -458,6 +457,9 @@ impl Pipeline {
         self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
         self.clear_job_progress_floor_runtime(job_id);
+        // Chase cleanup captures its descendant join before the runtime moves
+        // those workers into the background drainer.
+        self.clear_job_extraction_runtime(job_id);
         self.clear_job_phase_progress_runtime(job_id);
         self.discard_stage_timers(job_id);
         self.clear_job_retention_excludes(job_id);
@@ -654,9 +656,23 @@ impl Pipeline {
         // Purge and republish before arming the deferred event: the runtime
         // snapshot must already list the job as finished when a subscriber
         // reacts, or the history facade rejects the lookup as a still-live job.
+        let cleanup = if completed {
+            self.archive_runtime
+                .get_mut(&job_id)
+                .and_then(|runtime| runtime.terminal_cleanup.take())
+                .map(|mut cleanup| {
+                    cleanup.delivered = self
+                        .jobs
+                        .get(&job_id)
+                        .map(|state| state.working_dir.clone());
+                    cleanup
+                })
+        } else {
+            None
+        };
         self.purge_terminal_job_runtime(job_id);
         self.publish_snapshot();
-        self.publish_terminal_event_after_archive(archived, terminal_event);
+        self.publish_terminal_event_after_archive(archived, terminal_event, cleanup);
     }
 
     fn publish_terminal_event(&self, terminal_event: Option<PipelineEvent>) {
@@ -673,14 +689,24 @@ impl Pipeline {
         &self,
         archived: oneshot::Receiver<()>,
         terminal_event: Option<PipelineEvent>,
+        cleanup: Option<crate::pipeline::completion::finalize::TerminalArchiveCleanup>,
     ) {
-        let Some(event) = terminal_event else {
+        if terminal_event.is_none() && cleanup.is_none() {
             return;
-        };
+        }
         let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
-            let _ = archived.await;
-            let _ = event_tx.send(event);
+            if archived.await.is_ok()
+                && let Some(cleanup) = cleanup
+            {
+                let result = tokio::task::spawn_blocking(move || cleanup.run()).await;
+                if !matches!(&result, Ok(Ok(()))) {
+                    tracing::warn!(?result, "delivered archive backing cleanup deferred");
+                }
+            }
+            if let Some(event) = terminal_event {
+                let _ = event_tx.send(event);
+            }
         });
     }
 }

@@ -3,6 +3,88 @@
 
 use super::*;
 
+#[tokio::test]
+async fn job_archive_authority_never_enters_legacy_restore_or_sweep() {
+    use crate::jobs::archive_checkpoint::{ArchiveCheckpointRef, CheckpointCommit};
+    use crate::pipeline::direct_store::manifest::ManifestStore;
+
+    let temp = tempfile::tempdir().unwrap();
+    let job_id = JobId(41981);
+    let payload = vec![23; 8000];
+    let volumes = single_member_store_set("payload.bin", &payload, 3);
+    let working = direct_store_before_restart(&temp, job_id, &volumes, &[(0, 0), (0, 1)], 4).await;
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let envelope = working.join("silver.horizon.f0.vol00000.envelope");
+    let before = std::fs::read(&envelope).unwrap();
+    let reference = ManifestStore::for_job(&working, job_id)
+        .prepare(b"unsupported graph schema", None)
+        .unwrap();
+    assert_eq!(
+        pipeline
+            .db
+            .commit_archive_checkpoint(
+                job_id,
+                None,
+                ArchiveCheckpointRef {
+                    generation: 1,
+                    reference: reference.clone(),
+                },
+            )
+            .unwrap(),
+        CheckpointCommit::Committed,
+    );
+    assert!(pipeline.db.load_direct_coverage(job_id).unwrap().is_empty());
+
+    for gate in [DirectStoreGate::Enabled, DirectStoreGate::Disabled] {
+        pipeline.direct_store.set_gate(gate);
+        let result = pipeline.load_archive_restore_rows(job_id, &working).await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&envelope).unwrap(), before);
+        assert_eq!(
+            ManifestStore::for_job(&working, job_id)
+                .read(&reference)
+                .unwrap(),
+            b"unsupported graph schema",
+        );
+        assert_eq!(
+            pipeline
+                .db
+                .load_archive_checkpoint(job_id)
+                .unwrap()
+                .unwrap()
+                .reference,
+            reference,
+        );
+    }
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec: direct_store_job_spec("Silver Horizon", &volumes),
+            complete_files: HashSet::new(),
+            file_progress: HashMap::new(),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            extracted_members: HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir: working.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(pipeline.blocked_restores.contains_key(&job_id));
+    assert!(pipeline.jobs[&job_id].assembly.files().next().is_none());
+    assert!(peek_queued_segments(&mut pipeline, job_id).is_empty());
+    assert_eq!(std::fs::read(&envelope).unwrap(), before);
+}
+
 // ---------------------------------------------------------------------------
 // Restart
 // ---------------------------------------------------------------------------
@@ -167,7 +249,7 @@ async fn restart_after_refetch_demotion_restores_incomplete_source_ownership() {
 
     restarted.schedule_job_completion_check(job_id);
     drain_rar_refreshes(&mut restarted).await;
-    drive_extractions_to_terminal(&mut restarted, job_id, 64).await;
+    drive_extractions_to_terminal(&mut restarted, job_id).await;
     let (member, _) = member_after_gate(&complete_dir, &working_dir, member_name);
     assert_eq!(member.as_deref(), Some(payload.as_slice()));
     assert!(matches!(
@@ -315,7 +397,7 @@ async fn a_mid_download_restart_honours_its_floors_and_completes_byte_identicall
         "the member gate must have re-read the pre-restart ranges before finalizing"
     );
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let complete_dir = temp_dir.path().join("complete");
     let (restarted_member, restarted_location) =
@@ -822,7 +904,7 @@ async fn a_member_first_seen_in_a_later_volume_still_restarts_from_its_checkpoin
     // redownload.
     let committed = {
         let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-        let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        let rows = coverage_rows_in(&pipeline, job_id, &working_dir);
         retire_pipeline_database(pipeline).await;
         rows.into_iter()
             .next()
@@ -842,7 +924,7 @@ async fn a_member_first_seen_in_a_later_volume_still_restarts_from_its_checkpoin
 
     // The invariant itself, stated where it can be read: the digest the row
     // carries is the digest this run computes for the same set.
-    let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+    let rows = coverage_rows_in(&pipeline, job_id, &working_dir);
     let set = pipeline
         .direct_store
         .set(job_id, 0)
@@ -900,7 +982,7 @@ async fn a_member_first_seen_in_a_later_volume_still_restarts_from_its_checkpoin
         .await;
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let complete_dir = temp_dir.path().join("complete");
     let restarted: Vec<GateMember> = names
@@ -993,7 +1075,7 @@ async fn a_restart_after_a_member_migration_keeps_its_checkpoint() {
 
     let committed = {
         let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-        let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        let rows = coverage_rows_in(&pipeline, job_id, &working_dir);
         retire_pipeline_database(pipeline).await;
         rows.into_iter()
             .next()
@@ -1073,7 +1155,7 @@ async fn a_restart_after_a_member_migration_keeps_its_checkpoint() {
         .await;
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let complete_dir = temp_dir.path().join("complete");
     let restarted: Vec<GateMember> = [store_name, extra_name]
@@ -1334,7 +1416,7 @@ async fn finish_restored_identity_job(
         "the files that arrived after the restart bound to the restored set"
     );
     drain_rar_refreshes(pipeline).await;
-    drive_extractions_to_terminal(pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(pipeline, job_id).await;
     assert!(
         !volumes
             .iter()
@@ -1397,7 +1479,7 @@ async fn a_header_admitted_set_restarts_from_its_floors_and_completes_byte_ident
     {
         let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
-        let snapshot = coverage_snapshot_of(&pipeline, job_id);
+        let snapshot = coverage_snapshot_in(&pipeline, job_id, &working_dir);
         assert_eq!(
             rows.keys().cloned().collect::<Vec<_>>(),
             vec!["obfuscated-set.f0".to_string()]
@@ -1614,7 +1696,7 @@ async fn a_standalone_identity_archive_restarts_from_its_floor_and_completes_byt
         direct_store_before_restart(&temp_dir, job_id, &volumes, &arrivals, ARTICLES).await;
     {
         let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-        let snapshot = coverage_snapshot_of(&pipeline, job_id);
+        let snapshot = coverage_snapshot_in(&pipeline, job_id, &working_dir);
         assert_eq!(
             snapshot
                 .identity
@@ -1776,7 +1858,7 @@ async fn a_described_identity_set_restarts_from_its_floors_and_completes_byte_id
         let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
         assert_eq!(rows.len(), 1, "non-vacuity: the described set checkpointed");
-        let snapshot = coverage_snapshot_of(&pipeline, job_id);
+        let snapshot = coverage_snapshot_in(&pipeline, job_id, &working_dir);
         assert_eq!(
             snapshot.identity.map(|identity| (
                 identity.kind,
@@ -2000,7 +2082,7 @@ async fn a_restart_during_the_par2_wait_refetches_nothing_of_the_set() {
     );
 
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let complete_dir = temp_dir.path().join("complete");
     let (member, location) = member_after_gate(&complete_dir, &working_dir, member_name);
@@ -2446,10 +2528,7 @@ async fn pausing_a_job_with_dirty_direct_coverage_demands_a_barrier() {
     }
 
     let generation = |pipeline: &Pipeline| -> u64 {
-        pipeline
-            .db
-            .load_direct_coverage(job_id)
-            .unwrap()
+        coverage_rows_in(pipeline, job_id, &pipeline.jobs[&job_id].working_dir)
             .values()
             .next()
             .map(|blob| {
@@ -2532,10 +2611,7 @@ async fn a_demanded_barrier_joins_a_flight_with_the_done_channel_full() {
         !pipeline.direct_barrier_flights.contains_key(&(job_id, 0)),
         "the demand settled the flight"
     );
-    let generation = pipeline
-        .db
-        .load_direct_coverage(job_id)
-        .unwrap()
+    let generation = coverage_rows_in(&pipeline, job_id, &pipeline.jobs[&job_id].working_dir)
         .values()
         .next()
         .map(|blob| {
@@ -2637,7 +2713,7 @@ async fn a_volume_completing_into_held_bytes_is_not_checkpointed_complete() {
     // database the restart is about to consult.
     {
         let (probe, _, _) = new_direct_pipeline(&temp_dir).await;
-        let snapshot = coverage_snapshot_of(&probe, job_id);
+        let snapshot = coverage_snapshot_in(&probe, job_id, &working_dir);
         let entry = snapshot
             .floors
             .iter()
@@ -2695,7 +2771,7 @@ async fn a_volume_completing_into_held_bytes_is_not_checkpointed_complete() {
         .await;
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let complete_dir = temp_dir.path().join("complete");
     let (member, _) = member_after_gate(&complete_dir, &working_dir, member_name);
@@ -2778,7 +2854,7 @@ async fn a_restored_last_volume_reconfirms_from_its_envelope_and_finalizes() {
         .await;
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     assert!(
@@ -3760,7 +3836,7 @@ async fn a_restart_after_finalization_restores_the_set_as_installed() {
         .await;
     }
     pipeline.check_job_completion(job_id).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     let complete_dir = temp_dir.path().join("complete");
     let (restarted_member, restarted_location) =
         member_after_gate(&complete_dir, &working_dir, member_name);
@@ -4024,7 +4100,7 @@ async fn a_barrier_demanded_after_finalization_keeps_the_set_installed() {
             // live set, which is exactly what hid this.
             pipeline.demand_direct_store_barriers(job_id, demand).await;
         }
-        let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+        let rows = coverage_rows_in(&pipeline, job_id, &working_dir);
         assert!(
             !rows.is_empty()
                 && rows

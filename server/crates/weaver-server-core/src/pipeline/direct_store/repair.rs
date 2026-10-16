@@ -85,6 +85,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+pub(crate) mod graph;
+
 use par2_rs::{FileId, Par2FileSet, VerificationResult};
 
 use super::par2_access::{DirectVolumeFileAccess, MaterializedPar2Volume};

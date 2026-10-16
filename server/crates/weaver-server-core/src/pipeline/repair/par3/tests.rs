@@ -328,6 +328,7 @@ fn native_repair_reads_virtual_sources_and_materializes_only_the_damaged_file() 
             vec![HeldRun::memory(0, bytes.clone(), 0, len)]
         };
         let volume = VirtualVolume {
+            backing_leases: Default::default(),
             volume_index: index as u32,
             envelope: root.path().join(format!("{index}.unused-envelope")),
             extents: Vec::new(),
@@ -337,6 +338,7 @@ fn native_repair_reads_virtual_sources_and_materializes_only_the_damaged_file() 
             held: Arc::new(held),
             len,
             ciphers: Arc::default(),
+            nested: Default::default(),
         };
         let image = virtual_source::VirtualInput::new(volume, &job.options).unwrap();
         job.publish_virtual(SourceId(index as u64 + 1), image, name)

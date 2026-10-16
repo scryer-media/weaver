@@ -1435,7 +1435,7 @@ async fn a_direct_volume_with_no_unambiguous_par2_identity_demotes_before_the_pa
         .file_identities
         .remove(&1);
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     let output_root =
         complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
     let produced = std::fs::read(output_root.join(member_name))

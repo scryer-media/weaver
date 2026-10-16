@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+pub(in crate::pipeline) mod namespace;
+
 use super::backend::RepairBackend;
 use super::*;
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
@@ -160,7 +162,10 @@ impl Par2ScanBudget {
         cancellation: par2_rs::CancellationToken,
     ) -> Self {
         Self {
-            native: par2_rs::PacketScanBudget::new(limits),
+            native: par2_rs::PacketScanBudget::with_cancellation(
+                limits,
+                Some(cancellation.clone()),
+            ),
             retained: process
                 .try_reserve_retained(0)
                 .expect("zero-byte reservation"),

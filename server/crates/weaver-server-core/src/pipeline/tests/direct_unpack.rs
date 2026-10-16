@@ -16,6 +16,48 @@ use crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime;
 mod repair_guards;
 mod staging;
 
+// Native installation and namespace collection finish independently. Observe
+// the payload result after processing coordinator acknowledgments/progress.
+async fn next_native_extraction_done(pipeline: &mut Pipeline) -> ExtractionDone {
+    loop {
+        let done = next_extraction_done(pipeline).await;
+        match &done {
+            ExtractionDone::NativeChaseResolved {
+                job_id,
+                set_name,
+                result: Ok(Some(outcome)),
+                ..
+            } => {
+                let observed = ExtractionDone::FullSet {
+                    job_id: *job_id,
+                    set_name: set_name.clone(),
+                    result: Ok(FullSetExtractionOutcome {
+                        extracted: outcome.extracted.clone(),
+                        failed: outcome.failed.clone(),
+                        selected_password: outcome.selected_password.clone(),
+                    }),
+                };
+                // These installation tests inspect the private files before
+                // the terminal actor continuation can publish/move them.
+                assert!(pipeline.accept_chase_stream(*job_id, set_name));
+                return observed;
+            }
+            ExtractionDone::FullSet { .. } => return done,
+            ExtractionDone::Scoped {
+                decoded: None,
+                result: Ok(outcome),
+                ..
+            } if !outcome.extracted.is_empty() => return done,
+            ExtractionDone::Scoped {
+                decoded: None,
+                result: Err(_),
+                ..
+            } => return done,
+            _ => pipeline.handle_extraction_done(done).await,
+        }
+    }
+}
+
 // Turn the feature on for one pipeline, the way config would.
 fn enable_direct_unpack(pipeline: &mut Pipeline) {
     pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
@@ -631,8 +673,14 @@ async fn a_finished_chase_is_installed_instead_of_re_extracting() {
     destroy_parts(&pipeline, job_id, &files);
 
     pipeline.extract_7z_set(job_id, set_name).await.unwrap();
-    let done = next_extraction_done(&mut pipeline).await;
-    let ExtractionDone::FullSet { result, .. } = done else {
+    let done = next_native_extraction_done(&mut pipeline).await;
+    let (ExtractionDone::FullSet { result, .. }
+    | ExtractionDone::Scoped {
+        result,
+        decoded: None,
+        ..
+    }) = done
+    else {
         panic!("expected a full-set extraction result");
     };
     let outcome = result.expect("installed members, so the destroyed sources never mattered");
@@ -674,7 +722,7 @@ async fn consumption_attributes_the_chase_bytes_to_the_extracting_phase_once() {
     assert!(expected_total > 0, "the chase decoded real bytes");
 
     pipeline.extract_7z_set(job_id, set_name).await.unwrap();
-    let _ = next_extraction_done(&mut pipeline).await;
+    let _ = next_native_extraction_done(&mut pipeline).await;
 
     let counters = pipeline
         .phase_progress
@@ -722,8 +770,15 @@ async fn conventional_split_7z_jobs_finish_after_peer_metadata_grows() {
     }
     let mut completed = std::collections::HashSet::new();
     for _ in jobs {
-        let done = next_extraction_done(&mut pipeline).await;
-        let ExtractionDone::FullSet { job_id, result, .. } = done else {
+        let done = next_native_extraction_done(&mut pipeline).await;
+        let (ExtractionDone::FullSet { job_id, result, .. }
+        | ExtractionDone::Scoped {
+            job_id,
+            result,
+            decoded: None,
+            ..
+        }) = done
+        else {
             panic!("full set required")
         };
         let outcome = result.expect("peer metadata must not fail extraction");
@@ -763,8 +818,14 @@ async fn a_tainted_outcome_is_discarded_and_the_set_is_extracted_conventionally(
     // Sources are intact here, so conventional extraction must produce the
     // same members from scratch.
     pipeline.extract_7z_set(job_id, set_name).await.unwrap();
-    let done = next_extraction_done(&mut pipeline).await;
-    let ExtractionDone::FullSet { result, .. } = done else {
+    let done = next_native_extraction_done(&mut pipeline).await;
+    let (ExtractionDone::FullSet { result, .. }
+    | ExtractionDone::Scoped {
+        result,
+        decoded: None,
+        ..
+    }) = done
+    else {
         panic!("expected a full-set extraction result");
     };
     let outcome = result.expect("conventional extraction of intact sources");
@@ -839,8 +900,14 @@ async fn a_repair_rewrite_mid_chase_taints_the_running_chase() {
 
     // Consumption then finds nothing to consume and extracts conventionally.
     pipeline.extract_7z_set(job_id, set_name).await.unwrap();
-    let done = next_extraction_done(&mut pipeline).await;
-    let ExtractionDone::FullSet { result, .. } = done else {
+    let done = next_native_extraction_done(&mut pipeline).await;
+    let (ExtractionDone::FullSet { result, .. }
+    | ExtractionDone::Scoped {
+        result,
+        decoded: None,
+        ..
+    }) = done
+    else {
         panic!("expected a full-set extraction result");
     };
     assert!(
@@ -955,8 +1022,14 @@ async fn a_chase_still_running_at_extraction_is_awaited_and_installed() {
     );
 
     pipeline.extract_7z_set(job_id, set_name).await.unwrap();
-    let done = next_extraction_done(&mut pipeline).await;
-    let ExtractionDone::FullSet { result, .. } = done else {
+    let done = next_native_extraction_done(&mut pipeline).await;
+    let (ExtractionDone::FullSet { result, .. }
+    | ExtractionDone::Scoped {
+        result,
+        decoded: None,
+        ..
+    }) = done
+    else {
         panic!("expected a full-set extraction result");
     };
     let outcome = result.expect("the awaited chase produced members");
@@ -1297,8 +1370,14 @@ async fn a_repair_over_an_unvouched_chase_taints_exactly_as_before() {
 
     // And the set extracts conventionally, correctly.
     pipeline.extract_7z_set(job_id, set_name).await.unwrap();
-    let done = next_extraction_done(&mut pipeline).await;
-    let ExtractionDone::FullSet { result, .. } = done else {
+    let done = next_native_extraction_done(&mut pipeline).await;
+    let (ExtractionDone::FullSet { result, .. }
+    | ExtractionDone::Scoped {
+        result,
+        decoded: None,
+        ..
+    }) = done
+    else {
         panic!("expected a full-set extraction result");
     };
     let outcome = result.expect("conventional extraction of intact sources");
@@ -2642,8 +2721,14 @@ async fn a_parked_chase_does_not_block_another_jobs_extraction() {
     );
 
     pipeline.extract_7z_set(ready_job, set_name).await.unwrap();
-    let done = next_extraction_done(&mut pipeline).await;
-    let ExtractionDone::FullSet { result, .. } = done else {
+    let done = next_native_extraction_done(&mut pipeline).await;
+    let (ExtractionDone::FullSet { result, .. }
+    | ExtractionDone::Scoped {
+        result,
+        decoded: None,
+        ..
+    }) = done
+    else {
         panic!("expected a full-set extraction result");
     };
     let outcome = result.expect("conventional extraction must not wait on a parked chase");
@@ -2856,8 +2941,14 @@ async fn consumption_gives_up_on_a_chase_that_never_finishes() {
     }
 
     pipeline.extract_7z_set(job_id, set_name).await.unwrap();
-    let done = next_extraction_done(&mut pipeline).await;
-    let ExtractionDone::FullSet { result, .. } = done else {
+    let done = next_native_extraction_done(&mut pipeline).await;
+    let (ExtractionDone::FullSet { result, .. }
+    | ExtractionDone::Scoped {
+        result,
+        decoded: None,
+        ..
+    }) = done
+    else {
         panic!("expected a full-set extraction result");
     };
     let outcome = result.expect("conventional extraction must finish after the deadline");
@@ -3019,7 +3110,6 @@ fn chase_context(
         root: std::sync::Arc::new(
             crate::pipeline::extraction::ExtractionRoot::open(&output_dir).expect("root"),
         ),
-        output_dir,
         budget,
         password: sevenz_turbo::Password::empty(),
         event_tx: events,

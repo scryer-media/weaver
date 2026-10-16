@@ -298,6 +298,7 @@ impl DirectSetRouter {
                     },
                 );
                 spans.push(RoutedSpan {
+                    owner: Default::default(),
                     destination: DirectDestination::Member { member_id },
                     destination_offset: start,
                     volume_index,
@@ -315,6 +316,7 @@ impl DirectSetRouter {
             // last cipher block still exists once the plaintext is on disk.
             if piece_len > destination_len {
                 spans.push(RoutedSpan {
+                    owner: Default::default(),
                     destination: DirectDestination::Envelope { volume_index },
                     destination_offset: physical + destination_len,
                     volume_index,

@@ -229,3 +229,85 @@ async fn demotion_rejects_par2_analysis_receipts_on_both_sides_of_the_handback()
         settle_direct_demotion_work(&mut pipeline).await;
     }
 }
+
+#[tokio::test]
+async fn direct_demotion_joins_live_descendant_before_starting_backing_sweep() {
+    use crate::pipeline::extraction::runtime::ArchiveRuntime;
+    use crate::pipeline::extraction::session::InputVersion;
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let job = JobId(41121);
+    let volumes = damaged_single_volume_set("Copper.Lantern.S03E03.mkv");
+    insert_active_job(
+        &mut pipeline,
+        job,
+        direct_store_job_spec("Copper Lantern", &volumes),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id: job,
+        file_index: 0,
+    };
+    take_queued_segment(
+        &mut pipeline,
+        job,
+        SegmentId {
+            file_id,
+            segment_number: 0,
+        },
+    );
+    decode_article_leaving_the_sweep_unsettled(&mut pipeline, job, &volumes, 0).await;
+    let set = pipeline
+        .direct_store
+        .set(job, 0)
+        .expect("first article admits direct root")
+        .set_name()
+        .to_owned();
+    let working = pipeline.jobs[&job].working_dir.clone();
+    let staging = pipeline.extraction_staging_dir(job);
+    let runtime = pipeline
+        .archive_runtime
+        .entry(job)
+        .or_insert_with(ArchiveRuntime::new);
+    runtime.set_roots(working.clone(), staging.clone());
+    let root = runtime
+        .graph_lease(&set, 0, None, InputVersion(0))
+        .unwrap()
+        .owner;
+    let child = runtime.admit(Some(root), InputVersion(0)).unwrap();
+    let (finished, mut joined) = tokio::sync::oneshot::channel();
+    runtime.track_worker(
+        child.owner,
+        tokio::spawn(async move {
+            child.cancelled().await;
+            finished.send(()).unwrap();
+        }),
+    );
+    take_queued_segment(
+        &mut pipeline,
+        job,
+        SegmentId {
+            file_id,
+            segment_number: 1,
+        },
+    );
+    decode_article_leaving_the_sweep_unsettled(&mut pipeline, job, &volumes, 1).await;
+    assert!(
+        pipeline
+            .direct_store
+            .set(job, 0)
+            .is_some_and(|set| set.is_demoted()),
+        "{}",
+        debug_job_state(&pipeline, job)
+    );
+    joined
+        .try_recv()
+        .expect("demotion must join the descendant before returning to its sweep");
+    let runtime = &pipeline.archive_runtime[&job];
+    assert!(!runtime.pending());
+    assert!(runtime.namespace_nodes(&set).is_empty());
+    assert!(!runtime.graph_owners.contains_key(&(set, 0)));
+    // The sweep is asynchronous; retire it before dropping its test backing.
+    while hand_back_next_swept_message(&mut pipeline).await.is_some() {}
+}

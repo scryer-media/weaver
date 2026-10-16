@@ -568,7 +568,6 @@ mod tests {
         SevenZipExtractionContext {
             job_id: JobId(41),
             set_name: "positional-fixture".to_string(),
-            output_dir: private,
             root,
             budget,
             password: sevenz_turbo::Password::empty(),
@@ -950,7 +949,7 @@ mod tests {
         let slot = Arc::new(std::sync::Mutex::new(None));
         let budget = Arc::clone(&context.budget);
         let counters = Arc::clone(&context.phase_counters);
-        let staging_dir = context.output_dir.clone();
+        let staging_dir = temp.path().join("private");
         let worker_coverage = Arc::clone(&coverage);
         let worker_slot = Arc::clone(&slot);
         let worker_destination = destination.clone();
@@ -1399,7 +1398,7 @@ mod tests {
             positional: slot.lock().unwrap().take(),
             result: Ok(outcome),
             elapsed: std::time::Duration::ZERO,
-            staging_dir: context.output_dir.clone(),
+            staging_dir: temp.path().join("private"),
             total_bytes: context.phase_counters.total_bytes.load(Ordering::Relaxed),
             completed_bytes: context
                 .phase_counters

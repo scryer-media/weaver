@@ -3311,3 +3311,6 @@ async fn a_settled_set_holding_nothing_still_moves_when_other_sets_fill_the_shar
         .holds_accountant()
         .release(&mut others);
 }
+
+mod scoped_composition;
+mod scoped_runtime;

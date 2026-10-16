@@ -1353,7 +1353,9 @@ async fn drive_schedule(
                     // What the barrier just published is what the restart may
                     // rely on. Bytes held without a destination are not in it.
                     let mut kept = BTreeSet::new();
-                    for blob in pipeline.db.load_direct_coverage(job).unwrap().values() {
+                    for blob in
+                        coverage_rows_in(&pipeline, job, &pipeline.jobs[&job].working_dir).values()
+                    {
                         use crate::pipeline::direct_store::snapshot;
                         // A finalized set's marker vouches for every article
                         // of every file it installed from.

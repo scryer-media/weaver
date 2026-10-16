@@ -92,12 +92,14 @@ pub mod reader;
 pub mod settings;
 pub(crate) mod sevenz_runs;
 pub mod start_header;
+mod stream;
 pub(crate) mod wiring;
 
 pub use coverage::{PartProgress, PositionInPart, SetCoverage};
 pub use reader::GatedSplitReader;
 pub use settings::{DIRECT_UNPACK_ENV, DirectUnpackGate, DirectUnpackSettings};
 pub use start_header::{StartHeader, StartHeaderError};
+pub(crate) use stream::ChaseExpectedMembers;
 
 #[cfg(test)]
 mod gating_tests;

@@ -82,9 +82,8 @@ impl Pool {
         if n <= per {
             return all.to_vec();
         }
-        let spacing = n / per;
         (0..per)
-            .map(|k| all[(k * n / per + rotation % spacing) % n].clone())
+            .map(|k| all[(k * n / per + rotation % n) % n].clone())
             .collect()
     }
 
@@ -101,6 +100,10 @@ pub(super) trait Cell: Copy + std::fmt::Debug {
     // Whether the cell's recovery set is PAR2: a defect there blocks a
     // release.
     fn par2(self) -> bool;
+
+    fn requires_direct(self, _interruption: Interruption) -> bool {
+        false
+    }
 
     fn case_weight(self) -> usize {
         1
@@ -143,6 +146,13 @@ pub(super) async fn run_cell<C: Cell>(
         eprintln!("{context}");
         let ran = run::run(&fixture.post, profile, &order, interruption).await;
         ran.assert(&fixture.post, profile, verdict, &context);
+        if profile == ExtractionProfile::DirectStore && cell.requires_direct(interruption) {
+            assert!(
+                ran.finalized > 0,
+                "{context}: supported clean input fell back: {:?}",
+                ran.trace
+            );
+        }
     }
 }
 

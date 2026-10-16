@@ -963,6 +963,13 @@ impl Pipeline {
         let mut removed = 0u32;
         for filename in &volume_files {
             let path = cleanup_dir.join(filename);
+            if self
+                .archive_runtime
+                .get(&job_id)
+                .is_some_and(|runtime| runtime.retains_input_path(&path))
+            {
+                continue;
+            }
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => removed += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

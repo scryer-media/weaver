@@ -199,6 +199,7 @@ pub(crate) trait CoveragePersist {
 #[derive(Clone)]
 pub(crate) struct DatabaseCoveragePersist {
     database: crate::Database,
+    working_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for DatabaseCoveragePersist {
@@ -209,12 +210,40 @@ impl std::fmt::Debug for DatabaseCoveragePersist {
 
 impl DatabaseCoveragePersist {
     pub(crate) fn new(database: crate::Database) -> Self {
-        Self { database }
+        Self {
+            database,
+            working_dir: None,
+        }
+    }
+
+    pub(crate) fn with_manifests(mut self, working_dir: std::path::PathBuf) -> Self {
+        self.working_dir = Some(working_dir);
+        self
     }
 }
 
 impl CoveragePersist for DatabaseCoveragePersist {
     fn write(&mut self, job_id: JobId, set_name: &str, blob: &[u8]) -> Result<(), String> {
+        if let Some(directory) = &self.working_dir {
+            let store = super::manifest::ManifestStore::new(directory, job_id, set_name);
+            let rows = self
+                .database
+                .load_direct_coverage(job_id)
+                .map_err(|e| e.to_string())?;
+            let current = rows.get(set_name).map(Vec::as_slice);
+            let reference = store.prepare(blob, current).map_err(|e| e.to_string())?;
+            if current != Some(reference.as_slice()) {
+                self.database
+                    .save_direct_coverage(job_id, set_name, &reference)
+                    .map_err(|e| e.to_string())?;
+            }
+            // The committed reference is already authoritative. Cleanup failure
+            // must not turn a successful checkpoint into an unpublished one.
+            if let Err(error) = store.reclaim(Some(&reference)) {
+                tracing::warn!(%error, "could not reclaim retired direct checkpoint");
+            }
+            return Ok(());
+        }
         self.database
             .save_direct_coverage(job_id, set_name, blob)
             .map_err(|error| error.to_string())
@@ -223,7 +252,14 @@ impl CoveragePersist for DatabaseCoveragePersist {
     fn delete(&mut self, job_id: JobId, set_name: &str) -> Result<(), String> {
         self.database
             .delete_direct_coverage(job_id, set_name)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if let Some(directory) = &self.working_dir
+            && let Err(error) =
+                super::manifest::ManifestStore::new(directory, job_id, set_name).reclaim(None)
+        {
+            tracing::warn!(%error, "could not reclaim retired direct checkpoint");
+        }
+        Ok(())
     }
 }
 
@@ -801,6 +837,10 @@ impl CoverageBarrier {
                 (*volume_index, volume.ranges.contiguous_from(volume.floor))
             })
             .collect()
+    }
+
+    pub(crate) fn checkpoint_snapshot(&self, generation: u64) -> CoverageSnapshot {
+        self.build_snapshot(generation, &self.candidate_floors())
     }
 
     fn build_snapshot(&self, generation: u64, floors: &BTreeMap<u32, u64>) -> CoverageSnapshot {

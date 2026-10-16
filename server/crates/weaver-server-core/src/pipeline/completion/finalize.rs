@@ -1,6 +1,6 @@
 use super::*;
 
-const MAX_NESTED_EXTRACTION_DEPTH: u32 = 3;
+use crate::pipeline::direct_store::nested::MAX_DEPTH as MAX_NESTED_EXTRACTION_DEPTH;
 const MAX_CONCURRENT_REPAIRS: usize = 1;
 
 #[derive(Debug, Clone)]
@@ -8,18 +8,14 @@ struct ScannedExtractionFile {
     relative_path: String,
     declared_role: weaver_model::files::FileRole,
     detected_archive: Option<crate::jobs::assembly::DetectedArchiveIdentity>,
-    size: u64,
 }
 
 #[derive(Debug, Clone)]
 struct NestedArchiveFile {
     relative_path: String,
-    declared_role: weaver_model::files::FileRole,
-    detected_archive: Option<crate::jobs::assembly::DetectedArchiveIdentity>,
     archive_type: crate::jobs::assembly::ArchiveType,
     set_name: String,
     volume_number: u32,
-    size: u64,
 }
 
 impl ScannedExtractionFile {
@@ -71,6 +67,7 @@ pub(crate) mod deobfuscate;
 pub(in crate::pipeline) mod extract;
 mod nested;
 mod output;
+pub(in crate::pipeline) use output::TerminalArchiveCleanup;
 pub(crate) mod placement;
 pub(crate) mod rar;
 mod sfv;

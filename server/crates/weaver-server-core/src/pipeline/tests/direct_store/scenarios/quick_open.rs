@@ -1279,7 +1279,7 @@ async fn an_unmatched_obfuscated_extra_stays_conventional_beside_an_identity_set
     settle_direct_verification_read(&mut pipeline, job_id).await;
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     assert!(
         sets.contains("Finalized"),
@@ -1327,6 +1327,7 @@ async fn a_restored_job_with_a_conventional_floor_is_never_readmitted() {
     let spec = direct_store_job_spec("Silver Horizon", &volumes);
     let working_dir = temp_dir.path().join("restored-floor");
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    persist_restore_fixture(&pipeline, job_id, &spec, &working_dir);
     // The prefix the previous run wrote conventionally, exactly as the
     // restart sweep would find it. The restore floor counts the spec's
     // yEnc-encoded segment sizes and clamps to the on-disk length, so the
@@ -2974,6 +2975,7 @@ async fn a_malformed_chain_demotion_leaves_a_partial_crc_atom_provisional() {
             );
             set.record_writes(
                 &[crate::pipeline::direct_store::router::RoutedSpan {
+                    owner: Default::default(),
                     destination:
                         crate::pipeline::direct_store::router::DirectDestination::Envelope {
                             volume_index: 1,
@@ -3333,7 +3335,7 @@ async fn two_sets_share_one_resident_limit_and_the_one_routing_pages() {
             submit_volume_article(&mut pipeline, job_id, volumes, file_index, segment_number).await;
         }
         drain_rar_refreshes(&mut pipeline).await;
-        drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+        drive_extractions_to_terminal(&mut pipeline, job_id).await;
         assert_eq!(
             job_status_for_assert(&pipeline, job_id),
             Some(JobStatus::Complete)
@@ -3435,7 +3437,7 @@ async fn the_shared_scratch_total_demotes_the_set_that_asked_last() {
         .await;
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, first, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, first).await;
     assert_eq!(
         job_status_for_assert(&pipeline, first),
         Some(JobStatus::Complete)
@@ -3503,7 +3505,7 @@ async fn the_disk_reserve_refuses_a_spill_before_it_is_written() {
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     assert_eq!(
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Complete)
@@ -3586,7 +3588,7 @@ async fn a_pinned_scratch_outlives_its_set_and_no_longer_than_its_last_reader() 
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     assert!(
         matches!(
             job_status_for_assert(&pipeline, job_id),
@@ -3945,7 +3947,7 @@ async fn a_pinned_compaction_charges_the_retired_image_until_its_reader_lets_go(
 
     submit_volume_article(&mut pipeline, job_id, &volumes, 2, 0).await;
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     assert!(
         matches!(
             job_status_for_assert(&pipeline, job_id),

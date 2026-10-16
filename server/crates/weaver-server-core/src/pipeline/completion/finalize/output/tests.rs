@@ -1,6 +1,50 @@
 use super::*;
 
 #[test]
+fn terminal_archive_cleanup_removes_only_owned_backings_after_durable_delivery() {
+    for unrelated in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let working = directory.path().join("working");
+        let delivered = directory.path().join("delivered");
+        std::fs::create_dir(&working).unwrap();
+        std::fs::create_dir(&delivered).unwrap();
+        std::fs::write(delivered.join("leaf.bin"), b"delivered").unwrap();
+        std::fs::write(working.join(WORKING_DIR_MARKER), b"owned").unwrap();
+        let input = working.join("original.rar");
+        let empty = working.join("empty-directory");
+        std::fs::write(&input, b"original").unwrap();
+        std::fs::create_dir(&empty).unwrap();
+        let private = working.join(crate::pipeline::direct_store::manifest::DIRECTORY);
+        std::fs::create_dir(&private).unwrap();
+        std::fs::write(private.join("manifest"), b"private").unwrap();
+        if unrelated {
+            std::fs::write(working.join("unrelated.bin"), b"preserve").unwrap();
+        }
+        TerminalArchiveCleanup {
+            roots: vec![working.clone()],
+            files: vec![input.clone(), empty.clone()],
+            delivered: Some(delivered.clone()),
+        }
+        .run()
+        .unwrap();
+        assert!(!input.exists());
+        assert!(!empty.exists());
+        assert!(!private.exists());
+        assert_eq!(working.exists(), unrelated);
+        if unrelated {
+            assert_eq!(
+                std::fs::read(working.join("unrelated.bin")).unwrap(),
+                b"preserve"
+            );
+        }
+        assert_eq!(
+            std::fs::read(delivered.join("leaf.bin")).unwrap(),
+            b"delivered"
+        );
+    }
+}
+
+#[test]
 fn member_crc_map_preserves_paths_and_rejects_conflicting_values() {
     let mut by_path = HashMap::new();
     let mut ambiguous_paths = HashSet::new();

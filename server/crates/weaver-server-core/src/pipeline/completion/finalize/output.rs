@@ -7,6 +7,104 @@ use crate::jobs::working_dir::{WORKING_DIR_MARKER, mark_weaver_owned_output_dir}
 use crate::post_processing::model::PostProcessingSettings;
 use crate::runtime::{file_cache, fs as runtime_fs};
 
+pub(crate) struct TerminalArchiveCleanup {
+    roots: Vec<PathBuf>,
+    files: Vec<PathBuf>,
+    pub(crate) delivered: Option<PathBuf>,
+}
+
+impl TerminalArchiveCleanup {
+    fn sync_delivery(delivered: &Path) -> std::io::Result<()> {
+        use crate::pipeline::extraction::ExtractionRoot;
+        let root = ExtractionRoot::open_existing(delivered).map_err(std::io::Error::other)?;
+        let entries = root.list_entries_no_links(&[])?;
+        for (path, metadata) in &entries {
+            if metadata.is_file() {
+                root.sync_file(path)?;
+            }
+        }
+        for (path, metadata) in entries.iter().rev() {
+            if metadata.is_dir() {
+                root.sync_directory(path)?;
+            }
+        }
+        let parent = ExtractionRoot::open_existing(
+            delivered
+                .parent()
+                .ok_or_else(|| std::io::Error::other("delivered root parent absent"))?,
+        )
+        .map_err(std::io::Error::other)?;
+        parent.sync_directory(Path::new(
+            delivered
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("delivered root name absent"))?,
+        ))?;
+        Ok(())
+    }
+
+    pub(crate) fn run(self) -> std::io::Result<()> {
+        use crate::pipeline::extraction::ExtractionRoot;
+        if let Some(delivered) = &self.delivered {
+            Self::sync_delivery(delivered)?;
+        }
+        for root_path in self.roots {
+            if !root_path.exists() {
+                continue;
+            }
+            let root = ExtractionRoot::open_existing(&root_path).map_err(std::io::Error::other)?;
+            let mut directories = std::collections::BTreeSet::new();
+            for path in &self.files {
+                let Ok(relative) = path.strip_prefix(&root_path) else {
+                    continue;
+                };
+                match root.remove_owned_backing(relative, false) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::InvalidData
+                            && root.probe_directory(relative).is_ok() =>
+                    {
+                        directories.insert(relative.to_path_buf());
+                    }
+                    Err(error) => return Err(error),
+                }
+                let mut parent = relative.parent();
+                while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+                    directories.insert(path.to_path_buf());
+                    parent = path.parent();
+                }
+            }
+            for private in [
+                crate::pipeline::direct_store::manifest::DIRECTORY,
+                ".weaver-nested",
+                ".weaver-chunks",
+            ] {
+                match root.remove_owned_backing(Path::new(private), true) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let mut directories: Vec<_> = directories.into_iter().collect();
+            directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+            for directory in directories {
+                let _ = root.remove_empty_directory(&directory);
+            }
+            let remaining = root.list_entries_no_links(&[])?;
+            if remaining
+                .iter()
+                .all(|(path, _)| path == Path::new(WORKING_DIR_MARKER))
+            {
+                if !remaining.is_empty() {
+                    root.remove_owned_backing(Path::new(WORKING_DIR_MARKER), false)?;
+                }
+                std::fs::remove_dir(&root_path)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn record_member_crc32_value(
     by_path: &mut HashMap<String, u32>,
     ambiguous_paths: &mut HashSet<String>,
@@ -96,7 +194,12 @@ fn validate_delivery_sources(
     source_exists |= scan_delivery_root(
         working_dir,
         "working",
-        &[".weaver-chunks", ".weaver-staging", WORKING_DIR_MARKER],
+        &[
+            ".weaver-chunks",
+            ".weaver-staging",
+            WORKING_DIR_MARKER,
+            crate::pipeline::direct_store::manifest::DIRECTORY,
+        ],
         settings,
         &mut validation,
     )?;
@@ -583,6 +686,7 @@ async fn run_move_to_claimed_destination(
             let file_name = entry.file_name();
             if file_name == ".weaver-chunks"
                 || file_name == ".weaver-staging"
+                || file_name == crate::pipeline::direct_store::manifest::DIRECTORY
                 || file_name == WORKING_DIR_MARKER
             {
                 continue;
@@ -1095,6 +1199,67 @@ impl Pipeline {
                 None,
             )
         };
+        let (working_dir, staging_dir) = if let Some(publication) = self
+            .prepare_scoped_publication(job_id, working_dir.clone(), staging_dir.clone())
+            .await?
+        {
+            let mut files = self
+                .archive_runtime
+                .get(&job_id)
+                .map(|runtime| runtime.retained_input_paths())
+                .unwrap_or_default();
+            if let Some(runtime) = self.archive_runtime.get_mut(&job_id) {
+                runtime.join_finished_workers().await?;
+            }
+            if let Some(state) = self.jobs.get(&job_id) {
+                for file in state.assembly.files() {
+                    let name = self.current_filename_for_file(job_id, file);
+                    files.push(working_dir.join(&name));
+                    if let Some(staging) = &staging_dir {
+                        files.push(staging.join(name));
+                    }
+                }
+            }
+            if let Some(members) = self.extracted_members.get(&job_id) {
+                for member in members {
+                    files.push(working_dir.join(member));
+                    if let Some(staging) = &staging_dir {
+                        files.push(staging.join(member));
+                    }
+                }
+            }
+            for set in self.direct_store.sets_for(job_id) {
+                files.extend(
+                    set.qualified_placements()
+                        .map(|placement| placement.path.clone()),
+                );
+                files.extend(
+                    set.legacy_physical_claims()
+                        .into_iter()
+                        .map(|claim| set.plan().destination_path(&claim.relative_path)),
+                );
+                files.extend(
+                    set.plan()
+                        .volumes
+                        .keys()
+                        .map(|volume| set.plan().envelope_path(*volume)),
+                );
+            }
+            files.sort();
+            files.dedup();
+            if let Some(runtime) = self.archive_runtime.get_mut(&job_id) {
+                runtime.terminal_cleanup = Some(TerminalArchiveCleanup {
+                    roots: std::iter::once(working_dir.clone())
+                        .chain(staging_dir.iter().cloned())
+                        .collect(),
+                    files,
+                    delivered: None,
+                });
+            }
+            (publication, None)
+        } else {
+            (working_dir, staging_dir)
+        };
         self.phase_end(job_id, JobPhase::Extracting);
         self.phase_end(job_id, JobPhase::Repairing);
         let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
@@ -1112,6 +1277,10 @@ impl Pipeline {
         let policy_source = DeliveryPolicySource::Persisted(self.db.clone());
 
         let move_done_tx = self.move_done_tx.clone();
+        let retain_archive_backings = self
+            .archive_runtime
+            .get(&job_id)
+            .is_some_and(|runtime| runtime.terminal_cleanup.is_some());
         debug!(
             job_id = job_id.0,
             dest = %dest.display(),
@@ -1123,7 +1292,7 @@ impl Pipeline {
                 if let Some((db, context)) = script_validation {
                     validate_script_move_destination(db, context, &dest).await?;
                 }
-                run_move_to_complete(
+                let outcome = run_move_to_complete(
                     job_id,
                     working_dir,
                     staging_dir,
@@ -1132,7 +1301,25 @@ impl Pipeline {
                     naming,
                     policy_source,
                 )
-                .await
+                .await?;
+                if retain_archive_backings {
+                    let delivered = dest.clone();
+                    tokio::task::spawn_blocking(move || {
+                        TerminalArchiveCleanup::sync_delivery(&delivered)
+                    })
+                    .await
+                    .map_err(|error| {
+                        MoveToCompleteFailure::Operational(format!(
+                            "delivered archive durability worker failed: {error}"
+                        ))
+                    })?
+                    .map_err(|error| {
+                        MoveToCompleteFailure::Operational(format!(
+                            "delivered archive durability failed: {error}"
+                        ))
+                    })?;
+                }
+                Ok(outcome)
             }
             .await;
             match &result {

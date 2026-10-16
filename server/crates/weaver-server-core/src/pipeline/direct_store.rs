@@ -165,6 +165,9 @@ use std::sync::OnceLock;
 
 pub(crate) mod accountant;
 pub(crate) mod barrier;
+pub(crate) mod graph_checkpoint;
+pub(crate) mod manifest;
+pub(crate) mod nested;
 pub(crate) mod par2_access;
 pub(crate) mod plan;
 pub(crate) mod provider;

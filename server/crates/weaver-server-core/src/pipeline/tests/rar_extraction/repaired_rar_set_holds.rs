@@ -836,7 +836,7 @@ async fn a_recovery_volume_restore_rebuilds_the_set_from_disk_and_extracts_the_m
         "the rebuilt topology spans every volume, the restored one included"
     );
 
-    drive_extractions_to_terminal(&mut pipeline, job_id, 8).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     assert!(
         matches!(
             job_status_for_assert(&pipeline, job_id),

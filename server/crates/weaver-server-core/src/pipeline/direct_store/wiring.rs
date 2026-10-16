@@ -812,6 +812,8 @@ struct ToleratedTarget {
 // whose metadata still has to be restored.
 #[derive(Debug, Default)]
 pub(crate) struct ToleratedExtraction {
+    // Source members delegated to the namespace engine have no installed file.
+    streamed: Vec<String>,
     // Raw header names produced, for `extracted_members`. Directory entries
     // are in here too — the conventional extractor reports one the same way,
     // and a name in neither list is a name completion cannot account for.

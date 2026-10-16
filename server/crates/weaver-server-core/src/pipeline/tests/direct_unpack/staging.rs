@@ -314,7 +314,8 @@ async fn a_failed_install_retires_the_chases_staging() {
     std::fs::write(blocker.join("occupied.bin"), b"in the way").unwrap();
 
     pipeline.extract_7z_set(job_id, set_name).await.unwrap();
-    let _ = next_extraction_done(&mut pipeline).await;
+    let done = next_extraction_done(&mut pipeline).await;
+    pipeline.handle_extraction_done(done).await;
     assert_eq!(pipeline.direct_unpack.counters().consumed, 1);
     assert!(
         blocker.join("occupied.bin").is_file(),
@@ -373,4 +374,406 @@ async fn arming_does_not_open_part_one_before_its_header_is_committed() {
     assert!(pipeline.direct_unpack.is_armed(job_id, set_name));
 
     pipeline.direct_unpack_shutdown("test teardown").await;
+}
+
+#[tokio::test]
+async fn native_chase_streams_nested_store_only_after_source_acceptance() {
+    use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod};
+    fn archive(entries: &[(&str, Vec<u8>)], method: EncoderMethod) -> Vec<u8> {
+        let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(vec![EncoderConfiguration::new(method)]);
+        for (name, bytes) in entries {
+            writer
+                .push_archive_entry(
+                    ArchiveEntry::new_file(name),
+                    Some(std::io::Cursor::new(bytes.clone())),
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_direct_unpack(&mut pipeline);
+    let job = JobId(44719);
+    let leaf = vec![39; 131073];
+    let inner = archive(&[("leaf.bin", leaf.clone())], EncoderMethod::COPY);
+    let ordinary = vec![71; 65539];
+    let outer = archive(
+        &[("ordinary.bin", ordinary.clone()), ("inner.7z", inner)],
+        EncoderMethod::LZMA2,
+    );
+    let files = insert_single_7z_job(&mut pipeline, job, outer).await;
+    let set = "silver_horizon.7z";
+    write_and_complete_file(&mut pipeline, job, 0, &files[0].0, &files[0].1).await;
+    while !pipeline.direct_unpack.armed_worker_finished(job, set) {
+        while let Ok(done) = pipeline.extract_done_rx.try_recv() {
+            assert!(
+                matches!(
+                    &done,
+                    crate::pipeline::ExtractionDone::ScopedNamespace { .. }
+                ),
+                "source acceptance fences terminal decoded publication"
+            );
+            pipeline.handle_extraction_done(done).await;
+        }
+        tokio::task::yield_now().await;
+    }
+    pipeline.reap_direct_unpack().await;
+    while let Ok(done) = pipeline.extract_done_rx.try_recv() {
+        assert!(matches!(
+            &done,
+            crate::pipeline::ExtractionDone::ScopedNamespace { .. }
+        ));
+        pipeline.handle_extraction_done(done).await;
+    }
+    let outcome = pipeline.direct_unpack.outcome(job, set).unwrap();
+    assert_eq!(outcome.result.as_ref().unwrap().extracted, ["ordinary.bin"]);
+    let staging = outcome.staging_dir.clone();
+    assert_eq!(
+        std::fs::read(staging.join("ordinary.bin")).unwrap(),
+        ordinary
+    );
+    assert!(!staging.join("inner.7z").exists());
+    pipeline.extract_7z_set(job, set).await.unwrap();
+    let done = loop {
+        let done = pipeline.extract_done_rx.recv().await.unwrap();
+        if matches!(
+            &done,
+            ExtractionDone::Scoped {
+                decoded: Some(_),
+                ..
+            }
+        ) {
+            break done;
+        }
+        pipeline.handle_extraction_done(done).await;
+    };
+    let crate::pipeline::ExtractionDone::Scoped {
+        decoded: Some(decoded),
+        result: Ok(result),
+        ..
+    } = done
+    else {
+        panic!("accepted chase must retain the nested namespace");
+    };
+    assert_eq!(
+        result.extracted,
+        ["ordinary.bin"],
+        "decoded repair must retain its ordinary sibling roster"
+    );
+    let selected = decoded.publication().unwrap();
+    assert_eq!(std::fs::read(&selected["leaf.bin"]).unwrap(), leaf);
+}
+
+#[tokio::test]
+async fn scoped_native_install_failure_is_reported_instead_of_empty_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_direct_unpack(&mut pipeline);
+    let job = JobId(44751);
+    let set = "generated_split_store_plain.7z";
+    let files = sevenz_fixture_bytes(set);
+    insert_active_job(
+        &mut pipeline,
+        job,
+        rar_job_spec("Amber Lantern Split", &files),
+    )
+    .await;
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job, index as u32, name, bytes).await;
+    }
+    yield_until(|| pipeline.direct_unpack.armed_worker_finished(job, set)).await;
+    pipeline.reap_direct_unpack().await;
+    assert!(pipeline.has_scoped_chase(job, set));
+    let member = pipeline
+        .direct_unpack
+        .outcome(job, set)
+        .unwrap()
+        .result
+        .as_ref()
+        .unwrap()
+        .extracted[0]
+        .clone();
+    let blocker = pipeline.extraction_staging_dir(job).join(member);
+    std::fs::create_dir_all(&blocker).unwrap();
+    std::fs::write(blocker.join("occupied.bin"), b"occupied").unwrap();
+    pipeline.extract_7z_set(job, set).await.unwrap();
+    loop {
+        let done = pipeline.extract_done_rx.recv().await.unwrap();
+        if let ExtractionDone::NativeChaseResolved {
+            job_id,
+            set_name,
+            result,
+            ..
+        } = &done
+        {
+            assert_eq!(*job_id, job);
+            assert_eq!(set_name, set);
+            let Err(error) = result else {
+                panic!("ordinary payload installation failure must not become empty success");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("scoped direct-unpack output installation failed")
+            );
+            pipeline.handle_extraction_done(done).await;
+            break;
+        } else {
+            pipeline.handle_extraction_done(done).await;
+        }
+    }
+    assert_eq!(
+        std::fs::read(blocker.join("occupied.bin")).unwrap(),
+        b"occupied"
+    );
+}
+
+#[tokio::test]
+async fn independent_extraction_retires_unaccepted_native_request_before_nested_gate() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_direct_unpack(&mut pipeline);
+    let job = JobId(44752);
+    let set = "generated_split_store_plain.7z";
+    let files = sevenz_fixture_bytes(set);
+    insert_active_job(
+        &mut pipeline,
+        job,
+        rar_job_spec("Amber Lantern Split", &files),
+    )
+    .await;
+    for (index, (name, bytes)) in files.iter().enumerate() {
+        write_and_complete_file(&mut pipeline, job, index as u32, name, bytes).await;
+    }
+    yield_until(|| pipeline.direct_unpack.armed_worker_finished(job, set)).await;
+    pipeline.reap_direct_unpack().await;
+    assert!(pipeline.archive_runtime[&job].pending());
+    pipeline
+        .extracted_archives
+        .entry(job)
+        .or_default()
+        .insert(set.to_owned());
+    let _ = pipeline.maybe_start_nested_extraction(job).await.unwrap();
+    assert!(!pipeline.has_scoped_chase(job, set));
+    assert!(
+        !pipeline.archive_runtime[&job].pending(),
+        "an independently satisfied archive must not strand a speculative request"
+    );
+    assert!(
+        pipeline.extract_done_rx.try_recv().is_err(),
+        "discarded native output must not publish a completion"
+    );
+}
+
+#[tokio::test]
+async fn revoked_native_owner_cannot_acknowledge_an_installed_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_direct_unpack(&mut pipeline);
+    let job = JobId(44753);
+    let set = "generated_split_store_plain.7z";
+    chase_a_complete_split_set(&mut pipeline, job, set).await;
+    let owner = pipeline.chase_stream_owner(job, set).unwrap();
+    pipeline
+        .archive_runtime
+        .get_mut(&job)
+        .unwrap()
+        .sessions
+        .revoke(owner)
+        .unwrap();
+    pipeline
+        .handle_extraction_done(ExtractionDone::NativeChaseResolved {
+            job_id: job,
+            set_name: set.to_owned(),
+            owner,
+            kind: crate::jobs::assembly::ArchiveType::SevenZip,
+            result: Ok(Some(FullSetExtractionOutcome {
+                extracted: vec!["stale.bin".to_owned()],
+                failed: Vec::new(),
+                selected_password: None,
+            })),
+            retirement: None,
+        })
+        .await;
+    assert!(!pipeline.has_scoped_chase(job, set));
+    assert!(
+        !pipeline
+            .extracted_archives
+            .get(&job)
+            .is_some_and(|sets| sets.contains(set))
+    );
+    assert!(
+        !pipeline
+            .extracted_members
+            .get(&job)
+            .is_some_and(|names| names.contains("stale.bin"))
+    );
+}
+
+#[tokio::test]
+async fn obsolete_native_ack_joins_its_producer_without_retiring_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_direct_unpack(&mut pipeline);
+    let job = JobId(44754);
+    let set = "generated_split_store_plain.7z";
+    chase_a_complete_split_set(&mut pipeline, job, set).await;
+    let old = pipeline.chase_stream_owner(job, set).unwrap();
+    pipeline.discard_chase_stream_joined(job, set).await;
+    let destination = pipeline.extraction_staging_dir(job);
+    let budget = pipeline.extraction_budget(job, &destination).unwrap();
+    let replacement = pipeline
+        .admit_root_stream(
+            job,
+            set,
+            Vec::new(),
+            crate::jobs::assembly::ArchiveType::SevenZip,
+            destination,
+            budget,
+        )
+        .unwrap();
+    let replacement_owner = replacement.owner;
+    let retired = temp.path().join("retired-native");
+    std::fs::create_dir_all(&retired).unwrap();
+    let writer_root = retired.clone();
+    let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = joined.clone();
+    let producer = tokio::spawn(async move {
+        std::fs::write(writer_root.join("last-write.bin"), b"complete").unwrap();
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(FullSetExtractionOutcome {
+            extracted: Vec::new(),
+            failed: Vec::new(),
+            selected_password: None,
+        })
+    });
+    pipeline
+        .handle_extraction_done(ExtractionDone::NativeChaseResolved {
+            job_id: job,
+            set_name: set.to_owned(),
+            owner: old,
+            kind: crate::jobs::assembly::ArchiveType::SevenZip,
+            result: Ok(None),
+            retirement: Some(
+                crate::pipeline::completion::finalize::extract::ChaseRetirement::for_test(
+                    retired.clone(),
+                    producer,
+                ),
+            ),
+        })
+        .await;
+    assert!(joined.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!retired.exists());
+    assert!(
+        pipeline.archive_runtime[&job]
+            .sessions
+            .execution_current(replacement_owner)
+    );
+    assert_eq!(
+        pipeline.archive_runtime[&job].graph_owners[&(set.to_owned(), 0)],
+        replacement_owner
+    );
+    drop(replacement);
+}
+
+#[tokio::test]
+async fn successful_pending_install_preserves_native_scope_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_direct_unpack(&mut pipeline);
+    let job = JobId(44755);
+    let set = "generated_split_store_plain.7z";
+    let files = sevenz_fixture_bytes(set);
+    insert_active_job(
+        &mut pipeline,
+        job,
+        rar_job_spec("Pending native authority", &files),
+    )
+    .await;
+    write_and_complete_file(&mut pipeline, job, 0, &files[0].0, &files[0].1).await;
+    let disposition = pipeline.take_direct_unpack_disposition(job, set);
+    let crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(pending) = disposition
+    else {
+        panic!("incomplete source must transfer a pending worker");
+    };
+    let budget = pending.budget.clone();
+    let working = pipeline.jobs[&job].working_dir.clone();
+    for (index, (name, bytes)) in files.iter().enumerate().skip(1) {
+        std::fs::write(working.join(name), bytes).unwrap();
+        pending
+            .coverage
+            .advance_watermark(index, bytes.len() as u64);
+        pending
+            .coverage
+            .note_committed_range(index, 0, bytes.len() as u64);
+        pending.coverage.mark_part_complete(index);
+    }
+    let destination = pipeline.extraction_staging_dir(job);
+    let resolution = crate::pipeline::completion::finalize::extract::install_direct_unpack_checked(
+        crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(pending),
+        destination,
+        std::sync::Arc::new(crate::jobs::PhaseCounters::default()),
+        job,
+        set,
+        None,
+        None,
+    )
+    .await;
+    assert!(resolution.result.is_ok_and(|outcome| outcome.is_some()));
+    assert!(resolution.retirement.is_none());
+    assert!(
+        budget.stopped_failure().is_none(),
+        "successful consumer must not cancel the producer budget"
+    );
+    assert!(pipeline.accept_chase_stream(job, set));
+    let owner = pipeline.chase_stream_owner(job, set).unwrap();
+    assert!(pipeline.archive_runtime[&job].sessions.accepts(owner));
+}
+
+#[tokio::test]
+async fn forgotten_completed_chase_retains_staging_until_descendant_joins() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_direct_unpack(&mut pipeline);
+    let job = JobId(44756);
+    let set = "generated_split_store_plain.7z";
+    chase_a_complete_split_set(&mut pipeline, job, set).await;
+    let outcome = pipeline.direct_unpack.outcome(job, set).unwrap();
+    let staging = outcome.staging_dir.clone();
+    let member = staging.join(&outcome.result.as_ref().unwrap().extracted[0]);
+    let expected = std::fs::read(&member).unwrap();
+    let owner = pipeline.chase_stream_owner(job, set).unwrap();
+    let runtime = pipeline.archive_runtime.get_mut(&job).unwrap();
+    let child = runtime
+        .admit(
+            Some(owner),
+            crate::pipeline::extraction::session::InputVersion(0),
+        )
+        .unwrap();
+    let child_owner = child.owner;
+    let (cancelled, cancellation) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let worker = tokio::spawn(async move {
+        child.cancelled().await;
+        cancelled.send(()).unwrap();
+        released.await.unwrap();
+        assert_eq!(
+            std::fs::read(member).unwrap(),
+            expected,
+            "retired descendant still owns its source until joined"
+        );
+        drop(child);
+    });
+    runtime.track_worker(child_owner, worker);
+    pipeline.purge_terminal_job_runtime(job);
+    cancellation.await.unwrap();
+    assert!(
+        staging.is_dir(),
+        "cancellation must not delete an unjoined source"
+    );
+    release.send(()).unwrap();
+    pipeline.settle_direct_unpack_staging_cleanups().await;
+    assert!(!staging.exists());
 }

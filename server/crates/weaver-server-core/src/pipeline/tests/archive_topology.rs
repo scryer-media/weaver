@@ -154,7 +154,10 @@ async fn nested_scan_detects_obfuscated_split_7z_archives_from_staging() {
     }
 
     let mut state = minimal_job_state(job_id, "Nested Obfuscated 7z", temp_dir.path().join("wd"));
+    tokio::fs::create_dir_all(&state.working_dir).await.unwrap();
     state.staging_dir = Some(staging_dir);
+    let posted_files = state.assembly.files().count();
+    let posted_topologies = state.assembly.archive_topologies().len();
     pipeline.jobs.insert(job_id, state);
     pipeline.job_order.push(job_id);
 
@@ -166,39 +169,37 @@ async fn nested_scan_detects_obfuscated_split_7z_archives_from_staging() {
         crate::pipeline::completion::NestedExtractionDecision::Started
     ));
 
-    let state = pipeline.jobs.get(&job_id).unwrap();
-    let topology = state
-        .assembly
-        .archive_topology_for("51273aad56a8b904e96928935278a627")
+    let done = next_extraction_done(&mut pipeline).await;
+    let ExtractionDone::Scoped {
+        owner,
+        request,
+        result: Ok(outcome),
+        ..
+    } = done
+    else {
+        panic!("detected split archive must dispatch scoped extraction");
+    };
+    assert!(outcome.failed.is_empty());
+    assert!(!outcome.extracted.is_empty());
+    let work = pipeline
+        .archive_runtime
+        .get_mut(&job_id)
+        .unwrap()
+        .complete(owner, request)
         .unwrap();
+    assert_eq!(work.kind, crate::jobs::assembly::ArchiveType::SevenZip);
+    assert_eq!(work.set_name, "51273aad56a8b904e96928935278a627");
     assert_eq!(
-        topology.archive_type,
-        crate::jobs::assembly::ArchiveType::SevenZip
+        work.input_names,
+        obfuscated_files
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
     );
-    assert_eq!(topology.complete_volumes.len(), obfuscated_files.len());
-    for file_index in 0..obfuscated_files.len() {
-        let file = state
-            .assembly
-            .file(NzbFileId {
-                job_id,
-                file_index: file_index as u32,
-            })
-            .unwrap();
-        assert!(matches!(
-            file.role(),
-            weaver_model::files::FileRole::Unknown
-        ));
-        assert!(matches!(
-            pipeline.classified_role_for_file(job_id, file),
-            weaver_model::files::FileRole::SevenZipSplit { .. }
-        ));
-        assert_eq!(
-            pipeline
-                .detected_archive_identity(job_id, file.file_id())
-                .map(|detected| detected.set_name.as_str()),
-            Some("51273aad56a8b904e96928935278a627")
-        );
-    }
+    assert_eq!(work.inputs.len(), obfuscated_files.len());
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(state.assembly.files().count(), posted_files);
+    assert_eq!(state.assembly.archive_topologies().len(), posted_topologies);
 }
 
 #[tokio::test]

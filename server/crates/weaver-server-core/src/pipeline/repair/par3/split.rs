@@ -16,12 +16,25 @@ pub(super) fn file_index(source: SourceId) -> Option<u32> {
 
 // A split 7z can still be routed to member partials. Preserve those immutable
 // views, including envelope bytes and held runs, without materializing a copy.
+#[derive(Default)]
+struct SplitBackings {
+    paths: HashMap<u32, PathBuf>,
+    nested: HashMap<u32, VirtualVolume>,
+}
+
+impl SplitBackings {
+    fn next_id(&self) -> EngineResult<u32> {
+        u32::try_from(self.paths.len().saturating_add(self.nested.len()))
+            .map_err(|_| budget::host_limit("embedded PAR3 split backings"))
+    }
+}
+
 fn append_virtual_part(
     image: &VirtualVolume,
     offset: u64,
     len: u64,
     extents: &mut Vec<MemberExtent>,
-    partials: &mut HashMap<u32, PathBuf>,
+    backings: &mut SplitBackings,
     covered: &mut ByteRanges,
     held: &mut Vec<crate::pipeline::direct_store::provider::HeldRun>,
 ) -> EngineResult<()> {
@@ -36,13 +49,16 @@ fn append_virtual_part(
         let member_id = if let Some(id) = ids.get(&extent.member_id) {
             *id
         } else {
-            let path = image
-                .partials
-                .get(&extent.member_id)
-                .ok_or(EngineError::InvalidState("split 7z member backing missing"))?;
-            let id = u32::try_from(partials.len())
-                .map_err(|_| budget::host_limit("embedded PAR3 split backings"))?;
-            partials.insert(id, path.clone());
+            let id = backings.next_id()?;
+            if let Some(child) = image.nested.get(&extent.member_id) {
+                backings.nested.insert(id, child.clone());
+            } else {
+                let path = image
+                    .partials
+                    .get(&extent.member_id)
+                    .ok_or(EngineError::InvalidState("split 7z member backing missing"))?;
+                backings.paths.insert(id, path.clone());
+            }
             ids.insert(extent.member_id, id);
             id
         };
@@ -53,9 +69,8 @@ fn append_virtual_part(
             len: extent.len.min(len - extent.physical_offset),
         });
     }
-    let envelope_id = u32::try_from(partials.len())
-        .map_err(|_| budget::host_limit("embedded PAR3 split backings"))?;
-    partials.insert(envelope_id, image.envelope.clone());
+    let envelope_id = backings.next_id()?;
+    backings.paths.insert(envelope_id, image.envelope.clone());
     for &(start, end) in image.envelope_covered.ranges() {
         let end = end.min(len);
         let mut cursor = start;
@@ -185,27 +200,30 @@ impl Pipeline {
         };
         let mut covered = ByteRanges::new();
         let mut extents = Vec::new();
-        let mut partials = HashMap::new();
+        let mut backings = SplitBackings::default();
         let mut held = Vec::new();
+        let mut backing_leases = Vec::new();
         for (number, (part, path, disk_len, virtual_part)) in parts {
             let offset = chunk * u64::from(number);
             let part_len = if number == last { disk_len } else { chunk };
             if let Some(image) = virtual_part {
+                if let Some(leases) = &image.backing_leases {
+                    backing_leases.extend(leases.iter().cloned());
+                }
                 append_virtual_part(
                     &image,
                     offset,
                     part_len,
                     &mut extents,
-                    &mut partials,
+                    &mut backings,
                     &mut covered,
                     &mut held,
                 )?;
                 continue;
             }
             let id = part.file_id();
-            let member_id = u32::try_from(partials.len())
-                .map_err(|_| budget::host_limit("embedded PAR3 split backings"))?;
-            partials.insert(member_id, path);
+            let member_id = backings.next_id()?;
+            backings.paths.insert(member_id, path);
             extents.push(MemberExtent {
                 member_id,
                 physical_offset: offset,
@@ -235,15 +253,17 @@ impl Pipeline {
         held.sort_unstable_by_key(|run| run.start);
         Ok(Some((
             VirtualVolume {
+                backing_leases: (!backing_leases.is_empty()).then(|| Arc::new(backing_leases)),
                 volume_index: 0,
                 envelope: state.working_dir.join(base),
                 extents,
-                partials: Arc::new(partials),
+                partials: Arc::new(backings.paths),
                 covered,
                 envelope_covered: ByteRanges::new(),
                 held: Arc::new(held),
                 len: length,
                 ciphers: Arc::new(HashMap::new()),
+                nested: backings.nested.into(),
             },
             base.to_string(),
             start,
@@ -342,6 +362,7 @@ mod tests {
         std::fs::write(&second_path, b"EFGH").unwrap();
         std::fs::write(&envelope, b"HHxxxxTT").unwrap();
         let mut first = VirtualVolume {
+            backing_leases: Default::default(),
             volume_index: 0,
             envelope: envelope.clone(),
             extents: vec![MemberExtent {
@@ -361,6 +382,7 @@ mod tests {
             )]),
             len: 10,
             ciphers: Arc::new(HashMap::new()),
+            nested: Default::default(),
         };
         first.covered.insert(0, 8);
         first.envelope_covered.insert(0, 8);
@@ -381,7 +403,7 @@ mod tests {
         combined.extents.clear();
         combined.covered = ByteRanges::new();
         combined.len = 15;
-        let mut paths = HashMap::new();
+        let mut backings = SplitBackings::default();
         let mut holds = Vec::new();
         for (image, offset) in [(&first, 0), (&second, 10)] {
             append_virtual_part(
@@ -389,7 +411,7 @@ mod tests {
                 offset,
                 image.len,
                 &mut combined.extents,
-                &mut paths,
+                &mut backings,
                 &mut combined.covered,
                 &mut holds,
             )
@@ -398,7 +420,8 @@ mod tests {
         combined
             .extents
             .sort_unstable_by_key(|extent| extent.physical_offset);
-        combined.partials = Arc::new(paths);
+        combined.partials = Arc::new(backings.paths);
+        combined.nested = backings.nested.into();
         combined.held = Arc::new(holds);
         let mut reader = VirtualVolumeReader::<false>::new(combined, Arc::new(Default::default()));
         let mut bytes = [0; 13];

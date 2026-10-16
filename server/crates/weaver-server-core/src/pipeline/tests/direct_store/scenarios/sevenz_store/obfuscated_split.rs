@@ -97,7 +97,7 @@ impl HeldSplit {
         self.pipeline.check_job_completion(self.job_id).await;
         let sets = self.sets();
         drain_rar_refreshes(&mut self.pipeline).await;
-        drive_extractions_to_terminal(&mut self.pipeline, self.job_id, 64).await;
+        drive_extractions_to_terminal(&mut self.pipeline, self.job_id).await;
         let output_root = self
             .complete_dir
             .join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
@@ -262,7 +262,7 @@ async fn run_unnamed_split(
     }
     pipeline.check_job_completion(job_id).await;
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     let output_root =
         complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
     let produced = std::fs::read(output_root.join(MEMBER))

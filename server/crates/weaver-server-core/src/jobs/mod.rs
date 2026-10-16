@@ -1,3 +1,4 @@
+pub(crate) mod archive_checkpoint;
 mod archive_password;
 pub mod assembly;
 pub mod duplicate;

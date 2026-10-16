@@ -354,13 +354,13 @@ struct RarArchiveOpenInputs<'a> {
     budget: Option<Arc<JobExtractionBudget>>,
 }
 
-struct BudgetedRarVolumeProvider<'a, P> {
+pub(super) struct BudgetedRarVolumeProvider<'a, P> {
     inner: &'a P,
     budget: Arc<JobExtractionBudget>,
 }
 
 impl<'a, P> BudgetedRarVolumeProvider<'a, P> {
-    fn new(inner: &'a P, budget: Arc<JobExtractionBudget>) -> Self {
+    pub(super) fn new(inner: &'a P, budget: Arc<JobExtractionBudget>) -> Self {
         Self { inner, budget }
     }
 }
@@ -441,7 +441,7 @@ fn current_umask() -> u32 {
 }
 
 #[cfg(unix)]
-fn rar_member_unix_output_mode(member: &unrar_rs::MemberInfo) -> Option<u32> {
+pub(crate) fn rar_member_unix_output_mode(member: &unrar_rs::MemberInfo) -> Option<u32> {
     match member.host_os {
         unrar_rs::HostOs::Unix | unrar_rs::HostOs::Darwin => {
             let mode = member.attributes.unix_mode() & 0o7777;

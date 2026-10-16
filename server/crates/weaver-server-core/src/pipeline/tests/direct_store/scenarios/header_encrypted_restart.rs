@@ -128,7 +128,7 @@ async fn assert_hp_set_survives_restart(
     // member gates can compose; settle that read the way the select loop does.
     settle_direct_post_repair_work(&mut pipeline).await;
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let complete_dir = temp_dir.path().join("complete");
     let (member, _) = member_after_gate(&complete_dir, &working_dir, member_name);

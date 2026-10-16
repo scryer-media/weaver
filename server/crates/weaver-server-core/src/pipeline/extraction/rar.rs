@@ -19,6 +19,8 @@ pub(crate) use member::{
 pub(crate) use member::validate_sanitized_rar_member_path;
 
 pub(crate) use member::apply_rar_member_filesystem_metadata;
+#[cfg(unix)]
+pub(crate) use member::rar_member_unix_output_mode;
 
 pub(crate) use member::{
     apply_server_rar_limits_with_memory_limit, ensure_rar_dictionary_within_limit,
@@ -30,3 +32,5 @@ pub(crate) use member::RarArchiveSnapshotOpenRequest;
 
 #[cfg(test)]
 mod tests;
+
+mod stream;

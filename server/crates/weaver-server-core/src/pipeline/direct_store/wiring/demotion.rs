@@ -93,6 +93,21 @@ impl Pipeline {
         reason: DemotionReason,
         handoffs: &[SegmentId],
     ) {
+        if self
+            .direct_store
+            .set(job_id, set_index)
+            .is_some_and(|set| set.is_delegated())
+        {
+            // The selected immutable derivative owns all further validation.
+            // A late direct failure must not retire its original backing.
+            if !handoffs.is_empty() {
+                self.fail_job(
+                    job_id,
+                    format!("direct source failed after extraction handoff: {reason:?}"),
+                );
+            }
+            return;
+        }
         let orphans = self.take_direct_placements(job_id, set_index).await;
         let mut all_handoffs = handoffs.to_vec();
         all_handoffs.extend(
@@ -224,6 +239,16 @@ impl Pipeline {
             crate::pipeline::direct_unpack::wiring::DemotionReason::PartUnreadable,
         );
         self.taint_direct_unpack_set(job_id, &set_name);
+        self.drain_direct_unpack_set(job_id, &set_name).await;
+        if let Some(runtime) = self.archive_runtime.get_mut(&job_id)
+            && let Err(error) = runtime.retire_graph_namespace(&set_name).await
+        {
+            self.fail_job(
+                job_id,
+                format!("direct namespace retirement failed: {error:?}"),
+            );
+            return;
+        }
         self.clear_pending_par2_repairs_for_job(job_id);
         self.invalidate_par3_direct_set(job_id, set_index);
         self.direct_store.begin_materialization(

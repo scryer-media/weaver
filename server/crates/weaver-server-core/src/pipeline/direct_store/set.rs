@@ -15,6 +15,8 @@ use super::router::{CrcRuns, DemotionReason, DirectDestination, DirectSetRouter,
 use super::snapshot::CoverageSnapshot;
 use crate::jobs::ids::JobId;
 
+type NestedReplayMember = (u32, std::path::PathBuf, Vec<(u64, u64)>);
+
 // Destination key for volume `volume_index`'s envelope file.
 //
 // Envelope v2 gives every source volume its own sparse envelope file, so the
@@ -60,6 +62,17 @@ pub(crate) enum DirectSetStatus {
     Finalized,
     // The set left direct mode; the caller refetches its volumes normally.
     Demoted(DemotionReason),
+}
+
+pub(crate) struct LiveChildDescription {
+    pub(crate) node: u32,
+    pub(crate) parent: u32,
+    pub(crate) generation: u64,
+    pub(crate) format: super::plan::SetFormat,
+    pub(crate) set_name: String,
+    pub(crate) input_names: BTreeMap<u32, String>,
+    pub(crate) parts: BTreeMap<u32, crate::pipeline::extraction::input::LivePart>,
+    pub(crate) roster_closed: bool,
 }
 
 pub(crate) struct DirectSet {
@@ -172,6 +185,33 @@ pub(crate) struct DirectSet {
     // restored checkpoint.
     proven_fingerprints: BTreeMap<u32, ([u8; 16], u64)>,
     repost_digests: BTreeMap<u32, super::snapshot::RepostDigest>,
+    nested: Option<super::nested::NestedGraph>,
+    nested_authority: bool,
+    delegated: bool,
+    qualified_placements: BTreeMap<QualifiedKey, QualifiedPlacement>,
+    graph_dirty_bytes: u64,
+    graph_dirty_since: Option<Instant>,
+    graph_metadata: Option<blake3::Hash>,
+    live_metadata: Option<blake3::Hash>,
+    live_placement_revision: u64,
+    installed: Option<super::snapshot::InstalledSet>,
+}
+
+type QualifiedKey = (u32, u64, u8, u32, Option<(u32, u32, u64)>);
+
+pub(crate) struct QualifiedPlacement {
+    pub(crate) owner: super::router::SpanOwner,
+    pub(crate) destination: DirectDestination,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) ranges: ByteRanges,
+}
+
+pub(crate) struct GraphRearmPlan {
+    pub(crate) node: u32,
+    pub(crate) generation: u64,
+    pub(crate) runs: Vec<super::router::RestartReadRun>,
+    pub(crate) physical: std::sync::Arc<HashMap<u32, std::path::PathBuf>>,
+    pub(crate) nested: super::provider::NestedMembers,
 }
 
 impl std::fmt::Debug for DirectSet {
@@ -209,6 +249,612 @@ impl DirectSet {
             retained: None,
             proven_fingerprints: BTreeMap::new(),
             repost_digests: BTreeMap::new(),
+            nested: None,
+            nested_authority: false,
+            delegated: false,
+            qualified_placements: BTreeMap::new(),
+            graph_dirty_bytes: 0,
+            graph_dirty_since: None,
+            graph_metadata: None,
+            live_metadata: None,
+            live_placement_revision: 0,
+            installed: None,
+        }
+    }
+
+    pub(crate) fn install_restored_nested(&mut self, graph: super::nested::NestedGraph) {
+        self.nested = Some(graph);
+    }
+
+    pub(crate) fn nested_graph(&self) -> Option<&super::nested::NestedGraph> {
+        self.nested.as_ref()
+    }
+
+    pub(crate) fn take_live_refresh(&mut self) -> bool {
+        let mut hash = blake3::Hasher::new();
+        hash.update(self.graph_metadata_fingerprint().as_bytes());
+        hash.update(&self.live_placement_revision.to_le_bytes());
+        let next = hash.finalize();
+        if self.live_metadata == Some(next) {
+            return false;
+        }
+        self.live_metadata = Some(next);
+        true
+    }
+
+    pub(crate) fn direct_producer_states(&self) -> Vec<(u32, Option<u32>, u64, bool)> {
+        if !self.nested_authority {
+            return Vec::new();
+        }
+        let mut result = vec![(
+            0,
+            None,
+            0,
+            self.all_volumes_complete()
+                && self.router.all_members_verified()
+                && !self.router.awaits_par3_verdict(),
+        )];
+        result.extend(
+            self.nested
+                .as_ref()
+                .expect("active graph")
+                .direct_producer_states(),
+        );
+        result
+    }
+
+    pub(crate) fn live_child_descriptions(&self) -> Vec<LiveChildDescription> {
+        if !self.nested_authority {
+            return Vec::new();
+        }
+        self.nested
+            .as_ref()
+            .expect("active graph")
+            .live_child_descriptions(&self.router)
+    }
+
+    pub(crate) fn graph_rearm_plans(&self) -> Vec<GraphRearmPlan> {
+        if !self.nested_authority {
+            return Vec::new();
+        }
+        let graph = self.nested.as_ref().expect("active graph");
+        (0..=graph.nodes.len() as u32)
+            .filter_map(|node| {
+                let router = graph.router(&self.router, node);
+                let runs = router.restart_read_plan();
+                if runs.is_empty() {
+                    return None;
+                }
+                let (physical, nested) = graph.member_backings(&self.router, node);
+                Some(GraphRearmPlan {
+                    node,
+                    generation: if node == 0 {
+                        0
+                    } else {
+                        graph.node(node).generation
+                    },
+                    runs,
+                    physical,
+                    nested,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn apply_graph_rearm(
+        &mut self,
+        node: u32,
+        generation: u64,
+        runs: &[super::router::RestartReadRun],
+        checksums: Vec<u32>,
+    ) -> Result<(), DemotionReason> {
+        let router = if node == 0 {
+            &mut self.router
+        } else {
+            let graph = self
+                .nested
+                .as_mut()
+                .ok_or(DemotionReason::ConflictingVolumeFacts)?;
+            if graph.node(node).generation != generation {
+                return Err(DemotionReason::ConflictingVolumeFacts);
+            }
+            &mut graph.node_mut(node).router
+        };
+        if router.restart_read_plan() != runs || runs.len() != checksums.len() {
+            return Err(DemotionReason::ConflictingVolumeFacts);
+        }
+        for (run, checksum) in runs.iter().zip(checksums) {
+            router.note_restored_member_crc(
+                run.member_id,
+                run.logical_offset,
+                run.len,
+                checksum,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn installed_snapshot(&self) -> Option<&super::snapshot::InstalledSet> {
+        self.installed.as_ref()
+    }
+
+    pub(crate) fn set_installed_snapshot(&mut self, installed: super::snapshot::InstalledSet) {
+        self.installed = Some(installed);
+    }
+
+    pub(crate) fn has_nested_checkpoint_authority(&self) -> bool {
+        self.nested_authority
+    }
+
+    // Called only after the job graph's first CAS has migrated every root.
+    pub(crate) fn enable_nested_checkpoint_authority(&mut self) {
+        self.router.retain_checkpoint_backings();
+        self.nested.get_or_insert_with(Default::default);
+        self.nested_authority = true;
+    }
+
+    pub(crate) fn nested_replay_members(&self) -> Vec<NestedReplayMember> {
+        let candidates: std::collections::HashSet<_> =
+            super::nested::catalog::archive_candidates(&self.router)
+                .into_iter()
+                .map(|candidate| candidate.0)
+                .collect();
+        let partials: HashMap<_, _> = self
+            .router
+            .member_partials()
+            .into_iter()
+            .map(|(member, _, relative)| (member, self.plan().destination_path(relative)))
+            .collect();
+        let mut coverage: BTreeMap<u32, ByteRanges> = BTreeMap::new();
+        for claim in self.legacy_physical_claims() {
+            for extent in claim.extents {
+                coverage
+                    .entry(claim.member_index)
+                    .or_default()
+                    .insert(extent.start, extent.end - extent.start);
+            }
+        }
+        for placement in self.qualified_placements() {
+            if placement.owner.node == 0
+                && placement.owner.raw_child.is_none()
+                && let DirectDestination::Member { member_id } = placement.destination
+            {
+                for &(start, end) in placement.ranges.ranges() {
+                    coverage
+                        .entry(member_id)
+                        .or_default()
+                        .insert(start, end - start);
+                }
+            }
+        }
+        coverage
+            .into_iter()
+            .filter_map(|(member, ranges)| {
+                if !candidates.contains(&member) {
+                    return None;
+                }
+                let path = partials.get(&member)?.clone();
+                let delivered = self.nested.as_ref().and_then(|graph| {
+                    graph
+                        .binding(0, member)
+                        .map(|(child, volume)| &graph.node(child).inputs[&volume].delivered)
+                });
+                let ranges: Vec<_> = ranges
+                    .ranges()
+                    .iter()
+                    .flat_map(|&(start, end)| {
+                        delivered.map_or_else(
+                            || vec![(start, end)],
+                            |delivered| delivered.missing(start, end - start),
+                        )
+                    })
+                    .collect();
+                (!ranges.is_empty()).then_some((member, path, ranges))
+            })
+            .collect()
+    }
+
+    pub(crate) fn forward_existing_member(
+        &mut self,
+        member: u32,
+        offset: u64,
+        bytes: bytes::Bytes,
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        use crate::pipeline::extraction::catalog::{
+            InputProjection, MemberProjection, MemberRange,
+        };
+        let graph = self
+            .nested
+            .as_mut()
+            .ok_or(DemotionReason::ConflictingVolumeFacts)?;
+        graph.forward(&self.router, super::nested::ROOT_NODE, Vec::new())?;
+        if graph.binding(super::nested::ROOT_NODE, member).is_none() {
+            return Ok(Vec::new());
+        }
+        let InputProjection::Mapped(sources) = self
+            .router
+            .project_member(
+                member,
+                MemberRange {
+                    offset,
+                    len: bytes.len() as u64,
+                    write_offset: 0,
+                },
+            )
+            .map_err(|_| DemotionReason::ConflictingVolumeFacts)?
+        else {
+            return Err(DemotionReason::ConflictingVolumeFacts);
+        };
+        let spans = sources
+            .into_iter()
+            .map(|source| {
+                let start = usize::try_from(source.write_offset)
+                    .map_err(|_| DemotionReason::ConflictingVolumeFacts)?;
+                let length = usize::try_from(source.len)
+                    .map_err(|_| DemotionReason::ConflictingVolumeFacts)?;
+                let end = start
+                    .checked_add(length)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or(DemotionReason::ConflictingVolumeFacts)?;
+                Ok(RoutedSpan {
+                    owner: Default::default(),
+                    destination: DirectDestination::Member { member_id: member },
+                    destination_offset: offset + source.write_offset,
+                    volume_index: source.volume,
+                    source_offset: source.offset,
+                    bytes: vec![bytes.slice(start..end)],
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let spans = graph.forward(&self.router, super::nested::ROOT_NODE, spans)?;
+        let mut forwarded = Vec::new();
+        for span in spans {
+            if span.owner == super::nested::ROOT_NODE {
+                if span.raw_child.is_some() {
+                    // This replay came from an already receipt-backed root
+                    // partial. A refused child keeps that physical evidence.
+                    self.record_placements(std::iter::once(span.placement()), Instant::now());
+                }
+            } else {
+                forwarded.push(span.into_span());
+            }
+        }
+        Ok(forwarded)
+    }
+
+    pub(crate) fn qualified_placements(&self) -> impl Iterator<Item = &QualifiedPlacement> {
+        self.qualified_placements.values().filter(|placement| {
+            self.placement_path(placement.owner, placement.destination)
+                .is_some_and(|path| path == placement.path)
+        })
+    }
+
+    pub(crate) fn seed_qualified_placement(
+        &mut self,
+        owner: super::router::SpanOwner,
+        destination: DirectDestination,
+        path: std::path::PathBuf,
+        extents: Vec<(u64, u64)>,
+    ) {
+        let (kind, destination_key) = match destination {
+            DirectDestination::Member { member_id } => (0, member_id),
+            DirectDestination::Envelope { volume_index } => (1, volume_index),
+        };
+        let raw = owner
+            .raw_child
+            .map(|child| (child.node, child.volume, child.generation));
+        let key = (owner.node, owner.generation, kind, destination_key, raw);
+        let claim = self
+            .qualified_placements
+            .entry(key)
+            .or_insert_with(|| QualifiedPlacement {
+                owner,
+                destination,
+                path,
+                ranges: ByteRanges::new(),
+            });
+        for (start, end) in extents {
+            claim.ranges.insert(start, end - start);
+        }
+    }
+
+    pub(crate) fn seed_root_source_coverage(&mut self, volume: u32, ranges: Vec<(u64, u64)>) {
+        let coverage = self.placed.entry(volume).or_default();
+        for (start, end) in ranges {
+            coverage.insert(start, end - start);
+        }
+    }
+
+    pub(crate) fn mark_graph_checkpoint_committed(&mut self, _now: Instant) {
+        self.graph_dirty_bytes = 0;
+        self.graph_dirty_since = None;
+        self.graph_metadata = Some(self.graph_metadata_fingerprint());
+    }
+
+    fn graph_metadata_fingerprint(&self) -> blake3::Hash {
+        let mut hash = blake3::Hasher::new();
+        hash.update(&self.router.member_facts_revision().to_le_bytes());
+        hash.update(&[
+            u8::from(self.router.all_members_verified()),
+            u8::from(self.router.awaits_par3_verdict()),
+        ]);
+        for (&volume, &length) in &self.complete_volumes {
+            hash.update(&volume.to_le_bytes());
+            hash.update(&length.to_le_bytes());
+        }
+        if let Some(graph) = &self.nested {
+            for node in &graph.nodes {
+                hash.update(&node.parent.to_le_bytes());
+                hash.update(&node.generation.to_le_bytes());
+                hash.update(&node.router.member_facts_revision().to_le_bytes());
+                hash.update(&[
+                    u8::from(node.router.all_members_verified()),
+                    u8::from(node.router.awaits_par3_verdict()),
+                ]);
+                hash.update(&[
+                    u8::from(node.roster_closed),
+                    match node.mode {
+                        super::nested::NodeMode::Direct => 0,
+                        super::nested::NodeMode::MaterializationPending(_) => 1,
+                        super::nested::NodeMode::Materialized => 2,
+                    },
+                ]);
+                for (&volume, input) in &node.inputs {
+                    hash.update(&volume.to_le_bytes());
+                    hash.update(&input.length.unwrap_or(u64::MAX).to_le_bytes());
+                    hash.update(&[u8::from(input.confirmed)]);
+                }
+            }
+        }
+        hash.finalize()
+    }
+
+    pub(crate) fn legacy_physical_claims(&self) -> Vec<super::snapshot::DestinationClaim> {
+        self.barrier
+            .as_ref()
+            .map(|barrier| barrier.checkpoint_snapshot(1).destinations)
+            .or_else(|| {
+                self.resumed
+                    .as_ref()
+                    .map(|snapshot| snapshot.destinations.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn checkpoint_metadata(&self, generation: u64) -> CoverageSnapshot {
+        let crypt = self.router.member_crypt_snapshots();
+        let mut destinations = self.legacy_physical_claims();
+        for (member_index, _, relative) in self.router.member_partials() {
+            let claim = super::snapshot::DestinationClaim {
+                member_index,
+                relative_path: relative.to_owned(),
+                extents: Vec::new(),
+                crypt: crypt.get(&member_index).cloned(),
+            };
+            match destinations
+                .iter_mut()
+                .find(|entry| entry.member_index == member_index)
+            {
+                Some(existing) => existing.crypt = claim.crypt,
+                None => destinations.push(claim),
+            }
+        }
+        destinations.sort_by_key(|entry| entry.member_index);
+        CoverageSnapshot {
+            generation,
+            plan_digest: self.plan_digest(),
+            destinations,
+            floors: self
+                .plan()
+                .volumes
+                .iter()
+                .map(|(&volume_index, &file_index)| {
+                    let floor = self.volume_coverage(volume_index).contiguous_from(0);
+                    let complete = self
+                        .complete_volumes
+                        .get(&volume_index)
+                        .is_some_and(|length| floor >= *length);
+                    super::snapshot::VolumeFloor {
+                        volume_index,
+                        file_index,
+                        floor,
+                        complete,
+                    }
+                })
+                .collect(),
+            identity: self.plan().identity_binding(),
+            fingerprints: self.fingerprint_rows(),
+            repost_digests: self.repost_digests.values().copied().collect(),
+        }
+    }
+
+    pub(crate) fn checkpoint_volume_lengths(&self) -> BTreeMap<u32, u64> {
+        let facts = self.router.checkpoint_facts();
+        self.plan()
+            .volumes
+            .keys()
+            .map(|&volume| {
+                let known = self
+                    .complete_volumes
+                    .get(&volume)
+                    .map(|length| self.virtual_volume_len(volume, *length))
+                    .or_else(|| match facts.get(&volume) {
+                        Some(super::restart::DirectVolumeFacts::SevenZip(facts)) => {
+                            Some(facts.declared_len)
+                        }
+                        _ => None,
+                    });
+                let length = known.unwrap_or_else(|| {
+                    self.segment_extents
+                        .get(&volume)
+                        .into_iter()
+                        .flat_map(|segments| segments.values())
+                        .map(|(offset, length)| offset.saturating_add(*length))
+                        .chain(
+                            self.volume_coverage(volume)
+                                .ranges()
+                                .iter()
+                                .map(|(_, end)| *end),
+                        )
+                        .chain(
+                            self.router
+                                .held_ranges(volume)
+                                .into_iter()
+                                .map(|(_, end)| end),
+                        )
+                        .max()
+                        .unwrap_or(0)
+                });
+                (volume, length)
+            })
+            .collect()
+    }
+
+    pub(crate) fn owner_router(&self, owner: u32) -> Option<&DirectSetRouter> {
+        if owner == super::nested::ROOT_NODE {
+            return Some(&self.router);
+        }
+        let graph = self.nested.as_ref()?;
+        graph.nodes.get(owner as usize - 1).map(|node| &node.router)
+    }
+
+    pub(crate) fn finalization_members(
+        &self,
+    ) -> Vec<(String, u64, std::path::PathBuf, std::path::PathBuf)> {
+        fn append(
+            set: &DirectSet,
+            owner: u32,
+            visited: &mut HashSet<u32>,
+            output: &mut Vec<(String, u64, std::path::PathBuf, std::path::PathBuf)>,
+        ) {
+            let Some(router) = set.owner_router(owner) else {
+                return;
+            };
+            let sizes: HashMap<_, _> = router.member_digest_entries().into_iter().collect();
+            for (member, name, partial) in router.member_partials() {
+                if set.nested_authority
+                    && let Some(graph) = set.nested.as_ref()
+                    && let Some((child, _)) = graph.binding(owner, member)
+                    && graph.node(child).mode != super::nested::NodeMode::Materialized
+                {
+                    if visited.insert(child) {
+                        append(set, child, visited, output);
+                    }
+                    continue;
+                }
+                if let Ok(destination) = set.plan().member_output_path(name) {
+                    output.push((
+                        name.to_owned(),
+                        sizes.get(name).copied().unwrap_or(0),
+                        router.plan().destination_path(partial),
+                        destination,
+                    ));
+                }
+            }
+        }
+        let mut members = Vec::new();
+        append(
+            self,
+            super::nested::ROOT_NODE,
+            &mut HashSet::new(),
+            &mut members,
+        );
+        members
+    }
+
+    pub(crate) fn all_envelope_paths(&self) -> Vec<std::path::PathBuf> {
+        let mut paths = self.plan().envelope_paths();
+        if let Some(graph) = self.nested.as_ref() {
+            for node in &graph.nodes {
+                paths.extend(node.router.plan().envelope_paths());
+            }
+        }
+        paths
+    }
+
+    pub(crate) fn prepare_nested_materialization(
+        &self,
+    ) -> Option<super::nested::materialize::Materialization> {
+        if !self.nested_authority {
+            return None;
+        }
+        let graph = self.nested.as_ref()?;
+        let node = graph.nodes.iter().position(|node| {
+            matches!(
+                node.mode,
+                super::nested::NodeMode::MaterializationPending(_)
+            )
+        })?;
+        graph.prepare_materialization(&self.router, node as u32 + 1)
+    }
+
+    pub(crate) fn apply_nested_materialization(
+        &mut self,
+        materialized: super::nested::materialize::Materialized,
+    ) -> Result<(), DemotionReason> {
+        let receipts = self
+            .nested
+            .as_mut()
+            .ok_or(DemotionReason::ConflictingVolumeFacts)?
+            .apply_materialization(&self.router, materialized)?;
+        for (receipt, sources) in receipts {
+            let destination = DirectDestination::Member {
+                member_id: receipt.member,
+            };
+            let path = self
+                .placement_path(receipt.owner, destination)
+                .ok_or(DemotionReason::ConflictingVolumeFacts)?;
+            let raw = receipt
+                .owner
+                .raw_child
+                .map(|child| (child.node, child.volume, child.generation));
+            let key = (
+                receipt.owner.node,
+                receipt.owner.generation,
+                0,
+                receipt.member,
+                raw,
+            );
+            self.qualified_placements
+                .entry(key)
+                .or_insert_with(|| QualifiedPlacement {
+                    owner: receipt.owner,
+                    destination,
+                    path,
+                    ranges: ByteRanges::new(),
+                })
+                .ranges
+                .insert(receipt.offset, receipt.len);
+            for source in sources {
+                self.placed
+                    .entry(source.volume)
+                    .or_default()
+                    .insert(source.offset, source.len);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn placement_path(
+        &self,
+        owner: super::router::SpanOwner,
+        destination: DirectDestination,
+    ) -> Option<std::path::PathBuf> {
+        let router = self.owner_router(owner.node)?;
+        if owner.node != super::nested::ROOT_NODE
+            && self.nested.as_ref()?.node(owner.node).generation != owner.generation
+        {
+            return None;
+        }
+        match destination {
+            DirectDestination::Envelope { volume_index } => {
+                Some(router.plan().envelope_path(volume_index))
+            }
+            DirectDestination::Member { member_id } => router
+                .member_partials()
+                .into_iter()
+                .find(|(member, _, _)| *member == member_id)
+                .map(|(_, _, relative)| router.plan().destination_path(relative)),
         }
     }
 
@@ -534,6 +1180,14 @@ impl DirectSet {
         matches!(self.status, DirectSetStatus::Finalized)
     }
 
+    pub(crate) fn delegate_effective_extraction(&mut self) {
+        self.delegated = true;
+    }
+
+    pub(crate) fn is_delegated(&self) -> bool {
+        self.delegated
+    }
+
     // The reason the set left direct mode under, which is the router's own
     // when it demoted from inside `route` before the wiring seam was asked.
     #[cfg(test)]
@@ -811,7 +1465,10 @@ impl DirectSet {
         source_offset: u64,
         pieces: &[bytes::Bytes],
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
-        let spans = self.router.route(volume_index, source_offset, pieces);
+        let spans = self
+            .router
+            .route(volume_index, source_offset, pieces)
+            .and_then(|spans| self.forward_root_spans(spans));
         match spans {
             Ok(spans) => {
                 if !spans.is_empty() {
@@ -829,11 +1486,42 @@ impl DirectSet {
     // Every volume has completed, every member has passed its archive gate,
     // and any deferred PAR3 verdict has been applied to the router.
     pub(crate) fn ready_to_finalize(&self) -> bool {
-        !self.is_demoted()
+        !self.delegated
+            && !self.is_demoted()
             && !self.is_finalized()
             && self.all_volumes_complete()
             && !self.router.awaits_par3_verdict()
             && self.router.all_members_verified()
+            && (!self.nested_authority
+                || self.nested.as_ref().is_some_and(|graph| {
+                    graph.nodes.iter().all(|node| {
+                        node.mode == super::nested::NodeMode::Materialized
+                            || (node.mode == super::nested::NodeMode::Direct
+                                && node.roster_closed
+                                && node.inputs.values().all(|input| input.confirmed)
+                                && node.router.all_members_verified()
+                                && !node.router.awaits_par3_verdict())
+                    })
+                }))
+    }
+
+    fn forward_root_spans(
+        &mut self,
+        spans: Vec<RoutedSpan>,
+    ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        if !self.nested_authority {
+            return Ok(spans);
+        }
+        self.nested
+            .as_mut()
+            .expect("active graph")
+            .forward(&self.router, super::nested::ROOT_NODE, spans)
+            .map(|spans| {
+                spans
+                    .into_iter()
+                    .map(super::nested::NodeSpan::into_span)
+                    .collect()
+            })
     }
 
     // Every source volume the set plans has finished downloading.
@@ -889,7 +1577,24 @@ impl DirectSet {
         // really has, the same answer PAR2 is given for it. The checkpoint
         // above keeps the over-estimate on purpose.
         let routed_len = self.virtual_volume_len(volume_index, decoded_len);
-        match self.router.note_volume_complete(volume_index, routed_len) {
+        let spans = self
+            .router
+            .note_volume_complete(volume_index, routed_len)
+            .and_then(|spans| self.forward_root_spans(spans))
+            .and_then(|mut spans| {
+                if self.nested_authority && self.all_volumes_complete() {
+                    spans.extend(
+                        self.nested
+                            .as_mut()
+                            .expect("active graph")
+                            .close_parent_roster(&self.router, super::nested::ROOT_NODE)?
+                            .into_iter()
+                            .map(super::nested::NodeSpan::into_span),
+                    );
+                }
+                Ok(spans)
+            });
+        match spans {
             Ok(spans) => {
                 if !spans.is_empty() {
                     self.latched_direct = true;
@@ -1039,6 +1744,80 @@ impl DirectSet {
     // Records spans whose writes have **all** returned. A refusal here is a
     // wiring bug, not a runtime condition, and the barrier says so loudly.
     pub(crate) fn record_writes(&mut self, spans: &[RoutedSpan], now: Instant) {
+        self.record_placements(spans.iter().map(RoutedSpan::placement), now);
+    }
+
+    pub(crate) fn record_placements(
+        &mut self,
+        spans: impl Iterator<Item = super::router::PlacementReceipt> + Clone,
+        now: Instant,
+    ) {
+        if self.nested_authority {
+            for receipt in spans {
+                let Some(path) = self.placement_path(receipt.owner, receipt.destination) else {
+                    self.demote(DemotionReason::ConflictingVolumeFacts);
+                    return;
+                };
+                let sources = match self
+                    .nested
+                    .as_mut()
+                    .expect("active graph")
+                    .record_placement(&self.router, receipt)
+                {
+                    Ok(sources) => sources,
+                    Err(reason) => {
+                        self.demote(reason);
+                        return;
+                    }
+                };
+                let (kind, destination) = match receipt.destination {
+                    DirectDestination::Member { member_id } => (0, member_id),
+                    DirectDestination::Envelope { volume_index } => (1, volume_index),
+                };
+                let raw = receipt
+                    .owner
+                    .raw_child
+                    .map(|child| (child.node, child.volume, child.generation));
+                let key = (
+                    receipt.owner.node,
+                    receipt.owner.generation,
+                    kind,
+                    destination,
+                    raw,
+                );
+                let fresh = self
+                    .qualified_placements
+                    .entry(key)
+                    .or_insert_with(|| QualifiedPlacement {
+                        owner: receipt.owner,
+                        destination: receipt.destination,
+                        path,
+                        ranges: ByteRanges::new(),
+                    })
+                    .ranges
+                    .insert(receipt.destination_offset, receipt.len);
+                self.graph_dirty_bytes = self.graph_dirty_bytes.saturating_add(fresh);
+                if fresh > 0 {
+                    self.live_placement_revision = self.live_placement_revision.saturating_add(1);
+                    self.graph_dirty_since.get_or_insert(now);
+                }
+                for source in sources {
+                    self.placed
+                        .entry(source.volume)
+                        .or_default()
+                        .insert(source.offset, source.len);
+                }
+                if receipt.owner.node == super::nested::ROOT_NODE
+                    && let DirectDestination::Envelope { volume_index } = receipt.destination
+                {
+                    self.placed_envelope
+                        .entry(volume_index)
+                        .or_default()
+                        .insert(receipt.destination_offset, receipt.len);
+                }
+            }
+            return;
+        }
         self.ensure_registered();
         // Ordering assumption, asserted rather than assumed: the barrier comes
         // into existence with the *first member*, and every volume's envelope is
@@ -1051,10 +1830,10 @@ impl DirectSet {
         // would mean the parse produced envelope runs from a member-less
         // layout.
         debug_assert!(
-            spans.is_empty()
+            spans.clone().next().is_none()
                 || self.barrier.is_some()
                 || spans
-                    .iter()
+                    .clone()
                     .all(|span| !matches!(span.destination, DirectDestination::Envelope { .. })),
             "direct-store emitted envelope spans for {} before any member registered a barrier",
             self.set_name()
@@ -1063,16 +1842,16 @@ impl DirectSet {
         // exists: this is the account [`Self::volume_coverage`] falls back on,
         // and it must describe writes that *returned*, exactly like the
         // barrier's.
-        for span in spans {
+        for span in spans.clone() {
             self.placed
                 .entry(span.volume_index)
                 .or_default()
-                .insert(span.source_offset, span.len());
+                .insert(span.source_offset, span.len);
             if let DirectDestination::Envelope { volume_index } = span.destination {
                 self.placed_envelope
                     .entry(volume_index)
                     .or_default()
-                    .insert(span.destination_offset, span.len());
+                    .insert(span.destination_offset, span.len);
             }
         }
         let Some(barrier) = self.barrier.as_mut() else {
@@ -1089,7 +1868,7 @@ impl DirectSet {
                 &RoutedWrite {
                     volume_index: span.volume_index,
                     source_offset: span.source_offset,
-                    len: span.len(),
+                    len: span.len,
                     member_index,
                     destination_offset: span.destination_offset,
                 },
@@ -1099,6 +1878,20 @@ impl DirectSet {
     }
 
     pub(crate) fn due(&self, now: Instant) -> Option<BarrierTrigger> {
+        if self.nested_authority {
+            if self.graph_metadata != Some(self.graph_metadata_fingerprint()) {
+                return Some(BarrierTrigger::PlanDigestChanged);
+            }
+            if self.graph_dirty_bytes >= super::barrier::BARRIER_DIRTY_BYTES {
+                return Some(BarrierTrigger::DirtyBytes);
+            }
+            return self
+                .graph_dirty_since
+                .filter(|since| {
+                    now.saturating_duration_since(*since) >= super::barrier::BARRIER_DIRTY_AGE
+                })
+                .map(|_| BarrierTrigger::DirtyAge);
+        }
         self.barrier.as_ref().and_then(|barrier| barrier.due(now))
     }
 
@@ -1106,6 +1899,9 @@ impl DirectSet {
     // is about to make durable. Read before a barrier runs, because running it
     // resets the count.
     pub(crate) fn dirty_bytes(&self) -> u64 {
+        if self.nested_authority {
+            return self.graph_dirty_bytes;
+        }
         self.barrier
             .as_ref()
             .map(|barrier| barrier.dirty_bytes())
@@ -1307,10 +2103,19 @@ impl DirectSet {
     // whose write failed, and claiming one of those would send the demotion
     // sweep to read a byte back out of a file that never received it.
     pub(crate) fn volume_coverage(&self, volume_index: u32) -> ByteRanges {
-        self.barrier
+        let mut coverage = self
+            .barrier
             .as_ref()
             .and_then(|barrier| barrier.volume_coverage(volume_index))
-            .unwrap_or_else(|| self.placed.get(&volume_index).cloned().unwrap_or_default())
+            .unwrap_or_else(|| self.placed.get(&volume_index).cloned().unwrap_or_default());
+        if self.nested_authority
+            && let Some(placed) = self.placed.get(&volume_index)
+        {
+            for &(start, end) in placed.ranges() {
+                coverage.insert(start, end - start);
+            }
+        }
+        coverage
     }
 
     // [`Self::volume_coverage`] plus the volume's holds: everything a
@@ -1339,7 +2144,8 @@ impl DirectSet {
     // zeros rather than failing, and "the volume placed this byte somewhere" is
     // not evidence that the envelope is where it went.
     pub(crate) fn envelope_coverage(&self, volume_index: u32) -> ByteRanges {
-        self.barrier
+        let mut coverage = self
+            .barrier
             .as_ref()
             .and_then(|barrier| {
                 barrier.destination_coverage(envelope_destination_key(volume_index))
@@ -1350,7 +2156,15 @@ impl DirectSet {
                     .get(&volume_index)
                     .cloned()
                     .unwrap_or_default()
-            })
+            });
+        if self.nested_authority
+            && let Some(placed) = self.placed_envelope.get(&volume_index)
+        {
+            for &(start, end) in placed.ranges() {
+                coverage.insert(start, end - start);
+            }
+        }
+        coverage
     }
 
     // A [`HybridVolumeProvider`] over this set's partials and envelopes.
@@ -1398,9 +2212,18 @@ impl DirectSet {
         // its own snapshot rather than a fresh copy of it, which is what keeps
         // a per-read provider off the checkpoint map.
         let ciphers = self.router.member_ciphers();
+        let (partials, nested) = if self.nested_authority {
+            self.nested
+                .as_ref()
+                .expect("active graph")
+                .member_backings(&self.router, super::nested::ROOT_NODE)
+        } else {
+            (partials, Default::default())
+        };
         volume_lengths
             .iter()
             .map(|(volume_index, len)| VirtualVolume {
+                backing_leases: Default::default(),
                 volume_index: *volume_index,
                 envelope: self.router.plan().envelope_path(*volume_index),
                 extents: self.router.volume_member_extents(*volume_index),
@@ -1410,6 +2233,7 @@ impl DirectSet {
                 held: std::sync::Arc::new(self.router.held_runs(*volume_index)),
                 len: *len,
                 ciphers: std::sync::Arc::clone(&ciphers),
+                nested: nested.clone(),
             })
             .collect()
     }
@@ -1458,6 +2282,17 @@ impl DirectSet {
         if volume_lengths.len() != self.router.plan().volumes.len() {
             return false;
         }
+        if self.nested_authority {
+            let volumes = self.virtual_volumes(volume_lengths);
+            if !volumes
+                .iter()
+                .all(|volume| volume.len > 0 && volume.readable_prefix() == Some(volume.len))
+            {
+                return false;
+            }
+            self.retained = Some(volumes);
+            return true;
+        }
         let Some(partials) = self.committed_member_paths() else {
             return false;
         };
@@ -1468,6 +2303,7 @@ impl DirectSet {
         let volumes: Vec<VirtualVolume> = volume_lengths
             .iter()
             .map(|(volume_index, len)| VirtualVolume {
+                backing_leases: Default::default(),
                 volume_index: *volume_index,
                 envelope: self.router.plan().envelope_path(*volume_index),
                 extents: self.router.volume_member_extents(*volume_index),
@@ -1478,6 +2314,7 @@ impl DirectSet {
                 held: std::sync::Arc::new(Vec::new()),
                 len: *len,
                 ciphers: std::sync::Arc::clone(&ciphers),
+                nested: Default::default(),
             })
             .collect();
         if !volumes
@@ -1494,6 +2331,20 @@ impl DirectSet {
     // released it.
     pub(crate) fn retained_volumes(&self) -> Option<&[VirtualVolume]> {
         self.retained.as_deref()
+    }
+
+    pub(crate) fn retain_restored_finalized(&mut self) -> bool {
+        let lengths = self.checkpoint_volume_lengths();
+        let volumes = self.virtual_volumes(&lengths);
+        if volumes.is_empty()
+            || !volumes
+                .iter()
+                .all(|volume| volume.len > 0 && volume.readable_prefix() == Some(volume.len))
+        {
+            return false;
+        }
+        self.retained = Some(volumes);
+        true
     }
 
     // Drops the retained image. The caller deletes the envelope files it named

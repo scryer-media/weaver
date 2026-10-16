@@ -1485,6 +1485,11 @@ pub(super) struct DirectRearmDone {
 }
 
 pub(super) struct DirectToleratedWorkDone {
+    pub(super) set_name: String,
+    pub(super) used_chase: bool,
+    pub(super) chase_owner: Option<extraction::output::channel::StreamOwner>,
+    pub(super) retry_after_chase: bool,
+    pub(super) retirement: Option<completion::finalize::extract::ChaseRetirement>,
     pub(super) job_id: JobId,
     pub(super) work_id: u64,
     pub(super) set_index: usize,
@@ -1697,6 +1702,28 @@ impl Par2RuntimeState {
 }
 
 pub(super) enum ExtractionDone {
+    NativeChaseResolved {
+        job_id: JobId,
+        set_name: String,
+        owner: extraction::output::channel::StreamOwner,
+        kind: crate::jobs::assembly::ArchiveType,
+        result: Result<Option<FullSetExtractionOutcome>, ExtractionError>,
+        retirement: Option<completion::finalize::extract::ChaseRetirement>,
+    },
+    ScopedNamespace {
+        job_id: JobId,
+        owner: extraction::output::channel::StreamOwner,
+        namespace: String,
+        producers: Vec<(u32, Option<u32>, u64, bool)>,
+        children: Vec<direct_store::set::LiveChildDescription>,
+    },
+    Scoped {
+        job_id: JobId,
+        owner: extraction::output::channel::StreamOwner,
+        request: extraction::runtime::RequestId,
+        decoded: Option<Box<extraction::runtime::decoded::DecodedState>>,
+        result: Result<FullSetExtractionOutcome, ExtractionError>,
+    },
     // Batch extraction of specific members completed.
     Batch {
         job_id: JobId,
@@ -2545,6 +2572,7 @@ pub struct Pipeline {
     pub(super) metrics: Arc<PipelineMetrics>,
     // Per-job state.
     pub(super) jobs: HashMap<JobId, JobState>,
+    pub(crate) archive_runtime: HashMap<JobId, extraction::runtime::ArchiveRuntime>,
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,

@@ -2322,6 +2322,122 @@ async fn rar_member_refresh_request_ignores_verified_suspects_when_covered() {
 }
 
 #[tokio::test]
+async fn streamed_batch_failure_waits_for_scoped_failure_decision() {
+    use crate::pipeline::archive::rar_state::{RarSetState, build_plan};
+    for recoverable in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+        let job = JobId(10068);
+        let filename = "rar5_nested_2deep.rar";
+        let set = "rar5_nested_2deep";
+        let bytes = rar5_fixture_bytes(filename);
+        let working = insert_active_job(
+            &mut pipeline,
+            job,
+            rar_job_spec(
+                "Stream Failure Decision",
+                &[(filename.to_owned(), bytes.clone())],
+            ),
+        )
+        .await;
+        let input = working.join(filename);
+        std::fs::write(&input, &bytes).unwrap();
+        pipeline
+            .jobs
+            .get_mut(&job)
+            .unwrap()
+            .assembly
+            .file_mut(NzbFileId {
+                job_id: job,
+                file_index: 0,
+            })
+            .unwrap()
+            .commit_segment(0, bytes.len() as u32)
+            .unwrap();
+        let archive = unrar_rs::RarArchive::open(std::io::Cursor::new(bytes.clone())).unwrap();
+        let facts = std::collections::BTreeMap::from([(
+            0,
+            unrar_rs::RarArchive::parse_volume_facts(std::io::Cursor::new(bytes), None).unwrap(),
+        )]);
+        let plan = build_plan(
+            HashMap::from([(filename.to_owned(), 0)]),
+            &facts,
+            &archive,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            plan.ready_members
+                .iter()
+                .any(|member| member.name == "inner.rar")
+        );
+        pipeline.rar_sets.insert(
+            (job, set.to_owned()),
+            RarSetState {
+                facts,
+                volume_files: std::collections::BTreeMap::from([(0, filename.to_owned())]),
+                plan: Some(plan),
+                active_workers: 1,
+                in_flight_members: HashSet::from(["inner.rar".to_owned()]),
+                ..Default::default()
+            },
+        );
+        let sink = pipeline
+            .scoped_archive_sink(
+                job,
+                set,
+                "inner.rar",
+                vec![(0, input)],
+                crate::jobs::assembly::ArchiveType::Rar,
+            )
+            .await
+            .unwrap();
+        let owner = pipeline.archive_runtime[&job].graph_owners[&(set.to_owned(), 0)];
+        let message = "original streamed member failure";
+        let error = if recoverable {
+            ExtractionError::recoverable(message)
+        } else {
+            ExtractionError::terminal(message)
+        };
+        pipeline
+            .handle_extraction_done(ExtractionDone::Batch {
+                job_id: job,
+                set_name: set.to_owned(),
+                attempted: vec!["inner.rar".to_owned()],
+                result: Ok(BatchExtractionOutcome {
+                    extracted: Vec::new(),
+                    failed: vec![("inner.rar".to_owned(), error)],
+                    selected_password: None,
+                    phase_completed_bytes: 0,
+                }),
+            })
+            .await;
+        drop(sink);
+        assert!(pipeline.archive_runtime[&job].scoped_decision_pending(set));
+        pipeline.try_rar_extraction(job).await;
+        assert_eq!(
+            pipeline.archive_runtime[&job].graph_owners[&(set.to_owned(), 0)],
+            owner
+        );
+        assert_eq!(pipeline.rar_sets[&(job, set.to_owned())].active_workers, 0);
+        let done = next_extraction_done(&mut pipeline).await;
+        assert!(
+            matches!(&done, ExtractionDone::Scoped { owner: actual, result: Err(error), .. }
+            if *actual == owner && error.to_string().contains(message))
+        );
+        pipeline.handle_extraction_done(done).await;
+        assert!(
+            matches!(job_status_for_assert(&pipeline, job), Some(JobStatus::Failed { error })
+            if error.contains(message) && (!recoverable || error.contains("recovery"))),
+            "recoverable={recoverable}: {}",
+            debug_job_state(&pipeline, job)
+        );
+    }
+}
+
+#[tokio::test]
 async fn nested_rar_two_deep_extracts_final_media() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
@@ -2340,15 +2456,19 @@ async fn nested_rar_two_deep_extracts_final_media() {
     settle_inflight_moves(&mut pipeline).await;
     settle_inflight_moves(&mut pipeline).await;
     settle_inflight_moves(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
         "Nested RAR Two Deep",
     ));
-    assert!(matches!(
-        job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Complete)
-    ));
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
     assert!(dest.join("sample.mkv").exists());
     assert!(!dest.join("inner.rar").exists());
 }
@@ -2383,15 +2503,19 @@ async fn an_obfuscated_extracted_member_reaches_the_complete_dir_under_the_job_n
     for _ in 0..4 {
         settle_inflight_moves(&mut pipeline).await;
     }
-    drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
         "Silver Horizon S01E07",
     ));
-    assert!(matches!(
-        job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Complete)
-    ));
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
     assert!(
         dest.join("Silver Horizon S01E07.mkv").exists(),
         "dest entries: {:?}",
@@ -2433,15 +2557,19 @@ async fn nested_rar_three_deep_extracts_through_inner_7z() {
         .await;
     received.await.unwrap();
     assert!(pipeline.pending_completion_checks.contains(&job_id));
-    drive_extractions_to_terminal(&mut pipeline, job_id, 6).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
         "Nested RAR Three Deep",
     ));
-    assert!(matches!(
-        job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Complete)
-    ));
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
     assert!(dest.join("sample.mkv").exists());
     assert!(!dest.join("middle.rar").exists());
     assert!(!dest.join("inner.7z").exists());
@@ -2462,15 +2590,19 @@ async fn nested_rar_five_deep_stops_at_depth_limit() {
     write_and_complete_rar_volume(&mut pipeline, job_id, 0, fixture_name, &fixture_bytes).await;
 
     pipeline.check_job_completion(job_id).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 8).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
         "Nested RAR Five Deep",
     ));
-    assert!(matches!(
-        job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Complete)
-    ));
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
     assert!(dest.join("level2.rar").exists());
     assert!(!dest.join("sample.mkv").exists());
 }
@@ -2496,6 +2628,8 @@ async fn nested_single_stream_preserves_non_archive_sibling() {
         .unwrap();
 
     let mut state = minimal_job_state(job_id, "Nested XZ With Sibling", temp_dir.path().join("wd"));
+    tokio::fs::create_dir_all(&state.working_dir).await.unwrap();
+    persist_restore_fixture(&pipeline, job_id, &state.spec, &state.working_dir);
     state.staging_dir = Some(staging_dir.clone());
     pipeline.jobs.insert(job_id, state);
     pipeline.job_order.push(job_id);
@@ -2537,7 +2671,7 @@ async fn nested_single_stream_preserves_non_archive_sibling() {
         "starting a selective nested pass must preserve ordinary siblings"
     );
 
-    drive_extractions_to_terminal(&mut pipeline, job_id, 2).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
         "Nested XZ With Sibling",
@@ -2611,7 +2745,11 @@ async fn nested_scan_detects_obfuscated_rar_archives_from_staging() {
     }
 
     let mut state = minimal_job_state(job_id, "Nested Obfuscated RAR", temp_dir.path().join("wd"));
+    tokio::fs::create_dir_all(&state.working_dir).await.unwrap();
+    persist_restore_fixture(&pipeline, job_id, &state.spec, &state.working_dir);
     state.staging_dir = Some(staging_dir);
+    let posted_files = state.assembly.files().count();
+    let posted_topologies = state.assembly.archive_topologies().len();
     pipeline.jobs.insert(job_id, state);
     pipeline.job_order.push(job_id);
 
@@ -2622,47 +2760,37 @@ async fn nested_scan_detects_obfuscated_rar_archives_from_staging() {
             .unwrap(),
         crate::pipeline::completion::NestedExtractionDecision::Started
     ));
-    assert!(
-        pipeline
-            .inflight_extractions
-            .get(&job_id)
-            .is_none_or(|sets| !sets.contains("51273aad56a8b904e96928935278a627")),
-        "nested RAR should use incremental RAR scheduling, not generic full-set extraction"
-    );
-
-    let state = pipeline.jobs.get(&job_id).unwrap();
-    let topology = state
-        .assembly
-        .archive_topology_for("51273aad56a8b904e96928935278a627")
+    let done = next_extraction_done(&mut pipeline).await;
+    let ExtractionDone::Scoped {
+        owner,
+        request,
+        result: Ok(outcome),
+        ..
+    } = done
+    else {
+        panic!("detected RAR must dispatch scoped extraction");
+    };
+    assert!(outcome.failed.is_empty());
+    assert!(!outcome.extracted.is_empty());
+    let work = pipeline
+        .archive_runtime
+        .get_mut(&job_id)
+        .unwrap()
+        .complete(owner, request)
         .unwrap();
+    assert_eq!(work.kind, crate::jobs::assembly::ArchiveType::Rar);
+    assert_eq!(work.set_name, "51273aad56a8b904e96928935278a627");
     assert_eq!(
-        topology.archive_type,
-        crate::jobs::assembly::ArchiveType::Rar
+        work.input_names,
+        obfuscated_files
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>()
     );
-    assert_eq!(topology.complete_volumes.len(), obfuscated_files.len());
-    for file_index in 0..obfuscated_files.len() {
-        let file = state
-            .assembly
-            .file(NzbFileId {
-                job_id,
-                file_index: file_index as u32,
-            })
-            .unwrap();
-        assert!(matches!(
-            file.role(),
-            weaver_model::files::FileRole::Unknown
-        ));
-        assert!(matches!(
-            pipeline.classified_role_for_file(job_id, file),
-            weaver_model::files::FileRole::RarVolume { .. }
-        ));
-        assert_eq!(
-            pipeline
-                .detected_archive_identity(job_id, file.file_id())
-                .map(|detected| detected.set_name.as_str()),
-            Some("51273aad56a8b904e96928935278a627")
-        );
-    }
+    assert_eq!(work.inputs.len(), obfuscated_files.len());
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(state.assembly.files().count(), posted_files);
+    assert_eq!(state.assembly.archive_topologies().len(), posted_topologies);
 }
 
 #[tokio::test]
@@ -2747,7 +2875,7 @@ async fn upstream_probe_registers_obfuscated_unknown_rar_volumes_before_completi
 
     resume_job_downloading_for_test(&mut pipeline, job_id);
     pipeline.check_job_completion(job_id).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
         "Obfuscated Unknown RAR Recovery",
@@ -2810,7 +2938,7 @@ async fn upstream_probe_registers_obfuscated_split_topology_rar_volumes_before_c
 
     resume_job_downloading_for_test(&mut pipeline, job_id);
     pipeline.check_job_completion(job_id).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
         "Obfuscated Split RAR Recovery",
@@ -2897,7 +3025,7 @@ async fn a_rar_chase_armed_by_idle_restart_is_joined_once_it_finishes() {
         "a finished chase nothing else will join must be handed to extraction"
     );
 
-    drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
         "Idle Restart RAR Chase",
     ));
@@ -2966,7 +3094,7 @@ async fn upstream_probe_falls_back_from_rar_to_7z_for_obfuscated_split_files() {
     }
 
     pipeline.check_job_completion(job_id).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 2).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
         "Obfuscated Split 7z Detection",

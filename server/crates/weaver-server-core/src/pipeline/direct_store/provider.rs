@@ -221,10 +221,40 @@ fn hole(volume_index: u32, offset: u64) -> std::io::Error {
     )
 }
 
+// Ordinary volumes have no children. Keep that representation allocation-free
+// and clone-free; only composed sources need a shared child table.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NestedMembers(Option<Arc<HashMap<u32, VirtualVolume>>>);
+
+impl From<HashMap<u32, VirtualVolume>> for NestedMembers {
+    fn from(members: HashMap<u32, VirtualVolume>) -> Self {
+        Self((!members.is_empty()).then(|| Arc::new(members)))
+    }
+}
+
+impl std::ops::Deref for NestedMembers {
+    type Target = HashMap<u32, VirtualVolume>;
+
+    fn deref(&self) -> &Self::Target {
+        static EMPTY: std::sync::LazyLock<HashMap<u32, VirtualVolume>> =
+            std::sync::LazyLock::new(HashMap::new);
+        self.0.as_deref().unwrap_or(&EMPTY)
+    }
+}
+
+impl NestedMembers {
+    pub(crate) fn make_mut(&mut self) -> Option<&mut HashMap<u32, VirtualVolume>> {
+        self.0.as_mut().map(Arc::make_mut)
+    }
+}
+
 // Everything one virtual volume needs, with no borrows, so the whole provider
 // can be moved onto the blocking pool.
 #[derive(Debug, Clone)]
 pub(crate) struct VirtualVolume {
+    // The backing owner holds one strong reference per generation. Frozen
+    // views retain another until even readers that open files lazily are gone.
+    pub(crate) backing_leases: Option<Arc<Vec<Arc<()>>>>,
     pub(crate) volume_index: u32,
     // Absolute path of this volume's sparse envelope file.
     pub(crate) envelope: PathBuf,
@@ -237,6 +267,9 @@ pub(crate) struct VirtualVolume {
     // Shared rather than owned: every volume of a set resolves member ids
     // against the same map, and the provider only ever reads it.
     pub(crate) partials: Arc<HashMap<u32, PathBuf>>,
+    // A member routed into another archive retains a reconstructible source
+    // view instead of a physical partial. A member must have only one backing.
+    pub(crate) nested: NestedMembers,
     // Physical ranges that were actually placed. Everything else is a hole.
     pub(crate) covered: ByteRanges,
     // Of `covered`, the physical ranges the **envelope file** received.
@@ -316,7 +349,45 @@ impl CipherOverlayCounters {
     }
 }
 
+struct RetainedPayloads<'a> {
+    held: std::slice::Iter<'a, HeldRun>,
+    current: Option<&'a VirtualVolume>,
+    pending: Vec<&'a VirtualVolume>,
+}
+
+impl<'a> Iterator for RetainedPayloads<'a> {
+    type Item = &'a Bytes;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            for run in self.held.by_ref() {
+                if let HeldSource::Memory { bytes, .. } = &run.source {
+                    return Some(bytes);
+                }
+            }
+            if let Some(current) = self.current.take() {
+                self.pending.extend(current.nested.values());
+            }
+            let next = self.pending.pop()?;
+            self.current = Some(next);
+            self.held = next.held.iter();
+        }
+    }
+}
+
 impl VirtualVolume {
+    // Reconstruction can consume retained input, but a speculative extractor
+    // may consume only placed bytes. Apply that policy to the whole composed
+    // source tree, independent of the strategy that produced each node.
+    pub(crate) fn retain_placed_only(&mut self) {
+        self.held = Arc::default();
+        if let Some(children) = self.nested.make_mut() {
+            for child in children.values_mut() {
+                child.retain_placed_only();
+            }
+        }
+    }
+
     // Conservative image charge for consumers without shared payload leases.
     pub(crate) fn retained_bytes(&self) -> usize {
         self.retained_payloads()
@@ -329,6 +400,11 @@ impl VirtualVolume {
     // by consumers so readers of the same buffer do not multiply its charge.
     pub(crate) fn retained_metadata_bytes(&self) -> usize {
         let mut bytes = 4096usize
+            .saturating_add(
+                self.backing_leases
+                    .as_ref()
+                    .map_or(0, |leases| leases.capacity().saturating_mul(64)),
+            )
             .saturating_add(self.envelope.capacity().saturating_mul(4))
             .saturating_add(self.extents.capacity().saturating_mul(128))
             .saturating_add(self.covered.ranges().len().saturating_mul(64))
@@ -341,16 +417,20 @@ impl VirtualVolume {
         for cipher in self.ciphers.values() {
             bytes = bytes.saturating_add(cipher.retained_bytes());
         }
+        for child in self.nested.values() {
+            bytes = bytes.saturating_add(child.retained_metadata_bytes());
+        }
         bytes.saturating_add(self.held.len().saturating_mul(256))
     }
 
     // Even a short range can pin a whole allocation. Callers must lease the
     // allocation, not just the readable length, while any image retains it.
-    pub(crate) fn retained_payloads(&self) -> impl Iterator<Item = &Bytes> {
-        self.held.iter().filter_map(|run| match &run.source {
-            HeldSource::Memory { bytes, .. } => Some(bytes),
-            HeldSource::Scratch { .. } => None,
-        })
+    pub(crate) fn retained_payloads(&self) -> impl Iterator<Item = &Bytes> + '_ {
+        RetainedPayloads {
+            held: self.held.iter(),
+            current: Some(self),
+            pending: Vec::new(),
+        }
     }
 
     // Distinct pinned scratch handles retained by this image. The pins read
@@ -364,6 +444,20 @@ impl VirtualVolume {
             })
             .collect::<std::collections::BTreeSet<_>>()
             .len()
+            .saturating_add(self.nested.values().fold(0usize, |total, child| {
+                total.saturating_add(child.retained_handles())
+            }))
+    }
+
+    // A bounded reader retains one envelope at each level and one member
+    // branch. Reserve for the deepest branch before opening any backing.
+    pub(crate) fn bounded_reader_levels(&self) -> usize {
+        self.nested
+            .values()
+            .map(Self::bounded_reader_levels)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
     }
 
     // The physical ranges a [`VirtualVolumeReader`] can actually answer, in
@@ -375,14 +469,28 @@ impl VirtualVolume {
     // a byte of it.
     pub(crate) fn readable_ranges(&self) -> Vec<(u64, u64)> {
         let mut sources = ByteRanges::new();
+        let mut claimed = self.covered.clone();
         for extent in &self.extents {
-            sources.insert(extent.physical_offset, extent.len);
+            if let Some(child) = self.nested.get(&extent.member_id) {
+                for (start, end) in child.readable_ranges() {
+                    let start = start.max(extent.logical_offset);
+                    let end = end.min(extent.logical_offset.saturating_add(extent.len));
+                    if start < end {
+                        let physical = extent.physical_offset + start - extent.logical_offset;
+                        sources.insert(physical, end - start);
+                        // Includes live child holds for reconstruction, never
+                        // for checkpoint floors (which use placement receipts).
+                        claimed.insert(physical, end - start);
+                    }
+                }
+            } else {
+                sources.insert(extent.physical_offset, extent.len);
+            }
         }
         for &(start, end) in self.envelope_covered.ranges() {
             sources.insert(start, end.saturating_sub(start));
         }
         // A hold is both claimed and sourced by the bytes it carries.
-        let mut claimed = self.covered.clone();
         for run in self.held.iter() {
             sources.insert(run.start, run.len);
             claimed.insert(run.start, run.len);
@@ -405,6 +513,21 @@ impl VirtualVolume {
             }
         }
         readable
+    }
+
+    pub(crate) fn backing_paths(&self) -> std::collections::BTreeSet<PathBuf> {
+        let mut paths = std::collections::BTreeSet::new();
+        if !self.envelope_covered.ranges().is_empty() {
+            paths.insert(self.envelope.clone());
+        }
+        for extent in &self.extents {
+            if let Some(child) = self.nested.get(&extent.member_id) {
+                paths.extend(child.backing_paths());
+            } else if let Some(path) = self.partials.get(&extent.member_id) {
+                paths.insert(path.clone());
+            }
+        }
+        paths
     }
 
     // `Some(end)` when everything readable is one run from zero — the volume
@@ -524,6 +647,7 @@ pub(crate) struct VirtualVolumeReader<const BOUNDED: bool = false> {
     position: u64,
     envelope_handle: Option<File>,
     partial_handles: HashMap<u32, File>,
+    nested_readers: HashMap<u32, Box<VirtualVolumeReader<BOUNDED>>>,
     // Per-member CBC frontier: the cipher offset the last re-encryption ended
     // at and the 16 cipher bytes ending there.
     //
@@ -584,6 +708,7 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
             position: 0,
             envelope_handle: None,
             partial_handles: HashMap::new(),
+            nested_readers: HashMap::new(),
             chains: HashMap::new(),
             counters,
         }
@@ -623,6 +748,20 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         // nothing placed it, and it needs no file, because it carries its bytes.
         if let Some((_, run)) = self.held_at(position) {
             return Some(run.end().min(self.volume.len));
+        }
+        if let Some(extent) = self.extent_at(position)
+            && let Some(child) = self.volume.nested.get(&extent.member_id)
+        {
+            let offset = extent.logical_offset + position - extent.physical_offset;
+            return child
+                .readable_ranges()
+                .into_iter()
+                .find(|(start, end)| *start <= offset && offset < *end)
+                .map(|(_, end)| {
+                    (position + end - offset)
+                        .min(extent.physical_offset.saturating_add(extent.len))
+                        .min(self.volume.len)
+                });
         }
         let covered_end = covered_run_end(&self.volume.covered, position)?;
 
@@ -737,11 +876,36 @@ impl<const BOUNDED: bool> VirtualVolumeReader<BOUNDED> {
         offset: u64,
         out: &mut [u8],
     ) -> std::io::Result<usize> {
+        if let Some(volume) = self.volume.nested.get(&member_id) {
+            if self.volume.partials.contains_key(&member_id) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "member has both physical and nested backing",
+                ));
+            }
+            if !self.nested_readers.contains_key(&member_id) {
+                if BOUNDED {
+                    self.partial_handles.clear();
+                    self.nested_readers.clear();
+                }
+                self.nested_readers.insert(
+                    member_id,
+                    Box::new(Self::new(volume.clone(), Arc::clone(&self.counters))),
+                );
+            }
+            let reader = self
+                .nested_readers
+                .get_mut(&member_id)
+                .expect("reader just inserted");
+            reader.seek(SeekFrom::Start(offset))?;
+            return reader.read(out);
+        }
         if !self.partial_handles.contains_key(&member_id) {
             if BOUNDED {
                 // Evict before opening: only the envelope and this partial
                 // can be opened here. Scratch pins own separate shared handles.
                 self.partial_handles.clear();
+                self.nested_readers.clear();
             }
             let path = self
                 .volume
@@ -1051,3 +1215,6 @@ impl<const BOUNDED: bool> Seek for VirtualVolumeReader<BOUNDED> {
         Ok(self.position)
     }
 }
+
+#[cfg(test)]
+mod nested_tests;

@@ -113,7 +113,7 @@ async fn exhausted_promoted_rar_recovery_reaches_the_next_wave() {
     // The direct harness must service the topology refresh messages that
     // the running orchestrator normally handles before extraction starts.
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 8).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     assert_eq!(
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Complete)

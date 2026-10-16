@@ -29,7 +29,7 @@ impl Pipeline {
             .direct_store
             .sets_for(job_id)
             .iter()
-            .any(|set| !set.is_demoted() && !set.is_finalized())
+            .any(|set| !set.is_demoted() && !set.is_finalized() && !set.is_delegated())
         {
             crate::runtime::perf_probe::record(
                 "completion.quick_verify.rejected.live_direct_set",

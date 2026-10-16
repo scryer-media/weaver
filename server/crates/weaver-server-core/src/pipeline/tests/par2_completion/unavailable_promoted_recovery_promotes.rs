@@ -1008,6 +1008,7 @@ async fn restore_repairing_preserves_status_and_slot_ownership() {
     let spec = standalone_job_spec("Restore repairing", &[("sample.bin".to_string(), 100)]);
     let working_dir = temp_dir.path().join("restore-repairing");
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    persist_restore_fixture(&pipeline, job_id, &spec, &working_dir);
 
     pipeline
         .restore_job(RestoreJobRequest {

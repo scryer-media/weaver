@@ -263,9 +263,12 @@ impl PositionalManifest {
             for member in self.members.iter().flatten().rev() {
                 if member.spec.directory
                     && let Some((modified, accessed)) = member.spec.directory_times
-                    && let Err(error) =
-                        self.root
-                            .set_dir_times(&member.spec.name, modified, accessed)
+                    && let Err(error) = self.root.set_directory_metadata(
+                        &member.spec.name,
+                        Some(modified),
+                        accessed,
+                        None,
+                    )
                 {
                     tracing::debug!(%error, "positional directory times not restored");
                 }

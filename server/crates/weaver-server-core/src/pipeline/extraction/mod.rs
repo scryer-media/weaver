@@ -1,8 +1,14 @@
 use super::*;
 
+pub(crate) mod catalog;
 pub(crate) mod error;
+pub(crate) mod input;
+pub(crate) mod output;
 mod rar;
+pub(crate) mod runtime;
 pub(crate) mod safety;
+pub(crate) mod session;
+pub(crate) mod storage;
 
 pub(crate) use error::{ExtractionError, ExtractionErrorClass, OrTerminal};
 pub(crate) use rar::{RarArchiveOpenMode, RarExtractionContext, RarExtractionOpenRequest};

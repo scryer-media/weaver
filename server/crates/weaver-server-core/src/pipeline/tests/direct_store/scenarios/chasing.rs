@@ -439,7 +439,15 @@ async fn run_chase(gate: DirectStoreGate, invalidate_for_repair: bool) {
     state.recovery_queue = crate::DownloadQueue::new();
     pipeline.check_job_completion(job_id).await;
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete)
+        ),
+        "{}",
+        debug_job_state(&pipeline, job_id)
+    );
     let output_root = complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Mixed chase"));
     for (name, bytes) in expected {
         assert_eq!(
@@ -781,5 +789,85 @@ async fn handing_a_chase_to_extraction_never_raises_a_gate() {
         unrar_rs::RarArchive::open(std::io::Cursor::new(bytes))
             .unwrap()
             .len()
+    );
+}
+
+#[tokio::test]
+async fn mixed_rar_chase_streams_a_tolerated_compressed_archive_without_materializing_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
+        gate: DirectUnpackGate::Enabled,
+    });
+    let leaf = vec![41; 4096];
+    let nested = single_member_store_set("leaf.bin", &leaf, 1).remove(0).1;
+    let packed = rar5_literal_stream(&nested);
+    let ordinary = vec![23; 128 * 1024];
+    let volumes = store_set_with_extra_member(
+        "ordinary.bin",
+        &ordinary,
+        "inner.rar",
+        &packed,
+        2,
+        ToleranceExtra::GenuineCompressed {
+            unpacked_len: nested.len() as u64,
+            unpacked_crc32: checksum::crc32(&nested),
+        },
+    );
+    let job = JobId(41959);
+    insert_active_job(
+        &mut pipeline,
+        job,
+        direct_store_job_spec("Nested mixed chase", &volumes),
+    )
+    .await;
+    for index in 0..volumes.len() {
+        for segment in 0..2 {
+            submit_volume_article(&mut pipeline, job, &volumes, index as u32, segment).await;
+            assert!(
+                !matches!(
+                    job_status_for_assert(&pipeline, job),
+                    Some(JobStatus::Failed { .. })
+                ),
+                "mixed RAR failed after volume {index} article {segment}: {}",
+                debug_job_state(&pipeline, job)
+            );
+        }
+    }
+    let set = pipeline
+        .direct_store
+        .set(job, 0)
+        .expect("mixed RAR root admitted");
+    assert!(
+        !set.is_demoted(),
+        "mixed RAR demoted: {:?}",
+        set.demotion_reason()
+    );
+    pipeline.check_job_completion(job).await;
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job).await;
+    assert!(
+        matches!(
+            job_status_for_assert(&pipeline, job),
+            Some(JobStatus::Complete)
+        ),
+        "{}",
+        debug_job_state(&pipeline, job)
+    );
+    let output = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
+        "Nested mixed chase",
+    ));
+    assert_eq!(
+        std::fs::read(output.join("ordinary.bin")).unwrap(),
+        ordinary
+    );
+    assert_eq!(std::fs::read(output.join("leaf.bin")).unwrap(), leaf);
+    assert!(!output.join("inner.rar").exists());
+    assert!(
+        !pipeline
+            .extraction_staging_dir(job)
+            .join("inner.rar")
+            .exists()
     );
 }

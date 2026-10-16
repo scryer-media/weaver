@@ -2833,24 +2833,17 @@ impl Database {
                 SqlArg::Bytes(facts_blob),
                 SqlArg::I64(job_id.0 as i64),
             ];
-            let affected = match datastore.engine() {
-                SqlEngine::Postgres => {
-                    SqlRuntime::execute(
-                        datastore.read_exec(),
-                        "INSERT INTO active_rar_volume_facts
-                         (job_id, set_name, volume_index, facts_blob)
-                         SELECT {}, {}, {}, {}
-                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_rar_volume_facts_parent
-                         ON CONFLICT(job_id, set_name, volume_index) DO UPDATE SET facts_blob = excluded.facts_blob
-                         WHERE active_rar_volume_facts.facts_blob <> excluded.facts_blob",
-                        &args,
-                    )
-                    .await?
-                }
-                SqlEngine::Sqlite => {
-                    SqlRuntime::run_in_transaction(&datastore, "save_rar_volume_facts", |tx| {
+            let affected = SqlRuntime::run_in_transaction(&datastore, "save_rar_volume_facts", |tx| {
                         let args = args.clone();
                         Box::pin(async move {
+                            // The authority read must follow the parent lock in
+                            // a separate statement so a waiting PostgreSQL writer
+                            // observes a handover that committed while it waited.
+                            if !super::archive_checkpoint::lock_parent(tx, job_id).await?
+                                || tx.fetch_optional("SELECT 1 FROM active_archive_checkpoint WHERE job_id = {}", &[SqlArg::I64(job_id.0 as i64)]).await?.is_some()
+                            {
+                                return Ok(0);
+                            }
                             tx.execute(
                                 "INSERT INTO active_rar_volume_facts
                                  (job_id, set_name, volume_index, facts_blob)
@@ -2863,9 +2856,7 @@ impl Database {
                             .await
                         })
                     })
-                    .await?
-                }
-            };
+                    .await?;
             let label = if affected == 0 {
                 "persistence.rar_volume_facts.upsert.unchanged"
             } else {
@@ -2905,38 +2896,32 @@ impl Database {
                 SqlArg::Bytes(snapshot),
                 SqlArg::I64(job_id.0 as i64),
             ];
-            match datastore.engine() {
-                // The statement guards itself with FOR KEY SHARE, so it runs as
-                // a single autocommit statement rather than a redundant
-                // BEGIN/COMMIT round trip.
-                SqlEngine::Postgres => {
-                    SqlRuntime::execute(
-                        datastore.read_exec(),
+            SqlRuntime::run_in_transaction(&datastore, "save_direct_coverage", |tx| {
+                let args = args.clone();
+                Box::pin(async move {
+                    // Acquire the parent lock before the guarded statement.
+                    // PostgreSQL must take a fresh statement snapshot after a
+                    // concurrent job checkpoint's ownership transfer commits.
+                    lock_active_job_for_write_tx(tx, job_id).await?;
+                    let affected = tx.execute(
                         "INSERT INTO active_direct_coverage (job_id, set_name, snapshot)
                          SELECT {}, {}, {}
-                         FROM (SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE) active_direct_coverage_parent
+                         FROM active_jobs AS active_direct_coverage_parent
+                         WHERE job_id = {} AND NOT EXISTS (SELECT 1 FROM active_archive_checkpoint WHERE job_id = active_direct_coverage_parent.job_id)
                          ON CONFLICT(job_id, set_name) DO UPDATE SET snapshot = excluded.snapshot",
                         &args,
-                    )
-                    .await?;
-                }
-                SqlEngine::Sqlite => {
-                    SqlRuntime::run_in_transaction(&datastore, "save_direct_coverage", |tx| {
-                        let args = args.clone();
-                        Box::pin(async move {
-                            tx.execute(
-                                "INSERT INTO active_direct_coverage (job_id, set_name, snapshot)
-                                 SELECT {}, {}, {}
-                                 WHERE EXISTS (SELECT 1 FROM active_jobs WHERE job_id = {})
-                                 ON CONFLICT(job_id, set_name) DO UPDATE SET snapshot = excluded.snapshot",
-                                &args,
-                            )
-                            .await
-                        })
-                    })
-                    .await?;
-                }
-            }
+                    ).await?;
+                    if affected == 0 && tx.fetch_optional(
+                        "SELECT 1 FROM active_archive_checkpoint WHERE job_id = {}",
+                        &[SqlArg::I64(job_id.0 as i64)],
+                    ).await?.is_some() {
+                        // A legacy barrier must not publish its captured floors
+                        // after the graph owner has replaced its authority.
+                        return Err(StateError::Database("archive checkpoint is owned by the job coordinator".into()));
+                    }
+                    Ok(affected)
+                })
+            }).await?;
             Ok(())
         })
     }

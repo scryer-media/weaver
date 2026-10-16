@@ -43,7 +43,7 @@ async fn complete_job_and_drive_extraction(
     }
     pipeline.check_job_completion(job_id).await;
     drain_rar_refreshes(pipeline).await;
-    drive_extractions_to_terminal(pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(pipeline, job_id).await;
 }
 
 fn assert_completed_with_member(

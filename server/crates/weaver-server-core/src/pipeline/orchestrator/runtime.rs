@@ -243,6 +243,7 @@ impl Pipeline {
             scheduled_hardware_profile: None,
             metrics,
             jobs: HashMap::new(),
+            archive_runtime: HashMap::new(),
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             archive_password_winners: HashMap::new(),

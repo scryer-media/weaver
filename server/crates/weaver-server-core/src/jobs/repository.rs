@@ -22,6 +22,7 @@ pub struct OrphanActiveStateCounts {
     pub active_volume_status: usize,
     pub active_rar_verified_suspect: usize,
     pub active_direct_coverage: usize,
+    pub active_archive_checkpoint: usize,
     pub active_repair_outputs: usize,
 }
 
@@ -41,13 +42,14 @@ impl OrphanActiveStateCounts {
             + self.active_volume_status
             + self.active_rar_verified_suspect
             + self.active_direct_coverage
+            + self.active_archive_checkpoint
             + self.active_repair_outputs
     }
 }
 
 const INLINE_INCREMENTAL_VACUUM_PAGES: u64 = 256;
 
-const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
+const ACTIVE_JOB_CHILD_TABLES: [&str; 16] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
@@ -62,6 +64,7 @@ const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
     "active_volume_status",
     "active_rar_verified_suspect",
     "active_direct_coverage",
+    "active_archive_checkpoint",
     "active_repair_outputs",
 ];
 
@@ -382,6 +385,11 @@ impl Database {
                             active_direct_coverage: delete_orphan_rows(
                                 tx,
                                 "active_direct_coverage",
+                            )
+                            .await?,
+                            active_archive_checkpoint: delete_orphan_rows(
+                                tx,
+                                "active_archive_checkpoint",
                             )
                             .await?,
                         })

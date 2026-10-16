@@ -56,6 +56,13 @@ pub(crate) enum UnmaterializedArchiveSet {
 
 impl Pipeline {
     pub(crate) fn purge_empty_rar_set_if_idle(&mut self, job_id: JobId, set_name: &str) {
+        if self
+            .archive_runtime
+            .get(&job_id)
+            .is_some_and(|runtime| runtime.retains_archive_set(set_name))
+        {
+            return;
+        }
         let set_key = (job_id, set_name.to_string());
         if self
             .rar_refresh_state
@@ -1485,6 +1492,13 @@ impl Pipeline {
                     let Some(path) = self.resolve_job_input_path(job_id, filename) else {
                         continue;
                     };
+                    if self
+                        .archive_runtime
+                        .get(&job_id)
+                        .is_some_and(|runtime| runtime.retains_input_path(&path))
+                    {
+                        continue;
+                    }
                     match tokio::fs::remove_file(&path).await {
                         Ok(()) => removed += 1,
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

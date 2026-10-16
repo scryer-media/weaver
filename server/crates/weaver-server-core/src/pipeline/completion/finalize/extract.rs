@@ -1,5 +1,8 @@
 use super::rar::{ArchiveSetRetirement, UnmaterializedArchiveSet};
 use super::*;
+use crate::pipeline::extraction::output::{
+    ArchiveOutput, FileOutput, Integrity, Metadata, OutputMember, PendingOutput,
+};
 use crate::pipeline::extraction::{
     BudgetedReader, MemoryPermit, MemoryWaitError, RarExtractionOpenRequest,
 };
@@ -12,6 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 
 mod password_candidates;
 pub(in crate::pipeline) mod positional;
+pub(super) mod prepared;
+#[cfg(test)]
 use password_candidates::extract_7z_with_password_candidates;
 pub(in crate::pipeline) mod sequential;
 
@@ -420,6 +425,7 @@ struct WrittenMember {
     bytes_written: u64,
     attempt: Arc<PhaseAttemptCounters>,
     committed: bool,
+    output: Option<PendingOutput>,
 }
 
 // The members of one decode pass, committed in the order they were written
@@ -473,19 +479,20 @@ impl<'a> MemberCommits<'a> {
 
     // Record a member whose bytes are all written, committing it now when
     // the archive records no CRC for it.
-    fn written(&mut self, member: WrittenMember, has_crc: bool) {
+    fn written(&mut self, member: WrittenMember, has_crc: bool) -> std::io::Result<()> {
         if has_crc {
             self.pending.insert(member.file_index, self.members.len());
         }
         self.members.push(member);
         if !has_crc {
             let last = self.members.len() - 1;
-            self.commit(last);
+            self.commit(last, Integrity::NoChecksum)?;
         }
+        Ok(())
     }
 
     // Commit every member the reader has vouched for since the last call.
-    fn settle(&mut self) {
+    fn settle(&mut self) -> std::io::Result<()> {
         let verified = std::mem::take(
             &mut *self
                 .verified
@@ -494,13 +501,17 @@ impl<'a> MemberCommits<'a> {
         );
         for file_index in verified {
             if let Some(index) = self.pending.remove(&file_index) {
-                self.commit(index);
+                self.commit(index, Integrity::Verified)?;
             }
         }
+        Ok(())
     }
 
-    fn commit(&mut self, index: usize) {
+    fn commit(&mut self, index: usize, integrity: Integrity) -> std::io::Result<()> {
         let member = &mut self.members[index];
+        if let Some(output) = member.output.take() {
+            output.integrity(integrity)?;
+        }
         member.attempt.commit();
         member.committed = true;
         tracing::info!(
@@ -521,6 +532,7 @@ impl<'a> MemberCommits<'a> {
             set_name: self.set_name.to_string(),
             member: member.name.clone(),
         });
+        Ok(())
     }
 
     // The members extracted, in the order they were written, once the walk
@@ -528,7 +540,8 @@ impl<'a> MemberCommits<'a> {
     // fails the set: with verification on the reader either reports it or
     // fails, so this is a decode that ended without a verdict.
     fn finish(mut self) -> Result<Vec<String>, ExtractionError> {
-        self.settle();
+        self.settle()
+            .map_err(|error| ExtractionError::from_io("member output verdict", &error))?;
         if let Some(member) = self.members.iter().find(|member| !member.committed) {
             return Err(ExtractionError::terminal(format!(
                 "7z extraction failed: member {} ended without a CRC verdict from the reader",
@@ -629,7 +642,6 @@ impl<W: Write> Write for CountingWriter<W> {
 pub(in crate::pipeline) struct SevenZipExtractionContext {
     pub(in crate::pipeline) job_id: JobId,
     pub(in crate::pipeline) set_name: String,
-    pub(in crate::pipeline) output_dir: PathBuf,
     pub(in crate::pipeline) root: Arc<ExtractionRoot>,
     pub(in crate::pipeline) budget: Arc<JobExtractionBudget>,
     pub(in crate::pipeline) password: sevenz_turbo::Password,
@@ -1306,7 +1318,6 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek + Send + 'static>(
     set_name: &str,
     reader: R,
     positional: Option<R>,
-    output_dir: &Path,
     password: sevenz_turbo::Password,
     limits: sevenz_turbo::ArchiveLimits,
     threads: SevenZipDecodeThreads,
@@ -1327,9 +1338,6 @@ fn decode_7z_streaming<R: std::io::Read + std::io::Seek + Send + 'static>(
     // The reads take turns on the one handle; the decoding does not.
     if let Some(positional) = positional {
         archive_reader.set_positional_source(sevenz_turbo::SerialReadAt::new(positional));
-    }
-    if !output_dir.exists() {
-        std::fs::create_dir_all(output_dir)?;
     }
     // Every entry the walk hands over is an element of the reader's own file
     // table, on every path: sequential, parallel folders and the empty files
@@ -1467,17 +1475,57 @@ pub(in crate::pipeline) fn sevenz_extraction_error(error: &sevenz_turbo::Error) 
 // it is, and every seek goes through the reader rather than around it.
 pub(in crate::pipeline) fn extract_7z_stream<R, F>(
     context: &SevenZipExtractionContext,
+    open_reader: F,
+) -> Result<FullSetExtractionOutcome, ExtractionError>
+where
+    R: std::io::Read + std::io::Seek + Send + 'static,
+    F: FnMut() -> Result<R, ExtractionError>,
+{
+    let output = FileOutput {
+        root: &context.root,
+        budget: &context.budget,
+    };
+    extract_7z_to(context.stream_context(), &output, open_reader)
+}
+
+impl SevenZipExtractionContext {
+    pub(in crate::pipeline) fn stream_context(&self) -> SevenZipStreamContext<'_> {
+        SevenZipStreamContext {
+            job_id: self.job_id,
+            set_name: &self.set_name,
+            budget: &self.budget,
+            password: &self.password,
+            event_tx: &self.event_tx,
+            phase_counters: &self.phase_counters,
+            decode_memory: &self.decode_memory,
+            decode_threads: self.decode_threads,
+        }
+    }
+}
+
+pub(in crate::pipeline) struct SevenZipStreamContext<'a> {
+    pub job_id: JobId,
+    pub set_name: &'a str,
+    pub budget: &'a Arc<JobExtractionBudget>,
+    pub password: &'a sevenz_turbo::Password,
+    pub event_tx: &'a broadcast::Sender<PipelineEvent>,
+    pub phase_counters: &'a Arc<PhaseCounters>,
+    pub decode_memory: &'a SevenZipDecodeMemory,
+    pub decode_threads: u32,
+}
+
+pub(in crate::pipeline) fn extract_7z_to<R, F, O: ArchiveOutput>(
+    context: SevenZipStreamContext<'_>,
+    output: &O,
     mut open_reader: F,
 ) -> Result<FullSetExtractionOutcome, ExtractionError>
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
     F: FnMut() -> Result<R, ExtractionError>,
 {
-    let SevenZipExtractionContext {
+    let SevenZipStreamContext {
         job_id,
         set_name,
-        output_dir,
-        root,
         budget,
         password,
         event_tx,
@@ -1485,7 +1533,6 @@ where
         decode_memory,
         decode_threads,
     } = context;
-    let job_id = *job_id;
 
     let end_header_bytes = match decode_memory {
         SevenZipDecodeMemory::ReservedForFixedThreads {
@@ -1546,7 +1593,7 @@ where
         };
         for entry in &archive.files {
             budget.check_member_metadata(entry.name(), entry.size())?;
-            root.validate_relative_path(entry.name())
+            ExtractionRoot::parse_relative_path(entry.name())
                 .map_err(|error| budget.reject_unsafe_path(error))?;
         }
         let known_total = archive
@@ -1574,7 +1621,7 @@ where
                 set_name,
                 &archive,
                 end_header_bytes,
-                *decode_threads,
+                decode_threads,
                 budget.max_memory_bytes(),
             ),
             SevenZipDecodeMemory::ReservedPerPass { .. } => chase_decode_memory_bytes(
@@ -1606,10 +1653,9 @@ where
     let sub_stream_hook = commits.hook();
     // Directory times are stamped after the decode, once nothing more will
     // be created inside them.
-    let mut directory_times: Vec<(PathBuf, SevenZipEntryTimes)> = Vec::new();
+    let mut directory_times: Vec<(usize, PathBuf, SevenZipEntryTimes)> = Vec::new();
     let directory_times_ref = &mut directory_times;
     let event_tx_ref = event_tx;
-    let root_ref = root;
     let budget_ref = budget;
 
     let extract_fn = |entry: &sevenz_turbo::ArchiveEntry,
@@ -1618,9 +1664,8 @@ where
      -> Result<bool, sevenz_turbo::Error> {
         // Members the reader vouched for since the last entry are committed
         // before anything is said about this one.
-        commits.settle();
-        let safe_path = root_ref
-            .validate_relative_path(entry.name())
+        commits.settle()?;
+        let safe_path = ExtractionRoot::parse_relative_path(entry.name())
             .map_err(|error| std::io::Error::other(budget_ref.reject_unsafe_path(error)))?;
         // An anti-item is an update archive's deletion marker: it names a
         // path that must not exist once the update is applied, and carries
@@ -1640,24 +1685,20 @@ where
             .check_member_metadata(entry.name(), entry.size())
             .map_err(std::io::Error::other)?;
         if entry.is_directory() {
-            root_ref
-                .create_dir(&safe_path, budget_ref)
-                .map_err(std::io::Error::other)?;
+            output.directory(file_index, &safe_path)?;
             if let Some(times) = sevenz_entry_times(entry) {
-                directory_times_ref.push((safe_path, times));
+                directory_times_ref.push((file_index, safe_path, times));
             }
             return Ok(true);
         }
 
         let _ = event_tx_ref.send(PipelineEvent::ExtractionMemberStarted {
             job_id,
-            set_name: set_name.clone(),
+            set_name: set_name.to_string(),
             member: entry.name().to_string(),
         });
 
-        let file = root_ref
-            .create_file(&safe_path, budget_ref)
-            .map_err(std::io::Error::other)?;
+        let file = output.file(file_index, &safe_path, Some(entry.size()))?;
         let attempt = Arc::new(PhaseAttemptCounters::new(Arc::clone(phase_counters)));
         let mut file = buffered_extraction_output(CountingWriter::new(file, Arc::clone(&attempt)));
         let copied = copy_verified_7z_member(entry, reader, &mut file);
@@ -1675,7 +1716,11 @@ where
         // The stamp is metadata, not payload: a filesystem that refuses it
         // has still received every byte, so the member stays extracted.
         if let Some(times) = sevenz_entry_times(entry)
-            && let Err(error) = file.get_ref().get_ref().set_times(times.file_times())
+            && let Err(error) = file.get_ref().get_ref().metadata(Metadata {
+                modified: Some(times.modified),
+                accessed: times.accessed,
+                unix_mode: None,
+            })
         {
             tracing::debug!(
                 job_id = job_id.0,
@@ -1685,6 +1730,13 @@ where
             );
         }
 
+        let pending = match file.into_parts().0.inner.finish_data() {
+            Ok(pending) => pending,
+            Err(error) => {
+                attempt.rollback();
+                return Err(error.into());
+            }
+        };
         commits.written(
             WrittenMember {
                 file_index,
@@ -1693,9 +1745,10 @@ where
                 bytes_written,
                 attempt,
                 committed: false,
+                output: Some(pending),
             },
             entry.has_crc,
-        );
+        )?;
         Ok(true)
     };
 
@@ -1713,10 +1766,10 @@ where
             // The workers are charged against the same limit. A chase gets
             // no second handle: it reads at the download frontier, and its
             // governor widens the one decoder from the backlog it sees.
-            if *decode_threads > 1 {
+            if decode_threads > 1 {
                 positional = Some(BudgetedReader::new(open_reader()?, Arc::clone(budget)));
             }
-            SevenZipDecodeThreads::Fixed(*decode_threads)
+            SevenZipDecodeThreads::Fixed(decode_threads)
         }
         SevenZipDecodeMemory::ReservedPerPass { widening, .. } => {
             // The reader's limit is fixed when it opens and cannot follow the
@@ -1725,10 +1778,10 @@ where
             // what keeps a widened decode within what it actually holds: the
             // governor sets no thread it has not paid for.
             limits.memory_limit_bytes = decode_granted
-                .saturating_add(chase_widening_bytes(*decode_threads))
+                .saturating_add(chase_widening_bytes(decode_threads))
                 .min(budget.max_memory_bytes());
             SevenZipDecodeThreads::Adaptive {
-                ceiling: *decode_threads,
+                ceiling: decode_threads,
                 widening: *widening,
                 budget: Arc::clone(budget),
             }
@@ -1739,7 +1792,6 @@ where
         set_name,
         reader,
         positional,
-        output_dir,
         password.clone(),
         limits,
         threads,
@@ -1751,8 +1803,16 @@ where
 
     // Deepest directories first: a directory's own stamp is the last thing
     // to touch it, and nothing below it is touched afterwards.
-    for (relative, times) in directory_times.into_iter().rev() {
-        if let Err(error) = root.set_dir_times(&relative, times.modified, times.accessed) {
+    for (index, relative, times) in directory_times.into_iter().rev() {
+        if let Err(error) = output.directory_metadata(
+            index,
+            &relative,
+            Metadata {
+                modified: Some(times.modified),
+                accessed: times.accessed,
+                unix_mode: None,
+            },
+        ) {
             tracing::debug!(
                 job_id = job_id.0,
                 directory = %relative.display(),
@@ -2114,6 +2174,41 @@ fn shift_mirrored(phase: &std::sync::atomic::AtomicU64, mirrored: &mut u64, curr
     *mirrored = current;
 }
 
+pub(crate) struct ChaseRetirement {
+    staging: PathBuf,
+    pending: Option<tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>>>,
+}
+
+impl ChaseRetirement {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        staging: PathBuf,
+        pending: tokio::task::JoinHandle<Result<FullSetExtractionOutcome, String>>,
+    ) -> Self {
+        Self {
+            staging,
+            pending: Some(pending),
+        }
+    }
+
+    pub(in crate::pipeline) async fn retire(self, job_id: JobId, set_name: &str) {
+        if let Some(pending) = self.pending {
+            let _ = pending.await;
+        }
+        crate::pipeline::direct_unpack::wiring::remove_chase_staging(
+            job_id,
+            set_name,
+            &self.staging,
+        )
+        .await;
+    }
+}
+
+pub(in crate::pipeline) struct ChaseInstallResolution {
+    pub(in crate::pipeline) result: Result<Option<FullSetExtractionOutcome>, ExtractionError>,
+    pub(in crate::pipeline) retirement: Option<ChaseRetirement>,
+}
+
 pub(in crate::pipeline) async fn install_direct_unpack(
     disposition: crate::pipeline::direct_unpack::wiring::ChaseDisposition,
     staging_for_install: PathBuf,
@@ -2121,227 +2216,245 @@ pub(in crate::pipeline) async fn install_direct_unpack(
     job_id: JobId,
     set_name_for_channel: &str,
     policy: Option<&crate::post_processing::model::PostProcessingSettings>,
-    expected_names: Option<&HashSet<String>>,
+    expected_names: Option<&crate::pipeline::direct_unpack::ChaseExpectedMembers>,
 ) -> Option<FullSetExtractionOutcome> {
-    let mut mirror = ChaseMirror::new(phase_counters_for_install);
-    // Resolve the chase first: if it produced usable members there is
-    // no reason to decode the archive a second time.
-    let chase = match disposition {
-        crate::pipeline::direct_unpack::wiring::ChaseDisposition::Ready(outcome) => {
-            Some((*outcome).into_installable())
-        }
-        crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(mut pending) => {
-            // Every part is complete by now, so this is finishing at
-            // disk speed rather than at download speed — but "should
-            // finish quickly" is not a guarantee, and this await used to
-            // have no deadline. A chase that never exits (one still
-            // queued behind occupied chase workers, say, which cannot
-            // even see its own abort) made extraction never return, left
-            // the job in Extracting forever, and held a global
-            // extraction slot until the job was cancelled. That is the
-            // whole shape of the round-9 slow tail.
-            //
-            // On the deadline: end the chase's coverage so its worker
-            // has something to fail on if it is inside the reader, say
-            // so loudly, and extract conventionally. One warning line
-            // and a working job, instead of a wedge.
-            let deadline = tokio::time::sleep(
-                crate::pipeline::direct_unpack::wiring::pending_chase_deadline(),
-            );
-            tokio::pin!(deadline);
-            let mut handle = pending.handle;
-            let mut mirror_tick = tokio::time::interval(CHASE_MIRROR_INTERVAL);
-            mirror_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let joined = loop {
-                tokio::select! {
-                    joined = &mut handle => break Some(joined),
-                    _ = &mut deadline => break None,
-                    _ = mirror_tick.tick() => mirror.sync(&pending.counters),
-                }
-            };
-            match joined {
-                // The deadline won. End the chase's coverage so a worker
-                // inside the reader has something to fail on, drop its
-                // staging, and fall through to conventional extraction
-                // below — which is the whole point: the job finishes.
-                None => {
-                    tracing::warn!(
-                        job_id = job_id.0,
-                        set_name = %pending.set_name,
-                        waited_s =
-                            crate::pipeline::direct_unpack::wiring::pending_chase_deadline()
-                                .as_secs(),
-                        "chase did not finish within the consumption deadline; \
-                         ending it and extracting conventionally"
-                    );
-                    pending
-                        .coverage
-                        .abort("chase exceeded the consumption deadline");
-                    pending.budget.cancel();
-                    handle.abort();
-                    // Aborting a started blocking task does not stop it. Let
-                    // its cancellation checkpoints run before deleting paths
-                    // it can still be writing, without delaying fallback.
-                    let set_name = pending.set_name.clone();
-                    tokio::spawn(async move {
-                        let _ = handle.await;
-                        crate::pipeline::direct_unpack::wiring::remove_chase_staging(
-                            job_id,
-                            &set_name,
-                            &pending.staging_dir,
-                        )
-                        .await;
-                    });
-                    None
-                }
-                Some(joined) => match joined {
-                    Ok(Ok(outcome)) => {
-                        // The worker has joined. Keep its guarded positional
-                        // output active through publication; cancellation still
-                        // owns every failure and abandoned handoff above.
-                        let positional = pending
-                            .positional
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .take();
-                        if positional.is_some() {
-                            pending.cancel_on_drop.completed();
-                        }
-                        Some((
-                            outcome,
-                            pending.staging_dir,
-                            pending.counters.total_bytes.load(Ordering::Relaxed),
-                            pending.counters.completed_bytes.load(Ordering::Relaxed),
-                            positional,
-                        ))
+    let resolved = install_direct_unpack_checked(
+        disposition,
+        staging_for_install,
+        phase_counters_for_install,
+        job_id,
+        set_name_for_channel,
+        policy,
+        expected_names,
+    )
+    .await;
+    if let Some(retirement) = resolved.retirement {
+        retirement.retire(job_id, set_name_for_channel).await;
+    }
+    resolved.result.ok().flatten()
+}
+
+pub(in crate::pipeline) async fn install_direct_unpack_checked(
+    disposition: crate::pipeline::direct_unpack::wiring::ChaseDisposition,
+    staging_for_install: PathBuf,
+    phase_counters_for_install: Arc<PhaseCounters>,
+    job_id: JobId,
+    set_name_for_channel: &str,
+    policy: Option<&crate::post_processing::model::PostProcessingSettings>,
+    expected_names: Option<&crate::pipeline::direct_unpack::ChaseExpectedMembers>,
+) -> ChaseInstallResolution {
+    let mut retirement = None;
+    let result = async {
+        let mut mirror = ChaseMirror::new(phase_counters_for_install);
+        // Resolve the chase first: if it produced usable members there is
+        // no reason to decode the archive a second time.
+        let chase = match disposition {
+            crate::pipeline::direct_unpack::wiring::ChaseDisposition::Ready(outcome) => {
+                Some((*outcome).into_installable())
+            }
+            crate::pipeline::direct_unpack::wiring::ChaseDisposition::Rejected(outcome) => {
+                retirement = Some(ChaseRetirement {
+                    staging: outcome.staging_dir,
+                    pending: None,
+                });
+                None
+            }
+            crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(pending) => {
+                // Every part is complete by now, so this is finishing at
+                // disk speed rather than at download speed — but "should
+                // finish quickly" is not a guarantee, and this await used to
+                // have no deadline. A chase that never exits (one still
+                // queued behind occupied chase workers, say, which cannot
+                // even see its own abort) made extraction never return, left
+                // the job in Extracting forever, and held a global
+                // extraction slot until the job was cancelled. That is the
+                // whole shape of the round-9 slow tail.
+                //
+                // On the deadline: end the chase's coverage so its worker
+                // has something to fail on if it is inside the reader, say
+                // so loudly, and extract conventionally. One warning line
+                // and a working job, instead of a wedge.
+                let deadline = tokio::time::sleep(
+                    crate::pipeline::direct_unpack::wiring::pending_chase_deadline(),
+                );
+                tokio::pin!(deadline);
+                let mut cancel_on_drop = pending.cancel_on_drop;
+                let mut handle = pending.handle;
+                let mut mirror_tick = tokio::time::interval(CHASE_MIRROR_INTERVAL);
+                mirror_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let joined = loop {
+                    tokio::select! {
+                        joined = &mut handle => break Some(joined),
+                        _ = &mut deadline => break None,
+                        _ = mirror_tick.tick() => mirror.sync(&pending.counters),
                     }
-                    Ok(Err(error)) => {
-                        tracing::debug!(
-                            job_id = job_id.0,
-                            error = %error,
-                            "chase failed at consumption; extracting conventionally"
-                        );
-                        crate::pipeline::direct_unpack::wiring::spawn_chase_staging_removal(
-                            job_id,
-                            set_name_for_channel,
-                            pending.staging_dir,
-                        );
-                        None
-                    }
-                    Err(error) => {
+                };
+                match joined {
+                    // The deadline won. End the chase's coverage so a worker
+                    // inside the reader has something to fail on, drop its
+                    // staging, and fall through to conventional extraction
+                    // below — which is the whole point: the job finishes.
+                    None => {
                         tracing::warn!(
                             job_id = job_id.0,
-                            error = %error,
-                            "chase worker panicked; extracting conventionally"
+                            set_name = %pending.set_name,
+                            waited_s =
+                                crate::pipeline::direct_unpack::wiring::pending_chase_deadline()
+                                    .as_secs(),
+                            "chase did not finish within the consumption deadline; \
+                             ending it and extracting conventionally"
                         );
-                        crate::pipeline::direct_unpack::wiring::spawn_chase_staging_removal(
-                            job_id,
-                            set_name_for_channel,
-                            pending.staging_dir,
-                        );
+                        pending
+                            .coverage
+                            .abort("chase exceeded the consumption deadline");
+                        pending.budget.cancel();
+                        // Keep the collector alive so joining it also joins the
+                        // native producer; aborting it would detach that worker.
+                        // The actor joins the speculative subtree before this
+                        // token joins the native producer and removes its backing.
+                        retirement = Some(ChaseRetirement {
+                            staging: pending.staging_dir,
+                            pending: Some(handle),
+                        });
                         None
                     }
-                },
+                    Some(joined) => match joined {
+                        Ok(Ok(outcome)) => {
+                            // Completion transfers integrity authority to the
+                            // actor; dropping the wait guard must not revoke it.
+                            cancel_on_drop.disarm();
+                            // A positional chase wrote its members in place;
+                            // the handoff publishes them below.
+                            let positional = pending
+                                .positional
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .take();
+                            Some((
+                                outcome,
+                                pending.staging_dir,
+                                pending.counters.total_bytes.load(Ordering::Relaxed),
+                                pending.counters.completed_bytes.load(Ordering::Relaxed),
+                                positional,
+                            ))
+                        }
+                        Ok(Err(error)) => {
+                            tracing::debug!(
+                                job_id = job_id.0,
+                                error = %error,
+                                "chase failed at consumption; extracting conventionally"
+                            );
+                            retirement = Some(ChaseRetirement {
+                                staging: pending.staging_dir,
+                                pending: None,
+                            });
+                            None
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id = job_id.0,
+                                error = %error,
+                                "chase worker panicked; extracting conventionally"
+                            );
+                            retirement = Some(ChaseRetirement {
+                                staging: pending.staging_dir,
+                                pending: None,
+                            });
+                            None
+                        }
+                    },
+                }
             }
-        }
-        crate::pipeline::direct_unpack::wiring::ChaseDisposition::None => None,
-    };
+            crate::pipeline::direct_unpack::wiring::ChaseDisposition::None => None,
+        };
 
-    // The chase's tree is deleted on a task of its own so the conventional
-    // fallback does not wait for it. Nothing joins these deletes at shutdown:
-    // this whole path already runs on an extraction task shutdown does not
-    // join, and the maintenance sweep collects a tree an exit interrupts once
-    // its job is gone.
-    if let Some((outcome, chase_staging, total_bytes, completed_bytes, positional)) = chase {
-        if expected_names.is_some_and(|expected| {
-            outcome.extracted.iter().cloned().collect::<HashSet<_>>() != *expected
-        }) {
-            crate::pipeline::direct_unpack::wiring::spawn_chase_staging_removal(
-                job_id,
-                set_name_for_channel,
-                chase_staging,
-            );
-            return None;
-        }
-        if policy.is_some_and(|policy| {
-            outcome
-                .extracted
-                .iter()
-                .any(|name| policy.unacceptable_extension_match(name).is_some())
-        }) {
-            crate::pipeline::direct_unpack::wiring::spawn_chase_staging_removal(
-                job_id,
-                set_name_for_channel,
-                chase_staging,
-            );
-            return None;
-        }
-        // RAR supplies either its policy (whole set) or its mixed-member
-        // manifest. Other formats retain their existing installation path.
-        let rar_names =
-            (policy.is_some() || expected_names.is_some()).then(|| outcome.extracted.clone());
-        // Both installs remove the chase's tree only once every member is in
-        // place, so a failed one leaves it behind for this path to retire.
-        let retired_staging = chase_staging.clone();
-        let install = tokio::task::spawn_blocking(move || {
-            if let Some(handoff) = positional {
-                handoff
-                    .manifest
-                    .publish(&handoff.epoch, &staging_for_install)
-                    .map_err(|error| error.to_string())?;
-                // Only this generation's private metadata tree is retired.
-                // Provisional payload was already written in the destination.
-                let _ = std::fs::remove_dir_all(&chase_staging);
-                Ok(())
-            } else if let Some(names) = rar_names {
-                crate::pipeline::direct_unpack::rar::install(
-                    &chase_staging,
-                    &staging_for_install,
-                    &names,
-                )
-            } else {
-                crate::pipeline::direct_unpack::wiring::install_chased_members(
-                    &chase_staging,
-                    &staging_for_install,
-                )
+        // Failed consumption transfers cleanup ownership to the actor, which
+        // retires the speculative subtree before permitting conventional fallback.
+        if let Some((outcome, chase_staging, total_bytes, completed_bytes, positional)) = chase {
+            if expected_names.is_some_and(|expected| !expected.matches(&outcome.extracted)) {
+                retirement = Some(ChaseRetirement {
+                    staging: chase_staging,
+                    pending: None,
+                });
+                return Ok(None);
             }
-        })
-        .await;
+            if policy.is_some_and(|policy| {
+                outcome
+                    .extracted
+                    .iter()
+                    .any(|name| policy.unacceptable_extension_match(name).is_some())
+            }) {
+                retirement = Some(ChaseRetirement {
+                    staging: chase_staging,
+                    pending: None,
+                });
+                return Ok(None);
+            }
+            // RAR supplies either its policy (whole set) or its mixed-member
+            // manifest. Other formats retain their existing installation path.
+            let rar_names =
+                (policy.is_some() || expected_names.is_some()).then(|| outcome.extracted.clone());
+            // Both installs remove the chase's tree only once every member is in
+            // place, so a failed one leaves it behind for this path to retire.
+            let retired_staging = chase_staging.clone();
+            let install = tokio::task::spawn_blocking(move || {
+                if let Some(handoff) = positional {
+                    handoff
+                        .manifest
+                        .publish(&handoff.epoch, &staging_for_install)
+                        .map_err(|error| error.to_string())?;
+                    // Only this generation's private metadata tree is retired.
+                    // Provisional payload was already written in the destination.
+                    let _ = std::fs::remove_dir_all(&chase_staging);
+                    Ok(())
+                } else if let Some(names) = rar_names {
+                    crate::pipeline::direct_unpack::rar::install(
+                        &chase_staging,
+                        &staging_for_install,
+                        &names,
+                    )
+                } else {
+                    crate::pipeline::direct_unpack::wiring::install_chased_members(
+                        &chase_staging,
+                        &staging_for_install,
+                    )
+                }
+            })
+            .await;
 
-        match install {
-            Ok(Ok(())) => {
-                // The decode already happened, most or all of it before the
-                // phase could see it. Settle it here, so the Extracting bar
-                // reports real bytes instead of a zero-byte lie.
-                mirror.settle(total_bytes, completed_bytes);
-                tracing::info!(
-                    job_id = job_id.0,
-                    set_name = %set_name_for_channel,
-                    members = outcome.extracted.len(),
-                    total_bytes,
-                    "installed direct-unpack members instead of re-extracting"
-                );
-                return Some(outcome);
-            }
-            Ok(Err(error)) => tracing::warn!(
-                job_id = job_id.0,
-                error = %error,
-                "failed to install chased members; extracting conventionally"
-            ),
-            Err(error) => tracing::warn!(
-                job_id = job_id.0,
-                error = %error,
-                "install task panicked; extracting conventionally"
-            ),
+            let failure = match install {
+                Ok(Ok(())) => {
+                    // The decode already happened, most or all of it before the
+                    // phase could see it. Settle it here, so the Extracting bar
+                    // reports real bytes instead of a zero-byte lie.
+                    mirror.settle(total_bytes, completed_bytes);
+                    tracing::info!(
+                        job_id = job_id.0,
+                        set_name = %set_name_for_channel,
+                        members = outcome.extracted.len(),
+                        total_bytes,
+                        "installed direct-unpack members instead of re-extracting"
+                    );
+                    return Ok(Some(outcome));
+                }
+                Ok(Err(error)) => ExtractionError::terminal(format!(
+                    "scoped direct-unpack output installation failed: {error}"
+                )),
+                Err(error) => ExtractionError::terminal(format!(
+                    "scoped direct-unpack output installation task failed: {error}"
+                )),
+            };
+            retirement = Some(ChaseRetirement {
+                staging: retired_staging,
+                pending: None,
+            });
+            return Err(failure);
         }
-        crate::pipeline::direct_unpack::wiring::spawn_chase_staging_removal(
-            job_id,
-            set_name_for_channel,
-            retired_staging,
-        );
+
+        Ok(None)
     }
-
-    None
+    .await;
+    ChaseInstallResolution { result, retirement }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3246,7 +3359,6 @@ impl Pipeline {
             .map_err(|error| budget.reject_content_policy(error))?;
         let root = Arc::new(ExtractionRoot::open(&output_dir).or_terminal()?);
         let task_permit = budget.task_permit_for_root(root)?;
-        let set_name_for_result = set_name_owned.clone();
         let settle_budget = Arc::clone(&budget);
         let shared_kdf_cache = self
             .rar_sets
@@ -3265,9 +3377,54 @@ impl Pipeline {
         // extract_rar_member_to_output); topology may not be rebuilt yet here.
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
         let disposition = self.take_direct_unpack_disposition(job_id, set_name);
+        let scoped_chase = self.has_scoped_chase(job_id, set_name);
         let staging_for_install = output_dir.clone();
         let phase_counters_for_install = Arc::clone(&phase_counters);
-        tokio::task::spawn(async move {
+        if scoped_chase {
+            let owner = self
+                .chase_stream_owner(job_id, set_name)
+                .expect("native chase owner");
+            tokio::spawn(async move {
+                let result = install_direct_unpack_checked(
+                    disposition,
+                    staging_for_install,
+                    phase_counters_for_install,
+                    job_id,
+                    &set_name_for_task,
+                    Some(&policy),
+                    None,
+                )
+                .await;
+                let _ = extract_done_tx
+                    .send(ExtractionDone::NativeChaseResolved {
+                        job_id,
+                        set_name: set_name_for_task,
+                        owner,
+                        kind: crate::jobs::assembly::ArchiveType::Rar,
+                        result: result.result,
+                        retirement: result.retirement,
+                    })
+                    .await;
+            });
+            return Ok(0);
+        }
+        self.retire_unusable_root_stream(job_id, set_name).await?;
+        let mut dispatch = self.admit_root_stream(
+            job_id,
+            set_name,
+            volume_paths
+                .iter()
+                .map(|(volume, path)| (*volume, path.clone()))
+                .collect(),
+            crate::jobs::assembly::ArchiveType::Rar,
+            output_dir.clone(),
+            Arc::clone(&budget),
+        )?;
+        let owner = dispatch.owner;
+        let request = dispatch.request.clone();
+        let channel = dispatch.channel.take().expect("root RAR channel");
+        let completion_lease = dispatch.lease();
+        let worker = tokio::task::spawn(async move {
             if let Some(outcome) = install_direct_unpack(
                 disposition,
                 staging_for_install,
@@ -3279,141 +3436,62 @@ impl Pipeline {
             )
             .await
             {
-                let _ = extract_done_tx
-                    .send(ExtractionDone::FullSet {
-                        job_id,
-                        set_name: set_name_for_task,
-                        result: Ok(outcome),
-                    })
+                let _ = completion_lease
+                    .send_event(
+                        &extract_done_tx,
+                        ExtractionDone::Scoped {
+                            job_id,
+                            owner,
+                            request,
+                            decoded: None,
+                            result: Ok(outcome),
+                        },
+                    )
                     .await;
                 return;
             }
-            let result = tokio::task::spawn_blocking(move || pp_pool.install(move || {
-                let _task_permit = task_permit;
-                let root = _task_permit.root();
-                if volume_paths.is_empty() {
-                    return Err(ExtractionError::terminal(format!(
-                        "no on-disk RAR volumes for set '{set_name_owned}'"
-                    )));
-                }
-
-                let selection = Self::open_rar_archive_for_extraction_with_password_candidates(
-                    RarExtractionOpenRequest {
-                        set_name: &set_name_owned,
-                        volume_paths: volume_paths.clone(),
-                        password_candidates: password_candidates.clone(),
+            let task = tokio::task::spawn_blocking(move || {
+                pp_pool.install(move || {
+                    let _task_permit = task_permit;
+                    let root = _task_permit.root();
+                    let prepared = prepared::PreparedRar {
+                        job_id,
+                        set_name: set_name_owned,
+                        volume_paths,
                         cached_headers,
-                        shared_kdf_cache: shared_kdf_cache.clone(),
+                        password_candidates,
+                        shared_kdf_cache,
                         open_mode,
-                        requested_members: &[],
-                        already_extracted: Some(&already_extracted),
-                        budget: Some(Arc::clone(&budget)),
+                        already_extracted,
+                        root,
+                        budget,
+                        policy,
+                        event_tx,
+                        output_dir,
+                        phase_counters,
+                    };
+                    channel.run(|output| prepared.run_archive_members_to(output))
+                })
+            });
+            let (result, decoded) = dispatch.collect(task).await;
+            let result = result.map_err(|error| error.settle(&settle_budget));
+            let _ = completion_lease
+                .send_event(
+                    &extract_done_tx,
+                    ExtractionDone::Scoped {
+                        job_id,
+                        owner,
+                        request,
+                        decoded,
+                        result,
                     },
-                )?;
-                if let Some(member) = Self::blocked_rar_member(&selection.archive, &policy) {
-                    return Err(budget
-                        .reject_content_policy(
-                            crate::post_processing::model::unwanted_extension_reason(&member),
-                        )
-                        .into());
-                }
-                let _memory_permit =
-                    budget.reserve_memory_wait(selection.decoder_memory_bytes)?;
-                let mut archive = selection.archive;
-                let selected_password = selection.password;
-
-                let meta = archive.metadata();
-                let archive_password_required = meta.is_encrypted;
-                let options = unrar_rs::ExtractOptions {
-                    verify: true,
-                    password: selected_password.clone(),
-                    restore_owners: false,
-                };
-                let is_solid = archive.is_solid();
-
-                let mut extracted_members = Vec::new();
-                let mut failed_members: Vec<(String, ExtractionError)> = Vec::new();
-                let mut validated_password = selection.validated_password;
-                for (idx, member) in meta.members.iter().enumerate() {
-                    if already_extracted.contains(&member.name) {
-                        continue;
-                    }
-
-                    let member_password_required = archive_password_required || member.is_encrypted;
-                    match Self::extract_rar_member_to_output(
-                        &mut archive,
-                        crate::pipeline::extraction::RarExtractionContext::new(
-                            &volume_paths,
-                            &event_tx,
-                            job_id,
-                            &set_name_for_task,
-                            &output_dir,
-                            &options,
-                        )
-                        .with_security(Arc::clone(&root), Arc::clone(&budget))
-                        .with_phase_attempt(Some(Arc::new(PhaseAttemptCounters::new(Arc::clone(
-                            &phase_counters,
-                        ))))),
-                        idx,
-                    ) {
-                        Ok((member_name, bytes_written, total_bytes)) => {
-                            if validated_password.is_none() && member_password_required {
-                                validated_password = selected_password.clone();
-                            }
-                            info!(job_id = job_id.0, member = %member_name, bytes_written, total_bytes, "member extracted");
-                            let _ = event_tx.send(PipelineEvent::ExtractionProgress {
-                                job_id,
-                                member: member_name.clone(),
-                                bytes_written,
-                                total_bytes,
-                            });
-                            let _ = event_tx.send(PipelineEvent::ExtractionMemberFinished {
-                                job_id,
-                                set_name: set_name_for_task.clone(),
-                                member: member_name.clone(),
-                            });
-                            extracted_members.push(member_name);
-                        }
-                        Err(e) => {
-                            let error = e.settle(&budget);
-                            let _ = event_tx.send(PipelineEvent::ExtractionMemberFailed {
-                                job_id,
-                                set_name: set_name_for_task.clone(),
-                                member: member.name.clone(),
-                                error: error.message().to_string(),
-                            });
-                            tracing::warn!(member = %member.name, error = %error, "member extraction failed, continuing with remaining members");
-                            failed_members.push((member.name.clone(), error));
-                            if is_solid {
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                Ok(FullSetExtractionOutcome {
-                    extracted: extracted_members,
-                    failed: failed_members,
-                    selected_password: validated_password,
-                })
-            }))
-            .await;
-
-            let result = match result {
-                Ok(result) => result,
-                Err(e) => Err(ExtractionError::terminal(format!(
-                    "extraction task panicked: {e}"
-                ))),
-            }
-            .map_err(|error| error.settle(&settle_budget));
-            let _ = extract_done_tx
-                .send(ExtractionDone::FullSet {
-                    job_id,
-                    set_name: set_name_for_result,
-                    result,
-                })
+                )
                 .await;
         });
+        self.archive_runtime
+            .get_mut(&job_id)
+            .expect("admitted RAR root runtime")
+            .track_worker(owner, worker);
 
         // Extraction runs in background — result comes through extract_done_tx channel.
         Ok(0)
@@ -3626,10 +3704,52 @@ impl Pipeline {
         // resolved inside the spawned task below — a chase that is still
         // running must never be awaited on this loop.
         let disposition = self.take_direct_unpack_disposition(job_id, set_name);
+        let scoped_chase = self.has_scoped_chase(job_id, set_name);
         let staging_for_install = output_dir.clone();
         let phase_counters_for_install = Arc::clone(&phase_counters);
 
-        tokio::task::spawn(async move {
+        if scoped_chase {
+            let owner = self
+                .chase_stream_owner(job_id, set_name)
+                .expect("native chase owner");
+            tokio::spawn(async move {
+                let result = install_direct_unpack_checked(
+                    disposition,
+                    staging_for_install,
+                    phase_counters_for_install,
+                    job_id,
+                    &set_name_for_channel,
+                    None,
+                    None,
+                )
+                .await;
+                let _ = extract_done_tx
+                    .send(ExtractionDone::NativeChaseResolved {
+                        job_id,
+                        set_name: set_name_for_channel,
+                        owner,
+                        kind: crate::jobs::assembly::ArchiveType::SevenZip,
+                        result: result.result,
+                        retirement: result.retirement,
+                    })
+                    .await;
+            });
+            return Ok(0);
+        }
+        self.retire_unusable_root_stream(job_id, set_name).await?;
+        let mut dispatch = self.admit_root_stream(
+            job_id,
+            set_name,
+            part_candidates.clone(),
+            crate::jobs::assembly::ArchiveType::SevenZip,
+            output_dir,
+            Arc::clone(&budget),
+        )?;
+        let owner = dispatch.owner;
+        let request = dispatch.request.clone();
+        let channel = dispatch.channel.take().expect("root channel");
+        let completion_lease = dispatch.lease();
+        let worker = tokio::task::spawn(async move {
             if let Some(outcome) = install_direct_unpack(
                 disposition,
                 staging_for_install,
@@ -3641,71 +3761,81 @@ impl Pipeline {
             )
             .await
             {
-                let _ = extract_done_tx
-                    .send(ExtractionDone::FullSet {
-                        job_id,
-                        set_name: set_name_for_channel,
-                        result: Ok(outcome),
-                    })
+                let _ = completion_lease
+                    .send_event(
+                        &extract_done_tx,
+                        ExtractionDone::Scoped {
+                            job_id,
+                            owner,
+                            request,
+                            decoded: None,
+                            result: Ok(outcome),
+                        },
+                    )
                     .await;
                 return;
             }
-
-            let result = tokio::task::spawn_blocking(move || {
+            let task = tokio::task::spawn_blocking(move || {
                 pp_pool.install(move || {
                     let _task_permit = task_permit;
                     let root = _task_permit.root();
-                    let parts =
-                        resolve_sevenz_parts(&part_candidates, &uu_paths).map_err(|error| {
-                            error.map_message(|message| {
-                                format!("failed to read 7z archive: {message}")
-                            })
-                        })?;
-                    let end_header_bytes = sevenz_declared_end_header_bytes(&parts.paths[0]);
-
-                    let context = SevenZipExtractionContext {
+                    let file_root = Arc::clone(&root);
+                    let file_budget = Arc::clone(&budget);
+                    let prepared = prepared::PreparedSevenZip {
                         job_id,
                         set_name: set_name_owned,
-                        output_dir,
+                        part_candidates,
+                        uu_paths,
+                        passwords,
                         root,
                         budget,
-                        password: sevenz_turbo::Password::empty(),
                         event_tx,
                         phase_counters,
-                        decode_memory: SevenZipDecodeMemory::ReservedForFixedThreads {
-                            end_header_bytes,
-                            allowance_cap: sevenz_decode_memory,
-                        },
-                        decode_threads: sevenz_decode_threads,
+                        sevenz_decode_memory,
+                        sevenz_decode_threads,
                     };
-
-                    extract_7z_with_password_candidates(context, &passwords, || {
-                        parts.open().map_err(|error| {
-                            ExtractionError::from_io(
-                                format!("failed to open 7z parts: {error}"),
-                                &error,
-                            )
-                        })
+                    channel.run(|output| {
+                        prepared.run_to(
+                            &crate::pipeline::extraction::output::select::SelectOutput {
+                                first: output,
+                                second: FileOutput {
+                                    root: &file_root,
+                                    budget: &file_budget,
+                                },
+                                select_first: |_: usize, path: &Path| {
+                                    matches!(
+                                        weaver_model::files::FileRole::from_filename(
+                                            &path.to_string_lossy()
+                                        ),
+                                        weaver_model::files::FileRole::RarVolume { .. }
+                                            | weaver_model::files::FileRole::SevenZipArchive
+                                            | weaver_model::files::FileRole::SevenZipSplit { .. }
+                                    )
+                                },
+                            },
+                        )
                     })
                 })
-            })
-            .await;
-
-            let result = match result {
-                Ok(r) => r,
-                Err(e) => Err(ExtractionError::terminal(format!(
-                    "7z extraction task panicked: {e}"
-                ))),
-            }
-            .map_err(|error| error.settle(&settle_budget));
-            let _ = extract_done_tx
-                .send(ExtractionDone::FullSet {
-                    job_id,
-                    set_name: set_name_for_channel,
-                    result,
-                })
+            });
+            let (result, decoded) = dispatch.collect(task).await;
+            let result = result.map_err(|error| error.settle(&settle_budget));
+            let _ = completion_lease
+                .send_event(
+                    &extract_done_tx,
+                    ExtractionDone::Scoped {
+                        job_id,
+                        owner,
+                        request,
+                        decoded,
+                        result,
+                    },
+                )
                 .await;
         });
+        self.archive_runtime
+            .get_mut(&job_id)
+            .expect("admitted root runtime")
+            .track_worker(owner, worker);
 
         // Return Ok(0) for now — actual result comes through the channel.
         Ok(0)
@@ -3820,131 +3950,20 @@ impl Pipeline {
                 pp_pool.install(move || {
                     let _task_permit = task_permit;
                     let root = _task_permit.root();
-                    if file_paths.is_empty() {
-                        return Err(ExtractionError::terminal(format!(
-                            "no files found for set '{set_name_owned}'"
-                        )));
-                    }
-                    let _memory_permit = simple_archive_task_memory_permit(
+                    prepared::PreparedSimple {
+                        job_id,
+                        set_name: set_name_owned,
                         kind,
-                        file_paths.first().map(PathBuf::as_path),
-                        &budget,
-                    )?;
-
-                    let mut selected_password = None;
-                    let extracted_members = match kind {
-                        SimpleArchiveKind::Zip => {
-                            let (members, password) = extract_zip(
-                                &file_paths[0],
-                                &root,
-                                &budget,
-                                &passwords,
-                                &event_tx,
-                                job_id,
-                                &set_name_owned,
-                                Some(Arc::clone(&phase_counters)),
-                            )?;
-                            selected_password = password;
-                            members
-                        }
-                        SimpleArchiveKind::Tar => extract_tar(
-                            &file_paths[0],
-                            &root,
-                            &budget,
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                        )?,
-                        SimpleArchiveKind::TarGz => extract_tar_gz(
-                            &file_paths[0],
-                            &root,
-                            &budget,
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                        )?,
-                        SimpleArchiveKind::TarBz2 => extract_tar_bz2(
-                            &file_paths[0],
-                            &root,
-                            &budget,
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                        )?,
-                        SimpleArchiveKind::TarXz => extract_tar_xz(
-                            &file_paths[0],
-                            &root,
-                            &budget,
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                        )?,
-                        SimpleArchiveKind::Gz => extract_gz(
-                            &file_paths[0],
-                            &root,
-                            &budget,
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                        )?,
-                        SimpleArchiveKind::Deflate => extract_deflate(
-                            &file_paths[0],
-                            &root,
-                            &budget,
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                        )?,
-                        SimpleArchiveKind::Brotli => extract_brotli(
-                            &file_paths[0],
-                            &root,
-                            &budget,
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                        )?,
-                        SimpleArchiveKind::Zstd => extract_zstd(
-                            &file_paths[0],
-                            &root,
-                            &budget,
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                        )?,
-                        SimpleArchiveKind::Bzip2 => extract_bzip2(
-                            &file_paths[0],
-                            &root,
-                            &budget,
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                        )?,
-                        SimpleArchiveKind::Xz => extract_xz(
-                            &file_paths[0],
-                            &root,
-                            &budget,
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                            xz_worker_threads,
-                        )?,
-                        SimpleArchiveKind::Split => extract_split(
-                            &file_paths,
-                            &root,
-                            &budget,
-                            &event_tx,
-                            job_id,
-                            &set_name_owned,
-                            Some(Arc::clone(&phase_counters)),
-                            joined_output_already_present,
-                        )?,
-                    };
-
-                    Ok(FullSetExtractionOutcome {
-                        extracted: extracted_members,
-                        failed: Vec::new(),
-                        selected_password,
-                    })
+                        file_paths,
+                        passwords,
+                        joined_output_already_present,
+                        root,
+                        budget,
+                        event_tx,
+                        phase_counters,
+                        xz_worker_threads,
+                    }
+                    .run()
                 })
             })
             .await;
@@ -3970,6 +3989,13 @@ impl Pipeline {
 
     // Persist RAR volume eligibility without deleting source volumes.
     pub(crate) fn try_delete_volumes(&mut self, job_id: JobId, set_name: &str) {
+        if self
+            .archive_runtime
+            .get(&job_id)
+            .is_some_and(|runtime| runtime.retains_archive_set(set_name))
+        {
+            return;
+        }
         let key = (job_id, set_name.to_string());
         if self
             .rar_sets
@@ -4055,6 +4081,13 @@ impl Pipeline {
                 let Some(path) = self.resolve_job_input_path(job_id, &filename) else {
                     return;
                 };
+                if self
+                    .archive_runtime
+                    .get(&job_id)
+                    .is_some_and(|runtime| runtime.retains_input_path(&path))
+                {
+                    continue;
+                }
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
                         self.eagerly_deleted

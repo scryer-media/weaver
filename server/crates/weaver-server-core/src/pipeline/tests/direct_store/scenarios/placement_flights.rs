@@ -695,7 +695,7 @@ async fn land_and_finish(
     assert_carried_forward(pipeline, job_id);
 
     drain_rar_refreshes(pipeline).await;
-    drive_extractions_to_terminal(pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(pipeline, job_id).await;
     assert_eq!(
         job_status_for_assert(pipeline, job_id),
         Some(JobStatus::Complete)
@@ -860,7 +860,7 @@ async fn placements_a_barrier_settles_still_carry_a_deferred_completion_on() {
     assert_carried_forward(&pipeline, job_id);
 
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
     assert_eq!(
         job_status_for_assert(&pipeline, job_id),
         Some(JobStatus::Complete)

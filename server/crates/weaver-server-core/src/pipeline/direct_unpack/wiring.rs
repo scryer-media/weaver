@@ -55,7 +55,7 @@ use super::start_header::{SIGNATURE_HEADER_LEN, StartHeader};
 use crate::jobs::ids::JobId;
 use crate::pipeline::Pipeline;
 use crate::pipeline::completion::finalize::extract::{
-    SevenZipDecodeMemory, SevenZipExtractionContext, extract_7z_stream,
+    SevenZipDecodeMemory, SevenZipExtractionContext, extract_7z_stream, extract_7z_to,
     extract_zip_stream_candidates,
 };
 use crate::pipeline::extraction::ExtractionRoot;
@@ -368,7 +368,7 @@ pub(in crate::pipeline) struct PendingChase {
 }
 
 pub(in crate::pipeline) struct PendingChaseCancellation {
-    completed: bool,
+    armed: bool,
     coverage: Arc<SetCoverage>,
     budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
 }
@@ -379,14 +379,14 @@ impl PendingChaseCancellation {
         budget: Arc<crate::pipeline::extraction::JobExtractionBudget>,
     ) -> Self {
         Self {
-            completed: false,
+            armed: true,
             coverage,
             budget,
         }
     }
 
-    pub(in crate::pipeline) fn completed(&mut self) {
-        self.completed = true;
+    pub(in crate::pipeline) fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
@@ -394,7 +394,7 @@ impl Drop for PendingChaseCancellation {
     fn drop(&mut self) {
         // The completion task may be cancelled before it is ever polled. Keep
         // this guard in the transferred ownership itself, not in its await.
-        if !self.completed {
+        if self.armed {
             self.coverage.abort("direct-unpack consumer dropped");
             self.budget.cancel();
         }
@@ -434,6 +434,9 @@ pub(in crate::pipeline) enum ChaseDisposition {
     None,
     // A finished, untainted chase whose members are ready to install.
     Ready(Box<ChaseOutcome>),
+    // A completed source rejected by integrity; the actor joins its namespace
+    // before deleting this staging tree and starting a conventional decoder.
+    Rejected(Box<ChaseOutcome>),
     // A chase still running. Every part is complete by now, so it is finishing
     // at disk speed.
     Pending(PendingChase),
@@ -447,6 +450,7 @@ pub(crate) struct DirectUnpackRuntime {
     // `None` in tests that build a runtime by hand, where the gate falls back
     // to the all-defaults resolution: off.
     settings: Option<DirectUnpackSettings>,
+    pub(super) streams: HashMap<(JobId, String), super::stream::ChaseStream>,
     // Sets currently being chased.
     armed: HashMap<(JobId, String), ArmedSet>,
     // Single-file archives that have not been offered to arming yet.
@@ -501,6 +505,7 @@ pub(crate) struct DirectUnpackRuntime {
     last_staging: HashMap<(JobId, String), PathBuf>,
     // Deletions of retired chases' staging trees that may still be running.
     staging_cleanups: Vec<tokio::task::JoinHandle<()>>,
+    pub(super) retirement_barriers: HashMap<PathBuf, tokio::sync::watch::Receiver<bool>>,
     // Holds every staging deletion before it starts until a permit is
     // added, so a test can see the pipeline carry on while one is pending.
     #[cfg(test)]
@@ -587,9 +592,15 @@ impl DirectUnpackRuntime {
         self.staging_cleanups
             .retain(|cleanup| !cleanup.is_finished());
         let (job_id, set_name) = key.clone();
+        let barrier = self.retirement_barriers.remove(&staging_dir);
         #[cfg(test)]
         let hold = self.staging_cleanup_hold.clone();
         self.staging_cleanups.push(tokio::spawn(async move {
+            if let Some(mut barrier) = barrier
+                && barrier.wait_for(|joined| *joined).await.is_err()
+            {
+                return;
+            }
             #[cfg(test)]
             if let Some(hold) = hold {
                 let _ = hold.acquire().await;
@@ -1326,6 +1337,67 @@ impl Pipeline {
         } else {
             output_dir.clone()
         };
+        let stream_destination = self.extraction_staging_dir(job_id);
+        let mut dispatch = if matches!(format, ChaseFormat::Rar | ChaseFormat::SevenZip { .. }) {
+            let kind = if matches!(format, ChaseFormat::Rar) {
+                crate::jobs::assembly::ArchiveType::Rar
+            } else {
+                crate::jobs::assembly::ArchiveType::SevenZip
+            };
+            self.admit_root_stream(
+                job_id,
+                set_name,
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, path)| (i as u32, path.clone()))
+                    .collect(),
+                kind,
+                stream_destination,
+                Arc::clone(&budget),
+            )
+            .ok()
+        } else if matches!(format, ChaseFormat::RarVirtual { .. }) {
+            let source = crate::pipeline::extraction::runtime::VirtualInputSource {
+                root_set: set_name.to_owned(),
+                node: crate::pipeline::direct_store::nested::ROOT_NODE,
+            };
+            let names = paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    (
+                        index as u32,
+                        path.file_name()
+                            .expect("virtual volume filename")
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .collect();
+            self.admit_virtual_chase_stream(
+                job_id,
+                set_name,
+                source,
+                stream_destination,
+                Arc::clone(&budget),
+                names,
+            )
+            .ok()
+        } else {
+            None
+        };
+        if let Some(dispatch) = &dispatch {
+            self.archive_runtime
+                .get_mut(&job_id)
+                .expect("chase archive runtime")
+                .mark_speculative(&dispatch.request)
+                .expect("new chase request");
+        }
+        let channel = dispatch
+            .as_mut()
+            .and_then(|dispatch| dispatch.channel.take());
+        let manifest = super::stream::ChaseManifest::default();
         let handle = self.spawn_direct_unpack_worker(
             job_id,
             set_name.to_string(),
@@ -1336,10 +1408,29 @@ impl Pipeline {
             password,
             Arc::clone(&counters),
             format,
+            channel,
+            manifest.clone(),
             virtual_source.as_ref().map(|(_, input)| input.clone()),
             destination,
             Arc::clone(&positional),
         );
+
+        let handle = if let Some(dispatch) = dispatch {
+            let stream = super::stream::ChaseStream::new(
+                job_id,
+                &dispatch,
+                self.extract_done_tx.clone(),
+                manifest,
+                output_dir.clone(),
+            );
+            let handle = stream.collect(dispatch, handle);
+            self.direct_unpack
+                .streams
+                .insert((job_id, set_name.to_owned()), stream);
+            handle
+        } else {
+            handle
+        };
 
         self.direct_unpack
             .watermark_targets
@@ -1915,6 +2006,8 @@ impl Pipeline {
         password: Option<String>,
         counters: Arc<crate::jobs::PhaseCounters>,
         format: ChaseFormat,
+        channel: Option<crate::pipeline::extraction::output::channel::ChannelOutput>,
+        manifest: super::stream::ChaseManifest,
         virtual_source: Option<super::rar_virtual::VirtualRarInput>,
         destination: PathBuf,
         positional: crate::pipeline::completion::finalize::extract::positional::PositionalSlot,
@@ -1981,7 +2074,6 @@ impl Pipeline {
                     let context = SevenZipExtractionContext {
                         job_id,
                         set_name,
-                        output_dir,
                         root,
                         budget: Arc::clone(&budget),
                         password: pw,
@@ -1993,6 +2085,9 @@ impl Pipeline {
                         },
                         decode_threads,
                     };
+                    // A positional chase writes every member in place, child
+                    // archives included; those reach the nested engine from
+                    // disk once the set is installed.
                     if let Some(outcome) =
                         crate::pipeline::completion::finalize::extract::positional::try_extract(
                             &context,
@@ -2005,20 +2100,36 @@ impl Pipeline {
                     {
                         return Ok(outcome);
                     }
+                    let open_reader = || {
+                        GatedSplitReader::open(&paths, Arc::clone(&coverage))
+                            .map(|reader| {
+                                std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader)
+                            })
+                            .map_err(|error| {
+                                ExtractionError::from_io(
+                                    format!("failed to open 7z direct-unpack reader: {error}"),
+                                    &error,
+                                )
+                            })
+                    };
                     pp_pool.install(|| {
-                        extract_7z_stream(&context, || {
-                            GatedSplitReader::open(&paths, Arc::clone(&coverage))
-                                .map(|reader| {
-                                    std::io::BufReader::with_capacity(CHASE_BUFFER_BYTES, reader)
+                        if let Some(channel) = &channel {
+                            let output = crate::pipeline::extraction::output::select::SelectOutput {
+                                first: channel.clone(),
+                                second: crate::pipeline::extraction::output::FileOutput {
+                                    root: &context.root,
+                                    budget: &context.budget,
+                                },
+                                select_first: |_, path: &std::path::Path| manifest.route(path),
+                            };
+                            channel
+                                .run(|_| {
+                                    extract_7z_to(context.stream_context(), &output, open_reader)
                                 })
-                                .map_err(|error| {
-                                    ExtractionError::from_io(
-                                        format!("failed to open 7z direct-unpack reader: {error}"),
-                                        &error,
-                                    )
-                                })
-                        })
-                        .map_err(String::from)
+                                .map_err(String::from)
+                        } else {
+                            extract_7z_stream(&context, open_reader).map_err(String::from)
+                        }
                     })
                 })();
                 match &outcome {
@@ -2054,12 +2165,36 @@ impl Pipeline {
                             paths,
                             coverage: Arc::clone(&coverage),
                         };
+                        if let Some(channel) = &channel {
+                            let output =
+                                crate::pipeline::extraction::output::select::SelectOutput {
+                                    first: channel.clone(),
+                                    second: crate::pipeline::extraction::output::FileOutput {
+                                        root: &root,
+                                        budget: &budget,
+                                    },
+                                    select_first: |_, path: &std::path::Path| manifest.route(path),
+                                };
+                            return channel.run(|_| {
+                                super::rar::extract_to(
+                                    super::rar::RarStreamContext {
+                                        provider: &provider,
+                                        volume_count: provider.paths.len(),
+                                        budget: &budget,
+                                        password,
+                                        counters: &counters,
+                                        policy: rar_policy.as_deref().expect("RAR policy"),
+                                    },
+                                    &output,
+                                    |_| Ok(true),
+                                )
+                            });
+                        }
                         return super::rar::extract(
                             super::rar::RarChaseContext {
                                 provider: &provider,
                                 volume_count: provider.paths.len(),
                                 root: &root,
-                                output_dir: &output_dir,
                                 budget: &budget,
                                 password,
                                 counters: &counters,
@@ -2069,12 +2204,36 @@ impl Pipeline {
                         );
                     }
                     if let Some(input) = virtual_source {
+                        if let Some(channel) = &channel {
+                            let output =
+                                crate::pipeline::extraction::output::select::SelectOutput {
+                                    first: channel.clone(),
+                                    second: crate::pipeline::extraction::output::FileOutput {
+                                        root: &root,
+                                        budget: &budget,
+                                    },
+                                    select_first: |_, path: &std::path::Path| manifest.route(path),
+                                };
+                            return channel.run(|_| {
+                                super::rar::extract_to(
+                                    super::rar::RarStreamContext {
+                                        provider: &input,
+                                        volume_count: paths.len(),
+                                        budget: &budget,
+                                        password,
+                                        counters: &counters,
+                                        policy: rar_policy.as_deref().expect("RAR policy"),
+                                    },
+                                    &output,
+                                    |name| input.should_extract(name),
+                                )
+                            });
+                        }
                         return super::rar::extract(
                             super::rar::RarChaseContext {
                                 provider: &input,
                                 volume_count: paths.len(),
                                 root: &root,
-                                output_dir: &output_dir,
                                 budget: &budget,
                                 password,
                                 counters: &counters,
@@ -2368,6 +2527,8 @@ impl Pipeline {
             return;
         };
 
+        self.discard_chase_stream(job_id, set_name);
+
         // Wake the worker before anything else: it is parked on the coverage,
         // and a join that happened first would hang here instead of there.
         //
@@ -2397,6 +2558,25 @@ impl Pipeline {
         self.direct_unpack
             .draining
             .push(((job_id, set_name.to_string()), armed));
+    }
+
+    // A demotion must release readers before reconstructing or deleting the
+    // virtual volume backings they were consuming.
+    pub(in crate::pipeline) async fn drain_direct_unpack_set(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+    ) {
+        while let Some(index) = self
+            .direct_unpack
+            .draining
+            .iter()
+            .position(|(key, _)| key.0 == job_id && key.1 == set_name)
+        {
+            let (key, armed) = self.direct_unpack.draining.swap_remove(index);
+            let _ = armed.handle.await;
+            self.direct_unpack.retire_staging(&key, armed.staging_dir);
+        }
     }
 
     // Abort every chase in the pipeline, then join them all. The shutdown and
@@ -2791,6 +2971,7 @@ impl Pipeline {
                     }
                 }
                 Err(error) => {
+                    self.discard_chase_stream(key.0, &key.1);
                     // A part that vanished under the reader is a rename racing
                     // the chase, not a broken archive. The staging check comes
                     // first: its error can carry the same "not found" text.
@@ -2896,19 +3077,26 @@ impl Pipeline {
                 );
                 return ChaseDisposition::Ready(Box::new(outcome));
             }
+            // The actor may retry finalization after joining this rejected
+            // namespace. That retry must use the conventional decoder rather
+            // than arm a fresh chase over the same invalidated source.
+            self.direct_unpack.latched.insert(key.clone(), "discarded");
             self.direct_unpack.counters.discarded += 1;
             record_event("discarded");
             // A failed chase's tree was already retired when it was reaped.
-            if outcome.result.is_ok() {
-                self.direct_unpack
-                    .retire_staging(&key, outcome.staging_dir.clone());
-            }
+            // A successful but tainted source still backs its speculative
+            // descendants, so transfer cleanup to the joined actor path.
+            let rejected_source = outcome.result.is_ok();
             debug!(
                 job_id = job_id.0,
                 set_name,
                 tainted = outcome.tainted,
                 "discarding a chase outcome; extracting conventionally"
             );
+            if rejected_source {
+                return ChaseDisposition::Rejected(Box::new(outcome));
+            }
+            self.discard_chase_stream(job_id, set_name);
             return ChaseDisposition::None;
         }
 
@@ -3166,6 +3354,7 @@ impl Pipeline {
                 elapsed_ms = armed.started_at.elapsed().as_millis() as u64,
                 "direct unpack demoted — repair rewrote a set being chased; the chase is aborted"
             );
+            self.discard_chase_stream(job_id, set_name);
             self.direct_unpack.draining.push((key, armed));
         }
     }
@@ -3994,6 +4183,16 @@ impl Pipeline {
             AbortLatch::Permanent,
             DemotionReason::DownloadEnded,
         );
+        let streams: Vec<_> = self
+            .direct_unpack
+            .streams
+            .keys()
+            .filter(|(job, _)| *job == job_id)
+            .cloned()
+            .collect();
+        for (_, set_name) in streams {
+            self.discard_chase_stream(job_id, &set_name);
+        }
         self.direct_unpack
             .latched
             .retain(|(latched_job, _), _| *latched_job != job_id);
@@ -4093,19 +4292,6 @@ pub(in crate::pipeline) async fn remove_chase_staging(
             "failed to remove direct-unpack staging"
         );
     }
-}
-
-// Delete a chase's staging tree on a task of its own, for a caller that
-// has nothing more to do with it and should not wait for it to go.
-pub(in crate::pipeline) fn spawn_chase_staging_removal(
-    job_id: JobId,
-    set_name: &str,
-    staging_dir: PathBuf,
-) {
-    let set_name = set_name.to_string();
-    tokio::spawn(async move {
-        remove_chase_staging(job_id, &set_name, &staging_dir).await;
-    });
 }
 
 // Every path [`read_signature_header`] was asked to open, so a test can

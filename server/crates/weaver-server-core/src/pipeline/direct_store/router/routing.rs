@@ -16,6 +16,21 @@ impl DirectSetRouter {
         source_offset: u64,
         pieces: &[Bytes],
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        let mut spans = Vec::new();
+        self.route_into(volume_index, source_offset, pieces, &mut spans)?;
+        Ok(spans)
+    }
+
+    // The caller owns every emitted span even when a later volume refuses.
+    // A nested source cannot refetch bytes from NNTP after an earlier drain
+    // trimmed them; its coordinator must place these spans before fallback.
+    pub(crate) fn route_into(
+        &mut self,
+        volume_index: u32,
+        source_offset: u64,
+        pieces: &[Bytes],
+        spans: &mut Vec<RoutedSpan>,
+    ) -> Result<(), DemotionReason> {
         if let Some(reason) = self.demoted {
             return Err(reason);
         }
@@ -30,7 +45,7 @@ impl DirectSetRouter {
         // Every volume, not just this one: a header landing here is exactly what
         // resolves a *later* volume's split-continuation offset, so its holds
         // become routable in the same call.
-        let spans = self.drain_staged_volumes()?;
+        spans.extend(self.drain_staged_volumes()?);
 
         // A breach — of this set's budget, or of the process-wide limit every
         // set shares — pages rather than demoting. Demotion is what is left
@@ -40,7 +55,7 @@ impl DirectSetRouter {
         {
             return Err(self.fail(reason));
         }
-        Ok(spans)
+        Ok(())
     }
 
     // Copies what [`Self::route`] left staged from one article out of the
@@ -406,6 +421,17 @@ impl DirectSetRouter {
         volume_index: u32,
         decoded_len: u64,
     ) -> Result<Vec<RoutedSpan>, DemotionReason> {
+        let mut spans = Vec::new();
+        self.note_volume_complete_into(volume_index, decoded_len, &mut spans)?;
+        Ok(spans)
+    }
+
+    pub(crate) fn note_volume_complete_into(
+        &mut self,
+        volume_index: u32,
+        decoded_len: u64,
+        spans: &mut Vec<RoutedSpan>,
+    ) -> Result<(), DemotionReason> {
         if let Some(reason) = self.demoted {
             return Err(reason);
         }
@@ -464,8 +490,8 @@ impl DirectSetRouter {
             }
         }
         self.check_eligibility()?;
-        let spans = self.drain_staged_volumes()?;
-        Ok(spans)
+        spans.extend(self.drain_staged_volumes()?);
+        Ok(())
     }
 
     // The expensive arm of the confirming parse: re-parse a restored volume's
@@ -1360,6 +1386,18 @@ impl DirectSetRouter {
     // per-member state is a map, and every gate is per member. What the
     // restriction bought was the finalization and demotion bookkeeping being
     // trivially per-set; the router pays for those properly instead.
+    fn placement_name(&self, name: &str) -> Result<String, ()> {
+        if self.private_destinations {
+            DirectSetPlan::member_collision_key(name)?;
+            Ok(format!(
+                "member-{}.partial",
+                blake3::hash(name.as_bytes()).to_hex()
+            ))
+        } else {
+            self.plan.member_partial_path(name)
+        }
+    }
+
     pub(super) fn sync_members(&mut self) -> Result<(), DemotionReason> {
         // Collisions are decided over **every member the layout has started**,
         // not just the routable ones, and not pairwise as members are adopted:
@@ -1387,7 +1425,7 @@ impl DirectSetRouter {
             let Ok(key) = DirectSetPlan::member_collision_key(name) else {
                 return Err(self.fail(DemotionReason::UnsafeDestination));
             };
-            let Ok(partial) = self.plan.member_partial_path(name) else {
+            let Ok(partial) = self.placement_name(name) else {
                 return Err(self.fail(DemotionReason::UnsafeDestination));
             };
             if !seen.insert(key) || !partials.insert(partial.to_ascii_lowercase()) {
@@ -1428,19 +1466,21 @@ impl DirectSetRouter {
             sevenz_keys.insert(name, (keys, facts));
         }
 
-        let routable: Vec<(String, u64, Option<unrar_rs::EncryptedStore>)> = self
+        let routable: Vec<(String, Option<u64>, Option<unrar_rs::EncryptedStore>)> = self
             .layout_members()
             .iter()
             .filter(|member| member.eligibility.routes_direct())
             .map(|member| {
                 (
                     member.name.clone(),
-                    member.unpacked_size.unwrap_or(0),
+                    member.unpacked_size,
                     member.eligibility.encrypted_store(),
                 )
             })
             .collect();
         for (name, unpacked_size, encrypted) in routable {
+            let size_known = unpacked_size.is_some();
+            let unpacked_size = unpacked_size.unwrap_or(0);
             // Unreachable while `admit_encrypted` demotes on every refusal, and
             // stated anyway: an encrypted member with no key routes nothing, and
             // the alternative to skipping it is a destination full of cipher.
@@ -1453,12 +1493,13 @@ impl DirectSetRouter {
                 // snapshot is part of what it does.
                 let mut size_moved = false;
                 if let Some(existing) = self.member_mut(member_id) {
-                    // A size that actually moved is a digest fact that moved:
-                    // the first header of a member can declare none at all
-                    // (`unwrap_or(0)`) and a later one fill it in, and the
-                    // checkpoint's digest binds the size it was written under.
-                    if existing.unpacked_size != unpacked_size {
+                    // Publish both size changes and resolution of an unknown
+                    // size to zero. Discovery must distinguish an empty member
+                    // from one whose final length has not arrived yet.
+                    if existing.unpacked_size != unpacked_size || existing.size_known != size_known
+                    {
                         existing.unpacked_size = unpacked_size;
+                        existing.size_known = size_known;
                         size_moved = true;
                     }
                     if let (Some(facts), Some(crypt)) = (encrypted, existing.crypt.as_mut()) {
@@ -1472,7 +1513,7 @@ impl DirectSetRouter {
                 }
                 continue;
             }
-            let relative_partial = match self.plan.member_partial_path(&name) {
+            let relative_partial = match self.placement_name(&name) {
                 Ok(path) => path,
                 Err(()) => return Err(self.fail(DemotionReason::UnsafeDestination)),
             };
@@ -1498,6 +1539,7 @@ impl DirectSetRouter {
                     name,
                     relative_partial,
                     unpacked_size,
+                    size_known,
                     covered: ByteRanges::new(),
                     parts: BTreeMap::new(),
                     checked_parts: BTreeMap::new(),
@@ -1857,6 +1899,7 @@ impl DirectSetRouter {
                     let bytes = vec![Bytes::from(buffer)];
                     let offset = extent.physical_offset.saturating_add(moved);
                     spans.push(RoutedSpan {
+                        owner: Default::default(),
                         destination: DirectDestination::Envelope {
                             volume_index: *volume_index,
                         },
@@ -1897,7 +1940,9 @@ impl DirectSetRouter {
         // Its bytes are in `migrated` already, so this cannot lose them, and a
         // failure to unlink is not worth demoting a set over — the restart sweep
         // knows the suffix.
-        let _ = std::fs::remove_file(&partial);
+        if !self.retain_backings {
+            let _ = std::fs::remove_file(&partial);
+        }
         crate::runtime::perf_probe::record(
             "direct_store.member.migrated_to_envelope",
             std::time::Duration::from_nanos(1),
@@ -1917,8 +1962,9 @@ impl DirectSetRouter {
         std::mem::take(&mut self.retired_destinations)
     }
 
-    // Revision of the facts the checkpoint's plan digest binds. Changes only
-    // when the digest would.
+    // Revision of the member catalog used by checkpoint digests and child
+    // discovery. Resolving an unknown length to zero also advances it, even
+    // though the digest's numeric size remains zero.
     pub(crate) fn member_facts_revision(&self) -> u64 {
         self.member_facts_revision
     }
@@ -2115,6 +2161,7 @@ impl DirectSetRouter {
                             .and_then(|staging| staging.slice(cursor, len, &self.scratch));
                         if let Some(bytes) = bytes {
                             spans.push(RoutedSpan {
+                                owner: Default::default(),
                                 destination: DirectDestination::Envelope { volume_index },
                                 destination_offset: cursor,
                                 volume_index,
@@ -2175,6 +2222,7 @@ impl DirectSetRouter {
                                 },
                             );
                             spans.push(RoutedSpan {
+                                owner: Default::default(),
                                 destination: DirectDestination::Member { member_id },
                                 destination_offset: logical_offset,
                                 volume_index,

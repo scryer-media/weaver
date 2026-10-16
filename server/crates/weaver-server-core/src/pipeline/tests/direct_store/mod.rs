@@ -623,7 +623,7 @@ async fn run_gate_with_password(
         }
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let status = job_status_for_assert(&pipeline, job_id);
     let output_root =
@@ -916,7 +916,7 @@ async fn run_par2_direct_gate_with_password(
     let sets_after_verification = format!("{:?}", pipeline.direct_store.sets_for(job_id));
 
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let volume_file_at_end = volumes
         .iter()
@@ -1023,7 +1023,7 @@ async fn run_obfuscated_par2_gate(
     let sets_after_verification = format!("{:?}", pipeline.direct_store.sets_for(job_id));
 
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     // Both name populations: a conventional volume is born under its hex name
     // and renamed to its described name once identity settles, and either
@@ -1144,7 +1144,7 @@ async fn run_obfuscated_headers_gate(
     let admitted = !pipeline.direct_store.sets_for(job_id).is_empty();
     let sets = format!("{:?}", pipeline.direct_store.sets_for(job_id));
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let volume_file_seen = volume_file_seen
         || obfuscated
@@ -1787,7 +1787,7 @@ async fn run_multi_member_gate(
         }
     }
     drain_rar_refreshes(&mut pipeline).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let output_root =
         complete_dir.join(crate::jobs::working_dir::sanitize_dirname("Silver Horizon"));
@@ -2134,6 +2134,84 @@ fn store_set_with_an_empty_member(
     ]
 }
 
+// A genuine RAR5 Huffman block with no matches or filters. The literal table
+// gives every byte its canonical eight-bit code, so fixture contents remain
+// arbitrary while the normal compressed-member decoder still consumes them.
+fn rar5_literal_stream(payload: &[u8]) -> Vec<u8> {
+    assert!(
+        payload.len() <= 0x00ff_ffff - 64,
+        "fixture exceeds one RAR5 block"
+    );
+    let mut body = Vec::with_capacity(payload.len() + 64);
+    let mut position = 0usize;
+    let mut bits = |value: u8, width: usize| {
+        for shift in (0..width).rev() {
+            if position.is_multiple_of(8) {
+                body.push(0);
+            }
+            body[position / 8] |= ((value >> shift) & 1) << (7 - position % 8);
+            position += 1;
+        }
+    };
+    // Bootstrap symbols zero and eight form a complete one-bit tree. They
+    // encode the lengths of NC(306), DC(64), LDC(16), and RC(44).
+    for symbol in 0..20 {
+        bits(u8::from(symbol == 0 || symbol == 8), 4);
+    }
+    for _ in 0..256 {
+        bits(1, 1);
+    }
+    for _ in 256..430 {
+        bits(0, 1);
+    }
+    for &byte in payload {
+        bits(byte, 8);
+    }
+    let size_bytes = if body.len() <= 0xff {
+        1
+    } else if body.len() <= 0xffff {
+        2
+    } else {
+        3
+    };
+    // Six valid bits in the final byte, a new table, and the final block.
+    let flags = 0xc0 | ((size_bytes - 1) << 3) as u8 | 5;
+    let size = (body.len() as u32).to_le_bytes();
+    let checksum = size[..size_bytes]
+        .iter()
+        .fold(0x5a ^ flags, |sum, byte| sum ^ byte);
+    let mut packed = vec![flags, checksum];
+    packed.extend_from_slice(&size[..size_bytes]);
+    packed.extend_from_slice(&body);
+    packed
+}
+
+#[test]
+fn rar5_literal_fixture_decodes_arbitrary_bytes_and_all_block_size_widths() {
+    for length in [1, 257, 65_537] {
+        let payload: Vec<u8> = (0..length)
+            .map(|index| (index * 37 + index / 17) as u8)
+            .collect();
+        let packed = rar5_literal_stream(&payload);
+        let mut archive = b"Rar!\x1a\x07\x01\x00".to_vec();
+        archive.extend_from_slice(&build_test_rar_main_header(0, None));
+        archive.extend_from_slice(&build_test_rar_compressed_file_header(
+            "inner.rar",
+            0,
+            packed.len() as u64,
+            payload.len() as u64,
+            Some(checksum::crc32(&payload)),
+            test_rar_compression_info(3, false),
+        ));
+        archive.extend_from_slice(&packed);
+        archive.extend_from_slice(&build_test_rar_end_header(false));
+        let mut archive = unrar_rs::RarArchive::open(std::io::Cursor::new(archive)).unwrap();
+        let mut decoded = Vec::new();
+        archive.by_index(0).unwrap().copy_to(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+}
+
 // What the extra, ineligible member of a tolerance fixture looks like.
 #[derive(Clone, Copy)]
 enum ToleranceExtra {
@@ -2160,7 +2238,14 @@ enum ToleranceExtra {
     // An unsplit compressed member. The data area is not really compressed —
     // nothing extracts it — so this is only good for what the
     // *classification* decides.
-    Compressed { declared_unpacked: u64, solid: bool },
+    Compressed {
+        declared_unpacked: u64,
+        solid: bool,
+    },
+    GenuineCompressed {
+        unpacked_len: u64,
+        unpacked_crc32: u32,
+    },
     // A compressed member split across the last two volumes, so its packed
     // total is a lower bound until the chain closes.
     CompressedSplit,
@@ -2270,6 +2355,17 @@ fn store_set_with_extra_member(
                             declared_unpacked,
                             Some(checksum::crc32(extra_part)),
                             test_rar_compression_info(3, solid),
+                        ),
+                        ToleranceExtra::GenuineCompressed {
+                            unpacked_len,
+                            unpacked_crc32,
+                        } => build_test_rar_compressed_file_header(
+                            extra_name,
+                            extra_flags,
+                            extra_part.len() as u64,
+                            unpacked_len,
+                            Some(unpacked_crc32),
+                            test_rar_compression_info(3, false),
                         ),
                         ToleranceExtra::CompressedSplit => build_test_rar_compressed_file_header(
                             extra_name,
@@ -2646,12 +2742,54 @@ fn member_after_gate(
     }
 }
 
-// Reads the one accepted coverage row of a job back out of the database.
+fn coverage_rows_in(
+    pipeline: &Pipeline,
+    job_id: JobId,
+    working_dir: &std::path::Path,
+) -> HashMap<String, Vec<u8>> {
+    use crate::pipeline::direct_store::manifest::{ManifestStore, is_reference};
+    pipeline
+        .db
+        .load_direct_coverage(job_id)
+        .unwrap()
+        .into_iter()
+        .map(|(name, blob)| {
+            let body = if is_reference(&blob) {
+                assert!(
+                    blob.len() <= 256,
+                    "SQL checkpoint references must stay bounded"
+                );
+                ManifestStore::new(working_dir, job_id, &name)
+                    .read(&blob)
+                    .unwrap()
+            } else {
+                blob
+            };
+            (name, body)
+        })
+        .collect()
+}
+
+// Reads the one accepted coverage checkpoint selected by the database.
 fn coverage_snapshot_of(
     pipeline: &Pipeline,
     job_id: JobId,
 ) -> crate::pipeline::direct_store::snapshot::CoverageSnapshot {
-    let rows = pipeline.db.load_direct_coverage(job_id).unwrap();
+    let working_dir = &pipeline
+        .direct_store
+        .set(job_id, 0)
+        .unwrap()
+        .plan()
+        .working_dir;
+    coverage_snapshot_in(pipeline, job_id, working_dir)
+}
+
+fn coverage_snapshot_in(
+    pipeline: &Pipeline,
+    job_id: JobId,
+    working_dir: &std::path::Path,
+) -> crate::pipeline::direct_store::snapshot::CoverageSnapshot {
+    let rows = coverage_rows_in(pipeline, job_id, working_dir);
     let blob = rows
         .values()
         .next()

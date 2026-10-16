@@ -1693,7 +1693,8 @@ async fn restart_deletes_every_row_it_refuses() {
         &expected,
         &mut recorder.clone(),
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(outcome.accepted.len(), 1);
     assert!(outcome.accepted.contains_key(SET));
@@ -1728,7 +1729,8 @@ async fn a_disabled_gate_ignores_rows_without_deleting_them() {
         &expected,
         &mut recorder.clone(),
     )
-    .await;
+    .await
+    .unwrap();
 
     assert!(outcome.accepted.is_empty());
     assert!(outcome.rejected.is_empty());
@@ -1805,6 +1807,66 @@ fn refetch_floors_take_the_lowest_floor_for_a_repeated_file_index() {
 // ---------------------------------------------------------------------------
 // The real database seam
 // ---------------------------------------------------------------------------
+
+#[test]
+fn manifest_checkpoints_keep_one_small_row_and_unchanged_reload_does_not_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = crate::Database::open_in_memory().unwrap();
+    database.create_active_job(&direct_active_job()).unwrap();
+    let store = super::super::manifest::ManifestStore::new(dir.path(), JOB, SET);
+    let mut snapshot = sample_snapshot();
+    snapshot.floors = (0..2_000)
+        .map(|index| VolumeFloor {
+            volume_index: index,
+            file_index: index,
+            floor: 60,
+            complete: false,
+        })
+        .collect();
+    for generation in 1..=20 {
+        snapshot.generation = generation;
+        let body = encode(&snapshot).unwrap();
+        let mut persist =
+            DatabaseCoveragePersist::new(database.clone()).with_manifests(dir.path().into());
+        persist.write(JOB, SET, &body).unwrap();
+        let rows = database.load_direct_coverage(JOB).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[SET].len() <= 256);
+        assert_eq!(store.read(&rows[SET]).unwrap(), body);
+        assert_eq!(
+            std::fs::read_dir(dir.path().join(super::super::manifest::DIRECTORY))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    // Any attempted row rewrite now fails. Recreating the adapter models the
+    // empty in-memory state after reload, so this cannot pass via a cache.
+    let datastore = database.datastore();
+    database
+        .run_sql_blocking(async move {
+            crate::persistence::sql_runtime::SqlRuntime::execute(
+                datastore.read_exec(),
+                "CREATE TRIGGER reject_unchanged_checkpoint BEFORE UPDATE ON active_direct_coverage
+                 BEGIN SELECT RAISE(ABORT, 'unchanged checkpoint was rewritten'); END",
+                &[],
+            )
+            .await
+        })
+        .unwrap();
+    let selected = database.load_direct_coverage(JOB).unwrap();
+    for _ in 0..50 {
+        let body = store.read(&selected[SET]).unwrap();
+        let restored = decode(&body).unwrap();
+        let mut persist =
+            DatabaseCoveragePersist::new(database.clone()).with_manifests(dir.path().into());
+        persist
+            .write(JOB, SET, &encode(&restored).unwrap())
+            .unwrap();
+        assert_eq!(database.load_direct_coverage(JOB).unwrap(), selected);
+    }
+}
 
 // The barrier's persist step against a real database rather than a test
 // double. The codec's blob-size test proves something about memory; this

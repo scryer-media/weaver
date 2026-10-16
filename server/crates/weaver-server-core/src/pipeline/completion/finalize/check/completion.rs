@@ -910,6 +910,7 @@ impl Pipeline {
             || self.direct_store.sets_for(job_id).iter().any(|set| {
                 !set.is_demoted()
                     && !set.is_finalized()
+                    && !set.is_delegated()
                     && set.all_volumes_complete()
                     && !set.ready_to_finalize()
             })
@@ -3260,6 +3261,13 @@ impl Pipeline {
                             let Some(path) = self.resolve_job_input_path(job_id, filename) else {
                                 continue;
                             };
+                            if self
+                                .archive_runtime
+                                .get(&job_id)
+                                .is_some_and(|runtime| runtime.retains_input_path(&path))
+                            {
+                                continue;
+                            }
                             match tokio::fs::remove_file(&path).await {
                                 Ok(()) => removed += 1,
                                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

@@ -2,6 +2,37 @@
 
 use super::*;
 
+async fn next_payload_done(pipeline: &mut Pipeline) -> ExtractionDone {
+    loop {
+        let done = next_extraction_done(pipeline).await;
+        if matches!(
+            done,
+            ExtractionDone::ScopedNamespace { .. }
+                | ExtractionDone::NativeChaseResolved {
+                    result: Ok(None),
+                    ..
+                }
+        ) {
+            pipeline.handle_extraction_done(done).await;
+        } else {
+            return done;
+        }
+    }
+}
+
+fn payload_set_name<'a>(pipeline: &'a Pipeline, done: &'a ExtractionDone) -> &'a str {
+    match done {
+        ExtractionDone::FullSet { set_name, .. }
+        | ExtractionDone::NativeChaseResolved { set_name, .. } => set_name,
+        ExtractionDone::Scoped {
+            job_id, request, ..
+        } => pipeline.archive_runtime[job_id]
+            .request_set_name(request)
+            .expect("current scoped extraction request"),
+        _ => panic!("expected an archive payload completion"),
+    }
+}
+
 #[tokio::test]
 async fn par2_metadata_immediately_rebinds_obfuscated_rar_file_identity() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -586,7 +617,7 @@ async fn clean_par2_verification_exits_verifying_for_rar_extraction() {
         Some(JobStatus::Verifying)
     );
 
-    let done = next_extraction_done(&mut pipeline).await;
+    let done = next_payload_done(&mut pipeline).await;
     match done {
         ExtractionDone::Batch {
             job_id: done_job_id,
@@ -634,17 +665,31 @@ async fn clean_par2_verification_exits_verifying_for_sevenz_extraction() {
         Some(JobStatus::Verifying)
     );
 
-    let done = next_extraction_done(&mut pipeline).await;
+    let done = next_payload_done(&mut pipeline).await;
     match &done {
         ExtractionDone::FullSet {
             job_id: done_job_id,
             result,
+            ..
+        }
+        | ExtractionDone::Scoped {
+            job_id: done_job_id,
+            result,
+            decoded: None,
             ..
         } => {
             assert_eq!(*done_job_id, job_id);
             if let Err(error) = result {
                 panic!("7z extraction failed: {error}");
             }
+        }
+        ExtractionDone::NativeChaseResolved {
+            job_id: done_job_id,
+            result: Ok(Some(outcome)),
+            ..
+        } => {
+            assert_eq!(*done_job_id, job_id);
+            assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
         }
         _ => panic!("expected 7z extraction result"),
     }
@@ -710,16 +755,31 @@ async fn clean_par2_verification_exits_verifying_for_single_sevenz_extraction() 
         Some(JobStatus::Verifying)
     );
 
-    let done = next_extraction_done(&mut pipeline).await;
+    let done = next_payload_done(&mut pipeline).await;
     match &done {
         ExtractionDone::FullSet {
             job_id: done_job_id,
-            set_name,
             result,
+            ..
+        }
+        | ExtractionDone::Scoped {
+            job_id: done_job_id,
+            result,
+            decoded: None,
+            ..
+        } => {
+            assert_eq!(*done_job_id, job_id);
+            assert_eq!(payload_set_name(&pipeline, &done), archive_filename);
+            assert!(result.is_err());
+        }
+        ExtractionDone::NativeChaseResolved {
+            job_id: done_job_id,
+            set_name,
+            result: Err(_),
+            ..
         } => {
             assert_eq!(*done_job_id, job_id);
             assert_eq!(set_name, archive_filename);
-            assert!(result.is_err());
         }
         _ => panic!("expected single 7z extraction result"),
     }
@@ -800,7 +860,7 @@ async fn clean_par2_verification_exits_verifying_for_gzip_extraction() {
         Some(JobStatus::Verifying)
     );
 
-    let done = next_extraction_done(&mut pipeline).await;
+    let done = next_payload_done(&mut pipeline).await;
     match &done {
         ExtractionDone::FullSet {
             job_id: done_job_id,
@@ -1020,7 +1080,7 @@ async fn incremental_rar_batches_survive_eager_delete_of_earlier_volumes() {
     }
 
     pipeline.try_rar_extraction(job_id).await;
-    let first_done = next_extraction_done(&mut pipeline).await;
+    let first_done = next_payload_done(&mut pipeline).await;
     match &first_done {
         ExtractionDone::Batch {
             attempted, result, ..
@@ -1043,7 +1103,7 @@ async fn incremental_rar_batches_survive_eager_delete_of_earlier_volumes() {
     write_and_complete_rar_volume(&mut pipeline, job_id, 3, &files[3].0, &files[3].1).await;
     pipeline.try_rar_extraction(job_id).await;
 
-    let second_done = next_extraction_done(&mut pipeline).await;
+    let second_done = next_payload_done(&mut pipeline).await;
     match &second_done {
         ExtractionDone::Batch {
             job_id: done_job_id,
@@ -1086,7 +1146,7 @@ async fn non_solid_incremental_rar_batches_cleanup_chunks_after_finalize() {
     }
 
     pipeline.try_rar_extraction(job_id).await;
-    let done = next_extraction_done(&mut pipeline).await;
+    let done = next_payload_done(&mut pipeline).await;
     match &done {
         ExtractionDone::Batch {
             attempted, result, ..
@@ -1166,8 +1226,8 @@ async fn non_solid_rar_set_dispatches_two_members_concurrently() {
             .collect()
     );
 
-    let first_done = next_extraction_done(&mut pipeline).await;
-    let second_done = next_extraction_done(&mut pipeline).await;
+    let first_done = next_payload_done(&mut pipeline).await;
+    let second_done = next_payload_done(&mut pipeline).await;
     let mut attempted_members = Vec::new();
     for done in [&first_done, &second_done] {
         match done {
@@ -1242,8 +1302,8 @@ async fn rar_eager_delete_waits_for_all_active_workers_in_set() {
         Some(2)
     );
 
-    let first_done = next_extraction_done(&mut pipeline).await;
-    let second_done = next_extraction_done(&mut pipeline).await;
+    let first_done = next_payload_done(&mut pipeline).await;
+    let second_done = next_payload_done(&mut pipeline).await;
 
     pipeline.handle_extraction_done(first_done).await;
     assert_eq!(
@@ -1341,8 +1401,8 @@ async fn non_solid_rar_scheduler_skips_duplicate_ready_members() {
         [first.clone(), second.clone()].into_iter().collect()
     );
 
-    let first_done = next_extraction_done(&mut pipeline).await;
-    let second_done = next_extraction_done(&mut pipeline).await;
+    let first_done = next_payload_done(&mut pipeline).await;
+    let second_done = next_payload_done(&mut pipeline).await;
     let mut attempted_members = Vec::new();
     for done in [&first_done, &second_done] {
         match done {
@@ -1478,7 +1538,7 @@ async fn non_solid_rar_scheduler_waits_for_link_dependency_source() {
         [source_member.clone()].into_iter().collect()
     );
 
-    let source_done = next_extraction_done(&mut pipeline).await;
+    let source_done = next_payload_done(&mut pipeline).await;
     pipeline.handle_extraction_done(source_done).await;
     pipeline.try_rar_extraction(job_id).await;
 
@@ -1585,8 +1645,8 @@ async fn rar_identity_rebind_preserves_in_flight_workers() {
     assert_eq!(set_state.active_workers, 2);
     assert_eq!(set_state.in_flight_members, expected_in_flight);
 
-    let first_done = next_extraction_done(&mut pipeline).await;
-    let second_done = next_extraction_done(&mut pipeline).await;
+    let first_done = next_payload_done(&mut pipeline).await;
+    let second_done = next_payload_done(&mut pipeline).await;
     pipeline.handle_extraction_done(first_done).await;
     pipeline.handle_extraction_done(second_done).await;
     let set_state = pipeline
@@ -1651,8 +1711,8 @@ async fn rar_identity_rebind_removes_empty_set_after_in_flight_workers_finish() 
     assert!(set_state.volume_files.is_empty());
     assert!(set_state.active_workers > 0);
 
-    let first_done = next_extraction_done(&mut pipeline).await;
-    let second_done = next_extraction_done(&mut pipeline).await;
+    let first_done = next_payload_done(&mut pipeline).await;
+    let second_done = next_payload_done(&mut pipeline).await;
     pipeline.handle_extraction_done(first_done).await;
     pipeline.handle_extraction_done(second_done).await;
 
@@ -1699,7 +1759,7 @@ async fn non_solid_rar_incremental_requires_member_chain_not_download_activity()
         ["E01.mkv".to_string()].into_iter().collect()
     );
 
-    let done = next_extraction_done(&mut pipeline).await;
+    let done = next_payload_done(&mut pipeline).await;
     match &done {
         ExtractionDone::Batch {
             attempted, result, ..
@@ -1814,7 +1874,7 @@ async fn rar_extraction_capacity_pressure_keeps_member_waiting_without_repair_pr
     assert_eq!(set_state.active_workers, 1);
     assert!(set_state.in_flight_members.contains("E01.mkv"));
 
-    let done = next_extraction_done(&mut pipeline).await;
+    let done = next_payload_done(&mut pipeline).await;
     pipeline.handle_extraction_done(done).await;
 }
 
@@ -1914,7 +1974,7 @@ async fn rar_full_set_capacity_pressure_retries_without_failing_job() {
         crate::pipeline::rar_state::RarSetPhase::Extracting
     ));
 
-    let done = next_extraction_done(&mut pipeline).await;
+    let done = next_payload_done(&mut pipeline).await;
     pipeline.handle_extraction_done(done).await;
 }
 
@@ -2059,7 +2119,7 @@ async fn non_solid_rar_incremental_uses_ready_plan_even_if_complete_volumes_lag(
         ["E02.mkv".to_string()].into_iter().collect()
     );
 
-    let done = next_extraction_done(&mut pipeline).await;
+    let done = next_payload_done(&mut pipeline).await;
     match &done {
         ExtractionDone::Batch {
             attempted, result, ..
@@ -2149,7 +2209,7 @@ async fn solid_rar4_pipeline_extracts_large_fixture_end_to_end() {
     write_and_complete_rar_volume(&mut pipeline, job_id, 0, "solid.rar", &fixture_bytes).await;
 
     pipeline.check_job_completion(job_id).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 4).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let dest = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(
         "RAR4 Solid End-to-End",
@@ -2361,7 +2421,7 @@ async fn partial_rar_extraction_does_not_bypass_par2_early() {
     );
 
     pipeline.try_rar_extraction(job_id).await;
-    let done = next_extraction_done(&mut pipeline).await;
+    let done = next_payload_done(&mut pipeline).await;
     match &done {
         ExtractionDone::Batch {
             attempted, result, ..
@@ -2419,7 +2479,7 @@ async fn rar_completion_prefers_incremental_batches_over_full_set_after_eager_de
     resume_job_downloading_for_test(&mut pipeline, job_id);
     pipeline.check_job_completion(job_id).await;
 
-    let done = next_extraction_done(&mut pipeline).await;
+    let done = next_payload_done(&mut pipeline).await;
     match &done {
         ExtractionDone::Batch {
             attempted, result, ..
@@ -2431,7 +2491,10 @@ async fn rar_completion_prefers_incremental_batches_over_full_set_after_eager_de
                     .is_ok_and(|outcome| outcome.failed.is_empty())
             );
         }
-        ExtractionDone::FullSet { .. } => {
+        ExtractionDone::FullSet { .. }
+        | ExtractionDone::NativeChaseResolved { .. }
+        | ExtractionDone::Scoped { .. }
+        | ExtractionDone::ScopedNamespace { .. } => {
             panic!("RAR completion should not fall back to full-set extraction here")
         }
     }
@@ -2685,7 +2748,7 @@ async fn clean_verify_retries_non_rar_full_set_extraction() {
     pipeline.check_job_completion(job_id).await;
 
     assert!(!pipeline.failed_extractions.contains_key(&job_id));
-    let done = next_extraction_done(&mut pipeline).await;
+    let done = next_payload_done(&mut pipeline).await;
     match done {
         ExtractionDone::FullSet { set_name, .. } => {
             assert_eq!(set_name, "archive.zip");
@@ -2924,13 +2987,8 @@ async fn generic_par2_repair_requeues_extraction_for_7z_and_gzip_payloads() {
             pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
             Some(JobStatus::Extracting | JobStatus::QueuedExtract)
         ));
-        let done = next_extraction_done(&mut pipeline).await;
-        match done {
-            ExtractionDone::FullSet { set_name, .. } => {
-                assert_eq!(set_name, payload_filename);
-            }
-            _ => panic!("expected full-set extraction after generic PAR2 repair"),
-        }
+        let done = next_payload_done(&mut pipeline).await;
+        assert_eq!(payload_set_name(&pipeline, &done), payload_filename);
     }
 }
 
@@ -3079,14 +3137,23 @@ async fn par2_rebuilds_a_split_7z_part_the_nzb_never_carried_and_extraction_foll
                 .expect("a completion check should be queued after repair");
             pipeline.check_job_completion(queued).await;
         }
-        match next_extraction_done(&mut pipeline).await {
-            ExtractionDone::FullSet {
-                set_name: done_set,
+        let done = next_payload_done(&mut pipeline).await;
+        assert_eq!(payload_set_name(&pipeline, &done), set_name);
+        match done {
+            ExtractionDone::FullSet { result, .. }
+            | ExtractionDone::Scoped {
                 result,
+                decoded: None,
                 ..
             } => {
-                assert_eq!(done_set, set_name);
                 let outcome = result.expect("the whole set extracts");
+                assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+                assert!(!outcome.extracted.is_empty());
+            }
+            ExtractionDone::NativeChaseResolved {
+                result: Ok(Some(outcome)),
+                ..
+            } => {
                 assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
                 assert!(!outcome.extracted.is_empty());
             }
@@ -3418,7 +3485,7 @@ async fn next_7z_extraction_or_rest(
             .get(&job_id)
             .is_some_and(|sets| !sets.is_empty())
         {
-            return Some(next_extraction_done(pipeline).await);
+            return Some(next_payload_done(pipeline).await);
         }
         if matches!(
             job_status_for_assert(pipeline, job_id),
@@ -3447,14 +3514,20 @@ async fn a_strong_decode_verified_7z_whose_extraction_hits_a_damaged_block_is_re
         strong_decode_verified_split_7z(&mut pipeline, job_id, Some(damaged)).await;
     let (damaged_name, original) = parts[damaged].clone();
 
-    let first = next_extraction_done(&mut pipeline).await;
+    let first = next_payload_done(&mut pipeline).await;
     match &first {
         ExtractionDone::FullSet {
-            set_name: extracted,
+            result: Err(error), ..
+        }
+        | ExtractionDone::Scoped {
             result: Err(error),
+            decoded: None,
             ..
+        }
+        | ExtractionDone::NativeChaseResolved {
+            result: Err(error), ..
         } => {
-            assert_eq!(extracted, set_name);
+            assert_eq!(payload_set_name(&pipeline, &first), set_name);
             assert!(
                 error.is(crate::pipeline::ExtractionErrorClass::Recoverable),
                 "the damaged block reads as a data error: {error}"
@@ -3490,8 +3563,19 @@ async fn a_strong_decode_verified_7z_whose_extraction_hits_a_damaged_block_is_re
         "the repair rebuilt the damaged part byte for byte"
     );
     match &done {
-        ExtractionDone::FullSet { result, .. } => {
+        ExtractionDone::FullSet { result, .. }
+        | ExtractionDone::Scoped {
+            result,
+            decoded: None,
+            ..
+        } => {
             let outcome = result.as_ref().expect("the repaired set extracts");
+            assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        }
+        ExtractionDone::NativeChaseResolved {
+            result: Ok(Some(outcome)),
+            ..
+        } => {
             assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
         }
         _ => panic!("expected a full-set extraction of the repaired 7z"),
@@ -3513,7 +3597,7 @@ async fn a_7z_data_error_the_recovery_data_finds_clean_fails_after_one_retry() {
     let _ = drain_job_verification_started(&mut events, job_id);
 
     let mut failures = 0;
-    let mut next = Some(next_extraction_done(&mut pipeline).await);
+    let mut next = Some(next_payload_done(&mut pipeline).await);
     while let Some(done) = next.take() {
         // Whatever the extraction really produced, it reports the same data
         // error: the shape of a defect repair cannot reach.
@@ -3523,6 +3607,34 @@ async fn a_7z_data_error_the_recovery_data_finds_clean_fails_after_one_retry() {
             } => ExtractionDone::FullSet {
                 job_id,
                 set_name,
+                result: Err(sevenz_corrupted_block_error()),
+            },
+            ExtractionDone::Scoped {
+                job_id,
+                owner,
+                request,
+                decoded: None,
+                ..
+            } => ExtractionDone::Scoped {
+                job_id,
+                owner,
+                request,
+                decoded: None,
+                result: Err(sevenz_corrupted_block_error()),
+            },
+            ExtractionDone::NativeChaseResolved {
+                job_id,
+                set_name,
+                owner,
+                kind,
+                retirement,
+                ..
+            } => ExtractionDone::NativeChaseResolved {
+                job_id,
+                set_name,
+                owner,
+                kind,
+                retirement,
                 result: Err(sevenz_corrupted_block_error()),
             },
             _ => panic!("expected a full-set 7z extraction"),
@@ -3673,7 +3785,7 @@ async fn a_strong_decode_verified_gzip_whose_extraction_fails_is_repaired_once()
     let (working_dir, archive_filename, original) =
         strong_decode_verified_gzip(&mut pipeline, job_id, true).await;
 
-    let first = next_extraction_done(&mut pipeline).await;
+    let first = next_payload_done(&mut pipeline).await;
     match &first {
         ExtractionDone::FullSet {
             set_name,
@@ -3710,7 +3822,12 @@ async fn a_strong_decode_verified_gzip_whose_extraction_fails_is_repaired_once()
         "the repair rebuilt the archive byte for byte"
     );
     match &done {
-        ExtractionDone::FullSet { result, .. } => {
+        ExtractionDone::FullSet { result, .. }
+        | ExtractionDone::Scoped {
+            result,
+            decoded: None,
+            ..
+        } => {
             let outcome = result.as_ref().expect("the repaired set extracts");
             assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
         }
@@ -3734,7 +3851,7 @@ async fn a_gzip_failure_the_recovery_data_finds_clean_is_final_after_one_fallbac
     let injected = "gzip stream ended in a corrupt deflate block";
 
     let mut failures = 0;
-    let mut next = Some(next_extraction_done(&mut pipeline).await);
+    let mut next = Some(next_payload_done(&mut pipeline).await);
     while let Some(done) = next.take() {
         // Whatever the extraction really produced, it reports the same
         // failure: the shape of a defect repair cannot reach.
@@ -3835,7 +3952,7 @@ async fn colliding_member_paths_fail_the_job_instead_of_respinning_extraction() 
     pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
 
     pipeline.check_job_completion(job_id).await;
-    drive_extractions_to_terminal(&mut pipeline, job_id, 6).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id).await;
 
     let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) else {
         panic!(

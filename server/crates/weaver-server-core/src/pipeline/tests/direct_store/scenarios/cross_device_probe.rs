@@ -602,6 +602,17 @@ async fn demoting_a_carrying_set_clears_the_carry_and_the_ticket_slots() {
     let (mut pipeline, _working_dir) =
         live_damaged_direct_job(&temp_dir, job_id, &volumes, &par2_bytes, None).await;
 
+    assert!(matches!(
+        pipeline.db.load_archive_authority(job_id).unwrap(),
+        crate::jobs::archive_checkpoint::ArchiveAuthority::Legacy(_)
+    ));
+    assert!(
+        !pipeline
+            .direct_store
+            .sets_for(job_id)
+            .iter()
+            .any(|set| set.has_nested_checkpoint_authority())
+    );
     assert_eq!(
         pipeline.direct_store.repair_attempts, 1,
         "non-vacuity: the set must have had its one real repair, or there is \

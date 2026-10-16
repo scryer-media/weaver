@@ -1957,6 +1957,7 @@ async fn restore_job_reemits_open_download_finalization_and_drains_it() {
     );
     let working_dir = temp_dir.path().join("restore-finalizing-download");
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    persist_restore_fixture(&pipeline, job_id, &spec, &working_dir);
 
     pipeline
         .db
@@ -2052,6 +2053,7 @@ async fn restore_paused_postprocessing_target_normalizes_to_downloading() {
     let spec = standalone_job_spec("Restore paused", &[("sample.bin".to_string(), 100)]);
     let working_dir = temp_dir.path().join("restore-paused");
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    persist_restore_fixture(&pipeline, job_id, &spec, &working_dir);
 
     pipeline
         .restore_job(RestoreJobRequest {

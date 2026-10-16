@@ -1653,6 +1653,7 @@ mod disk_windows;
 mod donors;
 mod identity;
 pub(in crate::pipeline) mod inside;
+pub(in crate::pipeline) mod namespace;
 pub(in crate::pipeline) mod outcome;
 mod outputs;
 pub(in crate::pipeline) mod paths;
