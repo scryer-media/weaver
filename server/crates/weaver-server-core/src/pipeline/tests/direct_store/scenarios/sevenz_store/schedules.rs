@@ -41,23 +41,19 @@ fn sevenz_number(bytes: &[u8], at: &mut usize) -> u64 {
 
 // The archive byte ranges a reader needs before it knows the container's
 // layout: the start header, the end header it points at, and, when that end
-// header only names a compressed header stored earlier, that stream too. An
-// encrypted header refuses the set from the end header alone, so its stream
-// is never needed.
+// header only names an encoded header stored earlier, that stream too. An
+// encrypted header is such a stream: the set is read from it once the
+// password opens it.
 fn map_extents(archive: &[u8]) -> Vec<(usize, usize)> {
     const SIGNATURE_HEADER: usize = 32;
     const ENCODED_HEADER: u8 = 0x17;
     const PACK_INFO: u8 = 0x06;
-    const AES_CODER: [u8; 4] = [0x06, 0xF1, 0x07, 0x01];
     let offset = u64::from_le_bytes(archive[12..20].try_into().unwrap()) as usize;
     let size = u64::from_le_bytes(archive[20..28].try_into().unwrap()) as usize;
     let start = SIGNATURE_HEADER + offset;
     let header = &archive[start..start + size];
     let mut extents = vec![(0, SIGNATURE_HEADER), (start, start + size)];
-    if header.first() == Some(&ENCODED_HEADER)
-        && header.get(1) == Some(&PACK_INFO)
-        && !header.windows(AES_CODER.len()).any(|id| id == AES_CODER)
-    {
+    if header.first() == Some(&ENCODED_HEADER) && header.get(1) == Some(&PACK_INFO) {
         let mut at = 2;
         let pack_position = sevenz_number(header, &mut at) as usize;
         let streams = sevenz_number(header, &mut at);
@@ -269,6 +265,8 @@ async fn run_shape(
     let mut spec = sevenz_job_spec(&volumes, 4 / count);
     spec.password = password.map(str::to_owned);
     let wanted = expected.keys().copied().collect::<Vec<_>>();
+    // AES over `Copy` is the member's bytes once deciphered in place, under a
+    // plain header or one the password opens.
     let direct_compatible = matches!(
         shape,
         Shape::Copy
@@ -278,6 +276,8 @@ async fn run_shape(
             | Shape::Multiple
             | Shape::EmptyEntry
             | Shape::Nested
+            | Shape::EncryptedCopy
+            | Shape::EncryptedHeaders
     ) || (matches!(shape, Shape::CopyObfuscated)
         && options.recovery != RecoveryFormat::Par3);
     // A 7z set's layout lives in articles of its own: the start header opens
@@ -331,13 +331,9 @@ async fn run_shape(
                 matches!(reason, DemotionReason::SevenZip(SevenZipRefusal::Coder))
             })
         },
-        // Ciphertext is not the member's bytes either, and a header that is
-        // itself encrypted hides the layout.
-        Shape::EncryptedCopy
-        | Shape::EncryptedHeaders
-        | Shape::EncryptedLzma2
-        | Shape::SolidEncrypted
-        | Shape::SolidHeaders => Route {
+        // Coder output under a cipher is no more the archive's bytes than
+        // without one.
+        Shape::EncryptedLzma2 | Shape::SolidEncrypted | Shape::SolidHeaders => Route {
             unmapped_loss,
             ..Route::refused(|reason| {
                 matches!(
