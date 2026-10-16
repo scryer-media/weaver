@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 mod password_candidates;
+pub(in crate::pipeline) mod positional;
 use password_candidates::extract_7z_with_password_candidates;
 pub(in crate::pipeline) mod sequential;
 
@@ -2129,7 +2130,7 @@ pub(in crate::pipeline) async fn install_direct_unpack(
         crate::pipeline::direct_unpack::wiring::ChaseDisposition::Ready(outcome) => {
             Some((*outcome).into_installable())
         }
-        crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(pending) => {
+        crate::pipeline::direct_unpack::wiring::ChaseDisposition::Pending(mut pending) => {
             // Every part is complete by now, so this is finishing at
             // disk speed rather than at download speed — but "should
             // finish quickly" is not a guarantee, and this await used to
@@ -2194,12 +2195,26 @@ pub(in crate::pipeline) async fn install_direct_unpack(
                     None
                 }
                 Some(joined) => match joined {
-                    Ok(Ok(outcome)) => Some((
-                        outcome,
-                        pending.staging_dir,
-                        pending.counters.total_bytes.load(Ordering::Relaxed),
-                        pending.counters.completed_bytes.load(Ordering::Relaxed),
-                    )),
+                    Ok(Ok(outcome)) => {
+                        // The worker has joined. Keep its guarded positional
+                        // output active through publication; cancellation still
+                        // owns every failure and abandoned handoff above.
+                        let positional = pending
+                            .positional
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .take();
+                        if positional.is_some() {
+                            pending.cancel_on_drop.completed();
+                        }
+                        Some((
+                            outcome,
+                            pending.staging_dir,
+                            pending.counters.total_bytes.load(Ordering::Relaxed),
+                            pending.counters.completed_bytes.load(Ordering::Relaxed),
+                            positional,
+                        ))
+                    }
                     Ok(Err(error)) => {
                         tracing::debug!(
                             job_id = job_id.0,
@@ -2237,7 +2252,7 @@ pub(in crate::pipeline) async fn install_direct_unpack(
     // this whole path already runs on an extraction task shutdown does not
     // join, and the maintenance sweep collects a tree an exit interrupts once
     // its job is gone.
-    if let Some((outcome, chase_staging, total_bytes, completed_bytes)) = chase {
+    if let Some((outcome, chase_staging, total_bytes, completed_bytes, positional)) = chase {
         if expected_names.is_some_and(|expected| {
             outcome.extracted.iter().cloned().collect::<HashSet<_>>() != *expected
         }) {
@@ -2269,7 +2284,16 @@ pub(in crate::pipeline) async fn install_direct_unpack(
         // place, so a failed one leaves it behind for this path to retire.
         let retired_staging = chase_staging.clone();
         let install = tokio::task::spawn_blocking(move || {
-            if let Some(names) = rar_names {
+            if let Some(handoff) = positional {
+                handoff
+                    .manifest
+                    .publish(&handoff.epoch, &staging_for_install)
+                    .map_err(|error| error.to_string())?;
+                // Only this generation's private metadata tree is retired.
+                // Provisional payload was already written in the destination.
+                let _ = std::fs::remove_dir_all(&chase_staging);
+                Ok(())
+            } else if let Some(names) = rar_names {
                 crate::pipeline::direct_unpack::rar::install(
                     &chase_staging,
                     &staging_for_install,

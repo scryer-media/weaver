@@ -5,7 +5,7 @@
 
 use super::*;
 use par3_rs::creation::{
-    CreationCodec, CreationDurability, CreationOptions, CreationPlan, CreationSource, Deduplication,
+    CreationCodec, CreationOptions, CreationPlan, CreationSource, Deduplication,
 };
 use par3_rs::session::RepairStatus;
 use par3_rs::source::MemorySourceAccess;
@@ -218,10 +218,9 @@ impl Fixture {
             );
         }
         let paths = plan
-            .execute_with_durability(
+            .execute(
                 &self._root.path().join(format!("{stem}.par3")),
                 self._root.path(),
-                CreationDurability::Buffered,
             )
             .unwrap();
         self.carriers
