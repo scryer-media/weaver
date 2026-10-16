@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 import { useClient, useMutation, useQuery } from "urql";
 import {
   ADD_SERVER_MUTATION,
@@ -225,6 +225,7 @@ export function ProvidersPanel() {
   const [, resetQuota] = useMutation(RESET_SERVER_DOWNLOAD_QUOTA_USAGE_MUTATION);
   const [, testConnection] = useMutation(TEST_CONNECTION_MUTATION);
   const client = useClient();
+  const navigate = useNavigate();
 
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
   const editorSession = useRef(0);
@@ -435,29 +436,31 @@ export function ProvidersPanel() {
     setEditingId("new");
   };
 
+  const editProvider = (id: number) => {
+    closeEditor();
+    setForm(null);
+    setTestResult(null);
+    setEditingId(id);
+  };
+
   const blocks: SettingsBlock[] = [
     {
       kind: "table",
       id: "servers",
       title: t("next.providers.servers"),
       note: t("next.settings.panel.serversNote"),
-      columns: "minmax(0, 1fr) 132px 190px 150px 92px 44px",
+      columns: "minmax(0, 1.2fr) 132px minmax(0, 1fr) minmax(0, 0.8fr) 92px 272px",
       headers: [
         t("next.providers.host"),
         t("next.providers.connections"),
         t("next.providers.transport"),
         t("next.providers.role"),
-        "",
+        t("next.providers.enabled"),
         "",
       ],
       empty: t("next.providers.empty"),
       add: { label: t("next.providers.add"), onClick: addProvider },
-      onRowClick: (id) => {
-        closeEditor();
-        setForm(null);
-        setTestResult(null);
-        setEditingId(Number(id));
-      },
+      onRowClick: (id) => editProvider(Number(id)),
       rows: servers.map((server) => ({
         id: String(server.id),
         searchText: `${server.host} ${server.port} ${roleLabel(t, server)} ${transportLabel(t, server)}`,
@@ -474,16 +477,6 @@ export function ProvidersPanel() {
             {transportLabel(t, server)}
           </Cell>,
           <Cell key="role">{roleLabel(t, server)}</Cell>,
-          <span key="speed" onClick={(event) => event.stopPropagation()}>
-            <Link
-              to={speedPage(`server:${server.id}`)}
-              aria-label={t("next.networking.speed.testServer", { host: server.host })}
-              className="inline-flex items-center gap-[5px] font-wv-mono text-[12px] text-wv-accent hover:underline"
-            >
-              <Icon name="speedTest" size={12} className="flex-none" />
-              {t("next.networking.speed.title")}
-            </Link>
-          </span>,
           <span key="active" onClick={(event) => event.stopPropagation()}>
             <Toggle
               size="table"
@@ -491,6 +484,18 @@ export function ProvidersPanel() {
               onChange={(next) => void setActive(server, next)}
               label={t("next.providers.enabledAria", { host: server.host })}
             />
+          </span>,
+          <span key="actions" className="ml-auto flex gap-2" onClick={(event) => event.stopPropagation()}>
+            <SecondaryButton
+              size="compact"
+              icon="speedTest"
+              onClick={() => void navigate(speedPage(`server:${server.id}`))}
+            >
+              {t("next.networking.speed.title")}
+            </SecondaryButton>
+            <SecondaryButton size="compact" icon="edit" onClick={() => editProvider(server.id)}>
+              {t("next.providers.edit")}
+            </SecondaryButton>
           </span>,
         ],
       })),
