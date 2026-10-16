@@ -24,7 +24,7 @@ impl NestedGraph {
         receipt: MemberPlacement,
     ) -> Result<Vec<SourceSpan>, DemotionReason> {
         let chain = self.validate_member_placement(root, receipt)?;
-        Ok(self.apply_member_placement(receipt, chain))
+        self.apply_member_placement(receipt, chain)
     }
 
     pub(super) fn validate_member_placement(
@@ -94,12 +94,12 @@ impl NestedGraph {
         &mut self,
         receipt: MemberPlacement,
         chain: Vec<(u32, SourceSpan)>,
-    ) -> Vec<SourceSpan> {
+    ) -> Result<Vec<SourceSpan>, DemotionReason> {
         if let Some(raw) = receipt.owner.raw_child {
             self.node_mut(raw.node)
                 .inputs
                 .get_mut(&raw.volume)
-                .expect("validated input")
+                .ok_or(DemotionReason::ConflictingVolumeFacts)?
                 .raw_placed
                 .insert(receipt.offset, receipt.len);
         }
@@ -111,12 +111,12 @@ impl NestedGraph {
                 self.node_mut(owner)
                     .inputs
                     .get_mut(&source.volume)
-                    .expect("validated input")
+                    .ok_or(DemotionReason::ConflictingVolumeFacts)?
                     .placed
                     .insert(source.offset, source.len);
             }
         }
         root_sources.sort_by_key(|span| span.write_offset);
-        root_sources
+        Ok(root_sources)
     }
 }

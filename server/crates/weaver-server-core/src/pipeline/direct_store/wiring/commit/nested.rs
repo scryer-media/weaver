@@ -1,13 +1,81 @@
 use super::*;
+use crate::pipeline::extraction::runtime::decoded::NamespaceProgress;
+use crate::pipeline::extraction::runtime::rearm::RearmRead;
+use crate::pipeline::extraction::runtime::{
+    ArchiveRuntime, NamespaceWork, RuntimeError, VirtualInputSource, limits,
+};
+use crate::pipeline::extraction::session::InputVersion;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+fn placement_error(step: &'static str) -> impl FnOnce(DirectPlacementError) -> RuntimeError {
+    move |error| match error {
+        DirectPlacementError::Sparse { error, .. } | DirectPlacementError::Write(error) => {
+            RuntimeError::io(step)(error)
+        }
+    }
+}
+
+fn open_staging_root(
+    staging: &std::path::Path,
+) -> Result<Arc<crate::pipeline::extraction::ExtractionRoot>, RuntimeError> {
+    crate::pipeline::extraction::ExtractionRoot::open(staging)
+        .map(Arc::new)
+        .map_err(RuntimeError::refused("staging root"))
+}
+
+// The work a live child archive runs, read through its parent's gate.
+fn child_work(
+    set_name: &str,
+    child: crate::pipeline::direct_store::set::LiveChildDescription,
+    destination: PathBuf,
+) -> NamespaceWork {
+    let source = VirtualInputSource {
+        root_set: set_name.to_owned(),
+        node: child.node,
+    };
+    NamespaceWork {
+        kind: match child.format {
+            crate::pipeline::direct_store::plan::SetFormat::Rar => {
+                crate::jobs::assembly::ArchiveType::Rar
+            }
+            crate::pipeline::direct_store::plan::SetFormat::SevenZip => {
+                crate::jobs::assembly::ArchiveType::SevenZip
+            }
+        },
+        set_name: child.set_name,
+        volumes: child.input_names.keys().copied().collect(),
+        input_names: child.input_names.into_values().collect(),
+        inputs: Vec::new(),
+        original_inputs: Vec::new(),
+        virtual_source: Some(source.clone()),
+        original_virtual_source: Some(source),
+        output: PathBuf::new(),
+        destination,
+        outputs: Default::default(),
+        root_set: None,
+        ordinary: Vec::new(),
+        selected_password: None,
+    }
+}
+
 impl Pipeline {
+    // Reports the failure as the sentence the job fails with.
     pub(crate) async fn refresh_direct_live_inputs(
         &mut self,
         job_id: JobId,
         set_name: &str,
     ) -> Result<(), String> {
+        self.refresh_live_inputs(job_id, set_name)
+            .await
+            .map_err(String::from)
+    }
+
+    async fn refresh_live_inputs(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+    ) -> Result<(), RuntimeError> {
         let Some(set) = self
             .direct_store
             .sets_mut(job_id)
@@ -47,13 +115,13 @@ impl Pipeline {
         let working = self
             .jobs
             .get(&job_id)
-            .ok_or("missing direct job")?
+            .ok_or(RuntimeError::Invariant("direct job"))?
             .working_dir
             .clone();
         self.publish_scoped_namespace(
             job_id,
             set_name,
-            crate::pipeline::extraction::runtime::decoded::NamespaceProgress {
+            NamespaceProgress {
                 producers,
                 children,
             },
@@ -68,107 +136,26 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         set_name: &str,
-        progress: crate::pipeline::extraction::runtime::decoded::NamespaceProgress,
+        progress: NamespaceProgress,
         working: PathBuf,
         destination: PathBuf,
         speculative: Option<crate::pipeline::extraction::output::channel::StreamOwner>,
-    ) -> Result<(), String> {
-        let crate::pipeline::extraction::runtime::decoded::NamespaceProgress {
+    ) -> Result<(), RuntimeError> {
+        let NamespaceProgress {
             producers,
             children,
         } = progress;
-        use crate::pipeline::extraction::runtime::{
-            ArchiveRuntime, NamespaceWork, VirtualInputSource,
-        };
-        use crate::pipeline::extraction::session::InputVersion;
         let runtime = self
             .archive_runtime
             .entry(job_id)
             .or_insert_with(ArchiveRuntime::new);
         runtime.set_roots(working, destination.clone());
-        // Capture the previous execution mode before the binding pass admits
-        // fresh child keys. A direct producer becoming a decoder invalidates
-        // every result produced below its previous interpretation.
-        for child in &children {
-            runtime
-                .prepare_graph_decoder(set_name, child.node, child.parent)
-                .await
-                .map_err(|error| format!("direct child transition: {error:?}"))?;
-        }
-        let mut bindings: Vec<_> = producers
-            .iter()
-            .map(|&(node, parent, generation, _)| (node, parent, generation))
-            .chain(
-                children
-                    .iter()
-                    .map(|child| (child.node, Some(child.parent), child.generation)),
-            )
-            .collect();
-        bindings.sort_by_key(|entry| entry.0);
-        for (node, parent, _generation) in bindings {
-            runtime
-                .graph_lease(set_name, node, parent, InputVersion(0))
-                .map_err(|error| format!("direct namespace admission: {error:?}"))?;
-        }
+        runtime
+            .bind_namespace(set_name, &producers, &children)
+            .await?;
         for child in children {
-            if self.archive_runtime[&job_id].graph_source_replaced(set_name, child.node) {
-                continue;
-            }
-            let key = (set_name.to_owned(), child.node);
-            let fresh = !self.archive_runtime[&job_id].gates.contains_key(&key);
-            let runtime = self
-                .archive_runtime
-                .get_mut(&job_id)
-                .expect("admitted runtime");
-            let input = runtime.gates.entry(key).or_default().clone();
-            input.publish(
-                child.parts,
-                child.roster_closed,
-                &self.process_memory_budget,
-            )?;
-            if fresh && !runtime.has_replay_source(set_name, child.node) {
-                let lease = runtime
-                    .graph_lease(set_name, child.node, Some(child.parent), InputVersion(0))
-                    .map_err(|error| format!("direct child admission: {error:?}"))?;
-                let source = VirtualInputSource {
-                    root_set: set_name.to_owned(),
-                    node: child.node,
-                };
-                let work = NamespaceWork {
-                    kind: match child.format {
-                        crate::pipeline::direct_store::plan::SetFormat::Rar => {
-                            crate::jobs::assembly::ArchiveType::Rar
-                        }
-                        crate::pipeline::direct_store::plan::SetFormat::SevenZip => {
-                            crate::jobs::assembly::ArchiveType::SevenZip
-                        }
-                    },
-                    set_name: child.set_name,
-                    volumes: child.input_names.keys().copied().collect(),
-                    input_names: child.input_names.into_values().collect(),
-                    inputs: Vec::new(),
-                    original_inputs: Vec::new(),
-                    virtual_source: Some(source.clone()),
-                    original_virtual_source: Some(source),
-                    output: PathBuf::new(),
-                    destination: destination.clone(),
-                    outputs: Default::default(),
-                    root_set: None,
-                    ordinary: Vec::new(),
-                    selected_password: None,
-                };
-                self.archive_runtime
-                    .get_mut(&job_id)
-                    .expect("admitted runtime")
-                    .consumed
-                    .extend(work.input_names.iter().cloned());
-                self.spawn_scoped_live_extraction(job_id, work, lease, input)
-                    .await?;
-                if let Some(parent) = speculative {
-                    let runtime = self.archive_runtime.get_mut(&job_id).expect("runtime");
-                    runtime.mark_namespace_speculative(set_name, parent);
-                }
-            }
+            self.open_child_gate(job_id, set_name, child, &destination, speculative)
+                .await?;
         }
         Box::pin(self.resume_scoped_replay(job_id)).await?;
         for (node, _, _, verified) in producers {
@@ -177,10 +164,61 @@ impl Pipeline {
                     .await?;
             }
         }
-        self.drain_scoped_repairs(job_id).await
+        self.drain_repairs(job_id).await
     }
 
+    // Publishes the child's parts to its gate, and starts its extraction the
+    // first time the gate opens.
+    async fn open_child_gate(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        mut child: crate::pipeline::direct_store::set::LiveChildDescription,
+        destination: &std::path::Path,
+        speculative: Option<crate::pipeline::extraction::output::channel::StreamOwner>,
+    ) -> Result<(), RuntimeError> {
+        let runtime = self
+            .archive_runtime
+            .get_mut(&job_id)
+            .ok_or(RuntimeError::Invariant("admitted archive runtime"))?;
+        if runtime.graph_source_replaced(set_name, child.node) {
+            return Ok(());
+        }
+        let key = (set_name.to_owned(), child.node);
+        let fresh = !runtime.gates.contains_key(&key);
+        let input = runtime.gates.entry(key).or_default().clone();
+        input
+            .publish(
+                std::mem::take(&mut child.parts),
+                child.roster_closed,
+                &self.process_memory_budget,
+            )
+            .map_err(RuntimeError::refused("child gate publication"))?;
+        if !fresh || runtime.has_replay_source(set_name, child.node) {
+            return Ok(());
+        }
+        let lease = runtime
+            .graph_lease(set_name, child.node, Some(child.parent), InputVersion(0))
+            .map_err(RuntimeError::session("direct child admission"))?;
+        let work = child_work(set_name, child, destination.to_owned());
+        runtime.consumed.extend(work.input_names.iter().cloned());
+        self.spawn_scoped_live_extraction(job_id, work, lease, input)
+            .await
+            .map_err(RuntimeError::refused("child extraction spawn"))?;
+        if let Some(parent) = speculative
+            && let Some(runtime) = self.archive_runtime.get_mut(&job_id)
+        {
+            runtime.mark_namespace_speculative(set_name, parent);
+        }
+        Ok(())
+    }
+
+    // Reports the failure as the sentence the job fails with.
     pub(crate) async fn drain_scoped_repairs(&mut self, job_id: JobId) -> Result<(), String> {
+        self.drain_repairs(job_id).await.map_err(String::from)
+    }
+
+    async fn drain_repairs(&mut self, job_id: JobId) -> Result<(), RuntimeError> {
         let Some(runtime) = self.archive_runtime.get_mut(&job_id) else {
             return Ok(());
         };
@@ -189,24 +227,26 @@ impl Pipeline {
             if !self.virtual_repair_ready(job_id, &work) {
                 self.archive_runtime
                     .get_mut(&job_id)
-                    .expect("admitted runtime")
+                    .ok_or(RuntimeError::Invariant("admitted archive runtime"))?
                     .deferred_repairs
                     .push((owner, work));
                 continue;
             }
-            if !Box::pin(self.repair_scoped_failure_with_inventory(
+            let changed = Box::pin(self.repair_scoped_failure_with_inventory(
                 job_id,
                 owner,
                 work,
                 Default::default(),
             ))
-            .await?
-            {
-                self.archive_runtime
-                    .get_mut(&job_id)
-                    .expect("admitted runtime")
-                    .fail(owner);
-                return Err("nested archive recovery could not change the failed input".into());
+            .await
+            .map_err(RuntimeError::refused("nested archive recovery"))?;
+            if !changed {
+                if let Some(runtime) = self.archive_runtime.get_mut(&job_id) {
+                    runtime.fail(owner);
+                }
+                return Err(RuntimeError::Invariant(
+                    "nested archive recovery could not change the failed input",
+                ));
             }
         }
         Ok(())
@@ -216,10 +256,7 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         set_index: usize,
-    ) -> Result<(), String> {
-        use std::io::{Read, Seek, SeekFrom};
-        trait Input: Read + Seek {}
-        impl<T: Read + Seek> Input for T {}
+    ) -> Result<(), RuntimeError> {
         let Some(set) = self.direct_store.set(job_id, set_index) else {
             return Ok(());
         };
@@ -229,47 +266,23 @@ impl Pipeline {
         }
         let staging = set.plan().destination_dir.clone();
         let budget = self.extraction_budget(job_id, &staging)?;
-        let root = Arc::new(crate::pipeline::extraction::ExtractionRoot::open(&staging)?);
+        let root = open_staging_root(&staging)?;
         for plan in plans {
-            let memory = budget
-                .try_reserve_memory(64 * 1024)
-                .ok_or("nested gate rearm memory admission unavailable")?;
-            let task = budget
-                .task_permit_for_root(Arc::clone(&root))
-                .map_err(|error| error.to_string())?;
-            let (node, generation) = (plan.node, plan.generation);
-            let (root, staging, budget) = (Arc::clone(&root), staging.clone(), Arc::clone(&budget));
-            let (runs, checksums) = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
-                let (_memory, _task) = (memory, task);
-                let mut buffer = vec![0; 64 * 1024];
-                let mut checksums = Vec::with_capacity(plan.runs.len());
-                for run in &plan.runs {
-                    let mut input: Box<dyn Input> = if let Some(image) = plan.nested.get(&run.member_id) {
-                        Box::new(crate::pipeline::direct_store::provider::VirtualVolumeReader::<true>::new(image.clone(), Arc::default()))
-                    } else {
-                        let path = plan.physical.get(&run.member_id).ok_or_else(|| std::io::Error::other("rearm member backing absent"))?;
-                        let relative = path.strip_prefix(&staging).map_err(std::io::Error::other)?;
-                        Box::new(root.open_input(relative)?.into_std())
-                    };
-                    input.seek(SeekFrom::Start(run.logical_offset))?;
-                    let mut hash = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
-                    let mut remaining = run.len;
-                    while remaining != 0 {
-                        budget.check_active_io()?;
-                        let count = remaining.min(buffer.len() as u64) as usize;
-                        input.read_exact(&mut buffer[..count])?;
-                        hash.update(&buffer[..count]);
-                        remaining -= count as u64;
-                    }
-                    checksums.push(hash.finalize() as u32);
-                }
-                Ok((plan.runs, checksums))
-            }).await.map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+            let (runs, checksums) = RearmRead {
+                runs: plan.runs,
+                physical: plan.physical,
+                nested: plan.nested,
+                root: Arc::clone(&root),
+                base: staging.clone(),
+                budget: Arc::clone(&budget),
+            }
+            .checksum()
+            .await?;
             self.direct_store
                 .set_mut(job_id, set_index)
-                .ok_or("direct root vanished during gate rearm")?
-                .apply_graph_rearm(node, generation, &runs, checksums)
-                .map_err(|error| format!("nested gate rearm rejected: {error:?}"))?;
+                .ok_or(RuntimeError::Invariant("direct root during gate rearm"))?
+                .apply_graph_rearm(plan.node, plan.generation, &runs, checksums)
+                .map_err(RuntimeError::routing("nested gate rearm"))?;
         }
         Ok(())
     }
@@ -277,7 +290,7 @@ impl Pipeline {
     pub(super) async fn promote_direct_archive_graph(
         &mut self,
         job_id: JobId,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let sets = self.direct_store.sets_for(job_id);
         let live: Vec<_> = sets
             .iter()
@@ -295,7 +308,7 @@ impl Pipeline {
                 .iter()
                 .any(|(_, set)| !set.nested_replay_members().is_empty())
             {
-                self.replay_direct_archive_prefixes(job_id).await?;
+                self.replay_archive_prefixes(job_id).await?;
                 self.commit_archive_graph(job_id).await?;
             }
             return Ok(());
@@ -326,10 +339,20 @@ impl Pipeline {
         self.commit_archive_graph(job_id).await
     }
 
+    // Reports the failure as the sentence the job fails with.
     pub(crate) async fn replay_direct_archive_prefixes(
         &mut self,
         job_id: JobId,
     ) -> Result<(), String> {
+        self.replay_archive_prefixes(job_id)
+            .await
+            .map_err(String::from)
+    }
+
+    pub(crate) async fn replay_archive_prefixes(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<(), RuntimeError> {
         let indices: Vec<_> = self
             .direct_store
             .sets_for(job_id)
@@ -345,69 +368,47 @@ impl Pipeline {
             .map(|(index, _)| index)
             .collect();
         for index in indices {
-            self.await_direct_placement_io(job_id, index).await;
-            let staging = self
-                .direct_store
-                .set(job_id, index)
-                .ok_or("direct root vanished during replay")?
-                .plan()
-                .destination_dir
-                .clone();
-            let budget = self.extraction_budget(job_id, &staging)?;
-            let _memory = budget
-                .try_reserve_memory(64 * 1024)
-                .ok_or("nested replay memory admission unavailable")?;
-            let members = self
-                .direct_store
-                .set(job_id, index)
-                .ok_or("direct root vanished during graph replay")?
-                .nested_replay_members();
-            for (member, path, ranges) in members {
-                let parent = path
-                    .parent()
-                    .ok_or("replay member has no parent")?
-                    .to_path_buf();
-                let name = path
-                    .file_name()
-                    .ok_or("replay member has no name")?
-                    .to_owned();
-                let file = tokio::task::spawn_blocking(move || {
-                    crate::pipeline::extraction::ExtractionRoot::open(&parent)
-                        .map_err(std::io::Error::other)?
-                        .open_input(std::path::Path::new(&name))
-                        .map(|file| file.into_std())
-                })
-                .await
-                .map_err(|error| error.to_string())?
-                .map_err(|error| error.to_string())?;
-                let mut file = tokio::fs::File::from_std(file);
-                for (start, end) in ranges {
-                    file.seek(std::io::SeekFrom::Start(start))
+            self.replay_set_prefix(job_id, index).await?;
+        }
+        Ok(())
+    }
+
+    async fn replay_set_prefix(&mut self, job_id: JobId, index: usize) -> Result<(), RuntimeError> {
+        const VANISHED: RuntimeError = RuntimeError::Invariant("direct root during graph replay");
+        self.await_direct_placement_io(job_id, index).await;
+        let set = self.direct_store.set(job_id, index).ok_or(VANISHED)?;
+        let staging = set.plan().destination_dir.clone();
+        let members = set.nested_replay_members();
+        let budget = self.extraction_budget(job_id, &staging)?;
+        let _memory = budget
+            .try_reserve_memory(limits::MATERIALIZATION_PERMIT_BYTES)
+            .ok_or(RuntimeError::Admission("nested replay"))?;
+        for (member, path, ranges) in members {
+            let mut file = open_replay_member(path).await?;
+            for (start, end) in ranges {
+                file.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(RuntimeError::io("nested replay seek"))?;
+                let mut offset = start;
+                while offset < end {
+                    budget
+                        .check_active_io()
+                        .map_err(RuntimeError::io("nested replay"))?;
+                    let size = (end - offset).min(limits::MATERIALIZATION_PERMIT_BYTES) as usize;
+                    let mut bytes = vec![0; size];
+                    file.read_exact(&mut bytes)
                         .await
-                        .map_err(|error| error.to_string())?;
-                    let mut offset = start;
-                    while offset < end {
-                        budget
-                            .check_active_io()
-                            .map_err(|error| error.to_string())?;
-                        let size = (end - offset).min(64 * 1024) as usize;
-                        let mut bytes = vec![0; size];
-                        file.read_exact(&mut bytes)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        let spans = self
-                            .direct_store
-                            .set_mut(job_id, index)
-                            .ok_or("direct root vanished during graph replay")?
-                            .forward_existing_member(member, offset, bytes.into())
-                            .map_err(|error| format!("nested replay refused: {error:?}"))?;
-                        self.try_place_direct_spans(job_id, index, &spans)
-                            .await
-                            .map_err(|error| {
-                                format!("nested replay placement failed: {error:?}")
-                            })?;
-                        offset += size as u64;
-                    }
+                        .map_err(RuntimeError::io("nested replay read"))?;
+                    let spans = self
+                        .direct_store
+                        .set_mut(job_id, index)
+                        .ok_or(VANISHED)?
+                        .forward_existing_member(member, offset, bytes.into())
+                        .map_err(RuntimeError::routing("nested replay"))?;
+                    self.try_place_direct_spans(job_id, index, &spans)
+                        .await
+                        .map_err(placement_error("nested replay placement"))?;
+                    offset += size as u64;
                 }
             }
         }
@@ -418,7 +419,7 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         set_index: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         self.await_direct_placement_io(job_id, set_index).await;
         loop {
             let Some(set) = self.direct_store.set(job_id, set_index) else {
@@ -431,18 +432,18 @@ impl Pipeline {
             let need = plan
                 .writes()
                 .try_fold(0u64, |total, (_, write)| total.checked_add(write.len))
-                .ok_or("nested materialization byte count overflow")?;
+                .ok_or(RuntimeError::Invariant(
+                    "nested materialization byte count overflow",
+                ))?;
             let budget = self.extraction_budget(job_id, &staging)?;
             if need > budget.job_limit_bytes() {
-                return Err("nested materialization exceeds job disk admission".into());
+                return Err(RuntimeError::Admission("nested materialization disk"));
             }
             let memory = budget
-                .try_reserve_memory(64 * 1024)
-                .ok_or("nested materialization memory admission unavailable")?;
-            let root = Arc::new(crate::pipeline::extraction::ExtractionRoot::open(&staging)?);
-            let task = budget
-                .task_permit_for_root(Arc::clone(&root))
-                .map_err(|error| error.to_string())?;
+                .try_reserve_memory(limits::MATERIALIZATION_PERMIT_BYTES)
+                .ok_or(RuntimeError::Admission("nested materialization"))?;
+            let root = open_staging_root(&staging)?;
+            let task = budget.task_permit_for_root(Arc::clone(&root))?;
             let sparse = self.direct_store.sparse_marking();
             let reserve = self.direct_store.settings().holds_disk_reserve_bytes;
             let copied = tokio::task::spawn_blocking(move || {
@@ -463,15 +464,39 @@ impl Pipeline {
                 )
             })
             .await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string())?;
+            .map_err(RuntimeError::join("nested materialization"))?
+            .map_err(RuntimeError::io("nested materialization"))?;
             self.direct_store
                 .set_mut(job_id, set_index)
-                .ok_or("direct root vanished during materialization")?
+                .ok_or(RuntimeError::Invariant(
+                    "direct root during materialization",
+                ))?
                 .apply_nested_materialization(copied)
-                .map_err(|error| format!("nested materialization generation refused: {error:?}"))?;
+                .map_err(RuntimeError::routing("nested materialization generation"))?;
             // Old descendant backings remain until a later retirement pass.
             self.commit_archive_graph(job_id).await?;
         }
     }
+}
+
+// Opens a replay member through its own pinned parent directory.
+async fn open_replay_member(path: PathBuf) -> Result<tokio::fs::File, RuntimeError> {
+    let parent = path
+        .parent()
+        .ok_or(RuntimeError::Invariant("replay member has no parent"))?
+        .to_path_buf();
+    let name = path
+        .file_name()
+        .ok_or(RuntimeError::Invariant("replay member has no name"))?
+        .to_owned();
+    let file = tokio::task::spawn_blocking(move || {
+        crate::pipeline::extraction::ExtractionRoot::open(&parent)
+            .map_err(std::io::Error::other)?
+            .open_input(std::path::Path::new(&name))
+            .map(|file| file.into_std())
+    })
+    .await
+    .map_err(RuntimeError::join("nested replay open"))?
+    .map_err(RuntimeError::io("nested replay open"))?;
+    Ok(tokio::fs::File::from_std(file))
 }

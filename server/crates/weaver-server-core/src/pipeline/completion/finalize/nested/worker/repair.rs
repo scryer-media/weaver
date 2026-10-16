@@ -229,7 +229,7 @@ impl Pipeline {
         } else {
             let state = runtime.decoded.iter().find(|state| {
                 let owner = state.generation.owner();
-                source.root_set == format!("decoded-{}-{}", owner.node, owner.generation)
+                source.root_set == decoded_namespace_name(owner)
             })?;
             let parent = state
                 .graph

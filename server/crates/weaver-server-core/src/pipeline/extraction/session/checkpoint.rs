@@ -72,6 +72,37 @@ pub(crate) struct SessionCheckpoint {
     pub(crate) phase: u8,
 }
 
+impl SessionCheckpoint {
+    pub(crate) fn is_retired(&self) -> bool {
+        self.phase == Phase::Retired.code()
+    }
+}
+
+impl Phase {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Running => 0,
+            Self::Closed => 1,
+            Self::Draining => 2,
+            Self::Drained => 3,
+            Self::Retired => 4,
+        }
+    }
+
+    const fn restored(code: u8) -> Option<Self> {
+        match code {
+            // A crashed worker did not prove integrity. Preserve its
+            // unverified ancestry while a new execution gets a new owner.
+            0 => Some(Self::Running),
+            1 => Some(Self::Closed),
+            // No writer survives a restart, so a drain in progress has ended.
+            2 | 3 => Some(Self::Drained),
+            4 => Some(Self::Retired),
+            _ => None,
+        }
+    }
+}
+
 impl ArchiveSessions {
     pub(crate) fn preview_replacement_checkpoint(
         &self,
@@ -102,7 +133,7 @@ impl ArchiveSessions {
             if replacement.retiring.iter().any(|owner| {
                 owner.node == session.owner.node && owner.generation == session.owner.generation
             }) {
-                session.phase = 4;
+                session.phase = Phase::Retired.code();
             }
         }
         let selected = &mut saved.nodes[replacement.node as usize];
@@ -118,7 +149,7 @@ impl ArchiveSessions {
                 generation,
             },
             containing: selected.containing,
-            phase: 0,
+            phase: Phase::Running.code(),
         });
         Ok((
             saved,
@@ -157,13 +188,7 @@ impl ArchiveSessions {
                 .map(|(&(node, generation), session)| SessionCheckpoint {
                     owner: Owner { node, generation },
                     containing: session.containing.map(owner),
-                    phase: match session.phase {
-                        Phase::Running => 0,
-                        Phase::Closed => 1,
-                        Phase::Draining => 2,
-                        Phase::Drained => 3,
-                        Phase::Retired => 4,
-                    },
+                    phase: session.phase.code(),
                 })
                 .collect(),
         }
@@ -210,24 +235,14 @@ impl ArchiveSessions {
                 .nodes
                 .get(&session.owner.node)
                 .ok_or(SessionError::Admission)?;
-            if session.owner.generation == 0
-                || session.owner.generation >= node.next_generation
-                || session.phase > 4
-            {
+            let phase = Phase::restored(session.phase).ok_or(SessionError::Admission)?;
+            if session.owner.generation == 0 || session.owner.generation >= node.next_generation {
                 return Err(SessionError::Admission);
             }
             let containing = session.containing.map(owner);
             if containing != node.containing {
                 return Err(SessionError::Admission);
             }
-            let phase = match session.phase {
-                // A crashed worker did not prove integrity. Preserve its
-                // unverified ancestry while a new execution gets a new owner.
-                0 => Phase::Running,
-                1 => Phase::Closed,
-                2 | 3 => Phase::Drained,
-                _ => Phase::Retired,
-            };
             let cancelled = !matches!(phase, Phase::Running | Phase::Closed);
             let (wake, _) = watch::channel(cancelled);
             if restored

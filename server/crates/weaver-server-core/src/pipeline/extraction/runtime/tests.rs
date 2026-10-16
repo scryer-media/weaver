@@ -54,6 +54,34 @@ fn sibling_and_ancestor_integrity_gate_publication() {
 }
 
 #[test]
+fn failure_aborts_gated_and_live_inputs() {
+    use crate::pipeline::extraction::input::LiveArchiveInput;
+    let mut runtime = ArchiveRuntime::new();
+    let owner = runtime.admit(None, InputVersion(0)).unwrap().owner;
+    let gate = LiveArchiveInput::new();
+    let live = LiveArchiveInput::new();
+    runtime.gates.insert(("set".into(), 1), gate.clone());
+    runtime.live_inputs.push((owner, live.clone()));
+    runtime.fail(owner);
+    assert!(gate.wait_volume(0).is_err());
+    assert!(live.wait_volume(0).is_err());
+}
+
+#[test]
+fn removal_aborts_gated_and_live_inputs() {
+    use crate::pipeline::extraction::input::LiveArchiveInput;
+    let mut runtime = ArchiveRuntime::new();
+    let owner = runtime.admit(None, InputVersion(0)).unwrap().owner;
+    let gate = LiveArchiveInput::new();
+    let live = LiveArchiveInput::new();
+    runtime.gates.insert(("set".into(), 1), gate.clone());
+    runtime.live_inputs.push((owner, live.clone()));
+    drop(runtime);
+    assert!(gate.wait_volume(0).is_err());
+    assert!(live.wait_volume(0).is_err());
+}
+
+#[test]
 fn ancestor_revocation_rejects_late_child_completion() {
     let mut runtime = ArchiveRuntime::new();
     let parent = runtime.admit(None, InputVersion(0)).unwrap().owner;

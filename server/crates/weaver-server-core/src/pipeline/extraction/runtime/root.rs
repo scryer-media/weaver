@@ -1,6 +1,5 @@
 use super::*;
-use crate::pipeline::direct_store::plan::{DirectSetPlan, SetFormat};
-use crate::pipeline::direct_store::router::RouterResources;
+use crate::pipeline::direct_store::plan::DirectSetPlan;
 use crate::pipeline::extraction::JobExtractionBudget;
 use crate::pipeline::extraction::output::channel::{ChannelOutput, Frame, Generation};
 use crate::pipeline::*;
@@ -48,9 +47,7 @@ impl Pipeline {
             runtime
                 .retire_graph_namespace(set_name)
                 .await
-                .map_err(|error| {
-                    ExtractionError::terminal(format!("root archive retirement: {error:?}"))
-                })?;
+                .map_err(RuntimeError::session("root archive retirement"))?;
         }
         Ok(())
     }
@@ -100,54 +97,21 @@ impl Pipeline {
         destination: PathBuf,
         budget: Arc<JobExtractionBudget>,
     ) -> Result<RootDispatch, ExtractionError> {
-        let (parts, kind, source, names) = match input {
-            StreamInput::Physical { parts, kind } => (parts, kind, None, BTreeMap::new()),
-            StreamInput::Virtual { source, names } => (
-                Vec::new(),
-                crate::jobs::assembly::ArchiveType::Rar,
-                Some(source),
-                names,
-            ),
-        };
-        let (mut volumes, inputs): (Vec<_>, Vec<_>) = parts.into_iter().unzip();
-        if source.is_some() {
-            volumes = names.keys().copied().collect();
-        }
         let working = self
             .jobs
             .get(&job_id)
-            .ok_or_else(|| ExtractionError::terminal("missing root archive job"))?
+            .ok_or(RuntimeError::Invariant("root archive job"))?
             .working_dir
             .clone();
         let admission = budget
-            .try_reserve_memory(512 * 1024)
-            .ok_or_else(|| ExtractionError::terminal("root archive bridge memory unavailable"))?;
+            .try_reserve_memory(limits::BRIDGE_ADMISSION_BYTES)
+            .ok_or(RuntimeError::Admission("root archive bridge"))?;
         let runtime = self
             .archive_runtime
             .entry(job_id)
             .or_insert_with(ArchiveRuntime::new);
         runtime.set_roots(working.clone(), destination.clone());
-        let lease = if let Some(source) = &source {
-            if !runtime
-                .graph_owners
-                .contains_key(&(source.root_set.clone(), source.node))
-                && source.node == 0
-            {
-                runtime
-                    .graph_lease(&source.root_set, 0, None, InputVersion(0))
-                    .map_err(|e| {
-                        ExtractionError::terminal(format!("virtual parent admission: {e:?}"))
-                    })?;
-            }
-            let parent = *runtime
-                .graph_owners
-                .get(&(source.root_set.clone(), source.node))
-                .ok_or_else(|| ExtractionError::terminal("virtual chase parent absent"))?;
-            runtime.admit(Some(parent), InputVersion(0))
-        } else {
-            runtime.graph_lease(set_name, 0, None, InputVersion(0))
-        }
-        .map_err(|e| ExtractionError::terminal(format!("root archive admission: {e:?}")))?;
+        let lease = runtime.stream_lease(set_name, input.virtual_source())?;
         let owner = lease.owner;
         let private = working
             .join(crate::pipeline::direct_store::manifest::DIRECTORY)
@@ -155,8 +119,7 @@ impl Pipeline {
                 "namespace-{}-{}-{}",
                 owner.root, owner.node, owner.generation
             ));
-
-        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let (sender, receiver) = tokio::sync::mpsc::channel(limits::FRAME_CHANNEL_DEPTH);
         let (channel, generation) = ChannelOutput::new(
             owner,
             admission,
@@ -164,58 +127,18 @@ impl Pipeline {
             tokio::runtime::Handle::current(),
             Arc::clone(&budget),
         )
-        .map_err(|e| ExtractionError::terminal(e.to_string()))?;
+        .map_err(RuntimeError::io("root channel"))?;
         runtime
             .sessions
             .attach_channel(generation.clone())
-            .map_err(|e| ExtractionError::terminal(format!("root channel admission: {e:?}")))?;
+            .map_err(RuntimeError::session("root channel admission"))?;
         let saved = runtime.sessions.capture_checkpoint();
         let sessions = ArchiveSessions::restore_checkpoint(&saved, owner.root)
-            .map_err(|e| ExtractionError::terminal(format!("root session view: {e:?}")))?;
+            .map_err(RuntimeError::session("root session view"))?;
+        let work = input.work(set_name, private.clone(), &working, destination);
         let request = runtime
-            .dispatch(
-                owner,
-                NamespaceWork {
-                    virtual_source: source.clone(),
-                    original_virtual_source: source.clone(),
-                    kind,
-                    set_name: set_name.to_owned(),
-                    volumes,
-                    output: private.clone(),
-                    input_names: if source.is_some() {
-                        names.into_values().collect()
-                    } else {
-                        inputs
-                            .iter()
-                            .map(|path| {
-                                path.strip_prefix(&working)
-                                    .or_else(|_| path.strip_prefix(&destination))
-                                    .unwrap_or(path)
-                                    .to_string_lossy()
-                                    .into_owned()
-                            })
-                            .collect()
-                    },
-                    original_inputs: inputs.clone(),
-                    inputs,
-                    destination,
-                    outputs: BTreeMap::new(),
-                    root_set: Some(set_name.to_owned()),
-                    ordinary: Vec::new(),
-                    selected_password: None,
-                },
-            )
-            .map_err(|e| ExtractionError::terminal(format!("root archive dispatch: {e:?}")))?;
-        let plan = DirectSetPlan {
-            set_name: format!("namespace-{}", owner.node),
-            format: SetFormat::SevenZip,
-            volumes: BTreeMap::from([(0, 0)]),
-            files: HashMap::from([(0, 0)]),
-            identity: None,
-            unposted: Default::default(),
-            working_dir: private.clone(),
-            destination_dir: private.clone(),
-        };
+            .dispatch(owner, work)
+            .map_err(RuntimeError::session("root archive dispatch"))?;
         Ok(RootDispatch {
             channel: Some(channel),
             owner,
@@ -224,12 +147,97 @@ impl Pipeline {
             generation,
             sessions: Some(sessions),
             _lease: lease,
-            plan,
+            plan: DirectSetPlan::namespace(owner, &private),
             budget,
             private,
             job_id,
             event_tx: self.extract_done_tx.clone(),
         })
+    }
+}
+
+impl ArchiveRuntime {
+    // A physical root takes the set's own graph owner. A virtual chase runs
+    // under the graph node that carries its bytes, admitting the namespace
+    // root first when the chase reads straight from it.
+    fn stream_lease(
+        &mut self,
+        set_name: &str,
+        source: Option<&VirtualInputSource>,
+    ) -> Result<SessionLease, RuntimeError> {
+        let Some(source) = source else {
+            return self
+                .graph_lease(set_name, 0, None, InputVersion(0))
+                .map_err(RuntimeError::session("root archive admission"));
+        };
+        let key = (source.root_set.clone(), source.node);
+        if source.node == 0 && !self.graph_owners.contains_key(&key) {
+            self.graph_lease(&source.root_set, 0, None, InputVersion(0))
+                .map_err(RuntimeError::session("virtual parent admission"))?;
+        }
+        let parent = *self
+            .graph_owners
+            .get(&key)
+            .ok_or(RuntimeError::Invariant("virtual chase parent"))?;
+        self.admit(Some(parent), InputVersion(0))
+            .map_err(RuntimeError::session("root archive admission"))
+    }
+}
+
+impl StreamInput {
+    fn virtual_source(&self) -> Option<&VirtualInputSource> {
+        match self {
+            Self::Physical { .. } => None,
+            Self::Virtual { source, .. } => Some(source),
+        }
+    }
+
+    fn work(
+        self,
+        set_name: &str,
+        output: PathBuf,
+        working: &std::path::Path,
+        destination: PathBuf,
+    ) -> NamespaceWork {
+        let (kind, volumes, inputs, input_names, source) = match self {
+            Self::Physical { parts, kind } => {
+                let (volumes, inputs): (Vec<_>, Vec<_>) = parts.into_iter().unzip();
+                let names = inputs
+                    .iter()
+                    .map(|path| {
+                        path.strip_prefix(working)
+                            .or_else(|_| path.strip_prefix(&destination))
+                            .unwrap_or(path)
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+                (kind, volumes, inputs, names, None)
+            }
+            Self::Virtual { source, names } => (
+                crate::jobs::assembly::ArchiveType::Rar,
+                names.keys().copied().collect(),
+                Vec::new(),
+                names.into_values().collect(),
+                Some(source),
+            ),
+        };
+        NamespaceWork {
+            virtual_source: source.clone(),
+            original_virtual_source: source,
+            kind,
+            set_name: set_name.to_owned(),
+            volumes,
+            output,
+            input_names,
+            original_inputs: inputs.clone(),
+            inputs,
+            destination,
+            outputs: BTreeMap::new(),
+            root_set: Some(set_name.to_owned()),
+            ordinary: Vec::new(),
+            selected_password: None,
+        }
     }
 }
 
@@ -249,87 +257,82 @@ impl RootDispatch {
         // the established file-output path and do not cross the bridge.
         self.channel.take();
         let mut state = None;
-        let mut stream_error = None;
-        loop {
-            let frame = tokio::select! {
-                biased;
-                _ = self._lease.cancelled() => { self.generation.revoke(); stream_error = Some("archive generation retired".into()); break; },
-                frame = self.receiver.recv() => match frame { Some(frame) => frame, None => break },
-            };
-            if state.is_none() {
-                let resources = RouterResources {
-                    accountant: Arc::default(),
-                    holds_budget: 4 * 1024 * 1024,
-                    scratch_ceiling: 8 * 1024 * 1024,
-                    sparse: Default::default(),
-                    migration_ceiling_bytes: 8 * 1024 * 1024,
-                };
-                match decoded::DecodedState::new(
-                    self.generation.clone(),
-                    self.sessions.take().expect("first frame session view"),
-                    self.plan.clone(),
-                    resources,
-                    Arc::clone(&self.budget),
-                    self.private.clone(),
-                ) {
-                    Ok(decoded) => state = Some(Box::new(decoded)),
-                    Err(error) => {
-                        stream_error = Some(error);
-                        self.generation.revoke();
-                        break;
-                    }
-                }
-            }
-            if let Err(error) = state
-                .as_mut()
-                .expect("initialized decoded state")
-                .accept(frame)
-                .await
-            {
-                stream_error = Some(error);
-                self.generation.revoke();
-                break;
-            }
-            if let Err(error) = state
-                .as_mut()
-                .expect("initialized decoded state")
-                .publish_progress(self.job_id, &self.event_tx, &self._lease)
-                .await
-            {
-                stream_error = Some(error);
-                self.generation.revoke();
-                break;
-            }
+        let mut stream_error = self.stream_frames(&mut state).await.err();
+        if stream_error.is_some() {
+            self.generation.revoke();
         }
         drop(self.receiver);
-        let mut result = worker.await.unwrap_or_else(|error| {
-            Err(ExtractionError::terminal(format!(
-                "root archive worker failed: {error}"
-            )))
-        });
+        let mut result = worker
+            .await
+            .unwrap_or_else(|error| Err(RuntimeError::join("root archive worker")(error).into()));
         if result
             .as_ref()
             .is_ok_and(|outcome| outcome.failed.is_empty())
             && stream_error.is_none()
             && let Some(state) = &mut state
         {
-            if let Err(error) = state.close().await {
-                stream_error = Some(error);
-            }
-            if stream_error.is_none()
-                && let Err(error) = state
-                    .publish_progress(self.job_id, &self.event_tx, &self._lease)
-                    .await
-            {
-                stream_error = Some(error);
-            }
+            stream_error = Self::finish_stream(state, self.job_id, &self.event_tx, &self._lease)
+                .await
+                .err();
         }
         if let Some(error) = stream_error
             && result.is_ok()
         {
-            result = Err(ExtractionError::terminal(error));
+            result = Err(error.into());
         }
         (result, state)
+    }
+
+    // Feeds every frame into the decoded state, admitting that state when the
+    // first frame arrives. Stops at the first failure, or when the lease is
+    // cancelled.
+    async fn stream_frames(
+        &mut self,
+        state: &mut Option<Box<decoded::DecodedState>>,
+    ) -> Result<(), RuntimeError> {
+        loop {
+            let frame = tokio::select! {
+                biased;
+                _ = self._lease.cancelled() => return Err(RuntimeError::Revoked),
+                frame = self.receiver.recv() => match frame {
+                    Some(frame) => frame,
+                    None => return Ok(()),
+                },
+            };
+            let decoded = match state {
+                Some(decoded) => decoded,
+                None => state.insert(Box::new(self.admit_decoded()?)),
+            };
+            decoded.accept(frame).await?;
+            decoded
+                .publish_progress(self.job_id, &self.event_tx, &self._lease)
+                .await?;
+        }
+    }
+
+    fn admit_decoded(&mut self) -> Result<decoded::DecodedState, RuntimeError> {
+        let sessions = self
+            .sessions
+            .take()
+            .ok_or(RuntimeError::Invariant("root session view"))?;
+        decoded::DecodedState::new(
+            self.generation.clone(),
+            sessions,
+            self.plan.clone(),
+            limits::namespace_router_resources(),
+            Arc::clone(&self.budget),
+            self.private.clone(),
+        )
+    }
+
+    async fn finish_stream(
+        state: &mut decoded::DecodedState,
+        job_id: JobId,
+        event_tx: &tokio::sync::mpsc::Sender<ExtractionDone>,
+        lease: &SessionLease,
+    ) -> Result<(), RuntimeError> {
+        state.close().await?;
+        state.publish_progress(job_id, event_tx, lease).await
     }
 }
 
@@ -407,18 +410,22 @@ impl Pipeline {
         let budget = self.extraction_budget(job_id, &staging)?;
         let mut dispatch =
             self.admit_root_stream(job_id, set_name, parts, kind, staging, budget)?;
-        let output = dispatch.channel.take().expect("persistent archive channel");
+        let output = dispatch
+            .channel
+            .take()
+            .ok_or(RuntimeError::Invariant("persistent archive channel"))?;
         let owner = dispatch.owner;
         let request = dispatch.request.clone();
         let generation = dispatch.generation.clone();
+        let tx = self.extract_done_tx.clone();
         let runtime = self
             .archive_runtime
             .get_mut(&job_id)
-            .expect("persistent archive runtime");
+            .ok_or(RuntimeError::Invariant("persistent archive runtime"))?;
         runtime
             .requests
-            .get_mut(&request.sequence)
-            .expect("persistent archive request")
+            .get_mut(&request)
+            .ok_or(RuntimeError::Invariant("persistent archive request"))?
             .work
             .root_set = None;
         let mut members = BTreeMap::new();
@@ -435,7 +442,6 @@ impl Pipeline {
                 finish,
             },
         );
-        let tx = self.extract_done_tx.clone();
         let completion_lease = dispatch.lease();
         let worker = tokio::spawn(async move {
             let producer = tokio::task::spawn_blocking(move || {
@@ -459,10 +465,7 @@ impl Pipeline {
                 )
                 .await;
         });
-        self.archive_runtime
-            .get_mut(&job_id)
-            .expect("persistent archive runtime")
-            .track_worker(owner, worker);
+        runtime.track_worker(owner, worker);
         Ok(ScopedMemberOutput {
             channel: output,
             occurrence: 0,
@@ -474,7 +477,7 @@ impl Pipeline {
         if let Some(runtime) = self.archive_runtime.get_mut(&job_id)
             && let Some(sink) = runtime.sinks.remove(set_name)
         {
-            if let Some(request) = runtime.requests.get_mut(&sink.request.sequence) {
+            if let Some(request) = runtime.requests.get_mut(&sink.request) {
                 let work = &mut request.work;
                 let working = runtime
                     .checkpoint_roots
@@ -670,16 +673,7 @@ mod tests {
             generation,
             sessions: Some(sessions),
             _lease: lease.clone(),
-            plan: DirectSetPlan {
-                set_name: "archive".into(),
-                format: SetFormat::SevenZip,
-                volumes: BTreeMap::from([(0, 0)]),
-                files: HashMap::from([(0, 0)]),
-                identity: None,
-                unposted: Default::default(),
-                working_dir: private.clone(),
-                destination_dir: private.clone(),
-            },
+            plan: DirectSetPlan::restored_namespace("archive".into(), &private),
             budget,
             private,
             job_id: JobId(1),

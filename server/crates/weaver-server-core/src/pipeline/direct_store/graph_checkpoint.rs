@@ -7,6 +7,12 @@ use super::ByteRanges;
 use super::manifest::graph::*;
 use super::router::DirectDestination;
 use super::set::DirectSet;
+use crate::pipeline::extraction::runtime::RuntimeError;
+
+type CheckpointAuthority = (
+    Option<crate::jobs::archive_checkpoint::ArchiveCheckpointRef>,
+    Vec<InstalledRoot>,
+);
 
 impl crate::pipeline::Pipeline {
     /// Publish one complete job image after syncing every claimed backing.
@@ -14,41 +20,105 @@ impl crate::pipeline::Pipeline {
     pub(crate) async fn commit_archive_graph(
         &mut self,
         job_id: crate::jobs::ids::JobId,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         use super::manifest::ManifestStore;
-        use crate::jobs::archive_checkpoint::{
-            ArchiveAuthority, ArchiveCheckpointRef, CheckpointCommit,
-        };
-        let state = self.jobs.get(&job_id).ok_or("archive job disappeared")?;
+        use crate::jobs::archive_checkpoint::ArchiveCheckpointRef;
+        let state = self.jobs.get(&job_id).ok_or(JOB_GONE)?;
         let working = state.working_dir.clone();
         let output = state.staging_dir.clone().unwrap_or_else(|| working.clone());
         let store = ManifestStore::for_job(&working, job_id);
-        let authority = self
-            .db
-            .load_archive_authority(job_id)
-            .map_err(|error| error.to_string())?;
-        let (current, installed) = match authority {
-            ArchiveAuthority::JobGone => return Err("archive job disappeared".into()),
-            ArchiveAuthority::Legacy(rows) => (
-                None,
-                lift_legacy_installed(&working, job_id, &rows)
-                    .map_err(|error| error.to_string())?,
-            ),
-            ArchiveAuthority::Job(reference) => {
-                let previous = JobGraph::decode(
-                    &store
-                        .read(&reference.reference)
-                        .map_err(|error| error.to_string())?,
-                )
-                .map_err(|error| error.to_string())?;
-                (Some(reference), previous.installed)
-            }
-        };
+        let (current, installed) = self.checkpoint_authority(job_id, &store, &working)?;
         let expected = current.as_ref().map(|reference| reference.generation);
         let generation = expected
             .unwrap_or(0)
             .checked_add(1)
-            .ok_or("archive checkpoint generation exhausted")?;
+            .ok_or(RuntimeError::Invariant(
+                "archive checkpoint generation exhausted",
+            ))?;
+        let graph = self.capture_job_graph(job_id, generation, installed, &working, &output)?;
+        let body = graph
+            .encode()
+            .map_err(RuntimeError::io("archive graph encoding"))?;
+        for outcome in crate::pipeline::orchestrator::sync_direct_destinations(graph_paths(
+            &graph, &working, &output,
+        ))
+        .await
+        {
+            outcome.map_err(RuntimeError::io("archive backing sync"))?;
+        }
+        let current_bytes = current
+            .as_ref()
+            .map(|reference| reference.reference.clone());
+        let writer = store.clone();
+        let (reference, graph) = tokio::task::spawn_blocking(move || {
+            graph.sync_directories(&working, &output)?;
+            let reference = writer.prepare(&body, current_bytes.as_deref())?;
+            Ok::<_, io::Error>((reference, graph))
+        })
+        .await
+        .map_err(RuntimeError::join("archive manifest write"))?
+        .map_err(RuntimeError::io("archive manifest write"))?;
+        self.select_checkpoint(
+            job_id,
+            expected,
+            ArchiveCheckpointRef {
+                generation,
+                reference: reference.clone(),
+            },
+        )?;
+        self.adopt_committed_graph(job_id, &graph)?;
+        Box::pin(self.replay_archive_prefixes(job_id)).await?;
+        // Reclamation names only manifests owned by this job, never input files.
+        let reclaimed = tokio::task::spawn_blocking(move || store.reclaim(Some(&reference)))
+            .await
+            .map_err(RuntimeError::join("archive manifest reclaim"))
+            .and_then(|result| result.map_err(RuntimeError::io("archive manifest reclaim")));
+        if let Err(error) = reclaimed {
+            tracing::warn!(job_id = job_id.0, %error, "archive checkpoint committed; orphan manifest cleanup deferred");
+        }
+        Ok(())
+    }
+
+    // The checkpoint the job's SQL row selects now, and the installed roots it
+    // carries forward.
+    fn checkpoint_authority(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        store: &super::manifest::ManifestStore,
+        working: &Path,
+    ) -> Result<CheckpointAuthority, RuntimeError> {
+        use crate::jobs::archive_checkpoint::ArchiveAuthority;
+        let authority = self
+            .db
+            .load_archive_authority(job_id)
+            .map_err(RuntimeError::refused("archive authority"))?;
+        Ok(match authority {
+            ArchiveAuthority::JobGone => return Err(JOB_GONE),
+            ArchiveAuthority::Legacy(rows) => (
+                None,
+                lift_legacy_installed(working, job_id, &rows)
+                    .map_err(RuntimeError::io("legacy archive authority"))?,
+            ),
+            ArchiveAuthority::Job(reference) => {
+                let bytes = store
+                    .read(&reference.reference)
+                    .map_err(RuntimeError::io("archive manifest read"))?;
+                let previous = JobGraph::decode(&bytes)
+                    .map_err(RuntimeError::io("archive manifest decode"))?;
+                (Some(reference), previous.installed)
+            }
+        })
+    }
+
+    fn capture_job_graph(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        generation: u64,
+        installed: Vec<InstalledRoot>,
+        working: &Path,
+        output: &Path,
+    ) -> Result<JobGraph, RuntimeError> {
+        const CAPTURE: &str = "archive graph capture";
         let mut graph = JobGraph::empty(generation);
         graph.installed = installed;
         for set in self.direct_store.sets_for(job_id) {
@@ -61,81 +131,57 @@ impl crate::pipeline::Pipeline {
                     marker: marker.clone(),
                 });
                 if set.has_nested_checkpoint_authority() {
-                    capture_direct_root(&mut graph, set).map_err(|error| error.to_string())?;
+                    capture_direct_root(&mut graph, set).map_err(RuntimeError::io(CAPTURE))?;
                 }
             } else if !set.is_finalized() {
-                capture_direct_root(&mut graph, set).map_err(|error| error.to_string())?;
+                capture_direct_root(&mut graph, set).map_err(RuntimeError::io(CAPTURE))?;
             }
         }
         if let Some(runtime) = self.archive_runtime.get(&job_id) {
             runtime
                 .append_checkpoint(&mut graph)
-                .map_err(|error| error.to_string())?;
+                .map_err(RuntimeError::io(CAPTURE))?;
         }
         graph
-            .probe(&working, &output)
-            .map_err(|error| error.to_string())?;
-        let body = graph.encode().map_err(|error| error.to_string())?;
-        let mut paths: Vec<_> = graph
-            .files
-            .iter()
-            .map(|file| {
-                if file.root == 0 {
-                    working.join(&file.path)
-                } else {
-                    output.join(&file.path)
-                }
-            })
-            .collect();
-        paths.extend(graph.installed.iter().flat_map(|root| {
-            root.marker
-                .members
-                .iter()
-                .map(|member| output.join(&member.relative_path))
-        }));
-        for outcome in crate::pipeline::orchestrator::sync_direct_destinations(paths).await {
-            outcome.map_err(|error| error.to_string())?;
-        }
-        let current_bytes = current
-            .as_ref()
-            .map(|reference| reference.reference.clone());
-        let writer = store.clone();
-        let directory_working = working.clone();
-        let directory_output = output.clone();
-        let (reference, graph) = tokio::task::spawn_blocking(move || {
-            graph.sync_directories(&directory_working, &directory_output)?;
-            let reference = writer.prepare(&body, current_bytes.as_deref())?;
-            Ok::<_, io::Error>((reference, graph))
-        })
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())?;
-        let candidate = ArchiveCheckpointRef {
-            generation,
-            reference: reference.clone(),
-        };
+            .probe(working, output)
+            .map_err(RuntimeError::io("archive graph probe"))?;
+        Ok(graph)
+    }
+
+    // Selects the candidate in SQL. An ambiguous failure counts as committed
+    // only when a readback shows the candidate selected.
+    fn select_checkpoint(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        expected: Option<u64>,
+        candidate: crate::jobs::archive_checkpoint::ArchiveCheckpointRef,
+    ) -> Result<(), RuntimeError> {
+        use crate::jobs::archive_checkpoint::CheckpointCommit;
         match self
             .db
             .commit_archive_checkpoint(job_id, expected, candidate.clone())
         {
-            Ok(CheckpointCommit::Committed) => {}
-            Ok(CheckpointCommit::Conflict) => {
-                return Err("archive checkpoint ownership changed".into());
-            }
-            Ok(CheckpointCommit::JobGone) => return Err("archive job disappeared".into()),
+            Ok(CheckpointCommit::Committed) => Ok(()),
+            Ok(CheckpointCommit::Conflict) => Err(RuntimeError::Invariant(
+                "archive checkpoint ownership changed",
+            )),
+            Ok(CheckpointCommit::JobGone) => Err(JOB_GONE),
             Err(error) => {
-                if self
-                    .db
-                    .load_archive_checkpoint(job_id)
-                    .ok()
-                    .flatten()
-                    .as_ref()
-                    != Some(&candidate)
-                {
-                    return Err(error.to_string());
+                let selected = self.db.load_archive_checkpoint(job_id).ok().flatten();
+                if selected.as_ref() == Some(&candidate) {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::refused("archive checkpoint commit")(error))
                 }
             }
         }
+    }
+
+    fn adopt_committed_graph(
+        &mut self,
+        job_id: crate::jobs::ids::JobId,
+        graph: &JobGraph,
+    ) -> Result<(), RuntimeError> {
         let now = std::time::Instant::now();
         for index in 0..self.direct_store.sets_for(job_id).len() {
             if let Some(set) = self.direct_store.set_mut(job_id, index)
@@ -151,17 +197,28 @@ impl crate::pipeline::Pipeline {
         if let Some(runtime) = self.archive_runtime.get_mut(&job_id) {
             runtime.confirm_replacement_checkpoint(&graph.sessions)?;
         }
-        Box::pin(self.replay_direct_archive_prefixes(job_id)).await?;
-        // Reclamation names only manifests owned by this job, never input files.
-        if let Err(error) = tokio::task::spawn_blocking(move || store.reclaim(Some(&reference)))
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result.map_err(|error| error.to_string()))
-        {
-            tracing::warn!(job_id = job_id.0, %error, "archive checkpoint committed; orphan manifest cleanup deferred");
-        }
         Ok(())
     }
+}
+
+const JOB_GONE: RuntimeError = RuntimeError::Invariant("archive job disappeared");
+
+// Every file the graph claims, which must be durable before it is selected.
+fn graph_paths(graph: &JobGraph, working: &Path, output: &Path) -> Vec<std::path::PathBuf> {
+    let files = graph.files.iter().map(|file| {
+        if file.root == 0 {
+            working.join(&file.path)
+        } else {
+            output.join(&file.path)
+        }
+    });
+    let installed = graph.installed.iter().flat_map(|root| {
+        root.marker
+            .members
+            .iter()
+            .map(|member| output.join(&member.relative_path))
+    });
+    files.chain(installed).collect()
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -442,21 +499,17 @@ pub(crate) fn capture_namespace_images(
     let count = nested.map_or(0, |nested| nested.nodes.len() as u32);
     let mut ids = BTreeMap::new();
     for node in (u32::from(root_router.is_none())..=count).rev() {
-        let router = if node == 0 {
-            root_router.ok_or_else(|| invalid("missing namespace router"))?
+        let (router, lengths) = if node == 0 {
+            (
+                root_router.ok_or_else(|| invalid("missing namespace router"))?,
+                root_lengths.clone(),
+            )
         } else {
-            &nested
+            let child = nested
                 .ok_or_else(|| invalid("missing nested graph"))?
-                .node(node)
-                .router
-        };
-        let facts = router.checkpoint_facts();
-        let lengths = if node == 0 {
-            root_lengths.clone()
-        } else {
-            nested
-                .unwrap()
-                .node(node)
+                .node(node);
+            // An input of undeclared length is as long as its furthest byte.
+            let lengths = child
                 .inputs
                 .iter()
                 .map(|(&volume, input)| {
@@ -469,8 +522,10 @@ pub(crate) fn capture_namespace_images(
                     });
                     (volume, length)
                 })
-                .collect()
+                .collect();
+            (&child.router, lengths)
         };
+        let facts = router.checkpoint_facts();
         for (volume, length) in lengths {
             let mut claims = Vec::new();
             let mut covered = ByteRanges::new();

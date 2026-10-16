@@ -2123,6 +2123,46 @@ impl ExtractionRoot {
         Ok(())
     }
 
+    /// Move a private regular file under a new name in `target`, keeping its
+    /// inode. Fails with `CrossesDevices` when the roots live on different
+    /// filesystems, so the caller decides whether a copy is acceptable.
+    pub(crate) fn rename_input_to(
+        &self,
+        relative: &Path,
+        target: &Self,
+        target_relative: &Path,
+    ) -> io::Result<()> {
+        let (source, name) = self.namespace_parent(relative, false)?;
+        let (destination, target_name) = target.namespace_parent(target_relative, true)?;
+        if !source.symlink_metadata(&name)?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "namespace input is not a regular file",
+            ));
+        }
+        source.rename(&name, &destination, &target_name)?;
+        // A symlink swapped in after the check moves as itself; it must never
+        // remain published under the member's name.
+        if !destination.symlink_metadata(&target_name)?.is_file() {
+            destination.remove_file(&target_name)?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "namespace input changed during publication",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Create and account the missing parents of `relative`, as creating a
+    /// file there would, for a caller that places an existing inode instead.
+    pub(crate) fn create_parents(
+        &self,
+        relative: &Path,
+        budget: &Arc<JobExtractionBudget>,
+    ) -> Result<(), ExtractionError> {
+        self.ensure_parents(relative, budget)
+    }
+
     pub(crate) fn list_entries_no_links(
         &self,
         skip_top: &[&str],

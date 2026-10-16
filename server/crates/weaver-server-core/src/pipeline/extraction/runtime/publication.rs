@@ -1,38 +1,47 @@
 use super::*;
 use crate::pipeline::extraction::ExtractionRoot;
+use crate::pipeline::extraction::safety::JobExtractionBudget;
 use crate::pipeline::*;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+// Bookkeeping directories that never belong to the published tree.
+const UNPUBLISHED: [&str; 5] = [
+    ".weaver-checkpoints",
+    ".weaver-nested",
+    ".weaver-chunks",
+    ".weaver-staging",
+    crate::jobs::working_dir::WORKING_DIR_MARKER,
+];
+
+type Selection = BTreeMap<String, (PathBuf, cap_std::fs::Metadata)>;
+
+fn open_root(path: &Path) -> Result<ExtractionRoot, RuntimeError> {
+    ExtractionRoot::open(path).map_err(RuntimeError::refused("publication root"))
+}
+
 fn collect(
     root: &Path,
-    current: &Path,
     excluded: &HashSet<String>,
-    files: &mut BTreeMap<String, (PathBuf, cap_std::fs::Metadata)>,
-) -> Result<(), String> {
-    let _ = current;
+    files: &mut Selection,
+) -> Result<(), RuntimeError> {
     if !root.exists() {
         return Ok(());
     }
-    let pinned = ExtractionRoot::open(root)?;
+    let pinned = open_root(root)?;
     for (relative, metadata) in pinned
-        .list_entries_no_links(&[
-            ".weaver-checkpoints",
-            ".weaver-nested",
-            ".weaver-chunks",
-            ".weaver-staging",
-            crate::jobs::working_dir::WORKING_DIR_MARKER,
-        ])
-        .map_err(|e| e.to_string())?
+        .list_entries_no_links(&UNPUBLISHED)
+        .map_err(RuntimeError::io("publication listing"))?
     {
         let name = relative
             .to_str()
-            .ok_or("publication path encoding")?
+            .ok_or(RuntimeError::Invariant("publication path encoding"))?
             .replace('\\', "/");
         if excluded.contains(&name) {
             continue;
         }
-        ExtractionRoot::parse_relative_path(&name)?;
+        ExtractionRoot::parse_relative_path(&name)
+            .map_err(RuntimeError::refused("publication path"))?;
         files
             .entry(name)
             .or_insert_with(|| (root.join(relative), metadata));
@@ -40,34 +49,148 @@ fn collect(
     Ok(())
 }
 
-impl Pipeline {
-    pub(crate) async fn prepare_scoped_publication(
-        &mut self,
-        job_id: JobId,
-        working: PathBuf,
-        staging: Option<PathBuf>,
-    ) -> Result<Option<PathBuf>, String> {
-        let Some(runtime) = self.archive_runtime.get(&job_id) else {
-            return Ok(None);
-        };
-        if runtime.consumed.is_empty() && runtime.decoded.is_empty() {
-            return Ok(None);
+fn permission_mode(metadata: &cap_std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt;
+        Some(metadata.permissions().mode())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn apply_metadata(
+    target: &ExtractionRoot,
+    relative: &Path,
+    metadata: &cap_std::fs::Metadata,
+) -> Result<(), RuntimeError> {
+    target
+        .set_directory_metadata(
+            relative,
+            metadata.modified().ok().map(|time| time.into_std()),
+            metadata.accessed().ok().map(|time| time.into_std()),
+            permission_mode(metadata),
+        )
+        .map_err(RuntimeError::io("publication metadata"))
+}
+
+// The private roots a publication reads from and the one it fills.
+struct PublicationRoots {
+    working: PathBuf,
+    working_root: ExtractionRoot,
+    staging: Option<(PathBuf, ExtractionRoot)>,
+    target: ExtractionRoot,
+}
+
+impl PublicationRoots {
+    fn source<'a>(&self, path: &'a Path) -> Result<(&ExtractionRoot, &'a Path), RuntimeError> {
+        if let Some((staging, root)) = &self.staging
+            && let Ok(relative) = path.strip_prefix(staging)
+        {
+            return Ok((root, relative));
         }
-        if !runtime.publication_ready()
-            || runtime.staged_replacement.is_some()
-            || !runtime.replay.is_empty()
-            || runtime
+        let relative = path
+            .strip_prefix(&self.working)
+            .map_err(|_| RuntimeError::Invariant("publication source outside its roots"))?;
+        Ok((&self.working_root, relative))
+    }
+
+    // Links the file into the publication, and copies it only when the two
+    // roots sit on different devices.
+    fn publish_file(
+        &self,
+        path: &Path,
+        relative: &Path,
+        metadata: &cap_std::fs::Metadata,
+        budget: &Arc<JobExtractionBudget>,
+    ) -> Result<(), RuntimeError> {
+        let (source, source_path) = self.source(path)?;
+        let Err(error) = source.link_input_to(source_path, &self.target, relative) else {
+            return Ok(());
+        };
+        if error.kind() != std::io::ErrorKind::CrossesDevices {
+            return Err(RuntimeError::io("publication link")(error));
+        }
+        let mut input = source
+            .open_input(source_path)
+            .map_err(RuntimeError::io("publication source"))?;
+        let mut output = self.target.create_file(relative, budget)?;
+        std::io::copy(&mut input, &mut output).map_err(RuntimeError::io("publication copy"))?;
+        output
+            .flush()
+            .map_err(RuntimeError::io("publication flush"))?;
+        drop(output);
+        apply_metadata(&self.target, relative, metadata)
+    }
+}
+
+fn publish_selection(
+    working: PathBuf,
+    staging: Option<PathBuf>,
+    publication: &Path,
+    excluded: &HashSet<String>,
+    budget: &Arc<JobExtractionBudget>,
+) -> Result<PathBuf, RuntimeError> {
+    let mut selected = Selection::new();
+    if let Some(staging) = &staging {
+        collect(staging, excluded, &mut selected)?;
+    }
+    collect(&working, excluded, &mut selected)?;
+    let _parent = open_root(publication)?;
+    let publication = tempfile::Builder::new()
+        .prefix("publication-")
+        .tempdir_in(publication)
+        .map_err(RuntimeError::io("publication directory"))?
+        .keep();
+    let roots = PublicationRoots {
+        target: open_root(&publication)?,
+        working_root: open_root(&working)?,
+        staging: staging
+            .filter(|path| path.exists())
+            .map(|path| open_root(&path).map(|root| (path, root)))
+            .transpose()?,
+        working,
+    };
+    let mut directories = Vec::new();
+    for (name, (path, metadata)) in selected {
+        let relative = Path::new(&name);
+        budget.note_entry(relative)?;
+        if metadata.is_dir() {
+            roots.target.create_dir(relative, budget)?;
+            directories.push((name, metadata));
+        } else {
+            roots.publish_file(&path, relative, &metadata, budget)?;
+        }
+    }
+    // Children first, so filling a directory never moves its own times.
+    for (name, metadata) in directories.into_iter().rev() {
+        apply_metadata(&roots.target, Path::new(&name), &metadata)?;
+    }
+    Ok(publication)
+}
+
+impl ArchiveRuntime {
+    fn publication_unresolved(&self) -> bool {
+        !self.publication_ready()
+            || self.staged_replacement.is_some()
+            || !self.replay.is_empty()
+            || self
                 .decoded
                 .iter()
-                .any(|state| !runtime.sessions.ancestry_verified(state.generation.owner()))
-        {
-            return Err("archive namespace publication remains unresolved".into());
-        }
-        let mut excluded = runtime.consumed.clone();
-        for (_, work) in &runtime.retained_work {
+                .any(|state| !self.sessions.ancestry_verified(state.generation.owner()))
+    }
+
+    // Consumed archive names and every input a retained namespace read,
+    // relative to whichever root holds it.
+    fn publication_exclusions(&self, roots: &[&PathBuf]) -> HashSet<String> {
+        let mut excluded = self.consumed.clone();
+        for (_, work) in &self.retained_work {
             excluded.extend(work.input_names.iter().cloned());
             for path in work.inputs.iter().chain(&work.original_inputs) {
-                for root in std::iter::once(&working).chain(staging.iter()) {
+                for root in roots {
                     if let Ok(relative) = path.strip_prefix(root)
                         && let Some(name) = relative.to_str()
                     {
@@ -76,105 +199,40 @@ impl Pipeline {
                 }
             }
         }
+        excluded
+    }
+}
+
+impl Pipeline {
+    pub(crate) async fn prepare_scoped_publication(
+        &mut self,
+        job_id: JobId,
+        working: PathBuf,
+        staging: Option<PathBuf>,
+    ) -> Result<Option<PathBuf>, RuntimeError> {
+        let Some(runtime) = self.archive_runtime.get(&job_id) else {
+            return Ok(None);
+        };
+        if runtime.consumed.is_empty() && runtime.decoded.is_empty() {
+            return Ok(None);
+        }
+        if runtime.publication_unresolved() {
+            return Err(RuntimeError::Invariant(
+                "archive namespace publication remains unresolved",
+            ));
+        }
+        let roots: Vec<&PathBuf> = std::iter::once(&working).chain(staging.iter()).collect();
+        let excluded = runtime.publication_exclusions(&roots);
         let publication = staging
             .as_ref()
             .unwrap_or(&working)
             .join(crate::pipeline::direct_store::manifest::DIRECTORY);
-        let budget = self
-            .extraction_budget(job_id, &publication)
-            .map_err(|e| e.to_string())?;
-        let result = tokio::task::spawn_blocking(move || -> Result<PathBuf, String> {
-            let mut selected = BTreeMap::new();
-            if let Some(staging) = &staging {
-                collect(staging, staging, &excluded, &mut selected)?;
-            }
-            collect(&working, &working, &excluded, &mut selected)?;
-            let _parent = ExtractionRoot::open(&publication)?;
-            let publication = tempfile::Builder::new()
-                .prefix("publication-")
-                .tempdir_in(&publication)
-                .map_err(|e| e.to_string())?
-                .keep();
-            let target = ExtractionRoot::open(&publication)?;
-            let working_root = ExtractionRoot::open(&working)?;
-            let staging_root = staging
-                .as_ref()
-                .filter(|path| path.exists())
-                .map(|path| ExtractionRoot::open(path))
-                .transpose()?;
-            let mut directories = Vec::new();
-            for (name, (path, metadata)) in selected {
-                let relative = Path::new(&name);
-                budget.note_entry(relative).map_err(|e| e.to_string())?;
-                if metadata.is_dir() {
-                    target
-                        .create_dir(relative, &budget)
-                        .map_err(|e| e.to_string())?;
-                    directories.push((name, metadata));
-                    continue;
-                }
-                let (source, source_path) = if let Some(staging) = &staging
-                    && let Ok(relative) = path.strip_prefix(staging)
-                {
-                    (
-                        staging_root.as_ref().ok_or("staging source absent")?,
-                        relative,
-                    )
-                } else {
-                    (
-                        &working_root,
-                        path.strip_prefix(&working).map_err(|e| e.to_string())?,
-                    )
-                };
-                if let Err(error) = source.link_input_to(source_path, &target, relative) {
-                    if error.kind() != std::io::ErrorKind::CrossesDevices {
-                        return Err(error.to_string());
-                    }
-                    let mut input = source.open_input(source_path).map_err(|e| e.to_string())?;
-                    let mut output = target
-                        .create_file(relative, &budget)
-                        .map_err(|e| e.to_string())?;
-                    std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
-                    output.flush().map_err(|e| e.to_string())?;
-                    drop(output);
-                    #[cfg(unix)]
-                    let mode = {
-                        use cap_std::fs::PermissionsExt;
-                        Some(metadata.permissions().mode())
-                    };
-                    #[cfg(not(unix))]
-                    let mode = None;
-                    target
-                        .set_directory_metadata(
-                            relative,
-                            metadata.modified().ok().map(|time| time.into_std()),
-                            metadata.accessed().ok().map(|time| time.into_std()),
-                            mode,
-                        )
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            for (name, metadata) in directories.into_iter().rev() {
-                #[cfg(unix)]
-                let mode = {
-                    use cap_std::fs::PermissionsExt;
-                    Some(metadata.permissions().mode())
-                };
-                #[cfg(not(unix))]
-                let mode = None;
-                target
-                    .set_directory_metadata(
-                        Path::new(&name),
-                        metadata.modified().ok().map(|time| time.into_std()),
-                        metadata.accessed().ok().map(|time| time.into_std()),
-                        mode,
-                    )
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(publication)
+        let budget = self.extraction_budget(job_id, &publication)?;
+        let result = tokio::task::spawn_blocking(move || {
+            publish_selection(working, staging, &publication, &excluded, &budget)
         })
         .await
-        .map_err(|e| e.to_string())??;
+        .map_err(RuntimeError::join("archive publication"))??;
         Ok(Some(result))
     }
 }
@@ -198,7 +256,6 @@ mod tests {
         .unwrap();
         let mut selected = BTreeMap::new();
         collect(
-            temp.path(),
             temp.path(),
             &HashSet::from(["nested/source.7z".into()]),
             &mut selected,

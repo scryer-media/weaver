@@ -735,11 +735,8 @@ impl Pipeline {
                     "RAR incremental extraction member ready"
                 );
 
-                let stream_output = if matches!(
-                    weaver_model::files::FileRole::from_filename(&member_name),
-                    weaver_model::files::FileRole::RarVolume { .. }
-                        | weaver_model::files::FileRole::SevenZipArchive
-                        | weaver_model::files::FileRole::SevenZipSplit { .. }
+                let stream_output = if crate::pipeline::extraction::output::routes_to_child_engine(
+                    std::path::Path::new(&member_name),
                 ) {
                     match self
                         .scoped_archive_sink(
@@ -1182,6 +1179,113 @@ impl Pipeline {
             .await;
     }
 
+    async fn handle_native_chase_resolved(
+        &mut self,
+        job_id: JobId,
+        set_name: String,
+        owner: crate::pipeline::extraction::output::channel::StreamOwner,
+        kind: crate::jobs::assembly::ArchiveType,
+        result: Result<Option<FullSetExtractionOutcome>, ExtractionError>,
+        retirement: Option<crate::pipeline::completion::finalize::extract::ChaseRetirement>,
+    ) {
+        let verdict = self.native_chase_verdict(job_id, &set_name, owner, result);
+        self.settle_native_chase(job_id, &set_name, owner, &verdict, retirement)
+            .await;
+        let result = match verdict {
+            NativeChaseVerdict::Superseded | NativeChaseVerdict::Stale => return,
+            NativeChaseVerdict::Accepted(outcome) => Ok(outcome),
+            NativeChaseVerdict::Failed(error) => Err(error),
+            NativeChaseVerdict::Restart => {
+                self.restart_native_chase(job_id, &set_name, kind).await;
+                return;
+            }
+        };
+        Box::pin(self.handle_extraction_done(ExtractionDone::FullSet {
+            job_id,
+            set_name,
+            result,
+        }))
+        .await;
+    }
+
+    fn native_chase_verdict(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        owner: crate::pipeline::extraction::output::channel::StreamOwner,
+        result: Result<Option<FullSetExtractionOutcome>, ExtractionError>,
+    ) -> NativeChaseVerdict {
+        if self.chase_stream_owner(job_id, set_name) != Some(owner) {
+            return NativeChaseVerdict::Superseded;
+        }
+        if !self
+            .archive_runtime
+            .get(&job_id)
+            .is_some_and(|runtime| runtime.sessions.execution_current(owner))
+        {
+            return NativeChaseVerdict::Stale;
+        }
+        match result {
+            Ok(Some(outcome)) => {
+                if self.accept_chase_stream(job_id, set_name) {
+                    NativeChaseVerdict::Accepted(outcome)
+                } else {
+                    NativeChaseVerdict::Stale
+                }
+            }
+            Ok(None) => NativeChaseVerdict::Restart,
+            Err(error) => NativeChaseVerdict::Failed(error),
+        }
+    }
+
+    // An accepted chase keeps its stream and its staging; every other verdict
+    // gives up this owner's work before the staging is released.
+    async fn settle_native_chase(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        owner: crate::pipeline::extraction::output::channel::StreamOwner,
+        verdict: &NativeChaseVerdict,
+        retirement: Option<crate::pipeline::completion::finalize::extract::ChaseRetirement>,
+    ) {
+        match verdict {
+            NativeChaseVerdict::Accepted(_) => return,
+            // The set's stream belongs to a newer owner; only this one goes.
+            NativeChaseVerdict::Superseded => {
+                if let Some(runtime) = self.archive_runtime.get_mut(&job_id) {
+                    let _ = runtime.retire_owner_joined(owner).await;
+                }
+            }
+            NativeChaseVerdict::Stale
+            | NativeChaseVerdict::Failed(_)
+            | NativeChaseVerdict::Restart => {
+                self.discard_chase_stream_joined(job_id, set_name).await;
+            }
+        }
+        if let Some(retirement) = retirement {
+            retirement.retire(job_id, set_name).await;
+        }
+    }
+
+    async fn restart_native_chase(
+        &mut self,
+        job_id: JobId,
+        set_name: &str,
+        kind: crate::jobs::assembly::ArchiveType,
+    ) {
+        use crate::pipeline::completion::finalize::extract::ArchiveEngine;
+        let result = match ArchiveEngine::of(kind) {
+            ArchiveEngine::Rar => Box::pin(self.extract_rar_set(job_id, set_name)).await,
+            ArchiveEngine::SevenZip => Box::pin(self.extract_7z_set(job_id, set_name)).await,
+            ArchiveEngine::Simple(_) => Err(ExtractionError::terminal(format!(
+                "native chase for '{set_name}' has no streamed form to restart"
+            ))),
+        };
+        if let Err(error) = result {
+            self.fail_job_on_extraction_error(job_id, error);
+        }
+    }
+
     async fn settle_rar_set_after_extraction_worker(
         &mut self,
         job_id: JobId,
@@ -1246,72 +1350,10 @@ impl Pipeline {
                 result,
                 retirement,
             } => {
-                if self.chase_stream_owner(job_id, &set_name) != Some(owner) {
-                    if let Some(runtime) = self.archive_runtime.get_mut(&job_id) {
-                        let _ = runtime.retire_owner_joined(owner).await;
-                    }
-                    if let Some(retirement) = retirement {
-                        retirement.retire(job_id, &set_name).await;
-                    }
-                    return;
-                }
-                if !self
-                    .archive_runtime
-                    .get(&job_id)
-                    .is_some_and(|runtime| runtime.sessions.execution_current(owner))
-                {
-                    self.discard_chase_stream_joined(job_id, &set_name).await;
-                    if let Some(retirement) = retirement {
-                        retirement.retire(job_id, &set_name).await;
-                    }
-                    return;
-                }
-                let outcome = match result {
-                    Ok(Some(outcome)) => {
-                        if !self.accept_chase_stream(job_id, &set_name) {
-                            self.discard_chase_stream_joined(job_id, &set_name).await;
-                            if let Some(retirement) = retirement {
-                                retirement.retire(job_id, &set_name).await;
-                            }
-                            return;
-                        }
-                        Some(Ok(outcome))
-                    }
-                    Err(error) => {
-                        self.discard_chase_stream_joined(job_id, &set_name).await;
-                        if let Some(retirement) = retirement {
-                            retirement.retire(job_id, &set_name).await;
-                        }
-                        Some(Err(error))
-                    }
-                    Ok(None) => {
-                        self.discard_chase_stream_joined(job_id, &set_name).await;
-                        if let Some(retirement) = retirement {
-                            retirement.retire(job_id, &set_name).await;
-                        }
-                        let result = match kind {
-                            crate::jobs::assembly::ArchiveType::Rar => {
-                                Box::pin(self.extract_rar_set(job_id, &set_name)).await
-                            }
-                            crate::jobs::assembly::ArchiveType::SevenZip => {
-                                Box::pin(self.extract_7z_set(job_id, &set_name)).await
-                            }
-                            _ => unreachable!("native streamed chase format"),
-                        };
-                        if let Err(error) = result {
-                            self.fail_job_on_extraction_error(job_id, error);
-                        }
-                        None
-                    }
-                };
-                if let Some(result) = outcome {
-                    Box::pin(self.handle_extraction_done(ExtractionDone::FullSet {
-                        job_id,
-                        set_name,
-                        result,
-                    }))
-                    .await;
-                }
+                self.handle_native_chase_resolved(
+                    job_id, set_name, owner, kind, result, retirement,
+                )
+                .await;
             }
             ExtractionDone::ScopedNamespace {
                 job_id,
@@ -1388,11 +1430,23 @@ impl Pipeline {
                     return;
                 }
 
-                let streamed = current_attempted.iter().any(|member| {
-                    self.archive_runtime
-                        .get(&job_id)
-                        .is_some_and(|runtime| runtime.scoped_streamed_member(&set_name, member))
-                });
+                // Each lookup walks the stream's retained catalogs, so every
+                // name this batch touched is resolved once.
+                let streamed_names: HashSet<String> = self
+                    .archive_runtime
+                    .get(&job_id)
+                    .map(|runtime| {
+                        current_attempted
+                            .iter()
+                            .chain(result.iter().flat_map(|outcome| &outcome.extracted))
+                            .filter(|name| runtime.scoped_streamed_member(&set_name, name))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let streamed = current_attempted
+                    .iter()
+                    .any(|member| streamed_names.contains(member));
                 let stream_failure = if streamed {
                     match &result {
                         Err(error) => Some(error.clone()),
@@ -1425,11 +1479,7 @@ impl Pipeline {
                         let physical_members: Vec<_> = outcome
                             .extracted
                             .iter()
-                            .filter(|name| {
-                                !self.archive_runtime.get(&job_id).is_some_and(|runtime| {
-                                    runtime.scoped_streamed_member(&set_name, name)
-                                })
-                            })
+                            .filter(|name| !streamed_names.contains(*name))
                             .cloned()
                             .collect();
                         if let Err(error) = self
@@ -1474,7 +1524,7 @@ impl Pipeline {
                                 .entry(job_id)
                                 .or_default()
                                 .insert(name.clone());
-                            if self.jobs.contains_key(&job_id) && physical_members.contains(name) {
+                            if self.jobs.contains_key(&job_id) && !streamed_names.contains(name) {
                                 let output_root = self
                                     .jobs
                                     .get(&job_id)
@@ -2019,4 +2069,16 @@ impl Pipeline {
             }
         }
     }
+}
+
+/// What the actor makes of a native chase's install verdict.
+enum NativeChaseVerdict {
+    /// A newer owner holds the set's stream.
+    Superseded,
+    /// The chase's generation lapsed, or its stream could not be accepted.
+    Stale,
+    Accepted(FullSetExtractionOutcome),
+    Failed(ExtractionError),
+    /// The chase left nothing to install; the full-set pass runs instead.
+    Restart,
 }

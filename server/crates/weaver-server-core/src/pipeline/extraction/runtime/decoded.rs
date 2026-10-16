@@ -38,28 +38,30 @@ impl DecodedState {
         resources: RouterResources,
         budget: Arc<JobExtractionBudget>,
         base: PathBuf,
-    ) -> Result<Self, String> {
-        let root = Arc::new(ExtractionRoot::open(&base)?);
+    ) -> Result<Self, RuntimeError> {
+        let root = Arc::new(
+            ExtractionRoot::open(&base).map_err(RuntimeError::refused("decoded namespace root"))?,
+        );
         let registry = DestinationRegistry::new(
             budget
-                .try_reserve_memory(4 * 1024 * 1024)
-                .ok_or("archive catalog/registry memory admission unavailable")?,
+                .try_reserve_memory(limits::CATALOG_ADMISSION_BYTES)
+                .ok_or(RuntimeError::Admission("archive registry"))?,
         )
-        .map_err(|e| format!("registry admission: {e:?}"))?;
+        .map_err(RuntimeError::session("registry admission"))?;
         let catalog = DecodedCatalog::new(
             generation.clone(),
             budget
-                .try_reserve_memory(4 * 1024 * 1024)
-                .ok_or("archive catalog/registry memory admission unavailable")?,
+                .try_reserve_memory(limits::CATALOG_ADMISSION_BYTES)
+                .ok_or(RuntimeError::Admission("archive catalog"))?,
         );
         let mut graph = NestedGraph::default();
         graph
             .set_namespace_depth(
                 sessions
                     .depth(generation.owner())
-                    .ok_or("unknown decoded owner")?,
+                    .ok_or(RuntimeError::Invariant("decoded owner"))?,
             )
-            .map_err(|_| "decoded namespace exceeds archive depth")?;
+            .map_err(RuntimeError::routing("decoded namespace depth"))?;
         Ok(Self {
             graph,
             catalog,
@@ -91,7 +93,7 @@ impl DecodedState {
         job_id: crate::jobs::ids::JobId,
         sender: &tokio::sync::mpsc::Sender<crate::pipeline::ExtractionDone>,
         lease: &SessionLease,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let NamespaceProgress {
             producers,
             children,
@@ -110,8 +112,8 @@ impl DecodedState {
         };
         tokio::select! {
             biased;
-            _ = lease.cancelled() => Err(String::from("decoded producer retired")),
-            result = sender.send(event) => result.map_err(|_| String::from("archive coordinator closed")),
+            _ = lease.cancelled() => Err(RuntimeError::Revoked),
+            result = sender.send(event) => result.map_err(|_| RuntimeError::CoordinatorClosed),
         }?;
         self.delegated.extend(nodes);
         Ok(())
@@ -124,17 +126,18 @@ impl DecodedState {
         }
     }
 
-    pub(crate) async fn accept(&mut self, frame: Frame) -> Result<(), String> {
+    pub(crate) async fn accept(&mut self, frame: Frame) -> Result<(), RuntimeError> {
         if self.generation.is_revoked() || frame.lease.is_revoked() {
-            return Err("decoded namespace revoked".into());
+            return Err(RuntimeError::Revoked);
         }
-        let member = self.catalog.accept(&frame).map_err(|e| e.to_string())?;
+        let member = self
+            .catalog
+            .accept(&frame)
+            .map_err(RuntimeError::io("decoded catalog"))?;
         match &frame.event {
             Event::Directory { .. } => {
                 let relative = PathBuf::from(format!("directory-{member}"));
-                self.root
-                    .create_dir(&relative, &self.budget)
-                    .map_err(|error| error.to_string())?;
+                self.root.create_dir(&relative, &self.budget)?;
                 self.destinations.insert(member, self.base.join(relative));
                 return Ok(());
             }
@@ -147,16 +150,16 @@ impl DecodedState {
                 let path = self
                     .destinations
                     .get(&member)
-                    .ok_or("metadata backing absent")?;
+                    .ok_or(RuntimeError::Invariant("metadata backing"))?;
                 let relative = path
                     .strip_prefix(&self.base)
-                    .map_err(|_| "metadata escaped namespace")?;
+                    .map_err(|_| RuntimeError::Invariant("metadata escaped namespace"))?;
                 // Stream declarations can describe an empty file, which never
                 // produces a byte placement to create its backing.
                 if !path.exists() {
                     self.root
                         .open_partial(relative)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(RuntimeError::io("metadata backing"))?;
                 }
                 self.root
                     .set_directory_metadata(
@@ -165,7 +168,7 @@ impl DecodedState {
                         metadata.accessed,
                         metadata.unix_mode,
                     )
-                    .map_err(|error| error.to_string())?;
+                    .map_err(RuntimeError::io("decoded metadata"))?;
                 return Ok(());
             }
             Event::PhysicalFile { length, .. } => {
@@ -179,14 +182,16 @@ impl DecodedState {
                     },
                     destination: DirectDestination::Member { member_id: member },
                 };
-                let length = length.ok_or("physical output requires declared length")?;
+                let length = length.ok_or(RuntimeError::Invariant(
+                    "physical output requires declared length",
+                ))?;
                 self.registry
                     .register(&self.sessions, destination, &relative, Some(length))
-                    .map_err(|e| format!("physical registration: {e:?}"))?;
+                    .map_err(RuntimeError::session("physical registration"))?;
                 let ticket = self
                     .registry
                     .begin_write(&self.sessions, destination, 0, length)
-                    .map_err(|e| format!("physical ticket: {e:?}"))?;
+                    .map_err(RuntimeError::session("physical ticket"))?;
                 self.physical.insert(member, (destination, Some(ticket)));
                 return Ok(());
             }
@@ -201,12 +206,14 @@ impl DecodedState {
                 self.registry
                     .placed(
                         &self.sessions,
-                        ticket.take().ok_or("duplicate physical completion")?,
+                        ticket
+                            .take()
+                            .ok_or(RuntimeError::Invariant("duplicate physical completion"))?,
                     )
-                    .map_err(|e| format!("physical placement: {e:?}"))?;
+                    .map_err(RuntimeError::session("physical placement"))?;
                 self.registry
                     .seal(&self.sessions, *destination, length)
-                    .map_err(|e| format!("physical seal: {e:?}"))?;
+                    .map_err(RuntimeError::session("physical seal"))?;
             }
             return Ok(());
         }
@@ -230,7 +237,7 @@ impl DecodedState {
         let writes = self
             .graph
             .forward(&namespace, ROOT_NODE, spans)
-            .map_err(|e| format!("decoded forwarding: {e:?}"))?;
+            .map_err(RuntimeError::routing("decoded forwarding"))?;
         // Routing retention owns its own holds/scratch admission. Release the
         // bridge frame only after that transfer; emitted writes still own Bytes.
         drop(frame.lease);
@@ -238,12 +245,12 @@ impl DecodedState {
         self.materialize_pending().await
     }
 
-    fn create_dataless_outputs(&mut self) -> Result<(), String> {
+    fn create_dataless_outputs(&mut self) -> Result<(), RuntimeError> {
         use crate::pipeline::direct_store::nested::NodeMode;
         let claims = self
             .registry
             .checkpoint_claims()
-            .map_err(|error| format!("dataless inventory: {error:?}"))?;
+            .map_err(RuntimeError::session("dataless inventory"))?;
         for (index, node) in self.graph.nodes.iter().enumerate() {
             if node.mode != NodeMode::Direct || !node.router.all_members_verified() {
                 continue;
@@ -263,14 +270,12 @@ impl DecodedState {
                     .join(format!("dataless-{entry_index}"));
                 let relative = path
                     .strip_prefix(&self.base)
-                    .map_err(|_| "dataless output escaped namespace")?;
+                    .map_err(|_| RuntimeError::Invariant("dataless output escaped namespace"))?;
                 if entry.is_directory {
                     if self.root.probe_directory(relative).is_ok() {
                         continue;
                     }
-                    self.root
-                        .create_dir(relative, &self.budget)
-                        .map_err(|error| error.to_string())?;
+                    self.root.create_dir(relative, &self.budget)?;
                 } else {
                     let destination = Destination {
                         namespace: self.generation.owner(),
@@ -291,18 +296,17 @@ impl DecodedState {
                     }) {
                         continue;
                     }
-                    let mut output = self
-                        .root
-                        .create_file(relative, &self.budget)
-                        .map_err(|error| error.to_string())?;
-                    output.flush().map_err(|error| error.to_string())?;
+                    let mut output = self.root.create_file(relative, &self.budget)?;
+                    output
+                        .flush()
+                        .map_err(RuntimeError::io("dataless output"))?;
                     drop(output);
                     self.registry
                         .register(&self.sessions, destination, relative, Some(0))
-                        .map_err(|error| format!("dataless registration: {error:?}"))?;
+                        .map_err(RuntimeError::session("dataless registration"))?;
                     self.registry
                         .seal(&self.sessions, destination, 0)
-                        .map_err(|error| format!("dataless seal: {error:?}"))?;
+                        .map_err(RuntimeError::session("dataless seal"))?;
                 }
                 let time = |ticks: u64| {
                     std::time::SystemTime::UNIX_EPOCH
@@ -321,26 +325,28 @@ impl DecodedState {
                         entry.accessed.and_then(time),
                         None,
                     )
-                    .map_err(|error| error.to_string())?;
+                    .map_err(RuntimeError::io("dataless metadata"))?;
             }
         }
         Ok(())
     }
 
-    async fn place(&mut self, writes: Vec<NodeSpan>) -> Result<(), String> {
+    async fn place(&mut self, writes: Vec<NodeSpan>) -> Result<(), RuntimeError> {
         let mut writes: std::collections::VecDeque<_> = writes.into();
         while let Some(write) = writes.pop_front() {
             if self.generation.is_revoked() {
-                return Err("decoded namespace revoked".into());
+                return Err(RuntimeError::Revoked);
             }
             let receipt = write.placement();
             let path = if write.owner == ROOT_NODE {
                 let DirectDestination::Member { member_id } = receipt.destination else {
-                    return Err("decoded root has no volume envelope".into());
+                    return Err(RuntimeError::Invariant(
+                        "decoded root has no volume envelope",
+                    ));
                 };
                 self.destinations
                     .get(&member_id)
-                    .ok_or("missing decoded destination")?
+                    .ok_or(RuntimeError::Invariant("decoded destination"))?
                     .clone()
             } else {
                 let router = &self.graph.node(write.owner).router;
@@ -353,7 +359,7 @@ impl DecodedState {
                             .member_partials()
                             .into_iter()
                             .find(|(id, _, _)| *id == member_id)
-                            .ok_or("missing nested destination")?
+                            .ok_or(RuntimeError::Invariant("nested destination"))?
                             .2;
                         router.plan().destination_path(partial)
                     }
@@ -361,7 +367,7 @@ impl DecodedState {
             };
             let relative = path
                 .strip_prefix(&self.base)
-                .map_err(|_| "decoded output escaped private root")?
+                .map_err(|_| RuntimeError::Invariant("decoded output escaped private root"))?
                 .to_owned();
             let destination = Destination {
                 namespace: self.generation.owner(),
@@ -370,7 +376,7 @@ impl DecodedState {
             };
             self.registry
                 .register(&self.sessions, destination, &relative, None)
-                .map_err(|e| format!("decoded registration: {e:?}"))?;
+                .map_err(RuntimeError::session("decoded registration"))?;
             let ticket = self
                 .registry
                 .begin_write(
@@ -379,26 +385,25 @@ impl DecodedState {
                     receipt.destination_offset,
                     receipt.len,
                 )
-                .map_err(|e| format!("decoded write admission: {e:?}"))?;
+                .map_err(RuntimeError::session("decoded write admission"))?;
             let root = Arc::clone(&self.root);
-            let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                let mut file = root.open_partial(&relative).map_err(|e| e.to_string())?;
-                file.seek(SeekFrom::Start(write.span.destination_offset))
-                    .map_err(|e| e.to_string())?;
+            let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                let mut file = root.open_partial(&relative)?;
+                file.seek(SeekFrom::Start(write.span.destination_offset))?;
                 for bytes in write.span.bytes {
-                    file.write_all(&bytes).map_err(|e| e.to_string())?;
+                    file.write_all(&bytes)?;
                 }
-                file.flush().map_err(|e| e.to_string())
+                file.flush()
             })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(RuntimeError::join("decoded write"))?;
             if let Err(error) = result {
                 let _ = self.registry.failed(ticket);
-                return Err(error);
+                return Err(RuntimeError::io("decoded write")(error));
             }
             self.registry
                 .placed(&self.sessions, ticket)
-                .map_err(|e| format!("decoded placement: {e:?}"))?;
+                .map_err(RuntimeError::session("decoded placement"))?;
             let namespace = DecodedNamespace {
                 catalog: &self.catalog,
                 plan: &self.plan,
@@ -407,13 +412,15 @@ impl DecodedState {
             };
             self.graph
                 .record_placement(&namespace, receipt)
-                .map_err(|e| format!("decoded receipt: {e:?}"))?;
+                .map_err(RuntimeError::routing("decoded receipt"))?;
         }
         Ok(())
     }
 
-    pub(crate) async fn close(&mut self) -> Result<(), String> {
-        self.catalog.close().map_err(|e| e.to_string())?;
+    pub(crate) async fn close(&mut self) -> Result<(), RuntimeError> {
+        self.catalog
+            .close()
+            .map_err(RuntimeError::io("decoded catalog close"))?;
         let namespace = DecodedNamespace {
             catalog: &self.catalog,
             plan: &self.plan,
@@ -423,13 +430,13 @@ impl DecodedState {
         let writes = self
             .graph
             .close_parent_roster(&namespace, ROOT_NODE)
-            .map_err(|e| format!("decoded roster: {e:?}"))?;
+            .map_err(RuntimeError::routing("decoded roster"))?;
         self.place(writes).await?;
         self.materialize_pending().await?;
         self.create_dataless_outputs()
     }
 
-    async fn materialize_pending(&mut self) -> Result<(), String> {
+    async fn materialize_pending(&mut self) -> Result<(), RuntimeError> {
         for id in 1..=self.graph.nodes.len() as u32 {
             let namespace = self.namespace();
             let Some(work) = self.graph.prepare_materialization(&namespace, id) else {
@@ -446,22 +453,22 @@ impl DecodedState {
                 };
                 let relative = path
                     .strip_prefix(&self.base)
-                    .map_err(|_| "materialization escaped namespace")?;
+                    .map_err(|_| RuntimeError::Invariant("materialization escaped namespace"))?;
                 self.registry
                     .register(&self.sessions, destination, relative, None)
-                    .map_err(|e| format!("materialization registration: {e:?}"))?;
+                    .map_err(RuntimeError::session("materialization registration"))?;
                 tickets.push(
                     self.registry
                         .begin_write(&self.sessions, destination, receipt.offset, receipt.len)
-                        .map_err(|e| format!("materialization admission: {e:?}"))?,
+                        .map_err(RuntimeError::session("materialization admission"))?,
                 );
             }
             let root = Arc::clone(&self.root);
             let base = self.base.clone();
             let budget = Arc::clone(&self.budget);
             let memory = budget
-                .try_reserve_memory(64 * 1024)
-                .ok_or("materialization memory admission unavailable")?;
+                .try_reserve_memory(limits::MATERIALIZATION_PERMIT_BYTES)
+                .ok_or(RuntimeError::Admission("materialization"))?;
             let result = tokio::task::spawn_blocking(move || {
                 let _memory = memory;
                 crate::pipeline::direct_store::nested::materialize::copy_inputs_to_checked(
@@ -473,10 +480,10 @@ impl DecodedState {
                 )
             })
             .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
+            .map_err(RuntimeError::join("materialization"))?
+            .map_err(RuntimeError::io("materialization"))?;
             if self.generation.is_revoked() {
-                return Err("decoded namespace revoked".into());
+                return Err(RuntimeError::Revoked);
             }
             let namespace = DecodedNamespace {
                 catalog: &self.catalog,
@@ -486,17 +493,17 @@ impl DecodedState {
             };
             self.graph
                 .apply_materialization(&namespace, result)
-                .map_err(|e| format!("materialization apply: {e:?}"))?;
+                .map_err(RuntimeError::routing("materialization apply"))?;
             for ticket in tickets {
                 self.registry
                     .placed(&self.sessions, ticket)
-                    .map_err(|e| format!("materialization placement: {e:?}"))?;
+                    .map_err(RuntimeError::session("materialization placement"))?;
             }
         }
         Ok(())
     }
 
-    pub(crate) fn publication(&self) -> Result<BTreeMap<String, PathBuf>, String> {
+    pub(crate) fn publication(&self) -> Result<BTreeMap<String, PathBuf>, RuntimeError> {
         let mut output = BTreeMap::new();
         self.collect_publication(ROOT_NODE, &mut output)?;
         Ok(output)
@@ -506,7 +513,7 @@ impl DecodedState {
         &self,
         owner: u32,
         output: &mut BTreeMap<String, PathBuf>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let facts: Vec<(u32, String, PathBuf)> =
             if owner == ROOT_NODE {
                 use crate::pipeline::extraction::catalog::MemberCatalog;
@@ -519,15 +526,17 @@ impl DecodedState {
                             fact.name.to_owned(),
                             self.destinations
                                 .get(&fact.id)
-                                .ok_or("missing decoded backing")?
+                                .ok_or(RuntimeError::Invariant("decoded backing"))?
                                 .clone(),
                         ))
                     })
-                    .collect::<Result<_, String>>()?
+                    .collect::<Result<_, RuntimeError>>()?
             } else {
                 let router = &self.graph.node(owner).router;
                 if !router.all_members_verified() {
-                    return Err("nested archive integrity remains unresolved".into());
+                    return Err(RuntimeError::Invariant(
+                        "nested archive integrity remains unresolved",
+                    ));
                 }
                 router
                     .member_partials()
@@ -575,7 +584,7 @@ impl DecodedState {
                 continue;
             }
             if output.insert(name.clone(), path).is_some() {
-                return Err(format!("nested archive output collision: {name}"));
+                return Err(RuntimeError::OutputCollision(name));
             }
         }
         Ok(())

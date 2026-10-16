@@ -1,11 +1,21 @@
 pub(crate) mod binding;
 pub(crate) mod checkpoint;
 pub(crate) mod decoded;
+pub(crate) mod error;
+pub(crate) mod limits;
+mod plan;
 pub(crate) mod publication;
+pub(crate) mod rearm;
 pub(crate) mod repair;
 pub(crate) mod replacement;
+mod requests;
 pub(crate) mod root;
 mod selected;
+mod workers;
+
+pub(crate) use error::RuntimeError;
+use requests::RequestTable;
+use workers::WorkerSet;
 
 use super::output::channel::StreamOwner;
 use super::session::{ArchiveSessions, InputVersion, SessionError, SessionLease};
@@ -14,6 +24,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// One root per job runtime. A u64 taken once per runtime does not wrap within
+// any process's lifetime, so two live runtimes never share a root.
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
@@ -46,21 +58,12 @@ pub(crate) struct NamespaceWork {
     pub(crate) selected_password: Option<String>,
 }
 
-struct Request {
-    owner: StreamOwner,
-    id: RequestId,
-    work: NamespaceWork,
-}
-
 // The job owner admits work and consumes completions. Workers own explicit
 // immutable input views and private output roots; they never resolve NZB IDs.
 pub(crate) struct ArchiveRuntime {
-    identity: Arc<()>,
     pub(crate) sessions: ArchiveSessions,
     pub(crate) root: u64,
-    next_request: u64,
-    requests: BTreeMap<u64, Request>,
-    speculative_requests: HashSet<u64>,
+    requests: RequestTable,
     speculative_namespaces: HashSet<String>,
     pub(crate) consumed: HashSet<String>,
     pub(crate) output_owners: BTreeMap<String, StreamOwner>,
@@ -69,7 +72,7 @@ pub(crate) struct ArchiveRuntime {
         Option<crate::pipeline::completion::finalize::TerminalArchiveCleanup>,
     pub(crate) completed: Vec<(StreamOwner, NamespaceWork, Vec<String>)>,
     pub(crate) decoded: Vec<decoded::DecodedState>,
-    workers: Vec<(StreamOwner, tokio::task::JoinHandle<()>)>,
+    workers: WorkerSet,
     pub(crate) replay: Vec<(StreamOwner, NamespaceWork)>,
     pub(crate) deferred_repairs: Vec<(StreamOwner, NamespaceWork)>,
     pub(crate) graph_owners: BTreeMap<(String, u32), StreamOwner>,
@@ -81,17 +84,24 @@ pub(crate) struct ArchiveRuntime {
     failed: bool,
 }
 
+// How owners leave the runtime, which decides what their graph slots and
+// consumed outputs become.
+#[derive(Clone, Copy)]
+enum Departure {
+    // Their whole subtree is gone: inputs abort, channels close, slots empty.
+    Revoked,
+    // A committed repair supersedes them: a node keeps its graph slot under
+    // the selected generation, and the outputs they consumed may be claimed again.
+    Replaced(StreamOwner),
+}
+
 impl ArchiveRuntime {
     pub(crate) fn new() -> Self {
         let root = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(root, u64::MAX, "archive runtime identity exhausted");
         Self {
-            identity: Arc::new(()),
             sessions: ArchiveSessions::new(root, 0),
             root,
-            next_request: 0,
-            requests: BTreeMap::new(),
-            speculative_requests: HashSet::new(),
+            requests: RequestTable::new(),
             speculative_namespaces: HashSet::new(),
             consumed: HashSet::new(),
             output_owners: BTreeMap::new(),
@@ -99,7 +109,7 @@ impl ArchiveRuntime {
             terminal_cleanup: None,
             completed: Vec::new(),
             decoded: Vec::new(),
-            workers: Vec::new(),
+            workers: WorkerSet::default(),
             replay: Vec::new(),
             deferred_repairs: Vec::new(),
             graph_owners: BTreeMap::new(),
@@ -137,37 +147,16 @@ impl ArchiveRuntime {
         if !self.sessions.accepts(owner) || self.failed {
             return Err(SessionError::Stale);
         }
-        let sequence = self
-            .next_request
-            .checked_add(1)
-            .ok_or(SessionError::Admission)?;
-        self.next_request = sequence;
-        let id = RequestId {
-            identity: Arc::clone(&self.identity),
-            sequence,
-        };
-        self.requests.insert(
-            sequence,
-            Request {
-                owner,
-                id: id.clone(),
-                work,
-            },
-        );
-        Ok(id)
+        self.requests.issue(owner, work)
     }
 
     // Called only after the worker has joined. The opaque identity fences a
     // late completion even after the same JobId has acquired a new runtime.
     pub(crate) fn complete(&mut self, owner: StreamOwner, id: RequestId) -> Option<NamespaceWork> {
-        if !Arc::ptr_eq(&self.identity, &id.identity) {
+        if self.requests.get(&id)?.owner != owner {
             return None;
         }
-        let request = self.requests.get(&id.sequence)?;
-        if request.owner != owner || !Arc::ptr_eq(&request.id.identity, &id.identity) {
-            return None;
-        }
-        let request = self.requests.remove(&id.sequence)?;
+        let request = self.requests.remove(&id)?;
         if !self.sessions.execution_current(owner) {
             let _ = self.sessions.joined(owner);
             return None;
@@ -177,16 +166,13 @@ impl ArchiveRuntime {
 
     #[cfg(test)]
     pub(crate) fn request_set_name(&self, request: &RequestId) -> Option<&str> {
-        if !Arc::ptr_eq(&self.identity, &request.identity) {
-            return None;
-        }
         self.requests
-            .get(&request.sequence)
+            .get(request)
             .map(|request| request.work.set_name.as_str())
     }
 
     pub(crate) fn track_worker(&mut self, owner: StreamOwner, worker: tokio::task::JoinHandle<()>) {
-        self.workers.push((owner, worker));
+        self.workers.track(owner, worker);
     }
 
     pub(crate) fn pending(&self) -> bool {
@@ -199,18 +185,30 @@ impl ArchiveRuntime {
 
     pub(crate) fn fail(&mut self, owner: StreamOwner) {
         self.failed = true;
-        for (_, input) in &self.live_inputs {
-            input.abort("archive runtime failed");
+        self.stop_all("archive runtime failed");
+        let _ = self.sessions.revoke(owner);
+        self.completed.clear();
+    }
+
+    // Revokes every running worker and producer. Revocation only fences
+    // authority; each worker keeps its private backings until it observes it.
+    fn stop_all(&mut self, reason: &'static str) {
+        for input in self
+            .live_inputs
+            .iter()
+            .map(|(_, input)| input)
+            .chain(self.gates.values())
+        {
+            input.abort(reason);
         }
         self.sinks.clear();
-        let _ = self.sessions.revoke(owner);
-        for &(sibling, _) in &self.workers {
-            let _ = self.sessions.revoke(sibling);
+        let owners: Vec<StreamOwner> = self.workers.owners().collect();
+        for owner in owners {
+            let _ = self.sessions.revoke(owner);
         }
         for state in &self.decoded {
             state.generation.revoke();
         }
-        self.completed.clear();
     }
 
     pub(crate) fn publication_ready(&self) -> bool {
@@ -224,26 +222,94 @@ impl ArchiveRuntime {
                 .iter()
                 .all(|(owner, _, _)| self.sessions.ancestry_verified(*owner))
     }
+
+    // Every per-owner field is named here, so a new one must say what an
+    // owner's departure does to it.
+    fn forget_owners(&mut self, gone: &[StreamOwner], departure: Departure) {
+        if let Departure::Revoked = departure {
+            self.abort_inputs(gone, "archive input owner revoked");
+            self.retire_sinks(gone);
+        }
+        let Self {
+            sessions: _,
+            root: _,
+            requests,
+            speculative_namespaces,
+            consumed,
+            output_owners,
+            retained_work,
+            terminal_cleanup: _,
+            completed,
+            decoded,
+            // Joining is the caller's choice: some wait, some leave a barrier.
+            workers: _,
+            replay,
+            deferred_repairs,
+            graph_owners,
+            // Only revocation closes channels, and it has done so above.
+            sinks: _,
+            gates,
+            live_inputs,
+            checkpoint_roots: _,
+            staged_replacement,
+            failed: _,
+        } = self;
+        let kept = |owner: &StreamOwner| !gone.contains(owner);
+        completed.retain(|(owner, _, _)| kept(owner));
+        retained_work.retain(|(owner, _)| kept(owner));
+        deferred_repairs.retain(|(owner, _)| kept(owner));
+        replay.retain(|(owner, _)| kept(owner));
+        decoded.retain(|state| kept(&state.generation.owner()));
+        match departure {
+            Departure::Revoked => {
+                requests.forget(gone);
+                output_owners.retain(|_, owner| kept(owner));
+                graph_owners.retain(|_, owner| kept(owner));
+                speculative_namespaces
+                    .retain(|namespace| graph_owners.keys().any(|(bound, _)| bound == namespace));
+                gates.retain(|key, _| graph_owners.contains_key(key));
+                if staged_replacement.as_ref().is_some_and(|staged| {
+                    !kept(&staged.selected) || staged.retiring.iter().any(|owner| !kept(owner))
+                }) {
+                    staged_replacement.take();
+                }
+            }
+            Departure::Replaced(selected) => {
+                output_owners.retain(|name, owner| {
+                    let keep = kept(owner);
+                    if !keep {
+                        consumed.remove(name);
+                    }
+                    keep
+                });
+                graph_owners.retain(|_, owner| {
+                    if kept(owner) {
+                        return true;
+                    }
+                    if owner.node == selected.node {
+                        *owner = selected;
+                        return true;
+                    }
+                    false
+                });
+            }
+        }
+        live_inputs.retain(|(owner, _)| kept(owner));
+    }
 }
 
 impl Drop for ArchiveRuntime {
     fn drop(&mut self) {
-        for (_, input) in &self.live_inputs {
-            input.abort("archive runtime removed");
-        }
-        self.sinks.clear();
-        for (owner, _) in &self.workers {
-            let _ = self.sessions.revoke(*owner);
-        }
-        for state in &self.decoded {
-            state.generation.revoke();
-        }
+        self.stop_all("archive runtime removed");
         // Removal fences requests immediately, while this drainer retains each
         // worker until it has stopped touching its private backing namespace.
-        let workers = std::mem::take(&mut self.workers);
+        // Without a Tokio runtime there is nothing to drain on, and dropping a
+        // JoinHandle detaches its task rather than cancelling it, so each
+        // worker still runs to its own cancellation checkpoint.
+        let workers = self.workers.take_all();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                for (_, worker) in workers {
+                for worker in workers {
                     let _ = worker.await;
                 }
             });

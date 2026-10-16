@@ -255,6 +255,10 @@ impl Write for ChannelWriter {
             .offset
             .checked_add(length as u64)
             .ok_or_else(|| io::Error::other("archive output offset overflow"))?;
+        // The decoder lends this slice only for the call, while the frame
+        // waits in the bridge until the coordinator drains it. The copy is the
+        // one the bridge's admission already charges for, so a pooled buffer
+        // would only move the same bytes into a second owner.
         self.output.send(self.occurrence, length, || Event::Bytes {
             offset: self.offset,
             bytes: bytes::Bytes::copy_from_slice(&bytes[..length]),

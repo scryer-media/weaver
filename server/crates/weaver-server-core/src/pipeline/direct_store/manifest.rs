@@ -39,15 +39,25 @@ impl Reference {
         if bytes.len() != REFERENCE_BYTES || !is_reference(bytes) {
             return Err(invalid("invalid direct checkpoint reference"));
         }
-        let length = u64::from_le_bytes(bytes[36..44].try_into().unwrap());
+        let Some((owner, length, digest)) = Self::fields(bytes) else {
+            return Err(invalid("invalid direct checkpoint reference"));
+        };
         if length == 0 || length > MAX_MANIFEST_BYTES as u64 {
             return Err(invalid("direct checkpoint exceeds its size limit"));
         }
         Ok(Self {
-            owner: bytes[4..36].try_into().unwrap(),
+            owner,
             length,
-            digest: bytes[44..76].try_into().unwrap(),
+            digest,
         })
+    }
+
+    fn fields(bytes: &[u8]) -> Option<([u8; 32], u64, [u8; 32])> {
+        let (owner, rest) = bytes
+            .strip_prefix(MAGIC.as_slice())?
+            .split_first_chunk::<32>()?;
+        let (length, digest) = rest.split_first_chunk::<8>()?;
+        Some((*owner, u64::from_le_bytes(*length), digest.try_into().ok()?))
     }
 }
 
@@ -57,6 +67,7 @@ pub(crate) fn is_reference(bytes: &[u8]) -> bool {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ManifestStore {
+    working_dir: PathBuf,
     directory: PathBuf,
     owner: [u8; 32],
 }
@@ -67,6 +78,7 @@ impl ManifestStore {
         hash.update(b"weaver-job-archive-checkpoint-v1\0");
         hash.update(&job_id.0.to_le_bytes());
         Self {
+            working_dir: working_dir.to_path_buf(),
             directory: working_dir.join(DIRECTORY),
             owner: *hash.finalize().as_bytes(),
         }
@@ -78,6 +90,7 @@ impl ManifestStore {
         hash.update(&job_id.0.to_le_bytes());
         hash.update(set_name.as_bytes());
         Self {
+            working_dir: working_dir.to_path_buf(),
             directory: working_dir.join(DIRECTORY),
             owner: *hash.finalize().as_bytes(),
         }
@@ -140,11 +153,7 @@ impl ManifestStore {
         };
         let encoded = reference.encode();
         match fs::create_dir(&self.directory) {
-            Ok(()) => sync_directory(
-                self.directory
-                    .parent()
-                    .expect("checkpoint directory has a parent"),
-            )?,
+            Ok(()) => sync_directory(&self.working_dir)?,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }

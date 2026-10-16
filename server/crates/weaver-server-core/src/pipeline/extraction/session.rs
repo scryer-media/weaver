@@ -1,4 +1,5 @@
 use super::output::channel::{Generation, StreamOwner};
+use super::runtime::limits::MAX_DEPTH;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +9,6 @@ pub(crate) mod checkpoint;
 
 const MAX_NODES: usize = 4096;
 const MAX_SESSIONS: usize = 8192;
-const MAX_DEPTH: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InputVersion(pub(crate) u64);
@@ -20,6 +20,19 @@ pub(crate) enum SessionError {
     Admission,
     InvalidTransition,
 }
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Stale => "archive session is no longer current",
+            Self::Busy => "archive session is still running",
+            Self::Admission => "archive session limit reached",
+            Self::InvalidTransition => "archive session cannot make that transition",
+        })
+    }
+}
+
+impl std::error::Error for SessionError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -125,6 +138,10 @@ impl ArchiveSessions {
         self.sessions
             .get(&(owner.node, owner.generation))
             .ok_or(SessionError::Stale)
+    }
+
+    fn node_mut(&mut self, node: u32) -> Result<&mut Node, SessionError> {
+        self.nodes.get_mut(&node).ok_or(SessionError::Stale)
     }
 
     fn session_mut(&mut self, owner: StreamOwner) -> Result<&mut Session, SessionError> {
@@ -233,21 +250,13 @@ impl ArchiveSessions {
         {
             return Err(SessionError::Stale);
         }
-        let previous = state.containing;
-        self.nodes
-            .get_mut(&node)
-            .expect("validated node")
-            .containing = containing;
-        match self.start(node) {
-            Ok(lease) => Ok(lease),
-            Err(error) => {
-                self.nodes
-                    .get_mut(&node)
-                    .expect("validated node")
-                    .containing = previous;
-                Err(error)
+        let previous = std::mem::replace(&mut self.node_mut(node)?.containing, containing);
+        self.start(node).inspect_err(|_| {
+            // `start` never removes a node, so the one just changed is there.
+            if let Ok(state) = self.node_mut(node) {
+                state.containing = previous;
             }
-        }
+        })
     }
 
     pub(crate) fn start(&mut self, node: u32) -> Result<SessionLease, SessionError> {
@@ -269,6 +278,9 @@ impl ArchiveSessions {
             node,
             generation,
         };
+        let state = self.node_mut(node)?;
+        state.next_generation = next;
+        state.active = Some(owner);
         let (cancellation_wake, receiver) = watch::channel(false);
         let lease = SessionLease {
             owner,
@@ -287,9 +299,6 @@ impl ArchiveSessions {
                 channel: None,
             },
         );
-        let state = self.nodes.get_mut(&node).expect("validated node");
-        state.next_generation = next;
-        state.active = Some(owner);
         self.revision += 1;
         Ok(lease)
     }
@@ -459,10 +468,7 @@ impl ArchiveSessions {
         for owner in replacement.retiring {
             self.session_mut(owner)?.phase = Phase::Retired;
         }
-        let node = self
-            .nodes
-            .get_mut(&replacement.node)
-            .expect("validated node");
+        let node = self.node_mut(replacement.node)?;
         node.effective = replacement.effective;
         node.active = None;
         self.revision += 1;

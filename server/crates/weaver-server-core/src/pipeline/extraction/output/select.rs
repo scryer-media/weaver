@@ -10,6 +10,18 @@ pub(crate) struct SelectOutput<A, B, F> {
     pub(crate) select_first: F,
 }
 
+impl<A, B> SelectOutput<A, B, fn(usize, &Path) -> bool> {
+    /// Members that feed a child engine go to `archives`; every leaf goes to
+    /// `leaves`.
+    pub(crate) fn child_archives(archives: A, leaves: B) -> Self {
+        Self {
+            first: archives,
+            second: leaves,
+            select_first: |_, path| routes_to_child_engine(path),
+        }
+    }
+}
+
 pub(crate) enum SelectedMember<A, B> {
     First(A),
     Second(B),

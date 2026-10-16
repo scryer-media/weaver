@@ -20,6 +20,106 @@ pub(super) mod prepared;
 use password_candidates::extract_7z_with_password_candidates;
 pub(in crate::pipeline) mod sequential;
 
+/// The decoder family an archive type runs on.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::pipeline) enum ArchiveEngine {
+    Rar,
+    SevenZip,
+    Simple(SimpleArchiveKind),
+}
+
+impl ArchiveEngine {
+    pub(in crate::pipeline) fn of(kind: crate::jobs::assembly::ArchiveType) -> Self {
+        use crate::jobs::assembly::ArchiveType as A;
+        match kind {
+            A::Rar => Self::Rar,
+            A::SevenZip => Self::SevenZip,
+            A::Zip => Self::Simple(SimpleArchiveKind::Zip),
+            A::Tar => Self::Simple(SimpleArchiveKind::Tar),
+            A::TarGz => Self::Simple(SimpleArchiveKind::TarGz),
+            A::TarBz2 => Self::Simple(SimpleArchiveKind::TarBz2),
+            A::TarXz => Self::Simple(SimpleArchiveKind::TarXz),
+            A::Gz => Self::Simple(SimpleArchiveKind::Gz),
+            A::Deflate => Self::Simple(SimpleArchiveKind::Deflate),
+            A::Brotli => Self::Simple(SimpleArchiveKind::Brotli),
+            A::Zstd => Self::Simple(SimpleArchiveKind::Zstd),
+            A::Bzip2 => Self::Simple(SimpleArchiveKind::Bzip2),
+            A::Xz => Self::Simple(SimpleArchiveKind::Xz),
+            A::Split => Self::Simple(SimpleArchiveKind::Split),
+        }
+    }
+}
+
+/// A chase that already owns the set's stream. Its install is resolved off the
+/// actor and the verdict returns for the actor to keep, discard, or restart.
+struct NativeChaseInstall {
+    job_id: JobId,
+    set_name: String,
+    owner: crate::pipeline::extraction::output::channel::StreamOwner,
+    kind: crate::jobs::assembly::ArchiveType,
+    disposition: crate::pipeline::direct_unpack::wiring::ChaseDisposition,
+    staging: PathBuf,
+    counters: Arc<PhaseCounters>,
+    policy: Option<Arc<crate::post_processing::model::PostProcessingSettings>>,
+}
+
+impl NativeChaseInstall {
+    async fn resolve(self, done: tokio::sync::mpsc::Sender<ExtractionDone>) {
+        let resolution = install_direct_unpack_checked(
+            self.disposition,
+            self.staging,
+            self.counters,
+            self.job_id,
+            &self.set_name,
+            self.policy.as_deref(),
+            None,
+        )
+        .await;
+        let _ = done
+            .send(ExtractionDone::NativeChaseResolved {
+                job_id: self.job_id,
+                set_name: self.set_name,
+                owner: self.owner,
+                kind: self.kind,
+                result: resolution.result,
+                retirement: resolution.retirement,
+            })
+            .await;
+    }
+}
+
+/// Where a root stream's verdict goes. The lease keeps a superseded
+/// generation's verdict from reaching the actor.
+struct RootCompletion {
+    job_id: JobId,
+    owner: crate::pipeline::extraction::output::channel::StreamOwner,
+    request: crate::pipeline::extraction::runtime::RequestId,
+    lease: crate::pipeline::extraction::session::SessionLease,
+    done: tokio::sync::mpsc::Sender<ExtractionDone>,
+}
+
+impl RootCompletion {
+    async fn report(
+        self,
+        decoded: Option<Box<crate::pipeline::extraction::runtime::decoded::DecodedState>>,
+        result: Result<FullSetExtractionOutcome, ExtractionError>,
+    ) {
+        let _ = self
+            .lease
+            .send_event(
+                &self.done,
+                ExtractionDone::Scoped {
+                    job_id: self.job_id,
+                    owner: self.owner,
+                    request: self.request,
+                    decoded,
+                    result,
+                },
+            )
+            .await;
+    }
+}
+
 // The decoder an xz file on disk gets: single-threaded over the whole file,
 // or block-parallel with the job's memory budget charged for exactly what the
 // workers will hold.
@@ -3377,35 +3477,20 @@ impl Pipeline {
         // extract_rar_member_to_output); topology may not be rebuilt yet here.
         let phase_counters = self.phase_begin(job_id, JobPhase::Extracting, None);
         let disposition = self.take_direct_unpack_disposition(job_id, set_name);
-        let scoped_chase = self.has_scoped_chase(job_id, set_name);
         let staging_for_install = output_dir.clone();
         let phase_counters_for_install = Arc::clone(&phase_counters);
-        if scoped_chase {
-            let owner = self
-                .chase_stream_owner(job_id, set_name)
-                .expect("native chase owner");
-            tokio::spawn(async move {
-                let result = install_direct_unpack_checked(
-                    disposition,
-                    staging_for_install,
-                    phase_counters_for_install,
-                    job_id,
-                    &set_name_for_task,
-                    Some(&policy),
-                    None,
-                )
-                .await;
-                let _ = extract_done_tx
-                    .send(ExtractionDone::NativeChaseResolved {
-                        job_id,
-                        set_name: set_name_for_task,
-                        owner,
-                        kind: crate::jobs::assembly::ArchiveType::Rar,
-                        result: result.result,
-                        retirement: result.retirement,
-                    })
-                    .await;
-            });
+        if let Some(owner) = self.chase_stream_owner(job_id, set_name) {
+            let chase = NativeChaseInstall {
+                job_id,
+                set_name: set_name_for_task,
+                owner,
+                kind: crate::jobs::assembly::ArchiveType::Rar,
+                disposition,
+                staging: staging_for_install,
+                counters: phase_counters_for_install,
+                policy: Some(policy),
+            };
+            tokio::spawn(chase.resolve(extract_done_tx));
             return Ok(0);
         }
         self.retire_unusable_root_stream(job_id, set_name).await?;
@@ -3421,9 +3506,19 @@ impl Pipeline {
             Arc::clone(&budget),
         )?;
         let owner = dispatch.owner;
-        let request = dispatch.request.clone();
-        let channel = dispatch.channel.take().expect("root RAR channel");
-        let completion_lease = dispatch.lease();
+        let channel = dispatch.channel.take().ok_or_else(|| {
+            ExtractionError::terminal(format!("root stream for '{set_name}' has no channel"))
+        })?;
+        let runtime = self.archive_runtime.get_mut(&job_id).ok_or_else(|| {
+            ExtractionError::terminal(format!("root stream for '{set_name}' has no runtime"))
+        })?;
+        let completion = RootCompletion {
+            job_id,
+            owner,
+            request: dispatch.request.clone(),
+            lease: dispatch.lease(),
+            done: extract_done_tx,
+        };
         let worker = tokio::task::spawn(async move {
             if let Some(outcome) = install_direct_unpack(
                 disposition,
@@ -3436,18 +3531,7 @@ impl Pipeline {
             )
             .await
             {
-                let _ = completion_lease
-                    .send_event(
-                        &extract_done_tx,
-                        ExtractionDone::Scoped {
-                            job_id,
-                            owner,
-                            request,
-                            decoded: None,
-                            result: Ok(outcome),
-                        },
-                    )
-                    .await;
+                completion.report(None, Ok(outcome)).await;
                 return;
             }
             let task = tokio::task::spawn_blocking(move || {
@@ -3475,23 +3559,9 @@ impl Pipeline {
             });
             let (result, decoded) = dispatch.collect(task).await;
             let result = result.map_err(|error| error.settle(&settle_budget));
-            let _ = completion_lease
-                .send_event(
-                    &extract_done_tx,
-                    ExtractionDone::Scoped {
-                        job_id,
-                        owner,
-                        request,
-                        decoded,
-                        result,
-                    },
-                )
-                .await;
+            completion.report(decoded, result).await;
         });
-        self.archive_runtime
-            .get_mut(&job_id)
-            .expect("admitted RAR root runtime")
-            .track_worker(owner, worker);
+        runtime.track_worker(owner, worker);
 
         // Extraction runs in background — result comes through extract_done_tx channel.
         Ok(0)
@@ -3512,58 +3582,11 @@ impl Pipeline {
                 .or_default()
                 .insert(name.clone());
 
-            let result = match archive_type {
-                crate::jobs::assembly::ArchiveType::SevenZip => {
-                    self.extract_7z_set(job_id, name).await
-                }
-                crate::jobs::assembly::ArchiveType::Rar => self.extract_rar_set(job_id, name).await,
-                crate::jobs::assembly::ArchiveType::Zip => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Zip)
-                        .await
-                }
-                crate::jobs::assembly::ArchiveType::Tar => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Tar)
-                        .await
-                }
-                crate::jobs::assembly::ArchiveType::TarGz => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::TarGz)
-                        .await
-                }
-                crate::jobs::assembly::ArchiveType::TarBz2 => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::TarBz2)
-                        .await
-                }
-                crate::jobs::assembly::ArchiveType::TarXz => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::TarXz)
-                        .await
-                }
-                crate::jobs::assembly::ArchiveType::Gz => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Gz)
-                        .await
-                }
-                crate::jobs::assembly::ArchiveType::Deflate => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Deflate)
-                        .await
-                }
-                crate::jobs::assembly::ArchiveType::Brotli => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Brotli)
-                        .await
-                }
-                crate::jobs::assembly::ArchiveType::Zstd => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Zstd)
-                        .await
-                }
-                crate::jobs::assembly::ArchiveType::Bzip2 => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Bzip2)
-                        .await
-                }
-                crate::jobs::assembly::ArchiveType::Xz => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Xz)
-                        .await
-                }
-                crate::jobs::assembly::ArchiveType::Split => {
-                    self.extract_simple_archive(job_id, name, SimpleArchiveKind::Split)
-                        .await
+            let result = match ArchiveEngine::of(*archive_type) {
+                ArchiveEngine::SevenZip => self.extract_7z_set(job_id, name).await,
+                ArchiveEngine::Rar => self.extract_rar_set(job_id, name).await,
+                ArchiveEngine::Simple(kind) => {
+                    self.extract_simple_archive(job_id, name, kind).await
                 }
             };
             match result {
@@ -3704,36 +3727,21 @@ impl Pipeline {
         // resolved inside the spawned task below — a chase that is still
         // running must never be awaited on this loop.
         let disposition = self.take_direct_unpack_disposition(job_id, set_name);
-        let scoped_chase = self.has_scoped_chase(job_id, set_name);
         let staging_for_install = output_dir.clone();
         let phase_counters_for_install = Arc::clone(&phase_counters);
 
-        if scoped_chase {
-            let owner = self
-                .chase_stream_owner(job_id, set_name)
-                .expect("native chase owner");
-            tokio::spawn(async move {
-                let result = install_direct_unpack_checked(
-                    disposition,
-                    staging_for_install,
-                    phase_counters_for_install,
-                    job_id,
-                    &set_name_for_channel,
-                    None,
-                    None,
-                )
-                .await;
-                let _ = extract_done_tx
-                    .send(ExtractionDone::NativeChaseResolved {
-                        job_id,
-                        set_name: set_name_for_channel,
-                        owner,
-                        kind: crate::jobs::assembly::ArchiveType::SevenZip,
-                        result: result.result,
-                        retirement: result.retirement,
-                    })
-                    .await;
-            });
+        if let Some(owner) = self.chase_stream_owner(job_id, set_name) {
+            let chase = NativeChaseInstall {
+                job_id,
+                set_name: set_name_for_channel,
+                owner,
+                kind: crate::jobs::assembly::ArchiveType::SevenZip,
+                disposition,
+                staging: staging_for_install,
+                counters: phase_counters_for_install,
+                policy: None,
+            };
+            tokio::spawn(chase.resolve(extract_done_tx));
             return Ok(0);
         }
         self.retire_unusable_root_stream(job_id, set_name).await?;
@@ -3746,9 +3754,19 @@ impl Pipeline {
             Arc::clone(&budget),
         )?;
         let owner = dispatch.owner;
-        let request = dispatch.request.clone();
-        let channel = dispatch.channel.take().expect("root channel");
-        let completion_lease = dispatch.lease();
+        let channel = dispatch.channel.take().ok_or_else(|| {
+            ExtractionError::terminal(format!("root stream for '{set_name}' has no channel"))
+        })?;
+        let runtime = self.archive_runtime.get_mut(&job_id).ok_or_else(|| {
+            ExtractionError::terminal(format!("root stream for '{set_name}' has no runtime"))
+        })?;
+        let completion = RootCompletion {
+            job_id,
+            owner,
+            request: dispatch.request.clone(),
+            lease: dispatch.lease(),
+            done: extract_done_tx,
+        };
         let worker = tokio::task::spawn(async move {
             if let Some(outcome) = install_direct_unpack(
                 disposition,
@@ -3761,18 +3779,7 @@ impl Pipeline {
             )
             .await
             {
-                let _ = completion_lease
-                    .send_event(
-                        &extract_done_tx,
-                        ExtractionDone::Scoped {
-                            job_id,
-                            owner,
-                            request,
-                            decoded: None,
-                            result: Ok(outcome),
-                        },
-                    )
-                    .await;
+                completion.report(None, Ok(outcome)).await;
                 return;
             }
             let task = tokio::task::spawn_blocking(move || {
@@ -3796,46 +3803,22 @@ impl Pipeline {
                     };
                     channel.run(|output| {
                         prepared.run_to(
-                            &crate::pipeline::extraction::output::select::SelectOutput {
-                                first: output,
-                                second: FileOutput {
+                            &crate::pipeline::extraction::output::select::SelectOutput::child_archives(
+                                output,
+                                FileOutput {
                                     root: &file_root,
                                     budget: &file_budget,
                                 },
-                                select_first: |_: usize, path: &Path| {
-                                    matches!(
-                                        weaver_model::files::FileRole::from_filename(
-                                            &path.to_string_lossy()
-                                        ),
-                                        weaver_model::files::FileRole::RarVolume { .. }
-                                            | weaver_model::files::FileRole::SevenZipArchive
-                                            | weaver_model::files::FileRole::SevenZipSplit { .. }
-                                    )
-                                },
-                            },
+                            ),
                         )
                     })
                 })
             });
             let (result, decoded) = dispatch.collect(task).await;
             let result = result.map_err(|error| error.settle(&settle_budget));
-            let _ = completion_lease
-                .send_event(
-                    &extract_done_tx,
-                    ExtractionDone::Scoped {
-                        job_id,
-                        owner,
-                        request,
-                        decoded,
-                        result,
-                    },
-                )
-                .await;
+            completion.report(decoded, result).await;
         });
-        self.archive_runtime
-            .get_mut(&job_id)
-            .expect("admitted root runtime")
-            .track_worker(owner, worker);
+        runtime.track_worker(owner, worker);
 
         // Return Ok(0) for now — actual result comes through the channel.
         Ok(0)

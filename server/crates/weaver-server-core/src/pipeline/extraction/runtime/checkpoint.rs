@@ -4,7 +4,6 @@ use crate::pipeline::direct_store::manifest::graph::{
     JobGraph, PhysicalDestination, PhysicalFile, PhysicalOwner, RootGraph,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -508,8 +507,7 @@ impl ArchiveRuntime {
             .requests
             .values()
             .filter(|request| {
-                self.checkpoint_keeps_owner(request.owner)
-                    && !self.speculative_requests.contains(&request.id.sequence)
+                self.checkpoint_keeps_owner(request.owner) && !self.requests.is_speculative(request)
             })
             .map(|request| {
                 WorkCheckpoint::capture(request.owner, &request.work, Vec::new(), working, staging)
@@ -551,8 +549,7 @@ impl ArchiveRuntime {
                 .filter(|((namespace, _), owner)| {
                     !self.speculative_namespaces.contains(namespace)
                         && !self.requests.values().any(|request| {
-                            request.owner == **owner
-                                && self.speculative_requests.contains(&request.id.sequence)
+                            request.owner == **owner && self.requests.is_speculative(request)
                         })
                 })
                 .filter_map(|((set, node), owner)| {
@@ -936,57 +933,37 @@ impl crate::pipeline::Pipeline {
         job: &JobGraph,
         index: u32,
         runtime: &ArchiveRuntime,
-    ) -> Result<decoded::DecodedState, String> {
+    ) -> Result<decoded::DecodedState, RuntimeError> {
+        const RESTORE: &str = "decoded graph restore";
         let saved = job
             .roots
             .get(index as usize)
             .and_then(|root| root.decoded.as_ref())
-            .ok_or("decoded graph record absent")?;
+            .ok_or(RuntimeError::Invariant("decoded graph record"))?;
         let staging = self.deterministic_extraction_staging_dir(job_id);
-        if saved.owner.root != job.sessions.root {
-            return Err("decoded owner root mismatch".into());
-        }
-        let owner = StreamOwner {
-            root: runtime.root,
-            ..saved.owner
-        };
-        if !runtime.sessions.ancestry_verified(owner) {
-            return Err("decoded graph namespace lacks integrity closure".into());
-        }
+        let owner = saved.restored_owner(job, runtime)?;
         let sessions = ArchiveSessions::restore_checkpoint(
             &runtime.sessions.capture_checkpoint(),
             runtime.root,
         )
-        .map_err(|e| format!("decoded lifecycle view: {e:?}"))?;
+        .map_err(RuntimeError::session("decoded lifecycle view"))?;
         let base = saved
             .base
             .resolve(working, &staging)
-            .map_err(|e| e.to_string())?;
+            .map_err(RuntimeError::io(RESTORE))?;
         if !base.starts_with(working.join(crate::pipeline::direct_store::manifest::DIRECTORY)) {
-            return Err("decoded namespace outside private root".into());
+            return Err(RuntimeError::Invariant(
+                "decoded namespace outside private root",
+            ));
         }
-        let destinations = saved
-            .destinations
-            .iter()
-            .map(|(id, path)| {
-                Ok((
-                    *id,
-                    path.resolve(working, &staging).map_err(|e| e.to_string())?,
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, String>>()?;
-        if destinations.len() != saved.destinations.len()
-            || destinations.values().any(|path| !path.starts_with(&base))
-        {
-            return Err("invalid decoded destinations".into());
-        }
-        let budget = self
-            .extraction_budget(job_id, &base)
-            .map_err(|e| e.to_string())?;
+        let destinations = saved.restored_destinations(working, &staging, &base)?;
+        let budget = self.extraction_budget(job_id, &base)?;
+        // A restored generation never carries a frame; the channel exists only
+        // so the generation has an owner to revoke.
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
         let memory = budget
-            .try_reserve_memory(1024)
-            .ok_or("decoded generation admission")?;
+            .try_reserve_memory(limits::RESTORED_GENERATION_ADMISSION_BYTES)
+            .ok_or(RuntimeError::Admission("decoded generation"))?;
         let (_output, generation) = super::super::output::channel::ChannelOutput::new(
             owner,
             memory,
@@ -994,69 +971,29 @@ impl crate::pipeline::Pipeline {
             tokio::runtime::Handle::current(),
             Arc::clone(&budget),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(RuntimeError::io("decoded generation"))?;
         let catalog = super::super::catalog::decoded::DecodedCatalog::restore_checkpoint(
             &saved.catalog,
             generation.clone(),
             budget
-                .try_reserve_memory(4 * 1024 * 1024)
-                .ok_or("decoded catalog admission")?,
+                .try_reserve_memory(limits::CATALOG_ADMISSION_BYTES)
+                .ok_or(RuntimeError::Admission("decoded catalog"))?,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(RuntimeError::io("decoded catalog restore"))?;
         let registry = super::super::storage::DestinationRegistry::restore_checkpoint(
             &saved.registry,
             budget
-                .try_reserve_memory(4 * 1024 * 1024)
-                .ok_or("decoded registry admission")?,
+                .try_reserve_memory(limits::CATALOG_ADMISSION_BYTES)
+                .ok_or(RuntimeError::Admission("decoded registry"))?,
             saved.owner.root,
             owner.root,
         )
-        .map_err(|e| format!("decoded registry restore: {e:?}"))?;
-        let claims = registry
-            .checkpoint_claims()
-            .map_err(|e| format!("decoded physical restore: {e:?}"))?;
-        let selected: Vec<_> = job
-            .files
-            .iter()
-            .filter(|file| file.archive_root() == Some(index))
-            .collect();
-        if claims.len() != selected.len() {
-            return Err("decoded physical inventory mismatch".into());
-        }
-        for (destination, relative, length, extents) in claims {
-            let path = base.join(relative);
-            let expected = selected
-                .iter()
-                .find(|file| {
-                    working.join(&file.path) == path
-                        && file.node() == destination.owner.node
-                        && file.generation() == destination.owner.generation
-                })
-                .ok_or("decoded registry claim lacks authoritative physical file")?;
-            if expected.length != length || expected.extents != extents {
-                return Err("decoded registry extents differ from authoritative graph".into());
-            }
-            if let Some(entry) = saved.dataless.iter().find(|entry| {
-                entry
-                    .path
-                    .resolve(working, &staging)
-                    .is_ok_and(|candidate| candidate == path)
-            }) && (entry.directory
-                || !matches!(destination.destination, crate::pipeline::direct_store::router::DirectDestination::Member { member_id } if member_id == u32::MAX - entry.index))
-            {
-                return Err("dataless registry identity mismatch".into());
-            }
-        }
-        let plan = crate::pipeline::direct_store::plan::DirectSetPlan {
-            set_name: saved.set_name.clone(),
-            format: crate::pipeline::direct_store::plan::SetFormat::SevenZip,
-            volumes: BTreeMap::from([(0, 0)]),
-            files: HashMap::from([(0, 0)]),
-            identity: None,
-            unposted: Default::default(),
-            working_dir: base.clone(),
-            destination_dir: base.clone(),
-        };
+        .map_err(RuntimeError::session("decoded registry restore"))?;
+        saved.validate_restored_claims(&registry, job, index, &base, working, &staging)?;
+        let plan = crate::pipeline::direct_store::plan::DirectSetPlan::restored_namespace(
+            saved.set_name.clone(),
+            &base,
+        );
         let resources = crate::pipeline::direct_store::router::RouterResources {
             accountant: Arc::default(),
             holds_budget: saved.holds,
@@ -1073,14 +1010,21 @@ impl crate::pipeline::Pipeline {
         let mut graph = crate::pipeline::direct_store::nested::NestedGraph::restore_checkpoint_at(
             &namespace, job, index, working, &staging,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(RuntimeError::io(RESTORE))?;
         graph
-            .set_namespace_depth(sessions.depth(owner).ok_or("unknown decoded owner")?)
-            .map_err(|_| "restored decoded namespace exceeds archive depth")?;
+            .set_namespace_depth(
+                sessions
+                    .depth(owner)
+                    .ok_or(RuntimeError::Invariant("decoded owner"))?,
+            )
+            .map_err(RuntimeError::routing("restored decoded namespace depth"))?;
         saved
             .validate_dataless_graph(&graph, working, &staging)
-            .map_err(|e| e.to_string())?;
-        let root = Arc::new(crate::pipeline::extraction::ExtractionRoot::open(&base)?);
+            .map_err(RuntimeError::io(RESTORE))?;
+        let root = Arc::new(
+            crate::pipeline::extraction::ExtractionRoot::open(&base)
+                .map_err(RuntimeError::refused("decoded namespace root"))?,
+        );
         let mut state = decoded::DecodedState {
             graph,
             catalog,
@@ -1101,11 +1045,109 @@ impl crate::pipeline::Pipeline {
     }
 }
 
+impl DecodedCheckpoint {
+    // The saved owner under this run's runtime root. Only a namespace whose
+    // whole ancestry closed with integrity may be rebuilt.
+    fn restored_owner(
+        &self,
+        job: &JobGraph,
+        runtime: &ArchiveRuntime,
+    ) -> Result<StreamOwner, RuntimeError> {
+        if self.owner.root != job.sessions.root {
+            return Err(RuntimeError::Invariant("decoded owner root mismatch"));
+        }
+        let owner = StreamOwner {
+            root: runtime.root,
+            ..self.owner
+        };
+        if !runtime.sessions.ancestry_verified(owner) {
+            return Err(RuntimeError::Invariant(
+                "decoded graph namespace lacks integrity closure",
+            ));
+        }
+        Ok(owner)
+    }
+
+    fn restored_destinations(
+        &self,
+        working: &Path,
+        staging: &Path,
+        base: &Path,
+    ) -> Result<BTreeMap<u32, PathBuf>, RuntimeError> {
+        let destinations = self
+            .destinations
+            .iter()
+            .map(|(id, path)| Ok((*id, path.resolve(working, staging)?)))
+            .collect::<std::io::Result<BTreeMap<_, _>>>()
+            .map_err(RuntimeError::io("decoded destinations"))?;
+        if destinations.len() != self.destinations.len()
+            || destinations.values().any(|path| !path.starts_with(base))
+        {
+            return Err(RuntimeError::Invariant("decoded destinations"));
+        }
+        Ok(destinations)
+    }
+
+    // Every registry claim must be exactly one physical file the job graph
+    // owns for this root, with the same length and extents.
+    fn validate_restored_claims(
+        &self,
+        registry: &super::super::storage::DestinationRegistry,
+        job: &JobGraph,
+        index: u32,
+        base: &Path,
+        working: &Path,
+        staging: &Path,
+    ) -> Result<(), RuntimeError> {
+        let claims = registry
+            .checkpoint_claims()
+            .map_err(RuntimeError::session("decoded physical restore"))?;
+        let selected: Vec<_> = job
+            .files
+            .iter()
+            .filter(|file| file.archive_root() == Some(index))
+            .collect();
+        if claims.len() != selected.len() {
+            return Err(RuntimeError::Invariant(
+                "decoded physical inventory mismatch",
+            ));
+        }
+        for (destination, relative, length, extents) in claims {
+            let path = base.join(relative);
+            let expected = selected
+                .iter()
+                .find(|file| {
+                    working.join(&file.path) == path
+                        && file.node() == destination.owner.node
+                        && file.generation() == destination.owner.generation
+                })
+                .ok_or(RuntimeError::Invariant(
+                    "decoded registry claim lacks authoritative physical file",
+                ))?;
+            if expected.length != length || expected.extents != extents {
+                return Err(RuntimeError::Invariant(
+                    "decoded registry extents differ from authoritative graph",
+                ));
+            }
+            if let Some(entry) = self.dataless.iter().find(|entry| {
+                entry
+                    .path
+                    .resolve(working, staging)
+                    .is_ok_and(|candidate| candidate == path)
+            }) && (entry.directory
+                || !matches!(destination.destination, crate::pipeline::direct_store::router::DirectDestination::Member { member_id } if member_id == u32::MAX - entry.index))
+            {
+                return Err(RuntimeError::Invariant(
+                    "dataless registry identity mismatch",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl decoded::DecodedState {
-    async fn rearm_restored_graph(&mut self) -> Result<(), String> {
-        use std::io::{Read, Seek, SeekFrom};
-        trait Input: Read + Seek {}
-        impl<T: Read + Seek> Input for T {}
+    async fn rearm_restored_graph(&mut self) -> Result<(), RuntimeError> {
         let nodes: Vec<_> = self
             .graph
             .direct_producer_states()
@@ -1118,51 +1160,22 @@ impl decoded::DecodedState {
                 continue;
             }
             let (physical, nested) = self.graph.member_backings(&self.namespace(), node);
-            let memory = self
-                .budget
-                .try_reserve_memory(64 * 1024)
-                .ok_or("decoded graph rearm memory admission")?;
-            let task = self
-                .budget
-                .task_permit_for_root(Arc::clone(&self.root))
-                .map_err(|error| error.to_string())?;
-            let (root, base, budget) = (
-                Arc::clone(&self.root),
-                self.base.clone(),
-                Arc::clone(&self.budget),
-            );
-            let (runs, checksums) = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
-                let (_memory, _task) = (memory, task);
-                let mut buffer = vec![0; 64 * 1024];
-                let mut checksums = Vec::with_capacity(runs.len());
-                for run in &runs {
-                    let mut input: Box<dyn Input> = if let Some(image) = nested.get(&run.member_id) {
-                        Box::new(crate::pipeline::direct_store::provider::VirtualVolumeReader::<true>::new(image.clone(), Arc::default()))
-                    } else {
-                        let path = physical.get(&run.member_id).ok_or_else(|| invalid("decoded rearm member backing absent"))?;
-                        let relative = path.strip_prefix(&base).map_err(std::io::Error::other)?;
-                        Box::new(root.open_input(relative)?.into_std())
-                    };
-                    input.seek(SeekFrom::Start(run.logical_offset))?;
-                    let mut hash = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
-                    let mut remaining = run.len;
-                    while remaining != 0 {
-                        budget.check_active_io()?;
-                        let count = remaining.min(buffer.len() as u64) as usize;
-                        input.read_exact(&mut buffer[..count])?;
-                        hash.update(&buffer[..count]);
-                        remaining -= count as u64;
-                    }
-                    checksums.push(hash.finalize() as u32);
-                }
-                Ok((runs, checksums))
-            }).await.map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+            let (runs, checksums) = super::rearm::RearmRead {
+                runs,
+                physical,
+                nested,
+                root: Arc::clone(&self.root),
+                base: self.base.clone(),
+                budget: Arc::clone(&self.budget),
+            }
+            .checksum()
+            .await?;
             for (run, checksum) in runs.iter().zip(checksums) {
                 self.graph
                     .node_mut(node)
                     .router
                     .note_restored_member_crc(run.member_id, run.logical_offset, run.len, checksum)
-                    .map_err(|error| format!("decoded graph integrity rearm: {error:?}"))?;
+                    .map_err(RuntimeError::routing("decoded graph integrity rearm"))?;
             }
         }
         Ok(())

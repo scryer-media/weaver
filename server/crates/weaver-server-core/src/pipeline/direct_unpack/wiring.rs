@@ -1362,37 +1362,34 @@ impl Pipeline {
                 root_set: set_name.to_owned(),
                 node: crate::pipeline::direct_store::nested::ROOT_NODE,
             };
+            // A volume path with no file name cannot be addressed inside the
+            // virtual source, so the chase runs without a stream.
             let names = paths
                 .iter()
                 .enumerate()
                 .map(|(index, path)| {
-                    (
-                        index as u32,
-                        path.file_name()
-                            .expect("virtual volume filename")
-                            .to_string_lossy()
-                            .into_owned(),
-                    )
+                    let name = path.file_name()?.to_string_lossy().into_owned();
+                    Some((index as u32, name))
                 })
-                .collect();
-            self.admit_virtual_chase_stream(
-                job_id,
-                set_name,
-                source,
-                stream_destination,
-                Arc::clone(&budget),
-                names,
-            )
-            .ok()
+                .collect::<Option<_>>();
+            names.and_then(|names| {
+                self.admit_virtual_chase_stream(
+                    job_id,
+                    set_name,
+                    source,
+                    stream_destination,
+                    Arc::clone(&budget),
+                    names,
+                )
+                .ok()
+            })
         } else {
             None
         };
-        if let Some(dispatch) = &dispatch {
-            self.archive_runtime
-                .get_mut(&job_id)
-                .expect("chase archive runtime")
-                .mark_speculative(&dispatch.request)
-                .expect("new chase request");
+        if let Some(admitted) = &dispatch
+            && !self.mark_chase_speculative(job_id, admitted, &output_dir)
+        {
+            dispatch = None;
         }
         let channel = dispatch
             .as_mut()
@@ -2114,14 +2111,13 @@ impl Pipeline {
                     };
                     pp_pool.install(|| {
                         if let Some(channel) = &channel {
-                            let output = crate::pipeline::extraction::output::select::SelectOutput {
-                                first: channel.clone(),
-                                second: crate::pipeline::extraction::output::FileOutput {
+                            let output = manifest.select(
+                                channel.clone(),
+                                crate::pipeline::extraction::output::FileOutput {
                                     root: &context.root,
                                     budget: &context.budget,
                                 },
-                                select_first: |_, path: &std::path::Path| manifest.route(path),
-                            };
+                            );
                             channel
                                 .run(|_| {
                                     extract_7z_to(context.stream_context(), &output, open_reader)
@@ -2161,20 +2157,21 @@ impl Pipeline {
                         .resolve_position(0, 0)
                         .map_err(|error| error.to_string())?;
                     if matches!(format, ChaseFormat::Rar) {
+                        let policy = rar_policy
+                            .as_deref()
+                            .ok_or("RAR chase started without its extension policy")?;
                         let provider = super::rar_reader::RarVolumeProvider {
                             paths,
                             coverage: Arc::clone(&coverage),
                         };
                         if let Some(channel) = &channel {
-                            let output =
-                                crate::pipeline::extraction::output::select::SelectOutput {
-                                    first: channel.clone(),
-                                    second: crate::pipeline::extraction::output::FileOutput {
-                                        root: &root,
-                                        budget: &budget,
-                                    },
-                                    select_first: |_, path: &std::path::Path| manifest.route(path),
-                                };
+                            let output = manifest.select(
+                                channel.clone(),
+                                crate::pipeline::extraction::output::FileOutput {
+                                    root: &root,
+                                    budget: &budget,
+                                },
+                            );
                             return channel.run(|_| {
                                 super::rar::extract_to(
                                     super::rar::RarStreamContext {
@@ -2183,7 +2180,7 @@ impl Pipeline {
                                         budget: &budget,
                                         password,
                                         counters: &counters,
-                                        policy: rar_policy.as_deref().expect("RAR policy"),
+                                        policy,
                                     },
                                     &output,
                                     |_| Ok(true),
@@ -2198,22 +2195,23 @@ impl Pipeline {
                                 budget: &budget,
                                 password,
                                 counters: &counters,
-                                policy: rar_policy.as_deref().expect("RAR policy loaded above"),
+                                policy,
                             },
                             |_| Ok(true),
                         );
                     }
                     if let Some(input) = virtual_source {
+                        let policy = rar_policy
+                            .as_deref()
+                            .ok_or("RAR chase started without its extension policy")?;
                         if let Some(channel) = &channel {
-                            let output =
-                                crate::pipeline::extraction::output::select::SelectOutput {
-                                    first: channel.clone(),
-                                    second: crate::pipeline::extraction::output::FileOutput {
-                                        root: &root,
-                                        budget: &budget,
-                                    },
-                                    select_first: |_, path: &std::path::Path| manifest.route(path),
-                                };
+                            let output = manifest.select(
+                                channel.clone(),
+                                crate::pipeline::extraction::output::FileOutput {
+                                    root: &root,
+                                    budget: &budget,
+                                },
+                            );
                             return channel.run(|_| {
                                 super::rar::extract_to(
                                     super::rar::RarStreamContext {
@@ -2222,7 +2220,7 @@ impl Pipeline {
                                         budget: &budget,
                                         password,
                                         counters: &counters,
-                                        policy: rar_policy.as_deref().expect("RAR policy"),
+                                        policy,
                                     },
                                     &output,
                                     |name| input.should_extract(name),
@@ -2237,7 +2235,7 @@ impl Pipeline {
                                 budget: &budget,
                                 password,
                                 counters: &counters,
-                                policy: rar_policy.as_deref().expect("RAR policy loaded above"),
+                                policy,
                             },
                             |name| input.should_extract(name),
                         );
@@ -2325,7 +2323,8 @@ impl Pipeline {
                             selected_password,
                         });
                     }
-                    unreachable!("all chase formats were dispatched above")
+                    // Every format with a decoder returned above.
+                    Err("direct-unpack chase format has no decoder".to_owned())
                 })();
                 match &outcome {
                     Ok(members) => info!(

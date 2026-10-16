@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::pipeline::direct_store::nested::MAX_DEPTH as MAX_NESTED_EXTRACTION_DEPTH;
+use crate::pipeline::extraction::runtime::limits::MAX_DEPTH as MAX_NESTED_EXTRACTION_DEPTH;
 const MAX_CONCURRENT_REPAIRS: usize = 1;
 
 #[derive(Debug, Clone)]

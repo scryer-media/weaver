@@ -46,8 +46,6 @@ struct PhysicalFile {
     sealed: bool,
     placed: ByteRanges,
     range_slots: u64,
-    #[cfg(test)]
-    readers: Arc<()>,
 }
 
 // Only the dispatcher can mint a ticket. The I/O worker returns it after the
@@ -62,23 +60,6 @@ struct PendingWrite {
     file: PhysicalFileId,
     offset: u64,
     len: u64,
-}
-
-#[cfg(test)]
-pub(crate) struct PhysicalClaim {
-    pub(crate) id: PhysicalFileId,
-    pub(crate) relative: PathBuf,
-    pub(crate) length: Option<u64>,
-    pub(crate) sealed: bool,
-    pub(crate) placed: ByteRanges,
-    // Frozen checkpoint candidates retain the exact files they describe.
-    pub(crate) readers: Arc<()>,
-}
-
-#[cfg(test)]
-pub(crate) struct PhysicalSnapshot {
-    pub(crate) files: Vec<PhysicalClaim>,
-    _admission: MemoryPermit,
 }
 
 // This records physical placement only. Root source floors are derived by the
@@ -174,7 +155,7 @@ impl DestinationRegistry {
             return Err(SessionError::InvalidTransition);
         }
         if let Some(id) = self.destinations.get(&destination.key()) {
-            let file = &self.files[id];
+            let file = self.files.get(id).ok_or(SessionError::Stale)?;
             return if file.relative.as_os_str() == relative.as_os_str() && file.length == length {
                 Ok(*id)
             } else {
@@ -217,8 +198,6 @@ impl DestinationRegistry {
                 sealed: false,
                 placed: ByteRanges::default(),
                 range_slots: 0,
-                #[cfg(test)]
-                readers: Arc::new(()),
             },
         );
         self.locations.insert(location, id);
@@ -243,12 +222,13 @@ impl DestinationRegistry {
         let end = offset
             .checked_add(len)
             .ok_or(SessionError::InvalidTransition)?;
-        if self.files[&file].sealed || self.files[&file].length.is_some_and(|length| end > length) {
+        let target = self.files.get(&file).ok_or(SessionError::Stale)?;
+        if target.sealed || target.length.is_some_and(|length| end > length) {
             return Err(SessionError::InvalidTransition);
         }
         // Backings are immutable once claimed. Retried/repaired bytes select a
         // new file generation; they cannot overwrite evidence a reader holds.
-        if self.files[&file]
+        if target
             .placed
             .ranges()
             .iter()
@@ -285,32 +265,6 @@ impl DestinationRegistry {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn write_target(
-        &self,
-        ticket: &WriteTicket,
-    ) -> Result<(&Path, u64, u64), SessionError> {
-        if !Arc::ptr_eq(&self.identity, &ticket.registry) {
-            return Err(SessionError::Stale);
-        }
-        let pending = self
-            .pending
-            .get(&ticket.sequence)
-            .ok_or(SessionError::Stale)?;
-        Ok((
-            &self.files[&pending.file].relative,
-            pending.offset,
-            pending.len,
-        ))
-    }
-
-    // Local graph retirement removes only the binding. Its physical evidence
-    // and readers remain until the replacement checkpoint retires that image.
-    #[cfg(test)]
-    pub(crate) fn retire(&mut self, destination: Destination) {
-        self.destinations.remove(&destination.key());
-    }
-
     fn take(&mut self, ticket: WriteTicket) -> Result<PendingWrite, SessionError> {
         if !Arc::ptr_eq(&self.identity, &ticket.registry) {
             return Err(SessionError::Stale);
@@ -343,7 +297,7 @@ impl DestinationRegistry {
         let file = self
             .files
             .get_mut(&pending.file)
-            .expect("registered physical file");
+            .ok_or(SessionError::Stale)?;
         file.placed.insert(pending.offset, pending.len);
         let after = file.placed.ranges().len() as u64;
         // ByteRanges retains allocation after coalescing. Charge its high-water
@@ -374,7 +328,7 @@ impl DestinationRegistry {
         if self.pending.values().any(|write| write.file == id) {
             return Err(SessionError::Busy);
         }
-        let file = self.files.get_mut(&id).expect("registered physical file");
+        let file = self.files.get_mut(&id).ok_or(SessionError::Stale)?;
         if file.length.is_some_and(|expected| expected != length)
             || file
                 .placed
@@ -392,41 +346,6 @@ impl DestinationRegistry {
         file.length = Some(length);
         file.sealed = true;
         Ok(())
-    }
-
-    // Fence and join dispatched writers before capturing. Sync every claimed
-    // physical file before preparing the immutable job manifest from this view.
-    #[cfg(test)]
-    pub(crate) fn capture_bytes(&self) -> u64 {
-        self.charged
-    }
-
-    #[cfg(test)]
-    pub(crate) fn capture(
-        &self,
-        admission: MemoryPermit,
-    ) -> Result<PhysicalSnapshot, SessionError> {
-        if !self.pending.is_empty() {
-            return Err(SessionError::Busy);
-        }
-        if admission.bytes() < self.capture_bytes() {
-            return Err(SessionError::Admission);
-        }
-        Ok(PhysicalSnapshot {
-            files: self
-                .files
-                .iter()
-                .map(|(&id, file)| PhysicalClaim {
-                    id,
-                    relative: file.relative.clone(),
-                    length: file.length,
-                    sealed: file.sealed,
-                    placed: file.placed.clone(),
-                    readers: Arc::clone(&file.readers),
-                })
-                .collect(),
-            _admission: admission,
-        })
     }
 }
 

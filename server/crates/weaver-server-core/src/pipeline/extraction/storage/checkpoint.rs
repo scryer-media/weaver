@@ -26,17 +26,20 @@ impl DestinationRegistry {
             files: self
                 .files
                 .values()
-                .map(|file| File {
-                    relative: file
+                .map(|file| {
+                    // Registration admits only UTF-8 relative paths.
+                    let relative = file
                         .relative
                         .to_str()
-                        .expect("validated registry path")
-                        .to_owned(),
-                    length: file.length,
-                    sealed: file.sealed,
-                    placed: file.placed.ranges().to_vec(),
+                        .ok_or(SessionError::InvalidTransition)?;
+                    Ok(File {
+                        relative: relative.to_owned(),
+                        length: file.length,
+                        sealed: file.sealed,
+                        placed: file.placed.ranges().to_vec(),
+                    })
                 })
-                .collect(),
+                .collect::<Result<_, SessionError>>()?,
             destinations: self
                 .destinations
                 .iter()
@@ -103,8 +106,6 @@ impl DestinationRegistry {
                     sealed: file.sealed,
                     placed,
                     range_slots: file.placed.len() as u64,
-                    #[cfg(test)]
-                    readers: Arc::new(()),
                 },
             );
         }

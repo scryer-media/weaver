@@ -67,7 +67,6 @@ pub(crate) enum DirectSetStatus {
 pub(crate) struct LiveChildDescription {
     pub(crate) node: u32,
     pub(crate) parent: u32,
-    pub(crate) generation: u64,
     pub(crate) format: super::plan::SetFormat,
     pub(crate) set_name: String,
     pub(crate) input_names: BTreeMap<u32, String>,

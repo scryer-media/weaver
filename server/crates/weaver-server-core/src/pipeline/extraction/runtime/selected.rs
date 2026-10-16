@@ -14,12 +14,16 @@ impl ArchiveRuntime {
             .collect()
     }
 
-    pub(crate) async fn join_finished_workers(&mut self) -> Result<(), String> {
+    pub(crate) async fn join_finished_workers(&mut self) -> Result<(), RuntimeError> {
         if !self.publication_ready() {
-            return Err("archive namespace publication remains unresolved".into());
+            return Err(RuntimeError::Invariant(
+                "archive namespace publication remains unresolved",
+            ));
         }
-        for (_, worker) in std::mem::take(&mut self.workers) {
-            worker.await.map_err(|error| error.to_string())?;
+        for worker in self.workers.take_all() {
+            worker
+                .await
+                .map_err(RuntimeError::join("archive namespace worker"))?;
         }
         Ok(())
     }

@@ -4,6 +4,7 @@ use std::io;
 use std::path::Path;
 
 use super::super::restart::DirectVolumeFacts;
+use crate::pipeline::extraction::runtime::limits::MAX_DEPTH;
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 6] = b"WJAG\x01\x00";
@@ -320,7 +321,7 @@ impl JobGraph {
                 if node.id as usize != index + 1
                     || node.parent >= node.id
                     || node.depth != depth
-                    || depth > 3
+                    || depth > MAX_DEPTH
                     || node.generation == 0
                     || node.format > 1
                     || node.mode > 2

@@ -104,11 +104,8 @@ impl PreparedRar {
             }
 
             let member_password_required = archive_password_required || member.is_encrypted;
-            let route_archive = matches!(
-                weaver_model::files::FileRole::from_filename(&member.name),
-                weaver_model::files::FileRole::RarVolume { .. }
-                    | weaver_model::files::FileRole::SevenZipArchive
-                    | weaver_model::files::FileRole::SevenZipSplit { .. }
+            let route_archive = crate::pipeline::extraction::output::routes_to_child_engine(
+                Path::new(&member.name),
             );
             let result = if let Some(output) = output.filter(|_| !only_archives || route_archive) {
                 Pipeline::extract_rar_member_to_sink(

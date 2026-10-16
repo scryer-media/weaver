@@ -17,12 +17,12 @@ pub(crate) mod placement;
 mod views;
 pub(crate) use views::RepairInventory;
 
+use crate::pipeline::extraction::runtime::limits::MAX_DEPTH;
 use catalog::{MemberCatalog, RoutingNamespace};
 
 pub(crate) const ROOT_NODE: u32 = 0;
 pub(crate) const MAX_NODES: usize = 4_096;
 pub(crate) const MAX_INPUTS: usize = 65_536;
-pub(crate) const MAX_DEPTH: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NodeMode {
@@ -251,7 +251,11 @@ impl NestedGraph {
         for (member, name, format, volume, whole, length) in candidates {
             if let Some((id, input_volume)) = self.binding(parent, member) {
                 let node = self.node_mut(id);
-                let input = node.inputs.get_mut(&input_volume).expect("bound input");
+                let Some(input) = node.inputs.get_mut(&input_volume) else {
+                    node.mode =
+                        NodeMode::MaterializationPending(DemotionReason::ConflictingVolumeFacts);
+                    continue;
+                };
                 if input.length.is_some() && length.is_some() && input.length != length {
                     node.mode =
                         NodeMode::MaterializationPending(DemotionReason::ConflictingVolumeFacts);
@@ -445,7 +449,11 @@ impl NestedGraph {
                     });
                     continue;
                 }
-                let input = node.inputs.get_mut(&volume).expect("bound child input");
+                let Some(input) = node.inputs.get_mut(&volume) else {
+                    node.mode =
+                        NodeMode::MaterializationPending(DemotionReason::ConflictingVolumeFacts);
+                    continue;
+                };
                 input.delivered.insert(span.destination_offset, span.len());
                 let mut emitted = Vec::new();
                 let result = node.router.route_into(
@@ -509,20 +517,20 @@ impl NestedGraph {
         receipt: NodePlacement,
     ) -> Result<Vec<SourceSpan>, DemotionReason> {
         let chain = self.validate_placement(root, receipt)?;
-        Ok(self.apply_placement(receipt, chain))
+        self.apply_placement(receipt, chain)
     }
 
     fn apply_placement(
         &mut self,
         receipt: NodePlacement,
         chain: Vec<(u32, SourceSpan)>,
-    ) -> Vec<SourceSpan> {
+    ) -> Result<Vec<SourceSpan>, DemotionReason> {
         let placed = receipt;
         if let Some(raw) = receipt.owner.raw_child {
             self.node_mut(raw.node)
                 .inputs
                 .get_mut(&raw.volume)
-                .expect("validated input")
+                .ok_or(DemotionReason::ConflictingVolumeFacts)?
                 .raw_placed
                 .insert(placed.destination_offset, placed.len);
         }
@@ -536,7 +544,7 @@ impl NestedGraph {
                 .node_mut(owner)
                 .inputs
                 .get_mut(&source.volume)
-                .expect("projection validated input");
+                .ok_or(DemotionReason::ConflictingVolumeFacts)?;
             input.placed.insert(source.offset, source.len);
             if owner == receipt.owner.node
                 && matches!(placed.destination, DirectDestination::Envelope { .. })
@@ -547,7 +555,7 @@ impl NestedGraph {
             }
         }
         root_sources.sort_by_key(|span| span.write_offset);
-        root_sources
+        Ok(root_sources)
     }
 
     fn checked_node(&self, id: u32) -> Result<&NestedNode, DemotionReason> {

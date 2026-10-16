@@ -10,43 +10,34 @@ pub(super) struct StagedReplacement {
 }
 
 impl ArchiveRuntime {
-    pub(crate) async fn begin_repair(&mut self, owner: StreamOwner) -> Result<(), String> {
+    pub(crate) async fn begin_repair(&mut self, owner: StreamOwner) -> Result<(), RuntimeError> {
         if self.staged_replacement.is_some() {
-            return Err("archive replacement already staged".into());
+            return Err(RuntimeError::Invariant(
+                "archive replacement already staged",
+            ));
         }
         let draining = self
             .sessions
             .revoke(owner)
-            .map_err(|error| format!("archive repair revoke: {error:?}"))?;
+            .map_err(RuntimeError::session("archive repair revoke"))?;
         self.retire_sinks(&draining);
-        for (input_owner, input) in &self.live_inputs {
-            if draining.contains(input_owner) {
-                input.abort("archive input generation retired for repair");
-            }
-        }
-        let mut keep = Vec::new();
+        self.abort_inputs(&draining, "archive input generation retired for repair");
         let mut join_error = None;
-        for (worker_owner, worker) in std::mem::take(&mut self.workers) {
-            if draining.contains(&worker_owner) {
-                if let Err(error) = worker.await {
-                    join_error.get_or_insert_with(|| error.to_string());
-                }
-            } else {
-                keep.push((worker_owner, worker));
+        for worker in self.workers.take(&draining) {
+            if let Err(error) = worker.await {
+                join_error.get_or_insert(error);
             }
         }
-        self.workers = keep;
         for revoked in &draining {
             self.sessions
                 .joined(*revoked)
-                .map_err(|error| format!("archive repair join: {error:?}"))?;
+                .map_err(RuntimeError::session("archive repair join"))?;
         }
-        self.requests
-            .retain(|_, request| !draining.contains(&request.owner));
-        if let Some(error) = join_error {
-            return Err(error);
+        self.requests.forget(&draining);
+        match join_error {
+            Some(error) => Err(RuntimeError::join("archive repair worker")(error)),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     pub(crate) fn stage_repair_replacement(
@@ -55,36 +46,36 @@ impl ArchiveRuntime {
         mut work: NamespaceWork,
         effective_inputs: Vec<PathBuf>,
         effective_names: Vec<String>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         if self.staged_replacement.is_some()
             || effective_inputs.is_empty()
             || effective_inputs.len() != effective_names.len()
         {
-            return Err("invalid archive replacement inventory".into());
+            return Err(RuntimeError::Invariant("archive replacement inventory"));
         }
         let (working, _) = self
             .checkpoint_roots
             .as_ref()
-            .ok_or("archive replacement roots absent")?;
+            .ok_or(RuntimeError::Invariant("archive replacement roots"))?;
         let effective = self
             .sessions
             .effective(owner.node)
-            .ok_or("archive replacement node absent")?
+            .ok_or(RuntimeError::Invariant("archive replacement node"))?
             .0
             .checked_add(1)
-            .ok_or("archive input version exhausted")?;
+            .ok_or(RuntimeError::Invariant("archive input version exhausted"))?;
         let replacement = self
             .sessions
             .prepare_replacement(owner.node, InputVersion(effective))
-            .map_err(|error| format!("archive replacement prepare: {error:?}"))?;
+            .map_err(RuntimeError::session("archive replacement prepare"))?;
         let (sessions, selected) = self
             .sessions
             .preview_replacement_checkpoint(&replacement)
-            .map_err(|error| format!("archive replacement preview: {error:?}"))?;
+            .map_err(RuntimeError::session("archive replacement preview"))?;
         let retiring = sessions
             .sessions
             .iter()
-            .filter(|session| session.phase == 4)
+            .filter(|session| session.is_retired())
             .map(|session| StreamOwner {
                 root: self.root,
                 node: session.owner.node,
@@ -119,56 +110,34 @@ impl ArchiveRuntime {
     // staged graph, including readback reconciliation after an ambiguous CAS.
     pub(crate) fn finish_repair_replacement(
         &mut self,
-    ) -> Result<(NamespaceWork, SessionLease), String> {
+    ) -> Result<(NamespaceWork, SessionLease), RuntimeError> {
         if !self
             .staged_replacement
             .as_ref()
             .is_some_and(|staged| staged.committed)
         {
-            return Err("archive replacement checkpoint is not confirmed".into());
+            return Err(RuntimeError::Invariant(
+                "archive replacement checkpoint is not confirmed",
+            ));
         }
         let staged = self
             .staged_replacement
             .take()
-            .ok_or("archive replacement is not staged")?;
+            .ok_or(RuntimeError::Invariant("archive replacement is not staged"))?;
         self.sessions
             .committed_replacement(staged.replacement, staged.sessions.checkpoint)
-            .map_err(|error| format!("archive replacement activation: {error:?}"))?;
-        self.completed
-            .retain(|(owner, _, _)| !staged.retiring.contains(owner));
-        self.retained_work
-            .retain(|(owner, _)| !staged.retiring.contains(owner));
-        self.deferred_repairs
-            .retain(|(owner, _)| !staged.retiring.contains(owner));
-        self.decoded
-            .retain(|state| !staged.retiring.contains(&state.generation.owner()));
-        for (name, owner) in &self.output_owners {
-            if staged.retiring.contains(owner) {
-                self.consumed.remove(name);
-            }
-        }
-        self.output_owners
-            .retain(|_, owner| !staged.retiring.contains(owner));
-        self.replay
-            .retain(|(owner, _)| !staged.retiring.contains(owner));
+            .map_err(RuntimeError::session("archive replacement activation"))?;
+        self.forget_owners(&staged.retiring, Departure::Replaced(staged.selected));
         self.failed = false;
         let lease = self
             .sessions
             .start(staged.selected.node)
-            .map_err(|error| format!("archive replacement start: {error:?}"))?;
+            .map_err(RuntimeError::session("archive replacement start"))?;
         if lease.owner != staged.selected {
-            return Err("archive replacement selected generation mismatch".into());
+            return Err(RuntimeError::Invariant(
+                "archive replacement selected generation mismatch",
+            ));
         }
-        self.graph_owners.retain(|_, owner| {
-            if owner.node == lease.owner.node && staged.retiring.contains(owner) {
-                *owner = lease.owner;
-                true
-            } else {
-                !staged.retiring.contains(owner)
-            }
-        });
-        self.live_inputs
-            .retain(|(owner, _)| !staged.retiring.contains(owner));
         Ok((staged.work, lease))
     }
 
@@ -189,14 +158,18 @@ impl ArchiveRuntime {
     pub(crate) fn confirm_replacement_checkpoint(
         &mut self,
         selected: &super::super::session::checkpoint::Checkpoint,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let Some(staged) = &mut self.staged_replacement else {
             return Ok(());
         };
-        let expected = rmp_serde::to_vec(&staged.sessions).map_err(|error| error.to_string())?;
-        let selected = rmp_serde::to_vec(selected).map_err(|error| error.to_string())?;
+        let expected = rmp_serde::to_vec(&staged.sessions)
+            .map_err(RuntimeError::checkpoint("staged archive lifecycle"))?;
+        let selected = rmp_serde::to_vec(selected)
+            .map_err(RuntimeError::checkpoint("committed archive lifecycle"))?;
         if expected != selected {
-            return Err("committed archive lifecycle differs from staged replacement".into());
+            return Err(RuntimeError::Invariant(
+                "committed archive lifecycle differs from staged replacement",
+            ));
         }
         staged.committed = true;
         Ok(())

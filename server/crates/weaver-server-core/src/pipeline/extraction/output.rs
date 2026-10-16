@@ -15,6 +15,16 @@ pub(crate) mod select;
 #[cfg(test)]
 mod tests;
 
+/// Whether a member is itself an archive that a child engine decodes, rather
+/// than a leaf written straight to its destination.
+pub(crate) fn routes_to_child_engine(path: &Path) -> bool {
+    use weaver_model::files::FileRole;
+    matches!(
+        FileRole::from_filename(&path.to_string_lossy()),
+        FileRole::RarVolume { .. } | FileRole::SevenZipArchive | FileRole::SevenZipSplit { .. }
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Integrity {
     Verified,

@@ -113,7 +113,6 @@ impl NestedGraph {
                 Some(super::super::set::LiveChildDescription {
                     node: node_id,
                     parent: node.parent,
-                    generation: node.generation,
                     format: node.router.plan().format,
                     set_name: node.router.plan().set_name.clone(),
                     input_names: node
@@ -177,8 +176,13 @@ impl NestedGraph {
             let images = children
                 .entry(child)
                 .or_insert_with(|| self.input_views(root, child));
-            let image = images.remove(&volume).expect("bound input view");
-            nested.insert(member, image);
+            // A binding without an input view has no virtual image to serve, so
+            // the member reads from its physical destination.
+            if let Some(image) = images.remove(&volume) {
+                nested.insert(member, image);
+            } else {
+                physical.insert(member, path);
+            }
         }
         (Arc::new(physical), nested.into())
     }
@@ -220,10 +224,14 @@ impl NestedGraph {
                 if input.raw_placed.ranges().is_empty() {
                     return (volume, image);
                 }
-                let path = self
+                // Without the parent member's destination the raw ranges have no
+                // backing, so they stay uncovered instead of reading elsewhere.
+                let Some(path) = self
                     .catalog(root, node.parent)
                     .member_destination(input.parent_member)
-                    .expect("bound parent member destination");
+                else {
+                    return (volume, image);
+                };
                 let mut covered = input.placed.clone();
                 for &(start, end) in input.raw_placed.ranges() {
                     covered.insert(start, end - start);

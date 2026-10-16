@@ -440,19 +440,14 @@ async fn decoded_parent_store(force_demotion: bool) {
         assert!(!receipts.is_empty());
         assert!(receipts.iter().all(|(_, source)| source.is_empty()));
         assert_eq!(fs::read(&destinations[&1]).unwrap(), inner);
-        let snapshot = registry
-            .capture(
-                lifecycle_budget
-                    .try_reserve_memory(registry.capture_bytes())
-                    .unwrap(),
-            )
-            .unwrap();
-        let physical_input = snapshot
-            .files
+        let claims = registry.checkpoint_claims().unwrap();
+        let (_, _, _, physical_input) = claims
             .iter()
-            .find(|file| file.relative == destinations[&1].strip_prefix(temp.path()).unwrap())
+            .find(|(_, relative, _, _)| {
+                relative == destinations[&1].strip_prefix(temp.path()).unwrap()
+            })
             .unwrap();
-        assert_eq!(physical_input.placed.ranges(), &[(0, inner.len() as u64)]);
+        assert_eq!(physical_input, &[(0, inner.len() as u64)]);
         let (physical, nested) = graph.member_backings(&namespace, ROOT_NODE);
         assert_eq!(physical.len(), 2);
         assert!(nested.is_empty());

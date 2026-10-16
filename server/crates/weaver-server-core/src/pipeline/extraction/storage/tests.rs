@@ -54,28 +54,25 @@ fn namespace_collisions_and_revoked_completions_cannot_claim_other_files() {
     assert_ne!(a, b);
     let complete = registry.begin_write(&sessions, first, 0, 4).unwrap();
     let stale = registry.begin_write(&sessions, second, 0, 8).unwrap();
-    assert_eq!(
-        registry.write_target(&complete).unwrap(),
-        (Path::new("a/leaf"), 0, 4)
-    );
     assert!(matches!(
-        registry.capture(budget.try_reserve_memory(16 * 1024).unwrap()),
+        registry.capture_checkpoint(),
+        Err(SessionError::Busy)
+    ));
+    assert!(matches!(
+        registry.checkpoint_claims(),
         Err(SessionError::Busy)
     ));
     registry.placed(&sessions, complete).unwrap();
     sessions.revoke(nested.owner).unwrap();
     assert_eq!(registry.placed(&sessions, stale), Err(SessionError::Stale));
-    let snapshot = registry
-        .capture(budget.try_reserve_memory(registry.capture_bytes()).unwrap())
-        .unwrap();
-    assert_eq!(snapshot.files[0].id, a);
-    assert_eq!(snapshot.files[0].placed.ranges(), &[(0, 4)]);
-    assert_eq!(snapshot.files[1].id, b);
-    assert!(snapshot.files[1].placed.is_empty());
-    assert_eq!(snapshot.files[0].relative, Path::new("a/leaf"));
-    assert_eq!(snapshot.files[0].length, Some(8));
-    assert!(!snapshot.files[0].sealed);
-    assert_eq!(Arc::strong_count(&snapshot.files[0].readers), 2);
+    assert_eq!(
+        registry.checkpoint_claims().unwrap(),
+        [
+            (first, PathBuf::from("a/leaf"), 8, vec![(0, 4)]),
+            (second, PathBuf::from("b/leaf"), 8, Vec::new()),
+        ]
+    );
+    assert!(!registry.files[&a].sealed);
 }
 
 #[test]
@@ -122,7 +119,7 @@ fn immutable_backings_reject_overlap_aliases_and_retired_tickets() {
     assert!(registry.begin_write(&sessions, sink, 2, 4).is_err());
     assert!(registry.begin_write(&sessions, sink, u64::MAX, 2).is_err());
     let tail = registry.begin_write(&sessions, sink, 4, 4).unwrap();
-    registry.retire(sink);
+    sessions.revoke(lease.owner).unwrap();
     assert_eq!(registry.placed(&sessions, tail), Err(SessionError::Stale));
     assert_eq!(
         registry.files.values().next().unwrap().placed.ranges(),
@@ -159,10 +156,6 @@ fn failed_writes_release_metadata_admission_without_claiming_sparse_length() {
         assert_eq!(registry.charged, initial);
     }
     assert!(registry.files.values().next().unwrap().placed.is_empty());
-    assert!(matches!(
-        registry.capture(budget.try_reserve_memory(1).unwrap()),
-        Err(SessionError::Admission)
-    ));
 }
 
 #[test]
@@ -195,17 +188,11 @@ fn sealing_requires_completed_coverage_and_explicit_empty_creation() {
         destination: DirectDestination::Member { member_id: 1 },
         ..sink
     };
-    registry
+    let empty_file = registry
         .register(&sessions, empty, Path::new("empty"), Some(0))
         .unwrap();
-    let snapshot = registry
-        .capture(budget.try_reserve_memory(16 * 1024).unwrap())
-        .unwrap();
-    assert!(!snapshot.files[1].sealed);
+    assert!(!registry.files[&empty_file].sealed);
     registry.seal(&sessions, empty, 0).unwrap();
-    let snapshot = registry
-        .capture(budget.try_reserve_memory(16 * 1024).unwrap())
-        .unwrap();
-    assert!(snapshot.files[1].sealed);
-    assert_eq!(snapshot.files[1].length, Some(0));
+    assert!(registry.files[&empty_file].sealed);
+    assert_eq!(registry.files[&empty_file].length, Some(0));
 }

@@ -347,12 +347,7 @@ impl unrar_rs::VolumeProvider for LiveArchiveInput {
                 reason: "archive volume is past the closed roster".into(),
             });
         }
-        Ok(Box::new(PartReader {
-            input: self.clone(),
-            index: index as u32,
-            position: 0,
-            source: None,
-        }))
+        Ok(Box::new(PartReader::new(self.clone(), index as u32)))
     }
 }
 
@@ -360,15 +355,41 @@ struct PartReader {
     input: LiveArchiveInput,
     index: u32,
     position: u64,
-    source: Option<(Arc<Snapshot>, VirtualVolumeReader<true>)>,
+    placed: Option<PlacedRange>,
 }
 
-impl Read for PartReader {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
+// The covered range the last read landed in, and where its backing reader
+// stands. Published bytes never change, so while its snapshot is current a
+// read inside the range needs no lookup and, when it continues the last read,
+// no seek.
+struct PlacedRange {
+    snapshot: Arc<Snapshot>,
+    reader: VirtualVolumeReader<true>,
+    start: u64,
+    end: u64,
+    cursor: Option<u64>,
+}
+
+impl PlacedRange {
+    fn covers(&self, position: u64) -> bool {
+        self.start <= position && position < self.end
+    }
+}
+
+impl PartReader {
+    fn new(input: LiveArchiveInput, index: u32) -> Self {
+        Self {
+            input,
+            index,
+            position: 0,
+            placed: None,
         }
-        let (snapshot, available) = {
+    }
+
+    // Waits until the byte at the current position is placed, or returns
+    // `None` at the part's end. A reader over the same snapshot is reused.
+    fn locate(&self, previous: Option<PlacedRange>) -> io::Result<Option<PlacedRange>> {
+        let (snapshot, start, end) = {
             let mut state = self.input.lock()?;
             loop {
                 LiveArchiveInput::check(&state)?;
@@ -380,14 +401,14 @@ impl Read for PartReader {
                         .length
                         .is_some_and(|length| self.position >= length)
                     {
-                        return Ok(0);
+                        return Ok(None);
                     }
-                    if let Some(&(_, end)) = part
+                    if let Some(&(start, end)) = part
                         .ranges
                         .iter()
                         .find(|&&(start, end)| start <= self.position && self.position < end)
                     {
-                        break (Arc::clone(snapshot), end - self.position);
+                        break (Arc::clone(snapshot), start, end);
                     }
                     if part.value.complete {
                         return Err(io::Error::new(
@@ -399,28 +420,56 @@ impl Read for PartReader {
                 state = self.input.wait(state)?;
             }
         };
-        if self
-            .source
-            .as_ref()
-            .is_none_or(|(old, _)| !Arc::ptr_eq(old, &snapshot))
-        {
-            let volume = snapshot.parts[&self.index].value.view.clone();
-            self.source = Some((
-                snapshot,
-                VirtualVolumeReader::<true>::new(volume, Arc::default()),
-            ));
+        let (reader, cursor) = match previous {
+            Some(previous) if Arc::ptr_eq(&previous.snapshot, &snapshot) => {
+                (previous.reader, previous.cursor)
+            }
+            _ => {
+                let volume = snapshot.parts[&self.index].value.view.clone();
+                (
+                    VirtualVolumeReader::<true>::new(volume, Arc::default()),
+                    None,
+                )
+            }
+        };
+        Ok(Some(PlacedRange {
+            snapshot,
+            reader,
+            start,
+            end,
+            cursor,
+        }))
+    }
+}
+
+impl Read for PartReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
         }
-        let reader = &mut self
-            .source
-            .as_mut()
-            .expect("selected immutable archive input")
-            .1;
-        reader.seek(SeekFrom::Start(self.position))?;
+        // A failed read drops the range, so the next one re-locates and seeks.
+        let mut placed = match self.placed.take() {
+            Some(placed) if placed.covers(self.position) => placed,
+            previous => match self.locate(previous)? {
+                Some(placed) => placed,
+                None => return Ok(0),
+            },
+        };
+        if placed.cursor != Some(self.position) {
+            placed.reader.seek(SeekFrom::Start(self.position))?;
+        }
         let wanted = out
             .len()
-            .min(usize::try_from(available).unwrap_or(usize::MAX));
-        let read = reader.read(&mut out[..wanted])?;
-        LiveArchiveInput::check(&*self.input.lock()?)?;
+            .min(usize::try_from(placed.end - self.position).unwrap_or(usize::MAX));
+        let read = placed.reader.read(&mut out[..wanted])?;
+        let current = {
+            let state = self.input.lock()?;
+            LiveArchiveInput::check(&state)?;
+            state
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| Arc::ptr_eq(snapshot, &placed.snapshot))
+        };
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -431,6 +480,12 @@ impl Read for PartReader {
             .position
             .checked_add(read as u64)
             .ok_or_else(|| invalid("archive position overflow"))?;
+        placed.cursor = Some(self.position);
+        // A superseded snapshot is released now rather than held for as long
+        // as reads stay inside its range.
+        if current {
+            self.placed = Some(placed);
+        }
         Ok(read)
     }
 }
@@ -466,16 +521,13 @@ impl Read for LiveArchiveReader {
             if self
                 .current
                 .as_ref()
-                .is_none_or(|reader| reader.index != index)
+                .is_some_and(|reader| reader.index != index)
             {
-                self.current = Some(PartReader {
-                    input: self.input.clone(),
-                    index,
-                    position: offset,
-                    source: None,
-                });
+                self.current = None;
             }
-            let reader = self.current.as_mut().expect("located archive part");
+            let reader = self
+                .current
+                .get_or_insert_with(|| PartReader::new(self.input.clone(), index));
             reader.position = offset;
             let count = reader.read(out)?;
             if count == 0 {

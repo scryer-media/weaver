@@ -79,10 +79,41 @@ impl ArchiveRuntime {
         self.sessions.close(owner)
     }
 
-    pub(crate) fn abort_inputs(&self, owners: &[StreamOwner]) {
+    // Binds every producer and child of a namespace to a graph owner, in
+    // node order so a parent is bound before its children. A direct producer
+    // that has become a decoder first retires what it produced before.
+    pub(crate) async fn bind_namespace(
+        &mut self,
+        set_name: &str,
+        producers: &[(u32, Option<u32>, u64, bool)],
+        children: &[crate::pipeline::direct_store::set::LiveChildDescription],
+    ) -> Result<(), RuntimeError> {
+        for child in children {
+            self.prepare_graph_decoder(set_name, child.node, child.parent)
+                .await
+                .map_err(RuntimeError::session("direct child transition"))?;
+        }
+        let mut bindings: Vec<_> = producers
+            .iter()
+            .map(|&(node, parent, _, _)| (node, parent))
+            .chain(
+                children
+                    .iter()
+                    .map(|child| (child.node, Some(child.parent))),
+            )
+            .collect();
+        bindings.sort_by_key(|&(node, _)| node);
+        for (node, parent) in bindings {
+            self.graph_lease(set_name, node, parent, InputVersion(0))
+                .map_err(RuntimeError::session("direct namespace admission"))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn abort_inputs(&self, owners: &[StreamOwner], reason: &'static str) {
         for (owner, input) in &self.live_inputs {
             if owners.contains(owner) {
-                input.abort("archive input owner revoked");
+                input.abort(reason);
             }
         }
     }
@@ -94,12 +125,12 @@ impl crate::pipeline::Pipeline {
         job_id: crate::jobs::ids::JobId,
         root_set: &str,
         node: u32,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         self.archive_runtime
             .get_mut(&job_id)
-            .ok_or("missing archive graph runtime")?
+            .ok_or(RuntimeError::Invariant("archive graph runtime"))?
             .close_graph_owner(root_set, node)
-            .map_err(|e| format!("archive graph close: {e:?}"))?;
+            .map_err(RuntimeError::session("archive graph close"))?;
         self.publish_scoped_completions(job_id).await;
         Ok(())
     }
@@ -146,7 +177,7 @@ impl crate::pipeline::Pipeline {
     pub(crate) async fn resume_scoped_replay(
         &mut self,
         job_id: crate::jobs::ids::JobId,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let restored: Vec<_> = self
             .archive_runtime
             .get(&job_id)
@@ -175,11 +206,11 @@ impl crate::pipeline::Pipeline {
             })
             .unwrap_or_default();
         for (namespace, producers, children) in restored {
-            let runtime = self.archive_runtime.get(&job_id).expect("restored runtime");
-            let (working, destination) = runtime
-                .checkpoint_roots
-                .clone()
-                .ok_or("restored namespace roots absent")?;
+            let (working, destination) = self
+                .archive_runtime
+                .get(&job_id)
+                .and_then(|runtime| runtime.checkpoint_roots.clone())
+                .ok_or(RuntimeError::Invariant("restored namespace roots"))?;
             Box::pin(self.publish_scoped_namespace(
                 job_id,
                 &namespace,
@@ -209,12 +240,13 @@ impl crate::pipeline::Pipeline {
             }
             let lease = runtime
                 .resume_owner(owner)
-                .map_err(|error| format!("archive replay lifecycle: {error:?}"))?;
+                .map_err(RuntimeError::session("archive replay lifecycle"))?;
             ready.push((work, lease));
         }
         for (work, lease) in ready {
             self.spawn_scoped_selected_extraction(job_id, work, lease)
-                .await?;
+                .await
+                .map_err(RuntimeError::refused("archive replay spawn"))?;
         }
         Ok(())
     }
@@ -222,21 +254,11 @@ impl crate::pipeline::Pipeline {
 
 impl ArchiveRuntime {
     pub(crate) fn mark_speculative(&mut self, request: &RequestId) -> Result<(), SessionError> {
-        if !Arc::ptr_eq(&self.identity, &request.identity)
-            || !self.requests.contains_key(&request.sequence)
-        {
-            return Err(SessionError::Stale);
-        }
-        self.speculative_requests.insert(request.sequence);
-        Ok(())
+        self.requests.mark_speculative(request)
     }
     pub(crate) fn accept_speculative(&mut self, request: &RequestId) -> Result<(), SessionError> {
-        if !Arc::ptr_eq(&self.identity, &request.identity)
-            || !self.speculative_requests.remove(&request.sequence)
-        {
-            return Err(SessionError::Stale);
-        }
-        if let Some(request) = self.requests.get_mut(&request.sequence) {
+        self.requests.accept_speculative(request)?;
+        if let Some(request) = self.requests.get_mut(request) {
             request.work.root_set = None;
         }
         Ok(())
@@ -245,14 +267,7 @@ impl ArchiveRuntime {
         &mut self,
         id: &RequestId,
     ) -> Result<Vec<StreamOwner>, SessionError> {
-        if !Arc::ptr_eq(&self.identity, &id.identity) {
-            return Err(SessionError::Stale);
-        }
-        let owner = self
-            .requests
-            .get(&id.sequence)
-            .ok_or(SessionError::Stale)?
-            .owner;
+        let owner = self.requests.get(id).ok_or(SessionError::Stale)?.owner;
         self.retire_namespace_tree(owner)
     }
     fn retire_namespace_tree(
@@ -260,40 +275,7 @@ impl ArchiveRuntime {
         owner: StreamOwner,
     ) -> Result<Vec<StreamOwner>, SessionError> {
         let revoked = self.sessions.revoke(owner)?;
-        self.abort_inputs(&revoked);
-        self.retire_sinks(&revoked);
-        self.requests
-            .retain(|_, request| !revoked.contains(&request.owner));
-        self.speculative_requests
-            .retain(|sequence| self.requests.contains_key(sequence));
-        self.completed
-            .retain(|(owner, _, _)| !revoked.contains(owner));
-        self.retained_work
-            .retain(|(owner, _)| !revoked.contains(owner));
-        self.deferred_repairs
-            .retain(|(owner, _)| !revoked.contains(owner));
-        self.replay.retain(|(owner, _)| !revoked.contains(owner));
-        self.decoded
-            .retain(|state| !revoked.contains(&state.generation.owner()));
-        self.output_owners
-            .retain(|_, owner| !revoked.contains(owner));
-        self.graph_owners
-            .retain(|_, owner| !revoked.contains(owner));
-        self.speculative_namespaces.retain(|namespace| {
-            self.graph_owners
-                .keys()
-                .any(|(bound, _)| bound == namespace)
-        });
-        self.gates
-            .retain(|key, _| self.graph_owners.contains_key(key));
-        self.live_inputs
-            .retain(|(owner, _)| !revoked.contains(owner));
-        if self.staged_replacement.as_ref().is_some_and(|staged| {
-            revoked.contains(&staged.selected)
-                || staged.retiring.iter().any(|owner| revoked.contains(owner))
-        }) {
-            self.staged_replacement.take();
-        }
+        self.forget_owners(&revoked, Departure::Revoked);
         Ok(revoked)
     }
     #[cfg(test)]
@@ -316,20 +298,12 @@ impl ArchiveRuntime {
         owner: StreamOwner,
     ) -> Result<tokio::sync::watch::Receiver<bool>, SessionError> {
         let revoked = self.retire_namespace_tree(owner)?;
-        let mut owned = Vec::new();
-        let mut remaining = Vec::new();
-        for (worker_owner, worker) in std::mem::take(&mut self.workers) {
-            if revoked.contains(&worker_owner) {
-                owned.push(worker);
-            } else {
-                remaining.push((worker_owner, worker));
-            }
-        }
+        let owned = self.workers.take(&revoked);
         let (completed, observer) = tokio::sync::watch::channel(owned.is_empty());
         if !owned.is_empty() {
             // Keep the barrier in the owner registry so a later retirement
             // still joins every producer while staging cleanup observes it.
-            remaining.push((
+            self.workers.track(
                 owner,
                 tokio::spawn(async move {
                     for worker in owned {
@@ -337,9 +311,8 @@ impl ArchiveRuntime {
                     }
                     completed.send_replace(true);
                 }),
-            ));
+            );
         }
-        self.workers = remaining;
         Ok(observer)
     }
 
@@ -397,15 +370,9 @@ impl ArchiveRuntime {
         Ok(())
     }
     async fn join_retired_workers(&mut self, revoked: Vec<StreamOwner>) {
-        let mut remaining = Vec::new();
-        for (owner, worker) in std::mem::take(&mut self.workers) {
-            if revoked.contains(&owner) {
-                let _ = worker.await;
-            } else {
-                remaining.push((owner, worker));
-            }
+        for worker in self.workers.take(&revoked) {
+            let _ = worker.await;
         }
-        self.workers = remaining;
         for owner in revoked {
             let _ = self.sessions.joined(owner);
         }
@@ -415,30 +382,11 @@ impl ArchiveRuntime {
 impl ArchiveRuntime {
     pub(crate) fn mark_namespace_speculative(&mut self, namespace: &str, parent: StreamOwner) {
         self.speculative_namespaces.insert(namespace.to_owned());
-        for request in self.requests.values() {
-            if request.owner != parent
-                && request
-                    .work
-                    .virtual_source
-                    .as_ref()
-                    .is_some_and(|source| source.root_set == namespace)
-            {
-                self.speculative_requests.insert(request.id.sequence);
-            }
-        }
+        self.requests.mark_namespace(namespace, parent);
     }
     pub(crate) fn accept_namespace(&mut self, namespace: &str) {
         self.speculative_namespaces.remove(namespace);
-        for request in self.requests.values() {
-            if request
-                .work
-                .virtual_source
-                .as_ref()
-                .is_some_and(|source| source.root_set == namespace)
-            {
-                self.speculative_requests.remove(&request.id.sequence);
-            }
-        }
+        self.requests.accept_namespace(namespace);
     }
 }
 impl crate::pipeline::Pipeline {

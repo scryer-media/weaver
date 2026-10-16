@@ -1,9 +1,16 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::jobs::ids::JobId;
 use crate::pipeline::extraction::output::channel::StreamOwner;
 use crate::pipeline::extraction::runtime::{RequestId, decoded::DecodedState, root::RootDispatch};
 use crate::pipeline::{ExtractionDone, ExtractionError, FullSetExtractionOutcome, Pipeline};
+
+// Every value behind these locks is plain data changed in single assignments
+// or set inserts, so a panic elsewhere cannot leave it half-written; the actor
+// keeps running on whatever the last completed step left.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct ChaseManifest {
@@ -11,17 +18,31 @@ pub(crate) struct ChaseManifest {
 }
 impl ChaseManifest {
     pub(super) fn route(&self, path: &std::path::Path) -> bool {
-        if !archive_member(path) {
+        if !crate::pipeline::extraction::output::routes_to_child_engine(path) {
             return false;
         }
-        self.streamed
-            .lock()
-            .expect("chase manifest")
-            .insert(path.to_string_lossy().replace('\\', "/"));
+        lock(&self.streamed).insert(path.to_string_lossy().replace('\\', "/"));
         true
     }
     pub(crate) fn streamed(&self) -> std::collections::HashSet<String> {
-        self.streamed.lock().expect("chase manifest").clone()
+        lock(&self.streamed).clone()
+    }
+    /// Child archives this chase streams go to `archives`; every other member
+    /// goes to `leaves`.
+    pub(super) fn select<A, B>(
+        &self,
+        archives: A,
+        leaves: B,
+    ) -> crate::pipeline::extraction::output::select::SelectOutput<
+        A,
+        B,
+        impl Fn(usize, &std::path::Path) -> bool + Sync + '_,
+    > {
+        crate::pipeline::extraction::output::select::SelectOutput {
+            first: archives,
+            second: leaves,
+            select_first: |_: usize, path: &std::path::Path| self.route(path),
+        }
     }
 }
 pub(crate) struct ChaseExpectedMembers {
@@ -58,15 +79,6 @@ pub(super) struct ChaseStream {
     state: Arc<Mutex<State>>,
     sender: tokio::sync::mpsc::Sender<ExtractionDone>,
     lease: Arc<Mutex<Option<crate::pipeline::extraction::session::SessionLease>>>,
-}
-
-pub(super) fn archive_member(path: &std::path::Path) -> bool {
-    matches!(
-        weaver_model::files::FileRole::from_filename(&path.to_string_lossy()),
-        weaver_model::files::FileRole::RarVolume { .. }
-            | weaver_model::files::FileRole::SevenZipArchive
-            | weaver_model::files::FileRole::SevenZipSplit { .. }
-    )
 }
 
 impl State {
@@ -135,7 +147,7 @@ impl ChaseStream {
                 })
                 .map_err(Clone::clone);
             {
-                let mut state = stream.state.lock().expect("chase stream state");
+                let mut state = lock(&stream.state);
                 if !state.discarded {
                     state.collected = Some((scoped, decoded));
                 }
@@ -147,7 +159,7 @@ impl ChaseStream {
 
     fn deliver(&self) {
         let collected = {
-            let mut state = self.state.lock().expect("chase stream state");
+            let mut state = lock(&self.state);
             state.take_ready()
         };
         if let Some((result, decoded)) = collected {
@@ -155,7 +167,7 @@ impl ChaseStream {
             let job_id = self.job_id;
             let owner = self.owner;
             let request = self.request.clone();
-            let Some(lease) = self.lease.lock().expect("chase stream lease").take() else {
+            let Some(lease) = lock(&self.lease).take() else {
                 return;
             };
             tokio::spawn(async move {
@@ -188,7 +200,7 @@ impl Pipeline {
                         .extracted_archives
                         .get(&job_id)
                         .is_some_and(|sets| sets.contains(set))
-                    && !stream.state.lock().expect("chase stream state").accepted)
+                    && !lock(&stream.state).accepted)
                     .then_some(set.clone())
             })
             .collect();
@@ -221,6 +233,7 @@ impl Pipeline {
             .map(|stream| stream.owner)
     }
 
+    #[cfg(test)]
     pub(crate) fn has_scoped_chase(&self, job_id: JobId, set_name: &str) -> bool {
         self.direct_unpack
             .streams
@@ -241,7 +254,7 @@ impl Pipeline {
             {
                 return false;
             }
-            stream.state.lock().expect("chase stream state").accepted = true;
+            lock(&stream.state).accepted = true;
             stream.deliver();
             return true;
         }
@@ -255,15 +268,38 @@ impl Pipeline {
             .remove(&(job_id, set_name.to_owned()))
         {
             {
-                let mut state = stream.state.lock().expect("chase stream state");
+                let mut state = lock(&stream.state);
                 state.discarded = true;
                 state.collected.take();
             }
-            stream.lease.lock().expect("chase stream lease").take();
+            lock(&stream.lease).take();
             if let Some(runtime) = self.archive_runtime.get_mut(&job_id) {
                 let _ = runtime.discard_speculative(&stream.request).await;
             }
         }
+    }
+
+    /// Marks a freshly admitted chase generation speculative. A generation
+    /// that cannot be marked is retired at once, behind a barrier on its
+    /// staging, and the chase runs without a stream.
+    pub(super) fn mark_chase_speculative(
+        &mut self,
+        job_id: JobId,
+        dispatch: &RootDispatch,
+        staging: &std::path::Path,
+    ) -> bool {
+        let Some(runtime) = self.archive_runtime.get_mut(&job_id) else {
+            return false;
+        };
+        if runtime.mark_speculative(&dispatch.request).is_ok() {
+            return true;
+        }
+        if let Ok(barrier) = runtime.retire_owner_barrier(dispatch.owner) {
+            self.direct_unpack
+                .retirement_barriers
+                .insert(staging.to_path_buf(), barrier);
+        }
+        false
     }
 
     pub(crate) fn discard_chase_stream(&mut self, job_id: JobId, set_name: &str) {
@@ -273,12 +309,12 @@ impl Pipeline {
             .remove(&(job_id, set_name.to_owned()))
         {
             let accepted = {
-                let mut state = stream.state.lock().expect("chase stream state");
+                let mut state = lock(&stream.state);
                 state.discarded = true;
                 state.collected.take();
                 state.accepted
             };
-            stream.lease.lock().expect("chase stream lease").take();
+            lock(&stream.lease).take();
             if let Some(runtime) = self.archive_runtime.get_mut(&job_id)
                 && let Ok(barrier) = runtime.retire_owner_barrier(stream.owner)
                 && !accepted
@@ -330,8 +366,10 @@ mod tests {
 
     #[test]
     fn archive_selection_keeps_ordinary_payload_on_file_output() {
-        assert!(archive_member(std::path::Path::new("inner.part01.rar")));
-        assert!(archive_member(std::path::Path::new("inner.7z.001")));
-        assert!(!archive_member(std::path::Path::new("video.mkv")));
+        use crate::pipeline::extraction::output::routes_to_child_engine;
+        use std::path::Path;
+        assert!(routes_to_child_engine(Path::new("inner.part01.rar")));
+        assert!(routes_to_child_engine(Path::new("inner.7z.001")));
+        assert!(!routes_to_child_engine(Path::new("video.mkv")));
     }
 }

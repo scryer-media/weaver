@@ -8,6 +8,7 @@ use super::super::provider::{VirtualVolume, VirtualVolumeReader};
 use super::super::router::SpanOwner;
 use super::super::sparse::{SparseMarker, SparseMarking};
 use super::placement::MemberPlacement;
+use crate::pipeline::extraction::runtime::limits::MATERIALIZATION_PERMIT_BYTES;
 
 pub(crate) struct Materialization {
     node: u32,
@@ -191,8 +192,11 @@ impl NestedGraph {
             .collect::<Result<Vec<_>, _>>()?;
         let applied = validated
             .into_iter()
-            .map(|(receipt, chain)| (receipt, self.apply_member_placement(receipt, chain)))
-            .collect();
+            .map(|(receipt, chain)| {
+                self.apply_member_placement(receipt, chain)
+                    .map(|sources| (receipt, sources))
+            })
+            .collect::<Result<_, _>>()?;
         let node = self.node_mut(result.node);
         node.generation = next_generation;
         node.mode = NodeMode::Materialized;
@@ -250,7 +254,7 @@ fn copy_inputs_with(
     mut open: impl FnMut(&std::path::Path) -> io::Result<std::fs::File>,
 ) -> io::Result<Materialized> {
     let mut copied = Vec::new();
-    let mut buffer = vec![0u8; 64 * 1024];
+    let mut buffer = vec![0u8; MATERIALIZATION_PERMIT_BYTES as usize];
     for input in plan.inputs {
         check()?;
         let ranges = input.ranges;
