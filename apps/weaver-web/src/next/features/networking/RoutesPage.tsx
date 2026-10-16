@@ -103,10 +103,14 @@ export function RoutesPage({
               detail={consumer.kind === "SERVER" ? `${openCount} / ${consumer.cap}` : undefined}
             />,
             <span key="edit" className="ml-auto flex gap-2" onClick={(event) => event.stopPropagation()}>
-              <SecondaryButton size="compact" onClick={() => void navigate(speedPage(consumer.key))}>
+              <SecondaryButton
+                size="compact"
+                icon="speedTest"
+                onClick={() => void navigate(speedPage(consumer.key))}
+              >
                 {t("next.networking.speed.title")}
               </SecondaryButton>
-              <SecondaryButton size="compact" onClick={() => setEditing(consumer)}>
+              <SecondaryButton size="compact" icon="edit" onClick={() => setEditing(consumer)}>
                 {t("next.networking.routes.edit")}
               </SecondaryButton>
             </span>,

@@ -159,7 +159,7 @@ export const EgressPage = memo(function EgressPage({
       kind: "table",
       id: "egress",
       title: t("next.networking.egress.title"),
-      columns: "minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 0.8fr) 104px minmax(0, 1.4fr) 124px",
+      columns: "minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 0.8fr) 104px minmax(0, 1.4fr) 132px",
       headers: [
         t("next.networking.egress.name"),
         t("next.networking.egress.bindingColumn"),
@@ -215,7 +215,7 @@ export const EgressPage = memo(function EgressPage({
             </Cell>,
             <QuotaCell key="quota" t={t} egress={egress} />,
             <span key="edit" className="ml-auto" onClick={(event) => event.stopPropagation()}>
-              <SecondaryButton size="compact" onClick={() => open(egress)}>
+              <SecondaryButton size="compact" icon="edit" onClick={() => open(egress)}>
                 {t("next.networking.egress.edit")}
               </SecondaryButton>
             </span>,

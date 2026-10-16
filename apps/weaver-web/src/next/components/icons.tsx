@@ -63,6 +63,7 @@ import {
   Signal,
   ShieldCheck,
   SlidersHorizontal,
+  SquarePen,
   SquareTerminal,
   Trash2,
   Undo2,
@@ -140,6 +141,7 @@ export const ICONS = {
 
   // Actions.
   add: Plus,
+  edit: SquarePen,
   remove: Trash2,
   forget: Eraser,
   cancelDownload: CircleX,

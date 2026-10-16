@@ -1066,7 +1066,7 @@ function SecurityPanelBody({
         onDismiss={() => setCreatedKey(null)}
         footer={
           <>
-            <SecondaryButton onClick={copyCreatedKey}>
+            <SecondaryButton icon={copied ? "copied" : "copy"} onClick={copyCreatedKey}>
               {copied ? t("next.security.copied") : t("next.security.copyKey")}
             </SecondaryButton>
             <PrimaryButton onClick={() => setCreatedKey(null)}>{t("next.security.done")}</PrimaryButton>

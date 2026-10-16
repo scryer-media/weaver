@@ -486,7 +486,9 @@ export function GeneralPanel() {
                       </SecondaryButton>
                     )}
                     {hasPasswords ? (
-                      <SecondaryButton onClick={() => setConfirmClear(true)}>{t("next.common.clear")}</SecondaryButton>
+                      <SecondaryButton icon="remove" onClick={() => setConfirmClear(true)}>
+                        {t("next.common.clear")}
+                      </SecondaryButton>
                     ) : null}
                   </div>
                 ),

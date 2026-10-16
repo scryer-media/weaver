@@ -478,8 +478,9 @@ export function ProvidersPanel() {
             <Link
               to={speedPage(`server:${server.id}`)}
               aria-label={t("next.networking.speed.testServer", { host: server.host })}
-              className="font-wv-mono text-[12px] text-wv-accent hover:underline"
+              className="inline-flex items-center gap-[5px] font-wv-mono text-[12px] text-wv-accent hover:underline"
             >
+              <Icon name="speedTest" size={12} className="flex-none" />
               {t("next.networking.speed.title")}
             </Link>
           </span>,

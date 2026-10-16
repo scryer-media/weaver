@@ -652,7 +652,7 @@ export function BackupPanel() {
         >
           {t("next.backup.download")}
         </SecondaryButton>
-        <SecondaryButton disabled={busy || createAction.busy || !password.trim() || mismatch} onClick={() => void create()}>{t("next.backup.createStored")}</SecondaryButton>
+        <SecondaryButton icon="add" disabled={busy || createAction.busy || !password.trim() || mismatch} onClick={() => void create()}>{t("next.backup.createStored")}</SecondaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
