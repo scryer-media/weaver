@@ -46,6 +46,22 @@ pub struct HistoryItem {
     pub delete_operation: Option<HistoryDeleteRowState>,
     #[serde(default)]
     pub duplicate_summary: Option<DuplicateSummaryInfo>,
+    /// The files written under a different name than they were posted with,
+    /// each with the name the poster gave it. Empty when every file kept its
+    /// posted name.
+    #[serde(default)]
+    pub posted_file_names: Vec<PostedFileName>,
+}
+
+/// A file Weaver wrote under a different name than it was posted with,
+/// because the posted name was too long for a filesystem, used characters
+/// one refuses, or clashed with another file in the job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct PostedFileName {
+    /// The file's name on disk, inside `outputDir`.
+    pub name: String,
+    /// The name the file was posted with.
+    pub posted_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
@@ -549,6 +565,15 @@ fn history_item_from_display(
         attention: attention_for_history_row(row, state),
         delete_operation,
         duplicate_summary: None,
+        posted_file_names: weaver_server_core::ingest::posted_file_names(&parse_history_metadata(
+            row.metadata.as_deref(),
+        ))
+        .into_iter()
+        .map(|file| PostedFileName {
+            name: file.name,
+            posted_name: file.posted_name,
+        })
+        .collect(),
     }
 }
 

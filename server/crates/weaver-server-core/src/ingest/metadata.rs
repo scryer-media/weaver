@@ -20,6 +20,71 @@ pub fn set_renamed_title(metadata: &mut Vec<(String, String)>, name: &str) {
     metadata.push((RENAMED_TITLE_METADATA_KEY.to_string(), name.to_string()));
 }
 
+// The name each file was posted under, for the files Weaver had to write
+// under a different name (shortened, cleaned of characters a filesystem
+// refuses, or made unique). Stored once, when the job is first built, as a
+// JSON list of `{name, posted_name}`.
+pub const POSTED_FILE_NAMES_METADATA_KEY: &str = "weaver.posted_file_names";
+// A pathological NZB could post thousands of long names; past this many
+// bytes the rest are not recorded.
+const POSTED_FILE_NAMES_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PostedFileName {
+    // The name the file has on disk.
+    pub name: String,
+    // The name the poster gave it.
+    pub posted_name: String,
+}
+
+// Record the posted name of every file whose disk name differs from it.
+// `files` pairs each posted name with the name Weaver writes. A job that
+// already carries the record keeps it: a restored job is built again from its
+// NZB and must report what the original submission saw.
+pub fn append_posted_file_names_metadata<'a>(
+    mut metadata: Vec<(String, String)>,
+    files: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<(String, String)> {
+    if metadata
+        .iter()
+        .any(|(key, _)| key == POSTED_FILE_NAMES_METADATA_KEY)
+    {
+        return metadata;
+    }
+
+    let mut recorded = Vec::new();
+    let mut recorded_bytes = 0usize;
+    for (posted_name, name) in files {
+        let posted_name = posted_name.trim();
+        if posted_name.is_empty() || posted_name == name {
+            continue;
+        }
+        recorded_bytes = recorded_bytes.saturating_add(posted_name.len() + name.len());
+        if recorded_bytes > POSTED_FILE_NAMES_MAX_BYTES {
+            break;
+        }
+        recorded.push(PostedFileName {
+            name: name.to_string(),
+            posted_name: posted_name.to_string(),
+        });
+    }
+    if recorded.is_empty() {
+        return metadata;
+    }
+    if let Ok(value) = serde_json::to_string(&recorded) {
+        metadata.push((POSTED_FILE_NAMES_METADATA_KEY.to_string(), value));
+    }
+    metadata
+}
+
+pub fn posted_file_names(metadata: &[(String, String)]) -> Vec<PostedFileName> {
+    metadata
+        .iter()
+        .find(|(key, _)| key == POSTED_FILE_NAMES_METADATA_KEY)
+        .and_then(|(_, value)| serde_json::from_str(value).ok())
+        .unwrap_or_default()
+}
+
 pub fn append_original_title_metadata(
     mut metadata: Vec<(String, String)>,
     primary: Option<&str>,
