@@ -1,0 +1,23 @@
+{
+  "slug": "nested-direct-aes-7z-inner",
+  "title": "E2E.Test.Nested.Direct.AES.7z.Inner.2026.1080p-TESTGRP{{weaver-e2e-nested-inner}}",
+  "description": "A stored RAR5 holding a 7z whose data is AES-encrypted under clear headers, beside an ordinary member. The job has no password of its own; the only candidate is the one in the NZB file name's braces. The posted set must finalize direct without demoting and the encrypted child must be streamed into a live child engine.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "sable.ford.s01e15.extras.bin": "ac64755cb72dc002eea95e84e549c7ed88b9c9cb6b32622e7b5a02badc9e2388",
+    "sable.ford.s01e15.mkv": "657199af6c5e591ebf4e6494f93b808a1e88e712ecce54ddc2de1bae0f541eaf"
+  },
+  "forbiddenOutputPaths": [
+    "*.7z",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "requireFinalizedDirect": true,
+      "forbidDemotion": true,
+      "requireStreamedChildren": 1,
+      "forbidChildMaterialization": true
+    }
+  }
+}

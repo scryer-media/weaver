@@ -1,0 +1,22 @@
+{
+  "slug": "nested-direct-3deep",
+  "title": "E2E.Test.Nested.Direct.3Deep.2026.1080p-TESTGRP",
+  "description": "RAR5 holding a 7z holding a RAR5 holding the payload, all stored: three archive levels, with the posted set finalizing direct and both nested archives routed by the graph.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "kestrel.line.s01e08.mkv": "ec0adfbba8eb52f6827d4529eccf318aae808e2a1d42d1be8c30ec2c7f1a033d"
+  },
+  "forbiddenOutputPaths": [
+    "*.7z",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "requireFinalizedDirect": true,
+      "forbidDemotion": true,
+      "requireStreamedChildren": 2,
+      "forbidChildMaterialization": true
+    }
+  }
+}

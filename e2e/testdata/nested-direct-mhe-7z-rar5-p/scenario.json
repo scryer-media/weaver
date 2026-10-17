@@ -1,0 +1,20 @@
+{
+  "slug": "nested-direct-mhe-7z-rar5-p",
+  "title": "E2E.Test.Nested.Direct.MHE.7z.RAR5.Encrypted.2026.1080p-TESTGRP",
+  "description": "An LZMA2 7z with -mhe=on header encryption holding a RAR5 -p inner under the same password. The job's password opens the headers, and AES over a compressing coder is a by-design direct-store refusal: the set demotes with 7z_encrypted_content and the conventional extraction opens the encrypted RAR child.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "jade.harbor.s01e07.mkv": "ab986f0f083fd1863040e4c4b1ddbecc3096705ffd82dfc84ef54f766adbc01a"
+  },
+  "password": "weaver-e2e-direct-password",
+  "forbiddenOutputPaths": [
+    "*.7z",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "expectedDemotionReason": "7z_encrypted_content"
+    }
+  }
+}

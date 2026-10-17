@@ -3181,6 +3181,430 @@
       }
     },
     {
+      "path": "testdata/nested-direct-3deep/archive.rar",
+      "size": 6291724,
+      "blake3": "ffb2f63106211875f72a9d6da61834afba23916fea7a1b8a5323bae22392e302",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-7z-aes-all-wrong/archive.rar",
+      "size": 4194555,
+      "blake3": "64b253707be83e96e67d1567a6b82a81eeb99959773b73aa6231e60edbbff36b",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-7z-aes-pair/archive.7z",
+      "size": 6292315,
+      "blake3": "5524a5227ed8fa2a6837dbbd90481043138f9ea0a2d25e39fe590efc91ba8eea",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-7z-empty-and-dirs/archive.rar",
+      "size": 4194581,
+      "blake3": "9dc58b8329c2784b04c203546ef893f07984822fbeae114f3e39c2559e2b446b",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-7z-in-7z/archive.7z",
+      "size": 9437527,
+      "blake3": "7fa3bf88cd392cb12cdfde1fc340353cc005a478a2a327e305850a44aa77fbd7",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-7z-in-rar5/archive.rar",
+      "size": 8388890,
+      "blake3": "52709a97d98846d4d7a7078f80f47dba3517975eea26f4075925d7884ebff96a",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-7z-mhe-first-password/archive.7z",
+      "size": 9438225,
+      "blake3": "a2d67461fc5753ebd2cd5138dec884fc47f8c17a996b91c9da6126414b57174f",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-7z-mhe-second-password/archive.7z",
+      "size": 9438225,
+      "blake3": "cee59816b43da97d3559740dd844cfcea615f14b054661f1df0a2093f0f087e6",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-aes-7z-inner/archive.rar",
+      "size": 7340336,
+      "blake3": "53ed393f153e42b7f947a412a57f2290f6942fa062ba6bcd27d48e493eacc900",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-extensionless-child/archive.rar",
+      "size": 6291726,
+      "blake3": "2d2e340417decb98587d469c155d1d9d43e980a9824d3d9559d25295bd427c5a",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-fake-archive-member/archive.rar",
+      "size": 6291575,
+      "blake3": "fd3928cf9b7459661e1a5c9186cf446f885364a036e11e6859f30495cc68633f",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-hp-rar5-aes-7z/archive.rar",
+      "size": 5243294,
+      "blake3": "2189ac6cd5bb7ccf2e16af04b14d33ed494908a0d06dd5a5312e7ccc5b7c138f",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-mhe-7z-rar5-p/archive.7z",
+      "size": 5243554,
+      "blake3": "8b74cf5021a4866103e4b75a2838b23894290d3f9f4d1c626f39a6f5c1510e71",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-multivolume-rar5-7z/archive.part1.rar",
+      "size": 8388608,
+      "blake3": "710f913dd406a1a714c779b9f8f9c6b63a69de13ff1fe48a17ea652795645f6e",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-multivolume-rar5-7z/archive.part2.rar",
+      "size": 8388608,
+      "blake3": "324ec1fef7e6c37be7520e8a49859351ace1280d4a161570ad43c1203ef3f507",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-multivolume-rar5-7z/archive.part3.rar",
+      "size": 4194724,
+      "blake3": "43b8e06d2943e4a8e1e358a54a045c1c0fea9fb181ebc686db18c8b9fd055370",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-par2-repaired-outer/archive.par2",
+      "size": 41108,
+      "blake3": "de464146b56b7f1cfcd04575e4d1974d57f0ecb06cb00d1e2b5ccbee837d099d",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-par2-repaired-outer/archive.part1.rar",
+      "size": 8388608,
+      "blake3": "7a505809237a225123b84610663f959e25cc4fac3d96bf8390046580a3fb042c",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-par2-repaired-outer/archive.part2.rar",
+      "size": 8388608,
+      "blake3": "25c644e275dcaa31eb3fa03e8573fe03615b6a26e0076dc0c389d2e6703a6a84",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-par2-repaired-outer/archive.part3.rar",
+      "size": 8388608,
+      "blake3": "3805765773628982e9d9a11dda027a00f96ea90b4529eae466e7727d2bf57b10",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-par2-repaired-outer/archive.part4.rar",
+      "size": 425,
+      "blake3": "30a17c7cc2c538daf9a3b04f21d40e326a9cb87d211e450fb662cfc70ea099b5",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-par2-repaired-outer/archive.vol000+100.par2",
+      "size": 1553508,
+      "blake3": "d684d9b7241e2a62376357bdef0f65fe73534ded6ed8795d061c850db7e7747f",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-par2-repaired-outer/archive.vol100+100.par2",
+      "size": 1553508,
+      "blake3": "2b5881aea91ff767136a10a9c7e1402de20a32ba1519097134ef538eece9e97b",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-par2-repaired-outer/archive.vol200+100.par2",
+      "size": 1553508,
+      "blake3": "a463af667554595c3397d3330cd6765b8ef66de5297101b9e32ca1f8f67e7426",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-par2-repaired-outer/archive.vol300+100.par2",
+      "size": 1553508,
+      "blake3": "d7990b5eead1ed89d580aec9e1d1cd735b964526adc829f3e829c0cf493a6001",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-rar5-in-7z/archive.7z",
+      "size": 8388889,
+      "blake3": "cd3edd3dd1c059651430a0192db93a39be032f0be85fc6019e7b29c203fab8b9",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-solid-outer-demotes/archive.rar",
+      "size": 6303461,
+      "blake3": "f1f305f89b33c3810471a103e789a5d8b5e4a4c659daa301e2c4f2cb5d96ca2e",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/nested-direct-split-7z-inner/archive.rar",
+      "size": 5243148,
+      "blake3": "a8dbb2922bbc1be07234b6b44127cc9a8fb5395c7e8328da38d1a98b7c6ce07f",
+      "format": "rar5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "rarlab-5.00",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
       "path": "testdata/nested-obfuscated-split-7z/archive.7z",
       "size": 84011804,
       "blake3": "beff86abe72db7b93ad1fc3e08954809e0f478e5d195a2085db383700519eee0",

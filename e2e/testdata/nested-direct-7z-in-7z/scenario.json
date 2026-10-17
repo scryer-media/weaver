@@ -1,0 +1,23 @@
+{
+  "slug": "nested-direct-7z-in-7z",
+  "title": "E2E.Test.Nested.Direct.7z.In.7z.2026.1080p-TESTGRP",
+  "description": "A stored 7z holding a stored 7z beside an ordinary member. The posted set must finalize direct without demoting, and the graph must route its one child rather than write it out as a file.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "lumen.vale.s01e01.extras.bin": "941b0734ae013ad6e63d1c5ea85558ea976f9f3fb2702a41291a3eb3d59fe517",
+    "lumen.vale.s01e01.mkv": "b269c13bd0b6fc488a6aa6d3d8873f0cfe660a3389ab67a12f50f7a8d01851a3"
+  },
+  "forbiddenOutputPaths": [
+    "*.7z",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "requireFinalizedDirect": true,
+      "forbidDemotion": true,
+      "requireStreamedChildren": 1,
+      "forbidChildMaterialization": true
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "slug": "nested-direct-7z-mhe-second-password",
+  "title": "E2E.Test.Nested.Direct.7z.MHE.Second.Password.2026.1080p-TESTGRP{{weaver-e2e-nested-outer}}",
+  "description": "nested-direct-7z-mhe-first-password with the candidates the other way round: the job's own password is wrong and the right one is in the NZB file name's braces. The set demotes with 7z_encrypted_content, and the direct-unpack chase must arm and have its members installed all the same.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "tarn.ridge.s01e16.extras.bin": "37d8d38f823f684065f3b100f34475cdc9aa72cf64b0c98c18a92b9a65414218",
+    "tarn.ridge.s01e16.mkv": "92569659f8c069f4d1649366bbb0a19c85dda9968b79412efa8eb07823bd85cc"
+  },
+  "password": "weaver-e2e-nested-inner",
+  "forbiddenOutputPaths": [
+    "*.7z"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "expectedDemotionReason": "7z_encrypted_content"
+    },
+    "directUnpack": {
+      "requireArmed": true,
+      "requireConsumed": true
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "slug": "nested-direct-extensionless-child",
+  "title": "E2E.Test.Nested.Direct.Extensionless.Child.2026.1080p-TESTGRP",
+  "description": "A stored RAR5 holding a stored 7z under the name 'bundle', with no archive extension. Routing is by name, so the child is placed as an ordinary file; its payload must still be delivered and the file itself must not be.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "north.quay.s01e11.extras.bin": "d7815acaff7299c6b4b68fa4dd80a559ddf2bb87cc0cfd9dc948cc1765297d0f",
+    "north.quay.s01e11.mkv": "a1663ad2356fe9c7c5443f9b0ae26fc92115426d409c91f751b4c94719aae3e7"
+  },
+  "forbiddenOutputPaths": [
+    "bundle",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "requireFinalizedDirect": true,
+      "forbidDemotion": true
+    }
+  }
+}

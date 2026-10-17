@@ -1575,6 +1575,7 @@ func Recipes() []Recipe {
 
 	// ------------------------------------------------------- direct store
 	recipes = append(recipes, DirectStoreRecipes()...)
+	recipes = append(recipes, NestedDirectRecipes()...)
 	recipes = append(recipes, PAR3Recipes()...)
 	recipes = append(recipes, SpeedTestRecipes()...)
 	return recipes

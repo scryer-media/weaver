@@ -1,0 +1,21 @@
+{
+  "slug": "nested-direct-fake-archive-member",
+  "title": "E2E.Test.Nested.Direct.Fake.Archive.Member.2026.1080p-TESTGRP",
+  "description": "A stored RAR5 holding an ordinary payload named notes.7z that is not an archive, beside a real payload. The name routes it to a child engine; it must be written out as a file instead and delivered unchanged, while the posted set still finalizes direct.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "notes.7z": "d2455cb9cb5f1325f88ea3cec1faba5e72acf3e06db678c3bb157afb447f2293",
+    "opal.drift.s01e12.mkv": "fcbb940920c554195700c49b72e90b9a60f5baa6b032a48e1958f85325eba32e"
+  },
+  "forbiddenOutputPaths": [
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "requireFinalizedDirect": true,
+      "forbidDemotion": true,
+      "requireMaterializedChildren": 1
+    }
+  }
+}

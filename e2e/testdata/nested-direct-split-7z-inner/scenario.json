@@ -1,0 +1,23 @@
+{
+  "slug": "nested-direct-split-7z-inner",
+  "title": "E2E.Test.Nested.Direct.Split.7z.Inner.2026.1080p-TESTGRP",
+  "description": "A stored RAR5 holding a stored 7z cut into .7z.001/.7z.002, so the child the graph routes is one archive assembled from two parent members in part order.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "marrow.field.s01e10.mkv": "70d3cc045126422036dd9c5e5d5b90aedc4b394d11f3ae81604fde82fc80a1f9"
+  },
+  "forbiddenOutputPaths": [
+    "*.7z",
+    "*.7z.0*",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "requireFinalizedDirect": true,
+      "forbidDemotion": true,
+      "requireStreamedChildren": 1,
+      "forbidChildMaterialization": true
+    }
+  }
+}

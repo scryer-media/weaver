@@ -1,0 +1,23 @@
+{
+  "slug": "nested-direct-multivolume-rar5-7z",
+  "title": "E2E.Test.Nested.Direct.Multivolume.RAR5.7z.2026.1080p-TESTGRP",
+  "description": "A stored RAR5 across three 8 MiB volumes whose stored 7z member crosses both volume boundaries, so the graph routes one child archive from three volumes' routed bytes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "glass.meadow.s01e04.extras.bin": "ab532b97dceaf7e8a90a30fba57ad0f6ec7b7a6a70fec0afcf67f7fdad94d907",
+    "glass.meadow.s01e04.mkv": "affec36284f5f754d7cf8fb5e8d45826a94eba08f7de12f22b6d06293cb776ec"
+  },
+  "forbiddenOutputPaths": [
+    "*.7z",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "requireFinalizedDirect": true,
+      "forbidDemotion": true,
+      "requireStreamedChildren": 1,
+      "forbidChildMaterialization": true
+    }
+  }
+}

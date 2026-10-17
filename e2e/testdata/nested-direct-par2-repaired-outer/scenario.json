@@ -1,0 +1,29 @@
+{
+  "slug": "nested-direct-par2-repaired-outer",
+  "title": "E2E.Test.Nested.Direct.PAR2.Repaired.Outer.2026.1080p-TESTGRP",
+  "description": "A stored RAR5 across four 8 MiB volumes with PAR2 at 20% whose only member is a stored 7z, damaged by deleting the tail articles of an interior volume. The outer is repaired without demoting and the child it streams still delivers the payload byte for byte.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "quill.marsh.s01e14.mkv": "5ee4ade82f338be884eea03361b48d1ea5ba40dc53214154efc86e0bce3cd5dd"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "deleteSubjectContains": [
+    "archive.part2.rar"
+  ],
+  "deleteSubjectTailArticles": 3,
+  "forbiddenOutputPaths": [
+    "*.7z",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "requireFinalizedDirect": true,
+      "forbidDemotion": true,
+      "requireStreamedChildren": 1,
+      "forbidChildMaterialization": true
+    }
+  }
+}

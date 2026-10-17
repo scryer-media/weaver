@@ -1,0 +1,26 @@
+{
+  "slug": "nested-direct-7z-empty-and-dirs",
+  "title": "E2E.Test.Nested.Direct.7z.Empty.And.Dirs.2026.1080p-TESTGRP",
+  "description": "A stored RAR5 holding a stored 7z whose tree carries a payload under a directory, a zero-length file and an empty directory. The graph must route the child, deliver the payload and the zero-length file byte for byte, and deliver the empty directory.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "pack/empty.marker": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "pack/pine.gate.s01e13.mkv": "9936aba78b3a20a699a91ee4e67bba1b290fc45d0ea29289abee9cff2edc41a6"
+  },
+  "expectedOutputDirectories": [
+    "pack/hollow"
+  ],
+  "forbiddenOutputPaths": [
+    "*.7z",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "requireFinalizedDirect": true,
+      "forbidDemotion": true,
+      "requireStreamedChildren": 1,
+      "forbidChildMaterialization": true
+    }
+  }
+}

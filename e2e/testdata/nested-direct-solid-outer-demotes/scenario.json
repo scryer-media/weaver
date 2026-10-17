@@ -1,0 +1,20 @@
+{
+  "slug": "nested-direct-solid-outer-demotes",
+  "title": "E2E.Test.Nested.Direct.Solid.Outer.Demotes.2026.1080p-TESTGRP",
+  "description": "A solid, compressed RAR5 holding a 7z beside an ordinary member; the writer puts the 7z first and makes the sibling the solid member. The set demotes with member_solid, which this scenario owns, and the conventional extraction streams the child archive instead.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "linen.pass.s01e09.extras.bin": "6c7f1b1eab3964e2fc2d4d2865d660a889783611384e692762a9093d03e0e8a3",
+    "linen.pass.s01e09.mkv": "36b194a9bacc9ca369351268fd02a0612e204e79590a687edee7ec0128e6fb5c"
+  },
+  "forbiddenOutputPaths": [
+    "*.7z",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "expectedDemotionReason": "member_solid"
+    }
+  }
+}

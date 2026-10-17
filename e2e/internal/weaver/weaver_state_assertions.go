@@ -683,6 +683,12 @@ func applyTerminalStateCheckSweeping(dbPath string, jobID int, slug string, stat
 				return "OUTPUT_DIGEST_ERROR", err.Error()
 			}
 		}
+		if err == nil && len(scenario.ExpectedOutputDirectories) > 0 {
+			if err := assertOutputDirectories(dbPath, jobID, scenario.ExpectedOutputDirectories); err != nil {
+				log.Printf("  %s: output directory missing after %s: %v", slug, status, err)
+				return "OUTPUT_DIRECTORY_ERROR", err.Error()
+			}
+		}
 		if err == nil && len(scenario.ForbiddenOutputPaths) > 0 {
 			if err := assertForbiddenOutputPaths(dbPath, jobID, scenario.ForbiddenOutputPaths); err != nil {
 				log.Printf("  %s: forbidden output present after %s: %v", slug, status, err)
@@ -717,6 +723,20 @@ func applyTerminalStateCheckSweeping(dbPath string, jobID int, slug string, stat
 			if err := assertLogScenario(jobID, scenario.logAssertion()); err != nil {
 				log.Printf("  %s: log runtime assertion failed after %s: %v", slug, status, err)
 				return "LOG_ASSERTION_ERROR", err.Error()
+			}
+		}
+	}
+	// A job built to fail can still pin what direct-store did before it
+	// failed: the outer set of a nested post can finalize direct and stream
+	// its child while the child's own extraction is what fails the job. The
+	// assertion reads only weaver's log, which a failure writes as fully as a
+	// success.
+	if normalizeFacadeState(status) == "FAILED" && directStoreEnabledForPhase() {
+		scenario, err := loadScenario(filepath.Join(testdataDir(), slug))
+		if err == nil && scenario.directStoreAssertion() != nil {
+			if err := assertDirectStoreScenario(jobID, scenario.directStoreAssertion()); err != nil {
+				log.Printf("  %s: direct-store runtime assertion failed after %s: %v", slug, status, err)
+				return "DIRECT_STORE_ASSERTION_ERROR", err.Error()
 			}
 		}
 	}
@@ -864,17 +884,92 @@ func assertDirectStoreScenario(jobID int, assertion *ScenarioDirectStoreAssertio
 	if err != nil {
 		return fmt.Errorf("read weaver log: %w", err)
 	}
+	return assertDirectStoreLines(string(raw), jobID, assertion)
+}
 
+// The lines a child archive of a direct set emits: one when the parent fed it
+// into a live child engine, one when the graph routed its members without an
+// engine, and one when it fell back to being written out as a file. All three
+// deliver byte-identical output, so these are the only external evidence of
+// which happened.
+const (
+	directChildStreamedMessage     = "direct-store child archive streamed into a live engine"
+	directChildRoutedMessage       = "direct-store child archive routed by the graph"
+	directChildMaterializedMessage = "direct-store child archive materialized as a file"
+)
+
+// directChildKey identifies one child archive across a job's log: the posted
+// set it belongs to and its node in that set's graph. A restarted job
+// announces the same child again under the same key.
+func directChildKey(line string) string {
+	return directLogField(line, "set_name") + "/" + directLogField(line, "node")
+}
+
+// directLogField reads one `key=value` field off an ANSI-stripped log line,
+// unquoting a value the writer quoted. The key must start a field, so `node`
+// never matches inside some longer field name ending in it.
+func directLogField(line, key string) string {
+	prefix := key + "="
+	for offset := 0; ; {
+		index := strings.Index(line[offset:], prefix)
+		if index < 0 {
+			return ""
+		}
+		start := offset + index
+		offset = start + len(prefix)
+		if start > 0 && line[start-1] != ' ' && line[start-1] != '\t' {
+			continue
+		}
+		rest := line[offset:]
+		if strings.HasPrefix(rest, `"`) {
+			if end := strings.Index(rest[1:], `"`); end >= 0 {
+				return rest[1 : end+1]
+			}
+		}
+		if end := strings.IndexAny(rest, " \t"); end >= 0 {
+			return rest[:end]
+		}
+		return strings.TrimSpace(rest)
+	}
+}
+
+// assertDirectStoreLines is assertDirectStoreScenario over log text already in
+// hand.
+func assertDirectStoreLines(raw string, jobID int, assertion *ScenarioDirectStoreAssertion) error {
 	wantJobID := strconv.Itoa(jobID)
 	seenDemotion := false
 	seenMaterialization := false
-	for _, rawLine := range strings.Split(string(raw), "\n") {
+	seenFinalizedDirect := false
+	streamedChildren := map[string]bool{}
+	materializedChildren := map[string]bool{}
+	for _, rawLine := range strings.Split(raw, "\n") {
 		line := ansiEscape.ReplaceAllString(rawLine, "")
 		if isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
 			continue
 		}
-		if strings.Contains(line, "direct-store set demoted") && directDemotionReason(line) == assertion.ExpectedDemotionReason {
-			seenDemotion = true
+		if strings.Contains(line, directChildStreamedMessage) || strings.Contains(line, directChildRoutedMessage) {
+			streamedChildren[directChildKey(line)] = true
+		}
+		if strings.Contains(line, directChildMaterializedMessage) {
+			if assertion.ForbidChildMaterialization {
+				return fmt.Errorf(
+					"direct-store wrote out child archive %s as a file (reason %q) instead of streaming it",
+					directChildKey(line), directDemotionReason(line),
+				)
+			}
+			materializedChildren[directChildKey(line)] = true
+		}
+		if strings.Contains(line, "direct-store set demoted") {
+			reason := directDemotionReason(line)
+			if assertion.ForbidDemotion {
+				return fmt.Errorf("direct-store demoted a set built to route direct (reason %q)", reason)
+			}
+			if reason == assertion.ExpectedDemotionReason {
+				seenDemotion = true
+			}
+		}
+		if strings.Contains(line, "direct-store set finalized without materializing a volume") {
+			seenFinalizedDirect = true
 		}
 		if strings.Contains(line, "direct-store set materialized from its own routed bytes") {
 			seenMaterialization = true
@@ -888,6 +983,21 @@ func assertDirectStoreScenario(jobID int, assertion *ScenarioDirectStoreAssertio
 	}
 	if assertion.RequireRoutedByteMaterialization && !seenMaterialization {
 		return errors.New("direct-store did not materialize the demoted set from routed bytes")
+	}
+	if assertion.RequireFinalizedDirect && !seenFinalizedDirect {
+		return errors.New("direct-store finalized no set of this job without materializing a volume")
+	}
+	if len(streamedChildren) < assertion.RequireStreamedChildren {
+		return fmt.Errorf(
+			"direct-store streamed into a live engine or routed by the graph %d child archive(s) of this job, fewer than the %d required",
+			len(streamedChildren), assertion.RequireStreamedChildren,
+		)
+	}
+	if len(materializedChildren) < assertion.RequireMaterializedChildren {
+		return fmt.Errorf(
+			"direct-store wrote out %d routed child member(s) of this job as a file, fewer than the %d required",
+			len(materializedChildren), assertion.RequireMaterializedChildren,
+		)
 	}
 	return nil
 }
@@ -1261,20 +1371,30 @@ func assertMaxJobEventCounts(dbPath string, jobID int, maximums map[string]int) 
 	return nil
 }
 
-func assertOutputBLAKE3(dbPath string, jobID int, expectedByRelativePath map[string]string) error {
+// jobOutputDirectory is where weaver delivered a finished job, as its history
+// row records it.
+func jobOutputDirectory(dbPath string, jobID int) (string, error) {
 	db, datastore, err := openWeaverStateDB(dbPath)
 	if err != nil {
-		return fmt.Errorf("open weaver state db: %w", err)
+		return "", fmt.Errorf("open weaver state db: %w", err)
 	}
 	defer closeWeaverStateDB(db, datastore)
 
 	var outputDir string
 	query := rebindWeaverSQL(datastore, `SELECT output_dir FROM job_history WHERE job_id = ?`)
 	if err := db.QueryRow(query, jobID).Scan(&outputDir); err != nil {
-		return fmt.Errorf("load output directory for job %d: %w", jobID, err)
+		return "", fmt.Errorf("load output directory for job %d: %w", jobID, err)
 	}
 	if outputDir == "" {
-		return fmt.Errorf("job %d has no output directory", jobID)
+		return "", fmt.Errorf("job %d has no output directory", jobID)
+	}
+	return outputDir, nil
+}
+
+func assertOutputBLAKE3(dbPath string, jobID int, expectedByRelativePath map[string]string) error {
+	outputDir, err := jobOutputDirectory(dbPath, jobID)
+	if err != nil {
+		return err
 	}
 
 	relativePaths := make([]string, 0, len(expectedByRelativePath))
@@ -1319,25 +1439,39 @@ func assertOutputBLAKE3(dbPath string, jobID int, expectedByRelativePath map[str
 	return nil
 }
 
+// assertOutputDirectories fails unless each slash-relative path is a directory
+// under the job's completed output. A digest pins a file's bytes; an empty
+// directory has no bytes to pin, so its presence is checked on its own.
+func assertOutputDirectories(dbPath string, jobID int, relativePaths []string) error {
+	outputDir, err := jobOutputDirectory(dbPath, jobID)
+	if err != nil {
+		return err
+	}
+	for _, relativePath := range relativePaths {
+		localRelativePath := filepath.FromSlash(relativePath)
+		if localRelativePath == "." || !filepath.IsLocal(localRelativePath) {
+			return fmt.Errorf("job %d output directory path %q is not relative", jobID, relativePath)
+		}
+		info, err := os.Stat(filepath.Join(outputDir, localRelativePath))
+		if err != nil {
+			return fmt.Errorf("stat output directory %q for job %d: %w", relativePath, jobID, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("job %d output %q is not a directory", jobID, relativePath)
+		}
+	}
+	return nil
+}
+
 // assertForbiddenOutputPaths fails when the job's completed output still holds
 // a file the scenario says is not part of the release. It is the counterpart of
 // assertOutputBLAKE3: that one says the release is right, this one says nothing
 // the pipeline used along the way was handed over with it — split parts a join
 // consumed, backups a repair wrote, an archive an extraction opened.
 func assertForbiddenOutputPaths(dbPath string, jobID int, patterns []string) error {
-	db, datastore, err := openWeaverStateDB(dbPath)
+	outputDir, err := jobOutputDirectory(dbPath, jobID)
 	if err != nil {
-		return fmt.Errorf("open weaver state db: %w", err)
-	}
-	defer closeWeaverStateDB(db, datastore)
-
-	var outputDir string
-	query := rebindWeaverSQL(datastore, `SELECT output_dir FROM job_history WHERE job_id = ?`)
-	if err := db.QueryRow(query, jobID).Scan(&outputDir); err != nil {
-		return fmt.Errorf("load output directory for job %d: %w", jobID, err)
-	}
-	if outputDir == "" {
-		return fmt.Errorf("job %d has no output directory", jobID)
+		return err
 	}
 
 	var delivered []string

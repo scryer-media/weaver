@@ -1,0 +1,21 @@
+{
+  "slug": "nested-direct-7z-aes-pair",
+  "title": "E2E.Test.Nested.Direct.7z.AES.Pair.2026.1080p-TESTGRP{{weaver-e2e-nested-inner}}",
+  "description": "An LZMA2 7z with AES data encryption holding a stored 7z AES inner under a different password. The job carries the outer password and the NZB file name's braces the inner one, so each level opens only with its own candidate. AES over a compressing coder is a by-design direct-store refusal: the set demotes with 7z_encrypted_content and the conventional extraction opens both levels.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "hollow.crest.s01e05.extras.bin": "a104dca1abe3bfa145cd6531ba75dcac88b3c2a0cc3cbcbd463671a98b302c80",
+    "hollow.crest.s01e05.mkv": "2f57314711502200529d1ec8cd77c73e233b9acc530a7d182dd0a7a3a1e36806"
+  },
+  "password": "weaver-e2e-nested-outer",
+  "forbiddenOutputPaths": [
+    "*.7z",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "expectedDemotionReason": "7z_encrypted_content"
+    }
+  }
+}

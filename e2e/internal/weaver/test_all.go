@@ -1152,8 +1152,9 @@ func assertDirectStoreEngagement(weaverURL string, jobs []testJob) error {
 // direct-store-par2-withheld-volume counts: a volume nobody posted is created
 // by the repair and the set finalizes direct around it. Three PAR3 twins of the
 // repair sets count the same way; direct-store-par3-withheld-volume is disabled
-// and does not run.
-const directStoreArchiveSetCount = 16
+// and does not run. The nested-direct family adds thirteen: the posted outer
+// set of each of its enabled scenarios that sets requireFinalizedDirect.
+const directStoreArchiveSetCount = 29
 
 // Demotion reasons that mean direct-store REFUSED an archive it is designed not
 // to carry. Refusal is the correct outcome and says nothing about health.
@@ -1162,16 +1163,21 @@ const directStoreArchiveSetCount = 16
 // reason in that enum is a failure — a set weaver admitted and then could not
 // carry — and fails the phase below.
 var byDesignDirectRefusals = map[string]bool{
-	"member_compressed":        true,
-	"member_encrypted":         true,
-	"member_solid":             true,
-	"member_directory":         true,
-	"member_redirection":       true,
-	"member_no_checksum":       true,
-	"member_malformed_chain":   true,
-	"member_blake2_only":       true,
-	"tolerance_budget":         true,
-	"unsupported_format":       true,
+	"member_compressed":      true,
+	"member_encrypted":       true,
+	"member_solid":           true,
+	"member_directory":       true,
+	"member_redirection":     true,
+	"member_no_checksum":     true,
+	"member_malformed_chain": true,
+	"member_blake2_only":     true,
+	"tolerance_budget":       true,
+	"unsupported_format":     true,
+	// The set's first bytes carry no signature of the format its name
+	// claims, so it is a file that only bears an archive's name. Nothing to
+	// carry, nothing to repair: the conventional path leaves it as the file
+	// it is.
+	"not_an_archive":           true,
 	"encrypted_facts_disagree": true,
 	// Refused *destinations* over a truthful image, not a carry failure. The
 	// router classifies both as `VolumeDemand::Virtual`: the archive parsed,

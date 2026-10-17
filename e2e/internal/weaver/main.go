@@ -72,13 +72,17 @@ type Scenario struct {
 	// the whole job, so a fixture whose outcome depends on the primary copy
 	// alone cannot be satisfied by the backup taking the first fetch when the
 	// primary is out of seats. The gate lifts once the job is terminal.
-	BackupUnavailableUntilJobTerminal bool                       `json:"backupUnavailableUntilJobTerminal,omitempty"`
-	RequiredJobEvents                 []string                   `json:"requiredJobEvents,omitempty"`
-	ForbiddenJobEvents                []string                   `json:"forbiddenJobEvents,omitempty"`
-	MaxJobEventCounts                 map[string]int             `json:"maxJobEventCounts,omitempty"`
-	ExpectedOutputBLAKE3              map[string]string          `json:"expectedOutputBLAKE3,omitempty"`
-	ForbiddenOutputPaths              []string                   `json:"forbiddenOutputPaths,omitempty"`
-	RuntimeAssertions                 *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
+	BackupUnavailableUntilJobTerminal bool              `json:"backupUnavailableUntilJobTerminal,omitempty"`
+	RequiredJobEvents                 []string          `json:"requiredJobEvents,omitempty"`
+	ForbiddenJobEvents                []string          `json:"forbiddenJobEvents,omitempty"`
+	MaxJobEventCounts                 map[string]int    `json:"maxJobEventCounts,omitempty"`
+	ExpectedOutputBLAKE3              map[string]string `json:"expectedOutputBLAKE3,omitempty"`
+	// ExpectedOutputDirectories names slash-relative paths the completed
+	// output must hold as directories: an empty one has no bytes for
+	// ExpectedOutputBLAKE3 to pin.
+	ExpectedOutputDirectories []string                   `json:"expectedOutputDirectories,omitempty"`
+	ForbiddenOutputPaths      []string                   `json:"forbiddenOutputPaths,omitempty"`
+	RuntimeAssertions         *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
 	// Disabled keeps a fixture in the corpus, seeded and verified, while the
 	// canonical runs leave it out. The value says why: the behavior it pins is
 	// one weaver does not deliver yet.
@@ -164,6 +168,61 @@ type ScenarioDirectStoreAssertion struct {
 	ExpectedDemotionReason           string `json:"expectedDemotionReason"`
 	RequireRoutedByteMaterialization bool   `json:"requireRoutedByteMaterialization"`
 	ForbidVolumeRefetch              bool   `json:"forbidVolumeRefetch"`
+	// RequireFinalizedDirect demands a set of this job finalized without
+	// materializing a volume. An outer set whose children were streamed
+	// delivers the same bytes as one that fell back, so only this line tells
+	// them apart.
+	RequireFinalizedDirect bool `json:"requireFinalizedDirect,omitempty"`
+	// ForbidDemotion fails the job on any direct-store demotion of its sets,
+	// by-design refusals included: the fixture is built to route direct end
+	// to end. It reads the posted sets' demotion line; a child archive that
+	// falls back announces itself on its own materialization line instead,
+	// which ForbidChildMaterialization covers.
+	ForbidDemotion bool `json:"forbidDemotion,omitempty"`
+	// RequireStreamedChildren demands this many distinct child archives of
+	// this job, keyed by posted set and graph node, streamed into a live child
+	// engine or routed by the graph. Distinct, because a restarted job
+	// announces the same child again. A child delivered either way and one
+	// written out as a file deliver byte-identical output, so only these lines
+	// tell them apart.
+	RequireStreamedChildren int `json:"requireStreamedChildren,omitempty"`
+	// ForbidChildMaterialization fails the job when any child archive of its
+	// sets fell back to being written out as a file.
+	ForbidChildMaterialization bool `json:"forbidChildMaterialization,omitempty"`
+	// RequireMaterializedChildren demands this many distinct members of this
+	// job, keyed the same way, that were routed to a child engine and then
+	// written out as a file instead. It is the fallback's only external
+	// evidence: the file it writes is the member the parent stored.
+	RequireMaterializedChildren int `json:"requireMaterializedChildren,omitempty"`
+}
+
+// validate rejects an assertion no run could satisfy, so a contradictory
+// scenario fails when it is loaded instead of failing every run it is in.
+func (a *ScenarioDirectStoreAssertion) validate() error {
+	if a == nil {
+		return nil
+	}
+	if a.RequireStreamedChildren < 0 {
+		return fmt.Errorf("requireStreamedChildren is %d; it counts child archives and cannot be negative", a.RequireStreamedChildren)
+	}
+	if a.RequireMaterializedChildren < 0 {
+		return fmt.Errorf("requireMaterializedChildren is %d; it counts child archives and cannot be negative", a.RequireMaterializedChildren)
+	}
+	if a.RequireMaterializedChildren > 0 && a.ForbidChildMaterialization {
+		return errors.New("requireMaterializedChildren contradicts forbidChildMaterialization")
+	}
+	if a.ExpectedDemotionReason == "" {
+		return nil
+	}
+	if a.ForbidDemotion {
+		return fmt.Errorf("forbidDemotion contradicts expectedDemotionReason %q", a.ExpectedDemotionReason)
+	}
+	// A demoted set is handed to the conventional path whole, so none of its
+	// members reaches a child engine and no child announces itself either way.
+	if a.RequireStreamedChildren > 0 || a.RequireMaterializedChildren > 0 || a.ForbidChildMaterialization {
+		return fmt.Errorf("child-archive assertions contradict expectedDemotionReason %q: a demoted set streams no children", a.ExpectedDemotionReason)
+	}
+	return nil
 }
 
 // ScenarioDirectUnpackAssertion pins what the 7z direct-unpack chase did, read
@@ -1319,6 +1378,27 @@ var canonicalFixtureSlugs = []string{
 	"mixed-archive",
 	"nested-3deep",
 	"nested-5deep",
+	// The nested direct-store shapes: child archives streamed out of a routed
+	// outer set, across format pairings, topologies, encryption, depth and the
+	// fallbacks the routing predicate owns.
+	"nested-direct-3deep",
+	"nested-direct-7z-aes-all-wrong",
+	"nested-direct-7z-aes-pair",
+	"nested-direct-7z-empty-and-dirs",
+	"nested-direct-7z-in-7z",
+	"nested-direct-7z-in-rar5",
+	"nested-direct-7z-mhe-first-password",
+	"nested-direct-7z-mhe-second-password",
+	"nested-direct-aes-7z-inner",
+	"nested-direct-extensionless-child",
+	"nested-direct-fake-archive-member",
+	"nested-direct-hp-rar5-aes-7z",
+	"nested-direct-mhe-7z-rar5-p",
+	"nested-direct-multivolume-rar5-7z",
+	"nested-direct-par2-repaired-outer",
+	"nested-direct-rar5-in-7z",
+	"nested-direct-solid-outer-demotes",
+	"nested-direct-split-7z-inner",
 	"nested-obfuscated-split-7z",
 	"nested-rar",
 	"nested-xz-rar",
@@ -1624,6 +1704,9 @@ func loadScenario(dir string) (*Scenario, error) {
 	var s Scenario
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, err
+	}
+	if err := s.directStoreAssertion().validate(); err != nil {
+		return nil, fmt.Errorf("runtimeAssertions.directStore: %w", err)
 	}
 	return &s, nil
 }

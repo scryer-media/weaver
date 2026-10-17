@@ -1,0 +1,17 @@
+{
+  "slug": "nested-direct-7z-aes-all-wrong",
+  "title": "E2E.Test.Nested.Direct.7z.AES.All.Wrong.2026.1080p-TESTGRP",
+  "description": "A stored RAR5 holding a 7z whose data is AES-encrypted under clear headers. The job's one candidate is the wrong key: the posted set must still finalize direct and stream the child, and the job must fail on the child because no candidate decrypts it.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "expectedErrorContains": "no supplied password could decrypt",
+  "password": "weaver-e2e-nested-outer",
+  "runtimeAssertions": {
+    "directStore": {
+      "requireFinalizedDirect": true,
+      "forbidDemotion": true,
+      "requireStreamedChildren": 1,
+      "forbidChildMaterialization": true
+    }
+  }
+}

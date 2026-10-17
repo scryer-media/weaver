@@ -1,0 +1,21 @@
+{
+  "slug": "nested-direct-hp-rar5-aes-7z",
+  "title": "E2E.Test.Nested.Direct.HP.RAR5.AES.7z.2026.1080p-TESTGRP",
+  "description": "A stored RAR5 with -hp header and data encryption holding a 7z AES inner under the same password. The outer routes direct and decrypts as it places; the encrypted parent member is not a routable child, so the 7z is opened from its placed file.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "iron.tide.s01e06.mkv": "3602df12f036a688a3bdf926cfa5a5c305e47214c997b8b1146534ee8a13044e"
+  },
+  "password": "weaver-e2e-direct-password",
+  "forbiddenOutputPaths": [
+    "*.7z",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "requireFinalizedDirect": true,
+      "forbidDemotion": true
+    }
+  }
+}

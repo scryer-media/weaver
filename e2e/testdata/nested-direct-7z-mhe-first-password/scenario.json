@@ -1,0 +1,24 @@
+{
+  "slug": "nested-direct-7z-mhe-first-password",
+  "title": "E2E.Test.Nested.Direct.7z.MHE.First.Password.2026.1080p-TESTGRP",
+  "description": "An LZMA2 7z with -mhe=on holding an ordinary member and a stored, unencrypted 7z. The job's own password is the right one; nested-direct-7z-mhe-second-password is the same shape with the right candidate second. The set demotes with 7z_encrypted_content, and the direct-unpack chase must arm and have its members installed.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "umber.lake.s01e17.extras.bin": "51b6009b3210d34e32264922948813fa5dfdb80eef4b999c6ff9988789cb4712",
+    "umber.lake.s01e17.mkv": "1bd6cb6051e26f9954f642e04756b970bd2049ed2462c40f6cb2e1d21f73ee2d"
+  },
+  "password": "weaver-e2e-nested-outer",
+  "forbiddenOutputPaths": [
+    "*.7z"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "expectedDemotionReason": "7z_encrypted_content"
+    },
+    "directUnpack": {
+      "requireArmed": true,
+      "requireConsumed": true
+    }
+  }
+}

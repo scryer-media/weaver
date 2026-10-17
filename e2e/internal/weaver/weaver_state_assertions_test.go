@@ -1212,6 +1212,33 @@ func TestAssertForbiddenOutputPathsReadsTheDeliveredTree(t *testing.T) {
 	}
 }
 
+func TestAssertOutputDirectoriesDemandsADirectory(t *testing.T) {
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	outputDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(outputDir, "pack", "hollow"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeStageTestFile(t, filepath.Join(outputDir, "pack", "empty.marker"), nil)
+	mustExecWeaverStateSQL(t, db,
+		`INSERT INTO job_history (job_id, status, output_dir) VALUES (1, 'COMPLETED', '`+outputDir+`')`)
+
+	if err := assertOutputDirectories(dbPath, 1, []string{"pack/hollow"}); err != nil {
+		t.Fatalf("a delivered empty directory must pass, got %v", err)
+	}
+	if err := assertOutputDirectories(dbPath, 1, []string{"pack/missing"}); err == nil {
+		t.Fatal("a directory that was not delivered must fail the assertion")
+	}
+	if err := assertOutputDirectories(dbPath, 1, []string{"pack/empty.marker"}); err == nil {
+		t.Fatal("a file where a directory belongs must fail the assertion")
+	}
+	if err := assertOutputDirectories(dbPath, 1, []string{"../outside"}); err == nil {
+		t.Fatal("a path outside the output directory must be refused")
+	}
+}
+
 func TestAssertDirectStoreScenarioRequiresRoutedMaterializationWithoutRefetch(t *testing.T) {
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)

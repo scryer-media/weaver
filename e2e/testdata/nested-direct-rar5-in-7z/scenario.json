@@ -1,0 +1,23 @@
+{
+  "slug": "nested-direct-rar5-in-7z",
+  "title": "E2E.Test.Nested.Direct.RAR5.In.7z.2026.1080p-TESTGRP",
+  "description": "A stored 7z holding a stored RAR5 beside an ordinary member: the 7z outer routes direct and the graph routes the RAR child.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "frost.arbor.s01e03.extras.bin": "6fc7a0c6e17c737afcca2f3e09574cd1c6fafd19a0b139f1aa911df2a88a67c0",
+    "frost.arbor.s01e03.mkv": "96bb5610028d28fbb9e9bb1715e57ebad06438a3105db4fed6e7f5c1756d2d87"
+  },
+  "forbiddenOutputPaths": [
+    "*.7z",
+    "*.rar"
+  ],
+  "runtimeAssertions": {
+    "directStore": {
+      "requireFinalizedDirect": true,
+      "forbidDemotion": true,
+      "requireStreamedChildren": 1,
+      "forbidChildMaterialization": true
+    }
+  }
+}
